@@ -46,11 +46,11 @@ const (
 
 // Errors
 var (
-	ErrExtentNotFound     = errors.New("extent not found")
-	ErrNoSpaceForExtent   = errors.New("no space for new extent (tree required)")
-	ErrExtentOverlap      = errors.New("extent overlap detected")
-	ErrInvalidExtent      = errors.New("invalid extent")
-	ErrBlockNotAllocated  = errors.New("block not allocated")
+	ErrExtentNotFound    = errors.New("extent not found")
+	ErrNoSpaceForExtent  = errors.New("no space for new extent (tree required)")
+	ErrExtentOverlap     = errors.New("extent overlap detected")
+	ErrInvalidExtent     = errors.New("invalid extent")
+	ErrBlockNotAllocated = errors.New("block not allocated")
 )
 
 // Extent represents a contiguous range of blocks.

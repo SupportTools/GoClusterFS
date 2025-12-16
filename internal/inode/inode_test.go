@@ -428,11 +428,11 @@ func TestInitRootInode(t *testing.T) {
 
 func TestInodeHelpers(t *testing.T) {
 	testCases := []struct {
-		name     string
-		mode     uint16
-		isDir    bool
-		isFile   bool
-		isLink   bool
+		name   string
+		mode   uint16
+		isDir  bool
+		isFile bool
+		isLink bool
 	}{
 		{"directory", S_IFDIR | 0o755, true, false, false},
 		{"regular file", S_IFREG | 0o644, false, true, false},
@@ -492,12 +492,12 @@ func TestSizeForInodes(t *testing.T) {
 		count    uint64
 		expected uint64
 	}{
-		{1, SectorSize},                           // 1 inode = 1 sector
-		{16, SectorSize},                          // 16 inodes = 1 sector
-		{17, 2 * SectorSize},                      // 17 inodes = 2 sectors
-		{32, 2 * SectorSize},                      // 32 inodes = 2 sectors
-		{100, 7 * SectorSize},                     // 100/16 = 6.25 → 7 sectors
-		{1000, (1000/16 + 1) * SectorSize},        // 62.5 → 63 sectors
+		{1, SectorSize},                    // 1 inode = 1 sector
+		{16, SectorSize},                   // 16 inodes = 1 sector
+		{17, 2 * SectorSize},               // 17 inodes = 2 sectors
+		{32, 2 * SectorSize},               // 32 inodes = 2 sectors
+		{100, 7 * SectorSize},              // 100/16 = 6.25 → 7 sectors
+		{1000, (1000/16 + 1) * SectorSize}, // 62.5 → 63 sectors
 	}
 
 	for _, tc := range testCases {

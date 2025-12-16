@@ -60,7 +60,7 @@ func New(deviceSize int64) *Superblock {
 		RequiredFlags: RequiredJournal,
 
 		// Geometry
-		BlockSize:     storage.DefaultBlockSize, // 1MB
+		BlockSize:     storage.DefaultBlockSize,  // 1MB
 		MetaBlockSize: storage.MetadataBlockSize, // 4KB
 		MaxNodes:      64,
 		InodeSize:     256,
@@ -85,10 +85,10 @@ func New(deviceSize int64) *Superblock {
 // Layout order: Superblock | NodeRegistry | Journal | LockBitmap | InodeTable | BlockBitmap | RefCount | Snapshot | Data
 func calculateLayout(sb *Superblock, deviceSize int64) {
 	const (
-		nodeRegistrySize = 1 << 20          // 1MB for node registry + heartbeats
-		journalPerNode   = 4 << 20          // 4MB per node
-		maxInodes        = 1 << 20          // 1M inodes max
-		inodeSize        = 256              // bytes per inode
+		nodeRegistrySize = 1 << 20 // 1MB for node registry + heartbeats
+		journalPerNode   = 4 << 20 // 4MB per node
+		maxInodes        = 1 << 20 // 1M inodes max
+		inodeSize        = 256     // bytes per inode
 	)
 
 	// Calculate data blocks (reserve ~1% for metadata, minimum)

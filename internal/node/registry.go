@@ -41,26 +41,26 @@ const (
 type NodeState uint32
 
 const (
-	NodeStateEmpty    NodeState = 0 // Slot is free
-	NodeStateActive   NodeState = 1 // Node is active
-	NodeStateLeaving  NodeState = 2 // Node is gracefully leaving
-	NodeStateDead     NodeState = 3 // Node failed (detected by others)
+	NodeStateEmpty   NodeState = 0 // Slot is free
+	NodeStateActive  NodeState = 1 // Node is active
+	NodeStateLeaving NodeState = 2 // Node is gracefully leaving
+	NodeStateDead    NodeState = 3 // Node failed (detected by others)
 )
 
 // Slot represents a node's on-disk registration entry.
 // Size: 4096 bytes (sector-aligned for O_DIRECT atomic writes)
 type Slot struct {
-	Magic           uint32     // 0x4E4F4445 "NODE"
-	State           NodeState  // Current state
-	UUID            [16]byte   // Node's unique identifier
-	HeartbeatSeq    uint64     // Monotonic heartbeat counter
-	HeartbeatTime   int64      // Unix timestamp of last heartbeat
-	MountTime       int64      // When this node mounted
-	JournalOffset   uint64     // This node's journal region offset
-	JournalSize     uint64     // This node's journal size
-	Hostname        [64]byte   // Node hostname (informational)
-	Reserved        [3964]byte // Padding to 4096 bytes
-	Checksum        uint32     // CRC32C of bytes 0-4091
+	Magic         uint32     // 0x4E4F4445 "NODE"
+	State         NodeState  // Current state
+	UUID          [16]byte   // Node's unique identifier
+	HeartbeatSeq  uint64     // Monotonic heartbeat counter
+	HeartbeatTime int64      // Unix timestamp of last heartbeat
+	MountTime     int64      // When this node mounted
+	JournalOffset uint64     // This node's journal region offset
+	JournalSize   uint64     // This node's journal size
+	Hostname      [64]byte   // Node hostname (informational)
+	Reserved      [3964]byte // Padding to 4096 bytes
+	Checksum      uint32     // CRC32C of bytes 0-4091
 }
 
 // Registry manages node registration and heartbeats.
@@ -69,18 +69,18 @@ type Registry struct {
 	dev    *storage.Device
 	offset uint64 // Registry region offset on device
 
-	localUUID  [16]byte
-	localSlot  int // -1 if not registered
-	stopCh     chan struct{}
+	localUUID   [16]byte
+	localSlot   int // -1 if not registered
+	stopCh      chan struct{}
 	heartbeatWg sync.WaitGroup
 }
 
 // Errors
 var (
-	ErrNoFreeSlots     = errors.New("no free node slots available")
-	ErrSlotTaken       = errors.New("node slot was taken by another node")
-	ErrNotRegistered   = errors.New("node is not registered")
-	ErrInvalidSlot     = errors.New("invalid slot data")
+	ErrNoFreeSlots   = errors.New("no free node slots available")
+	ErrSlotTaken     = errors.New("node slot was taken by another node")
+	ErrNotRegistered = errors.New("node is not registered")
+	ErrInvalidSlot   = errors.New("invalid slot data")
 )
 
 // NewRegistry creates a new registry manager.

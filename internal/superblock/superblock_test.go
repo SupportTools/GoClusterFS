@@ -8,22 +8,22 @@ import (
 func TestSerializeDeserialize(t *testing.T) {
 	// Create a superblock with known values
 	sb := &Superblock{
-		Version:        CurrentVersion,
-		FeatureFlags:   FeatureSparseFiles | FeatureLargeFiles,
-		RequiredFlags:  RequiredJournal,
-		BlockSize:      1 << 20,
-		TotalBlocks:    1000,
-		MetaBlockSize:  4096,
-		MaxNodes:       64,
-		InodeSize:      256,
-		InodeCount:     100000,
-		FreeInodes:     99999,
-		FreeBlocks:     900,
-		SnapshotCount:  5,
-		MountCount:     10,
-		CreateTime:     1700000000,
-		LastMountTime:  1700001000,
-		LastWriteTime:  1700002000,
+		Version:       CurrentVersion,
+		FeatureFlags:  FeatureSparseFiles | FeatureLargeFiles,
+		RequiredFlags: RequiredJournal,
+		BlockSize:     1 << 20,
+		TotalBlocks:   1000,
+		MetaBlockSize: 4096,
+		MaxNodes:      64,
+		InodeSize:     256,
+		InodeCount:    100000,
+		FreeInodes:    99999,
+		FreeBlocks:    900,
+		SnapshotCount: 5,
+		MountCount:    10,
+		CreateTime:    1700000000,
+		LastMountTime: 1700001000,
+		LastWriteTime: 1700002000,
 	}
 	copy(sb.Magic[:], Magic)
 	copy(sb.UUID[:], []byte("0123456789abcdef"))
@@ -277,7 +277,7 @@ func TestAlignUp(t *testing.T) {
 		{4095, 4096, 4096},
 		{4096, 4096, 4096},
 		{4097, 4096, 8192},
-		{1 << 20, 4096, 1 << 20},           // Already aligned
+		{1 << 20, 4096, 1 << 20}, // Already aligned
 		{(1 << 20) + 1, 4096, (1 << 20) + 4096},
 	}
 

@@ -207,12 +207,12 @@ type Dir struct {
 }
 
 var (
-	_ fs.Node               = (*Dir)(nil)
-	_ fs.HandleReadDirAller = (*Dir)(nil)
+	_ fs.Node                = (*Dir)(nil)
+	_ fs.HandleReadDirAller  = (*Dir)(nil)
 	_ fs.NodeRequestLookuper = (*Dir)(nil)
-	_ fs.NodeCreater        = (*Dir)(nil)
-	_ fs.NodeMkdirer        = (*Dir)(nil)
-	_ fs.NodeRemover        = (*Dir)(nil)
+	_ fs.NodeCreater         = (*Dir)(nil)
+	_ fs.NodeMkdirer         = (*Dir)(nil)
+	_ fs.NodeRemover         = (*Dir)(nil)
 )
 
 // Attr returns directory attributes.

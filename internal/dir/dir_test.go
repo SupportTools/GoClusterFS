@@ -110,12 +110,12 @@ func TestEntrySize(t *testing.T) {
 		nameLen  uint8
 		expected uint16
 	}{
-		{0, 12},   // Header only, rounds to 12
-		{1, 16},   // 12 + 1 = 13, rounds to 16
-		{2, 16},   // 12 + 2 = 14, rounds to 16
-		{3, 16},   // 12 + 3 = 15, rounds to 16
-		{4, 16},   // 12 + 4 = 16, already aligned
-		{5, 20},   // 12 + 5 = 17, rounds to 20
+		{0, 12},    // Header only, rounds to 12
+		{1, 16},    // 12 + 1 = 13, rounds to 16
+		{2, 16},    // 12 + 2 = 14, rounds to 16
+		{3, 16},    // 12 + 3 = 15, rounds to 16
+		{4, 16},    // 12 + 4 = 16, already aligned
+		{5, 20},    // 12 + 5 = 17, rounds to 20
 		{100, 112}, // 12 + 100 = 112, already aligned
 		{255, 268}, // 12 + 255 = 267, rounds to 268
 	}
@@ -131,8 +131,8 @@ func TestEntrySize(t *testing.T) {
 
 func TestSerializeParseEntry(t *testing.T) {
 	tests := []struct {
-		name     string
-		entry    DirEntry
+		name  string
+		entry DirEntry
 	}{
 		{
 			name: "short_name",

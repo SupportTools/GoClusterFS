@@ -5,16 +5,17 @@
 // nodes without any external services.
 //
 // Lock Hierarchy (must acquire in this order to prevent deadlocks):
-//   Level 0: Volume
-//   Level 1: SnapshotRegistry
-//   Level 2: Snapshot (by ID)
-//   Level 3: Journal (per-node)
-//   Level 4: RefCount Region
-//   Level 5: LockRegion
-//   Level 6: BlockBitmap
-//   Level 7: SFBContainer
-//   Level 8: Inode (by number)
-//   Level 9: Extent (by block)
+//
+//	Level 0: Volume
+//	Level 1: SnapshotRegistry
+//	Level 2: Snapshot (by ID)
+//	Level 3: Journal (per-node)
+//	Level 4: RefCount Region
+//	Level 5: LockRegion
+//	Level 6: BlockBitmap
+//	Level 7: SFBContainer
+//	Level 8: Inode (by number)
+//	Level 9: Extent (by block)
 package lock
 
 import (
@@ -54,16 +55,16 @@ const (
 type LockType uint8
 
 const (
-	LockTypeVolume          LockType = 0
-	LockTypeSnapshotReg     LockType = 1
-	LockTypeSnapshot        LockType = 2
-	LockTypeJournal         LockType = 3
-	LockTypeRefCount        LockType = 4
-	LockTypeLockRegion      LockType = 5
-	LockTypeBlockBitmap     LockType = 6
-	LockTypeSFBContainer    LockType = 7
-	LockTypeInode           LockType = 8
-	LockTypeExtent          LockType = 9
+	LockTypeVolume       LockType = 0
+	LockTypeSnapshotReg  LockType = 1
+	LockTypeSnapshot     LockType = 2
+	LockTypeJournal      LockType = 3
+	LockTypeRefCount     LockType = 4
+	LockTypeLockRegion   LockType = 5
+	LockTypeBlockBitmap  LockType = 6
+	LockTypeSFBContainer LockType = 7
+	LockTypeInode        LockType = 8
+	LockTypeExtent       LockType = 9
 )
 
 // LockMode indicates shared (read) or exclusive (write) access.
@@ -78,7 +79,7 @@ const (
 // Record represents an on-disk lock entry.
 // Size: 4096 bytes (sector-aligned for O_DIRECT atomic writes)
 type Record struct {
-	Magic       uint32     // 0x4C4F434B "LOCK"
+	Magic       uint32 // 0x4C4F434B "LOCK"
 	Type        LockType
 	Mode        LockMode
 	_           [2]byte    // Padding
@@ -96,13 +97,13 @@ const RecordMagic uint32 = 0x4C4F434B // "LOCK"
 
 // Manager handles distributed lock operations.
 type Manager struct {
-	mu          sync.Mutex
-	dev         *storage.Device
-	offset      uint64     // Lock region offset on device
-	size        uint64     // Lock region size
-	nodeUUID    [16]byte   // This node's UUID
-	nodeSlot    int        // This node's slot
-	heldLocks   map[lockKey]*heldLock
+	mu        sync.Mutex
+	dev       *storage.Device
+	offset    uint64   // Lock region offset on device
+	size      uint64   // Lock region size
+	nodeUUID  [16]byte // This node's UUID
+	nodeSlot  int      // This node's slot
+	heldLocks map[lockKey]*heldLock
 }
 
 type lockKey struct {
@@ -117,11 +118,11 @@ type heldLock struct {
 
 // Errors
 var (
-	ErrLockTimeout     = errors.New("lock acquisition timed out")
-	ErrLockHeld        = errors.New("lock already held by another node")
-	ErrNotLockOwner    = errors.New("not the lock owner")
-	ErrDeadlockRisk    = errors.New("lock order violation would cause deadlock")
-	ErrInvalidRecord   = errors.New("invalid lock record")
+	ErrLockTimeout   = errors.New("lock acquisition timed out")
+	ErrLockHeld      = errors.New("lock already held by another node")
+	ErrNotLockOwner  = errors.New("not the lock owner")
+	ErrDeadlockRisk  = errors.New("lock order violation would cause deadlock")
+	ErrInvalidRecord = errors.New("invalid lock record")
 )
 
 // NewManager creates a new lock manager.

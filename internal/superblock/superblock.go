@@ -48,11 +48,11 @@ var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots
 
 // Errors
 var (
-	ErrInvalidMagic      = errors.New("invalid superblock magic")
-	ErrNewerVersion      = errors.New("superblock version newer than supported - upgrade GoClusterFS")
-	ErrTooOldVersion     = errors.New("superblock version too old - run migration tool")
-	ErrChecksumMismatch  = errors.New("superblock checksum mismatch - possible corruption")
-	ErrUnknownRequired   = errors.New("superblock requires features this version doesn't support")
+	ErrInvalidMagic     = errors.New("invalid superblock magic")
+	ErrNewerVersion     = errors.New("superblock version newer than supported - upgrade GoClusterFS")
+	ErrTooOldVersion    = errors.New("superblock version too old - run migration tool")
+	ErrChecksumMismatch = errors.New("superblock checksum mismatch - possible corruption")
+	ErrUnknownRequired  = errors.New("superblock requires features this version doesn't support")
 )
 
 // Superblock is the on-disk superblock structure.
@@ -68,37 +68,37 @@ type Superblock struct {
 	RequiredFlags uint64 // Required features (must understand to mount)
 
 	// Geometry (offset 48-79)
-	BlockSize      uint32 // Data block size (default 1MB)
-	TotalBlocks    uint64 // Total data blocks
-	MetaBlockSize  uint32 // Metadata block size (4KB)
-	MaxNodes       uint32 // Maximum cluster nodes (default 64)
-	InodeSize      uint32 // Inode size in bytes (256)
+	BlockSize     uint32 // Data block size (default 1MB)
+	TotalBlocks   uint64 // Total data blocks
+	MetaBlockSize uint32 // Metadata block size (4KB)
+	MaxNodes      uint32 // Maximum cluster nodes (default 64)
+	InodeSize     uint32 // Inode size in bytes (256)
 
 	// Region offsets in bytes (offset 80-143)
-	NodeRegistryOffset   uint64 // Node registry + heartbeat region
-	JournalRegionOffset  uint64 // Journal region start
-	LockBitmapOffset     uint64 // Lock bitmap region
-	InodeTableOffset     uint64 // Inode table start
-	BlockBitmapOffset    uint64 // Block allocation bitmap
-	RefCountTableOffset  uint64 // Reference count table (for snapshots)
-	SnapshotRegOffset    uint64 // Snapshot registry
-	DataRegionOffset     uint64 // Data blocks start
+	NodeRegistryOffset  uint64 // Node registry + heartbeat region
+	JournalRegionOffset uint64 // Journal region start
+	LockBitmapOffset    uint64 // Lock bitmap region
+	InodeTableOffset    uint64 // Inode table start
+	BlockBitmapOffset   uint64 // Block allocation bitmap
+	RefCountTableOffset uint64 // Reference count table (for snapshots)
+	SnapshotRegOffset   uint64 // Snapshot registry
+	DataRegionOffset    uint64 // Data blocks start
 
 	// Region sizes in bytes (offset 144-207)
-	NodeRegistrySize   uint64
-	JournalRegionSize  uint64
-	LockBitmapSize     uint64
-	InodeTableSize     uint64
-	BlockBitmapSize    uint64
-	RefCountTableSize  uint64
-	SnapshotRegSize    uint64
+	NodeRegistrySize  uint64
+	JournalRegionSize uint64
+	LockBitmapSize    uint64
+	InodeTableSize    uint64
+	BlockBitmapSize   uint64
+	RefCountTableSize uint64
+	SnapshotRegSize   uint64
 
 	// Counters (offset 208-239)
-	InodeCount     uint64 // Total inodes allocated
-	FreeInodes     uint64 // Free inode count
-	FreeBlocks     uint64 // Free block count
-	SnapshotCount  uint32 // Active snapshots
-	MountCount     uint32 // Times mounted
+	InodeCount    uint64 // Total inodes allocated
+	FreeInodes    uint64 // Free inode count
+	FreeBlocks    uint64 // Free block count
+	SnapshotCount uint32 // Active snapshots
+	MountCount    uint32 // Times mounted
 
 	// Timestamps (offset 240-263)
 	CreateTime    int64 // Volume creation time (Unix)

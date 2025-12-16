@@ -120,15 +120,15 @@ func TestRoundToPoolSize(t *testing.T) {
 		input    int
 		expected int
 	}{
-		{1, SectorSize},                            // 1 -> 4096
-		{512, SectorSize},                          // 512 -> 4096
-		{4096, SectorSize},                         // 4096 -> 4096 (SectorSize = MetadataBlockSize now)
-		{4097, 64 * 1024},                          // 4097 -> 64KB
-		{65536, 64 * 1024},                         // 64KB -> 64KB
-		{65537, 256 * 1024},                        // 65537 -> 256KB
-		{262144, 256 * 1024},                       // 256KB -> 256KB
-		{262145, DefaultBlockSize},                 // 262145 -> 1MB
-		{DefaultBlockSize, DefaultBlockSize},       // 1MB -> 1MB
+		{1, SectorSize},                              // 1 -> 4096
+		{512, SectorSize},                            // 512 -> 4096
+		{4096, SectorSize},                           // 4096 -> 4096 (SectorSize = MetadataBlockSize now)
+		{4097, 64 * 1024},                            // 4097 -> 64KB
+		{65536, 64 * 1024},                           // 64KB -> 64KB
+		{65537, 256 * 1024},                          // 65537 -> 256KB
+		{262144, 256 * 1024},                         // 256KB -> 256KB
+		{262145, DefaultBlockSize},                   // 262145 -> 1MB
+		{DefaultBlockSize, DefaultBlockSize},         // 1MB -> 1MB
 		{DefaultBlockSize + 1, 2 * DefaultBlockSize}, // 1MB+1 -> 2MB
 	}
 

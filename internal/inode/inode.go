@@ -88,27 +88,27 @@ type InlineExtent struct {
 
 // Inode represents an on-disk inode (256 bytes).
 type Inode struct {
-	Magic            uint32           // 0x494E4F44 "INOD"
-	InodeNum         uint32           // Inode number
-	Mode             uint16           // File type + permissions
-	Flags            uint16           // Inode flags
-	UID              uint32           // Owner user ID
-	GID              uint32           // Owner group ID
-	LinkCount        uint32           // Hard link count
-	Size             uint64           // File size in bytes
-	AllocatedBlocks  uint64           // Physical blocks allocated
-	Atime            int64            // Access time (Unix timestamp)
-	Mtime            int64            // Modification time
-	Ctime            int64            // Change time (metadata)
-	DataGeneration   uint64           // Data modification counter
-	MetaGeneration   uint64           // Metadata modification counter
-	LastModifierUUID [16]byte         // UUID of last modifying node
-	InlineExtents    [2]InlineExtent  // Inline extent storage (64 bytes)
-	ExtentTreeRoot   uint64           // Block number for overflow tree
-	ExtentCount      uint64           // Total extent count
-	ExtentDepth      uint32           // Extent tree depth (0 = inline only)
-	Reserved         [60]byte         // Padding to 252 bytes
-	Checksum         uint32           // CRC32C checksum
+	Magic            uint32          // 0x494E4F44 "INOD"
+	InodeNum         uint32          // Inode number
+	Mode             uint16          // File type + permissions
+	Flags            uint16          // Inode flags
+	UID              uint32          // Owner user ID
+	GID              uint32          // Owner group ID
+	LinkCount        uint32          // Hard link count
+	Size             uint64          // File size in bytes
+	AllocatedBlocks  uint64          // Physical blocks allocated
+	Atime            int64           // Access time (Unix timestamp)
+	Mtime            int64           // Modification time
+	Ctime            int64           // Change time (metadata)
+	DataGeneration   uint64          // Data modification counter
+	MetaGeneration   uint64          // Metadata modification counter
+	LastModifierUUID [16]byte        // UUID of last modifying node
+	InlineExtents    [2]InlineExtent // Inline extent storage (64 bytes)
+	ExtentTreeRoot   uint64          // Block number for overflow tree
+	ExtentCount      uint64          // Total extent count
+	ExtentDepth      uint32          // Extent tree depth (0 = inline only)
+	Reserved         [60]byte        // Padding to 252 bytes
+	Checksum         uint32          // CRC32C checksum
 }
 
 // Table manages the inode table on disk.

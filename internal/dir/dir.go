@@ -62,24 +62,24 @@ const (
 
 // Errors
 var (
-	ErrNameTooLong   = errors.New("filename too long")
-	ErrNameEmpty     = errors.New("filename empty")
-	ErrNotDirectory  = errors.New("not a directory")
-	ErrNotFound      = errors.New("entry not found")
-	ErrExists        = errors.New("entry already exists")
-	ErrNotEmpty      = errors.New("directory not empty")
-	ErrInvalidEntry  = errors.New("invalid directory entry")
-	ErrNoSpace       = errors.New("no space in directory block")
-	ErrCorrupted     = errors.New("directory corrupted")
+	ErrNameTooLong  = errors.New("filename too long")
+	ErrNameEmpty    = errors.New("filename empty")
+	ErrNotDirectory = errors.New("not a directory")
+	ErrNotFound     = errors.New("entry not found")
+	ErrExists       = errors.New("entry already exists")
+	ErrNotEmpty     = errors.New("directory not empty")
+	ErrInvalidEntry = errors.New("invalid directory entry")
+	ErrNoSpace      = errors.New("no space in directory block")
+	ErrCorrupted    = errors.New("directory corrupted")
 )
 
 // DirEntry represents a directory entry.
 type DirEntry struct {
-	InodeNum uint64  // Inode number (0 = deleted entry)
-	RecLen   uint16  // Total record length including padding
-	NameLen  uint8   // Length of name
-	FileType uint8   // File type (DT_*)
-	Name     string  // Entry name
+	InodeNum uint64 // Inode number (0 = deleted entry)
+	RecLen   uint16 // Total record length including padding
+	NameLen  uint8  // Length of name
+	FileType uint8  // File type (DT_*)
+	Name     string // Entry name
 }
 
 // Manager handles directory operations.
