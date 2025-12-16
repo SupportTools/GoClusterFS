@@ -384,3 +384,69 @@ func (m *MountedFS) Exists(name string) bool {
 	_, err := os.Stat(m.Path(name))
 	return err == nil
 }
+
+// NewMountedFSWithImage creates a MountedFS that uses a pre-existing image file.
+// This is useful for multi-node tests where multiple mounts share the same image.
+// The image is NOT cleaned up by this instance - the caller manages the shared image.
+func NewMountedFSWithImage(t *testing.T, imagePath string) *MountedFS {
+	t.Helper()
+
+	binaryPath, err := findBinary()
+	if err != nil {
+		t.Fatalf("Failed to find binary: %v", err)
+	}
+
+	// Create mount point directory
+	mountPoint, err := os.MkdirTemp("", "goclusterfs_mnt_")
+	if err != nil {
+		t.Fatalf("Failed to create mount point: %v", err)
+	}
+	t.Logf("Mount point: %s (shared image: %s)", mountPoint, imagePath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	mfs := &MountedFS{
+		ImagePath:  imagePath,
+		MountPoint: mountPoint,
+		BinaryPath: binaryPath,
+		t:          t,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	// Register cleanup - only removes mount point, NOT the shared image
+	t.Cleanup(func() {
+		mfs.CleanupMountOnly()
+	})
+
+	return mfs
+}
+
+// CleanupMountOnly unmounts and removes the mount point but preserves the image.
+// Used for shared image scenarios where multiple mounts use the same backing file.
+func (m *MountedFS) CleanupMountOnly() {
+	// Unmount first
+	m.Unmount()
+
+	// Remove mount point directory only
+	if m.MountPoint != "" {
+		os.RemoveAll(m.MountPoint)
+	}
+	// Note: ImagePath is NOT removed - caller manages shared image
+}
+
+// PID returns the process ID of the mount command, or 0 if not running.
+func (m *MountedFS) PID() int {
+	if m.MountCmd != nil && m.MountCmd.Process != nil {
+		return m.MountCmd.Process.Pid
+	}
+	return 0
+}
+
+// Kill sends SIGKILL to the mount process to simulate a crash.
+func (m *MountedFS) Kill() error {
+	if m.MountCmd == nil || m.MountCmd.Process == nil {
+		return fmt.Errorf("mount process not running")
+	}
+	return m.MountCmd.Process.Kill()
+}
