@@ -1,0 +1,757 @@
+package extent
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/storage"
+)
+
+// createTestDevice creates a test file for O_DIRECT testing.
+func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
+	tb.Helper()
+
+	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
+	if tmpDir == "" {
+		tmpDir = "."
+	}
+
+	testFile := filepath.Join(tmpDir, "test_extents.bin")
+
+	f, err := os.Create(testFile)
+	if err != nil {
+		tb.Skipf("Cannot create test file: %v", err)
+	}
+
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		os.Remove(testFile)
+		tb.Skipf("Cannot truncate test file: %v", err)
+	}
+	f.Close()
+
+	dev, err := storage.Open(testFile)
+	if err != nil {
+		os.Remove(testFile)
+		tb.Skipf("O_DIRECT not supported: %v", err)
+	}
+
+	cleanup := func() {
+		dev.Close()
+		os.Remove(testFile)
+	}
+
+	return dev, cleanup
+}
+
+func createTestSetup(tb testing.TB) (*Manager, *inode.Inode, func()) {
+	tb.Helper()
+
+	dev, cleanup := createTestDevice(tb, 100<<20) // 100MB
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 1000, nil, uuid) // 1000 blocks
+	mgr := NewManager(dev, bm, nil)
+
+	ino := &inode.Inode{
+		Magic:    inode.InodeMagic,
+		InodeNum: 10,
+		Mode:     inode.S_IFREG | 0o644,
+	}
+
+	return mgr, ino, cleanup
+}
+
+func TestConstants(t *testing.T) {
+	if ExtentSize != 32 {
+		t.Errorf("ExtentSize = %d, want 32", ExtentSize)
+	}
+
+	if BlockSize != 1<<20 {
+		t.Errorf("BlockSize = %d, want %d", BlockSize, 1<<20)
+	}
+
+	if MaxInlineExtents != 2 {
+		t.Errorf("MaxInlineExtents = %d, want 2", MaxInlineExtents)
+	}
+}
+
+func TestSerializeDeserialize(t *testing.T) {
+	ext := &Extent{
+		LogicalBlock:  100,
+		PhysicalBlock: 500,
+		Length:        10,
+		Flags:         FlagAllocated | FlagUnwritten,
+	}
+
+	data := SerializeExtent(ext)
+	if len(data) != ExtentSize {
+		t.Fatalf("serialized size = %d, want %d", len(data), ExtentSize)
+	}
+
+	restored, err := DeserializeExtent(data)
+	if err != nil {
+		t.Fatalf("DeserializeExtent failed: %v", err)
+	}
+
+	if restored.LogicalBlock != ext.LogicalBlock {
+		t.Errorf("LogicalBlock = %d, want %d", restored.LogicalBlock, ext.LogicalBlock)
+	}
+	if restored.PhysicalBlock != ext.PhysicalBlock {
+		t.Errorf("PhysicalBlock = %d, want %d", restored.PhysicalBlock, ext.PhysicalBlock)
+	}
+	if restored.Length != ext.Length {
+		t.Errorf("Length = %d, want %d", restored.Length, ext.Length)
+	}
+	if restored.Flags != ext.Flags {
+		t.Errorf("Flags = %d, want %d", restored.Flags, ext.Flags)
+	}
+}
+
+func TestDeserializeInvalid(t *testing.T) {
+	_, err := DeserializeExtent(make([]byte, 10))
+	if err != ErrInvalidExtent {
+		t.Errorf("expected ErrInvalidExtent, got %v", err)
+	}
+}
+
+func TestExtentFlags(t *testing.T) {
+	ext := &Extent{Flags: 0}
+
+	if ext.IsAllocated() {
+		t.Error("should not be allocated")
+	}
+	if ext.IsUnwritten() {
+		t.Error("should not be unwritten")
+	}
+	if ext.IsShared() {
+		t.Error("should not be shared")
+	}
+
+	ext.Flags = FlagAllocated
+	if !ext.IsAllocated() {
+		t.Error("should be allocated")
+	}
+
+	ext.Flags = FlagUnwritten
+	if !ext.IsUnwritten() {
+		t.Error("should be unwritten")
+	}
+
+	ext.Flags = FlagShared
+	if !ext.IsShared() {
+		t.Error("should be shared")
+	}
+
+	ext.Flags = FlagAllocated | FlagShared
+	if !ext.IsAllocated() || !ext.IsShared() {
+		t.Error("should be allocated and shared")
+	}
+}
+
+func TestBlockHelpers(t *testing.T) {
+	testCases := []struct {
+		size   uint64
+		blocks uint64
+	}{
+		{0, 0},
+		{1, 1},
+		{BlockSize - 1, 1},
+		{BlockSize, 1},
+		{BlockSize + 1, 2},
+		{BlockSize * 5, 5},
+		{BlockSize*5 + 1, 6},
+	}
+
+	for _, tc := range testCases {
+		result := BlocksForSize(tc.size)
+		if result != tc.blocks {
+			t.Errorf("BlocksForSize(%d) = %d, want %d", tc.size, result, tc.blocks)
+		}
+	}
+}
+
+func TestOffsetBlockConversion(t *testing.T) {
+	testCases := []struct {
+		offset uint64
+		block  uint64
+	}{
+		{0, 0},
+		{BlockSize - 1, 0},
+		{BlockSize, 1},
+		{BlockSize + 1, 1},
+		{BlockSize * 100, 100},
+	}
+
+	for _, tc := range testCases {
+		result := OffsetToBlock(tc.offset)
+		if result != tc.block {
+			t.Errorf("OffsetToBlock(%d) = %d, want %d", tc.offset, result, tc.block)
+		}
+
+		// Verify BlockToOffset for whole blocks
+		if tc.offset%BlockSize == 0 {
+			back := BlockToOffset(tc.block)
+			if back != tc.offset {
+				t.Errorf("BlockToOffset(%d) = %d, want %d", tc.block, back, tc.offset)
+			}
+		}
+	}
+}
+
+func TestInsertExtent(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert first extent
+	ext1 := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+
+	err := mgr.Insert(ctx, ino, ext1)
+	if err != nil {
+		t.Fatalf("Insert first extent failed: %v", err)
+	}
+
+	if ino.ExtentCount != 1 {
+		t.Errorf("ExtentCount = %d, want 1", ino.ExtentCount)
+	}
+
+	// Insert second extent
+	ext2 := &Extent{
+		LogicalBlock:  10,
+		PhysicalBlock: 200,
+		Length:        3,
+		Flags:         FlagAllocated,
+	}
+
+	err = mgr.Insert(ctx, ino, ext2)
+	if err != nil {
+		t.Fatalf("Insert second extent failed: %v", err)
+	}
+
+	if ino.ExtentCount != 2 {
+		t.Errorf("ExtentCount = %d, want 2", ino.ExtentCount)
+	}
+}
+
+func TestInsertTooManyExtents(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Fill both inline slots
+	for i := uint64(0); i < MaxInlineExtents; i++ {
+		ext := &Extent{
+			LogicalBlock:  i * 10,
+			PhysicalBlock: 100 + i*10,
+			Length:        5,
+			Flags:         FlagAllocated,
+		}
+		err := mgr.Insert(ctx, ino, ext)
+		if err != nil {
+			t.Fatalf("Insert extent %d failed: %v", i, err)
+		}
+	}
+
+	// Third extent should fail (no extent tree yet)
+	ext3 := &Extent{
+		LogicalBlock:  100,
+		PhysicalBlock: 300,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+
+	err := mgr.Insert(ctx, ino, ext3)
+	if err != ErrNoSpaceForExtent {
+		t.Errorf("expected ErrNoSpaceForExtent, got %v", err)
+	}
+}
+
+func TestInsertOverlap(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert first extent (blocks 0-4)
+	ext1 := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext1)
+
+	// Try to insert overlapping extent (blocks 3-7)
+	ext2 := &Extent{
+		LogicalBlock:  3,
+		PhysicalBlock: 200,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+
+	err := mgr.Insert(ctx, ino, ext2)
+	if err != ErrExtentOverlap {
+		t.Errorf("expected ErrExtentOverlap, got %v", err)
+	}
+}
+
+func TestInsertInvalidExtent(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Zero-length extent should fail
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        0,
+		Flags:         FlagAllocated,
+	}
+
+	err := mgr.Insert(ctx, ino, ext)
+	if err != ErrInvalidExtent {
+		t.Errorf("expected ErrInvalidExtent, got %v", err)
+	}
+}
+
+func TestLookup(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extent (blocks 10-19)
+	ext := &Extent{
+		LogicalBlock:  10,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext)
+
+	// Lookup within extent
+	found, offset, err := mgr.Lookup(ino, 15)
+	if err != nil {
+		t.Fatalf("Lookup failed: %v", err)
+	}
+
+	if found.LogicalBlock != 10 {
+		t.Errorf("Found LogicalBlock = %d, want 10", found.LogicalBlock)
+	}
+	if offset != 5 {
+		t.Errorf("Offset = %d, want 5", offset)
+	}
+
+	// Lookup at start
+	found, offset, err = mgr.Lookup(ino, 10)
+	if err != nil {
+		t.Fatalf("Lookup at start failed: %v", err)
+	}
+	if offset != 0 {
+		t.Errorf("Offset at start = %d, want 0", offset)
+	}
+
+	// Lookup at end
+	found, offset, err = mgr.Lookup(ino, 19)
+	if err != nil {
+		t.Fatalf("Lookup at end failed: %v", err)
+	}
+	if offset != 9 {
+		t.Errorf("Offset at end = %d, want 9", offset)
+	}
+}
+
+func TestLookupNotFound(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extent (blocks 10-19)
+	ext := &Extent{
+		LogicalBlock:  10,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext)
+
+	// Lookup before extent
+	_, _, err := mgr.Lookup(ino, 5)
+	if err != ErrExtentNotFound {
+		t.Errorf("Lookup before: expected ErrExtentNotFound, got %v", err)
+	}
+
+	// Lookup after extent
+	_, _, err = mgr.Lookup(ino, 25)
+	if err != ErrExtentNotFound {
+		t.Errorf("Lookup after: expected ErrExtentNotFound, got %v", err)
+	}
+}
+
+func TestLookupPhysical(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extent
+	ext := &Extent{
+		LogicalBlock:  10,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext)
+
+	// Lookup physical block
+	phys, err := mgr.LookupPhysical(ino, 15)
+	if err != nil {
+		t.Fatalf("LookupPhysical failed: %v", err)
+	}
+
+	expected := uint64(105) // 100 + (15-10)
+	if phys != expected {
+		t.Errorf("Physical = %d, want %d", phys, expected)
+	}
+
+	// Lookup hole (not allocated) should return 0
+	phys, err = mgr.LookupPhysical(ino, 5)
+	if err != nil {
+		t.Fatalf("LookupPhysical hole failed: %v", err)
+	}
+	if phys != 0 {
+		t.Errorf("Physical for hole = %d, want 0", phys)
+	}
+}
+
+func TestAllocateBlocks(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate 5 blocks at logical block 0
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 5)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	if ext.LogicalBlock != 0 {
+		t.Errorf("Allocated LogicalBlock = %d, want 0", ext.LogicalBlock)
+	}
+	if ext.Length != 5 {
+		t.Errorf("Allocated Length = %d, want 5", ext.Length)
+	}
+	if !ext.IsAllocated() {
+		t.Error("Extent should be allocated")
+	}
+
+	// Verify inode stats updated
+	if ino.AllocatedBlocks != 5 {
+		t.Errorf("AllocatedBlocks = %d, want 5", ino.AllocatedBlocks)
+	}
+}
+
+func TestAllocateAlreadyExists(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// First allocation
+	ext1, err := mgr.AllocateBlocks(ctx, ino, 0, 5)
+	if err != nil {
+		t.Fatalf("First AllocateBlocks failed: %v", err)
+	}
+
+	// Same allocation again should return existing
+	ext2, err := mgr.AllocateBlocks(ctx, ino, 0, 5)
+	if err != nil {
+		t.Fatalf("Second AllocateBlocks failed: %v", err)
+	}
+
+	if ext2.PhysicalBlock != ext1.PhysicalBlock {
+		t.Errorf("Second allocation returned different physical block: %d vs %d",
+			ext2.PhysicalBlock, ext1.PhysicalBlock)
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extents
+	ext1 := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+	ext2 := &Extent{
+		LogicalBlock:  10,
+		PhysicalBlock: 200,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+
+	mgr.Insert(ctx, ino, ext1)
+	mgr.Insert(ctx, ino, ext2)
+	ino.AllocatedBlocks = 10
+	ino.Size = 15 * BlockSize
+
+	// Truncate to remove second extent entirely
+	err := mgr.Truncate(ctx, ino, 5*BlockSize)
+	if err != nil {
+		t.Fatalf("Truncate failed: %v", err)
+	}
+
+	// Verify second extent removed
+	extents := mgr.ListExtents(ino)
+	if len(extents) != 1 {
+		t.Errorf("After truncate: %d extents, want 1", len(extents))
+	}
+
+	if ino.Size != 5*BlockSize {
+		t.Errorf("Size after truncate = %d, want %d", ino.Size, 5*BlockSize)
+	}
+}
+
+func TestTruncatePartial(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extent covering blocks 0-9
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext)
+	ino.AllocatedBlocks = 10
+	ino.Size = 10 * BlockSize
+
+	// Truncate to 5 blocks
+	err := mgr.Truncate(ctx, ino, 5*BlockSize)
+	if err != nil {
+		t.Fatalf("Truncate failed: %v", err)
+	}
+
+	// Verify extent was shortened
+	extents := mgr.ListExtents(ino)
+	if len(extents) != 1 {
+		t.Fatalf("After truncate: %d extents, want 1", len(extents))
+	}
+
+	if extents[0].Length != 5 {
+		t.Errorf("Extent length after truncate = %d, want 5", extents[0].Length)
+	}
+
+	if ino.AllocatedBlocks != 5 {
+		t.Errorf("AllocatedBlocks = %d, want 5", ino.AllocatedBlocks)
+	}
+}
+
+func TestTruncateToZero(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extents
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext)
+	ino.AllocatedBlocks = 10
+	ino.Size = 10 * BlockSize
+
+	// Truncate to 0
+	err := mgr.Truncate(ctx, ino, 0)
+	if err != nil {
+		t.Fatalf("Truncate to 0 failed: %v", err)
+	}
+
+	extents := mgr.ListExtents(ino)
+	if len(extents) != 0 {
+		t.Errorf("After truncate to 0: %d extents, want 0", len(extents))
+	}
+
+	if ino.Size != 0 {
+		t.Errorf("Size after truncate = %d, want 0", ino.Size)
+	}
+}
+
+func TestListExtents(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extents out of order
+	ext2 := &Extent{
+		LogicalBlock:  20,
+		PhysicalBlock: 200,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+	ext1 := &Extent{
+		LogicalBlock:  10,
+		PhysicalBlock: 100,
+		Length:        5,
+		Flags:         FlagAllocated,
+	}
+
+	mgr.Insert(ctx, ino, ext2)
+	mgr.Insert(ctx, ino, ext1)
+
+	// List should return sorted
+	extents := mgr.ListExtents(ino)
+	if len(extents) != 2 {
+		t.Fatalf("ListExtents returned %d, want 2", len(extents))
+	}
+
+	if extents[0].LogicalBlock != 10 {
+		t.Errorf("First extent LogicalBlock = %d, want 10", extents[0].LogicalBlock)
+	}
+	if extents[1].LogicalBlock != 20 {
+		t.Errorf("Second extent LogicalBlock = %d, want 20", extents[1].LogicalBlock)
+	}
+}
+
+func TestExtentsOverlap(t *testing.T) {
+	testCases := []struct {
+		name    string
+		a       *Extent
+		b       *Extent
+		overlap bool
+	}{
+		{
+			name:    "no overlap before",
+			a:       &Extent{LogicalBlock: 0, Length: 5},
+			b:       &Extent{LogicalBlock: 10, Length: 5},
+			overlap: false,
+		},
+		{
+			name:    "no overlap after",
+			a:       &Extent{LogicalBlock: 10, Length: 5},
+			b:       &Extent{LogicalBlock: 0, Length: 5},
+			overlap: false,
+		},
+		{
+			name:    "adjacent no overlap",
+			a:       &Extent{LogicalBlock: 0, Length: 5},
+			b:       &Extent{LogicalBlock: 5, Length: 5},
+			overlap: false,
+		},
+		{
+			name:    "partial overlap",
+			a:       &Extent{LogicalBlock: 0, Length: 10},
+			b:       &Extent{LogicalBlock: 5, Length: 10},
+			overlap: true,
+		},
+		{
+			name:    "contained",
+			a:       &Extent{LogicalBlock: 0, Length: 20},
+			b:       &Extent{LogicalBlock: 5, Length: 5},
+			overlap: true,
+		},
+		{
+			name:    "exact same",
+			a:       &Extent{LogicalBlock: 5, Length: 5},
+			b:       &Extent{LogicalBlock: 5, Length: 5},
+			overlap: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := extentsOverlap(tc.a, tc.b)
+			if result != tc.overlap {
+				t.Errorf("extentsOverlap = %v, want %v", result, tc.overlap)
+			}
+		})
+	}
+}
+
+func TestAreContiguous(t *testing.T) {
+	testCases := []struct {
+		name       string
+		blocks     []uint64
+		contiguous bool
+	}{
+		{"empty", []uint64{}, true},
+		{"single", []uint64{5}, true},
+		{"two contiguous", []uint64{5, 6}, true},
+		{"three contiguous", []uint64{5, 6, 7}, true},
+		{"gap", []uint64{5, 7}, false},
+		{"reverse", []uint64{7, 6}, false},
+		{"long contiguous", []uint64{100, 101, 102, 103, 104}, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := areContiguous(tc.blocks)
+			if result != tc.contiguous {
+				t.Errorf("areContiguous = %v, want %v", result, tc.contiguous)
+			}
+		})
+	}
+}
+
+func BenchmarkLookup(b *testing.B) {
+	mgr, ino, cleanup := createTestSetup(b)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extents
+	mgr.Insert(ctx, ino, &Extent{LogicalBlock: 0, PhysicalBlock: 100, Length: 1000, Flags: FlagAllocated})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mgr.Lookup(ino, uint64(i%1000))
+	}
+}
+
+func BenchmarkInsert(b *testing.B) {
+	mgr, _, cleanup := createTestSetup(b)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ino := &inode.Inode{
+			Magic:    inode.InodeMagic,
+			InodeNum: uint32(i),
+		}
+		mgr.Insert(ctx, ino, &Extent{
+			LogicalBlock:  0,
+			PhysicalBlock: uint64(i * 10),
+			Length:        5,
+			Flags:         FlagAllocated,
+		})
+	}
+}

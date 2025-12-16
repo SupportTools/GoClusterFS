@@ -1,0 +1,19 @@
+# Build artifacts
+goclusterfs-mount
+GoClusterFS
+
+# Test artifacts
+*.img
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
