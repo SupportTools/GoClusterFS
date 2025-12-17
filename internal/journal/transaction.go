@@ -55,10 +55,10 @@ func (t TxnType) String() string {
 
 // Transaction errors
 var (
-	ErrInvalidTxnMagic    = errors.New("invalid transaction magic")
+	ErrInvalidTxnMagic     = errors.New("invalid transaction magic")
 	ErrTxnChecksumMismatch = errors.New("transaction checksum mismatch")
-	ErrTxnTooSmall        = errors.New("buffer too small for transaction")
-	ErrTxnTooLarge        = errors.New("transaction exceeds maximum size")
+	ErrTxnTooSmall         = errors.New("buffer too small for transaction")
+	ErrTxnTooLarge         = errors.New("transaction exceeds maximum size")
 	ErrTxnAlreadyCommitted = errors.New("transaction already committed")
 )
 

@@ -63,11 +63,11 @@ type Journal struct {
 	config     Config
 
 	// Active transaction tracking
-	activeTxns     map[uint64]*ActiveTxn
+	activeTxns      map[uint64]*ActiveTxn
 	oldestActiveSeq uint64
 
 	// Checkpoint tracking
-	lastCheckpointSeq uint64
+	lastCheckpointSeq  uint64
 	lastCheckpointTime time.Time
 
 	// Background checkpoint goroutine
@@ -75,7 +75,7 @@ type Journal struct {
 	checkpointWg   sync.WaitGroup
 
 	// Metrics
-	commitCount uint64
+	commitCount  uint64
 	bytesWritten uint64
 }
 

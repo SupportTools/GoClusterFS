@@ -9,9 +9,9 @@ import (
 
 // Recovery errors
 var (
-	ErrRecoveryFailed   = errors.New("journal recovery failed")
-	ErrCorruptTxn       = errors.New("corrupt transaction found")
-	ErrUnexpectedEnd    = errors.New("unexpected end of journal data")
+	ErrRecoveryFailed     = errors.New("journal recovery failed")
+	ErrCorruptTxn         = errors.New("corrupt transaction found")
+	ErrUnexpectedEnd      = errors.New("unexpected end of journal data")
 	ErrRecoveryInProgress = errors.New("another recovery already in progress")
 )
 

@@ -532,7 +532,7 @@ func DeserializeExtentRemove(buf []byte) (*ExtentRemovePayload, error) {
 // Size: 32 bytes
 type SnapshotCreatePayload struct {
 	SnapshotID   uint64
-	ParentID     uint64   // 0 for base snapshot
+	ParentID     uint64 // 0 for base snapshot
 	RootInodeNum uint64
 	Timestamp    int64
 }

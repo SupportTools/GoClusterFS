@@ -61,12 +61,12 @@ const (
 
 // Errors
 var (
-	ErrInvalidJournalMagic    = errors.New("invalid journal magic")
+	ErrInvalidJournalMagic     = errors.New("invalid journal magic")
 	ErrJournalChecksumMismatch = errors.New("journal superblock checksum mismatch")
-	ErrJournalTooSmall        = errors.New("buffer too small for journal superblock")
-	ErrJournalCorrupt         = errors.New("journal is corrupt")
-	ErrJournalFull            = errors.New("journal is full")
-	ErrJournalRecovering      = errors.New("journal is being recovered by another node")
+	ErrJournalTooSmall         = errors.New("buffer too small for journal superblock")
+	ErrJournalCorrupt          = errors.New("journal is corrupt")
+	ErrJournalFull             = errors.New("journal is full")
+	ErrJournalRecovering       = errors.New("journal is being recovered by another node")
 )
 
 // JournalSuperblock is the on-disk header for each node's journal area.

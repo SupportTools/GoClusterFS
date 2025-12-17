@@ -75,17 +75,17 @@ type Registry struct {
 	heartbeatWg sync.WaitGroup
 
 	// Cross-node recovery
-	recoveryHandler RecoveryHandler
+	recoveryHandler      RecoveryHandler
 	failureCheckInterval time.Duration // How often to scan for failed nodes
-	recoveryInProgress map[int]bool // Slots currently being recovered
+	recoveryInProgress   map[int]bool  // Slots currently being recovered
 }
 
 // Errors
 var (
-	ErrNoFreeSlots      = errors.New("no free node slots available")
-	ErrSlotTaken        = errors.New("node slot was taken by another node")
-	ErrNotRegistered    = errors.New("node is not registered")
-	ErrInvalidSlot      = errors.New("invalid slot data")
+	ErrNoFreeSlots        = errors.New("no free node slots available")
+	ErrSlotTaken          = errors.New("node slot was taken by another node")
+	ErrNotRegistered      = errors.New("node is not registered")
+	ErrInvalidSlot        = errors.New("invalid slot data")
 	ErrRecoveryInProgress = errors.New("recovery already in progress for this node")
 )
 

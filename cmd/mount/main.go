@@ -18,6 +18,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -112,6 +113,20 @@ func main() {
 
 	// Create filesystem
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nodeUUID, dataOffset)
+
+	// Set up cross-node recovery handler for failed node journal replay
+	recoveryCtx := &journal.RecoveryContext{
+		Dev:       dev,
+		InodeTbl:  inodeTbl,
+		BitmapMgr: bm,
+		DirMgr:    dirMgr,
+		ExtentMgr: extentMgr,
+	}
+	nodeReg.SetRecoveryHandler(journal.CreateRecoveryHandler(recoveryCtx))
+
+	// Start failure detection to monitor for crashed nodes
+	nodeReg.StartFailureDetection()
+	log.Println("Cross-node recovery enabled: monitoring for failed nodes")
 
 	// Format if requested
 	if *format {

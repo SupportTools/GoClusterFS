@@ -487,3 +487,60 @@ func OffsetToBlock(offset uint64) uint64 {
 func BlockToOffset(block uint64) uint64 {
 	return block * BlockSize
 }
+
+// AddExtentForRecovery adds an extent during recovery.
+// This is similar to Insert but designed for idempotent recovery.
+// It uses Insert internally but handles the case where the extent
+// may already exist due to concurrent recovery.
+func (m *Manager) AddExtentForRecovery(ctx context.Context, ino *inode.Inode, ext *Extent) error {
+	return m.Insert(ctx, ino, ext)
+}
+
+// RemoveExtentForRecovery removes extents during recovery.
+// This removes extents starting at fileBlock for the given length.
+func (m *Manager) RemoveExtentForRecovery(ctx context.Context, ino *inode.Inode, fileBlock, length uint32) error {
+	// Find and remove extents that overlap with the specified range
+	for i := range ino.InlineExtents {
+		ext := &ino.InlineExtents[i]
+		if ext.Length == 0 {
+			continue
+		}
+
+		// Check if this extent overlaps with the range to remove
+		rangeEnd := uint64(fileBlock) + uint64(length)
+		extEnd := ext.LogicalBlock + ext.Length
+
+		if ext.LogicalBlock >= uint64(fileBlock) && ext.LogicalBlock < rangeEnd {
+			// This extent starts within the removal range
+			// Free all blocks in this extent
+			for j := uint64(0); j < ext.Length; j++ {
+				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+j); err != nil {
+					log.Printf("[Recovery] Failed to free block %d: %v", ext.PhysicalBlock+j, err)
+				}
+			}
+			if ino.AllocatedBlocks >= ext.Length {
+				ino.AllocatedBlocks -= ext.Length
+			}
+			*ext = inode.InlineExtent{} // Clear
+			if ino.ExtentCount > 0 {
+				ino.ExtentCount--
+			}
+		} else if uint64(fileBlock) > ext.LogicalBlock && uint64(fileBlock) < extEnd {
+			// Removal starts in the middle of this extent - partial removal
+			keepBlocks := uint64(fileBlock) - ext.LogicalBlock
+			freeBlocks := ext.Length - keepBlocks
+
+			for j := uint64(0); j < freeBlocks; j++ {
+				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+keepBlocks+j); err != nil {
+					log.Printf("[Recovery] Failed to free block %d: %v", ext.PhysicalBlock+keepBlocks+j, err)
+				}
+			}
+			if ino.AllocatedBlocks >= freeBlocks {
+				ino.AllocatedBlocks -= freeBlocks
+			}
+			ext.Length = keepBlocks
+		}
+	}
+
+	return nil
+}

@@ -191,10 +191,10 @@ func TestJournalSuperblockAvailableSpace(t *testing.T) {
 	dataAreaSize := uint32(1000)
 
 	tests := []struct {
-		name       string
-		head       uint32
-		tail       uint32
-		wantSpace  uint32
+		name      string
+		head      uint32
+		tail      uint32
+		wantSpace uint32
 	}{
 		{"empty", 0, 0, 1000},
 		{"partial used", 0, 300, 700},
