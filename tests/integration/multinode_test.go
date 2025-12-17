@@ -412,3 +412,105 @@ func TestMultiNodeConcurrentDirectoryOps(t *testing.T) {
 
 	t.Log("Concurrent directory operations test completed")
 }
+
+// TestMultiNodeConcurrentSameFileWrites tests two nodes writing to the SAME file
+// at different offsets concurrently. This validates that the optimistic retry
+// pattern in File.Write() handles concurrent block allocations correctly.
+func TestMultiNodeConcurrentSameFileWrites(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	// Pre-create an empty file from node 0
+	node0 := cluster.Node(0)
+	if err := node0.WriteFile("shared.txt", []byte{}); err != nil {
+		t.Fatalf("Failed to create shared.txt: %v", err)
+	}
+	t.Log("Created shared.txt")
+
+	// Give time for the file to be visible to both nodes
+	time.Sleep(500 * time.Millisecond)
+
+	// Define test data - each node writes a distinct pattern at a specific offset
+	// Node 0 writes to the first part, Node 1 writes to the second part
+	// Using 1MB+ sizes to ensure block allocation is required
+	dataSize := 512 * 1024 // 512KB each
+	dataNode0 := bytes.Repeat([]byte("NODE0-"), dataSize/6)
+	dataNode1 := bytes.Repeat([]byte("NODE1-"), dataSize/6)
+
+	barrier := NewSyncBarrier(2)
+	var wg sync.WaitGroup
+	errors := make([]error, 2)
+
+	// Node 0 writes to offset 0
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		barrier.Wait()
+		// Use WriteFileAt for offset-based writing
+		errors[0] = cluster.Node(0).WriteFileAt("shared.txt", dataNode0, 0)
+	}()
+
+	// Node 1 writes to offset after Node 0's data
+	// This forces both nodes to potentially extend the file simultaneously
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		barrier.Wait()
+		errors[1] = cluster.Node(1).WriteFileAt("shared.txt", dataNode1, int64(len(dataNode0)))
+	}()
+
+	wg.Wait()
+
+	for i, err := range errors {
+		if err != nil {
+			t.Errorf("Node %d write failed: %v", i, err)
+		}
+	}
+
+	// Allow time for syncing
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify content integrity - read the whole file from node 0
+	fullContent, err := node0.ReadFile("shared.txt")
+	if err != nil {
+		t.Fatalf("Failed to read shared.txt: %v", err)
+	}
+
+	expectedSize := len(dataNode0) + len(dataNode1)
+	if len(fullContent) < expectedSize {
+		t.Errorf("File too small: got %d bytes, expected at least %d", len(fullContent), expectedSize)
+	}
+
+	// Verify Node 0's data at the beginning
+	if len(fullContent) >= len(dataNode0) {
+		node0Part := fullContent[:len(dataNode0)]
+		if !bytes.Equal(node0Part, dataNode0) {
+			t.Errorf("Node 0's data corrupted: first 20 bytes = %q", node0Part[:min(20, len(node0Part))])
+		} else {
+			t.Log("Node 0's data verified at offset 0")
+		}
+	}
+
+	// Verify Node 1's data at the expected offset
+	if len(fullContent) >= expectedSize {
+		node1Part := fullContent[len(dataNode0):expectedSize]
+		if !bytes.Equal(node1Part, dataNode1) {
+			t.Errorf("Node 1's data corrupted: first 20 bytes = %q", node1Part[:min(20, len(node1Part))])
+		} else {
+			t.Logf("Node 1's data verified at offset %d", len(dataNode0))
+		}
+	}
+
+	t.Logf("Concurrent same-file writes test completed - total file size: %d bytes", len(fullContent))
+}

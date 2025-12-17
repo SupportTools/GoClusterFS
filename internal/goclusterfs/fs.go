@@ -6,6 +6,7 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
 	"log"
 	"os"
 	"sync"
@@ -23,6 +24,14 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
+
+// errRetryWrite is an internal sentinel error indicating that a concurrent
+// modification was detected and the Write operation should be retried.
+var errRetryWrite = errors.New("retry write operation")
+
+// MaxWriteRetries is the maximum number of retry attempts for Write operations
+// when concurrent modifications are detected.
+const MaxWriteRetries = 3
 
 // BlockSize is the size of data blocks (1MB).
 const BlockSize = 1 << 20
@@ -589,33 +598,107 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 }
 
 // Write writes file data.
+// Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
-	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if err != nil {
-		log.Printf("[DEBUG] Write inode %d: Read failed: %v", f.inodeNum, err)
-		return syscall.EIO
+	// Retry loop to handle concurrent modifications from other nodes.
+	// When multiple nodes try to extend the same file simultaneously, they may race
+	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
+	// we retry the operation.
+	for attempt := 0; attempt < MaxWriteRetries; attempt++ {
+		bytesWritten, err := f.writeInternal(ctx, req)
+		if err == errRetryWrite {
+			log.Printf("[DEBUG] Write inode %d: retry attempt %d due to concurrent modification",
+				f.inodeNum, attempt+1)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		resp.Size = bytesWritten
+		return nil
 	}
 
+	log.Printf("[ERROR] Write inode %d: concurrent modification detected after %d retries",
+		f.inodeNum, MaxWriteRetries)
+	return syscall.EAGAIN
+}
+
+// writeInternal performs the actual write operation.
+// Returns errRetryWrite if a concurrent modification is detected and the caller should retry.
+func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, error) {
 	offset := uint64(req.Offset)
 	data := req.Data
 	bytesWritten := 0
+
+	// Track if we hold the inode lock
+	lockHeld := false
+	defer func() {
+		if lockHeld && f.fs.lockMgr != nil {
+			f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+		}
+	}()
+
+	// Read initial inode state
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Write inode %d: Read failed: %v", f.inodeNum, err)
+		return 0, syscall.EIO
+	}
 
 	for bytesWritten < len(data) {
 		blockNum := offset / BlockSize
 		blockOffset := offset % BlockSize
 
-		// Allocate block if needed
+		// Try to find existing extent first (without lock for read-only check)
 		ext, extOffset, err := f.fs.extentMgr.Lookup(ino, blockNum)
 		if err != nil {
-			// Need to allocate
+			// Need to allocate - must acquire lock first
+			if !lockHeld && f.fs.lockMgr != nil {
+				if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+					log.Printf("[DEBUG] Write inode %d: failed to acquire lock: %v", f.inodeNum, err)
+					return 0, syscall.EIO
+				}
+				lockHeld = true
+
+				// Re-read inode after acquiring lock to detect concurrent changes
+				freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+				if err != nil {
+					log.Printf("[DEBUG] Write inode %d: re-read failed: %v", f.inodeNum, err)
+					return 0, syscall.EIO
+				}
+
+				// Check if MetaGeneration changed (concurrent modification)
+				if freshIno.MetaGeneration != ino.MetaGeneration {
+					log.Printf("[DEBUG] Write inode %d: MetaGeneration changed %d -> %d, retrying",
+						f.inodeNum, ino.MetaGeneration, freshIno.MetaGeneration)
+					return 0, errRetryWrite
+				}
+				ino = freshIno
+
+				// Re-check if block now exists (another node may have allocated it)
+				ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum)
+				if err == nil {
+					// Block was allocated by another node - use it
+					goto writeBlock
+				}
+			}
+
+			// Allocate block while holding lock
 			ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
 			if err != nil {
+				// Check for extent conflicts indicating concurrent allocation
+				if err == extent.ErrExtentOverlap || err == extent.ErrNoSpaceForExtent {
+					log.Printf("[DEBUG] Write inode %d: extent conflict at block %d, retrying",
+						f.inodeNum, blockNum)
+					return 0, errRetryWrite
+				}
 				log.Printf("[DEBUG] Write inode %d: AllocateBlocks failed: %v", f.inodeNum, err)
-				return syscall.ENOSPC
+				return 0, syscall.ENOSPC
 			}
 			extOffset = 0
 		}
 
+	writeBlock:
 		// Calculate physical location
 		physBlock := ext.PhysicalBlock + extOffset
 		diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
@@ -651,7 +734,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			if _, err := f.fs.dev.WriteAt(buf.Bytes(), alignedOffset); err != nil {
 				log.Printf("[DEBUG] Write inode %d: WriteAt offset %d failed: %v", f.inodeNum, alignedOffset, err)
 				storage.PutBuffer(buf)
-				return syscall.EIO
+				return 0, syscall.EIO
 			}
 
 			bytesInBlock += copyLen
@@ -670,13 +753,20 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	}
 	ino.Mtime = time.Now().UnixNano()
 
-	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-		log.Printf("[DEBUG] Write inode %d: final inodeTbl.Write failed: %v", f.inodeNum, err)
-		return syscall.EIO
+	// Write inode - use WriteWithLockHeld if we hold the lock
+	if lockHeld {
+		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
+			log.Printf("[DEBUG] Write inode %d: WriteWithLockHeld failed: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+	} else {
+		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+			log.Printf("[DEBUG] Write inode %d: final inodeTbl.Write failed: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
 	}
 
-	resp.Size = bytesWritten
-	return nil
+	return bytesWritten, nil
 }
 
 // Setattr sets file attributes (used for truncate).

@@ -341,6 +341,19 @@ func (m *MountedFS) WriteFile(name string, data []byte) error {
 	return os.WriteFile(m.Path(name), data, 0644)
 }
 
+// WriteFileAt writes data to a file at a specific offset.
+// This allows testing concurrent writes to the same file at different positions.
+func (m *MountedFS) WriteFileAt(name string, data []byte, offset int64) error {
+	f, err := os.OpenFile(m.Path(name), os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = f.WriteAt(data, offset)
+	return err
+}
+
 // ReadFile reads data from a file in the mounted filesystem.
 func (m *MountedFS) ReadFile(name string) ([]byte, error) {
 	return os.ReadFile(m.Path(name))
