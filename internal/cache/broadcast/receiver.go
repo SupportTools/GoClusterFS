@@ -24,12 +24,12 @@ type InvalidationHandler interface {
 
 // Broadcaster manages cache invalidation broadcasting.
 type Broadcaster struct {
-	transport   *Transport
-	builder     *MessageBuilder
-	handler     InvalidationHandler
-	localUUID   [16]byte
-	nodeSlot    uint32
-	localPort   uint16
+	transport *Transport
+	builder   *MessageBuilder
+	handler   InvalidationHandler
+	localUUID [16]byte
+	nodeSlot  uint32
+	localPort uint16
 
 	// Deduplication
 	seenMu sync.RWMutex
@@ -42,10 +42,10 @@ type Broadcaster struct {
 	messagesIgnored       uint64 // messages from self
 
 	// Lifecycle
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	running    atomic.Bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+	running atomic.Bool
 }
 
 // NewBroadcaster creates a new cache invalidation broadcaster.
