@@ -41,8 +41,8 @@ test-integration: check-fuse build-mount
 test-all: test-unit test-integration
 	@echo "All tests completed"
 
-# Docker Compose configuration
-DOCKER_COMPOSE_TEST=docker compose -f tests/docker/docker-compose.test.yml
+# Docker Compose configuration (use docker-compose for compatibility)
+DOCKER_COMPOSE_TEST=docker-compose -f tests/docker/docker-compose.test.yml
 
 # Build Docker test images
 docker-build-test:
@@ -51,11 +51,27 @@ docker-build-test:
 	@echo "Docker images built successfully"
 
 # Run multi-node tests in Docker containers
+# Two-phase approach with detached mode to allow container kill/restart tests
 test-multinode-docker: docker-build-test
 	@echo "Running multi-node Docker tests..."
 	@mkdir -p tests/docker/results
-	$(DOCKER_COMPOSE_TEST) up --abort-on-container-exit --exit-code-from orchestrator
-	@echo "Docker tests completed. Results in tests/docker/results/"
+	@echo "Phase 1: Initializing shared storage..."
+	$(DOCKER_COMPOSE_TEST) run --rm storage-init
+	@echo "Phase 2: Starting nodes in background..."
+	$(DOCKER_COMPOSE_TEST) up --no-deps -d node1 node2 node3 node4
+	@echo "Phase 3: Waiting for nodes to be healthy..."
+	@sleep 5
+	@for node in goclusterfs-node1 goclusterfs-node2 goclusterfs-node3 goclusterfs-node4; do \
+		echo "Checking $$node..."; \
+		timeout 60 sh -c "until docker exec $$node /scripts/healthcheck.sh > /dev/null 2>&1; do sleep 1; done" || \
+		(echo "$$node failed to become healthy" && $(DOCKER_COMPOSE_TEST) logs $$node && exit 1); \
+	done
+	@echo "Phase 4: Running test orchestrator..."
+	$(DOCKER_COMPOSE_TEST) run --rm orchestrator; \
+	EXIT_CODE=$$?; \
+	echo "Orchestrator exited with code $$EXIT_CODE"; \
+	$(DOCKER_COMPOSE_TEST) stop node1 node2 node3 node4 2>/dev/null || true; \
+	exit $$EXIT_CODE
 
 # Clean up Docker test resources
 docker-clean-test:

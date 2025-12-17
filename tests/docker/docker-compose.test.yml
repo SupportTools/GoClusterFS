@@ -185,10 +185,8 @@ services:
 volumes:
   shared-data:
     driver: local
-    driver_opts:
-      type: tmpfs
-      device: tmpfs
-      o: size=500m
+    # Using regular disk-backed volume instead of tmpfs
+    # tmpfs data doesn't persist when containers exit
 
 # =============================================================================
 # Networks
