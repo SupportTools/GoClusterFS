@@ -826,6 +826,20 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 			toWrite = len(data) - bytesWritten
 		}
 
+		// Acquire extent lock on the physical block to prevent lost-update race.
+		// When multiple nodes write to different offsets within the same block,
+		// they must serialize their read-modify-write operations to avoid
+		// one node's changes being overwritten by another's stale read.
+		extentLockHeld := false
+		if f.fs.lockMgr != nil {
+			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
+				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
+					f.inodeNum, physBlock, err)
+				return 0, syscall.EIO
+			}
+			extentLockHeld = true
+		}
+
 		// Handle unaligned writes by read-modify-write
 		buf := storage.GetBuffer(storage.SectorSize)
 		alignedOffset := diskOffset &^ (storage.SectorSize - 1)
@@ -851,6 +865,9 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 			if _, err := f.fs.dev.WriteAt(buf.Bytes(), alignedOffset); err != nil {
 				log.Printf("[DEBUG] Write inode %d: WriteAt offset %d failed: %v", f.inodeNum, alignedOffset, err)
 				storage.PutBuffer(buf)
+				if extentLockHeld {
+					f.fs.lockMgr.ReleaseExtent(physBlock)
+				}
 				return 0, syscall.EIO
 			}
 
@@ -859,6 +876,11 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 			sectorOffset = 0
 		}
 		storage.PutBuffer(buf)
+
+		// Release extent lock after completing write to this block
+		if extentLockHeld {
+			f.fs.lockMgr.ReleaseExtent(physBlock)
+		}
 
 		bytesWritten += toWrite
 		offset += uint64(toWrite)

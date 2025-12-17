@@ -69,8 +69,8 @@ jobs:
 
       - name: Integration Tests
         run: |
-          # Run integration tests including most concurrent multi-node tests
-          # Lock order violation fix enables concurrent file/directory creation tests
-          # Skip TestMultiNodeConcurrentSameFileWrites - has lost-update race (Task #4801)
-          go test -v -timeout 5m -skip 'TestMultiNodeConcurrentSameFileWrites' ./tests/integration/...
+          # Run all integration tests including concurrent multi-node tests
+          # Lock order violation fix (Task #4798) enables concurrent file/directory creation tests
+          # Extent locking fix (Task #4801) enables concurrent same-file writes test
+          go test -v -timeout 5m ./tests/integration/...
         timeout-minutes: 10
