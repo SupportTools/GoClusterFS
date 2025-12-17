@@ -301,11 +301,10 @@ test_stress_random_failures() {
 # Main Test Execution
 # =============================================================================
 
-# Skip known-flaky concurrent tests that reveal race conditions
-# These tests are correct - they expose real bugs that need fixing:
-# - Concurrent Writes: lock order violation during parallel file creation
-# Same class of issues as TestMultiNodeConcurrent* in integration tests
-SKIP_CONCURRENT_TESTS="${SKIP_CONCURRENT_TESTS:-true}"
+# Concurrent tests are now enabled after lock order violation fix
+# The fix uses two-phase allocation: BlockBitmap (Level 6) before Inode (Level 8)
+# Set SKIP_CONCURRENT_TESTS=true to skip if issues arise
+SKIP_CONCURRENT_TESTS="${SKIP_CONCURRENT_TESTS:-false}"
 
 log "Waiting for all nodes to be healthy..."
 for node in "${NODE_ARRAY[@]}"; do

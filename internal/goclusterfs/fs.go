@@ -357,15 +357,51 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 }
 
 // Create creates a new file.
+//
+// Lock ordering: This function uses a two-phase allocation pattern to respect
+// the lock hierarchy (BlockBitmap Level 6 < Inode Level 8):
+//  1. FindFreeSlot() - no locks
+//  2. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for directory expansion
+//  3. ClaimSlot() - acquires Inode lock (Level 8)
 func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
-	// Allocate new inode
-	childIno, err := d.fs.inodeTbl.Alloc(ctx)
+	// Phase 1: Find a free inode slot (no distributed locks held)
+	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: Alloc failed: %v", req.Name, err)
+		log.Printf("[DEBUG] Create %q: FindFreeSlot failed: %v", req.Name, err)
 		return nil, nil, syscall.ENOSPC
 	}
 
-	// Initialize file inode
+	// Phase 2: Read parent directory inode
+	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
+		return nil, nil, syscall.EIO
+	}
+
+	// Phase 3: Add directory entry FIRST (may acquire BlockBitmap lock for directory expansion)
+	// This respects lock ordering: BlockBitmap (Level 6) before Inode (Level 8)
+	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(inodeNum), dir.DT_REG); err != nil {
+		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", req.Name, err)
+		return nil, nil, syscall.EIO
+	}
+
+	// Phase 4: Claim the inode slot (acquires Inode lock)
+	// If this fails, another node claimed the slot - rollback the directory entry
+	childIno, err := d.fs.inodeTbl.ClaimSlot(ctx, inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v - rolling back", req.Name, inodeNum, err)
+		// Rollback: remove the directory entry we just added
+		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); removeErr != nil {
+			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", req.Name, removeErr)
+		}
+		// If slot was taken by another node, retry with a different slot
+		if err == inode.ErrInodeInUse {
+			return nil, nil, syscall.EAGAIN
+		}
+		return nil, nil, syscall.ENOSPC
+	}
+
+	// Phase 5: Initialize file inode attributes
 	now := time.Now().UnixNano()
 	childIno.Mode = uint16(req.Mode & 0777)
 	childIno.UID = req.Uid
@@ -375,24 +411,12 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	childIno.Mtime = now
 	childIno.Ctime = now
 
-	// Write inode
+	// Phase 6: Write updated inode
 	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
 		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", req.Name, childIno.InodeNum, err)
+		// Rollback both: free inode and remove directory entry
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		return nil, nil, syscall.EIO
-	}
-
-	// Add directory entry
-	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
-	if err != nil {
-		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		return nil, nil, syscall.EIO
-	}
-
-	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(childIno.InodeNum), dir.DT_REG); err != nil {
-		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", req.Name, err)
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
+		d.fs.dirMgr.Remove(ctx, dirIno, req.Name)
 		return nil, nil, syscall.EIO
 	}
 
@@ -405,14 +429,53 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 }
 
 // Mkdir creates a new directory.
+//
+// Lock ordering: This function uses a two-phase allocation pattern to respect
+// the lock hierarchy (BlockBitmap Level 6 < Inode Level 8):
+//  1. FindFreeSlot() - no locks
+//  2. dirMgr.InitDirectory() - allocates blocks first (Level 6), then acquires inode lock
+//  3. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for parent directory expansion
+//  4. ClaimSlot() - acquires Inode lock (Level 8)
+//
+// Note: dirMgr.InitDirectory() already handles lock ordering internally by allocating
+// blocks before acquiring the inode lock.
 func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	// Allocate new inode
-	childIno, err := d.fs.inodeTbl.Alloc(ctx)
+	// Phase 1: Find a free inode slot (no distributed locks held)
+	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
 	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: FindFreeSlot failed: %v", req.Name, err)
 		return nil, syscall.ENOSPC
 	}
 
-	// Initialize directory inode
+	// Phase 2: Read parent directory inode
+	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
+		return nil, syscall.EIO
+	}
+
+	// Phase 3: Add directory entry in parent FIRST (may acquire BlockBitmap lock)
+	// This respects lock ordering: BlockBitmap (Level 6) before Inode (Level 8)
+	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(inodeNum), dir.DT_DIR); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", req.Name, err)
+		return nil, syscall.EIO
+	}
+
+	// Phase 4: Claim the inode slot (acquires Inode lock)
+	childIno, err := d.fs.inodeTbl.ClaimSlot(ctx, inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v - rolling back", req.Name, inodeNum, err)
+		// Rollback: remove the directory entry we just added
+		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); removeErr != nil {
+			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", req.Name, removeErr)
+		}
+		if err == inode.ErrInodeInUse {
+			return nil, syscall.EAGAIN
+		}
+		return nil, syscall.ENOSPC
+	}
+
+	// Phase 5: Initialize directory inode attributes
 	now := time.Now().UnixNano()
 	childIno.Mode = inode.S_IFDIR | uint16(req.Mode&0777)
 	childIno.UID = req.Uid
@@ -422,27 +485,20 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 	childIno.Mtime = now
 	childIno.Ctime = now
 
-	// Initialize directory contents
+	// Phase 6: Initialize directory contents (allocates data block for . and .. entries)
+	// Note: InitDirectory() handles lock ordering internally
 	if err := d.fs.dirMgr.InitDirectory(ctx, childIno, uint64(d.inodeNum)); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", req.Name, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
+		d.fs.dirMgr.Remove(ctx, dirIno, req.Name)
 		return nil, syscall.EIO
 	}
 
-	// Write inode
+	// Phase 7: Write updated inode
 	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", req.Name, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		return nil, syscall.EIO
-	}
-
-	// Add directory entry in parent
-	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
-	if err != nil {
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		return nil, syscall.EIO
-	}
-
-	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(childIno.InodeNum), dir.DT_DIR); err != nil {
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
+		d.fs.dirMgr.Remove(ctx, dirIno, req.Name)
 		return nil, syscall.EIO
 	}
 

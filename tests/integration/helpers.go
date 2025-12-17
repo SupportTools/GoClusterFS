@@ -125,7 +125,6 @@ func (m *MountedFS) Format() error {
 		"-device", m.ImagePath,
 		"-mount", m.MountPoint,
 		"-format",
-		"-broadcast=false", // Disable broadcast in tests (port conflicts on single host)
 	}
 
 	cmd := exec.Command(m.BinaryPath, args...)
@@ -187,7 +186,6 @@ func (m *MountedFS) Mount(debug bool) error {
 	args := []string{
 		"-device", m.ImagePath,
 		"-mount", m.MountPoint,
-		"-broadcast=false", // Disable broadcast in tests (port conflicts on single host)
 	}
 	if debug {
 		args = append(args, "-debug")
@@ -221,7 +219,6 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 		"-device", m.ImagePath,
 		"-mount", m.MountPoint,
 		"-format",
-		"-broadcast=false", // Disable broadcast in tests (port conflicts on single host)
 	}
 	if debug {
 		args = append(args, "-debug")

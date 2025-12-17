@@ -681,3 +681,210 @@ func BenchmarkWriteInode(b *testing.B) {
 		table.Write(ctx, inode)
 	}
 }
+
+// =============================================================================
+// Two-Phase Allocation Tests (FindFreeSlot + ClaimSlot)
+// =============================================================================
+
+func TestFindFreeSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+	table := NewTable(dev, 0, 10<<20, nil, uuid)
+
+	// Find first free slot
+	slot, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("FindFreeSlot failed: %v", err)
+	}
+
+	// Should return first usable inode
+	if slot != InodeFirstUsable {
+		t.Errorf("FindFreeSlot returned %d, want %d", slot, InodeFirstUsable)
+	}
+
+	// FindFreeSlot is read-only, calling again should return same slot
+	slot2, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("Second FindFreeSlot failed: %v", err)
+	}
+	if slot2 != slot {
+		t.Errorf("Second FindFreeSlot returned %d, want %d", slot2, slot)
+	}
+}
+
+func TestClaimSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+	table := NewTable(dev, 0, 10<<20, nil, uuid)
+	ctx := context.Background()
+
+	// Find a free slot
+	slot, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("FindFreeSlot failed: %v", err)
+	}
+
+	// Claim the slot
+	inode, err := table.ClaimSlot(ctx, slot)
+	if err != nil {
+		t.Fatalf("ClaimSlot failed: %v", err)
+	}
+
+	if inode.InodeNum != slot {
+		t.Errorf("Claimed inode num = %d, want %d", inode.InodeNum, slot)
+	}
+	if inode.Magic != InodeMagic {
+		t.Errorf("Claimed inode Magic = %x, want %x", inode.Magic, InodeMagic)
+	}
+
+	// Verify it's persisted
+	read, err := table.Read(slot)
+	if err != nil {
+		t.Fatalf("Read after ClaimSlot failed: %v", err)
+	}
+	if read.Magic != InodeMagic {
+		t.Errorf("Read inode Magic = %x, want %x", read.Magic, InodeMagic)
+	}
+}
+
+func TestClaimSlotAlreadyInUse(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+	table := NewTable(dev, 0, 10<<20, nil, uuid)
+	ctx := context.Background()
+
+	// Find a free slot
+	slot, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("FindFreeSlot failed: %v", err)
+	}
+
+	// Claim it first time
+	_, err = table.ClaimSlot(ctx, slot)
+	if err != nil {
+		t.Fatalf("First ClaimSlot failed: %v", err)
+	}
+
+	// Try to claim it again - should fail with ErrInodeInUse
+	_, err = table.ClaimSlot(ctx, slot)
+	if err != ErrInodeInUse {
+		t.Errorf("Second ClaimSlot error = %v, want ErrInodeInUse", err)
+	}
+}
+
+func TestTwoPhaseAllocation(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+	table := NewTable(dev, 0, 10<<20, nil, uuid)
+	ctx := context.Background()
+
+	// Simulate the two-phase allocation pattern:
+	// 1. Find slot (no locks)
+	// 2. Do other work (e.g., allocate blocks - would hold Level 6 lock)
+	// 3. Claim slot (acquires Level 8 lock)
+
+	slot1, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("FindFreeSlot 1 failed: %v", err)
+	}
+
+	// Simulate "other work" between find and claim
+	// In real code, this is where BlockBitmap lock would be acquired
+
+	slot2, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("FindFreeSlot 2 failed: %v", err)
+	}
+
+	// Both finds should return the same slot since neither claimed yet
+	if slot1 != slot2 {
+		t.Errorf("Two FindFreeSlot calls returned different slots: %d vs %d", slot1, slot2)
+	}
+
+	// Now claim the first slot
+	inode1, err := table.ClaimSlot(ctx, slot1)
+	if err != nil {
+		t.Fatalf("ClaimSlot 1 failed: %v", err)
+	}
+
+	// After claiming, FindFreeSlot should return a different slot
+	slot3, err := table.FindFreeSlot()
+	if err != nil {
+		t.Fatalf("FindFreeSlot 3 failed: %v", err)
+	}
+
+	if slot3 == slot1 {
+		t.Errorf("FindFreeSlot returned same slot %d after it was claimed", slot3)
+	}
+	if slot3 != slot1+1 {
+		t.Errorf("FindFreeSlot returned %d, expected next slot %d", slot3, slot1+1)
+	}
+
+	// Claim second slot
+	inode2, err := table.ClaimSlot(ctx, slot3)
+	if err != nil {
+		t.Fatalf("ClaimSlot 2 failed: %v", err)
+	}
+
+	if inode1.InodeNum == inode2.InodeNum {
+		t.Error("Two claimed inodes have same number")
+	}
+}
+
+func TestClaimSlotOutOfRange(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	table := NewTable(dev, 0, 10<<20, nil, uuid)
+	ctx := context.Background()
+
+	// Try to claim an out-of-range slot
+	totalInodes := table.TotalInodes()
+	_, err := table.ClaimSlot(ctx, uint32(totalInodes+100))
+	if err != ErrInodeOutOfRange {
+		t.Errorf("ClaimSlot out of range error = %v, want ErrInodeOutOfRange", err)
+	}
+}
+
+func TestFindFreeSlotWhenFull(t *testing.T) {
+	// Create a small table that we can fill
+	dev, cleanup := createTestDevice(t, SectorSize) // Just one sector = 16 inodes
+	defer cleanup()
+
+	var uuid [16]byte
+	table := NewTable(dev, 0, SectorSize, nil, uuid)
+	ctx := context.Background()
+
+	// Fill all usable slots (inodes 3-15, since 0,1,2 are reserved)
+	usableCount := InodesPerSector - int(InodeFirstUsable) // 16 - 3 = 13
+
+	for i := 0; i < usableCount; i++ {
+		slot, err := table.FindFreeSlot()
+		if err != nil {
+			t.Fatalf("FindFreeSlot %d failed: %v", i, err)
+		}
+		_, err = table.ClaimSlot(ctx, slot)
+		if err != nil {
+			t.Fatalf("ClaimSlot %d failed: %v", i, err)
+		}
+	}
+
+	// Now FindFreeSlot should return ErrInodeFull
+	_, err := table.FindFreeSlot()
+	if err != ErrInodeFull {
+		t.Errorf("FindFreeSlot on full table error = %v, want ErrInodeFull", err)
+	}
+}

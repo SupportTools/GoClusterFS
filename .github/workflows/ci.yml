@@ -69,10 +69,8 @@ jobs:
 
       - name: Integration Tests
         run: |
-          # Skip known-flaky concurrent tests that reveal race conditions
-          # These tests are correct - they expose real bugs that need fixing:
-          # - TestMultiNodeConcurrentDirectoryOps: extent pointer confusion during concurrent file creation
-          # - TestMultiNodeConcurrentSameFileWrites: lost-update race in concurrent block writes
-          # - TestMultiNodeConcurrentWrites: concurrent write race conditions
-          go test -v -timeout 5m -skip 'TestMultiNodeConcurrent' ./tests/integration/...
+          # Run integration tests including most concurrent multi-node tests
+          # Lock order violation fix enables concurrent file/directory creation tests
+          # Skip TestMultiNodeConcurrentSameFileWrites - has lost-update race (Task #4801)
+          go test -v -timeout 5m -skip 'TestMultiNodeConcurrentSameFileWrites' ./tests/integration/...
         timeout-minutes: 10

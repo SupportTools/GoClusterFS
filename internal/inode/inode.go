@@ -197,8 +197,88 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 	return t.writeInodeUnlocked(inode)
 }
 
+// FindFreeSlot scans for a free inode slot without acquiring any distributed locks.
+// This is the first phase of a two-phase allocation pattern used to respect lock ordering.
+// Returns the inode number of a free slot, or ErrInodeFull if none available.
+//
+// Important: The slot may be claimed by another node between FindFreeSlot() and ClaimSlot().
+// Callers should be prepared to retry with a different slot if ClaimSlot() returns ErrInodeInUse.
+func (t *Table) FindFreeSlot() (uint32, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	for num := InodeFirstUsable; uint64(num) < t.totalInodes; num++ {
+		inode, err := t.readInodeUnlocked(num)
+		if err != nil {
+			continue // Skip unreadable inodes
+		}
+		if inode.Magic == 0 {
+			return num, nil
+		}
+	}
+	return 0, ErrInodeFull
+}
+
+// ClaimSlot attempts to claim a specific inode slot found by FindFreeSlot().
+// This is the second phase of a two-phase allocation pattern.
+// Returns the initialized inode, or ErrInodeInUse if the slot was claimed by another node.
+//
+// This function acquires the distributed inode lock (Level 8), so callers must ensure
+// any BlockBitmap locks (Level 6) are acquired BEFORE calling this function.
+func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
+	if uint64(num) >= t.totalInodes {
+		return nil, ErrInodeOutOfRange
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Re-read to verify slot is still free (another node may have claimed it)
+	existing, err := t.readInodeUnlocked(num)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read inode slot: %w", err)
+	}
+	if existing.Magic != 0 {
+		return nil, ErrInodeInUse
+	}
+
+	// Acquire distributed lock if available
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
+			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
+		}
+		defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
+	}
+
+	// Double-check after acquiring lock (another node could have won the race)
+	existing, err = t.readInodeUnlocked(num)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-read inode slot: %w", err)
+	}
+	if existing.Magic != 0 {
+		return nil, ErrInodeInUse
+	}
+
+	// Initialize the inode
+	newInode := &Inode{
+		Magic:            InodeMagic,
+		InodeNum:         num,
+		LinkCount:        1,
+		LastModifierUUID: t.nodeUUID,
+	}
+
+	if err := t.writeInodeUnlocked(newInode); err != nil {
+		return nil, fmt.Errorf("failed to write new inode: %w", err)
+	}
+
+	return newInode, nil
+}
+
 // Alloc allocates a new inode.
 // Returns the allocated inode with InodeNum set, ready for initialization.
+//
+// Deprecated: Use FindFreeSlot() + ClaimSlot() for operations that need to allocate
+// blocks before claiming the inode (to respect lock ordering: BlockBitmap before Inode).
 func (t *Table) Alloc(ctx context.Context) (*Inode, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
