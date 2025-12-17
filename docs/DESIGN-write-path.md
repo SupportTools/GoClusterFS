@@ -451,7 +451,139 @@ If lock acquisition times out:
 
 ---
 
-## 8. Cross-References
+## 8. Multi-Node Concurrency
+
+When multiple nodes access the same file concurrently, GoClusterFS uses an **optimistic retry pattern** to handle conflicts without excessive locking overhead.
+
+### Design Philosophy: Pay for What You Use
+
+The concurrency handling is designed to minimize overhead for the common case (single-node access) while safely handling multi-node conflicts:
+
+```
+Write Request
+    │
+    ├─► Block already allocated? ──YES──► Write directly (NO LOCK)
+    │                                      │
+    │                                      └─► Fast path: ~0.3ms overhead
+    │
+    └─► Need new block? ──YES──► Acquire inode lock
+                                      │
+                                      ├─► Check MetaGeneration changed?
+                                      │       │
+                                      │       ├─► No change: proceed with allocation
+                                      │       │
+                                      │       └─► Changed: retry (another node modified)
+                                      │
+                                      └─► Allocate block, write, release lock
+```
+
+### Performance Impact by Scenario
+
+| Scenario | Lock Overhead | Retries | Impact |
+|----------|---------------|---------|--------|
+| Single-node, existing block | None | 0 | **Negligible** |
+| Single-node, extending file | One lock per new block | 0 | **Minimal** |
+| Multi-node, different files | One lock per new block | 0 | **Minimal** |
+| Multi-node, same file, same region | One lock per attempt | 0-3 | **Low** |
+| Multi-node, same file, extending | One lock per attempt | 0-3 | **Low** |
+
+### When Locking Occurs
+
+**No inode lock required:**
+- Writing to already-allocated blocks
+- Reading file data
+- Stat operations on cached inodes
+
+**Inode lock required:**
+- Allocating new blocks (file extension)
+- Updating file size beyond allocated extents
+- Modifying extent mappings
+
+### Conflict Detection with MetaGeneration
+
+The `MetaGeneration` field in the inode tracks metadata changes:
+
+```
+Timeline: Two nodes extending the same file
+
+Node A                                   Node B
+──────                                   ──────
+1. Read inode (MetaGen=5)
+2. Need block 10, acquire lock
+3. Check MetaGen still 5? YES
+4. Allocate block 10                     4. Read inode (MetaGen=5)
+5. Write extent, MetaGen=6               5. Need block 10, wait for lock...
+6. Release lock
+                                         6. Acquire lock
+                                         7. Re-read inode, MetaGen=6
+                                         8. Check block 10: already allocated!
+                                         9. Use existing block, release lock
+```
+
+### Retry Behavior
+
+When a conflict is detected, the operation retries with fresh inode state:
+
+```go
+const MaxWriteRetries = 3
+
+func (f *File) Write(...) error {
+    for attempt := 0; attempt < MaxWriteRetries; attempt++ {
+        bytesWritten, err := f.writeInternal(ctx, req)
+        if err == errRetryWrite {
+            continue  // Conflict detected, retry with fresh state
+        }
+        return err
+    }
+    return syscall.EAGAIN  // Exceeded retries (very rare)
+}
+```
+
+**Retry triggers:**
+- `MetaGeneration` changed between inode reads
+- Target block position already occupied by another node
+- Extent conflict detected during allocation
+
+**What does NOT trigger retry:**
+- Writes to existing blocks (no conflict possible)
+- Sequential single-node writes (no concurrent modifications)
+
+### Typical Performance
+
+For single-node workloads (most common):
+
+```
+Sequential file write (single node):
+├─ First block: Lock + allocate (~0.5ms extra)
+├─ Subsequent writes to same block: No lock (~0ms extra)
+├─ Next block: Lock + allocate (~0.5ms extra)
+└─ Total overhead: O(blocks_allocated), not O(writes)
+
+Example: Writing 100MB file in 64KB chunks
+├─ 1,600 write calls
+├─ 100 block allocations (1MB blocks)
+├─ 100 lock acquisitions
+└─ Lock overhead: ~50ms total (0.03% of typical I/O time)
+```
+
+For multi-node concurrent writes to same file:
+
+```
+Two nodes writing to different regions:
+├─ No conflicts (different blocks)
+├─ Each node proceeds independently
+└─ Same performance as single-node
+
+Two nodes extending same file simultaneously:
+├─ First node succeeds immediately
+├─ Second node detects conflict, retries
+├─ Retry uses existing block allocated by first node
+└─ Additional overhead: ~0.5ms per conflict
+```
+
+---
+
+## 9. Cross-References
 
 - **Locking**: See `docs/DESIGN.md` section on CAS locking protocol
 - **Journaling**: See `docs/DESIGN-journal.md` for transaction details
