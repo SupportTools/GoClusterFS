@@ -72,7 +72,15 @@ var (
 	ErrInvalidEntry = errors.New("invalid directory entry")
 	ErrNoSpace      = errors.New("no space in directory block")
 	ErrCorrupted    = errors.New("directory corrupted")
+
+	// errRetryAdd is an internal sentinel error indicating that a concurrent
+	// modification was detected and the Add operation should be retried.
+	errRetryAdd = errors.New("retry add operation")
 )
+
+// MaxAddRetries is the maximum number of retry attempts for Add operations
+// when concurrent modifications are detected.
+const MaxAddRetries = 3
 
 // DirEntry represents a directory entry.
 type DirEntry struct {
@@ -169,6 +177,7 @@ func (m *Manager) lookupUnlocked(ctx context.Context, dirIno *inode.Inode, name 
 }
 
 // Add adds a new entry to a directory.
+// Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8) error {
 	if !dirIno.IsDir() {
 		return ErrNotDirectory
@@ -191,6 +200,26 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	}
 	entry.RecLen = entrySize(entry)
 
+	// Retry loop to handle concurrent modifications from other nodes.
+	// When multiple nodes try to add entries simultaneously, they may race
+	// to allocate the same logical block position. If a conflict is detected,
+	// errRetryAdd is returned and we retry the operation.
+	for attempt := 0; attempt < MaxAddRetries; attempt++ {
+		err := m.addInternal(ctx, dirIno, entry)
+		if err == errRetryAdd {
+			log.Printf("[DEBUG] dir.Add: retry attempt %d for entry %q in inode %d",
+				attempt+1, name, dirIno.InodeNum)
+			continue
+		}
+		return err
+	}
+
+	return fmt.Errorf("concurrent modification detected after %d retries for entry %q", MaxAddRetries, name)
+}
+
+// addInternal performs the actual add operation.
+// Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
+func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
 	// Acquire exclusive lock for write operation
 	// NOTE: We do NOT use defer here because we may need to release the lock
 	// before calling addToNewBlock (which acquires its own lock). Using defer
@@ -215,7 +244,7 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	}
 
 	// Check if entry already exists (done under lock to avoid TOCTOU)
-	_, _, err = m.lookupUnlocked(ctx, freshIno, name)
+	_, _, err = m.lookupUnlocked(ctx, freshIno, entry.Name)
 	if err == nil {
 		if lockHeld {
 			m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
@@ -239,6 +268,14 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 			return err
 		}
 		if added {
+			// Increment MetaGeneration to signal modification
+			freshIno.MetaGeneration++
+			if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
+				if lockHeld {
+					m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+				}
+				return fmt.Errorf("failed to write directory inode: %w", err)
+			}
 			if lockHeld {
 				m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
 			}
@@ -261,6 +298,7 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	// for calculating which block to allocate. addToNewBlock will re-read anyway,
 	// but starting with a fresher estimate reduces wasted allocations.
 	// NOTE: addToNewBlock handles its own lock acquisition and release.
+	// It may return errRetryAdd if a concurrent modification is detected.
 	err = m.addToNewBlock(ctx, freshIno, entry)
 
 	// Copy updated state back to caller's inode
@@ -610,6 +648,7 @@ func (m *Manager) addToExistingBlock(ctx context.Context, dirIno *inode.Inode, n
 // addToNewBlock allocates a new block and adds the entry.
 // IMPORTANT: This function expects to be called WITHOUT holding the inode lock,
 // as it needs to allocate blocks (bitmap lock) before acquiring the inode lock.
+// Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
 func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
 	// Calculate next block number based on current (possibly stale) size
 	nextBlock := extent.BlocksForSize(dirIno.Size)
@@ -626,6 +665,8 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		if !blockUsed {
 			// Free the allocated block since we didn't use it.
 			// Ignore errors - best effort cleanup.
+			log.Printf("[DEBUG] dir.addToNewBlock: freeing unused block %d for inode %d",
+				ext.PhysicalBlock, dirIno.InodeNum)
 			m.extentMgr.FreePhysicalBlock(ctx, ext.PhysicalBlock)
 		}
 	}()
@@ -645,6 +686,19 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		return fmt.Errorf("failed to re-read directory inode: %w", err)
 	}
 
+	// CONFLICT DETECTION 1: Check if entry already exists.
+	// Another node may have added this entry while we were allocating the block.
+	_, _, lookupErr := m.lookupUnlocked(ctx, freshIno, entry.Name)
+	if lookupErr == nil {
+		// Entry was added by a concurrent operation - return ErrExists
+		log.Printf("[DEBUG] dir.addToNewBlock: entry %q already exists in inode %d (added by another node)",
+			entry.Name, dirIno.InodeNum)
+		return ErrExists
+	}
+	if lookupErr != ErrNotFound {
+		return lookupErr
+	}
+
 	// Check if the directory has grown since we released the lock
 	freshNextBlock := extent.BlocksForSize(freshIno.Size)
 	if freshNextBlock > nextBlock {
@@ -656,6 +710,11 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		}
 		if added {
 			// Successfully added to existing block.
+			// Increment MetaGeneration and write inode.
+			freshIno.MetaGeneration++
+			if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
+				return fmt.Errorf("failed to write directory inode: %w", err)
+			}
 			// The defer will free the block we allocated since blockUsed is false.
 			dirIno.Size = freshIno.Size
 			return nil
@@ -663,6 +722,21 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		// No space in existing blocks, use our newly allocated block
 		// but at the correct position based on fresh state
 		nextBlock = freshNextBlock
+	}
+
+	// CONFLICT DETECTION 2: Check if our target logical block is already occupied.
+	// Another node may have inserted an extent at this position while we were waiting.
+	_, _, extErr := m.extentMgr.Lookup(freshIno, nextBlock)
+	if extErr == nil {
+		// Block position is already taken - signal caller to retry.
+		// The defer will free our allocated block.
+		log.Printf("[DEBUG] dir.addToNewBlock: logical block %d already occupied in inode %d, retrying",
+			nextBlock, dirIno.InodeNum)
+		return errRetryAdd
+	}
+	// If extErr is not "not found", it's an unexpected error
+	if extErr != extent.ErrExtentNotFound {
+		return fmt.Errorf("failed to check extent: %w", extErr)
 	}
 
 	// The entry takes the first chunk (DirChunkSize) to keep RecLen in uint16 range
@@ -686,12 +760,19 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		Flags:         extent.FlagAllocated,
 	}
 	if err := m.extentMgr.Insert(ctx, freshIno, newExt); err != nil {
+		// If insert fails due to overlap, another node beat us - signal retry
+		if err == extent.ErrExtentOverlap || err == extent.ErrNoSpaceForExtent {
+			log.Printf("[DEBUG] dir.addToNewBlock: extent insert conflict in inode %d: %v, retrying",
+				dirIno.InodeNum, err)
+			return errRetryAdd
+		}
 		return fmt.Errorf("failed to insert extent: %w", err)
 	}
 
 	// Update directory size and allocated blocks
 	freshIno.Size = uint64(nextBlock+1) * BlockSize
 	freshIno.AllocatedBlocks++
+	freshIno.MetaGeneration++
 
 	// Write the updated inode to disk.
 	// Use WriteWithLockHeld since we already hold the inode lock.
