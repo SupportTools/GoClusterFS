@@ -39,14 +39,39 @@ jobs:
 
       - name: Run multi-node tests
         run: |
-          # Run the main test cluster (exclude storage-init which already completed)
-          # Note: Don't use --abort-on-container-exit because the test intentionally
-          # kills containers to test recovery. Use --exit-code-from to track the
-          # orchestrator's final result.
-          docker compose -f tests/docker/docker-compose.test.yml up \
-            --exit-code-from orchestrator \
+          # Start the test cluster detached (no --exit-code-from as it implies --abort-on-container-exit)
+          # The test intentionally kills containers to test recovery, so we can't abort on exit
+          docker compose -f tests/docker/docker-compose.test.yml up -d \
             node1 node2 node3 node4 orchestrator
-        timeout-minutes: 10
+
+          # Wait for orchestrator to complete (poll every 5s, timeout 10min)
+          echo "Waiting for orchestrator to complete..."
+          TIMEOUT=600
+          ELAPSED=0
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            # Check if orchestrator is still running
+            STATUS=$(docker inspect --format='{{.State.Status}}' goclusterfs-orchestrator 2>/dev/null || echo "not_found")
+            if [ "$STATUS" = "exited" ]; then
+              EXIT_CODE=$(docker inspect --format='{{.State.ExitCode}}' goclusterfs-orchestrator)
+              echo "Orchestrator exited with code: $EXIT_CODE"
+
+              # Show orchestrator logs
+              echo "=== Orchestrator Logs ==="
+              docker logs goclusterfs-orchestrator
+
+              # Stop remaining containers
+              docker compose -f tests/docker/docker-compose.test.yml down
+              exit $EXIT_CODE
+            fi
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+            echo "Still waiting... ($ELAPSED/$TIMEOUT seconds)"
+          done
+
+          echo "Timeout waiting for orchestrator"
+          docker compose -f tests/docker/docker-compose.test.yml down
+          exit 1
+        timeout-minutes: 12
 
       - name: Collect logs on failure
         if: failure()
