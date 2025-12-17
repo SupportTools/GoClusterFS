@@ -404,3 +404,197 @@ func TestLRUKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestCachedExtent tests the CachedExtent validation methods.
+func TestCachedExtent(t *testing.T) {
+	t.Run("IsStale", func(t *testing.T) {
+		cached := &CachedExtent{
+			PhysicalBlock: 100,
+			InodeDataGen:  5,
+		}
+
+		// Same generation - not stale
+		if cached.IsStale(5) {
+			t.Error("IsStale() should return false when generation matches")
+		}
+
+		// Different generation - stale
+		if !cached.IsStale(6) {
+			t.Error("IsStale() should return true when generation differs")
+		}
+	})
+}
+
+// TestExtentCacheKey tests the ExtentCacheKey as a map key.
+func TestExtentCacheKey(t *testing.T) {
+	t.Run("Equality", func(t *testing.T) {
+		key1 := ExtentCacheKey{InodeNum: 1, LogicalBlock: 10}
+		key2 := ExtentCacheKey{InodeNum: 1, LogicalBlock: 10}
+		key3 := ExtentCacheKey{InodeNum: 1, LogicalBlock: 11}
+		key4 := ExtentCacheKey{InodeNum: 2, LogicalBlock: 10}
+
+		if key1 != key2 {
+			t.Error("Identical keys should be equal")
+		}
+		if key1 == key3 {
+			t.Error("Keys with different LogicalBlock should not be equal")
+		}
+		if key1 == key4 {
+			t.Error("Keys with different InodeNum should not be equal")
+		}
+	})
+
+	t.Run("AsMapKey", func(t *testing.T) {
+		m := make(map[ExtentCacheKey]int)
+		key1 := ExtentCacheKey{InodeNum: 1, LogicalBlock: 10}
+		key2 := ExtentCacheKey{InodeNum: 1, LogicalBlock: 10}
+
+		m[key1] = 100
+		if m[key2] != 100 {
+			t.Error("Same key should retrieve same value from map")
+		}
+	})
+}
+
+// TestExtentCache tests the extent cache operations.
+func TestExtentCache(t *testing.T) {
+	t.Run("GetPutBasic", func(t *testing.T) {
+		lru := NewLRU[ExtentCacheKey, *CachedExtent](100)
+
+		key := ExtentCacheKey{InodeNum: 1, LogicalBlock: 5}
+		cached := &CachedExtent{
+			PhysicalBlock: 200,
+			InodeDataGen:  10,
+			CachedAt:      time.Now(),
+		}
+
+		lru.Put(key, cached)
+
+		got, ok := lru.Get(key)
+		if !ok {
+			t.Fatal("Get() should find cached extent")
+		}
+		if got.PhysicalBlock != 200 {
+			t.Errorf("PhysicalBlock = %d; want 200", got.PhysicalBlock)
+		}
+		if got.InodeDataGen != 10 {
+			t.Errorf("InodeDataGen = %d; want 10", got.InodeDataGen)
+		}
+	})
+
+	t.Run("HoleRepresentation", func(t *testing.T) {
+		lru := NewLRU[ExtentCacheKey, *CachedExtent](100)
+
+		// Physical block 0 represents a hole (sparse file)
+		key := ExtentCacheKey{InodeNum: 1, LogicalBlock: 5}
+		cached := &CachedExtent{
+			PhysicalBlock: 0, // Hole
+			InodeDataGen:  10,
+			CachedAt:      time.Now(),
+		}
+
+		lru.Put(key, cached)
+
+		got, ok := lru.Get(key)
+		if !ok {
+			t.Fatal("Get() should find cached hole")
+		}
+		if got.PhysicalBlock != 0 {
+			t.Errorf("PhysicalBlock = %d; want 0 (hole)", got.PhysicalBlock)
+		}
+	})
+
+	t.Run("StaleDetection", func(t *testing.T) {
+		lru := NewLRU[ExtentCacheKey, *CachedExtent](100)
+
+		key := ExtentCacheKey{InodeNum: 1, LogicalBlock: 5}
+		cached := &CachedExtent{
+			PhysicalBlock: 200,
+			InodeDataGen:  10,
+			CachedAt:      time.Now(),
+		}
+
+		lru.Put(key, cached)
+
+		got, ok := lru.Get(key)
+		if !ok {
+			t.Fatal("Get() should find cached extent")
+		}
+
+		// Same generation - not stale
+		if got.IsStale(10) {
+			t.Error("Extent should not be stale with matching generation")
+		}
+
+		// Different generation - stale
+		if !got.IsStale(11) {
+			t.Error("Extent should be stale with different generation")
+		}
+	})
+
+	t.Run("MultipleInodes", func(t *testing.T) {
+		lru := NewLRU[ExtentCacheKey, *CachedExtent](100)
+
+		// Cache extents for multiple inodes
+		for ino := uint32(1); ino <= 3; ino++ {
+			for blk := uint64(0); blk < 5; blk++ {
+				key := ExtentCacheKey{InodeNum: ino, LogicalBlock: blk}
+				cached := &CachedExtent{
+					PhysicalBlock: uint64(ino)*100 + blk,
+					InodeDataGen:  uint64(ino),
+					CachedAt:      time.Now(),
+				}
+				lru.Put(key, cached)
+			}
+		}
+
+		// Verify each inode's extents
+		for ino := uint32(1); ino <= 3; ino++ {
+			for blk := uint64(0); blk < 5; blk++ {
+				key := ExtentCacheKey{InodeNum: ino, LogicalBlock: blk}
+				got, ok := lru.Get(key)
+				if !ok {
+					t.Errorf("Missing extent for inode %d block %d", ino, blk)
+					continue
+				}
+				expectedPhys := uint64(ino)*100 + blk
+				if got.PhysicalBlock != expectedPhys {
+					t.Errorf("Inode %d block %d: PhysicalBlock = %d; want %d",
+						ino, blk, got.PhysicalBlock, expectedPhys)
+				}
+			}
+		}
+	})
+
+	t.Run("Eviction", func(t *testing.T) {
+		// Small cache to force evictions
+		lru := NewLRU[ExtentCacheKey, *CachedExtent](3)
+
+		// Add 3 entries
+		for i := uint64(0); i < 3; i++ {
+			key := ExtentCacheKey{InodeNum: 1, LogicalBlock: i}
+			lru.Put(key, &CachedExtent{PhysicalBlock: i * 10, InodeDataGen: 1})
+		}
+
+		// Access block 0 to make it most recent
+		lru.Get(ExtentCacheKey{InodeNum: 1, LogicalBlock: 0})
+
+		// Add block 3, should evict block 1 (LRU)
+		key3 := ExtentCacheKey{InodeNum: 1, LogicalBlock: 3}
+		lru.Put(key3, &CachedExtent{PhysicalBlock: 30, InodeDataGen: 1})
+
+		// Block 1 should be evicted
+		_, ok := lru.Get(ExtentCacheKey{InodeNum: 1, LogicalBlock: 1})
+		if ok {
+			t.Error("Block 1 should have been evicted")
+		}
+
+		// Blocks 0, 2, 3 should still exist
+		for _, blk := range []uint64{0, 2, 3} {
+			_, ok := lru.Get(ExtentCacheKey{InodeNum: 1, LogicalBlock: blk})
+			if !ok {
+				t.Errorf("Block %d should still exist", blk)
+			}
+		}
+	})
+}

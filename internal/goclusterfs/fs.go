@@ -172,6 +172,16 @@ func (f *FS) cacheInode(ino *inode.Inode) {
 	}
 }
 
+// lookupPhysical finds the physical block for a logical block, using cache.
+// Returns 0 for holes (sparse file regions with no allocated blocks).
+// This is the preferred method for read paths.
+func (f *FS) lookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
+	if f.cacheMgr != nil {
+		return f.cacheMgr.LookupPhysicalCached(f.extentMgr, ino, logicalBlock)
+	}
+	return f.extentMgr.LookupPhysical(ino, logicalBlock)
+}
+
 // CacheStats returns cache statistics for monitoring.
 // Returns zero values if cache is not enabled.
 func (f *FS) CacheStats() cache.Stats {
@@ -591,9 +601,12 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		blockNum := offset / BlockSize
 		blockOffset := offset % BlockSize
 
-		// Find extent for this block
-		ext, extOffset, err := f.fs.extentMgr.Lookup(ino, blockNum)
+		// Find physical block for this logical block (uses extent cache)
+		physBlock, err := f.fs.lookupPhysical(ino, blockNum)
 		if err != nil {
+			return syscall.EIO
+		}
+		if physBlock == 0 {
 			// Hole - return zeros
 			toRead := int(BlockSize - blockOffset)
 			if toRead > readSize-bytesRead {
@@ -605,8 +618,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 			continue
 		}
 
-		// Calculate physical location
-		physBlock := ext.PhysicalBlock + extOffset
+		// Calculate physical disk location
 		diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
 
 		// Read from disk

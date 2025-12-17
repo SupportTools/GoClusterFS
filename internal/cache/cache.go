@@ -48,7 +48,7 @@ type negativeEntry struct {
 }
 
 // Manager coordinates all caching for a GoClusterFS mount.
-// It maintains separate caches for inodes and negative lookups,
+// It maintains separate caches for inodes, extents, and negative lookups,
 // with generation-based validation for coherency across nodes.
 type Manager struct {
 	mu sync.RWMutex
@@ -58,6 +58,10 @@ type Manager struct {
 
 	// Inode cache (inode number -> cached inode)
 	inodes *LRU[uint32, *CachedInode]
+
+	// Extent cache (inode+logical block -> physical block)
+	// Validated against inode's DataGeneration
+	extents *LRU[ExtentCacheKey, *CachedExtent]
 
 	// Negative cache (inode number -> "not found" entry)
 	negatives *LRU[uint32, *negativeEntry]
@@ -81,6 +85,7 @@ func NewManager(cfg Config, inodeTbl *inode.Table, lockMgr *lock.Manager) (*Mana
 	return &Manager{
 		config:    cfg,
 		inodes:    NewLRU[uint32, *CachedInode](cfg.InodeCacheSize),
+		extents:   NewLRU[ExtentCacheKey, *CachedExtent](cfg.ExtentCacheSize),
 		negatives: NewLRU[uint32, *negativeEntry](cfg.NegativeCacheSize),
 		inodeTbl:  inodeTbl,
 		lockMgr:   lockMgr,
@@ -101,6 +106,7 @@ func (m *Manager) InodeTable() *inode.Table {
 // Stats returns cache statistics for monitoring.
 func (m *Manager) Stats() Stats {
 	inodeHits, inodeMisses := m.inodes.Stats()
+	extentHits, extentMisses := m.extents.Stats()
 	negHits, negMisses := m.negatives.Stats()
 
 	return Stats{
@@ -108,6 +114,10 @@ func (m *Manager) Stats() Stats {
 		InodeCacheHits:    inodeHits,
 		InodeCacheMisses:  inodeMisses,
 		InodeHitRate:      m.inodes.HitRate(),
+		ExtentCacheSize:   m.extents.Len(),
+		ExtentCacheHits:   extentHits,
+		ExtentCacheMisses: extentMisses,
+		ExtentHitRate:     m.extents.HitRate(),
 		NegativeCacheSize: m.negatives.Len(),
 		NegativeHits:      negHits,
 		NegativeMisses:    negMisses,
@@ -121,6 +131,12 @@ type Stats struct {
 	InodeCacheHits   uint64
 	InodeCacheMisses uint64
 	InodeHitRate     float64
+
+	// Extent cache stats
+	ExtentCacheSize   int
+	ExtentCacheHits   uint64
+	ExtentCacheMisses uint64
+	ExtentHitRate     float64
 
 	// Negative cache stats
 	NegativeCacheSize int
@@ -136,12 +152,14 @@ func (m *Manager) Clear() {
 	defer m.mu.Unlock()
 
 	m.inodes.Clear()
+	m.extents.Clear()
 	m.negatives.Clear()
 }
 
 // ResetStats resets all cache statistics.
 func (m *Manager) ResetStats() {
 	m.inodes.ResetStats()
+	m.extents.ResetStats()
 	m.negatives.ResetStats()
 }
 
