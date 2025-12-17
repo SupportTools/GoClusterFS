@@ -393,4 +393,3 @@ func TestMultiNodeRecoveryIdempotency(t *testing.T) {
 
 	t.Log("Recovery idempotency test PASSED")
 }
-
