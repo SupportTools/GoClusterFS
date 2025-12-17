@@ -29,9 +29,10 @@ services:
       target: runtime
     container_name: goclusterfs-node1
     privileged: true
-    depends_on:
-      storage-init:
-        condition: service_completed_successfully
+    # Note: storage-init is run separately in CI to avoid --abort-on-container-exit issue
+    # depends_on:
+    #   storage-init:
+    #     condition: service_completed_successfully
     volumes:
       - shared-data:/data
       - /dev/fuse:/dev/fuse

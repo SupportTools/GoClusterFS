@@ -32,11 +32,18 @@ jobs:
         run: |
           mkdir -p tests/docker/results
 
+      - name: Initialize shared storage
+        run: |
+          # Run storage-init separately to avoid --abort-on-container-exit issue
+          docker compose -f tests/docker/docker-compose.test.yml run --rm storage-init
+
       - name: Run multi-node tests
         run: |
+          # Run the main test cluster (exclude storage-init which already completed)
           docker compose -f tests/docker/docker-compose.test.yml up \
             --abort-on-container-exit \
-            --exit-code-from orchestrator
+            --exit-code-from orchestrator \
+            node1 node2 node3 node4 orchestrator
         timeout-minutes: 10
 
       - name: Collect logs on failure
