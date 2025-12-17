@@ -17,6 +17,7 @@ import (
 	"bazil.org/fuse/fs"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/cache"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -50,6 +51,7 @@ type FS struct {
 	inodeTbl  *inode.Table
 	extentMgr *extent.Manager
 	dirMgr    *dir.Manager
+	cacheMgr  *cache.Manager // Inode cache for read optimization
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -122,6 +124,7 @@ func NewWithComponents(
 	inodeTbl *inode.Table,
 	extentMgr *extent.Manager,
 	dirMgr *dir.Manager,
+	cacheMgr *cache.Manager,
 	nodeUUID [16]byte,
 	dataOffset uint64,
 ) *FS {
@@ -131,6 +134,7 @@ func NewWithComponents(
 		inodeTbl:   inodeTbl,
 		extentMgr:  extentMgr,
 		dirMgr:     dirMgr,
+		cacheMgr:   cacheMgr,
 		nodeUUID:   nodeUUID,
 		dataOffset: dataOffset,
 		uid:        uint32(os.Getuid()),
@@ -141,6 +145,40 @@ func NewWithComponents(
 // Close closes the filesystem and releases resources.
 func (f *FS) Close() error {
 	return f.dev.Close()
+}
+
+// getInode retrieves an inode, using the cache when available.
+// This is the preferred method for read paths where the inode won't be modified.
+func (f *FS) getInode(inodeNum uint32) (*inode.Inode, error) {
+	if f.cacheMgr != nil {
+		return f.cacheMgr.GetInode(inodeNum)
+	}
+	return f.inodeTbl.Read(inodeNum)
+}
+
+// invalidateInode removes an inode from the cache before modification.
+// Safe to call even if cache is nil.
+func (f *FS) invalidateInode(inodeNum uint32) {
+	if f.cacheMgr != nil {
+		f.cacheMgr.InvalidateInode(inodeNum)
+	}
+}
+
+// cacheInode adds a freshly-modified inode to the cache for subsequent reads.
+// Safe to call even if cache is nil.
+func (f *FS) cacheInode(ino *inode.Inode) {
+	if f.cacheMgr != nil {
+		f.cacheMgr.CacheInode(ino)
+	}
+}
+
+// CacheStats returns cache statistics for monitoring.
+// Returns zero values if cache is not enabled.
+func (f *FS) CacheStats() cache.Stats {
+	if f.cacheMgr != nil {
+		return f.cacheMgr.Stats()
+	}
+	return cache.Stats{}
 }
 
 // InitRoot initializes the root directory if it doesn't exist.
@@ -227,7 +265,7 @@ var (
 
 // Attr returns directory attributes.
 func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
-	ino, err := d.fs.inodeTbl.Read(d.inodeNum)
+	ino, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -252,7 +290,7 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 
 // Lookup finds a child by name.
 func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
-	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
+	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return nil, syscall.EIO
 	}
@@ -278,7 +316,7 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 
 // ReadDirAll returns all directory entries.
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
+	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return nil, syscall.EIO
 	}
@@ -408,6 +446,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 
 // Remove removes a file or empty directory.
 func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+	// Invalidate parent directory cache before modifying
+	d.fs.invalidateInode(d.inodeNum)
+
 	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
 	if err != nil {
 		return syscall.EIO
@@ -421,6 +462,9 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		}
 		return syscall.EIO
 	}
+
+	// Invalidate child inode cache - it's being removed
+	d.fs.invalidateInode(uint32(childInodeNum))
 
 	// Handle directory removal
 	if req.Dir {
@@ -465,12 +509,17 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		d.fs.inodeTbl.Free(ctx, uint32(childInodeNum))
 	} else {
 		d.fs.inodeTbl.Write(ctx, childIno)
+		// Cache the updated child inode
+		d.fs.cacheInode(childIno)
 	}
 
 	// Update directory mtime
 	now := time.Now().UnixNano()
 	dirIno.Mtime = now
 	d.fs.inodeTbl.Write(ctx, dirIno)
+
+	// Cache the updated parent directory inode
+	d.fs.cacheInode(dirIno)
 
 	return nil
 }
@@ -491,7 +540,7 @@ var (
 
 // Attr returns file attributes.
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
-	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	ino, err := f.fs.getInode(f.inodeNum)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -516,7 +565,7 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 // Read reads file data.
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	ino, err := f.fs.getInode(f.inodeNum)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -766,11 +815,17 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 		}
 	}
 
+	// Cache the freshly-written inode for subsequent reads
+	f.fs.cacheInode(ino)
+
 	return bytesWritten, nil
 }
 
 // Setattr sets file attributes (used for truncate).
 func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+	// Invalidate cache before modifying - ensures we read fresh data
+	f.fs.invalidateInode(f.inodeNum)
+
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
 		return syscall.EIO
@@ -815,6 +870,9 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 		return syscall.EIO
 	}
+
+	// Cache the freshly-written inode for subsequent reads
+	f.fs.cacheInode(ino)
 
 	return f.Attr(ctx, &resp.Attr)
 }

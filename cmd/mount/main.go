@@ -14,6 +14,7 @@ import (
 	"bazil.org/fuse/fs"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/cache"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
@@ -111,8 +112,25 @@ func main() {
 	extentMgr := extent.NewManager(dev, bm, lockMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 
+	// Create cache manager for read optimization
+	cacheMgr, err := cache.NewManager(cache.DefaultConfig(), inodeTbl, lockMgr)
+	if err != nil {
+		log.Fatalf("Failed to create cache manager: %v", err)
+	}
+	log.Printf("Cache: %d inodes, %d negative entries, TTL=%v",
+		cacheMgr.Config().InodeCacheSize,
+		cacheMgr.Config().NegativeCacheSize,
+		cacheMgr.Config().InodeTTL)
+
+	// Register cache invalidation callback with lock manager.
+	// When an exclusive lock is acquired, the cache for that resource
+	// is invalidated to ensure we read fresh data from disk.
+	lockMgr.SetOnAcquire(func(lockType lock.LockType, resourceID uint64, mode lock.LockMode) {
+		cacheMgr.OnLockAcquire(uint8(lockType), resourceID, uint8(mode))
+	})
+
 	// Create filesystem
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nodeUUID, dataOffset)
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{

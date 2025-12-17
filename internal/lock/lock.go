@@ -96,6 +96,13 @@ type Record struct {
 
 const RecordMagic uint32 = 0x4C4F434B // "LOCK"
 
+// OnAcquireFunc is called when a lock is successfully acquired.
+// This is used to trigger cache invalidation - the cache manager
+// registers a callback to invalidate cached data when locks are acquired.
+// Parameters: lockType identifies the resource type, resourceID identifies
+// the specific resource (e.g., inode number), mode indicates shared/exclusive.
+type OnAcquireFunc func(lockType LockType, resourceID uint64, mode LockMode)
+
 // Manager handles distributed lock operations.
 type Manager struct {
 	mu        sync.Mutex
@@ -105,6 +112,9 @@ type Manager struct {
 	nodeUUID  [16]byte // This node's UUID
 	nodeSlot  int      // This node's slot
 	heldLocks map[lockKey]*heldLock
+
+	// Callback for cache invalidation
+	onAcquire OnAcquireFunc
 }
 
 type lockKey struct {
@@ -137,6 +147,18 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		nodeSlot:  nodeSlot,
 		heldLocks: make(map[lockKey]*heldLock),
 	}
+}
+
+// SetOnAcquire registers a callback that is invoked when a lock is acquired.
+// This is typically used by the cache manager to invalidate cached data
+// when a lock is acquired, ensuring fresh data is read from disk.
+//
+// Only exclusive lock acquisitions trigger invalidation since shared locks
+// (readers) don't modify data and can safely use cached values.
+func (m *Manager) SetOnAcquire(fn OnAcquireFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.onAcquire = fn
 }
 
 // Acquire attempts to acquire a lock with the given parameters.
@@ -195,7 +217,17 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			}
 			m.heldLocks[key] = &heldLock{Mode: mode, RecordID: recordID, refCount: 1}
 			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired distributed lock (retries=%d, dur=%v)", lockType, resourceID, retryCount, time.Since(startTime))
+
+			// Trigger cache invalidation callback for exclusive locks.
+			// We do this before returning so the caller reads fresh data.
+			// Only exclusive locks trigger invalidation since shared locks
+			// are for reading and can safely use cached values.
+			onAcquire := m.onAcquire
 			m.mu.Unlock()
+
+			if onAcquire != nil && mode == LockModeExclusive {
+				onAcquire(lockType, resourceID, mode)
+			}
 			return nil
 		}
 
