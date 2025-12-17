@@ -18,6 +18,8 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -64,11 +66,16 @@ func main() {
 	// 0-1MB: Reserved (superblock area)
 	// 1-2MB: Bitmap region
 	// 2-3MB: Inode table
-	// 3MB+: Data blocks (1MB each)
+	// 3-4MB: Node registry (for distributed lock coordination)
+	// 4-5MB: Lock region (CAS-based distributed locks)
+	// 5MB+: Data blocks (1MB each)
 	const (
-		bitmapOffset = 1 * 1024 * 1024
-		inodeOffset  = 2 * 1024 * 1024
-		dataOffset   = 3 * 1024 * 1024
+		bitmapOffset       = 1 * 1024 * 1024
+		inodeOffset        = 2 * 1024 * 1024
+		nodeRegistryOffset = 3 * 1024 * 1024
+		lockOffset         = 4 * 1024 * 1024
+		lockSize           = 1 * 1024 * 1024 // 1MB for lock records
+		dataOffset         = 5 * 1024 * 1024
 	)
 
 	// Calculate capacities
@@ -77,26 +84,34 @@ func main() {
 	inodeCount := uint64(4096)                      // Fixed for now
 
 	if totalBlocks < 1 {
-		log.Fatalf("Device too small: need at least 4MB, have %d MB", devSize/(1024*1024))
+		log.Fatalf("Device too small: need at least 6MB, have %d MB", devSize/(1024*1024))
 	}
 
 	log.Printf("Layout: %d data blocks (%d MB), %d inodes", totalBlocks, totalBlocks, inodeCount)
 
-	// Create node UUID
-	var nodeUUID [16]byte
-	hostname, _ := os.Hostname()
-	copy(nodeUUID[:], fmt.Sprintf("node-%s-%d", hostname, os.Getpid()))
+	ctx := context.Background()
 
-	// Create managers (no distributed locking for single-node)
-	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, nil, nodeUUID)
-	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil)
-	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
+	// Create node registry for distributed coordination
+	nodeReg := node.NewRegistry(dev, nodeRegistryOffset)
+	hostname, _ := os.Hostname()
+	slotIdx, err := nodeReg.Register(ctx, hostname)
+	if err != nil {
+		log.Fatalf("Failed to register node: %v", err)
+	}
+	nodeUUID := nodeReg.LocalUUID()
+	log.Printf("Registered as node %d (UUID: %x)", slotIdx, nodeUUID[:8])
+
+	// Create lock manager for distributed locking
+	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
+
+	// Create managers with distributed locking enabled
+	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, lockMgr, nodeUUID)
+	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, lockMgr, nodeUUID)
+	extentMgr := extent.NewManager(dev, bm, lockMgr)
+	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 
 	// Create filesystem
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nodeUUID, dataOffset)
-
-	ctx := context.Background()
 
 	// Format if requested
 	if *format {

@@ -179,6 +179,24 @@ func (t *Table) Write(ctx context.Context, inode *Inode) error {
 	return t.writeInodeUnlocked(inode)
 }
 
+// WriteWithLockHeld writes an inode to disk without acquiring the distributed lock.
+// Use this when the caller already holds the inode lock (e.g., in directory operations).
+// This prevents deadlock from trying to acquire the same lock twice.
+func (t *Table) WriteWithLockHeld(inode *Inode) error {
+	if uint64(inode.InodeNum) >= t.totalInodes {
+		return ErrInodeOutOfRange
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Update modification tracking
+	inode.LastModifierUUID = t.nodeUUID
+	inode.MetaGeneration++
+
+	return t.writeInodeUnlocked(inode)
+}
+
 // Alloc allocates a new inode.
 // Returns the allocated inode with InodeNum set, ready for initialization.
 func (t *Table) Alloc(ctx context.Context) (*Inode, error) {

@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
@@ -276,8 +277,16 @@ func (m *Manager) FreeExtent(ctx context.Context, ino *inode.Inode, logicalBlock
 	return nil
 }
 
+// FreePhysicalBlock frees a single physical block back to the bitmap.
+// This is used when a block was allocated but not used (e.g., due to race conditions).
+// It does NOT modify any inode - caller is responsible for inode consistency.
+func (m *Manager) FreePhysicalBlock(ctx context.Context, physBlock uint64) error {
+	return m.bitmap.Free(ctx, physBlock)
+}
+
 // Truncate removes all extents beyond the given size.
 func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64) error {
+	log.Printf("[DEBUG] extent.Truncate: inode %d, newSize=%d, extentCount=%d", ino.InodeNum, newSize, ino.ExtentCount)
 	// Special case: truncate to 0 frees everything
 	if newSize == 0 {
 		for i := range ino.InlineExtents {
@@ -286,9 +295,12 @@ func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64
 				continue
 			}
 
+			log.Printf("[DEBUG] extent.Truncate: freeing extent[%d] physBlock=%d len=%d", i, ext.PhysicalBlock, ext.Length)
 			// Free all blocks
 			for j := uint64(0); j < ext.Length; j++ {
-				m.bitmap.Free(ctx, ext.PhysicalBlock+j)
+				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+j); err != nil {
+					log.Printf("[DEBUG] extent.Truncate: bitmap.Free(%d) failed: %v", ext.PhysicalBlock+j, err)
+				}
 			}
 			ino.AllocatedBlocks -= ext.Length
 			*ext = inode.InlineExtent{} // Clear

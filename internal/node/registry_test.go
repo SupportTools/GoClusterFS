@@ -359,3 +359,287 @@ func BenchmarkSlotDeserialize(b *testing.B) {
 		_, _ = deserializeSlot(data)
 	}
 }
+
+// --- Cross-Node Recovery Tests ---
+
+func TestSetRecoveryHandler(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+
+	called := false
+	handler := func(info *FailedNodeInfo) error {
+		called = true
+		return nil
+	}
+
+	reg.SetRecoveryHandler(handler)
+
+	// Handler should be set (can't directly verify, but test compilation)
+	if called {
+		t.Error("handler should not be called yet")
+	}
+}
+
+func TestGetFailedNodesEmpty(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+
+	failed, err := reg.GetFailedNodes()
+	if err != nil {
+		t.Fatalf("GetFailedNodes failed: %v", err)
+	}
+	if len(failed) != 0 {
+		t.Errorf("expected 0 failed nodes, got %d", len(failed))
+	}
+}
+
+func TestGetFailedNodesWithStaleHeartbeat(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	ctx := context.Background()
+
+	// Register a node
+	slot, err := reg.Register(ctx, "failing-node")
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	// Manually write a stale heartbeat (simulate node crash)
+	staleSlot := &Slot{
+		Magic:         SlotMagic,
+		State:         NodeStateActive,
+		UUID:          reg.LocalUUID(),
+		HeartbeatSeq:  1,
+		HeartbeatTime: time.Now().Add(-2 * HeartbeatTimeout).Unix(), // Stale
+		MountTime:     time.Now().Unix(),
+		JournalOffset: 1 << 20,
+		JournalSize:   4 << 20,
+	}
+	copy(staleSlot.Hostname[:], "failing-node")
+
+	reg.mu.Lock()
+	err = reg.writeSlot(slot, staleSlot)
+	reg.mu.Unlock()
+	if err != nil {
+		t.Fatalf("writeSlot failed: %v", err)
+	}
+
+	// Create a second registry to detect the failure
+	reg2 := NewRegistry(dev, 0)
+
+	failed, err := reg2.GetFailedNodes()
+	if err != nil {
+		t.Fatalf("GetFailedNodes failed: %v", err)
+	}
+	if len(failed) != 1 {
+		t.Errorf("expected 1 failed node, got %d", len(failed))
+	}
+
+	if len(failed) > 0 {
+		if failed[0].SlotIndex != slot {
+			t.Errorf("failed node slot = %d, want %d", failed[0].SlotIndex, slot)
+		}
+		if failed[0].JournalOffset != staleSlot.JournalOffset {
+			t.Errorf("JournalOffset = %d, want %d", failed[0].JournalOffset, staleSlot.JournalOffset)
+		}
+		if failed[0].JournalSize != staleSlot.JournalSize {
+			t.Errorf("JournalSize = %d, want %d", failed[0].JournalSize, staleSlot.JournalSize)
+		}
+	}
+}
+
+func TestRecoverFailedNode(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	// Create both registries first
+	reg := NewRegistry(dev, 0)
+	reg2 := NewRegistry(dev, 0)
+	ctx := context.Background()
+
+	// Register the recovery node FIRST to claim slot 0
+	recoverySlot, err := reg2.Register(ctx, "recovery-node")
+	if err != nil {
+		t.Fatalf("reg2 Register failed: %v", err)
+	}
+	t.Logf("reg2 claimed slot %d", recoverySlot)
+
+	// Register the failing node (will get slot 1)
+	failingSlot, err := reg.Register(ctx, "failing-node")
+	if err != nil {
+		t.Fatalf("reg Register failed: %v", err)
+	}
+	t.Logf("reg claimed slot %d", failingSlot)
+
+	// Now write a stale heartbeat to the failing node's slot
+	staleUUID := reg.LocalUUID()
+	staleSlot := &Slot{
+		Magic:         SlotMagic,
+		State:         NodeStateActive,
+		UUID:          staleUUID,
+		HeartbeatSeq:  1,
+		HeartbeatTime: time.Now().Add(-2 * HeartbeatTimeout).Unix(),
+		MountTime:     time.Now().Unix(),
+		JournalOffset: 1 << 20,
+		JournalSize:   4 << 20,
+	}
+	copy(staleSlot.Hostname[:], "failing-node")
+
+	reg.mu.Lock()
+	err = reg.writeSlot(failingSlot, staleSlot)
+	reg.mu.Unlock()
+	if err != nil {
+		t.Fatalf("writeSlot failed: %v", err)
+	}
+
+	// Set up recovery handler
+	var recoveredInfo *FailedNodeInfo
+	reg2.SetRecoveryHandler(func(info *FailedNodeInfo) error {
+		recoveredInfo = info
+		return nil
+	})
+
+	// Trigger recovery on the failing node's slot
+	err = reg2.RecoverFailedNode(failingSlot)
+	if err != nil {
+		t.Fatalf("RecoverFailedNode failed: %v", err)
+	}
+
+	// Verify recovery was called with correct info
+	if recoveredInfo == nil {
+		t.Fatal("recovery handler was not called")
+	}
+	if recoveredInfo.SlotIndex != failingSlot {
+		t.Errorf("SlotIndex = %d, want %d", recoveredInfo.SlotIndex, failingSlot)
+	}
+	if recoveredInfo.JournalOffset != staleSlot.JournalOffset {
+		t.Errorf("JournalOffset = %d, want %d", recoveredInfo.JournalOffset, staleSlot.JournalOffset)
+	}
+
+	// Verify slot is now empty
+	reg2.mu.Lock()
+	clearedSlot, err := reg2.readSlot(failingSlot)
+	reg2.mu.Unlock()
+	if err != nil {
+		t.Fatalf("readSlot failed: %v", err)
+	}
+	if clearedSlot.State != NodeStateEmpty {
+		t.Errorf("slot state after recovery = %v, want Empty", clearedSlot.State)
+	}
+}
+
+func TestRecoverFailedNodeNoHandler(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+
+	err := reg.RecoverFailedNode(0)
+	if err == nil {
+		t.Error("RecoverFailedNode should fail without handler")
+	}
+}
+
+func TestRecoverFailedNodeNotFailed(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	ctx := context.Background()
+
+	// Register a node
+	slot, err := reg.Register(ctx, "active-node")
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	// Create second registry
+	reg2 := NewRegistry(dev, 0)
+	reg2.SetRecoveryHandler(func(info *FailedNodeInfo) error {
+		return nil
+	})
+
+	// Try to recover an active node (should fail)
+	err = reg2.RecoverFailedNode(slot)
+	if err == nil {
+		t.Error("RecoverFailedNode should fail for active node")
+	}
+}
+
+func TestFailureDetectionLoop(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Create both registries
+	reg1 := NewRegistry(dev, 0)
+	reg2 := NewRegistry(dev, 0)
+	reg2.failureCheckInterval = 10 * time.Millisecond
+
+	// Register recovery node FIRST so it gets slot 0
+	recoverySlot, err := reg2.Register(ctx, "recovery-node")
+	if err != nil {
+		t.Fatalf("reg2 Register failed: %v", err)
+	}
+	t.Logf("recovery node got slot %d", recoverySlot)
+
+	// Register failing node (will get slot 1)
+	failingSlot, err := reg1.Register(ctx, "failing-node")
+	if err != nil {
+		t.Fatalf("reg1 Register failed: %v", err)
+	}
+	t.Logf("failing node got slot %d", failingSlot)
+
+	// Now write stale heartbeat to the failing node's slot
+	staleSlot := &Slot{
+		Magic:         SlotMagic,
+		State:         NodeStateActive,
+		UUID:          reg1.LocalUUID(),
+		HeartbeatSeq:  1,
+		HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix(),
+		MountTime:     time.Now().Unix(),
+		JournalOffset: 1 << 20,
+		JournalSize:   4 << 20,
+	}
+	copy(staleSlot.Hostname[:], "failing-node")
+
+	reg1.mu.Lock()
+	err = reg1.writeSlot(failingSlot, staleSlot)
+	reg1.mu.Unlock()
+	if err != nil {
+		t.Fatalf("writeSlot failed: %v", err)
+	}
+
+	// Set up recovery handler
+	recovered := make(chan *FailedNodeInfo, 1)
+	reg2.SetRecoveryHandler(func(info *FailedNodeInfo) error {
+		select {
+		case recovered <- info:
+		default:
+		}
+		return nil
+	})
+
+	// Start failure detection
+	reg2.StartFailureDetection()
+
+	// Wait for detection and recovery
+	select {
+	case info := <-recovered:
+		if info.SlotIndex != failingSlot {
+			t.Errorf("recovered wrong slot: %d, want %d", info.SlotIndex, failingSlot)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Error("timeout waiting for failure detection")
+	}
+
+	// Stop
+	reg2.Unregister(ctx)
+}

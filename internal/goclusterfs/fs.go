@@ -6,6 +6,7 @@ package goclusterfs
 
 import (
 	"context"
+	"log"
 	"os"
 	"sync"
 	"syscall"
@@ -222,6 +223,10 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 		return syscall.EIO
 	}
 
+	// Disable FUSE kernel caching for cluster operation.
+	// Other nodes may modify attributes at any time.
+	a.Valid = 0
+
 	a.Inode = uint64(ino.InodeNum)
 	a.Mode = os.ModeDir | os.FileMode(ino.Mode&0777)
 	a.Nlink = ino.LinkCount
@@ -250,6 +255,11 @@ func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.Lo
 		}
 		return nil, syscall.EIO
 	}
+
+	// Disable FUSE kernel caching for cluster operation.
+	// Other nodes may modify the filesystem at any time.
+	resp.EntryValid = 0
+	resp.Attr.Valid = 0
 
 	if fileType == dir.DT_DIR {
 		return &Dir{fs: d.fs, inodeNum: uint32(childInodeNum)}, nil
@@ -294,6 +304,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	// Allocate new inode
 	childIno, err := d.fs.inodeTbl.Alloc(ctx)
 	if err != nil {
+		log.Printf("[DEBUG] Create %q: Alloc failed: %v", req.Name, err)
 		return nil, nil, syscall.ENOSPC
 	}
 
@@ -309,6 +320,7 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 	// Write inode
 	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
+		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", req.Name, childIno.InodeNum, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
 		return nil, nil, syscall.EIO
 	}
@@ -316,11 +328,13 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 	// Add directory entry
 	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
 	if err != nil {
+		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
 		return nil, nil, syscall.EIO
 	}
 
 	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(childIno.InodeNum), dir.DT_REG); err != nil {
+		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", req.Name, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
 		return nil, nil, syscall.EIO
 	}
@@ -473,6 +487,10 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 		return syscall.EIO
 	}
 
+	// Disable FUSE kernel caching for cluster operation.
+	// Other nodes may modify attributes at any time.
+	a.Valid = 0
+
 	a.Inode = uint64(ino.InodeNum)
 	a.Mode = os.FileMode(ino.Mode & 0777)
 	a.Nlink = ino.LinkCount
@@ -574,6 +592,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
+		log.Printf("[DEBUG] Write inode %d: Read failed: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
 
@@ -591,6 +610,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 			// Need to allocate
 			ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
 			if err != nil {
+				log.Printf("[DEBUG] Write inode %d: AllocateBlocks failed: %v", f.inodeNum, err)
 				return syscall.ENOSPC
 			}
 			extOffset = 0
@@ -629,6 +649,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 
 			// Write back
 			if _, err := f.fs.dev.WriteAt(buf.Bytes(), alignedOffset); err != nil {
+				log.Printf("[DEBUG] Write inode %d: WriteAt offset %d failed: %v", f.inodeNum, alignedOffset, err)
 				storage.PutBuffer(buf)
 				return syscall.EIO
 			}
@@ -650,6 +671,7 @@ func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.Wri
 	ino.Mtime = time.Now().UnixNano()
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+		log.Printf("[DEBUG] Write inode %d: final inodeTbl.Write failed: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
 

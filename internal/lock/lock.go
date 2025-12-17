@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -114,6 +115,7 @@ type lockKey struct {
 type heldLock struct {
 	Mode     LockMode
 	RecordID uint64 // Position in lock region
+	refCount int    // Number of goroutines from this node holding the lock
 }
 
 // Errors
@@ -139,17 +141,22 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 
 // Acquire attempts to acquire a lock with the given parameters.
 // Blocks until the lock is acquired or context is cancelled.
+//
+// Same-node reference counting: When multiple goroutines from the same node
+// need the same lock, the first goroutine acquires the distributed lock and
+// subsequent goroutines increment a local reference count. This allows
+// concurrent FUSE operations from the same node to share locks efficiently
+// while still providing cross-node serialization.
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 
 	m.mu.Lock()
-	// Check if we already hold this lock
+	// Check if we already hold this lock (same node) - just increment refCount
 	if held, ok := m.heldLocks[key]; ok {
-		if held.Mode == LockModeExclusive || mode == LockModeShared {
-			m.mu.Unlock()
-			return nil // Already have sufficient access
-		}
-		// Upgrade from shared to exclusive - need to release and reacquire
+		held.refCount++
+		log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - reusing existing lock (refCount=%d)", lockType, resourceID, held.refCount)
+		m.mu.Unlock()
+		return nil
 	}
 
 	// Check lock ordering to prevent deadlocks
@@ -161,25 +168,59 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 
 	// Calculate record position (hash-based)
 	recordID := m.hashToRecord(lockType, resourceID)
+	retryCount := 0
+	startTime := time.Now()
 
 	// Retry loop with exponential backoff
 	delay := RetryBaseDelay
 	for {
-		select {
-		case <-ctx.Done():
-			return ErrLockTimeout
-		default:
-		}
-
+		// Always attempt acquire first, then check context after failure
+		// This ensures we try at least once even if context is nearly expired
 		acquired, err := m.tryAcquire(recordID, lockType, resourceID, mode)
 		if err != nil {
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - tryAcquire error: %v", lockType, resourceID, err)
 			return err
 		}
 		if acquired {
 			m.mu.Lock()
-			m.heldLocks[key] = &heldLock{Mode: mode, RecordID: recordID}
+			// Double-check in case another goroutine acquired while we were trying
+			if held, ok := m.heldLocks[key]; ok {
+				// Another goroutine beat us - just increment refCount
+				held.refCount++
+				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - late arrival, reusing (refCount=%d)", lockType, resourceID, held.refCount)
+				m.mu.Unlock()
+				// Release the on-disk lock we just acquired since we'll share the existing one
+				m.releaseRecord(recordID)
+				return nil
+			}
+			m.heldLocks[key] = &heldLock{Mode: mode, RecordID: recordID, refCount: 1}
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired distributed lock (retries=%d, dur=%v)", lockType, resourceID, retryCount, time.Since(startTime))
 			m.mu.Unlock()
 			return nil
+		}
+
+		// Check again if another goroutine acquired while we were waiting
+		m.mu.Lock()
+		if held, ok := m.heldLocks[key]; ok {
+			held.refCount++
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - piggyback on existing (refCount=%d)", lockType, resourceID, held.refCount)
+			m.mu.Unlock()
+			return nil
+		}
+		m.mu.Unlock()
+
+		retryCount++
+		log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - loop iteration, retryCount now %d", lockType, resourceID, retryCount)
+
+		// Check context cancellation, but allow at least 3 retries for same-node
+		// CAS races where the other goroutine is still adding to heldLocks
+		if retryCount >= 3 {
+			select {
+			case <-ctx.Done():
+				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - TIMEOUT after %d retries (%v)", lockType, resourceID, retryCount, time.Since(startTime))
+				return ErrLockTimeout
+			default:
+			}
 		}
 
 		// Add jitter to prevent thundering herd
@@ -195,19 +236,39 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 }
 
 // Release releases a held lock.
+// With reference counting, this decrements the local count and only releases
+// the distributed lock when the last goroutine releases.
 func (m *Manager) Release(lockType LockType, resourceID uint64) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 
 	m.mu.Lock()
 	held, ok := m.heldLocks[key]
 	if !ok {
+		log.Printf("[DEBUG] lock.Release: type=%d res=%d - NOT FOUND in heldLocks!", lockType, resourceID)
 		m.mu.Unlock()
 		return ErrNotLockOwner
 	}
+
+	// Decrement reference count
+	held.refCount--
+	if held.refCount > 0 {
+		// Other goroutines still using the lock
+		log.Printf("[DEBUG] lock.Release: type=%d res=%d - decremented refCount to %d", lockType, resourceID, held.refCount)
+		m.mu.Unlock()
+		return nil
+	}
+
+	// Last reference - release the distributed lock
+	log.Printf("[DEBUG] lock.Release: type=%d res=%d - last ref, releasing distributed lock", lockType, resourceID)
 	delete(m.heldLocks, key)
+	recordID := held.RecordID
 	m.mu.Unlock()
 
-	return m.releaseRecord(held.RecordID)
+	err := m.releaseRecord(recordID)
+	if err != nil {
+		log.Printf("[DEBUG] lock.Release: type=%d res=%d - releaseRecord error: %v", lockType, resourceID, err)
+	}
+	return err
 }
 
 // tryAcquire attempts a single lock acquisition.
@@ -222,28 +283,43 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 
 	// Check if lock is free or can be acquired
 	canAcquire := false
+	reason := "unknown"
 	switch {
 	case record.Mode == LockModeNone:
 		// Lock is free
 		canAcquire = true
+		reason = "free"
 
 	case record.Type != lockType || record.ResourceID != resourceID:
 		// Hash collision - different resource, treat as free
 		// In production, we'd use a more sophisticated collision resolution
 		canAcquire = true
+		reason = "hash_collision"
 
 	case m.isLockStale(record):
 		// Lock is stale (owner died)
 		canAcquire = true
+		reason = "stale"
 
 	case mode == LockModeShared && record.Mode == LockModeShared:
 		// Adding another shared holder
 		canAcquire = true
+		reason = "shared_add"
+
+	case record.OwnerUUID == m.nodeUUID:
+		// Same node owns the lock - this can happen due to a race between
+		// Release clearing heldLocks and releaseRecord clearing on-disk.
+		// Safe to re-acquire since the previous holder from this node is gone.
+		canAcquire = true
+		reason = "same_node_reacquire"
 	}
 
 	if !canAcquire {
+		log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - cannot acquire, held by node=%x mode=%d", lockType, resourceID, record.OwnerUUID[:8], record.Mode)
 		return false, nil
 	}
+
+	log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - canAcquire=true reason=%s", lockType, resourceID, reason)
 
 	// Prepare new record
 	newRecord := &Record{
@@ -412,12 +488,20 @@ func deserializeRecord(buf []byte) (*Record, error) {
 		return nil, ErrInvalidRecord
 	}
 
-	// Empty record is valid (Mode == None)
-	if binary.LittleEndian.Uint32(buf[0:4]) == 0 {
-		return &Record{}, nil
+	magic := binary.LittleEndian.Uint32(buf[0:4])
+	sequence := binary.LittleEndian.Uint64(buf[48:56])
+
+	// Empty/released record is valid (Mode == None)
+	// IMPORTANT: Preserve Sequence for proper CAS operation even when Magic==0.
+	// A released lock has Magic=0 but Sequence=N, and we must read that Sequence
+	// so the next acquisition can properly compare-and-swap.
+	if magic == 0 {
+		return &Record{
+			Sequence: sequence,
+		}, nil
 	}
 
-	// Verify checksum
+	// Verify checksum for active records
 	stored := binary.LittleEndian.Uint32(buf[RecordSize-4:])
 	computed := storage.CRC32C(buf[:RecordSize-4])
 	if stored != computed {
@@ -425,13 +509,13 @@ func deserializeRecord(buf []byte) (*Record, error) {
 	}
 
 	r := &Record{
-		Magic:       binary.LittleEndian.Uint32(buf[0:4]),
+		Magic:       magic,
 		Type:        LockType(buf[4]),
 		Mode:        LockMode(buf[5]),
 		ResourceID:  binary.LittleEndian.Uint64(buf[8:16]),
 		OwnerSlot:   binary.LittleEndian.Uint32(buf[32:36]),
 		AcquireTime: int64(binary.LittleEndian.Uint64(buf[40:48])),
-		Sequence:    binary.LittleEndian.Uint64(buf[48:56]),
+		Sequence:    sequence,
 		SharedCount: binary.LittleEndian.Uint32(buf[56:60]),
 		Checksum:    stored,
 	}

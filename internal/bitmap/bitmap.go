@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -148,6 +149,7 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 	}
 
 	r.freeBlocks -= uint64(len(allocated))
+	log.Printf("[DEBUG] bitmap.Alloc: allocated blocks %v, freeBlocks=%d", allocated, r.freeBlocks)
 	return allocated, nil
 }
 
@@ -180,6 +182,7 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 
 	// Check if already free
 	if (sectorData[byteIdx] & (1 << bitIdx)) == 0 {
+		log.Printf("[DEBUG] bitmap.Free: block %d already free!", blockNum)
 		return ErrAlreadyFree
 	}
 
@@ -191,6 +194,7 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 	}
 
 	r.freeBlocks++
+	log.Printf("[DEBUG] bitmap.Free: freed block %d, freeBlocks=%d", blockNum, r.freeBlocks)
 	return nil
 }
 

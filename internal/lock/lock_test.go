@@ -197,22 +197,28 @@ func TestManagerAcquireRelease(t *testing.T) {
 		t.Fatalf("Acquire failed: %v", err)
 	}
 
-	// Acquiring same lock again should succeed (already held)
+	// Acquiring same lock again should succeed (reference counting)
 	err = mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
 	if err != nil {
 		t.Fatalf("Second Acquire should succeed: %v", err)
 	}
 
-	// Release
+	// First Release - decrements refCount from 2 to 1
 	err = mgr.Release(LockTypeInode, 100)
 	if err != nil {
-		t.Fatalf("Release failed: %v", err)
+		t.Fatalf("First Release failed: %v", err)
 	}
 
-	// Release again should fail
+	// Second Release - decrements refCount from 1 to 0 and releases distributed lock
+	err = mgr.Release(LockTypeInode, 100)
+	if err != nil {
+		t.Fatalf("Second Release failed: %v", err)
+	}
+
+	// Third Release should fail - lock no longer held
 	err = mgr.Release(LockTypeInode, 100)
 	if err != ErrNotLockOwner {
-		t.Errorf("Second Release: err = %v, want ErrNotLockOwner", err)
+		t.Errorf("Third Release: err = %v, want ErrNotLockOwner", err)
 	}
 }
 
