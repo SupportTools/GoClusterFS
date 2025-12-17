@@ -40,8 +40,10 @@ jobs:
       - name: Run multi-node tests
         run: |
           # Run the main test cluster (exclude storage-init which already completed)
+          # Note: Don't use --abort-on-container-exit because the test intentionally
+          # kills containers to test recovery. Use --exit-code-from to track the
+          # orchestrator's final result.
           docker compose -f tests/docker/docker-compose.test.yml up \
-            --abort-on-container-exit \
             --exit-code-from orchestrator \
             node1 node2 node3 node4 orchestrator
         timeout-minutes: 10
