@@ -9,9 +9,14 @@
 //   - Acquiring exclusive locks (writer invalidates before modifying)
 //   - TTL expiration (periodic validation against disk)
 //   - LRU eviction (memory pressure)
+//   - Network broadcast (optional, for near-instant cross-node invalidation)
 package cache
 
-import "time"
+import (
+	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
+)
 
 // Config holds configuration for the cache manager.
 type Config struct {
@@ -46,10 +51,17 @@ type Config struct {
 	// but significantly impacts performance.
 	// Default: false
 	StrictMode bool
+
+	// Network holds configuration for network-based cache invalidation.
+	// When enabled, nodes broadcast invalidations to each other for
+	// near-instant cross-node cache coherency.
+	// Default: broadcast.DisabledConfig() (disabled)
+	Network broadcast.Config
 }
 
 // DefaultConfig returns a Config with sensible defaults for typical workloads.
 // These defaults balance memory usage, consistency, and performance.
+// Network broadcast is disabled by default for backward compatibility.
 func DefaultConfig() Config {
 	return Config{
 		InodeCacheSize:    10000,
@@ -58,11 +70,27 @@ func DefaultConfig() Config {
 		NegativeCacheSize: 1000,
 		NegativeTTL:       1 * time.Second,
 		StrictMode:        false,
+		Network:           broadcast.DisabledConfig(),
+	}
+}
+
+// NetworkEnabledConfig returns a Config with network broadcast enabled.
+// This provides near-instant (<100ms) cross-node cache invalidation.
+func NetworkEnabledConfig() Config {
+	return Config{
+		InodeCacheSize:    10000,
+		InodeTTL:          5 * time.Second,
+		ExtentCacheSize:   50000,
+		NegativeCacheSize: 1000,
+		NegativeTTL:       1 * time.Second,
+		StrictMode:        false,
+		Network:           broadcast.DefaultConfig(),
 	}
 }
 
 // HighConsistencyConfig returns a Config optimized for strong consistency.
 // Use this when data correctness is more important than performance.
+// Network broadcast is enabled for fastest invalidation.
 func HighConsistencyConfig() Config {
 	return Config{
 		InodeCacheSize:    10000,
@@ -71,11 +99,13 @@ func HighConsistencyConfig() Config {
 		NegativeCacheSize: 500,
 		NegativeTTL:       500 * time.Millisecond,
 		StrictMode:        true,
+		Network:           broadcast.DefaultConfig(),
 	}
 }
 
 // HighPerformanceConfig returns a Config optimized for read-heavy workloads.
 // Use this when reads vastly outnumber writes and brief staleness is acceptable.
+// Network broadcast is disabled to minimize network overhead.
 func HighPerformanceConfig() Config {
 	return Config{
 		InodeCacheSize:    50000,
@@ -84,6 +114,7 @@ func HighPerformanceConfig() Config {
 		NegativeCacheSize: 5000,
 		NegativeTTL:       5 * time.Second,
 		StrictMode:        false,
+		Network:           broadcast.DisabledConfig(),
 	}
 }
 

@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount test test-unit test-integration test-all test-multinode-docker docker-build-test docker-clean-test clean fmt vet check-fuse lint help
+.PHONY: build build-mount test test-unit test-integration test-all test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-build-image vm-clean clean fmt vet check-fuse check-qemu lint help
 
 # Go parameters
 GOCMD=go
@@ -81,6 +81,53 @@ docker-clean-test:
 	rm -rf tests/docker/results/*
 	@echo "Docker cleanup complete"
 
+# =============================================================================
+# VM Multi-Node Tests (QEMU-based)
+# =============================================================================
+
+VM_TEST_HARNESS=tests/vm/vm-test-harness.sh
+
+# Check QEMU is available
+check-qemu:
+	@which qemu-system-x86_64 > /dev/null 2>&1 || (echo "Error: qemu-system-x86_64 not found. Install QEMU first." && exit 1)
+	@echo "QEMU is available"
+
+# Build VM image with Packer
+vm-build-image: check-qemu build-mount
+	@echo "Building VM image..."
+	$(VM_TEST_HARNESS) --build-image
+	@echo "VM image built successfully"
+
+# Run multi-node tests in QEMU VMs
+test-multinode-vm: check-qemu build-mount
+	@echo "Running multi-node VM tests..."
+	@mkdir -p tests/vm/results
+	$(VM_TEST_HARNESS) --run-tests --nodes=2
+	@echo "VM tests completed"
+
+# Run VM tests with more nodes
+test-multinode-vm-3: check-qemu build-mount
+	@echo "Running multi-node VM tests (3 nodes)..."
+	@mkdir -p tests/vm/results
+	$(VM_TEST_HARNESS) --run-tests --nodes=3
+	@echo "VM tests completed"
+
+# Clean up VM test resources
+vm-clean:
+	@echo "Cleaning up VM test resources..."
+	$(VM_TEST_HARNESS) --cleanup
+	@echo "VM cleanup complete"
+
+# Full VM cleanup including built images
+vm-clean-all:
+	@echo "Cleaning up all VM resources..."
+	$(VM_TEST_HARNESS) --cleanup-all
+	@echo "Full VM cleanup complete"
+
+# =============================================================================
+# Environment Checks
+# =============================================================================
+
 # Check FUSE is available
 check-fuse:
 	@which fusermount > /dev/null 2>&1 || (echo "Error: fusermount not found. Install FUSE first." && exit 1)
@@ -130,6 +177,14 @@ help:
 	@echo "    test-multinode-docker - Run multi-node tests in Docker"
 	@echo "    docker-build-test     - Build Docker test images only"
 	@echo "    docker-clean-test     - Clean up Docker test resources"
+	@echo ""
+	@echo "  VM Multi-Node Tests (QEMU):"
+	@echo "    test-multinode-vm     - Run multi-node tests in QEMU VMs (2 nodes)"
+	@echo "    test-multinode-vm-3   - Run multi-node tests in QEMU VMs (3 nodes)"
+	@echo "    vm-build-image        - Build Alpine VM image with Packer"
+	@echo "    vm-clean              - Clean up VM runtime files"
+	@echo "    vm-clean-all          - Clean up all VM resources including images"
+	@echo "    check-qemu            - Verify QEMU is available"
 	@echo ""
 	@echo "  Code Quality:"
 	@echo "    fmt            - Format code with go fmt"

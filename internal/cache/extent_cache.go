@@ -126,6 +126,15 @@ func (m *Manager) InvalidateExtentsForInodes(inodeNums ...uint32) {
 	// See InvalidateExtents() comment.
 }
 
+// InvalidateExtentsForInode removes cached extents for a single inode.
+// This satisfies the broadcast.InvalidationHandler interface.
+func (m *Manager) InvalidateExtentsForInode(inodeNum uint32) {
+	// Lazy invalidation via DataGeneration check handles this.
+	// When the next GetExtent() call is made, the generation mismatch
+	// will cause the stale entry to be evicted.
+	m.InvalidateExtents(inodeNum)
+}
+
 // LookupPhysicalCached is a convenience method that checks cache first,
 // then falls back to disk lookup via the extent manager.
 //

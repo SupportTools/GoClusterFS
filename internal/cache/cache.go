@@ -1,9 +1,11 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 )
@@ -50,6 +52,7 @@ type negativeEntry struct {
 // Manager coordinates all caching for a GoClusterFS mount.
 // It maintains separate caches for inodes, extents, and negative lookups,
 // with generation-based validation for coherency across nodes.
+// Optionally broadcasts invalidations to peer nodes for faster coherency.
 type Manager struct {
 	mu sync.RWMutex
 
@@ -65,6 +68,9 @@ type Manager struct {
 
 	// Negative cache (inode number -> "not found" entry)
 	negatives *LRU[uint32, *negativeEntry]
+
+	// Network broadcast for cross-node invalidation (optional)
+	broadcaster *broadcast.Broadcaster
 
 	// Dependencies
 	inodeTbl *inode.Table
@@ -109,7 +115,7 @@ func (m *Manager) Stats() Stats {
 	extentHits, extentMisses := m.extents.Stats()
 	negHits, negMisses := m.negatives.Stats()
 
-	return Stats{
+	stats := Stats{
 		InodeCacheSize:    m.inodes.Len(),
 		InodeCacheHits:    inodeHits,
 		InodeCacheMisses:  inodeMisses,
@@ -122,6 +128,19 @@ func (m *Manager) Stats() Stats {
 		NegativeHits:      negHits,
 		NegativeMisses:    negMisses,
 	}
+
+	// Include broadcast stats if enabled
+	if m.broadcaster != nil {
+		bstats := m.broadcaster.Stats()
+		stats.BroadcastEnabled = true
+		stats.InvalidationsSent = bstats.InvalidationsSent
+		stats.InvalidationsReceived = bstats.InvalidationsReceived
+		stats.BroadcastDuplicates = bstats.DuplicatesDropped
+		stats.MulticastEnabled = bstats.Transport.MulticastEnabled
+		stats.PeerCount = bstats.Transport.PeerCount
+	}
+
+	return stats
 }
 
 // Stats holds cache statistics for monitoring and debugging.
@@ -142,6 +161,14 @@ type Stats struct {
 	NegativeCacheSize int
 	NegativeHits      uint64
 	NegativeMisses    uint64
+
+	// Broadcast stats (only populated when broadcast is enabled)
+	BroadcastEnabled      bool
+	InvalidationsSent     uint64
+	InvalidationsReceived uint64
+	BroadcastDuplicates   uint64
+	MulticastEnabled      bool
+	PeerCount             int
 }
 
 // Clear removes all entries from all caches.
@@ -181,5 +208,91 @@ func (m *Manager) OnLockAcquire(lockType uint8, resourceID uint64, mode uint8) {
 	if lockType == LockTypeInode {
 		inodeNum := uint32(resourceID)
 		m.InvalidateInode(inodeNum)
+	}
+}
+
+// StartBroadcast initializes and starts the network broadcaster.
+// This enables near-instant cross-node cache invalidation via UDP multicast.
+//
+// Parameters:
+//   - ctx: Context for lifecycle management
+//   - nodeUUID: This node's unique identifier (from node.Slot.Reserved)
+//   - nodeSlot: This node's slot number in the cluster
+//
+// Returns an error if the broadcaster fails to start.
+// If broadcast is disabled in config, this is a no-op.
+func (m *Manager) StartBroadcast(ctx context.Context, nodeUUID [16]byte, nodeSlot uint32) error {
+	if !m.config.Network.Enabled {
+		return nil
+	}
+
+	// Create broadcaster with this Manager as the handler
+	// Manager implements broadcast.InvalidationHandler
+	var err error
+	m.broadcaster, err = broadcast.NewBroadcaster(m.config.Network, nodeUUID, nodeSlot, m)
+	if err != nil {
+		return err
+	}
+
+	return m.broadcaster.Start(ctx)
+}
+
+// StopBroadcast shuts down the network broadcaster gracefully.
+func (m *Manager) StopBroadcast() error {
+	if m.broadcaster == nil {
+		return nil
+	}
+	return m.broadcaster.Stop()
+}
+
+// BroadcastEnabled returns whether network broadcast is active.
+func (m *Manager) BroadcastEnabled() bool {
+	return m.broadcaster != nil && m.broadcaster.IsEnabled()
+}
+
+// BroadcastInvalidateInode invalidates an inode locally AND broadcasts
+// the invalidation to peer nodes. Call this after modifying an inode.
+//
+// Parameters:
+//   - inodeNum: The inode number being invalidated
+//   - dataGen: The inode's new DataGeneration after modification
+//   - metaGen: The inode's new MetaGeneration after modification
+func (m *Manager) BroadcastInvalidateInode(inodeNum uint32, dataGen, metaGen uint64) {
+	// Local invalidation first
+	m.InvalidateInode(inodeNum)
+
+	// Broadcast to peers
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastInvalidateInode(inodeNum, dataGen, metaGen)
+	}
+}
+
+// BroadcastInvalidateExtent invalidates extent mappings for an inode locally
+// AND broadcasts the invalidation to peer nodes. Call this after modifying
+// file data that changes extent mappings (truncate, write past EOF, etc).
+//
+// Parameters:
+//   - inodeNum: The inode number whose extents are invalidated
+//   - dataGen: The inode's new DataGeneration after modification
+func (m *Manager) BroadcastInvalidateExtent(inodeNum uint32, dataGen uint64) {
+	// Local invalidation
+	m.InvalidateExtentsForInode(inodeNum)
+
+	// Broadcast to peers
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastInvalidateExtent(inodeNum, dataGen)
+	}
+}
+
+// BroadcastInvalidateAll clears all caches locally AND broadcasts
+// a full invalidation to peer nodes. Use this after events that
+// might invalidate many entries (fsck, network partition recovery, etc).
+func (m *Manager) BroadcastInvalidateAll() {
+	// Local invalidation
+	m.Clear()
+
+	// Broadcast to peers
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastInvalidateAll()
 	}
 }

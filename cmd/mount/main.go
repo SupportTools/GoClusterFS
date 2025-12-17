@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/cache"
+	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
@@ -31,6 +33,17 @@ func main() {
 		mountPoint = flag.String("mount", "", "Mount point directory")
 		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
 		debug      = flag.Bool("debug", false, "Enable FUSE debug output")
+
+		// Cache configuration
+		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
+		cacheTTL    = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
+
+		// Network broadcast configuration
+		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
+		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group address")
+		multicastPort    = flag.Int("mcast-port", 31337, "Multicast/unicast port")
+		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
+		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
 	)
 	flag.Parse()
 
@@ -112,15 +125,32 @@ func main() {
 	extentMgr := extent.NewManager(dev, bm, lockMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 
+	// Build cache configuration from flags
+	cacheCfg := cache.DefaultConfig()
+	cacheCfg.StrictMode = *cacheStrict
+	cacheCfg.InodeTTL = *cacheTTL
+	cacheCfg.Network = broadcast.Config{
+		Enabled:              *broadcastEnabled,
+		MulticastGroup:       *multicastGroup,
+		MulticastPort:        *multicastPort,
+		UnicastPort:          *multicastPort,
+		MulticastTTL:         1, // Same subnet
+		MaxMulticastFailures: 3,
+		HeartbeatInterval:    30 * time.Second,
+		Secret:               *broadcastSecret,
+		Interface:            *broadcastIface,
+	}
+
 	// Create cache manager for read optimization
-	cacheMgr, err := cache.NewManager(cache.DefaultConfig(), inodeTbl, lockMgr)
+	cacheMgr, err := cache.NewManager(cacheCfg, inodeTbl, lockMgr)
 	if err != nil {
 		log.Fatalf("Failed to create cache manager: %v", err)
 	}
-	log.Printf("Cache: %d inodes, %d negative entries, TTL=%v",
+	log.Printf("Cache: %d inodes, %d negative entries, TTL=%v, strict=%v",
 		cacheMgr.Config().InodeCacheSize,
 		cacheMgr.Config().NegativeCacheSize,
-		cacheMgr.Config().InodeTTL)
+		cacheMgr.Config().InodeTTL,
+		cacheMgr.Config().StrictMode)
 
 	// Register cache invalidation callback with lock manager.
 	// When an exclusive lock is acquired, the cache for that resource
@@ -128,6 +158,18 @@ func main() {
 	lockMgr.SetOnAcquire(func(lockType lock.LockType, resourceID uint64, mode lock.LockMode) {
 		cacheMgr.OnLockAcquire(uint8(lockType), resourceID, uint8(mode))
 	})
+
+	// Start network broadcast for cross-node cache invalidation
+	if *broadcastEnabled {
+		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
+			log.Printf("Warning: Failed to start cache broadcast: %v (continuing without broadcast)", err)
+		} else if cacheMgr.BroadcastEnabled() {
+			log.Printf("Broadcast: enabled on %s:%d (secret=%v)",
+				*multicastGroup, *multicastPort, *broadcastSecret != "")
+		}
+	} else {
+		log.Println("Broadcast: disabled (using storage-only cache validation)")
+	}
 
 	// Create filesystem
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, nodeUUID, dataOffset)
@@ -184,6 +226,12 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Received signal, unmounting...")
+
+		// Stop broadcaster first to notify peers
+		if err := cacheMgr.StopBroadcast(); err != nil {
+			log.Printf("Warning: Failed to stop broadcast: %v", err)
+		}
+
 		fuse.Unmount(*mountPoint)
 	}()
 
@@ -192,6 +240,21 @@ func main() {
 	// Serve filesystem - blocks until unmount
 	if err := fs.Serve(conn, gfs); err != nil {
 		log.Fatalf("Serve failed: %v", err)
+	}
+
+	// Clean shutdown
+	if err := cacheMgr.StopBroadcast(); err != nil {
+		log.Printf("Warning: Failed to stop broadcast on exit: %v", err)
+	}
+
+	// Print final cache stats
+	stats := cacheMgr.Stats()
+	log.Printf("Cache stats: inodes=%d (hit=%.1f%%), extents=%d (hit=%.1f%%)",
+		stats.InodeCacheSize, stats.InodeHitRate*100,
+		stats.ExtentCacheSize, stats.ExtentHitRate*100)
+	if stats.BroadcastEnabled {
+		log.Printf("Broadcast stats: sent=%d, received=%d, duplicates=%d",
+			stats.InvalidationsSent, stats.InvalidationsReceived, stats.BroadcastDuplicates)
 	}
 
 	log.Println("Filesystem unmounted.")
