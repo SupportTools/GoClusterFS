@@ -1,0 +1,75 @@
+# GoClusterFS Docker Multi-Node Integration Tests
+# Runs containerized multi-node tests for realistic cluster simulation
+
+name: Docker Multi-Node Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  docker-multinode-tests:
+    name: Multi-Node Docker Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test images
+        run: |
+          docker compose -f tests/docker/docker-compose.test.yml build
+
+      - name: Create results directory
+        run: |
+          mkdir -p tests/docker/results
+
+      - name: Run multi-node tests
+        run: |
+          docker compose -f tests/docker/docker-compose.test.yml up \
+            --abort-on-container-exit \
+            --exit-code-from orchestrator
+        timeout-minutes: 10
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Node 1 Logs ===" >> tests/docker/results/container-logs.txt
+          docker logs goclusterfs-node1 2>&1 >> tests/docker/results/container-logs.txt || true
+          echo "=== Node 2 Logs ===" >> tests/docker/results/container-logs.txt
+          docker logs goclusterfs-node2 2>&1 >> tests/docker/results/container-logs.txt || true
+          echo "=== Node 3 Logs ===" >> tests/docker/results/container-logs.txt
+          docker logs goclusterfs-node3 2>&1 >> tests/docker/results/container-logs.txt || true
+          echo "=== Node 4 Logs ===" >> tests/docker/results/container-logs.txt
+          docker logs goclusterfs-node4 2>&1 >> tests/docker/results/container-logs.txt || true
+          echo "=== Orchestrator Logs ===" >> tests/docker/results/container-logs.txt
+          docker logs goclusterfs-orchestrator 2>&1 >> tests/docker/results/container-logs.txt || true
+
+      - name: Cleanup containers
+        if: always()
+        run: |
+          docker compose -f tests/docker/docker-compose.test.yml down -v --remove-orphans || true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-test-results
+          path: tests/docker/results/
+          retention-days: 7
+
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'tests/docker/results/junit.xml'
+          fail_on_failure: true
+          require_tests: true

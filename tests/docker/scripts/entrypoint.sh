@@ -1,0 +1,94 @@
+#!/bin/bash
+# GoClusterFS Container Entrypoint
+# Handles both node mode (mounts filesystem) and orchestrator mode (runs tests)
+
+set -e
+
+# Configuration from environment
+NODE_ID="${NODE_ID:-1}"
+DEVICE_PATH="${DEVICE_PATH:-/data/cluster.img}"
+MOUNT_POINT="${MOUNT_POINT:-/mnt/goclusterfs}"
+FORMAT_ON_START="${FORMAT_ON_START:-false}"
+DEBUG="${DEBUG:-false}"
+ORCHESTRATOR_MODE="${ORCHESTRATOR_MODE:-false}"
+
+log() {
+    echo "[Node $NODE_ID] $(date '+%Y-%m-%d %H:%M:%S') $*"
+}
+
+# =============================================================================
+# Orchestrator Mode - Run tests
+# =============================================================================
+if [ "$ORCHESTRATOR_MODE" = "true" ]; then
+    log "Starting in orchestrator mode"
+
+    # Wait for all nodes to be healthy
+    log "Waiting for nodes to be ready..."
+    sleep 5  # Initial delay for nodes to start
+
+    # Run the test script if provided
+    if [ -n "$TEST_SCRIPT" ] && [ -f "$TEST_SCRIPT" ]; then
+        log "Running test script: $TEST_SCRIPT"
+        exec "$TEST_SCRIPT" "$@"
+    elif [ -f "/scripts/run-tests.sh" ]; then
+        log "Running default test script"
+        exec /scripts/run-tests.sh "$@"
+    else
+        log "No test script found, sleeping indefinitely"
+        exec sleep infinity
+    fi
+fi
+
+# =============================================================================
+# Node Mode - Mount filesystem
+# =============================================================================
+log "Starting GoClusterFS node"
+log "Device: $DEVICE_PATH"
+log "Mount point: $MOUNT_POINT"
+
+# Wait for device to be ready (shared volume may take a moment)
+WAIT_COUNT=0
+MAX_WAIT=30
+while [ ! -f "$DEVICE_PATH" ] && [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+    log "Waiting for device $DEVICE_PATH to be ready... ($WAIT_COUNT/$MAX_WAIT)"
+    sleep 1
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+done
+
+if [ ! -f "$DEVICE_PATH" ]; then
+    log "ERROR: Device $DEVICE_PATH not found after ${MAX_WAIT}s"
+    exit 1
+fi
+
+log "Device $DEVICE_PATH is ready (size: $(stat -c%s "$DEVICE_PATH") bytes)"
+
+# Build mount command arguments
+MOUNT_ARGS="-device $DEVICE_PATH -mount $MOUNT_POINT"
+
+if [ "$FORMAT_ON_START" = "true" ]; then
+    log "Formatting filesystem (FORMAT_ON_START=true)"
+    MOUNT_ARGS="$MOUNT_ARGS -format"
+fi
+
+if [ "$DEBUG" = "true" ]; then
+    MOUNT_ARGS="$MOUNT_ARGS -debug"
+fi
+
+# Ensure mount point exists
+mkdir -p "$MOUNT_POINT"
+
+log "Starting goclusterfs-mount with args: $MOUNT_ARGS"
+
+# Handle signals for graceful shutdown
+cleanup() {
+    log "Received shutdown signal, unmounting..."
+    fusermount -u "$MOUNT_POINT" 2>/dev/null || true
+    log "Cleanup complete"
+    exit 0
+}
+
+trap cleanup SIGTERM SIGINT SIGQUIT
+
+# Start the mount process in foreground
+# shellcheck disable=SC2086
+exec /usr/local/bin/goclusterfs-mount $MOUNT_ARGS

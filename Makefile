@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount test test-unit test-integration test-all clean fmt vet check-fuse lint help
+.PHONY: build build-mount test test-unit test-integration test-all test-multinode-docker docker-build-test docker-clean-test clean fmt vet check-fuse lint help
 
 # Go parameters
 GOCMD=go
@@ -40,6 +40,30 @@ test-integration: check-fuse build-mount
 # All tests
 test-all: test-unit test-integration
 	@echo "All tests completed"
+
+# Docker Compose configuration
+DOCKER_COMPOSE_TEST=docker compose -f tests/docker/docker-compose.test.yml
+
+# Build Docker test images
+docker-build-test:
+	@echo "Building Docker test images..."
+	$(DOCKER_COMPOSE_TEST) build
+	@echo "Docker images built successfully"
+
+# Run multi-node tests in Docker containers
+test-multinode-docker: docker-build-test
+	@echo "Running multi-node Docker tests..."
+	@mkdir -p tests/docker/results
+	$(DOCKER_COMPOSE_TEST) up --abort-on-container-exit --exit-code-from orchestrator
+	@echo "Docker tests completed. Results in tests/docker/results/"
+
+# Clean up Docker test resources
+docker-clean-test:
+	@echo "Cleaning up Docker test resources..."
+	$(DOCKER_COMPOSE_TEST) down -v --remove-orphans || true
+	docker image prune -f --filter "label=goclusterfs-test" || true
+	rm -rf tests/docker/results/*
+	@echo "Docker cleanup complete"
 
 # Check FUSE is available
 check-fuse:
@@ -85,6 +109,11 @@ help:
 	@echo "    test-unit      - Run unit tests only (fast, no FUSE needed)"
 	@echo "    test-integration - Run integration tests (requires FUSE)"
 	@echo "    test-all       - Run all tests (unit + integration)"
+	@echo ""
+	@echo "  Docker Multi-Node Tests:"
+	@echo "    test-multinode-docker - Run multi-node tests in Docker"
+	@echo "    docker-build-test     - Build Docker test images only"
+	@echo "    docker-clean-test     - Clean up Docker test resources"
 	@echo ""
 	@echo "  Code Quality:"
 	@echo "    fmt            - Format code with go fmt"

@@ -1,0 +1,203 @@
+# GoClusterFS Multi-Node Test Environment
+# Docker Compose configuration for integration testing
+
+services:
+  # ==========================================================================
+  # Shared Storage Initializer
+  # Creates the backing image file in the shared tmpfs volume
+  # ==========================================================================
+  storage-init:
+    image: busybox:latest
+    volumes:
+      - shared-data:/data
+    command: >
+      sh -c "
+        echo 'Creating 100MB cluster image...' &&
+        dd if=/dev/zero of=/data/cluster.img bs=1M count=100 &&
+        echo 'Image created successfully'
+      "
+    networks:
+      - cluster-net
+
+  # ==========================================================================
+  # Node 1 - Primary node (formats filesystem on first start)
+  # ==========================================================================
+  node1:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
+      target: runtime
+    container_name: goclusterfs-node1
+    privileged: true
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+    volumes:
+      - shared-data:/data
+      - /dev/fuse:/dev/fuse
+    environment:
+      - NODE_ID=1
+      - DEVICE_PATH=/data/cluster.img
+      - MOUNT_POINT=/mnt/goclusterfs
+      - FORMAT_ON_START=true
+      - DEBUG=${DEBUG:-false}
+    networks:
+      cluster-net:
+        ipv4_address: 192.168.168.11
+    healthcheck:
+      test: ["CMD", "/scripts/healthcheck.sh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # ==========================================================================
+  # Node 2
+  # ==========================================================================
+  node2:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
+      target: runtime
+    container_name: goclusterfs-node2
+    privileged: true
+    depends_on:
+      node1:
+        condition: service_healthy
+    volumes:
+      - shared-data:/data
+      - /dev/fuse:/dev/fuse
+    environment:
+      - NODE_ID=2
+      - DEVICE_PATH=/data/cluster.img
+      - MOUNT_POINT=/mnt/goclusterfs
+      - FORMAT_ON_START=false
+      - DEBUG=${DEBUG:-false}
+    networks:
+      cluster-net:
+        ipv4_address: 192.168.168.12
+    healthcheck:
+      test: ["CMD", "/scripts/healthcheck.sh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  # ==========================================================================
+  # Node 3
+  # ==========================================================================
+  node3:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
+      target: runtime
+    container_name: goclusterfs-node3
+    privileged: true
+    depends_on:
+      node1:
+        condition: service_healthy
+    volumes:
+      - shared-data:/data
+      - /dev/fuse:/dev/fuse
+    environment:
+      - NODE_ID=3
+      - DEVICE_PATH=/data/cluster.img
+      - MOUNT_POINT=/mnt/goclusterfs
+      - FORMAT_ON_START=false
+      - DEBUG=${DEBUG:-false}
+    networks:
+      cluster-net:
+        ipv4_address: 192.168.168.13
+    healthcheck:
+      test: ["CMD", "/scripts/healthcheck.sh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  # ==========================================================================
+  # Node 4
+  # ==========================================================================
+  node4:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
+      target: runtime
+    container_name: goclusterfs-node4
+    privileged: true
+    depends_on:
+      node1:
+        condition: service_healthy
+    volumes:
+      - shared-data:/data
+      - /dev/fuse:/dev/fuse
+    environment:
+      - NODE_ID=4
+      - DEVICE_PATH=/data/cluster.img
+      - MOUNT_POINT=/mnt/goclusterfs
+      - FORMAT_ON_START=false
+      - DEBUG=${DEBUG:-false}
+    networks:
+      cluster-net:
+        ipv4_address: 192.168.168.14
+    healthcheck:
+      test: ["CMD", "/scripts/healthcheck.sh"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+      start_period: 5s
+
+  # ==========================================================================
+  # Test Orchestrator
+  # Runs integration tests and controls other containers
+  # ==========================================================================
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile: tests/docker/Dockerfile
+      target: orchestrator
+    container_name: goclusterfs-orchestrator
+    privileged: true
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+      node3:
+        condition: service_healthy
+      node4:
+        condition: service_healthy
+    volumes:
+      - shared-data:/data
+      - ./results:/results
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - ORCHESTRATOR_MODE=true
+      - NODES=goclusterfs-node1,goclusterfs-node2,goclusterfs-node3,goclusterfs-node4
+      - RESULTS_DIR=/results
+    networks:
+      cluster-net:
+        ipv4_address: 192.168.168.100
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  shared-data:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=500m
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  cluster-net:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.168.0/24
+          gateway: 192.168.168.1

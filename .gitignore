@@ -4,6 +4,7 @@ GoClusterFS
 
 # Test artifacts
 *.img
+tests/docker/results/
 
 # IDE
 .idea/
