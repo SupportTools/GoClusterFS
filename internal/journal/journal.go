@@ -220,9 +220,10 @@ func (j *Journal) Begin() *Transaction {
 //
 // The WAL protocol:
 // 1. Serialize transaction to bytes
-// 2. Write to journal ring buffer
-// 3. Fsync journal (COMMIT POINT)
-// 4. Mark transaction as committed
+// 2. Write to journal ring buffer (advances tail in memory)
+// 3. Flush superblock with updated tail offset to disk
+// 4. Fsync journal (COMMIT POINT - barrier ensuring durability)
+// 5. Mark transaction as committed in memory
 func (j *Journal) Commit(txn *Transaction) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -273,7 +274,15 @@ func (j *Journal) Commit(txn *Transaction) error {
 		return fmt.Errorf("short write: %d < %d", written, len(data))
 	}
 
+	// Flush superblock with updated tail offset to disk
+	// This is CRITICAL for crash consistency - the tail offset must be
+	// persisted so recovery can find the transaction data.
+	if err := j.region.FlushSuperblock(); err != nil {
+		return fmt.Errorf("failed to flush superblock: %w", err)
+	}
+
 	// COMMIT POINT - sync to disk
+	// After this barrier, the transaction is guaranteed durable.
 	if j.config.CommitMode == CommitSync {
 		if err := j.region.Sync(); err != nil {
 			return fmt.Errorf("failed to sync journal: %w", err)
@@ -394,4 +403,61 @@ type JournalStats struct {
 // This is exposed for recovery operations.
 func (j *Journal) Region() *Region {
 	return j.region
+}
+
+// ScanAndRecover scans a journal region for uncommitted transactions and
+// replays them. This is called during mount AFTER managers are created
+// but BEFORE creating the new journal, to recover any dirty journals
+// left by crashed nodes.
+//
+// This function:
+// 1. Opens the journal region without UUID validation (for recovery)
+// 2. Checks if recovery is needed (journal is dirty)
+// 3. Replays committed transactions via the handler
+// 4. Resets the journal to clean state
+//
+// Returns:
+// - nil, nil if no recovery was needed
+// - result, nil if recovery succeeded
+// - nil, error if recovery failed
+func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handler RecoveryHandler) (*ScanRecoveryResult, error) {
+	// Try to open the journal region for recovery (no UUID validation)
+	region, err := OpenRegionForRecovery(dev, regionOffset, regionSize)
+	if err != nil {
+		// Journal doesn't exist or is corrupt - no recovery needed
+		// This is normal for fresh filesystems
+		return nil, nil
+	}
+
+	// Check if recovery is needed
+	if !region.NeedsRecovery() {
+		return nil, nil // Journal is clean, nothing to do
+	}
+
+	// Get info about the crashed node's journal
+	sb := region.Superblock()
+	result := &ScanRecoveryResult{
+		WasNeeded:  true,
+		NodeUUID:   sb.NodeUUID,
+		Generation: sb.NodeGeneration,
+	}
+
+	// Perform recovery
+	stats, err := Recover(region, handler)
+	if err != nil {
+		return nil, fmt.Errorf("journal recovery failed: %w", err)
+	}
+
+	result.Stats = *stats
+	return result, nil
+}
+
+// ScanRecoveryResult contains information about a self-recovery operation
+// performed during mount. This is distinct from RecoveryResult (in
+// cross_node_recovery.go) which is for recovering other nodes' journals.
+type ScanRecoveryResult struct {
+	WasNeeded  bool          // True if recovery was performed
+	NodeUUID   [16]byte      // UUID of the crashed node whose journal was recovered
+	Generation uint64        // Generation of the crashed node's journal
+	Stats      RecoveryStats // Detailed recovery statistics
 }

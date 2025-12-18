@@ -38,6 +38,10 @@ func main() {
 		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
 		cacheTTL    = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
 
+		// Journal configuration
+		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
+		skipRecovery   = flag.Bool("skip-recovery", false, "Skip journal recovery (emergency maintenance only)")
+
 		// Network broadcast configuration
 		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
 		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group address")
@@ -83,14 +87,17 @@ func main() {
 	// 2-3MB: Inode table
 	// 3-4MB: Node registry (for distributed lock coordination)
 	// 4-5MB: Lock region (CAS-based distributed locks)
-	// 5MB+: Data blocks (1MB each)
+	// 5-9MB: Journal region (4MB per node slot)
+	// 9MB+: Data blocks (1MB each)
 	const (
 		bitmapOffset       = 1 * 1024 * 1024
 		inodeOffset        = 2 * 1024 * 1024
 		nodeRegistryOffset = 3 * 1024 * 1024
 		lockOffset         = 4 * 1024 * 1024
 		lockSize           = 1 * 1024 * 1024 // 1MB for lock records
-		dataOffset         = 5 * 1024 * 1024
+		journalOffset      = 5 * 1024 * 1024 // Journal region start
+		journalSize        = 4 * 1024 * 1024 // 4MB journal slot
+		dataOffset         = 9 * 1024 * 1024
 	)
 
 	// Calculate capacities
@@ -99,7 +106,7 @@ func main() {
 	inodeCount := uint64(4096)                      // Fixed for now
 
 	if totalBlocks < 1 {
-		log.Fatalf("Device too small: need at least 6MB, have %d MB", devSize/(1024*1024))
+		log.Fatalf("Device too small: need at least 10MB, have %d MB", devSize/(1024*1024))
 	}
 
 	log.Printf("Layout: %d data blocks (%d MB), %d inodes", totalBlocks, totalBlocks, inodeCount)
@@ -120,10 +127,59 @@ func main() {
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
 
 	// Create managers with distributed locking enabled
+	// NOTE: Managers must be created BEFORE journal recovery so we can replay transactions
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, lockMgr, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, lockMgr, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, lockMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
+
+	// Check for and recover any dirty journal from a previous crash
+	// This must happen BEFORE we create our own journal to avoid data loss
+	if *journalEnabled && !*skipRecovery {
+		// Set up recovery context with our managers
+		recoveryCtx := &journal.RecoveryContext{
+			Dev:       dev,
+			InodeTbl:  inodeTbl,
+			BitmapMgr: bm,
+			DirMgr:    dirMgr,
+			ExtentMgr: extentMgr,
+		}
+		// Use per-transaction handler for self-recovery
+		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
+
+		// Scan for dirty journal and recover if needed
+		// This uses UUID-agnostic opening since the crashed node had a different UUID
+		result, err := journal.ScanAndRecover(dev, journalOffset, journalSize, recoveryHandler)
+		if err != nil {
+			log.Fatalf("Journal recovery failed: %v", err)
+		}
+		if result != nil && result.WasNeeded {
+			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
+				result.Stats.TxnCommitted, result.Stats.BytesScanned, result.NodeUUID[:8])
+		}
+	} else if *skipRecovery {
+		log.Println("Journal: WARNING - skipping recovery (emergency mode)")
+	}
+
+	// Create journal for write-ahead logging (crash consistency)
+	var j *journal.Journal
+	if *journalEnabled {
+		generation := uint64(time.Now().UnixNano())
+		jConfig := journal.DefaultConfig()
+
+		// Always initialize a fresh journal for this node
+		// Recovery (if needed) has already been performed above
+		j, err = journal.Init(dev, journalOffset, journalSize, nodeUUID, generation, jConfig)
+		if err != nil {
+			log.Fatalf("Failed to initialize journal: %v", err)
+		}
+		log.Printf("Journal: initialized at offset %d (%d MB)", journalOffset, journalSize/(1024*1024))
+
+		j.Start()
+		log.Printf("Journal: started (mode=%v, checkpoint=%v)", jConfig.CommitMode, jConfig.CheckpointInterval)
+	} else {
+		log.Println("Journal: disabled (no crash consistency guarantees)")
+	}
 
 	// Build cache configuration from flags
 	cacheCfg := cache.DefaultConfig()
@@ -171,8 +227,8 @@ func main() {
 		log.Println("Broadcast: disabled (using storage-only cache validation)")
 	}
 
-	// Create filesystem
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, nodeUUID, dataOffset)
+	// Create filesystem with journal for crash consistency
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -227,7 +283,14 @@ func main() {
 		<-sigChan
 		log.Println("Received signal, unmounting...")
 
-		// Stop broadcaster first to notify peers
+		// Stop journal first to ensure all transactions are checkpointed
+		if j != nil {
+			if err := j.Stop(); err != nil {
+				log.Printf("Warning: Failed to stop journal: %v", err)
+			}
+		}
+
+		// Stop broadcaster to notify peers
 		if err := cacheMgr.StopBroadcast(); err != nil {
 			log.Printf("Warning: Failed to stop broadcast: %v", err)
 		}
@@ -243,8 +306,21 @@ func main() {
 	}
 
 	// Clean shutdown
+	if j != nil {
+		if err := j.Stop(); err != nil {
+			log.Printf("Warning: Failed to stop journal on exit: %v", err)
+		}
+	}
+
 	if err := cacheMgr.StopBroadcast(); err != nil {
 		log.Printf("Warning: Failed to stop broadcast on exit: %v", err)
+	}
+
+	// Print final journal stats
+	if j != nil {
+		jStats := j.Stats()
+		log.Printf("Journal stats: commits=%d, bytes=%d, state=%v",
+			jStats.CommitCount, jStats.BytesWritten, jStats.State)
 	}
 
 	// Print final cache stats

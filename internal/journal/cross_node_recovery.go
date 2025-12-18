@@ -523,3 +523,19 @@ func CreateRecoveryHandler(rctx *RecoveryContext) node.RecoveryHandler {
 		return nil
 	}
 }
+
+// CreateTxnRecoveryHandler creates a per-transaction RecoveryHandler.
+// This is used for self-recovery during mount when we need to replay
+// transactions directly without the node.FailedNodeInfo wrapper.
+func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
+	ctx := context.Background()
+	return func(txn *RecoveredTxn) error {
+		result, err := applyTransaction(ctx, rctx, txn)
+		if err != nil {
+			return err
+		}
+		log.Printf("[Recovery] Replayed txn seq=%d: applied=%d, skipped=%d",
+			txn.Header.Seq, result.applied, result.skipped)
+		return nil
+	}
+}

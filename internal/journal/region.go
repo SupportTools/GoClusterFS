@@ -51,6 +51,34 @@ func OpenRegion(dev *storage.Device, regionOffset uint64, regionSize uint64, nod
 	return r, nil
 }
 
+// OpenRegionForRecovery opens a journal region without UUID validation.
+// This is used during crash recovery to replay dirty journals left by
+// crashed nodes. The caller should check NeedsRecovery() and perform
+// recovery before re-initializing the journal for a new node.
+//
+// Unlike OpenRegion(), this function:
+// - Does NOT validate UUID ownership (crashed node had different UUID)
+// - Returns error only if journal is corrupt or unreadable
+// - Intended for recovery path only, not normal operation
+func OpenRegionForRecovery(dev *storage.Device, regionOffset uint64, regionSize uint64) (*Region, error) {
+	r := &Region{
+		dev:          dev,
+		regionOffset: regionOffset,
+		regionSize:   regionSize,
+	}
+
+	// Read and validate the superblock (checksum + magic)
+	if err := r.readSuperblock(); err != nil {
+		return nil, fmt.Errorf("failed to read journal superblock: %w", err)
+	}
+
+	// Copy the UUID from the superblock (the crashed node's UUID)
+	r.nodeUUID = r.superblock.NodeUUID
+	r.generation = r.superblock.NodeGeneration
+
+	return r, nil
+}
+
 // InitRegion initializes a new journal region.
 // This should only be called when formatting a new filesystem or
 // when a node is claiming a previously unused slot.

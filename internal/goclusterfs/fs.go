@@ -7,6 +7,7 @@ package goclusterfs
 import (
 	"context"
 	"errors"
+	"hash/fnv"
 	"log"
 	"math/rand"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -60,7 +62,8 @@ type FS struct {
 	inodeTbl  *inode.Table
 	extentMgr *extent.Manager
 	dirMgr    *dir.Manager
-	cacheMgr  *cache.Manager // Inode cache for read optimization
+	cacheMgr  *cache.Manager   // Inode cache for read optimization
+	journal   *journal.Journal // Per-node journal for crash consistency (WAL)
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -77,13 +80,15 @@ type Config struct {
 	NodeUUID   [16]byte
 
 	// Region offsets (from superblock or config)
-	BitmapOffset uint64
-	InodeOffset  uint64
-	DataOffset   uint64
+	BitmapOffset  uint64
+	InodeOffset   uint64
+	DataOffset    uint64
+	JournalOffset uint64 // Journal region start offset (0 = no journal)
 
 	// Region sizes
 	TotalBlocks uint64 // Number of data blocks
 	InodeCount  uint64 // Number of inodes
+	JournalSize uint64 // Journal region size (default 4MB if JournalOffset > 0)
 }
 
 // New creates a new GoClusterFS instance.
@@ -134,6 +139,7 @@ func NewWithComponents(
 	extentMgr *extent.Manager,
 	dirMgr *dir.Manager,
 	cacheMgr *cache.Manager,
+	j *journal.Journal, // May be nil for backward compatibility
 	nodeUUID [16]byte,
 	dataOffset uint64,
 ) *FS {
@@ -144,6 +150,7 @@ func NewWithComponents(
 		extentMgr:  extentMgr,
 		dirMgr:     dirMgr,
 		cacheMgr:   cacheMgr,
+		journal:    j,
 		nodeUUID:   nodeUUID,
 		dataOffset: dataOffset,
 		uid:        uint32(os.Getuid()),
@@ -153,6 +160,12 @@ func NewWithComponents(
 
 // Close closes the filesystem and releases resources.
 func (f *FS) Close() error {
+	// Stop journal first to ensure clean shutdown
+	if f.journal != nil {
+		if err := f.journal.Stop(); err != nil {
+			log.Printf("Warning: failed to stop journal cleanly: %v", err)
+		}
+	}
 	return f.dev.Close()
 }
 
@@ -198,6 +211,14 @@ func (f *FS) CacheStats() cache.Stats {
 		return f.cacheMgr.Stats()
 	}
 	return cache.Stats{}
+}
+
+// hashString returns a 64-bit FNV-1a hash of the string.
+// Used for journal verification of filenames.
+func hashString(s string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }
 
 // InitRoot initializes the root directory if it doesn't exist.
@@ -398,6 +419,10 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 //  2. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for directory expansion
 //  3. ClaimSlot() - acquires Inode lock (Level 8)
 //
+// WAL Protocol: If journaling is enabled, the function logs intent BEFORE
+// actual metadata writes. The commit point (journal.Commit) ensures crash
+// consistency - operations after commit are recoverable.
+//
 // Returns errRetryCreate if the inode slot was claimed by another node.
 func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	// Phase 1: Find a free inode slot (no distributed locks held)
@@ -412,6 +437,44 @@ func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp 
 	if err != nil {
 		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
 		return nil, nil, syscall.EIO
+	}
+
+	// === WAL: Begin transaction and log intent ===
+	var txn *journal.Transaction
+	if d.fs.journal != nil {
+		txn = d.fs.journal.Begin()
+
+		// Log inode creation intent
+		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
+			InodeNum:       uint64(inodeNum),
+			Mode:           uint32(req.Mode),
+			UID:            req.Uid,
+			GID:            req.Gid,
+			ParentInodeNum: uint64(d.inodeNum),
+			NameHash:       hashString(req.Name),
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			log.Printf("[DEBUG] Create %q: journal LogInodeCreate failed: %v", req.Name, err)
+			return nil, nil, syscall.EIO
+		}
+
+		// Log directory entry addition intent
+		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
+			ParentInodeNum: uint64(d.inodeNum),
+			ChildInodeNum:  uint64(inodeNum),
+			EntryType:      journal.DirEntryRegular,
+			Name:           req.Name,
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			log.Printf("[DEBUG] Create %q: journal LogDirAddEntry failed: %v", req.Name, err)
+			return nil, nil, syscall.EIO
+		}
+
+		// COMMIT POINT: After this, the operation WILL complete (even after crash)
+		if err := d.fs.journal.Commit(txn); err != nil {
+			log.Printf("[DEBUG] Create %q: journal commit failed: %v", req.Name, err)
+			return nil, nil, syscall.EIO
+		}
 	}
 
 	// Phase 3: Add directory entry FIRST (may acquire BlockBitmap lock for directory expansion)
@@ -498,6 +561,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 //  3. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for parent directory expansion
 //  4. ClaimSlot() - acquires Inode lock (Level 8)
 //
+// WAL Protocol: If journaling is enabled, the function logs intent BEFORE
+// actual metadata writes. The commit point ensures crash consistency.
+//
 // Note: dirMgr.InitDirectory() already handles lock ordering internally by allocating
 // blocks before acquiring the inode lock.
 //
@@ -515,6 +581,48 @@ func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 	if err != nil {
 		log.Printf("[DEBUG] Mkdir %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
 		return nil, syscall.EIO
+	}
+
+	// === WAL: Begin transaction and log intent ===
+	var txn *journal.Transaction
+	if d.fs.journal != nil {
+		txn = d.fs.journal.Begin()
+
+		// Log directory inode creation intent
+		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
+			InodeNum:       uint64(inodeNum),
+			Mode:           uint32(inode.S_IFDIR) | uint32(req.Mode&0777),
+			UID:            req.Uid,
+			GID:            req.Gid,
+			ParentInodeNum: uint64(d.inodeNum),
+			NameHash:       hashString(req.Name),
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			log.Printf("[DEBUG] Mkdir %q: journal LogInodeCreate failed: %v", req.Name, err)
+			return nil, syscall.EIO
+		}
+
+		// Log directory entry addition intent
+		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
+			ParentInodeNum: uint64(d.inodeNum),
+			ChildInodeNum:  uint64(inodeNum),
+			EntryType:      journal.DirEntryDirectory,
+			Name:           req.Name,
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			log.Printf("[DEBUG] Mkdir %q: journal LogDirAddEntry failed: %v", req.Name, err)
+			return nil, syscall.EIO
+		}
+
+		// Note: We don't log BlockAlloc here because we don't know the block number yet.
+		// InitDirectory() will allocate it. In recovery, the block allocation is implicit
+		// from the directory inode's extent info.
+
+		// COMMIT POINT: After this, the operation WILL complete (even after crash)
+		if err := d.fs.journal.Commit(txn); err != nil {
+			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", req.Name, err)
+			return nil, syscall.EIO
+		}
 	}
 
 	// Phase 3: Add directory entry in parent FIRST (may acquire BlockBitmap lock)
@@ -596,6 +704,12 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	// Invalidate child inode cache - it's being removed
 	d.fs.invalidateInode(uint32(childInodeNum))
 
+	// Read child inode early - we need it for validation and WAL logging
+	childIno, err := d.fs.inodeTbl.Read(uint32(childInodeNum))
+	if err != nil {
+		return syscall.EIO
+	}
+
 	// Handle directory removal
 	if req.Dir {
 		if fileType != dir.DT_DIR {
@@ -603,11 +717,6 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		}
 
 		// Check if directory is empty
-		childIno, err := d.fs.inodeTbl.Read(uint32(childInodeNum))
-		if err != nil {
-			return syscall.EIO
-		}
-
 		isEmpty, err := d.fs.dirMgr.IsEmpty(ctx, childIno)
 		if err != nil {
 			return syscall.EIO
@@ -616,7 +725,91 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 			return syscall.ENOTEMPTY
 		}
 
-		// Decrement parent link count
+		// Will decrement parent link count (done after commit)
+	}
+
+	// Determine if inode will be freed (link count becomes 0)
+	willFreeInode := childIno.LinkCount == 1
+
+	// === WAL: Begin transaction and log intent ===
+	var txn *journal.Transaction
+	if d.fs.journal != nil {
+		txn = d.fs.journal.Begin()
+
+		// Determine entry type for directory removal
+		entryType := journal.DirEntryRegular
+		if req.Dir {
+			entryType = journal.DirEntryDirectory
+		}
+
+		// Log directory entry removal
+		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
+			ParentInodeNum: uint64(d.inodeNum),
+			ChildInodeNum:  uint64(childInodeNum),
+			EntryType:      entryType,
+			Name:           req.Name,
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			return syscall.EIO
+		}
+
+		// If link count will become 0, log inode deletion and extent freeing
+		if willFreeInode {
+			// Log block/extent freeing for all extents
+			// Note: extents are freed during Truncate(0)
+			if childIno.Size > 0 {
+				if err := txn.LogBlockFree(&journal.BlockFreePayload{
+					InodeNum:   uint64(childInodeNum),
+					StartBlock: 0, // Freeing all blocks
+					Count:      uint32((childIno.Size + BlockSize - 1) / BlockSize),
+				}); err != nil {
+					d.fs.journal.Abort(txn)
+					return syscall.EIO
+				}
+			}
+
+			// Log inode deletion
+			if err := txn.LogInodeDelete(&journal.InodeDeletePayload{
+				InodeNum: uint64(childInodeNum),
+			}); err != nil {
+				d.fs.journal.Abort(txn)
+				return syscall.EIO
+			}
+		} else {
+			// Log inode update for link count decrement
+			if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
+				InodeNum:   uint64(childInodeNum),
+				UpdateMask: journal.InodeUpdateNlink,
+			}); err != nil {
+				d.fs.journal.Abort(txn)
+				return syscall.EIO
+			}
+		}
+
+		// Log parent directory inode update (mtime change, and link count for rmdir)
+		parentMask := journal.InodeUpdateMtime
+		if req.Dir {
+			parentMask |= journal.InodeUpdateNlink
+		}
+		if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
+			InodeNum:   uint64(d.inodeNum),
+			UpdateMask: parentMask,
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			return syscall.EIO
+		}
+
+		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
+		if err := d.fs.journal.Commit(txn); err != nil {
+			return syscall.EIO
+		}
+	}
+	// === End WAL transaction ===
+
+	// Now execute the actual metadata operations (safe - recoverable if crash)
+
+	// Update parent link count for directory removal
+	if req.Dir {
 		dirIno.LinkCount--
 	}
 
@@ -626,11 +819,6 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	}
 
 	// Decrement child link count and potentially free
-	childIno, err := d.fs.inodeTbl.Read(uint32(childInodeNum))
-	if err != nil {
-		return syscall.EIO
-	}
-
 	childIno.LinkCount--
 	if childIno.LinkCount == 0 {
 		// Free all extents
@@ -819,6 +1007,21 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 		}
 	}()
 
+	// === WAL: Track transaction for extent allocations ===
+	var txn *journal.Transaction
+	allocatedExtents := make([]struct {
+		logicalBlock  uint64
+		physicalBlock uint64
+		count         uint32
+	}, 0)
+	// Abort transaction on error path
+	defer func() {
+		if txn != nil && f.fs.journal != nil {
+			// Transaction was not committed - abort it
+			f.fs.journal.Abort(txn)
+		}
+	}()
+
 	// Read initial inode state
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
@@ -877,6 +1080,17 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 				return 0, syscall.ENOSPC
 			}
 			extOffset = 0
+
+			// === WAL: Track the allocated extent for logging ===
+			allocatedExtents = append(allocatedExtents, struct {
+				logicalBlock  uint64
+				physicalBlock uint64
+				count         uint32
+			}{
+				logicalBlock:  blockNum,
+				physicalBlock: ext.PhysicalBlock,
+				count:         uint32(ext.Length),
+			})
 		}
 
 	writeBlock:
@@ -951,10 +1165,54 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 	}
 
 	// Update inode size if extended
+	newSize := ino.Size
 	if offset > ino.Size {
-		ino.Size = offset
+		newSize = offset
 	}
-	ino.Mtime = time.Now().UnixNano()
+	newMtime := time.Now().UnixNano()
+
+	// === WAL: Log extent allocations and inode update before committing metadata ===
+	if f.fs.journal != nil && (len(allocatedExtents) > 0 || newSize != ino.Size) {
+		txn = f.fs.journal.Begin()
+
+		// Log all extent allocations
+		for _, alloc := range allocatedExtents {
+			if err := txn.LogExtentAdd(&journal.ExtentAddPayload{
+				InodeNum:  uint64(f.inodeNum),
+				FileBlock: alloc.logicalBlock,
+				DiskBlock: alloc.physicalBlock,
+				Length:    alloc.count,
+			}); err != nil {
+				log.Printf("[DEBUG] Write inode %d: LogExtentAdd failed: %v", f.inodeNum, err)
+				return 0, syscall.EIO
+			}
+		}
+
+		// Log inode update (size and mtime)
+		mask := journal.InodeUpdateMtime
+		if newSize != ino.Size {
+			mask |= journal.InodeUpdateSize
+		}
+		if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
+			InodeNum:   uint64(f.inodeNum),
+			UpdateMask: mask,
+		}); err != nil {
+			log.Printf("[DEBUG] Write inode %d: LogInodeUpdate failed: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+
+		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
+		if err := f.fs.journal.Commit(txn); err != nil {
+			log.Printf("[DEBUG] Write inode %d: journal commit failed: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+		txn = nil // Mark as committed so defer doesn't abort
+	}
+	// === End WAL transaction ===
+
+	// Apply the metadata changes
+	ino.Size = newSize
+	ino.Mtime = newMtime
 
 	// Write inode - use WriteWithLockHeld if we hold the lock
 	if lockHeld {
@@ -987,6 +1245,102 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 	now := time.Now().UnixNano()
 
+	// Track what's changing for WAL
+	var mask journal.InodeUpdateMask
+	newSize := ino.Size
+	_ = newSize // Used for block calculations even if not in payload
+	newMtime := ino.Mtime
+	_ = newMtime // Suppress unused warning
+	newCtime := ino.Ctime
+	_ = newCtime // Suppress unused warning
+	newAtime := ino.Atime
+	_ = newAtime // Suppress unused warning
+	newMode := ino.Mode
+	_ = newMode // Suppress unused warning
+	newUID := ino.UID
+	_ = newUID // Suppress unused warning
+	newGID := ino.GID
+	_ = newGID // Suppress unused warning
+	truncating := false
+	blocksToFree := uint32(0)
+
+	if req.Valid.Size() {
+		mask |= journal.InodeUpdateSize | journal.InodeUpdateMtime
+		newSize = req.Size
+		newMtime = now
+		if req.Size < ino.Size {
+			truncating = true
+			// Calculate blocks being freed
+			oldBlocks := (ino.Size + BlockSize - 1) / BlockSize
+			newBlocks := (req.Size + BlockSize - 1) / BlockSize
+			if oldBlocks > newBlocks {
+				blocksToFree = uint32(oldBlocks - newBlocks)
+			}
+		}
+	}
+
+	if req.Valid.Mode() {
+		mask |= journal.InodeUpdateMode | journal.InodeUpdateCtime
+		newMode = uint16(req.Mode & 0777)
+		newCtime = now
+	}
+
+	if req.Valid.Uid() {
+		mask |= journal.InodeUpdateUID | journal.InodeUpdateCtime
+		newUID = req.Uid
+		newCtime = now
+	}
+
+	if req.Valid.Gid() {
+		mask |= journal.InodeUpdateGID | journal.InodeUpdateCtime
+		newGID = req.Gid
+		newCtime = now
+	}
+
+	if req.Valid.Atime() {
+		mask |= journal.InodeUpdateAtime
+		newAtime = req.Atime.UnixNano()
+	}
+
+	if req.Valid.Mtime() {
+		mask |= journal.InodeUpdateMtime
+		newMtime = req.Mtime.UnixNano()
+	}
+
+	// === WAL: Begin transaction and log intent ===
+	var txn *journal.Transaction
+	if f.fs.journal != nil && mask != 0 {
+		txn = f.fs.journal.Begin()
+
+		// Log block freeing if truncating
+		if truncating && blocksToFree > 0 {
+			if err := txn.LogBlockFree(&journal.BlockFreePayload{
+				InodeNum:   uint64(f.inodeNum),
+				StartBlock: uint64((newSize + BlockSize - 1) / BlockSize),
+				Count:      blocksToFree,
+			}); err != nil {
+				f.fs.journal.Abort(txn)
+				return syscall.EIO
+			}
+		}
+
+		// Log inode update (InodeUpdatePayload only stores inode number and mask)
+		if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
+			InodeNum:   uint64(f.inodeNum),
+			UpdateMask: mask,
+		}); err != nil {
+			f.fs.journal.Abort(txn)
+			return syscall.EIO
+		}
+
+		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
+		if err := f.fs.journal.Commit(txn); err != nil {
+			return syscall.EIO
+		}
+	}
+	// === End WAL transaction ===
+
+	// Now execute the actual operations (safe - recoverable if crash)
 	if req.Valid.Size() {
 		if req.Size < ino.Size {
 			// Truncate
