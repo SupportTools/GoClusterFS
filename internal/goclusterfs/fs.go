@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"math/rand"
 	"os"
 	"sync"
 	"syscall"
@@ -33,6 +34,14 @@ var errRetryWrite = errors.New("retry write operation")
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected.
 const MaxWriteRetries = 3
+
+// errRetryCreate is an internal sentinel error indicating that an inode slot
+// collision was detected during Create/Mkdir and the operation should be retried.
+var errRetryCreate = errors.New("retry create: inode slot collision")
+
+// MaxCreateRetries is the maximum number of retry attempts for Create/Mkdir
+// operations when inode slot collisions occur across cluster nodes.
+const MaxCreateRetries = 5
 
 // BlockSize is the size of data blocks (1MB).
 const BlockSize = 1 << 20
@@ -358,12 +367,39 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 
 // Create creates a new file.
 //
+// This function wraps createInternal() with a retry loop to handle inode slot
+// collisions that occur when multiple nodes race to create files concurrently.
+// When another node claims the same inode slot, we rollback and retry with a
+// different slot.
+func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
+		node, handle, err := d.createInternal(ctx, req, resp)
+		if err == errRetryCreate {
+			// Jittered exponential backoff: base * 2^attempt + random jitter
+			// This spreads out retries to reduce thundering herd collisions
+			baseDelay := time.Millisecond * time.Duration(1<<attempt) // 1ms, 2ms, 4ms, 8ms, 16ms
+			jitter := time.Duration(rand.Int63n(int64(baseDelay)))    // 0 to baseDelay
+			backoff := baseDelay + jitter
+			log.Printf("[DEBUG] Create %q: inode slot collision, retry %d/%d (backoff %v)", req.Name, attempt+1, MaxCreateRetries, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		return node, handle, err
+	}
+	log.Printf("[WARN] Create %q: exhausted %d retries due to inode slot collisions", req.Name, MaxCreateRetries)
+	return nil, nil, syscall.EAGAIN
+}
+
+// createInternal performs the actual file creation with two-phase allocation.
+//
 // Lock ordering: This function uses a two-phase allocation pattern to respect
 // the lock hierarchy (BlockBitmap Level 6 < Inode Level 8):
 //  1. FindFreeSlot() - no locks
 //  2. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for directory expansion
 //  3. ClaimSlot() - acquires Inode lock (Level 8)
-func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+//
+// Returns errRetryCreate if the inode slot was claimed by another node.
+func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	// Phase 1: Find a free inode slot (no distributed locks held)
 	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
 	if err != nil {
@@ -394,9 +430,9 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); removeErr != nil {
 			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", req.Name, removeErr)
 		}
-		// If slot was taken by another node, retry with a different slot
+		// If slot was taken by another node, signal retry with a different slot
 		if err == inode.ErrInodeInUse {
-			return nil, nil, syscall.EAGAIN
+			return nil, nil, errRetryCreate
 		}
 		return nil, nil, syscall.ENOSPC
 	}
@@ -430,6 +466,31 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 
 // Mkdir creates a new directory.
 //
+// This function wraps mkdirInternal() with a retry loop to handle inode slot
+// collisions that occur when multiple nodes race to create directories concurrently.
+// When another node claims the same inode slot, we rollback and retry with a
+// different slot.
+func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
+		node, err := d.mkdirInternal(ctx, req)
+		if err == errRetryCreate {
+			// Jittered exponential backoff: base * 2^attempt + random jitter
+			// This spreads out retries to reduce thundering herd collisions
+			baseDelay := time.Millisecond * time.Duration(1<<attempt) // 1ms, 2ms, 4ms, 8ms, 16ms
+			jitter := time.Duration(rand.Int63n(int64(baseDelay)))    // 0 to baseDelay
+			backoff := baseDelay + jitter
+			log.Printf("[DEBUG] Mkdir %q: inode slot collision, retry %d/%d (backoff %v)", req.Name, attempt+1, MaxCreateRetries, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		return node, err
+	}
+	log.Printf("[WARN] Mkdir %q: exhausted %d retries due to inode slot collisions", req.Name, MaxCreateRetries)
+	return nil, syscall.EAGAIN
+}
+
+// mkdirInternal performs the actual directory creation with two-phase allocation.
+//
 // Lock ordering: This function uses a two-phase allocation pattern to respect
 // the lock hierarchy (BlockBitmap Level 6 < Inode Level 8):
 //  1. FindFreeSlot() - no locks
@@ -439,7 +500,9 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 //
 // Note: dirMgr.InitDirectory() already handles lock ordering internally by allocating
 // blocks before acquiring the inode lock.
-func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+//
+// Returns errRetryCreate if the inode slot was claimed by another node.
+func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
 	// Phase 1: Find a free inode slot (no distributed locks held)
 	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
 	if err != nil {
@@ -469,8 +532,9 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); removeErr != nil {
 			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", req.Name, removeErr)
 		}
+		// If slot was taken by another node, signal retry with a different slot
 		if err == inode.ErrInodeInUse {
-			return nil, syscall.EAGAIN
+			return nil, errRetryCreate
 		}
 		return nil, syscall.ENOSPC
 	}
