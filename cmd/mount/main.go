@@ -25,6 +25,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
 func main() {
@@ -48,6 +49,11 @@ func main() {
 		multicastPort    = flag.Int("mcast-port", 31337, "Multicast/unicast port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
+
+		// TRIM configuration
+		trimEnabled   = flag.Bool("trim", true, "Enable batched TRIM for freed blocks")
+		trimBatchSize = flag.Int("trim-batch", 256, "TRIM batch size (blocks before flush)")
+		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Max age before TRIM flush")
 	)
 	flag.Parse()
 
@@ -227,8 +233,29 @@ func main() {
 		log.Println("Broadcast: disabled (using storage-only cache validation)")
 	}
 
-	// Create filesystem with journal for crash consistency
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, nodeUUID, dataOffset)
+	// Create TRIM manager for batched block discards
+	var trimMgr *trim.Manager
+	if *trimEnabled {
+		trimCfg := trim.Config{
+			BatchSize:  *trimBatchSize,
+			MaxAge:     *trimMaxAge,
+			DataOffset: dataOffset,
+			Enabled:    true,
+		}
+		trimMgr = trim.NewManager(dev, trimCfg)
+
+		// Connect TRIM manager to bitmap for automatic queueing
+		bm.SetTrimManager(trimMgr)
+
+		// Start TRIM background loop
+		trimMgr.Start()
+		log.Printf("TRIM: enabled (batch=%d, maxAge=%v)", *trimBatchSize, *trimMaxAge)
+	} else {
+		log.Println("TRIM: disabled")
+	}
+
+	// Create filesystem with journal and TRIM for crash consistency
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -283,7 +310,14 @@ func main() {
 		<-sigChan
 		log.Println("Received signal, unmounting...")
 
-		// Stop journal first to ensure all transactions are checkpointed
+		// Stop TRIM manager first to flush pending discards
+		if trimMgr != nil {
+			if err := trimMgr.Stop(); err != nil {
+				log.Printf("Warning: Failed to stop TRIM manager: %v", err)
+			}
+		}
+
+		// Stop journal to ensure all transactions are checkpointed
 		if j != nil {
 			if err := j.Stop(); err != nil {
 				log.Printf("Warning: Failed to stop journal: %v", err)
@@ -306,6 +340,12 @@ func main() {
 	}
 
 	// Clean shutdown
+	if trimMgr != nil {
+		if err := trimMgr.Stop(); err != nil {
+			log.Printf("Warning: Failed to stop TRIM manager on exit: %v", err)
+		}
+	}
+
 	if j != nil {
 		if err := j.Stop(); err != nil {
 			log.Printf("Warning: Failed to stop journal on exit: %v", err)
@@ -314,6 +354,14 @@ func main() {
 
 	if err := cacheMgr.StopBroadcast(); err != nil {
 		log.Printf("Warning: Failed to stop broadcast on exit: %v", err)
+	}
+
+	// Print final TRIM stats
+	if trimMgr != nil {
+		trimStats := trimMgr.Stats()
+		log.Printf("TRIM stats: queued=%d, discarded=%d, calls=%d, coalesce=%.1f",
+			trimStats.BlocksQueued, trimStats.BlocksDiscarded,
+			trimStats.DiscardCalls, trimStats.CoalesceRatio)
 	}
 
 	// Print final journal stats

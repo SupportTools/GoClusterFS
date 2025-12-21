@@ -27,6 +27,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
+	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
 // errRetryWrite is an internal sentinel error indicating that a concurrent
@@ -64,6 +65,7 @@ type FS struct {
 	dirMgr    *dir.Manager
 	cacheMgr  *cache.Manager   // Inode cache for read optimization
 	journal   *journal.Journal // Per-node journal for crash consistency (WAL)
+	trimMgr   *trim.Manager    // TRIM manager for batched block discards
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -140,6 +142,7 @@ func NewWithComponents(
 	dirMgr *dir.Manager,
 	cacheMgr *cache.Manager,
 	j *journal.Journal, // May be nil for backward compatibility
+	tm *trim.Manager, // May be nil if TRIM is disabled
 	nodeUUID [16]byte,
 	dataOffset uint64,
 ) *FS {
@@ -151,6 +154,7 @@ func NewWithComponents(
 		dirMgr:     dirMgr,
 		cacheMgr:   cacheMgr,
 		journal:    j,
+		trimMgr:    tm,
 		nodeUUID:   nodeUUID,
 		dataOffset: dataOffset,
 		uid:        uint32(os.Getuid()),
@@ -160,7 +164,14 @@ func NewWithComponents(
 
 // Close closes the filesystem and releases resources.
 func (f *FS) Close() error {
-	// Stop journal first to ensure clean shutdown
+	// Stop TRIM manager first to flush pending discards
+	if f.trimMgr != nil {
+		if err := f.trimMgr.Stop(); err != nil {
+			log.Printf("Warning: failed to stop TRIM manager cleanly: %v", err)
+		}
+	}
+
+	// Stop journal to ensure clean shutdown
 	if f.journal != nil {
 		if err := f.journal.Stop(); err != nil {
 			log.Printf("Warning: failed to stop journal cleanly: %v", err)
@@ -849,16 +860,19 @@ type File struct {
 }
 
 var (
-	_ fs.Node          = (*File)(nil)
-	_ fs.HandleReader  = (*File)(nil)
-	_ fs.HandleWriter  = (*File)(nil)
-	_ fs.NodeSetattrer = (*File)(nil)
-	_ fs.NodeFsyncer   = (*File)(nil)
+	_ fs.Node             = (*File)(nil)
+	_ fs.HandleReader     = (*File)(nil)
+	_ fs.HandleWriter     = (*File)(nil)
+	_ fs.NodeSetattrer    = (*File)(nil)
+	_ fs.NodeFsyncer      = (*File)(nil)
+	_ fs.HandleFAllocater = (*File)(nil)
 )
 
 // Attr returns file attributes.
 func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
-	ino, err := f.fs.getInode(f.inodeNum)
+	// Read directly from disk to get fresh inode state.
+	// In multi-node scenarios, another node may have updated the inode.
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -883,12 +897,14 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 // Read reads file data.
 func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	ino, err := f.fs.getInode(f.inodeNum)
+	// Read directly from disk to get fresh inode state.
+	// In multi-node scenarios, another node may have updated the inode.
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
 		return syscall.EIO
 	}
 
-	// Check bounds
+	// Check bounds using the authoritative size from disk
 	if uint64(req.Offset) >= ino.Size {
 		resp.Data = nil
 		return nil
@@ -1063,7 +1079,7 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 				ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum)
 				if err == nil {
 					// Block was allocated by another node - use it
-					goto writeBlock
+					goto handleExtent
 				}
 			}
 
@@ -1093,7 +1109,48 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 			})
 		}
 
-	writeBlock:
+	handleExtent:
+		// Check if this is an unwritten extent (from fallocate).
+		// If so, we need to clear the Unwritten flag on first write.
+		if ext.Flags&extent.FlagUnwritten != 0 {
+			// First write to unwritten block - need to clear flag
+			if !lockHeld && f.fs.lockMgr != nil {
+				// Acquire lock before modifying extent
+				if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+					log.Printf("[DEBUG] Write inode %d: failed to acquire lock for unwritten: %v", f.inodeNum, err)
+					return 0, syscall.EIO
+				}
+				lockHeld = true
+
+				// Re-read inode after acquiring lock
+				freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+				if err != nil {
+					log.Printf("[DEBUG] Write inode %d: re-read for unwritten failed: %v", f.inodeNum, err)
+					return 0, syscall.EIO
+				}
+				if freshIno.MetaGeneration != ino.MetaGeneration {
+					log.Printf("[DEBUG] Write inode %d: MetaGeneration changed during unwritten clear",
+						f.inodeNum)
+					return 0, errRetryWrite
+				}
+				ino = freshIno
+
+				// Re-lookup extent - another node may have already cleared it
+				ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum)
+				if err != nil {
+					log.Printf("[DEBUG] Write inode %d: extent disappeared during unwritten clear",
+						f.inodeNum)
+					return 0, errRetryWrite
+				}
+			}
+
+			// Clear the Unwritten flag (if still set)
+			if f.fs.extentMgr.ClearUnwritten(ino, ext) {
+				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
+					f.inodeNum, blockNum)
+			}
+		}
+
 		// Calculate physical location
 		physBlock := ext.PhysicalBlock + extOffset
 		diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
@@ -1165,9 +1222,35 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 	}
 
 	// Update inode size if extended
-	newSize := ino.Size
-	if offset > ino.Size {
-		newSize = offset
+	// To avoid lost-update race when multiple nodes write to the same file:
+	// 1. Acquire exclusive inode lock (if not already held)
+	// 2. Re-read inode to get freshest size from other nodes
+	// 3. Calculate newSize = max(fresh_size, our_write_end)
+	// 4. Write inode with updated size
+	// This serializes the read-modify-write cycle.
+	acquiredLockForSize := false
+	if !lockHeld && f.fs.lockMgr != nil {
+		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+			log.Printf("[DEBUG] Write inode %d: failed to acquire lock for size update: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+		acquiredLockForSize = true
+		lockHeld = true
+	}
+
+	// Re-read the inode while holding the lock to get the freshest size
+	freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Write inode %d: re-read inode failed: %v", f.inodeNum, err)
+		if acquiredLockForSize {
+			f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+		}
+		return 0, syscall.EIO
+	}
+	// Use the freshest size from disk, then calculate new size as max(fresh_size, our_write_end)
+	newSize := freshIno.Size
+	if offset > newSize {
+		newSize = offset // Our write extended the file
 	}
 	newMtime := time.Now().UnixNano()
 
@@ -1218,6 +1301,9 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 	if lockHeld {
 		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 			log.Printf("[DEBUG] Write inode %d: WriteWithLockHeld failed: %v", f.inodeNum, err)
+			if acquiredLockForSize {
+				f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+			}
 			return 0, syscall.EIO
 		}
 	} else {
@@ -1227,8 +1313,19 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 		}
 	}
 
+	// Release the lock we acquired for size update
+	if acquiredLockForSize {
+		f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+	}
+
 	// Cache the freshly-written inode for subsequent reads
 	f.fs.cacheInode(ino)
+
+	// Broadcast inode invalidation to other nodes for immediate visibility.
+	// This is fire-and-forget - doesn't block the write operation.
+	if f.fs.cacheMgr != nil {
+		f.fs.cacheMgr.BroadcastInvalidateInode(uint32(f.inodeNum), ino.DataGeneration, ino.MetaGeneration)
+	}
 
 	return bytesWritten, nil
 }
@@ -1388,4 +1485,89 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 // Fsync flushes file data to disk.
 func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
 	return f.fs.dev.Sync()
+}
+
+// FAllocate pre-allocates space for the file using unwritten (lazy-zero) extents.
+// Supports mode==0 (allocate and extend size) and FAllocateKeepSize (allocate only).
+// PUNCH_HOLE and ZERO_RANGE are not yet implemented.
+func (f *File) FAllocate(ctx context.Context, req *fuse.FAllocateRequest) error {
+	// Only support mode 0 (allocate) and KEEP_SIZE for now
+	if req.Mode != 0 && req.Mode != fuse.FAllocateKeepSize {
+		// PUNCH_HOLE and ZERO_RANGE not yet implemented
+		log.Printf("[DEBUG] FAllocate inode %d: unsupported mode %d", f.inodeNum, req.Mode)
+		return syscall.EOPNOTSUPP
+	}
+
+	// Read current inode
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] FAllocate inode %d: read failed: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
+
+	// Acquire inode lock for allocation
+	if f.fs.lockMgr != nil {
+		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+			log.Printf("[DEBUG] FAllocate inode %d: lock failed: %v", f.inodeNum, err)
+			return syscall.EIO
+		}
+		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+
+		// Re-read inode after lock
+		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
+		if err != nil {
+			log.Printf("[DEBUG] FAllocate inode %d: re-read failed: %v", f.inodeNum, err)
+			return syscall.EIO
+		}
+	}
+
+	// Calculate block range
+	startBlock := req.Offset / BlockSize
+	endOffset := req.Offset + req.Length
+	endBlock := (endOffset + BlockSize - 1) / BlockSize // Round up
+
+	log.Printf("[DEBUG] FAllocate inode %d: offset=%d length=%d blocks=%d-%d",
+		f.inodeNum, req.Offset, req.Length, startBlock, endBlock-1)
+
+	// Allocate unwritten extents for each block
+	for blockNum := startBlock; blockNum < endBlock; blockNum++ {
+		// Check if already allocated
+		_, _, err := f.fs.extentMgr.Lookup(ino, blockNum)
+		if err == nil {
+			continue // Already allocated, skip
+		}
+
+		// Allocate as unwritten (lazy-zero)
+		_, err = f.fs.extentMgr.AllocateUnwritten(ctx, ino, blockNum, 1)
+		if err != nil {
+			log.Printf("[DEBUG] FAllocate inode %d: AllocateUnwritten block %d failed: %v",
+				f.inodeNum, blockNum, err)
+			return syscall.ENOSPC
+		}
+	}
+
+	// Update file size if not KEEP_SIZE and new size is larger
+	if req.Mode == 0 {
+		newSize := req.Offset + req.Length
+		if newSize > ino.Size {
+			ino.Size = newSize
+		}
+	}
+
+	// Update timestamps
+	now := time.Now().UnixNano()
+	ino.Mtime = now
+	ino.Ctime = now
+	ino.MetaGeneration++
+
+	// Write updated inode
+	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+		log.Printf("[DEBUG] FAllocate inode %d: write inode failed: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
+
+	log.Printf("[DEBUG] FAllocate inode %d: success, AllocatedBlocks=%d WrittenBlocks=%d Size=%d",
+		f.inodeNum, ino.AllocatedBlocks, ino.WrittenBlocks, ino.Size)
+
+	return nil
 }

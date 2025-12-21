@@ -1,0 +1,627 @@
+# Test Manifest for GoClusterFS
+# This file is the single source of truth for test coverage across all environments.
+#
+# Priority levels:
+#   critical - CI fails if missing from any required environment
+#   high     - CI warns, should be addressed
+#   medium   - Tracked but optional
+#   go_only  - Unit tests, not applicable to Docker/VM
+#   vm_only  - Requires VM features (power failure, O_DIRECT)
+#   docker_only - Docker-specific tests
+#
+# Environment format: filename::FunctionName
+#   go:     integration_test.go::TestFunctionName
+#   docker: run-tests.sh::test_function_name
+#   vm:     run-vm-tests.sh::test_function_name
+#
+# Use TODO to mark tests that need to be implemented
+
+version: 1
+
+scenarios:
+  # ===========================================================================
+  # BASIC FILE OPERATIONS (Single-Node)
+  # ===========================================================================
+
+  - id: mount-unmount
+    name: Mount and unmount filesystem
+    description: Basic FUSE mount/unmount cycle
+    priority: go_only
+    environments:
+      go: integration_test.go::TestMountUnmount
+
+  - id: create-read-file
+    name: Create and read file
+    description: Create a file, write content, read it back
+    priority: critical
+    environments:
+      go: integration_test.go::TestCreateReadFile
+      docker: run-tests.sh::test_create_read_file
+      vm: run-vm-tests.sh::test_create_read_file
+
+  - id: create-directory
+    name: Create directory
+    description: Create a directory and verify it exists
+    priority: critical
+    environments:
+      go: integration_test.go::TestCreateDirectory
+      docker: run-tests.sh::test_create_directory
+      vm: run-vm-tests.sh::test_create_directory
+
+  - id: file-in-directory
+    name: File in directory
+    description: Create file inside a directory
+    priority: high
+    environments:
+      go: integration_test.go::TestFileInDirectory
+      docker: run-tests.sh::test_file_in_directory
+      vm: run-vm-tests.sh::test_file_in_directory
+
+  - id: data-persistence
+    name: Data persistence after unmount
+    description: Data survives unmount/remount cycle
+    priority: critical
+    environments:
+      go: integration_test.go::TestDataPersistence
+      docker: run-tests.sh::test_data_persistence
+      vm: run-vm-tests.sh::test_data_persistence
+
+  - id: large-file
+    name: Large file handling
+    description: Create and read file larger than one block
+    priority: high
+    environments:
+      go: integration_test.go::TestLargeFile
+      docker: run-tests.sh::test_large_file
+      vm: run-vm-tests.sh::test_large_file
+
+  - id: many-files
+    name: Many files in directory
+    description: Create 100+ files in a directory
+    priority: high
+    environments:
+      go: integration_test.go::TestManyFiles
+      docker: run-tests.sh::test_many_files
+      vm: run-vm-tests.sh::test_many_files
+
+  - id: nested-directories
+    name: Nested directory hierarchy
+    description: Create deeply nested directory structure
+    priority: high
+    environments:
+      go: integration_test.go::TestNestedDirectories
+      docker: run-tests.sh::test_nested_directories
+      vm: run-vm-tests.sh::test_nested_directories
+
+  - id: delete-file
+    name: Delete file
+    description: Delete a file and verify removal
+    priority: critical
+    environments:
+      go: integration_test.go::TestDeleteFile
+      docker: run-tests.sh::test_delete_file
+      vm: run-vm-tests.sh::test_delete_file
+
+  - id: delete-directory
+    name: Delete empty directory
+    description: Remove an empty directory
+    priority: high
+    environments:
+      go: integration_test.go::TestDeleteDirectory
+      docker: run-tests.sh::test_delete_directory
+      vm: run-vm-tests.sh::test_delete_directory
+
+  - id: delete-non-empty-directory
+    name: Delete non-empty directory fails
+    description: Cannot delete directory with contents
+    priority: medium
+    environments:
+      go: integration_test.go::TestDeleteNonEmptyDirectory
+      docker: TODO
+      vm: TODO
+
+  - id: file-attributes
+    name: File attributes (mtime, ctime)
+    description: File timestamps are set correctly
+    priority: medium
+    environments:
+      go: integration_test.go::TestFileAttributes
+      docker: TODO
+      vm: TODO
+
+  - id: long-filename
+    name: Long filename (255 chars)
+    description: Create file with maximum length name
+    priority: medium
+    environments:
+      go: integration_test.go::TestLongFilename
+      docker: TODO
+      vm: TODO
+
+  - id: special-characters
+    name: Special characters in filename
+    description: Unicode and spaces in filenames
+    priority: medium
+    environments:
+      go: integration_test.go::TestSpecialCharacters
+      docker: TODO
+      vm: TODO
+
+  - id: file-not-found
+    name: File not found error
+    description: Reading non-existent file returns error
+    priority: medium
+    environments:
+      go: integration_test.go::TestFileNotFound
+      docker: TODO
+      vm: TODO
+
+  - id: overwrite-file
+    name: Overwrite existing file
+    description: Writing to existing file replaces content
+    priority: critical
+    environments:
+      go: integration_test.go::TestOverwriteFile
+      docker: run-tests.sh::test_overwrite_file
+      vm: run-vm-tests.sh::test_overwrite_file
+
+  - id: truncate-file
+    name: Truncate file
+    description: Reduce file size via truncate
+    priority: high
+    environments:
+      go: integration_test.go::TestTruncateFile
+      docker: run-tests.sh::test_truncate_file
+      vm: run-vm-tests.sh::test_truncate_file
+
+  - id: filesystem-stats
+    name: Filesystem statistics
+    description: df/statfs returns correct values
+    priority: medium
+    environments:
+      go: integration_test.go::TestFilesystemStats
+      docker: TODO
+      vm: TODO
+
+  - id: append-file
+    name: Append to file
+    description: Append data to existing file
+    priority: high
+    environments:
+      go: integration_test.go::TestAppendFile
+      docker: run-tests.sh::test_append_file
+      vm: run-vm-tests.sh::test_append_file
+
+  - id: rename-file
+    name: Rename file
+    description: Rename a file within directory
+    priority: high
+    environments:
+      go: integration_test.go::TestRename
+      docker: run-tests.sh::test_rename_file
+      vm: run-vm-tests.sh::test_rename_file
+
+  - id: copy-file
+    name: Copy file
+    description: Copy file using standard tools
+    priority: medium
+    environments:
+      go: integration_test.go::TestCopyFile
+      docker: TODO
+      vm: TODO
+
+  - id: mkdir-p
+    name: Recursive mkdir
+    description: Create nested directories in one operation
+    priority: medium
+    environments:
+      go: integration_test.go::TestMkdirP
+      docker: TODO
+      vm: TODO
+
+  - id: stress-single-node
+    name: Single-node stress test
+    description: Rapid file operations on single node
+    priority: high
+    environments:
+      go: integration_test.go::TestStress
+      docker: run-tests.sh::test_stress_single_node
+      vm: run-vm-tests.sh::test_stress_single_node
+
+  # ===========================================================================
+  # MULTI-NODE OPERATIONS
+  # ===========================================================================
+
+  - id: multinode-concurrent-file-creation
+    name: Concurrent file creation across nodes
+    description: Multiple nodes create different files simultaneously
+    priority: critical
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentFileCreation
+      docker: run-tests.sh::test_concurrent_file_creation
+      vm: run-vm-tests.sh::test_concurrent_file_creation
+
+  - id: multinode-concurrent-writes
+    name: Concurrent writes to different files
+    description: Multiple nodes write to different files simultaneously
+    priority: critical
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentWrites
+      docker: run-tests.sh::test_concurrent_writes
+      vm: run-vm-tests.sh::test_concurrent_writes
+
+  - id: multinode-sequential-access
+    name: Sequential access across nodes
+    description: One node writes, another reads
+    priority: critical
+    environments:
+      go: multinode_test.go::TestMultiNodeSequentialAccess
+      docker: run-tests.sh::test_sequential_access
+      vm: run-vm-tests.sh::test_sequential_access
+
+  - id: multinode-crash-recovery
+    name: Node crash recovery
+    description: Surviving nodes continue after one crashes
+    priority: critical
+    environments:
+      go: multinode_test.go::TestMultiNodeCrashRecovery
+      docker: run-tests.sh::test_container_kill_recovery
+      vm: run-vm-tests.sh::test_vm_kill_recovery
+
+  - id: multinode-concurrent-directory-ops
+    name: Concurrent directory operations
+    description: Multiple nodes create directories simultaneously
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentDirectoryOps
+      docker: run-tests.sh::test_concurrent_directory_ops
+      vm: run-vm-tests.sh::test_concurrent_directory_ops
+
+  - id: multinode-same-file-writes-2nodes
+    name: Concurrent same-file writes (2 nodes)
+    description: Two nodes write to different offsets of same file
+    priority: critical
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentSameFileWrites
+      docker: run-tests.sh::test_concurrent_same_file_writes
+      vm: run-vm-tests.sh::test_concurrent_same_file_writes
+
+  - id: multinode-same-file-writes-3nodes
+    name: Concurrent same-file writes (3 nodes)
+    description: Three nodes write to different offsets of same file
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentSameFileWrites3Nodes
+      docker: run-tests.sh::test_concurrent_same_file_writes_3nodes
+      vm: run-vm-tests.sh::test_concurrent_same_file_writes_3vms
+
+  - id: multinode-mixed-size-writes
+    name: Mixed size concurrent writes
+    description: One node writes within file, another extends
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeMixedSizeWrites
+      docker: run-tests.sh::test_mixed_size_writes
+      vm: run-vm-tests.sh::test_mixed_size_writes
+
+  - id: multinode-overlapping-block-writes
+    name: Overlapping block writes
+    description: Multiple nodes write to same block at different offsets
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOverlappingBlockWrites
+      docker: run-tests.sh::test_overlapping_block_writes
+      vm: run-vm-tests.sh::test_overlapping_block_writes
+
+  - id: multinode-write-stress
+    name: Multi-node write stress
+    description: Multiple rounds of concurrent writes
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeWriteStress
+      docker: run-tests.sh::test_concurrent_write_stress
+      vm: run-vm-tests.sh::test_concurrent_write_stress
+
+  - id: multinode-reversed-write-order
+    name: Reversed write order
+    description: High-offset and low-offset writes concurrently
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeReversedWriteOrder
+      docker: run-tests.sh::test_reversed_write_order
+      vm: run-vm-tests.sh::test_reversed_write_order
+
+  # ===========================================================================
+  # NETWORK AND RESILIENCE TESTS
+  # ===========================================================================
+
+  - id: network-partition
+    name: Network partition handling
+    description: Nodes handle network isolation gracefully
+    priority: high
+    environments:
+      go: multinode_test.go::TestNetworkPartition
+      docker: run-tests.sh::test_network_partition
+      vm: run-vm-tests.sh::test_network_partition
+
+  - id: rolling-restart
+    name: Rolling restart
+    description: Nodes can be restarted one at a time
+    priority: high
+    environments:
+      go: multinode_test.go::TestRollingRestart
+      docker: run-tests.sh::test_rolling_restart
+      vm: run-vm-tests.sh::test_rolling_restart
+
+  - id: stress-random-failures
+    name: Stress with random failures
+    description: System handles random node failures during load
+    priority: high
+    environments:
+      go: multinode_test.go::TestStressRandomFailures
+      docker: run-tests.sh::test_stress_random_failures
+      vm: run-vm-tests.sh::test_stress_random_failures
+
+  # ===========================================================================
+  # JOURNAL AND RECOVERY TESTS
+  # ===========================================================================
+
+  - id: journal-recovery-multinode
+    name: Multi-node journal recovery
+    description: Journal recovery works across nodes
+    priority: critical
+    environments:
+      go: multinode_recovery_test.go::TestMultiNodeJournalRecovery
+      docker: run-tests.sh::test_journal_recovery_multinode
+      vm: run-vm-tests.sh::test_journal_recovery_multinode
+
+  - id: journal-recovery-multiple-files
+    name: Recovery with multiple files
+    description: Journal recovers multiple pending file operations
+    priority: high
+    environments:
+      go: multinode_recovery_test.go::TestMultiNodeRecoveryWithMultipleFiles
+      docker: run-tests.sh::test_journal_recovery_multiple_files
+      vm: run-vm-tests.sh::test_journal_recovery_multiple_files
+
+  - id: journal-recovery-large-file
+    name: Recovery with large file
+    description: Journal recovers large file writes
+    priority: high
+    environments:
+      go: multinode_recovery_test.go::TestMultiNodeRecoveryWithLargeFile
+      docker: run-tests.sh::test_journal_recovery_large_file
+      vm: run-vm-tests.sh::test_journal_recovery_large_file
+
+  - id: journal-recovery-idempotency
+    name: Recovery idempotency
+    description: Repeated recovery is safe
+    priority: high
+    environments:
+      go: multinode_recovery_test.go::TestMultiNodeRecoveryIdempotency
+      docker: run-tests.sh::test_journal_recovery_idempotency
+      vm: run-vm-tests.sh::test_journal_recovery_idempotency
+
+  - id: journal-crash-recovery-file
+    name: Journal crash recovery (file)
+    description: File operations survive simulated crash
+    priority: high
+    environments:
+      go: journal_test.go::TestJournalCrashRecoveryFile
+      docker: run-tests.sh::test_journal_crash_recovery_file
+      vm: run-vm-tests.sh::test_journal_crash_recovery_file
+
+  - id: journal-crash-recovery-directory
+    name: Journal crash recovery (directory)
+    description: Directory operations survive simulated crash
+    priority: high
+    environments:
+      go: journal_test.go::TestJournalCrashRecoveryDirectory
+      docker: run-tests.sh::test_journal_crash_recovery_directory
+      vm: run-vm-tests.sh::test_journal_crash_recovery_directory
+
+  - id: journal-crash-recovery-multiple-ops
+    name: Journal crash recovery (multiple ops)
+    description: Multiple operations survive simulated crash
+    priority: high
+    environments:
+      go: journal_test.go::TestJournalCrashRecoveryMultipleOps
+      docker: run-tests.sh::test_journal_crash_recovery_multiple_ops
+      vm: run-vm-tests.sh::test_journal_crash_recovery_multiple_ops
+
+  - id: journal-crash-during-write
+    name: Crash during write
+    description: System recovers from crash mid-write
+    priority: high
+    environments:
+      go: journal_test.go::TestJournalCrashDuringWrite
+      docker: run-tests.sh::test_journal_crash_during_write
+      vm: run-vm-tests.sh::test_journal_crash_during_write
+
+  - id: journal-disabled
+    name: Journal disabled mode
+    description: Filesystem works with journal disabled
+    priority: medium
+    environments:
+      go: journal_test.go::TestJournalDisabled
+      docker: TODO
+      vm: TODO
+
+  - id: journal-remount
+    name: Journal remount
+    description: Journal state preserved across remounts
+    priority: medium
+    environments:
+      go: journal_test.go::TestJournalRemountOpensExisting
+      docker: TODO
+      vm: TODO
+
+  # ===========================================================================
+  # VM-ONLY TESTS (Require QEMU/KVM features)
+  # ===========================================================================
+
+  - id: power-failure
+    name: Power failure simulation
+    description: Hard VM kill during write, verify recovery
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_power_failure
+
+  - id: power-failure-concurrent
+    name: Power failure during concurrent writes
+    description: Hard kill during multi-node concurrent writes
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_concurrent_writes_power_failure
+
+  - id: odirect-validation
+    name: O_DIRECT bypass validation
+    description: Verify O_DIRECT bypasses page cache
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_odirect_validation
+
+  - id: long-stability
+    name: Long-running stability
+    description: Extended operation test (5+ minutes)
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_stability
+
+  # ===========================================================================
+  # FUTURE TESTS (Not yet implemented anywhere)
+  # ===========================================================================
+
+  - id: symbolic-links
+    name: Symbolic links
+    description: Create and follow symbolic links
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: hard-links
+    name: Hard links
+    description: Create and verify hard links
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: file-permissions
+    name: File permissions (chmod)
+    description: Set and verify file permissions
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: file-ownership
+    name: File ownership (chown)
+    description: Set and verify file ownership
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: posix-locks
+    name: POSIX file locks
+    description: fcntl/flock locking behavior
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: sparse-files
+    name: Sparse file handling
+    description: Holes in files are preserved
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: inode-exhaustion
+    name: Inode exhaustion
+    description: Graceful handling when inodes full
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: block-exhaustion
+    name: Block exhaustion
+    description: Graceful handling when blocks full
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  - id: concurrent-deletes
+    name: Concurrent deletes
+    description: Multiple nodes delete files simultaneously
+    priority: medium
+    environments:
+      go: TODO
+      docker: TODO
+      vm: TODO
+
+  # ===========================================================================
+  # TRIM MANAGER TESTS (Phase 5: Thin Provisioning)
+  # ===========================================================================
+
+  - id: trim-coalesce
+    name: TRIM block coalescing
+    description: Tests that adjacent blocks are coalesced into contiguous ranges
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestCoalesceBlocks
+
+  - id: trim-batch-threshold
+    name: TRIM batch threshold trigger
+    description: Tests that TRIM is flushed when batch size is reached
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestBatchThreshold
+
+  - id: trim-age-threshold
+    name: TRIM age threshold trigger
+    description: Tests that TRIM is flushed after max age
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestAgeThreshold
+
+  - id: trim-queue-range
+    name: TRIM range queueing
+    description: Tests that multiple contiguous blocks can be queued efficiently
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestQueueRange
+
+  - id: trim-graceful-shutdown
+    name: TRIM graceful shutdown flush
+    description: Tests that pending TRIMs are flushed on shutdown
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestGracefulShutdown
+
+  - id: trim-coalesce-ratio
+    name: TRIM coalesce ratio tracking
+    description: Tests that coalesce ratio stats are tracked correctly
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestCoalesceRatio
+
+  - id: trim-thread-safety
+    name: TRIM thread safety
+    description: Tests that concurrent Queue and Stats calls are safe
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestStatsAreThreadSafe

@@ -41,6 +41,16 @@ var (
 	ErrAlreadyFree      = errors.New("block already free")
 )
 
+// TrimQueuer is the interface for queueing TRIM/discard operations.
+// This allows the bitmap to notify a TRIM manager when blocks are freed,
+// without creating a circular dependency between packages.
+type TrimQueuer interface {
+	// Queue adds a single freed block to the TRIM queue.
+	Queue(blockNum uint64)
+	// QueueRange adds multiple contiguous freed blocks to the TRIM queue.
+	QueueRange(startBlock, count uint64)
+}
+
 // Region manages block allocation using a bitmap stored on disk.
 type Region struct {
 	mu          sync.RWMutex
@@ -50,6 +60,7 @@ type Region struct {
 	freeBlocks  uint64        // Cached count of free blocks
 	lockMgr     *lock.Manager // For distributed locking (optional)
 	nodeUUID    [16]byte      // This node's UUID for locking
+	trimMgr     TrimQueuer    // Optional TRIM manager for batched discards
 }
 
 // NewRegion creates a new bitmap region manager.
@@ -195,6 +206,12 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 
 	r.freeBlocks++
 	log.Printf("[DEBUG] bitmap.Free: freed block %d, freeBlocks=%d", blockNum, r.freeBlocks)
+
+	// Queue block for TRIM if manager is configured
+	if r.trimMgr != nil {
+		r.trimMgr.Queue(blockNum)
+	}
+
 	return nil
 }
 
@@ -245,6 +262,14 @@ func (r *Region) AllocatedCount() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.totalBlocks - r.freeBlocks
+}
+
+// SetTrimManager sets the TRIM manager for batched block discards.
+// When set, freed blocks will be queued for TRIM rather than immediately discarded.
+func (r *Region) SetTrimManager(tm TrimQueuer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.trimMgr = tm
 }
 
 // Scan reads the entire bitmap and returns accurate free/allocated counts.
