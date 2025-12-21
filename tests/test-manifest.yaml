@@ -625,3 +625,42 @@ scenarios:
     priority: go_only
     environments:
       go: internal/trim/trim_test.go::TestStatsAreThreadSafe
+
+  # ===========================================================================
+  # SPACE REPORTING TESTS (Phase 5: Thin Provisioning)
+  # ===========================================================================
+
+  - id: file-stat-blocks
+    name: File st_blocks accuracy
+    description: Tests that st_blocks reports actual allocated blocks correctly
+    priority: go_only
+    environments:
+      go: integration_test.go::TestFileStatBlocks
+
+  - id: statfs-available-blocks
+    name: Statfs bavail accuracy
+    description: Tests that bavail decreases correctly after block allocation
+    priority: go_only
+    environments:
+      go: integration_test.go::TestStatfsAvailableBlocks
+
+  - id: sparse-file-blocks
+    name: Sparse file block reporting
+    description: Tests that sparse files report Size > Blocks × 512
+    priority: go_only
+    environments:
+      go: integration_test.go::TestSparseFileBlocks
+
+  - id: fallocate-unwritten-blocks
+    name: Fallocate unwritten block tracking
+    description: Tests that fallocate allocates blocks without counting as written
+    priority: go_only
+    environments:
+      go: integration_test.go::TestFallocateUnwrittenBlocks
+
+  - id: multiblock-file-stat
+    name: Multi-block file stat
+    description: Tests st_blocks for files spanning multiple blocks
+    priority: go_only
+    environments:
+      go: integration_test.go::TestMultiBlockFileStatBlocks
