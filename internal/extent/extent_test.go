@@ -720,6 +720,166 @@ func TestAreContiguous(t *testing.T) {
 	}
 }
 
+func TestAllocateBlocksTracksWrittenBlocks(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate 5 blocks at logical block 0
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 5)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	if ext.LogicalBlock != 0 {
+		t.Errorf("Allocated LogicalBlock = %d, want 0", ext.LogicalBlock)
+	}
+	if ext.Length != 5 {
+		t.Errorf("Allocated Length = %d, want 5", ext.Length)
+	}
+
+	// Verify both AllocatedBlocks and WrittenBlocks are updated
+	if ino.AllocatedBlocks != 5 {
+		t.Errorf("AllocatedBlocks = %d, want 5", ino.AllocatedBlocks)
+	}
+	if ino.WrittenBlocks != 5 {
+		t.Errorf("WrittenBlocks = %d, want 5", ino.WrittenBlocks)
+	}
+}
+
+func TestTruncateAdjustsWrittenBlocks(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert extent covering blocks 0-9 (written, not unwritten)
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated, // Not FlagUnwritten
+	}
+	mgr.Insert(ctx, ino, ext)
+	ino.AllocatedBlocks = 10
+	ino.WrittenBlocks = 10
+	ino.Size = 10 * BlockSize
+
+	// Truncate to 5 blocks
+	err := mgr.Truncate(ctx, ino, 5*BlockSize)
+	if err != nil {
+		t.Fatalf("Truncate failed: %v", err)
+	}
+
+	// Verify both AllocatedBlocks and WrittenBlocks are decremented
+	if ino.AllocatedBlocks != 5 {
+		t.Errorf("AllocatedBlocks = %d, want 5", ino.AllocatedBlocks)
+	}
+	if ino.WrittenBlocks != 5 {
+		t.Errorf("WrittenBlocks = %d, want 5", ino.WrittenBlocks)
+	}
+}
+
+func TestTruncateToZeroAdjustsWrittenBlocks(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert written extent
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated,
+	}
+	mgr.Insert(ctx, ino, ext)
+	ino.AllocatedBlocks = 10
+	ino.WrittenBlocks = 10
+	ino.Size = 10 * BlockSize
+
+	// Truncate to 0
+	err := mgr.Truncate(ctx, ino, 0)
+	if err != nil {
+		t.Fatalf("Truncate to 0 failed: %v", err)
+	}
+
+	if ino.AllocatedBlocks != 0 {
+		t.Errorf("AllocatedBlocks after truncate = %d, want 0", ino.AllocatedBlocks)
+	}
+	if ino.WrittenBlocks != 0 {
+		t.Errorf("WrittenBlocks after truncate = %d, want 0", ino.WrittenBlocks)
+	}
+}
+
+func TestTruncateUnwrittenExtentDoesNotAffectWrittenBlocks(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert unwritten extent (lazy zero, pre-allocated but not written)
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        10,
+		Flags:         FlagAllocated | FlagUnwritten,
+	}
+	mgr.Insert(ctx, ino, ext)
+	ino.AllocatedBlocks = 10
+	ino.WrittenBlocks = 0 // Unwritten extents don't count as written
+	ino.Size = 10 * BlockSize
+
+	// Truncate to 0
+	err := mgr.Truncate(ctx, ino, 0)
+	if err != nil {
+		t.Fatalf("Truncate to 0 failed: %v", err)
+	}
+
+	// AllocatedBlocks should be decremented, but WrittenBlocks stays at 0
+	if ino.AllocatedBlocks != 0 {
+		t.Errorf("AllocatedBlocks after truncate = %d, want 0", ino.AllocatedBlocks)
+	}
+	if ino.WrittenBlocks != 0 {
+		t.Errorf("WrittenBlocks should stay 0, got %d", ino.WrittenBlocks)
+	}
+}
+
+func TestFreeExtentAdjustsWrittenBlocks(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate blocks (which sets both AllocatedBlocks and WrittenBlocks)
+	_, err := mgr.AllocateBlocks(ctx, ino, 0, 5)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	if ino.AllocatedBlocks != 5 {
+		t.Errorf("AllocatedBlocks after alloc = %d, want 5", ino.AllocatedBlocks)
+	}
+	if ino.WrittenBlocks != 5 {
+		t.Errorf("WrittenBlocks after alloc = %d, want 5", ino.WrittenBlocks)
+	}
+
+	// Free the extent
+	err = mgr.FreeExtent(ctx, ino, 0)
+	if err != nil {
+		t.Fatalf("FreeExtent failed: %v", err)
+	}
+
+	// Both should be decremented
+	if ino.AllocatedBlocks != 0 {
+		t.Errorf("AllocatedBlocks after free = %d, want 0", ino.AllocatedBlocks)
+	}
+	if ino.WrittenBlocks != 0 {
+		t.Errorf("WrittenBlocks after free = %d, want 0", ino.WrittenBlocks)
+	}
+}
+
 func BenchmarkLookup(b *testing.B) {
 	mgr, ino, cleanup := createTestSetup(b)
 	defer cleanup()
@@ -753,5 +913,321 @@ func BenchmarkInsert(b *testing.B) {
 			Length:        5,
 			Flags:         FlagAllocated,
 		})
+	}
+}
+
+// ============================================================================
+// Unwritten Extent Tests (for fallocate lazy-zero support)
+// ============================================================================
+
+// TestAllocateUnwritten_CreatesUnwrittenExtent verifies that AllocateUnwritten
+// creates extents with the FlagUnwritten flag set.
+func TestAllocateUnwritten_CreatesUnwrittenExtent(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:    inode.InodeMagic,
+		InodeNum: 100,
+	}
+
+	// Allocate unwritten extent
+	ext, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateUnwritten failed: %v", err)
+	}
+
+	// Verify FlagUnwritten is set along with FlagAllocated
+	if ext.Flags&FlagUnwritten == 0 {
+		t.Errorf("Expected FlagUnwritten to be set, got flags=%d", ext.Flags)
+	}
+	if ext.Flags&FlagAllocated == 0 {
+		t.Errorf("Expected FlagAllocated to be set, got flags=%d", ext.Flags)
+	}
+
+	// Verify extent properties
+	if ext.LogicalBlock != 0 {
+		t.Errorf("Expected LogicalBlock=0, got %d", ext.LogicalBlock)
+	}
+	if ext.Length != 1 {
+		t.Errorf("Expected Length=1, got %d", ext.Length)
+	}
+}
+
+// TestAllocateUnwritten_DoesNotIncrementWrittenBlocks verifies that
+// AllocateUnwritten only increments AllocatedBlocks, not WrittenBlocks.
+func TestAllocateUnwritten_DoesNotIncrementWrittenBlocks(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:           inode.InodeMagic,
+		InodeNum:        100,
+		AllocatedBlocks: 0,
+		WrittenBlocks:   0,
+	}
+
+	// Allocate one unwritten extent (to stay within inline extent limit)
+	_, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateUnwritten failed: %v", err)
+	}
+
+	// Verify AllocatedBlocks was incremented
+	if ino.AllocatedBlocks != 1 {
+		t.Errorf("Expected AllocatedBlocks=1, got %d", ino.AllocatedBlocks)
+	}
+
+	// Verify WrittenBlocks was NOT incremented
+	if ino.WrittenBlocks != 0 {
+		t.Errorf("Expected WrittenBlocks=0 for unwritten extent, got %d", ino.WrittenBlocks)
+	}
+}
+
+// TestClearUnwritten_ClearsFlagAndIncrementsWritten verifies that ClearUnwritten
+// properly clears the flag and increments WrittenBlocks.
+func TestClearUnwritten_ClearsFlagAndIncrementsWritten(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:           inode.InodeMagic,
+		InodeNum:        100,
+		AllocatedBlocks: 0,
+		WrittenBlocks:   0,
+	}
+
+	// Allocate unwritten extent
+	ext, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateUnwritten failed: %v", err)
+	}
+
+	// Verify starting state
+	if ino.WrittenBlocks != 0 {
+		t.Fatalf("Expected WrittenBlocks=0 before clear, got %d", ino.WrittenBlocks)
+	}
+
+	// Clear unwritten flag
+	cleared := mgr.ClearUnwritten(ino, ext)
+	if !cleared {
+		t.Error("ClearUnwritten should return true for first clear")
+	}
+
+	// Verify FlagUnwritten is now cleared
+	if ext.Flags&FlagUnwritten != 0 {
+		t.Errorf("Expected FlagUnwritten to be cleared, got flags=%d", ext.Flags)
+	}
+
+	// FlagAllocated should still be set
+	if ext.Flags&FlagAllocated == 0 {
+		t.Errorf("Expected FlagAllocated to remain set, got flags=%d", ext.Flags)
+	}
+
+	// Verify WrittenBlocks was incremented
+	if ino.WrittenBlocks != 1 {
+		t.Errorf("Expected WrittenBlocks=1 after clear, got %d", ino.WrittenBlocks)
+	}
+}
+
+// TestClearUnwritten_NoOpIfAlreadyWritten verifies that ClearUnwritten
+// returns false and does nothing if the extent is already written.
+func TestClearUnwritten_NoOpIfAlreadyWritten(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:           inode.InodeMagic,
+		InodeNum:        100,
+		AllocatedBlocks: 0,
+		WrittenBlocks:   0,
+	}
+
+	// Use regular AllocateBlocks (which sets only FlagAllocated, not FlagUnwritten)
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	// Verify it's not unwritten
+	if ext.Flags&FlagUnwritten != 0 {
+		t.Fatalf("Regular AllocateBlocks should not set FlagUnwritten")
+	}
+
+	initialWrittenBlocks := ino.WrittenBlocks
+
+	// ClearUnwritten should be no-op
+	cleared := mgr.ClearUnwritten(ino, ext)
+	if cleared {
+		t.Error("ClearUnwritten should return false for already-written extent")
+	}
+
+	// WrittenBlocks should be unchanged
+	if ino.WrittenBlocks != initialWrittenBlocks {
+		t.Errorf("Expected WrittenBlocks to remain %d, got %d",
+			initialWrittenBlocks, ino.WrittenBlocks)
+	}
+}
+
+// TestLookupPhysical_ReturnsZeroForUnwritten verifies that LookupPhysical
+// returns 0 (hole) for unwritten extents.
+func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:    inode.InodeMagic,
+		InodeNum: 100,
+	}
+
+	// Allocate unwritten extent
+	ext, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateUnwritten failed: %v", err)
+	}
+
+	// LookupPhysical should return 0 (treat as hole for reads)
+	physBlock, err := mgr.LookupPhysical(ino, 0)
+	if err != nil {
+		t.Fatalf("LookupPhysical failed: %v", err)
+	}
+	if physBlock != 0 {
+		t.Errorf("Expected physBlock=0 for unwritten extent, got %d", physBlock)
+	}
+
+	// But Lookup should find the extent
+	foundExt, _, err := mgr.Lookup(ino, 0)
+	if err != nil {
+		t.Fatalf("Lookup failed: %v", err)
+	}
+	if foundExt.PhysicalBlock != ext.PhysicalBlock {
+		t.Errorf("Lookup should find the extent, got physBlock=%d", foundExt.PhysicalBlock)
+	}
+
+	// Now clear unwritten and LookupPhysical should return the real block
+	cleared := mgr.ClearUnwritten(ino, foundExt)
+	if !cleared {
+		t.Error("ClearUnwritten should return true for first clear")
+	}
+
+	physBlock, err = mgr.LookupPhysical(ino, 0)
+	if err != nil {
+		t.Fatalf("LookupPhysical after clear failed: %v", err)
+	}
+	// Note: ext.PhysicalBlock could be 0 (valid block number), so we compare directly
+	if physBlock != ext.PhysicalBlock {
+		t.Errorf("Expected physBlock=%d after clearing unwritten, got %d", ext.PhysicalBlock, physBlock)
+	}
+}
+
+// TestAllocateUnwritten_IdempotentForExisting verifies that AllocateUnwritten
+// is a no-op for already allocated blocks.
+func TestAllocateUnwritten_IdempotentForExisting(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:    inode.InodeMagic,
+		InodeNum: 100,
+	}
+
+	// Allocate first time
+	ext1, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("First AllocateUnwritten failed: %v", err)
+	}
+
+	allocatedBefore := ino.AllocatedBlocks
+
+	// Allocate again at same block
+	ext2, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("Second AllocateUnwritten failed: %v", err)
+	}
+
+	// Should return the existing extent
+	if ext2.PhysicalBlock != ext1.PhysicalBlock {
+		t.Errorf("Expected same physical block, got %d vs %d",
+			ext1.PhysicalBlock, ext2.PhysicalBlock)
+	}
+
+	// AllocatedBlocks should not change
+	if ino.AllocatedBlocks != allocatedBefore {
+		t.Errorf("Expected AllocatedBlocks to remain %d, got %d",
+			allocatedBefore, ino.AllocatedBlocks)
+	}
+}
+
+// TestFreeExtent_HandlesUnwrittenCorrectly verifies that FreeExtent
+// properly handles unwritten extents (doesn't decrement WrittenBlocks).
+func TestFreeExtent_HandlesUnwrittenCorrectly(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+
+	var uuid [16]byte
+	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
+	mgr := NewManager(dev, bm, nil)
+	ctx := context.Background()
+
+	ino := &inode.Inode{
+		Magic:    inode.InodeMagic,
+		InodeNum: 100,
+	}
+
+	// Allocate unwritten extent
+	_, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateUnwritten failed: %v", err)
+	}
+
+	// Verify WrittenBlocks is 0 (unwritten)
+	if ino.WrittenBlocks != 0 {
+		t.Fatalf("Expected WrittenBlocks=0, got %d", ino.WrittenBlocks)
+	}
+
+	// Free the extent
+	err = mgr.FreeExtent(ctx, ino, 0)
+	if err != nil {
+		t.Fatalf("FreeExtent failed: %v", err)
+	}
+
+	// AllocatedBlocks should be decremented
+	if ino.AllocatedBlocks != 0 {
+		t.Errorf("Expected AllocatedBlocks=0, got %d", ino.AllocatedBlocks)
+	}
+
+	// WrittenBlocks should still be 0 (wasn't written, so no decrement)
+	if ino.WrittenBlocks != 0 {
+		t.Errorf("Expected WrittenBlocks=0, got %d", ino.WrittenBlocks)
 	}
 }

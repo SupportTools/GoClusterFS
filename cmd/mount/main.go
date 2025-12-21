@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/cache"
@@ -61,13 +61,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n", os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(1)
-	}
-
-	// Enable debug logging if requested
-	if *debug {
-		fuse.Debug = func(msg interface{}) {
-			log.Printf("[FUSE] %v", msg)
-		}
 	}
 
 	// Check mount point exists
@@ -286,22 +279,30 @@ func main() {
 		log.Fatalf("Filesystem not formatted. Use -format to initialize.")
 	}
 
-	// Mount options
-	mountOpts := []fuse.MountOption{
-		fuse.FSName("goclusterfs"),
-		fuse.Subtype("goclusterfs"),
-		fuse.MaxReadahead(1 << 17), // 128KB
-		fuse.AsyncRead(),
-		// Note: AllowOther() requires 'user_allow_other' in /etc/fuse.conf
+	// Configure go-fuse mount options
+	// AttrTimeout and EntryTimeout control kernel-side caching
+	attrTimeout := 1 * time.Second
+	entryTimeout := 1 * time.Second
+
+	mountOpts := &fs.Options{
+		MountOptions: fuse.MountOptions{
+			FsName:        "goclusterfs",
+			Name:          "goclusterfs",
+			Debug:         *debug,
+			MaxReadAhead:  128 * 1024, // 128KB readahead
+			DisableXAttrs: false,
+			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
+		},
+		AttrTimeout:  &attrTimeout,
+		EntryTimeout: &entryTimeout,
 	}
 
-	// Mount filesystem
+	// Mount filesystem using go-fuse v2 API
 	log.Printf("Mounting at %s...", *mountPoint)
-	conn, err := fuse.Mount(*mountPoint, mountOpts...)
+	server, err := fs.Mount(*mountPoint, gfs, mountOpts)
 	if err != nil {
 		log.Fatalf("Failed to mount: %v", err)
 	}
-	defer conn.Close()
 
 	// Handle signals for clean unmount
 	sigChan := make(chan os.Signal, 1)
@@ -329,15 +330,14 @@ func main() {
 			log.Printf("Warning: Failed to stop broadcast: %v", err)
 		}
 
-		fuse.Unmount(*mountPoint)
+		// Unmount using go-fuse server method
+		server.Unmount()
 	}()
 
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
 
-	// Serve filesystem - blocks until unmount
-	if err := fs.Serve(conn, gfs); err != nil {
-		log.Fatalf("Serve failed: %v", err)
-	}
+	// Wait for filesystem to be unmounted - this blocks until unmount
+	server.Wait()
 
 	// Clean shutdown
 	if trimMgr != nil {

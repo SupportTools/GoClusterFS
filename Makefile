@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount test test-unit test-integration test-all test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-build-image vm-clean clean fmt vet check-fuse check-qemu lint help
+.PHONY: build build-mount test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-build-image vm-clean clean fmt vet check-fuse check-qemu lint help
 
 # Go parameters
 GOCMD=go
@@ -40,6 +40,16 @@ test-integration: check-fuse build-mount
 # All tests
 test-all: test-unit test-integration
 	@echo "All tests completed"
+
+# Test parity validation - ensures tests exist across all environments
+test-parity:
+	@echo "Validating test parity across environments..."
+	@./tests/scripts/validate-test-parity.sh
+
+# Test parity with detailed report
+test-parity-report:
+	@echo "Generating test parity report..."
+	@./tests/scripts/validate-test-parity.sh --report
 
 # Docker Compose configuration (use docker-compose for compatibility)
 DOCKER_COMPOSE_TEST=docker-compose -f tests/docker/docker-compose.test.yml
@@ -172,6 +182,8 @@ help:
 	@echo "    test-unit      - Run unit tests only (fast, no FUSE needed)"
 	@echo "    test-integration - Run integration tests (requires FUSE)"
 	@echo "    test-all       - Run all tests (unit + integration)"
+	@echo "    test-parity    - Validate test coverage across environments"
+	@echo "    test-parity-report - Detailed test coverage report"
 	@echo ""
 	@echo "  Docker Multi-Node Tests:"
 	@echo "    test-multinode-docker - Run multi-node tests in Docker"

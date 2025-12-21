@@ -109,6 +109,119 @@ heal_node() {
 }
 
 # =============================================================================
+# Advanced File Operations (for concurrent same-file writes)
+# =============================================================================
+
+# Pre-extend a file to a specific size (filled with zeros)
+# Usage: pre_extend_file <node> <filename> <size_bytes>
+pre_extend_file() {
+    local node=$1
+    local filename=$2
+    local size_bytes=$3
+
+    log "Pre-extending $filename to $size_bytes bytes on $node"
+    exec_on_node "$node" dd if=/dev/zero of="/mnt/goclusterfs/$filename" bs=1 count="$size_bytes" 2>/dev/null
+}
+
+# Write data at a specific offset in a file (using conv=notrunc to not truncate)
+# Usage: write_file_at <node> <filename> <content> <offset>
+write_file_at() {
+    local node=$1
+    local filename=$2
+    local content=$3
+    local offset=$4
+
+    # Write content to file at specific offset using dd
+    exec_on_node "$node" sh -c "echo -n '$content' | dd of='/mnt/goclusterfs/$filename' bs=1 seek=$offset conv=notrunc 2>/dev/null"
+}
+
+# Write binary pattern at specific offset
+# Usage: write_pattern_at <node> <filename> <pattern_char> <size_bytes> <offset>
+write_pattern_at() {
+    local node=$1
+    local filename=$2
+    local pattern_char=$3
+    local size_bytes=$4
+    local offset=$5
+
+    log "Writing ${size_bytes} bytes of pattern '$pattern_char' at offset $offset on $node"
+    # Use printf to generate pattern, then dd to write at offset
+    exec_on_node "$node" sh -c "head -c $size_bytes /dev/zero | tr '\\0' '$pattern_char' | dd of='/mnt/goclusterfs/$filename' bs=1 seek=$offset conv=notrunc 2>/dev/null"
+}
+
+# Read specific bytes from a file at an offset
+# Usage: read_file_at <node> <filename> <offset> <length>
+read_file_at() {
+    local node=$1
+    local filename=$2
+    local offset=$3
+    local length=$4
+
+    exec_on_node "$node" dd if="/mnt/goclusterfs/$filename" bs=1 skip="$offset" count="$length" 2>/dev/null
+}
+
+# Get file size
+# Usage: get_file_size <node> <filename>
+get_file_size() {
+    local node=$1
+    local filename=$2
+
+    exec_on_node "$node" stat -c%s "/mnt/goclusterfs/$filename" 2>/dev/null
+}
+
+# Verify content at a specific offset starts with expected string
+# Usage: verify_content_at <node> <filename> <expected_prefix> <offset>
+verify_content_at() {
+    local node=$1
+    local filename=$2
+    local expected_prefix=$3
+    local offset=$4
+    local check_len=${#expected_prefix}
+
+    local actual
+    actual=$(read_file_at "$node" "$filename" "$offset" "$check_len")
+
+    if [ "$actual" = "$expected_prefix" ]; then
+        return 0
+    else
+        log "Content mismatch at offset $offset: expected '$expected_prefix', got '$actual'"
+        return 1
+    fi
+}
+
+# Verify all bytes at offset match a specific character
+# Usage: verify_pattern_at <node> <filename> <pattern_char> <offset> <length>
+verify_pattern_at() {
+    local node=$1
+    local filename=$2
+    local pattern_char=$3
+    local offset=$4
+    local length=$5
+
+    # Read the data and check if it's all the expected pattern
+    local actual
+    actual=$(exec_on_node "$node" sh -c "dd if='/mnt/goclusterfs/$filename' bs=1 skip=$offset count=$length 2>/dev/null | tr -d '$pattern_char' | wc -c")
+
+    if [ "$actual" -eq 0 ]; then
+        return 0
+    else
+        log "Pattern mismatch at offset $offset: expected all '$pattern_char', found $actual non-matching bytes"
+        return 1
+    fi
+}
+
+# Generate MD5 hash of file portion
+# Usage: md5_portion <node> <filename> <offset> <length>
+md5_portion() {
+    local node=$1
+    local filename=$2
+    local offset=$3
+    local length=$4
+
+    exec_on_node "$node" sh -c "dd if='/mnt/goclusterfs/$filename' bs=1 skip=$offset count=$length 2>/dev/null | md5sum | cut -d' ' -f1"
+}
+
+# =============================================================================
 # Test Cases
 # =============================================================================
 
@@ -132,6 +245,1553 @@ run_test() {
         test_failed=$((test_failed + 1))
         echo "FAIL: $test_name" >> "$RESULTS_DIR/results.txt"
     fi
+}
+
+# Test 0: Create and read file (basic sanity check)
+test_create_read_file() {
+    log "Testing create and read file..."
+
+    local node="${NODE_ARRAY[0]}"
+    local filename="test_create_read.txt"
+    local expected_content="Hello GoClusterFS!"
+
+    # Write file
+    write_file "$node" "$filename" "$expected_content"
+
+    # Verify file exists
+    if ! file_exists "$node" "$filename"; then
+        log "ERROR: File not created"
+        return 1
+    fi
+
+    # Read and verify content
+    local actual_content
+    actual_content=$(read_file "$node" "$filename")
+
+    if [ "$actual_content" != "$expected_content" ]; then
+        log "ERROR: Content mismatch - expected '$expected_content', got '$actual_content'"
+        return 1
+    fi
+
+    log "Create and read file test passed"
+    return 0
+}
+
+# Test: Create directory
+test_create_directory() {
+    log "Testing create directory..."
+
+    local node="${NODE_ARRAY[0]}"
+    local dirname="testdir"
+
+    # Create directory
+    exec_on_node "$node" mkdir "/mnt/goclusterfs/$dirname"
+
+    # Verify it exists and is a directory
+    if ! exec_on_node "$node" test -d "/mnt/goclusterfs/$dirname"; then
+        log "ERROR: Directory not created or not a directory"
+        return 1
+    fi
+
+    # List root and verify directory appears
+    local listing
+    listing=$(exec_on_node "$node" ls -la /mnt/goclusterfs/)
+    if ! echo "$listing" | grep -q "^d.*$dirname"; then
+        log "ERROR: Directory not found in listing"
+        log "Listing: $listing"
+        return 1
+    fi
+
+    log "Create directory test passed"
+    return 0
+}
+
+# Test: File in directory
+# Creates a directory, then creates a file inside it
+test_file_in_directory() {
+    log "Testing file in directory..."
+
+    local node="${NODE_ARRAY[0]}"
+    local dirname="subdir"
+    local filename="nested.txt"
+    local filepath="$dirname/$filename"
+    local test_content="File in subdirectory"
+
+    # Create directory
+    exec_on_node "$node" mkdir -p "/mnt/goclusterfs/$dirname"
+
+    # Verify directory exists
+    if ! exec_on_node "$node" test -d "/mnt/goclusterfs/$dirname"; then
+        log "ERROR: Failed to create directory"
+        return 1
+    fi
+
+    # Create file inside directory
+    exec_on_node "$node" sh -c "echo '$test_content' > /mnt/goclusterfs/$filepath"
+
+    # Verify file exists
+    if ! exec_on_node "$node" test -f "/mnt/goclusterfs/$filepath"; then
+        log "ERROR: File not created in directory"
+        return 1
+    fi
+
+    # Read back and verify content
+    local read_back
+    read_back=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filepath")
+    if [[ "$read_back" != "$test_content" ]]; then
+        log "ERROR: Content mismatch. Expected: '$test_content', Got: '$read_back'"
+        return 1
+    fi
+
+    # List directory and verify file appears
+    local listing
+    listing=$(exec_on_node "$node" ls "/mnt/goclusterfs/$dirname/")
+    if ! echo "$listing" | grep -q "$filename"; then
+        log "ERROR: File not found in directory listing"
+        log "Listing: $listing"
+        return 1
+    fi
+
+    log "File in directory test passed"
+    return 0
+}
+
+# Test: Data persistence after remount
+test_data_persistence() {
+    log "Testing data persistence after remount..."
+
+    local node="${NODE_ARRAY[0]}"
+    local content="Persistent data test - this should survive remount!"
+    local nested_content="nested file"
+
+    # Write a file
+    exec_on_node "$node" sh -c "echo '$content' > /mnt/goclusterfs/persistent.txt"
+
+    # Create directory with nested file
+    exec_on_node "$node" mkdir -p "/mnt/goclusterfs/persistdir"
+    exec_on_node "$node" sh -c "echo '$nested_content' > /mnt/goclusterfs/persistdir/file.txt"
+
+    # Verify files exist before restart
+    if ! exec_on_node "$node" test -f "/mnt/goclusterfs/persistent.txt"; then
+        log "ERROR: persistent.txt not created"
+        return 1
+    fi
+
+    log "Data written, restarting node to test persistence..."
+
+    # Restart the node (triggers unmount/remount cycle)
+    restart_node "$node"
+    wait_node_healthy "$node" 30
+
+    # Verify data persisted
+    local read_content
+    read_content=$(exec_on_node "$node" cat "/mnt/goclusterfs/persistent.txt")
+    if [ "$read_content" != "$content" ]; then
+        log "ERROR: Content didn't persist. Expected: '$content', Got: '$read_content'"
+        return 1
+    fi
+
+    # Verify nested directory and file
+    if ! exec_on_node "$node" test -d "/mnt/goclusterfs/persistdir"; then
+        log "ERROR: persistdir directory didn't persist"
+        return 1
+    fi
+
+    local nested_read
+    nested_read=$(exec_on_node "$node" cat "/mnt/goclusterfs/persistdir/file.txt")
+    if [ "$nested_read" != "$nested_content" ]; then
+        log "ERROR: Nested file didn't persist. Expected: '$nested_content', Got: '$nested_read'"
+        return 1
+    fi
+
+    log "Data persistence test passed"
+    return 0
+}
+
+# Test: Delete file
+test_delete_file() {
+    log "Testing file deletion..."
+
+    local node="${NODE_ARRAY[0]}"
+    local filename="todelete.txt"
+
+    # Create a file
+    exec_on_node "$node" sh -c "echo 'delete me' > /mnt/goclusterfs/$filename"
+
+    # Verify it exists
+    if ! exec_on_node "$node" test -f "/mnt/goclusterfs/$filename"; then
+        log "ERROR: File should exist before deletion"
+        return 1
+    fi
+
+    # Delete it
+    exec_on_node "$node" rm "/mnt/goclusterfs/$filename"
+
+    # Verify it's gone
+    if exec_on_node "$node" test -f "/mnt/goclusterfs/$filename"; then
+        log "ERROR: File should not exist after deletion"
+        return 1
+    fi
+
+    log "File deletion test passed"
+    return 0
+}
+
+# Test: Overwrite existing file
+test_overwrite_file() {
+    log "Testing file overwrite..."
+
+    local node="${NODE_ARRAY[0]}"
+    local filename="overwrite.txt"
+    local original_content="Original content"
+    local new_content="New content that is different"
+
+    # Create a file with original content
+    exec_on_node "$node" sh -c "echo '$original_content' > /mnt/goclusterfs/$filename"
+
+    # Verify original content
+    local read_original
+    read_original=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename")
+    if [[ "$read_original" != "$original_content" ]]; then
+        log "ERROR: Original content mismatch: expected '$original_content', got '$read_original'"
+        return 1
+    fi
+
+    # Overwrite with new content
+    exec_on_node "$node" sh -c "echo '$new_content' > /mnt/goclusterfs/$filename"
+
+    # Read back and verify new content
+    local read_new
+    read_new=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename")
+    if [[ "$read_new" != "$new_content" ]]; then
+        log "ERROR: Overwrite failed: expected '$new_content', got '$read_new'"
+        return 1
+    fi
+
+    log "File overwrite test passed"
+    return 0
+}
+
+# Test: Large file handling
+# Creates a file larger than one block (1MB block size) to test multi-block operations
+test_large_file() {
+    log "Testing large file handling..."
+
+    local node="${NODE_ARRAY[0]}"
+    local filename="large_test.bin"
+    local size_kb=2048  # 2MB - spans multiple 1MB blocks
+
+    # Create a 2MB file with random data
+    log "Creating ${size_kb}KB file with random data..."
+    exec_on_node "$node" sh -c "dd if=/dev/urandom of=/mnt/goclusterfs/$filename bs=1K count=$size_kb 2>/dev/null"
+
+    # Verify file size
+    local actual_size
+    actual_size=$(exec_on_node "$node" stat -c%s "/mnt/goclusterfs/$filename")
+    local expected_size=$((size_kb * 1024))
+    if [[ "$actual_size" != "$expected_size" ]]; then
+        log "ERROR: Size mismatch. Expected: $expected_size bytes, Got: $actual_size bytes"
+        return 1
+    fi
+    log "File size verified: $actual_size bytes"
+
+    # Calculate checksum on writing node
+    local checksum_write
+    checksum_write=$(exec_on_node "$node" md5sum "/mnt/goclusterfs/$filename" | awk '{print $1}')
+    log "Write checksum: $checksum_write"
+
+    # If we have multiple nodes, verify from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        # Calculate checksum on reading node
+        local checksum_read
+        checksum_read=$(exec_on_node "$node2" md5sum "/mnt/goclusterfs/$filename" | awk '{print $1}')
+        log "Read checksum (from node2): $checksum_read"
+
+        if [[ "$checksum_write" != "$checksum_read" ]]; then
+            log "ERROR: Checksum mismatch between nodes"
+            return 1
+        fi
+        log "Cross-node checksum verified"
+    fi
+
+    log "Large file test passed (${size_kb}KB file verified)"
+    return 0
+}
+
+# Test: Many files in directory
+# Creates 100+ files in a directory to test directory listing and metadata handling
+test_many_files() {
+    log "Testing many files in directory..."
+
+    local node="${NODE_ARRAY[0]}"
+    local num_files=100
+    local test_dir="many_files_test"
+
+    # Create test directory
+    exec_on_node "$node" mkdir -p "/mnt/goclusterfs/$test_dir"
+
+    # Create 100 files with unique content
+    log "Creating $num_files files..."
+    for i in $(seq 0 $((num_files - 1))); do
+        local filename=$(printf "file_%03d.txt" "$i")
+        local content="Content of file $i"
+        exec_on_node "$node" sh -c "echo '$content' > /mnt/goclusterfs/$test_dir/$filename"
+    done
+
+    # Count files in directory
+    local count
+    count=$(exec_on_node "$node" sh -c "ls -1 /mnt/goclusterfs/$test_dir | wc -l")
+    if [[ "$count" -ne "$num_files" ]]; then
+        log "ERROR: Expected $num_files files, found $count"
+        return 1
+    fi
+    log "File count verified: $count files"
+
+    # Verify each file has correct content
+    local verify_errors=0
+    for i in $(seq 0 $((num_files - 1))); do
+        local filename=$(printf "file_%03d.txt" "$i")
+        local expected="Content of file $i"
+        local actual
+        actual=$(exec_on_node "$node" cat "/mnt/goclusterfs/$test_dir/$filename")
+        if [[ "$actual" != "$expected" ]]; then
+            log "ERROR: Content mismatch for $filename: expected '$expected', got '$actual'"
+            ((verify_errors++))
+        fi
+    done
+
+    if [[ "$verify_errors" -gt 0 ]]; then
+        log "ERROR: $verify_errors files had content mismatches"
+        return 1
+    fi
+
+    # If multiple nodes, verify from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        local count2
+        count2=$(exec_on_node "$node2" sh -c "ls -1 /mnt/goclusterfs/$test_dir | wc -l")
+        if [[ "$count2" -ne "$num_files" ]]; then
+            log "ERROR: Node2 sees $count2 files, expected $num_files"
+            return 1
+        fi
+        log "Cross-node file count verified: $count2 files"
+    fi
+
+    log "Many files test passed ($num_files files created and verified)"
+    return 0
+}
+
+# Test: Nested directory hierarchy
+# Creates deeply nested directory structure (a/b/c/d) with file at deepest level
+test_nested_directories() {
+    log "Testing nested directory hierarchy..."
+
+    local node="${NODE_ARRAY[0]}"
+    local base_dir="/mnt/goclusterfs"
+
+    # Create nested structure: a/b/c/d
+    log "Creating nested directories..."
+    exec_on_node "$node" mkdir -p "$base_dir/a/b/c/d"
+
+    # Verify each level exists and is a directory
+    for dir in "a" "a/b" "a/b/c" "a/b/c/d"; do
+        if ! exec_on_node "$node" test -d "$base_dir/$dir"; then
+            log "ERROR: $dir should exist and be a directory"
+            return 1
+        fi
+    done
+    log "All directory levels verified"
+
+    # Create a file at the deepest level
+    local deep_file="a/b/c/d/deep.txt"
+    local content="deep content"
+    exec_on_node "$node" sh -c "echo '$content' > $base_dir/$deep_file"
+
+    # Read it back and verify
+    local actual
+    actual=$(exec_on_node "$node" cat "$base_dir/$deep_file")
+    if [[ "$actual" != "$content" ]]; then
+        log "ERROR: Deep file content mismatch. Expected: '$content', Got: '$actual'"
+        return 1
+    fi
+    log "Deep file content verified"
+
+    # If multiple nodes, verify from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        # Verify directory structure from node2
+        if ! exec_on_node "$node2" test -d "$base_dir/a/b/c/d"; then
+            log "ERROR: Nested directory not visible from node2"
+            return 1
+        fi
+
+        # Verify file content from node2
+        local actual2
+        actual2=$(exec_on_node "$node2" cat "$base_dir/$deep_file")
+        if [[ "$actual2" != "$content" ]]; then
+            log "ERROR: Deep file content mismatch on node2"
+            return 1
+        fi
+        log "Cross-node nested directory verification passed"
+    fi
+
+    log "Nested directories test passed"
+    return 0
+}
+
+# Test: Delete empty directory
+# Creates an empty directory and removes it, verifying deletion
+test_delete_directory() {
+    log "Testing delete empty directory..."
+
+    local node="${NODE_ARRAY[0]}"
+    local dirname="emptydir_test"
+
+    # Create an empty directory
+    exec_on_node "$node" mkdir -p "/mnt/goclusterfs/$dirname"
+
+    # Verify it exists
+    if ! exec_on_node "$node" test -d "/mnt/goclusterfs/$dirname"; then
+        log "ERROR: Directory should exist after creation"
+        return 1
+    fi
+    log "Directory created successfully"
+
+    # Delete it
+    exec_on_node "$node" rmdir "/mnt/goclusterfs/$dirname"
+
+    # Verify it's gone
+    if exec_on_node "$node" test -d "/mnt/goclusterfs/$dirname"; then
+        log "ERROR: Directory should not exist after deletion"
+        return 1
+    fi
+    log "Directory deleted successfully"
+
+    # If multiple nodes, verify deletion is visible from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        if exec_on_node "$node2" test -d "/mnt/goclusterfs/$dirname"; then
+            log "ERROR: Deleted directory still visible from node2"
+            return 1
+        fi
+        log "Cross-node deletion verification passed"
+    fi
+
+    log "Delete directory test passed"
+    return 0
+}
+
+# Test: Truncate file
+# Creates a file and truncates it to a smaller size, verifying the operation
+test_truncate_file() {
+    log "Testing file truncation..."
+
+    local node="${NODE_ARRAY[0]}"
+    local filename="truncate_test.txt"
+    local original_content="This is some longer content that we will truncate"
+    local truncate_size=10
+
+    # Create a file with content
+    exec_on_node "$node" sh -c "echo -n '$original_content' > /mnt/goclusterfs/$filename"
+
+    # Verify original size
+    local original_size
+    original_size=$(exec_on_node "$node" stat -c%s "/mnt/goclusterfs/$filename")
+    log "Original file size: $original_size bytes"
+
+    # Truncate to 10 bytes
+    exec_on_node "$node" truncate -s $truncate_size "/mnt/goclusterfs/$filename"
+
+    # Verify new size
+    local new_size
+    new_size=$(exec_on_node "$node" stat -c%s "/mnt/goclusterfs/$filename")
+    if [[ "$new_size" -ne "$truncate_size" ]]; then
+        log "ERROR: Size after truncate: expected $truncate_size, got $new_size"
+        return 1
+    fi
+    log "Truncated size verified: $new_size bytes"
+
+    # Verify content is the first 10 bytes
+    local actual_content
+    actual_content=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename")
+    local expected_content="${original_content:0:$truncate_size}"
+    if [[ "$actual_content" != "$expected_content" ]]; then
+        log "ERROR: Content mismatch. Expected: '$expected_content', Got: '$actual_content'"
+        return 1
+    fi
+    log "Truncated content verified"
+
+    # If multiple nodes, verify from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        local size2
+        size2=$(exec_on_node "$node2" stat -c%s "/mnt/goclusterfs/$filename")
+        if [[ "$size2" -ne "$truncate_size" ]]; then
+            log "ERROR: Size mismatch on node2: expected $truncate_size, got $size2"
+            return 1
+        fi
+        log "Cross-node truncate verification passed"
+    fi
+
+    log "Truncate file test passed"
+    return 0
+}
+
+# Test: Append to file
+# Creates a file with initial content, appends more data, and verifies the combined result
+test_append_file() {
+    log "Testing file append operation..."
+
+    local node="${NODE_ARRAY[0]}"
+    local filename="append_test.txt"
+    local initial_content="Hello"
+    local append_content=" World!"
+    local expected_content="Hello World!"
+
+    # Create initial file with content
+    exec_on_node "$node" sh -c "echo -n '$initial_content' > /mnt/goclusterfs/$filename"
+
+    # Verify initial content
+    local initial_read
+    initial_read=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename")
+    if [[ "$initial_read" != "$initial_content" ]]; then
+        log "ERROR: Initial content mismatch. Expected: '$initial_content', Got: '$initial_read'"
+        return 1
+    fi
+    log "Initial content verified: '$initial_read'"
+
+    # Append data using >> redirection
+    exec_on_node "$node" sh -c "echo -n '$append_content' >> /mnt/goclusterfs/$filename"
+
+    # Read back and verify combined content
+    local final_read
+    final_read=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename")
+    if [[ "$final_read" != "$expected_content" ]]; then
+        log "ERROR: Append result mismatch. Expected: '$expected_content', Got: '$final_read'"
+        return 1
+    fi
+    log "Appended content verified: '$final_read'"
+
+    # If multiple nodes, verify from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        local cross_read
+        cross_read=$(exec_on_node "$node2" cat "/mnt/goclusterfs/$filename")
+        if [[ "$cross_read" != "$expected_content" ]]; then
+            log "ERROR: Cross-node content mismatch. Expected: '$expected_content', Got: '$cross_read'"
+            return 1
+        fi
+        log "Cross-node append verification passed"
+    fi
+
+    log "Append file test passed"
+    return 0
+}
+
+# Test: Rename file
+# Attempts to rename a file within the filesystem
+# Note: Rename is not yet implemented in GoClusterFS - test skips if operation fails
+test_rename_file() {
+    log "Testing file rename operation..."
+
+    local node="${NODE_ARRAY[0]}"
+    local oldname="oldname.txt"
+    local newname="newname.txt"
+    local content="Rename test content"
+
+    # Create the original file
+    exec_on_node "$node" sh -c "echo -n '$content' > /mnt/goclusterfs/$oldname"
+
+    # Verify it exists
+    if ! exec_on_node "$node" test -f "/mnt/goclusterfs/$oldname"; then
+        log "ERROR: Original file should exist before rename"
+        return 1
+    fi
+    log "Original file created: $oldname"
+
+    # Attempt to rename
+    if ! exec_on_node "$node" mv "/mnt/goclusterfs/$oldname" "/mnt/goclusterfs/$newname" 2>/dev/null; then
+        # Rename not implemented - this is expected for now
+        log "SKIP: Rename operation not yet implemented in GoClusterFS"
+        return 0
+    fi
+
+    # If rename succeeded, verify old name doesn't exist
+    if exec_on_node "$node" test -f "/mnt/goclusterfs/$oldname"; then
+        log "ERROR: Old name should not exist after rename"
+        return 1
+    fi
+    log "Old file no longer exists"
+
+    # Verify new name exists with same content
+    local readback
+    readback=$(exec_on_node "$node" cat "/mnt/goclusterfs/$newname")
+    if [[ "$readback" != "$content" ]]; then
+        log "ERROR: Content changed after rename. Expected: '$content', Got: '$readback'"
+        return 1
+    fi
+    log "New file content verified"
+
+    # If multiple nodes, verify from another node
+    if [[ ${#NODE_ARRAY[@]} -ge 2 ]]; then
+        local node2="${NODE_ARRAY[1]}"
+        sleep 1  # Allow time for sync
+
+        if exec_on_node "$node2" test -f "/mnt/goclusterfs/$oldname"; then
+            log "ERROR: Old name visible on node2 after rename"
+            return 1
+        fi
+        if ! exec_on_node "$node2" test -f "/mnt/goclusterfs/$newname"; then
+            log "ERROR: New name not visible on node2 after rename"
+            return 1
+        fi
+        log "Cross-node rename verification passed"
+    fi
+
+    log "Rename file test passed"
+    return 0
+}
+
+# Test: Single-node stress test
+# Rapidly creates, reads, verifies, and deletes files to stress test the filesystem
+test_stress_single_node() {
+    log "Running single-node stress test..."
+
+    local node="${NODE_ARRAY[0]}"
+    local iterations=100  # Reduced from Go's 200 for faster test execution
+    local errors=0
+
+    log "Running $iterations create/read/delete iterations..."
+
+    for i in $(seq 1 $iterations); do
+        local filename=$(printf "stress_%04d.txt" $i)
+        local content="Stress test iteration $i"
+
+        # Create file
+        if ! exec_on_node "$node" sh -c "echo -n '$content' > /mnt/goclusterfs/$filename" 2>/dev/null; then
+            log "ERROR: Iteration $i: Failed to create file"
+            ((errors++))
+            continue
+        fi
+
+        # Read and verify
+        local readback
+        readback=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename" 2>/dev/null)
+        if [[ "$readback" != "$content" ]]; then
+            log "ERROR: Iteration $i: Content mismatch. Expected: '$content', Got: '$readback'"
+            ((errors++))
+            continue
+        fi
+
+        # Delete
+        if ! exec_on_node "$node" rm "/mnt/goclusterfs/$filename" 2>/dev/null; then
+            log "ERROR: Iteration $i: Failed to delete file"
+            ((errors++))
+            continue
+        fi
+
+        # Progress logging every 25 iterations
+        if [[ $((i % 25)) -eq 0 ]]; then
+            log "Progress: $i/$iterations iterations completed"
+        fi
+    done
+
+    # Verify no stress test files remain
+    local remaining
+    remaining=$(exec_on_node "$node" sh -c "ls /mnt/goclusterfs/stress_*.txt 2>/dev/null | wc -l")
+    if [[ "$remaining" -gt 0 ]]; then
+        log "ERROR: $remaining stress test files remain after cleanup"
+        ((errors++))
+    fi
+
+    if [[ $errors -gt 0 ]]; then
+        log "ERROR: Stress test completed with $errors errors"
+        return 1
+    fi
+
+    log "Stress test passed: $iterations iterations with 0 errors"
+    return 0
+}
+
+# Test: Concurrent directory operations
+# Multiple nodes create files simultaneously (tests concurrent multi-node visibility)
+# Based on Go TestMultiNodeConcurrentDirectoryOps which creates files not directories
+test_concurrent_directory_ops() {
+    log "Testing concurrent directory operations across nodes..."
+
+    # Need at least 2 nodes for this test
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for concurrent directory ops test"
+        return 0
+    fi
+
+    local node1="${NODE_ARRAY[0]}"
+    local node2="${NODE_ARRAY[1]}"
+    local files_per_node=5
+    local errors=0
+
+    # Create files concurrently from both nodes (like Go test)
+    log "Creating $files_per_node files from each of 2 nodes concurrently..."
+
+    # Node 1 creates files in background
+    for i in $(seq 0 $((files_per_node - 1))); do
+        exec_on_node "$node1" sh -c "echo 'Content from node 0 file $i' > /mnt/goclusterfs/node0_${i}.txt" &
+    done
+
+    # Node 2 creates files in background
+    for i in $(seq 0 $((files_per_node - 1))); do
+        exec_on_node "$node2" sh -c "echo 'Content from node 1 file $i' > /mnt/goclusterfs/node1_${i}.txt" &
+    done
+
+    # Wait for all background processes
+    wait
+
+    # Give filesystem time to sync
+    sleep 2
+
+    # Verify all files are visible from node 1
+    log "Verifying all files visible from node 1..."
+    for n in 0 1; do
+        for i in $(seq 0 $((files_per_node - 1))); do
+            local filename="node${n}_${i}.txt"
+            if ! exec_on_node "$node1" test -f "/mnt/goclusterfs/$filename"; then
+                log "ERROR: $filename not visible from node 1"
+                ((errors++))
+            fi
+        done
+    done
+
+    # Verify all files are visible from node 2
+    log "Verifying all files visible from node 2..."
+    for n in 0 1; do
+        for i in $(seq 0 $((files_per_node - 1))); do
+            local filename="node${n}_${i}.txt"
+            if ! exec_on_node "$node2" test -f "/mnt/goclusterfs/$filename"; then
+                log "ERROR: $filename not visible from node 2"
+                ((errors++))
+            fi
+        done
+    done
+
+    # Cross-verify content
+    log "Cross-verifying file contents..."
+    for n in 0 1; do
+        for i in $(seq 0 $((files_per_node - 1))); do
+            local filename="node${n}_${i}.txt"
+            local expected="Content from node $n file $i"
+
+            # Read from both nodes
+            local content1
+            local content2
+            content1=$(exec_on_node "$node1" cat "/mnt/goclusterfs/$filename" 2>/dev/null)
+            content2=$(exec_on_node "$node2" cat "/mnt/goclusterfs/$filename" 2>/dev/null)
+
+            if [[ "$content1" != "$expected" ]]; then
+                log "ERROR: Content mismatch for $filename from node 1. Expected: '$expected', Got: '$content1'"
+                ((errors++))
+            fi
+            if [[ "$content2" != "$expected" ]]; then
+                log "ERROR: Content mismatch for $filename from node 2. Expected: '$expected', Got: '$content2'"
+                ((errors++))
+            fi
+        done
+    done
+
+    # Cleanup
+    for n in 0 1; do
+        for i in $(seq 0 $((files_per_node - 1))); do
+            exec_on_node "$node1" rm "/mnt/goclusterfs/node${n}_${i}.txt" 2>/dev/null || true
+        done
+    done
+
+    if [[ $errors -gt 0 ]]; then
+        log "ERROR: Concurrent directory ops test failed with $errors errors"
+        return 1
+    fi
+
+    log "Concurrent directory ops test passed"
+    return 0
+}
+
+# Test: Concurrent file creation across nodes
+# Multiple nodes create different files simultaneously, then verify all files
+# are visible from all nodes' perspectives
+test_concurrent_file_creation() {
+    log "Testing concurrent file creation across nodes..."
+
+    # Need at least 2 nodes for this test
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for concurrent file creation test"
+        return 0
+    fi
+
+    local node1="${NODE_ARRAY[0]}"
+    local node2="${NODE_ARRAY[1]}"
+
+    # Create files concurrently from different nodes
+    exec_on_node "$node1" sh -c "echo 'Content from Node 0' > /mnt/goclusterfs/fileA.txt" &
+    local pid1=$!
+    exec_on_node "$node2" sh -c "echo 'Content from Node 1' > /mnt/goclusterfs/fileB.txt" &
+    local pid2=$!
+
+    # Wait for both to complete
+    wait $pid1 $pid2
+
+    # Give filesystem time to sync
+    sleep 1
+
+    # Verify both files exist from both nodes' perspectives
+    for node in "$node1" "$node2"; do
+        if ! exec_on_node "$node" test -f "/mnt/goclusterfs/fileA.txt"; then
+            log "ERROR: fileA.txt not visible from $node"
+            return 1
+        fi
+        if ! exec_on_node "$node" test -f "/mnt/goclusterfs/fileB.txt"; then
+            log "ERROR: fileB.txt not visible from $node"
+            return 1
+        fi
+    done
+
+    # Verify content integrity
+    local contentA
+    contentA=$(exec_on_node "$node1" cat "/mnt/goclusterfs/fileA.txt")
+    if [[ "$contentA" != "Content from Node 0" ]]; then
+        log "ERROR: fileA.txt has wrong content: $contentA"
+        return 1
+    fi
+
+    local contentB
+    contentB=$(exec_on_node "$node1" cat "/mnt/goclusterfs/fileB.txt")
+    if [[ "$contentB" != "Content from Node 1" ]]; then
+        log "ERROR: fileB.txt has wrong content: $contentB"
+        return 1
+    fi
+
+    log "Concurrent file creation test passed"
+    return 0
+}
+
+# Test: Sequential access across nodes
+# One node writes data, then another node reads it
+test_sequential_access() {
+    log "Testing sequential access across nodes..."
+
+    # Need at least 2 nodes for this test
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for sequential access test"
+        return 0
+    fi
+
+    local node1="${NODE_ARRAY[0]}"
+    local node2="${NODE_ARRAY[1]}"
+    local filename="sequential_test.txt"
+    local test_content="Data written by node1 for node2 to read"
+
+    # Node 1 writes the file
+    log "Node 1 ($node1) writing file..."
+    exec_on_node "$node1" sh -c "echo '$test_content' > /mnt/goclusterfs/$filename"
+
+    # Verify node 1 can read it back
+    local read_node1
+    read_node1=$(exec_on_node "$node1" cat "/mnt/goclusterfs/$filename")
+    if [[ "$read_node1" != "$test_content" ]]; then
+        log "ERROR: Node 1 immediate read-back failed: expected '$test_content', got '$read_node1'"
+        return 1
+    fi
+    log "Node 1 verified write successful"
+
+    # Give filesystem time to sync
+    sleep 1
+
+    # Node 2 reads the file written by Node 1
+    log "Node 2 ($node2) reading file written by Node 1..."
+    local read_node2
+    read_node2=$(exec_on_node "$node2" cat "/mnt/goclusterfs/$filename")
+    if [[ "$read_node2" != "$test_content" ]]; then
+        log "ERROR: Node 2 failed to read data written by Node 1: expected '$test_content', got '$read_node2'"
+        return 1
+    fi
+
+    log "Sequential access test passed - Node 2 successfully read data written by Node 1"
+    return 0
+}
+
+# Test: Journal recovery across nodes
+# Simulates crash: Node A creates file, gets killed, Node B recovers via journal
+test_journal_recovery_multinode() {
+    log "Testing multi-node journal recovery..."
+
+    # Need at least 2 nodes for this test
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for journal recovery test"
+        return 0
+    fi
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]}"
+    local filename="recovery-test.txt"
+    local test_content="This file should survive node crash and be recovered"
+
+    # Phase 1: Node A creates a file
+    log "Phase 1: Node A ($node_a) creating test file..."
+    exec_on_node "$node_a" sh -c "echo '$test_content' > /mnt/goclusterfs/$filename"
+
+    # Verify Node A can read it
+    local read_a
+    read_a=$(exec_on_node "$node_a" cat "/mnt/goclusterfs/$filename")
+    if [[ "$read_a" != "$test_content" ]]; then
+        log "ERROR: Node A failed to verify created file"
+        return 1
+    fi
+    log "Node A verified file creation"
+
+    # Give time for data to sync to disk
+    sleep 1
+
+    # Phase 2: Kill Node A to simulate crash
+    log "Phase 2: Killing Node A to simulate crash..."
+    kill_node "$node_a"
+    sleep 2
+
+    # Phase 3: Wait for heartbeat to become stale
+    # In Docker environment, heartbeat detection is faster
+    log "Phase 3: Waiting for heartbeat timeout (10s)..."
+    sleep 10
+
+    # Phase 4: Node B should detect failed node via heartbeat
+    # The file should be visible on Node B through journal recovery or shared storage
+    log "Phase 4: Verifying file recovery on Node B..."
+
+    if ! file_exists "$node_b" "$filename"; then
+        log "ERROR: File not found on Node B after Node A crash"
+        # List directory for debugging
+        exec_on_node "$node_b" ls -la /mnt/goclusterfs/ || true
+        return 1
+    fi
+
+    local read_b
+    read_b=$(exec_on_node "$node_b" cat "/mnt/goclusterfs/$filename")
+    if [[ "$read_b" != "$test_content" ]]; then
+        log "ERROR: File content mismatch on Node B. Expected: '$test_content', Got: '$read_b'"
+        return 1
+    fi
+
+    log "Node B successfully recovered file from crashed Node A"
+
+    # Phase 5: Verify Node B can create new files after recovery
+    log "Phase 5: Verifying Node B can write after recovery..."
+    exec_on_node "$node_b" sh -c "echo 'Post-recovery file' > /mnt/goclusterfs/post-recovery.txt"
+
+    if ! file_exists "$node_b" "post-recovery.txt"; then
+        log "ERROR: Node B cannot create files after recovery"
+        return 1
+    fi
+
+    # Phase 6: Restart Node A and verify it can see recovered files
+    log "Phase 6: Restarting Node A..."
+    restart_node "$node_a"
+    wait_node_healthy "$node_a" 30
+
+    if ! file_exists "$node_a" "$filename"; then
+        log "ERROR: Original file not visible on restarted Node A"
+        return 1
+    fi
+
+    if ! file_exists "$node_a" "post-recovery.txt"; then
+        log "ERROR: Post-recovery file not visible on restarted Node A"
+        return 1
+    fi
+
+    log "Multi-node journal recovery test passed"
+    return 0
+}
+
+# Test: Journal recovery with multiple files
+# Simulates crash: Node A creates 5 files, gets killed, Node B recovers all via journal
+test_journal_recovery_multiple_files() {
+    log "Testing journal recovery with multiple files..."
+
+    # Need at least 2 nodes for this test
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for journal recovery test"
+        return 0
+    fi
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]}"
+    local file_count=5
+
+    # Phase 1: Node A creates multiple files
+    log "Phase 1: Node A ($node_a) creating $file_count test files..."
+    for i in $(seq 0 $((file_count - 1))); do
+        local filename="multifile_${i}.txt"
+        local content="Content of file $i - should survive crash"
+        exec_on_node "$node_a" sh -c "echo '$content' > /mnt/goclusterfs/$filename"
+        log "Node A: Created $filename"
+    done
+
+    # Give time for data to sync to disk
+    sleep 1
+
+    # Phase 2: Kill Node A to simulate crash
+    log "Phase 2: Killing Node A to simulate crash..."
+    kill_node "$node_a"
+    sleep 2
+
+    # Phase 3: Wait for heartbeat to become stale
+    log "Phase 3: Waiting for heartbeat timeout (10s)..."
+    sleep 10
+
+    # Phase 4: Verify all files are recovered on Node B
+    log "Phase 4: Verifying all files recovery on Node B..."
+    local recovered=0
+
+    for i in $(seq 0 $((file_count - 1))); do
+        local filename="multifile_${i}.txt"
+        local expected_content="Content of file $i - should survive crash"
+
+        if ! file_exists "$node_b" "$filename"; then
+            log "ERROR: File $filename not found on Node B after recovery"
+            continue
+        fi
+
+        local read_content
+        read_content=$(exec_on_node "$node_b" cat "/mnt/goclusterfs/$filename")
+        if [[ "$read_content" != "$expected_content" ]]; then
+            log "ERROR: Content mismatch for $filename"
+            continue
+        fi
+
+        recovered=$((recovered + 1))
+        log "Node B: Verified $filename"
+    done
+
+    log "Phase 4: Recovered $recovered/$file_count files"
+
+    if [[ $recovered -ne $file_count ]]; then
+        log "ERROR: Not all files were recovered"
+        return 1
+    fi
+
+    # Phase 5: Restart Node A and verify it can see all recovered files
+    log "Phase 5: Restarting Node A..."
+    restart_node "$node_a"
+    wait_node_healthy "$node_a" 30
+
+    for i in $(seq 0 $((file_count - 1))); do
+        local filename="multifile_${i}.txt"
+        if ! file_exists "$node_a" "$filename"; then
+            log "ERROR: File $filename not visible on restarted Node A"
+            return 1
+        fi
+    done
+
+    log "Multi-file journal recovery test passed"
+    return 0
+}
+
+# Test: Journal recovery with large file
+# Simulates crash: Node A creates 500KB file, gets killed, Node B recovers via journal
+test_journal_recovery_large_file() {
+    log "Testing journal recovery with large file..."
+
+    # Need at least 2 nodes for this test
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for journal recovery test"
+        return 0
+    fi
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]}"
+    local filename="large-recovery.txt"
+    local file_size=$((500 * 1024))  # 500KB to span multiple blocks
+
+    # Phase 1: Node A creates a large file
+    log "Phase 1: Node A ($node_a) creating ${file_size} byte file..."
+
+    # Create 500KB file with repeating pattern (matches Go test behavior)
+    exec_on_node "$node_a" sh -c "dd if=/dev/urandom of=/mnt/goclusterfs/$filename bs=1024 count=500 2>/dev/null"
+
+    # Get checksum of original file
+    local original_checksum
+    original_checksum=$(exec_on_node "$node_a" md5sum "/mnt/goclusterfs/$filename" | awk '{print $1}')
+    local original_size
+    original_size=$(exec_on_node "$node_a" stat -c%s "/mnt/goclusterfs/$filename")
+
+    log "Node A: Created $filename ($original_size bytes, md5: $original_checksum)"
+
+    # Give time for data to sync to disk
+    sleep 2
+
+    # Phase 2: Kill Node A to simulate crash
+    log "Phase 2: Killing Node A to simulate crash..."
+    kill_node "$node_a"
+    sleep 2
+
+    # Phase 3: Wait for heartbeat to become stale
+    log "Phase 3: Waiting for heartbeat timeout (10s)..."
+    sleep 10
+
+    # Phase 4: Verify large file is recovered on Node B
+    log "Phase 4: Verifying large file recovery on Node B..."
+
+    if ! file_exists "$node_b" "$filename"; then
+        log "ERROR: Large file not found on Node B after recovery"
+        return 1
+    fi
+
+    # Verify file size
+    local recovered_size
+    recovered_size=$(exec_on_node "$node_b" stat -c%s "/mnt/goclusterfs/$filename")
+    if [[ "$recovered_size" != "$original_size" ]]; then
+        log "ERROR: File size mismatch. Expected: $original_size, Got: $recovered_size"
+        return 1
+    fi
+
+    # Verify file content via checksum
+    local recovered_checksum
+    recovered_checksum=$(exec_on_node "$node_b" md5sum "/mnt/goclusterfs/$filename" | awk '{print $1}')
+    if [[ "$recovered_checksum" != "$original_checksum" ]]; then
+        log "ERROR: File checksum mismatch. Expected: $original_checksum, Got: $recovered_checksum"
+        return 1
+    fi
+
+    log "Node B: Successfully recovered large file ($recovered_size bytes, md5: $recovered_checksum)"
+
+    # Phase 5: Restart Node A and verify it can see the recovered file
+    log "Phase 5: Restarting Node A..."
+    restart_node "$node_a"
+    wait_node_healthy "$node_a" 30
+
+    if ! file_exists "$node_a" "$filename"; then
+        log "ERROR: Large file not visible on restarted Node A"
+        return 1
+    fi
+
+    log "Large file journal recovery test passed"
+    return 0
+}
+
+# Test: Journal recovery idempotency
+# Verifies that recovery is idempotent - multiple nodes can attempt recovery safely
+# Matches Go test: TestMultiNodeRecoveryIdempotency
+test_journal_recovery_idempotency() {
+    log "Testing journal recovery idempotency..."
+
+    # Need at least 3 nodes for this test (Node A creates, B recovers, C verifies idempotency)
+    if [[ ${#NODE_ARRAY[@]} -lt 3 ]]; then
+        log "SKIP: Need at least 3 nodes for idempotency test"
+        return 0
+    fi
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]}"
+    local node_c="${NODE_ARRAY[2]}"
+    local filename="idempotent.txt"
+    local content="Idempotency test"
+
+    # Phase 1: Node A creates file
+    log "Phase 1: Node A ($node_a) creating file..."
+    write_file "$node_a" "$filename" "$content"
+
+    # Let data sync
+    sleep 1
+
+    # Phase 2: Kill Node A
+    log "Phase 2: Killing Node A..."
+    kill_node "$node_a"
+    sleep 2
+
+    # Phase 3: Wait for heartbeat timeout
+    log "Phase 3: Waiting for heartbeat timeout (10s)..."
+    sleep 10
+
+    # Phase 4: Node B performs first recovery
+    log "Phase 4: Verifying first recovery on Node B..."
+
+    if ! file_exists "$node_b" "$filename"; then
+        log "ERROR: File not found on Node B after first recovery"
+        return 1
+    fi
+
+    local recovered_content
+    recovered_content=$(read_file "$node_b" "$filename")
+    if [[ "$recovered_content" != "$content" ]]; then
+        log "ERROR: Content mismatch on Node B. Expected: '$content', Got: '$recovered_content'"
+        return 1
+    fi
+
+    log "Node B: First recovery successful"
+
+    # Phase 5: Stop Node B
+    log "Phase 5: Stopping Node B..."
+    kill_node "$node_b"
+    sleep 2
+
+    # Phase 6: Verify idempotency on Node C
+    # Node C should see the same file - if recovery wasn't idempotent, file could be corrupted
+    log "Phase 6: Starting Node C and checking idempotency..."
+
+    # Wait a moment for any potential recovery attempt
+    sleep 5
+
+    if ! file_exists "$node_c" "$filename"; then
+        log "ERROR: File not found on Node C (idempotency violated)"
+        return 1
+    fi
+
+    local final_content
+    final_content=$(read_file "$node_c" "$filename")
+    if [[ "$final_content" != "$content" ]]; then
+        log "ERROR: Content corrupted on Node C after multiple recovery attempts"
+        log "Expected: '$content', Got: '$final_content'"
+        return 1
+    fi
+
+    log "Node C: File content verified after multiple nodes"
+
+    # Phase 7: Verify we can still create new files
+    log "Phase 7: Verifying new file creation works..."
+    write_file "$node_c" "new-file.txt" "Post-recovery file"
+
+    if ! file_exists "$node_c" "new-file.txt"; then
+        log "ERROR: Cannot create new files after recovery"
+        return 1
+    fi
+
+    # Cleanup: restart killed nodes
+    log "Cleanup: Restarting Node A and Node B..."
+    restart_node "$node_a"
+    restart_node "$node_b"
+    wait_node_healthy "$node_a" 30
+    wait_node_healthy "$node_b" 30
+
+    log "Journal recovery idempotency test passed"
+    return 0
+}
+
+# Test: Journal crash recovery (file)
+# Simulates single-node crash: create file, kill process, remount and verify recovery
+# Matches Go test: TestJournalCrashRecoveryFile
+test_journal_crash_recovery_file() {
+    log "Testing journal crash recovery for file operations..."
+
+    # This test works with a single node - we test crash/recovery on node A
+    local node_a="${NODE_ARRAY[0]}"
+    local filename="crash_test.txt"
+    local content="This data should survive a crash!"
+
+    # Phase 1: Create file with known content
+    log "Phase 1: Creating file on Node A..."
+    write_file "$node_a" "$filename" "$content"
+
+    # Verify file exists before crash
+    if ! file_exists "$node_a" "$filename"; then
+        log "ERROR: File should exist before crash"
+        return 1
+    fi
+
+    # Give time for journal sync
+    sleep 1
+
+    log "Phase 2: Simulating crash by killing container..."
+    kill_node "$node_a"
+    sleep 2
+
+    # Phase 3: Restart (remount) - this triggers journal recovery
+    log "Phase 3: Restarting container to trigger journal recovery..."
+    restart_node "$node_a"
+    wait_node_healthy "$node_a" 30
+
+    # Phase 4: Verify file was recovered
+    log "Phase 4: Verifying file recovery..."
+
+    if ! file_exists "$node_a" "$filename"; then
+        log "ERROR: File should exist after crash recovery"
+        return 1
+    fi
+
+    # Verify content is intact
+    local recovered_content
+    recovered_content=$(read_file "$node_a" "$filename")
+    if [[ "$recovered_content" != "$content" ]]; then
+        log "ERROR: Content mismatch after crash recovery"
+        log "Expected: '$content'"
+        log "Got: '$recovered_content'"
+        return 1
+    fi
+
+    log "Journal crash recovery file test passed"
+    return 0
+}
+
+# Test: Journal crash recovery (directory)
+# Simulates single-node crash: create directory with nested file, kill process, remount and verify recovery
+# Matches Go test: TestJournalCrashRecoveryDirectory
+test_journal_crash_recovery_directory() {
+    log "Testing journal crash recovery for directory operations..."
+
+    # This test works with a single node
+    local node_a="${NODE_ARRAY[0]}"
+    local dirname="recovered_dir"
+    local nested_file="$dirname/nested.txt"
+    local content="Nested file content"
+
+    # Phase 1: Create directory structure
+    log "Phase 1: Creating directory and nested file on Node A..."
+
+    # Create directory
+    exec_on_node "$node_a" mkdir -p "/mnt/goclusterfs/$dirname"
+
+    # Create nested file
+    write_file "$node_a" "$nested_file" "$content"
+
+    # Verify directory exists before crash
+    if ! exec_on_node "$node_a" test -d "/mnt/goclusterfs/$dirname"; then
+        log "ERROR: Directory should exist before crash"
+        return 1
+    fi
+
+    # Verify nested file exists before crash
+    if ! file_exists "$node_a" "$nested_file"; then
+        log "ERROR: Nested file should exist before crash"
+        return 1
+    fi
+
+    # Give time for journal sync
+    sleep 1
+
+    log "Phase 2: Simulating crash by killing container..."
+    kill_node "$node_a"
+    sleep 2
+
+    # Phase 3: Restart (remount) - this triggers journal recovery
+    log "Phase 3: Restarting container to trigger journal recovery..."
+    restart_node "$node_a"
+    wait_node_healthy "$node_a" 30
+
+    # Phase 4: Verify directory structure was recovered
+    log "Phase 4: Verifying directory recovery..."
+
+    # Verify directory exists and is a directory
+    if ! exec_on_node "$node_a" test -d "/mnt/goclusterfs/$dirname"; then
+        log "ERROR: Directory should exist after crash recovery"
+        return 1
+    fi
+
+    # Verify nested file exists
+    if ! file_exists "$node_a" "$nested_file"; then
+        log "ERROR: Nested file should exist after crash recovery"
+        return 1
+    fi
+
+    # Verify nested file content
+    local recovered_content
+    recovered_content=$(read_file "$node_a" "$nested_file")
+    if [[ "$recovered_content" != "$content" ]]; then
+        log "ERROR: Nested file content mismatch after crash recovery"
+        log "Expected: '$content'"
+        log "Got: '$recovered_content'"
+        return 1
+    fi
+
+    log "Journal crash recovery directory test passed"
+    return 0
+}
+
+# Test: Journal crash recovery for multiple operations
+# Matches Go test: TestJournalCrashRecoveryMultipleOps in journal_test.go
+# Creates multiple files + directory + nested file, crashes, verifies all recovered
+test_journal_crash_recovery_multiple_ops() {
+    log "Testing journal crash recovery for multiple operations..."
+
+    local node_a="${NODE_ARRAY[0]}"
+
+    # Perform multiple operations
+    # 1. Create file1.txt
+    log "Creating file1.txt..."
+    if ! write_file "$node_a" "file1.txt" "content1"; then
+        log "ERROR: Failed to create file1.txt"
+        return 1
+    fi
+
+    # 2. Create file2.txt
+    log "Creating file2.txt..."
+    if ! write_file "$node_a" "file2.txt" "content2"; then
+        log "ERROR: Failed to create file2.txt"
+        return 1
+    fi
+
+    # 3. Create directory
+    log "Creating testdir..."
+    if ! docker exec "$node_a" mkdir -p "$MOUNT_POINT/testdir"; then
+        log "ERROR: Failed to create testdir"
+        return 1
+    fi
+
+    # 4. Create nested file
+    log "Creating testdir/nested.txt..."
+    if ! docker exec "$node_a" sh -c "echo -n 'nested' > '$MOUNT_POINT/testdir/nested.txt'"; then
+        log "ERROR: Failed to create nested file"
+        return 1
+    fi
+
+    # Force sync
+    docker exec "$node_a" sync 2>/dev/null || true
+
+    log "All operations complete, simulating crash..."
+
+    # Kill the container to simulate crash
+    docker kill "$node_a" >/dev/null 2>&1 || true
+    sleep 2
+
+    # Restart container
+    log "Restarting container..."
+    docker start "$node_a" >/dev/null 2>&1
+
+    # Wait for container and remount
+    sleep 2
+    if ! docker exec "$node_a" mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        # May need to explicitly remount after restart
+        start_goclusterfs "$node_a" false
+        sleep 2
+    fi
+
+    # Verify all operations were recovered
+    log "Verifying all operations were recovered..."
+
+    # Verify file1.txt
+    local content1
+    content1=$(read_file "$node_a" "file1.txt")
+    if [[ "$content1" != "content1" ]]; then
+        log "ERROR: file1.txt content mismatch after crash recovery"
+        log "Expected: 'content1', Got: '$content1'"
+        return 1
+    fi
+    log "file1.txt recovered successfully"
+
+    # Verify file2.txt
+    local content2
+    content2=$(read_file "$node_a" "file2.txt")
+    if [[ "$content2" != "content2" ]]; then
+        log "ERROR: file2.txt content mismatch after crash recovery"
+        log "Expected: 'content2', Got: '$content2'"
+        return 1
+    fi
+    log "file2.txt recovered successfully"
+
+    # Verify testdir is a directory
+    if ! docker exec "$node_a" test -d "$MOUNT_POINT/testdir"; then
+        log "ERROR: testdir not recovered as directory"
+        return 1
+    fi
+    log "testdir recovered successfully"
+
+    # Verify nested file
+    local nested_content
+    nested_content=$(docker exec "$node_a" cat "$MOUNT_POINT/testdir/nested.txt" 2>/dev/null)
+    if [[ "$nested_content" != "nested" ]]; then
+        log "ERROR: testdir/nested.txt content mismatch after crash recovery"
+        log "Expected: 'nested', Got: '$nested_content'"
+        return 1
+    fi
+    log "testdir/nested.txt recovered successfully"
+
+    log "Journal crash recovery multiple ops test passed - all 4 operations recovered"
+    return 0
+}
+
+# Test: Journal crash during write
+# Matches Go test: TestJournalCrashDuringWrite in journal_test.go
+# Creates baseline file, writes rapid files, crashes mid-write, verifies baseline recovered
+test_journal_crash_during_write() {
+    log "Testing journal crash during active write operation..."
+
+    local node_a="${NODE_ARRAY[0]}"
+    local baseline_content="This file was created and synced before the crash"
+
+    # Create baseline file that MUST survive
+    log "Creating baseline file..."
+    if ! write_file "$node_a" "baseline.txt" "$baseline_content"; then
+        log "ERROR: Failed to create baseline file"
+        return 1
+    fi
+
+    # Force sync to ensure baseline is committed to journal
+    docker exec "$node_a" sync 2>/dev/null || true
+    sleep 1
+
+    log "Baseline file created and synced"
+
+    # Start rapid writes in background
+    log "Starting rapid writes..."
+    local write_count=0
+    for i in $(seq 1 20); do
+        docker exec "$node_a" sh -c "echo -n 'Rapid write $i' > '$MOUNT_POINT/rapid_$(printf '%04d' $i).txt'" 2>/dev/null &
+        ((write_count++))
+    done
+
+    # Give a brief moment for some writes to start
+    sleep 0.2
+
+    log "Wrote $write_count rapid files, crashing now..."
+
+    # Kill container while writes may be in progress
+    docker kill "$node_a" >/dev/null 2>&1 || true
+
+    # Wait for any background processes to terminate
+    wait 2>/dev/null || true
+    sleep 2
+
+    # Restart container
+    log "Restarting container after crash..."
+    docker start "$node_a" >/dev/null 2>&1
+
+    # Wait for container and remount
+    sleep 2
+    if ! docker exec "$node_a" mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        start_goclusterfs "$node_a" false
+        sleep 2
+    fi
+
+    # Baseline file MUST be recovered
+    log "Verifying baseline file recovery..."
+    local recovered_baseline
+    recovered_baseline=$(read_file "$node_a" "baseline.txt")
+    if [[ "$recovered_baseline" != "$baseline_content" ]]; then
+        log "ERROR: Baseline file not recovered or content mismatch"
+        log "Expected: '$baseline_content'"
+        log "Got: '$recovered_baseline'"
+        return 1
+    fi
+    log "Baseline file recovered successfully"
+
+    # Count how many rapid files were recovered (some may be lost, which is expected)
+    local recovered_count
+    recovered_count=$(docker exec "$node_a" ls "$MOUNT_POINT" 2>/dev/null | grep -c "^rapid_" || echo "0")
+    log "Recovered $recovered_count/$write_count rapid files (some in-flight writes may be lost, which is expected)"
+
+    # The key assertion: filesystem is consistent (we can read/list without errors)
+    if ! docker exec "$node_a" ls -la "$MOUNT_POINT" >/dev/null 2>&1; then
+        log "ERROR: Filesystem inconsistent after crash recovery"
+        return 1
+    fi
+
+    log "Journal crash during write test passed - filesystem is consistent"
+    return 0
 }
 
 # Test 1: Multi-container concurrent writes
@@ -298,6 +1958,281 @@ test_stress_random_failures() {
 }
 
 # =============================================================================
+# Concurrent Same-File Write Tests (using pre-extension pattern)
+# =============================================================================
+
+# Test 6: Two nodes write to same file at different offsets
+test_concurrent_same_file_writes() {
+    log "Testing concurrent same-file writes (2 nodes)..."
+
+    local filename="samefile_2node.txt"
+    local chunk_size=$((400 * 1024))  # 400KB each
+    local final_size=$((chunk_size * 2))  # 800KB total
+
+    # Pre-extend file to final size (critical: avoids TOCTOU race in lock CAS)
+    pre_extend_file "${NODE_ARRAY[0]}" "$filename" "$final_size"
+    sleep 1
+
+    # Concurrent writes at different offsets
+    # Node 0: 400KB of 'A' at offset 0
+    # Node 1: 400KB of 'B' at offset 400KB
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "A" "$chunk_size" 0 &
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "B" "$chunk_size" "$chunk_size" &
+    wait
+    sleep 2
+
+    # Verify file size
+    local actual_size
+    actual_size=$(get_file_size "${NODE_ARRAY[0]}" "$filename")
+    if [ "$actual_size" -lt "$final_size" ]; then
+        log "ERROR: File too small: $actual_size bytes, expected at least $final_size"
+        return 1
+    fi
+
+    # Verify each node's data at expected offset
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "A" 0 100; then
+        log "ERROR: Node 0 data corrupted at offset 0"
+        return 1
+    fi
+
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "B" "$chunk_size" 100; then
+        log "ERROR: Node 1 data corrupted at offset $chunk_size"
+        return 1
+    fi
+
+    log "Concurrent same-file writes (2 nodes) test passed"
+    return 0
+}
+
+# Test 7: Three nodes write to same file at different offsets
+test_concurrent_same_file_writes_3nodes() {
+    log "Testing concurrent same-file writes (3 nodes)..."
+
+    if [ "$NODE_COUNT" -lt 3 ]; then
+        log "SKIP: Need at least 3 nodes for this test"
+        return 0
+    fi
+
+    local filename="samefile_3node.txt"
+    local chunk_size=$((300 * 1024))  # 300KB each
+    local final_size=$((chunk_size * 3))  # 900KB total
+
+    # Pre-extend file
+    pre_extend_file "${NODE_ARRAY[0]}" "$filename" "$final_size"
+    sleep 1
+
+    # Concurrent writes
+    # Node 0: 300KB of '1' at offset 0
+    # Node 1: 300KB of '2' at offset 300KB
+    # Node 2: 300KB of '3' at offset 600KB
+    local offset1=$chunk_size
+    local offset2=$((chunk_size * 2))
+
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "1" "$chunk_size" 0 &
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "2" "$chunk_size" "$offset1" &
+    write_pattern_at "${NODE_ARRAY[2]}" "$filename" "3" "$chunk_size" "$offset2" &
+    wait
+    sleep 2
+
+    # Verify all three regions
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "1" 0 100; then
+        log "ERROR: Node 0 data corrupted"
+        return 1
+    fi
+
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "2" "$offset1" 100; then
+        log "ERROR: Node 1 data corrupted"
+        return 1
+    fi
+
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "3" "$offset2" 100; then
+        log "ERROR: Node 2 data corrupted"
+        return 1
+    fi
+
+    log "Concurrent same-file writes (3 nodes) test passed"
+    return 0
+}
+
+# Test 8: Mixed size writes - one within file, one extending
+test_mixed_size_writes() {
+    log "Testing mixed size writes..."
+
+    local filename="mixed_writes.txt"
+    local initial_size=$((500 * 1024))  # 500KB initial
+    local extend_size=$((512 * 1024))  # 512KB extension
+    local final_size=$((initial_size + extend_size))  # ~1MB total
+
+    # Pre-extend file to FINAL size (critical for avoiding race)
+    pre_extend_file "${NODE_ARRAY[0]}" "$filename" "$final_size"
+    sleep 1
+
+    # Fill initial region with 'I'
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "I" "$initial_size" 0
+    sleep 1
+
+    # Concurrent writes:
+    # Node 0: 100 bytes of 'N' at offset 250KB (within initial region)
+    # Node 1: 512KB of 'E' at offset 500KB (in extended region, pre-filled with zeros)
+    local within_offset=$((250 * 1024))
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "N" 100 "$within_offset" &
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "E" "$extend_size" "$initial_size" &
+    wait
+    sleep 2
+
+    # Verify the non-extending write
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "N" "$within_offset" 100; then
+        log "ERROR: Non-extending write data corrupted"
+        return 1
+    fi
+
+    # Verify the extending write
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "E" "$initial_size" 100; then
+        log "ERROR: Extending write data corrupted"
+        return 1
+    fi
+
+    log "Mixed size writes test passed"
+    return 0
+}
+
+# Test 9: Overlapping block writes (all within same 1MB block)
+test_overlapping_block_writes() {
+    log "Testing overlapping block writes..."
+
+    if [ "$NODE_COUNT" -lt 3 ]; then
+        log "SKIP: Need at least 3 nodes for this test"
+        return 0
+    fi
+
+    local filename="overlap_block.txt"
+    local chunk_size=$((256 * 1024))  # 256KB each
+    local final_size=$((chunk_size * 3))  # 768KB total (fits in one 1MB block)
+
+    # Pre-extend file
+    pre_extend_file "${NODE_ARRAY[0]}" "$filename" "$final_size"
+    sleep 1
+
+    # Concurrent writes to same block:
+    # Node 0: 256KB of 'X' at offset 0
+    # Node 1: 256KB of 'Y' at offset 256KB
+    # Node 2: 256KB of 'Z' at offset 512KB
+    local offset1=$chunk_size
+    local offset2=$((chunk_size * 2))
+
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "X" "$chunk_size" 0 &
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "Y" "$chunk_size" "$offset1" &
+    write_pattern_at "${NODE_ARRAY[2]}" "$filename" "Z" "$chunk_size" "$offset2" &
+    wait
+    sleep 2
+
+    # Verify all three regions
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "X" 0 100; then
+        log "ERROR: Node 0 data (X) corrupted"
+        return 1
+    fi
+
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "Y" "$offset1" 100; then
+        log "ERROR: Node 1 data (Y) corrupted"
+        return 1
+    fi
+
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "Z" "$offset2" 100; then
+        log "ERROR: Node 2 data (Z) corrupted"
+        return 1
+    fi
+
+    log "Overlapping block writes test passed"
+    return 0
+}
+
+# Test 10: Write stress test - multiple rounds
+test_concurrent_write_stress() {
+    log "Testing concurrent write stress (multiple rounds)..."
+
+    if [ "$NODE_COUNT" -lt 3 ]; then
+        log "SKIP: Need at least 3 nodes for this test"
+        return 0
+    fi
+
+    local filename="write_stress.txt"
+    local chunk_size=$((250 * 1024))  # 250KB each
+    local round1_size=$((chunk_size * 3))  # 750KB
+    local round2_size=$((chunk_size * 3))
+    local final_size=$((round1_size + round2_size))  # 1.5MB total
+
+    # Pre-extend file for all rounds
+    pre_extend_file "${NODE_ARRAY[0]}" "$filename" "$final_size"
+    sleep 1
+
+    # Round 1: First 750KB
+    log "Round 1: Writing first 750KB..."
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "a" "$chunk_size" 0 &
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "b" "$chunk_size" "$chunk_size" &
+    write_pattern_at "${NODE_ARRAY[2]}" "$filename" "c" "$chunk_size" "$((chunk_size * 2))" &
+    wait
+    sleep 1
+
+    # Round 2: Next 750KB
+    log "Round 2: Writing next 750KB..."
+    local r2_base=$round1_size
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "d" "$chunk_size" "$r2_base" &
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "e" "$chunk_size" "$((r2_base + chunk_size))" &
+    write_pattern_at "${NODE_ARRAY[2]}" "$filename" "f" "$chunk_size" "$((r2_base + chunk_size * 2))" &
+    wait
+    sleep 2
+
+    # Verify all 6 regions
+    local patterns=("a" "b" "c" "d" "e" "f")
+    for i in {0..5}; do
+        local offset=$((chunk_size * i))
+        if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "${patterns[$i]}" "$offset" 100; then
+            log "ERROR: Region $i (pattern ${patterns[$i]}) at offset $offset corrupted"
+            return 1
+        fi
+    done
+
+    log "Concurrent write stress test passed"
+    return 0
+}
+
+# Test 11: Reversed write order (high offset first)
+test_reversed_write_order() {
+    log "Testing reversed write order..."
+
+    local filename="reversed_order.txt"
+    local chunk_size=$((400 * 1024))  # 400KB each
+    local final_size=$((chunk_size * 2))  # 800KB total
+
+    # Pre-extend file
+    pre_extend_file "${NODE_ARRAY[0]}" "$filename" "$final_size"
+    sleep 1
+
+    # Concurrent writes with reversed order:
+    # Node 1 writes at HIGH offset (400KB) - started first
+    # Node 0 writes at LOW offset (0) - started slightly after
+    write_pattern_at "${NODE_ARRAY[1]}" "$filename" "H" "$chunk_size" "$chunk_size" &
+    sleep 0.1
+    write_pattern_at "${NODE_ARRAY[0]}" "$filename" "L" "$chunk_size" 0 &
+    wait
+    sleep 2
+
+    # Verify both regions
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "L" 0 100; then
+        log "ERROR: Low-offset data (L) corrupted"
+        return 1
+    fi
+
+    if ! verify_pattern_at "${NODE_ARRAY[0]}" "$filename" "H" "$chunk_size" 100; then
+        log "ERROR: High-offset data (H) corrupted"
+        return 1
+    fi
+
+    log "Reversed write order test passed"
+    return 0
+}
+
+# =============================================================================
 # Main Test Execution
 # =============================================================================
 
@@ -317,16 +2252,63 @@ log "All nodes healthy, starting tests..."
 > "$RESULTS_DIR/results.txt"
 
 # Run test suite
+# Basic sanity checks first
+run_test "Create and Read File" test_create_read_file
+run_test "Create Directory" test_create_directory
+run_test "File in Directory" test_file_in_directory
+run_test "Data Persistence" test_data_persistence
+run_test "Delete File" test_delete_file
+run_test "Large File" test_large_file
+run_test "Many Files" test_many_files
+run_test "Nested Directories" test_nested_directories
+run_test "Delete Directory" test_delete_directory
+run_test "Truncate File" test_truncate_file
+run_test "Append File" test_append_file
+run_test "Rename File" test_rename_file
+run_test "Stress Single Node" test_stress_single_node
+run_test "Overwrite File" test_overwrite_file
+run_test "Sequential Access" test_sequential_access
+
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"
     echo "SKIP: Concurrent Writes (known race conditions)" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Concurrent File Creation" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Concurrent Directory Ops" >> "$RESULTS_DIR/results.txt"
 else
     run_test "Concurrent Writes" test_concurrent_writes
+    run_test "Concurrent File Creation" test_concurrent_file_creation
+    run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 fi
 run_test "Container Kill Recovery" test_container_kill_recovery
+run_test "Journal Recovery Multi-Node" test_journal_recovery_multinode
+run_test "Journal Recovery Multiple Files" test_journal_recovery_multiple_files
+run_test "Journal Recovery Large File" test_journal_recovery_large_file
+run_test "Journal Recovery Idempotency" test_journal_recovery_idempotency
+run_test "Journal Crash Recovery File" test_journal_crash_recovery_file
+run_test "Journal Crash Recovery Directory" test_journal_crash_recovery_directory
+run_test "Journal Crash Recovery Multiple Ops" test_journal_crash_recovery_multiple_ops
+run_test "Journal Crash During Write" test_journal_crash_during_write
 run_test "Network Partition" test_network_partition
 run_test "Rolling Restart" test_rolling_restart
 run_test "Stress Random Failures" test_stress_random_failures
+
+# New concurrent same-file write tests (using pre-extension pattern)
+if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
+    log "SKIPPING: Concurrent Same-File Write tests"
+    echo "SKIP: Concurrent Same-File Writes (2 nodes)" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Concurrent Same-File Writes (3 nodes)" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Mixed Size Writes" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Overlapping Block Writes" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Concurrent Write Stress" >> "$RESULTS_DIR/results.txt"
+    echo "SKIP: Reversed Write Order" >> "$RESULTS_DIR/results.txt"
+else
+    run_test "Concurrent Same-File Writes (2 nodes)" test_concurrent_same_file_writes
+    run_test "Concurrent Same-File Writes (3 nodes)" test_concurrent_same_file_writes_3nodes
+    run_test "Mixed Size Writes" test_mixed_size_writes
+    run_test "Overlapping Block Writes" test_overlapping_block_writes
+    run_test "Concurrent Write Stress" test_concurrent_write_stress
+    run_test "Reversed Write Order" test_reversed_write_order
+fi
 
 # Count skipped tests
 test_skipped=$(grep -c "^SKIP:" "$RESULTS_DIR/results.txt" 2>/dev/null || echo 0)

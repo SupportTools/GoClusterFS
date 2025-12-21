@@ -120,7 +120,7 @@ func TestInitRoot(t *testing.T) {
 	}
 }
 
-func TestRoot(t *testing.T) {
+func TestRootDir(t *testing.T) {
 	fs, cleanup := createTestFS(t)
 	defer cleanup()
 
@@ -129,19 +129,15 @@ func TestRoot(t *testing.T) {
 		t.Fatalf("InitRoot failed: %v", err)
 	}
 
-	// Get root node
-	root, err := fs.Root()
-	if err != nil {
-		t.Fatalf("Root() failed: %v", err)
-	}
-
-	dir, ok := root.(*Dir)
-	if !ok {
-		t.Fatalf("Root should return *Dir")
-	}
+	// Get root dir node via helper
+	dir := fs.RootDir()
 
 	if dir.inodeNum != inode.InodeRoot {
 		t.Errorf("Expected root inode %d, got %d", inode.InodeRoot, dir.inodeNum)
+	}
+
+	if dir.fs != fs {
+		t.Error("Dir should have reference to FS")
 	}
 }
 
@@ -154,8 +150,7 @@ func TestDirAttr(t *testing.T) {
 		t.Fatalf("InitRoot failed: %v", err)
 	}
 
-	root, _ := fs.Root()
-	dir := root.(*Dir)
+	dir := fs.RootDir()
 
 	// We need to implement a mock fuse.Attr for testing
 	// For now, just verify the directory can be accessed

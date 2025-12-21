@@ -101,6 +101,7 @@ func TestSerializeDeserialize(t *testing.T) {
 		LinkCount:       2,
 		Size:            12345678,
 		AllocatedBlocks: 12,
+		WrittenBlocks:   10, // Include WrittenBlocks in serialization test
 		Atime:           now,
 		Mtime:           now - 100,
 		Ctime:           now - 200,
@@ -165,6 +166,9 @@ func TestSerializeDeserialize(t *testing.T) {
 	}
 	if restored.AllocatedBlocks != inode.AllocatedBlocks {
 		t.Errorf("AllocatedBlocks = %d, want %d", restored.AllocatedBlocks, inode.AllocatedBlocks)
+	}
+	if restored.WrittenBlocks != inode.WrittenBlocks {
+		t.Errorf("WrittenBlocks = %d, want %d", restored.WrittenBlocks, inode.WrittenBlocks)
 	}
 	if restored.Atime != inode.Atime {
 		t.Errorf("Atime = %d, want %d", restored.Atime, inode.Atime)

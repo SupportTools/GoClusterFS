@@ -97,6 +97,7 @@ type Inode struct {
 	LinkCount        uint32          // Hard link count
 	Size             uint64          // File size in bytes
 	AllocatedBlocks  uint64          // Physical blocks allocated
+	WrittenBlocks    uint64          // Actually written blocks (excluding unwritten)
 	Atime            int64           // Access time (Unix timestamp)
 	Mtime            int64           // Modification time
 	Ctime            int64           // Change time (metadata)
@@ -107,7 +108,7 @@ type Inode struct {
 	ExtentTreeRoot   uint64          // Block number for overflow tree
 	ExtentCount      uint64          // Total extent count
 	ExtentDepth      uint32          // Extent tree depth (0 = inline only)
-	Reserved         [60]byte        // Padding to 252 bytes
+	Reserved         [52]byte        // Padding to 252 bytes
 	Checksum         uint32          // CRC32C checksum
 }
 
@@ -510,22 +511,23 @@ func serializeInode(inode *Inode) []byte {
 	// Size and allocation
 	binary.LittleEndian.PutUint64(buf[24:32], inode.Size)
 	binary.LittleEndian.PutUint64(buf[32:40], inode.AllocatedBlocks)
+	binary.LittleEndian.PutUint64(buf[40:48], inode.WrittenBlocks)
 
 	// Timestamps
-	binary.LittleEndian.PutUint64(buf[40:48], uint64(inode.Atime))
-	binary.LittleEndian.PutUint64(buf[48:56], uint64(inode.Mtime))
-	binary.LittleEndian.PutUint64(buf[56:64], uint64(inode.Ctime))
+	binary.LittleEndian.PutUint64(buf[48:56], uint64(inode.Atime))
+	binary.LittleEndian.PutUint64(buf[56:64], uint64(inode.Mtime))
+	binary.LittleEndian.PutUint64(buf[64:72], uint64(inode.Ctime))
 
 	// Generation counters
-	binary.LittleEndian.PutUint64(buf[64:72], inode.DataGeneration)
-	binary.LittleEndian.PutUint64(buf[72:80], inode.MetaGeneration)
+	binary.LittleEndian.PutUint64(buf[72:80], inode.DataGeneration)
+	binary.LittleEndian.PutUint64(buf[80:88], inode.MetaGeneration)
 
 	// Last modifier UUID
-	copy(buf[80:96], inode.LastModifierUUID[:])
+	copy(buf[88:104], inode.LastModifierUUID[:])
 
 	// Inline extents (2 × 32 bytes = 64 bytes)
 	for i, ext := range inode.InlineExtents {
-		offset := 96 + i*32
+		offset := 104 + i*32
 		binary.LittleEndian.PutUint64(buf[offset:offset+8], ext.LogicalBlock)
 		binary.LittleEndian.PutUint64(buf[offset+8:offset+16], ext.PhysicalBlock)
 		binary.LittleEndian.PutUint64(buf[offset+16:offset+24], ext.Length)
@@ -534,11 +536,11 @@ func serializeInode(inode *Inode) []byte {
 	}
 
 	// Extent tree info
-	binary.LittleEndian.PutUint64(buf[160:168], inode.ExtentTreeRoot)
-	binary.LittleEndian.PutUint64(buf[168:176], inode.ExtentCount)
-	binary.LittleEndian.PutUint32(buf[176:180], inode.ExtentDepth)
+	binary.LittleEndian.PutUint64(buf[168:176], inode.ExtentTreeRoot)
+	binary.LittleEndian.PutUint64(buf[176:184], inode.ExtentCount)
+	binary.LittleEndian.PutUint32(buf[184:188], inode.ExtentDepth)
 
-	// Reserved bytes 180-247 (68 bytes) - already zero
+	// Reserved bytes 188-251 (64 bytes) - already zero
 
 	// Compute checksum (bytes 0-251)
 	checksum := storage.CRC32C(buf[:InodeSize-4])
@@ -577,23 +579,24 @@ func deserializeInode(buf []byte) (*Inode, error) {
 		LinkCount:       binary.LittleEndian.Uint32(buf[20:24]),
 		Size:            binary.LittleEndian.Uint64(buf[24:32]),
 		AllocatedBlocks: binary.LittleEndian.Uint64(buf[32:40]),
-		Atime:           int64(binary.LittleEndian.Uint64(buf[40:48])),
-		Mtime:           int64(binary.LittleEndian.Uint64(buf[48:56])),
-		Ctime:           int64(binary.LittleEndian.Uint64(buf[56:64])),
-		DataGeneration:  binary.LittleEndian.Uint64(buf[64:72]),
-		MetaGeneration:  binary.LittleEndian.Uint64(buf[72:80]),
-		ExtentTreeRoot:  binary.LittleEndian.Uint64(buf[160:168]),
-		ExtentCount:     binary.LittleEndian.Uint64(buf[168:176]),
-		ExtentDepth:     binary.LittleEndian.Uint32(buf[176:180]),
+		WrittenBlocks:   binary.LittleEndian.Uint64(buf[40:48]),
+		Atime:           int64(binary.LittleEndian.Uint64(buf[48:56])),
+		Mtime:           int64(binary.LittleEndian.Uint64(buf[56:64])),
+		Ctime:           int64(binary.LittleEndian.Uint64(buf[64:72])),
+		DataGeneration:  binary.LittleEndian.Uint64(buf[72:80]),
+		MetaGeneration:  binary.LittleEndian.Uint64(buf[80:88]),
+		ExtentTreeRoot:  binary.LittleEndian.Uint64(buf[168:176]),
+		ExtentCount:     binary.LittleEndian.Uint64(buf[176:184]),
+		ExtentDepth:     binary.LittleEndian.Uint32(buf[184:188]),
 		Checksum:        stored,
 	}
 
 	// Copy UUID
-	copy(inode.LastModifierUUID[:], buf[80:96])
+	copy(inode.LastModifierUUID[:], buf[88:104])
 
 	// Deserialize inline extents
 	for i := range inode.InlineExtents {
-		offset := 96 + i*32
+		offset := 104 + i*32
 		inode.InlineExtents[i] = InlineExtent{
 			LogicalBlock:  binary.LittleEndian.Uint64(buf[offset : offset+8]),
 			PhysicalBlock: binary.LittleEndian.Uint64(buf[offset+8 : offset+16]),

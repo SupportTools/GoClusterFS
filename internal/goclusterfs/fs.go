@@ -2,6 +2,8 @@
 //
 // This package integrates all Phase 2 components (bitmap, inode, extent, dir)
 // into a working FUSE filesystem that can be mounted and used.
+//
+// Uses hanwen/go-fuse v2 for proper FUSE capability negotiation (including fallocate).
 package goclusterfs
 
 import (
@@ -15,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
+	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/cache"
@@ -49,8 +51,11 @@ const MaxCreateRetries = 5
 // BlockSize is the size of data blocks (1MB).
 const BlockSize = 1 << 20
 
-// FS represents the GoClusterFS filesystem.
+// FS represents the GoClusterFS filesystem root.
+// Embeds fs.Inode for go-fuse v2 node identity.
 type FS struct {
+	fs.Inode
+
 	mu sync.RWMutex
 
 	// Storage layer
@@ -75,6 +80,13 @@ type FS struct {
 	uid uint32
 	gid uint32
 }
+
+// Verify interface compliance at compile time
+var (
+	_ fs.InodeEmbedder = (*FS)(nil)
+	_ fs.NodeOnAdder   = (*FS)(nil)
+	_ fs.NodeStatfser  = (*FS)(nil)
+)
 
 // Config holds filesystem configuration.
 type Config struct {
@@ -224,6 +236,16 @@ func (f *FS) CacheStats() cache.Stats {
 	return cache.Stats{}
 }
 
+// RootDir returns the root directory node for testing purposes.
+// This is a helper method to support tests that need direct access to
+// the root Dir without going through the FUSE layer.
+func (f *FS) RootDir() *Dir {
+	return &Dir{
+		fs:       f,
+		inodeNum: inode.InodeRoot,
+	}
+}
+
 // hashString returns a 64-bit FNV-1a hash of the string.
 // Used for journal verification of filenames.
 func hashString(s string) uint64 {
@@ -271,51 +293,66 @@ func (f *FS) InitRoot(ctx context.Context) error {
 	return f.inodeTbl.Write(ctx, rootIno)
 }
 
-// Root returns the root directory node.
-func (f *FS) Root() (fs.Node, error) {
-	return &Dir{
+// OnAdd is called when the filesystem is mounted. It sets up the root directory.
+func (f *FS) OnAdd(ctx context.Context) {
+	// Create the root directory node and add it to the tree
+	rootDir := &Dir{
 		fs:       f,
 		inodeNum: inode.InodeRoot,
-	}, nil
+	}
+
+	// Add the root directory as a persistent child of FS
+	// This establishes the directory tree root
+	ch := f.NewPersistentInode(ctx, rootDir, fs.StableAttr{
+		Mode: fuse.S_IFDIR,
+		Ino:  uint64(inode.InodeRoot),
+	})
+	f.AddChild("", ch, true)
 }
 
 // Statfs returns filesystem statistics.
-func (f *FS) Statfs(ctx context.Context, req *fuse.StatfsRequest, resp *fuse.StatfsResponse) error {
+func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
 	totalBlocks := f.bitmapMgr.TotalBlocks()
 	freeBlocks := f.bitmapMgr.FreeCount()
 
-	resp.Blocks = totalBlocks
-	resp.Bfree = freeBlocks
-	resp.Bavail = freeBlocks
-	resp.Files = f.inodeTbl.TotalInodes()
-	resp.Ffree = f.inodeTbl.FreeCount()
-	resp.Bsize = BlockSize
-	resp.Namelen = 255
-	resp.Frsize = BlockSize
+	out.Blocks = totalBlocks
+	out.Bfree = freeBlocks
+	out.Bavail = freeBlocks
+	out.Files = f.inodeTbl.TotalInodes()
+	out.Ffree = f.inodeTbl.FreeCount()
+	out.Bsize = BlockSize
+	out.NameLen = 255
+	out.Frsize = BlockSize
 
-	return nil
+	return 0
 }
 
 // Dir represents a directory in the filesystem.
+// Embeds fs.Inode for go-fuse v2 node identity.
 type Dir struct {
+	fs.Inode
+
 	fs       *FS
 	inodeNum uint32
 }
 
+// Verify interface compliance at compile time
 var (
-	_ fs.Node                = (*Dir)(nil)
-	_ fs.HandleReadDirAller  = (*Dir)(nil)
-	_ fs.NodeRequestLookuper = (*Dir)(nil)
-	_ fs.NodeCreater         = (*Dir)(nil)
-	_ fs.NodeMkdirer         = (*Dir)(nil)
-	_ fs.NodeRemover         = (*Dir)(nil)
+	_ fs.InodeEmbedder = (*Dir)(nil)
+	_ fs.NodeGetattrer = (*Dir)(nil)
+	_ fs.NodeLookuper  = (*Dir)(nil)
+	_ fs.NodeReaddirer = (*Dir)(nil)
+	_ fs.NodeCreater   = (*Dir)(nil)
+	_ fs.NodeMkdirer   = (*Dir)(nil)
+	_ fs.NodeUnlinker  = (*Dir)(nil)
+	_ fs.NodeRmdirer   = (*Dir)(nil)
 )
 
-// Attr returns directory attributes.
-func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
+// Getattr returns directory attributes.
+func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	ino, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return syscall.EIO
@@ -323,50 +360,89 @@ func (d *Dir) Attr(ctx context.Context, a *fuse.Attr) error {
 
 	// Disable FUSE kernel caching for cluster operation.
 	// Other nodes may modify attributes at any time.
-	a.Valid = 0
+	out.AttrValid = 0
 
-	a.Inode = uint64(ino.InodeNum)
-	a.Mode = os.ModeDir | os.FileMode(ino.Mode&0777)
-	a.Nlink = ino.LinkCount
-	a.Uid = ino.UID
-	a.Gid = ino.GID
-	a.Size = ino.Size
-	a.Atime = time.Unix(0, ino.Atime)
-	a.Mtime = time.Unix(0, ino.Mtime)
-	a.Ctime = time.Unix(0, ino.Ctime)
-	a.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
+	out.Ino = uint64(ino.InodeNum)
+	out.Mode = uint32(fuse.S_IFDIR | (ino.Mode & 0777))
+	out.Nlink = uint32(ino.LinkCount)
+	out.Uid = ino.UID
+	out.Gid = ino.GID
+	out.Size = ino.Size
+	out.Atime = uint64(ino.Atime / 1e9)
+	out.Atimensec = uint32(ino.Atime % 1e9)
+	out.Mtime = uint64(ino.Mtime / 1e9)
+	out.Mtimensec = uint32(ino.Mtime % 1e9)
+	out.Ctime = uint64(ino.Ctime / 1e9)
+	out.Ctimensec = uint32(ino.Ctime % 1e9)
+	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
+	out.Blksize = BlockSize
 
-	return nil
+	return 0
 }
 
 // Lookup finds a child by name.
-func (d *Dir) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (fs.Node, error) {
+func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return nil, syscall.EIO
 	}
 
-	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, req.Name)
+	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
 		if err == dir.ErrNotFound {
-			return nil, fuse.ENOENT
+			return nil, syscall.ENOENT
 		}
 		return nil, syscall.EIO
 	}
 
 	// Disable FUSE kernel caching for cluster operation.
 	// Other nodes may modify the filesystem at any time.
-	resp.EntryValid = 0
-	resp.Attr.Valid = 0
+	out.EntryValid = 0
+	out.AttrValid = 0
 
 	if fileType == dir.DT_DIR {
-		return &Dir{fs: d.fs, inodeNum: uint32(childInodeNum)}, nil
+		childDir := &Dir{fs: d.fs, inodeNum: uint32(childInodeNum)}
+		ch := d.NewPersistentInode(ctx, childDir, fs.StableAttr{
+			Mode: fuse.S_IFDIR,
+			Ino:  childInodeNum,
+		})
+		return ch, 0
 	}
-	return &File{fs: d.fs, inodeNum: uint32(childInodeNum)}, nil
+
+	childFile := &File{fs: d.fs, inodeNum: uint32(childInodeNum)}
+	ch := d.NewPersistentInode(ctx, childFile, fs.StableAttr{
+		Mode: fuse.S_IFREG,
+		Ino:  childInodeNum,
+	})
+	return ch, 0
 }
 
-// ReadDirAll returns all directory entries.
-func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
+// dirStream implements fs.DirStream for directory listing.
+type dirStream struct {
+	entries []fuse.DirEntry
+	pos     int
+}
+
+// HasNext returns true if there are more entries.
+func (ds *dirStream) HasNext() bool {
+	return ds.pos < len(ds.entries)
+}
+
+// Next returns the next directory entry.
+func (ds *dirStream) Next() (fuse.DirEntry, syscall.Errno) {
+	if ds.pos >= len(ds.entries) {
+		return fuse.DirEntry{}, 0 // No more entries
+	}
+	e := ds.entries[ds.pos]
+	ds.pos++
+	return e, 0
+}
+
+// Close releases resources.
+func (ds *dirStream) Close() {}
+
+// Readdir returns a DirStream for directory listing.
+func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return nil, syscall.EIO
@@ -377,24 +453,24 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 		return nil, syscall.EIO
 	}
 
-	var result []fuse.Dirent
+	var result []fuse.DirEntry
 	for _, entry := range entries {
-		dtype := fuse.DT_File
+		mode := uint32(fuse.S_IFREG)
 		switch entry.FileType {
 		case dir.DT_DIR:
-			dtype = fuse.DT_Dir
+			mode = fuse.S_IFDIR
 		case dir.DT_LNK:
-			dtype = fuse.DT_Link
+			mode = fuse.S_IFLNK
 		}
 
-		result = append(result, fuse.Dirent{
-			Inode: entry.InodeNum,
-			Name:  entry.Name,
-			Type:  dtype,
+		result = append(result, fuse.DirEntry{
+			Ino:  entry.InodeNum,
+			Name: entry.Name,
+			Mode: mode,
 		})
 	}
 
-	return result, nil
+	return &dirStream{entries: result}, 0
 }
 
 // Create creates a new file.
@@ -403,23 +479,23 @@ func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 // collisions that occur when multiple nodes race to create files concurrently.
 // When another node claims the same inode slot, we rollback and retry with a
 // different slot.
-func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+func (d *Dir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
-		node, handle, err := d.createInternal(ctx, req, resp)
-		if err == errRetryCreate {
+		node, fh, fuseFlags, errno = d.createInternal(ctx, name, flags, mode, out)
+		if errno == syscall.EAGAIN {
 			// Jittered exponential backoff: base * 2^attempt + random jitter
 			// This spreads out retries to reduce thundering herd collisions
 			baseDelay := time.Millisecond * time.Duration(1<<attempt) // 1ms, 2ms, 4ms, 8ms, 16ms
 			jitter := time.Duration(rand.Int63n(int64(baseDelay)))    // 0 to baseDelay
 			backoff := baseDelay + jitter
-			log.Printf("[DEBUG] Create %q: inode slot collision, retry %d/%d (backoff %v)", req.Name, attempt+1, MaxCreateRetries, backoff)
+			log.Printf("[DEBUG] Create %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
 			time.Sleep(backoff)
 			continue
 		}
-		return node, handle, err
+		return
 	}
-	log.Printf("[WARN] Create %q: exhausted %d retries due to inode slot collisions", req.Name, MaxCreateRetries)
-	return nil, nil, syscall.EAGAIN
+	log.Printf("[WARN] Create %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
+	return nil, nil, 0, syscall.EAGAIN
 }
 
 // createInternal performs the actual file creation with two-phase allocation.
@@ -434,20 +510,29 @@ func (d *Dir) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.Cr
 // actual metadata writes. The commit point (journal.Commit) ensures crash
 // consistency - operations after commit are recoverable.
 //
-// Returns errRetryCreate if the inode slot was claimed by another node.
-func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
+// Returns syscall.EAGAIN if the inode slot was claimed by another node.
+func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	// Phase 1: Find a free inode slot (no distributed locks held)
 	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: FindFreeSlot failed: %v", req.Name, err)
-		return nil, nil, syscall.ENOSPC
+		log.Printf("[DEBUG] Create %q: FindFreeSlot failed: %v", name, err)
+		return nil, nil, 0, syscall.ENOSPC
 	}
 
 	// Phase 2: Read parent directory inode
 	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
-		return nil, nil, syscall.EIO
+		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", name, d.inodeNum, err)
+		return nil, nil, 0, syscall.EIO
+	}
+
+	// Get uid/gid from context or use defaults
+	uid := d.fs.uid
+	gid := d.fs.gid
+	caller, ok := fuse.FromContext(ctx)
+	if ok {
+		uid = caller.Uid
+		gid = caller.Gid
 	}
 
 	// === WAL: Begin transaction and log intent ===
@@ -458,15 +543,15 @@ func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp 
 		// Log inode creation intent
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 			InodeNum:       uint64(inodeNum),
-			Mode:           uint32(req.Mode),
-			UID:            req.Uid,
-			GID:            req.Gid,
+			Mode:           mode,
+			UID:            uid,
+			GID:            gid,
 			ParentInodeNum: uint64(d.inodeNum),
-			NameHash:       hashString(req.Name),
+			NameHash:       hashString(name),
 		}); err != nil {
 			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Create %q: journal LogInodeCreate failed: %v", req.Name, err)
-			return nil, nil, syscall.EIO
+			log.Printf("[DEBUG] Create %q: journal LogInodeCreate failed: %v", name, err)
+			return nil, nil, 0, syscall.EIO
 		}
 
 		// Log directory entry addition intent
@@ -474,48 +559,48 @@ func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp 
 			ParentInodeNum: uint64(d.inodeNum),
 			ChildInodeNum:  uint64(inodeNum),
 			EntryType:      journal.DirEntryRegular,
-			Name:           req.Name,
+			Name:           name,
 		}); err != nil {
 			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Create %q: journal LogDirAddEntry failed: %v", req.Name, err)
-			return nil, nil, syscall.EIO
+			log.Printf("[DEBUG] Create %q: journal LogDirAddEntry failed: %v", name, err)
+			return nil, nil, 0, syscall.EIO
 		}
 
 		// COMMIT POINT: After this, the operation WILL complete (even after crash)
 		if err := d.fs.journal.Commit(txn); err != nil {
-			log.Printf("[DEBUG] Create %q: journal commit failed: %v", req.Name, err)
-			return nil, nil, syscall.EIO
+			log.Printf("[DEBUG] Create %q: journal commit failed: %v", name, err)
+			return nil, nil, 0, syscall.EIO
 		}
 	}
 
 	// Phase 3: Add directory entry FIRST (may acquire BlockBitmap lock for directory expansion)
 	// This respects lock ordering: BlockBitmap (Level 6) before Inode (Level 8)
-	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(inodeNum), dir.DT_REG); err != nil {
-		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", req.Name, err)
-		return nil, nil, syscall.EIO
+	if err := d.fs.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
+		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", name, err)
+		return nil, nil, 0, syscall.EIO
 	}
 
 	// Phase 4: Claim the inode slot (acquires Inode lock)
 	// If this fails, another node claimed the slot - rollback the directory entry
 	childIno, err := d.fs.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v - rolling back", req.Name, inodeNum, err)
+		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v - rolling back", name, inodeNum, err)
 		// Rollback: remove the directory entry we just added
-		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); removeErr != nil {
-			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", req.Name, removeErr)
+		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, name); removeErr != nil {
+			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", name, removeErr)
 		}
 		// If slot was taken by another node, signal retry with a different slot
 		if err == inode.ErrInodeInUse {
-			return nil, nil, errRetryCreate
+			return nil, nil, 0, syscall.EAGAIN
 		}
-		return nil, nil, syscall.ENOSPC
+		return nil, nil, 0, syscall.ENOSPC
 	}
 
 	// Phase 5: Initialize file inode attributes
 	now := time.Now().UnixNano()
-	childIno.Mode = uint16(req.Mode & 0777)
-	childIno.UID = req.Uid
-	childIno.GID = req.Gid
+	childIno.Mode = uint16(mode & 0777)
+	childIno.UID = uid
+	childIno.GID = gid
 	childIno.LinkCount = 1
 	childIno.Atime = now
 	childIno.Mtime = now
@@ -523,19 +608,42 @@ func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp 
 
 	// Phase 6: Write updated inode
 	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
-		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", req.Name, childIno.InodeNum, err)
+		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
 		// Rollback both: free inode and remove directory entry
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		d.fs.dirMgr.Remove(ctx, dirIno, req.Name)
-		return nil, nil, syscall.EIO
+		d.fs.dirMgr.Remove(ctx, dirIno, name)
+		return nil, nil, 0, syscall.EIO
 	}
 
 	// Update directory mtime
 	dirIno.Mtime = now
 	d.fs.inodeTbl.Write(ctx, dirIno)
 
+	// Create the file node
 	file := &File{fs: d.fs, inodeNum: childIno.InodeNum}
-	return file, file, nil
+	ch := d.NewPersistentInode(ctx, file, fs.StableAttr{
+		Mode: fuse.S_IFREG,
+		Ino:  uint64(childIno.InodeNum),
+	})
+
+	// Populate entry attributes
+	out.EntryValid = 0
+	out.AttrValid = 0
+	out.Ino = uint64(childIno.InodeNum)
+	out.Mode = uint32(fuse.S_IFREG | (mode & 0777))
+	out.Nlink = 1
+	out.Uid = uid
+	out.Gid = gid
+	out.Size = 0
+	out.Atime = uint64(now / 1e9)
+	out.Atimensec = uint32(now % 1e9)
+	out.Mtime = uint64(now / 1e9)
+	out.Mtimensec = uint32(now % 1e9)
+	out.Ctime = uint64(now / 1e9)
+	out.Ctimensec = uint32(now % 1e9)
+	out.Blksize = BlockSize
+
+	return ch, nil, 0, 0
 }
 
 // Mkdir creates a new directory.
@@ -544,22 +652,22 @@ func (d *Dir) createInternal(ctx context.Context, req *fuse.CreateRequest, resp 
 // collisions that occur when multiple nodes race to create directories concurrently.
 // When another node claims the same inode slot, we rollback and retry with a
 // different slot.
-func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+func (d *Dir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
-		node, err := d.mkdirInternal(ctx, req)
-		if err == errRetryCreate {
+		node, errno := d.mkdirInternal(ctx, name, mode, out)
+		if errno == syscall.EAGAIN {
 			// Jittered exponential backoff: base * 2^attempt + random jitter
 			// This spreads out retries to reduce thundering herd collisions
 			baseDelay := time.Millisecond * time.Duration(1<<attempt) // 1ms, 2ms, 4ms, 8ms, 16ms
 			jitter := time.Duration(rand.Int63n(int64(baseDelay)))    // 0 to baseDelay
 			backoff := baseDelay + jitter
-			log.Printf("[DEBUG] Mkdir %q: inode slot collision, retry %d/%d (backoff %v)", req.Name, attempt+1, MaxCreateRetries, backoff)
+			log.Printf("[DEBUG] Mkdir %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
 			time.Sleep(backoff)
 			continue
 		}
-		return node, err
+		return node, errno
 	}
-	log.Printf("[WARN] Mkdir %q: exhausted %d retries due to inode slot collisions", req.Name, MaxCreateRetries)
+	log.Printf("[WARN] Mkdir %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
 	return nil, syscall.EAGAIN
 }
 
@@ -578,20 +686,29 @@ func (d *Dir) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error
 // Note: dirMgr.InitDirectory() already handles lock ordering internally by allocating
 // blocks before acquiring the inode lock.
 //
-// Returns errRetryCreate if the inode slot was claimed by another node.
-func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
+// Returns syscall.EAGAIN if the inode slot was claimed by another node.
+func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	// Phase 1: Find a free inode slot (no distributed locks held)
 	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: FindFreeSlot failed: %v", req.Name, err)
+		log.Printf("[DEBUG] Mkdir %q: FindFreeSlot failed: %v", name, err)
 		return nil, syscall.ENOSPC
 	}
 
 	// Phase 2: Read parent directory inode
 	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: Read parent inode %d failed: %v", req.Name, d.inodeNum, err)
+		log.Printf("[DEBUG] Mkdir %q: Read parent inode %d failed: %v", name, d.inodeNum, err)
 		return nil, syscall.EIO
+	}
+
+	// Get uid/gid from context or use defaults
+	uid := d.fs.uid
+	gid := d.fs.gid
+	caller, ok := fuse.FromContext(ctx)
+	if ok {
+		uid = caller.Uid
+		gid = caller.Gid
 	}
 
 	// === WAL: Begin transaction and log intent ===
@@ -602,14 +719,14 @@ func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 		// Log directory inode creation intent
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 			InodeNum:       uint64(inodeNum),
-			Mode:           uint32(inode.S_IFDIR) | uint32(req.Mode&0777),
-			UID:            req.Uid,
-			GID:            req.Gid,
+			Mode:           uint32(inode.S_IFDIR) | (mode & 0777),
+			UID:            uid,
+			GID:            gid,
 			ParentInodeNum: uint64(d.inodeNum),
-			NameHash:       hashString(req.Name),
+			NameHash:       hashString(name),
 		}); err != nil {
 			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Mkdir %q: journal LogInodeCreate failed: %v", req.Name, err)
+			log.Printf("[DEBUG] Mkdir %q: journal LogInodeCreate failed: %v", name, err)
 			return nil, syscall.EIO
 		}
 
@@ -618,10 +735,10 @@ func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 			ParentInodeNum: uint64(d.inodeNum),
 			ChildInodeNum:  uint64(inodeNum),
 			EntryType:      journal.DirEntryDirectory,
-			Name:           req.Name,
+			Name:           name,
 		}); err != nil {
 			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Mkdir %q: journal LogDirAddEntry failed: %v", req.Name, err)
+			log.Printf("[DEBUG] Mkdir %q: journal LogDirAddEntry failed: %v", name, err)
 			return nil, syscall.EIO
 		}
 
@@ -631,38 +748,38 @@ func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 
 		// COMMIT POINT: After this, the operation WILL complete (even after crash)
 		if err := d.fs.journal.Commit(txn); err != nil {
-			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", req.Name, err)
+			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
 		}
 	}
 
 	// Phase 3: Add directory entry in parent FIRST (may acquire BlockBitmap lock)
 	// This respects lock ordering: BlockBitmap (Level 6) before Inode (Level 8)
-	if err := d.fs.dirMgr.Add(ctx, dirIno, req.Name, uint64(inodeNum), dir.DT_DIR); err != nil {
-		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", req.Name, err)
+	if err := d.fs.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", name, err)
 		return nil, syscall.EIO
 	}
 
 	// Phase 4: Claim the inode slot (acquires Inode lock)
 	childIno, err := d.fs.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v - rolling back", req.Name, inodeNum, err)
+		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v - rolling back", name, inodeNum, err)
 		// Rollback: remove the directory entry we just added
-		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); removeErr != nil {
-			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", req.Name, removeErr)
+		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, name); removeErr != nil {
+			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", name, removeErr)
 		}
 		// If slot was taken by another node, signal retry with a different slot
 		if err == inode.ErrInodeInUse {
-			return nil, errRetryCreate
+			return nil, syscall.EAGAIN
 		}
 		return nil, syscall.ENOSPC
 	}
 
 	// Phase 5: Initialize directory inode attributes
 	now := time.Now().UnixNano()
-	childIno.Mode = inode.S_IFDIR | uint16(req.Mode&0777)
-	childIno.UID = req.Uid
-	childIno.GID = req.Gid
+	childIno.Mode = inode.S_IFDIR | uint16(mode&0777)
+	childIno.UID = uid
+	childIno.GID = gid
 	childIno.LinkCount = 2 // . and parent
 	childIno.Atime = now
 	childIno.Mtime = now
@@ -671,17 +788,17 @@ func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 	// Phase 6: Initialize directory contents (allocates data block for . and .. entries)
 	// Note: InitDirectory() handles lock ordering internally
 	if err := d.fs.dirMgr.InitDirectory(ctx, childIno, uint64(d.inodeNum)); err != nil {
-		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", req.Name, err)
+		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", name, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		d.fs.dirMgr.Remove(ctx, dirIno, req.Name)
+		d.fs.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
 
 	// Phase 7: Write updated inode
 	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
-		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", req.Name, err)
+		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", name, err)
 		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		d.fs.dirMgr.Remove(ctx, dirIno, req.Name)
+		d.fs.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
 
@@ -690,11 +807,45 @@ func (d *Dir) mkdirInternal(ctx context.Context, req *fuse.MkdirRequest) (fs.Nod
 	dirIno.Mtime = now
 	d.fs.inodeTbl.Write(ctx, dirIno)
 
-	return &Dir{fs: d.fs, inodeNum: childIno.InodeNum}, nil
+	// Create the directory node
+	childDir := &Dir{fs: d.fs, inodeNum: childIno.InodeNum}
+	ch := d.NewPersistentInode(ctx, childDir, fs.StableAttr{
+		Mode: fuse.S_IFDIR,
+		Ino:  uint64(childIno.InodeNum),
+	})
+
+	// Populate entry attributes
+	out.EntryValid = 0
+	out.AttrValid = 0
+	out.Ino = uint64(childIno.InodeNum)
+	out.Mode = uint32(fuse.S_IFDIR | (mode & 0777))
+	out.Nlink = 2
+	out.Uid = uid
+	out.Gid = gid
+	out.Size = childIno.Size
+	out.Atime = uint64(now / 1e9)
+	out.Atimensec = uint32(now % 1e9)
+	out.Mtime = uint64(now / 1e9)
+	out.Mtimensec = uint32(now % 1e9)
+	out.Ctime = uint64(now / 1e9)
+	out.Ctimensec = uint32(now % 1e9)
+	out.Blksize = BlockSize
+
+	return ch, 0
 }
 
-// Remove removes a file or empty directory.
-func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
+// Unlink removes a file.
+func (d *Dir) Unlink(ctx context.Context, name string) syscall.Errno {
+	return d.removeEntry(ctx, name, false)
+}
+
+// Rmdir removes an empty directory.
+func (d *Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
+	return d.removeEntry(ctx, name, true)
+}
+
+// removeEntry removes a file or empty directory.
+func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.Errno {
 	// Invalidate parent directory cache before modifying
 	d.fs.invalidateInode(d.inodeNum)
 
@@ -704,10 +855,10 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	}
 
 	// Look up the entry
-	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, req.Name)
+	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
 		if err == dir.ErrNotFound {
-			return fuse.ENOENT
+			return syscall.ENOENT
 		}
 		return syscall.EIO
 	}
@@ -722,7 +873,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	}
 
 	// Handle directory removal
-	if req.Dir {
+	if isDir {
 		if fileType != dir.DT_DIR {
 			return syscall.ENOTDIR
 		}
@@ -737,6 +888,11 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 		}
 
 		// Will decrement parent link count (done after commit)
+	} else {
+		// Unlink: verify it's not a directory
+		if fileType == dir.DT_DIR {
+			return syscall.EISDIR
+		}
 	}
 
 	// Determine if inode will be freed (link count becomes 0)
@@ -749,7 +905,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
 		// Determine entry type for directory removal
 		entryType := journal.DirEntryRegular
-		if req.Dir {
+		if isDir {
 			entryType = journal.DirEntryDirectory
 		}
 
@@ -758,7 +914,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 			ParentInodeNum: uint64(d.inodeNum),
 			ChildInodeNum:  uint64(childInodeNum),
 			EntryType:      entryType,
-			Name:           req.Name,
+			Name:           name,
 		}); err != nil {
 			d.fs.journal.Abort(txn)
 			return syscall.EIO
@@ -799,7 +955,7 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 
 		// Log parent directory inode update (mtime change, and link count for rmdir)
 		parentMask := journal.InodeUpdateMtime
-		if req.Dir {
+		if isDir {
 			parentMask |= journal.InodeUpdateNlink
 		}
 		if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
@@ -820,12 +976,12 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	// Now execute the actual metadata operations (safe - recoverable if crash)
 
 	// Update parent link count for directory removal
-	if req.Dir {
+	if isDir {
 		dirIno.LinkCount--
 	}
 
 	// Remove directory entry
-	if err := d.fs.dirMgr.Remove(ctx, dirIno, req.Name); err != nil {
+	if err := d.fs.dirMgr.Remove(ctx, dirIno, name); err != nil {
 		return syscall.EIO
 	}
 
@@ -850,26 +1006,31 @@ func (d *Dir) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	// Cache the updated parent directory inode
 	d.fs.cacheInode(dirIno)
 
-	return nil
+	return 0
 }
 
 // File represents a file in the filesystem.
+// Embeds fs.Inode for go-fuse v2 node identity.
 type File struct {
+	fs.Inode
+
 	fs       *FS
 	inodeNum uint32
 }
 
+// Verify interface compliance at compile time
 var (
-	_ fs.Node             = (*File)(nil)
-	_ fs.HandleReader     = (*File)(nil)
-	_ fs.HandleWriter     = (*File)(nil)
-	_ fs.NodeSetattrer    = (*File)(nil)
-	_ fs.NodeFsyncer      = (*File)(nil)
-	_ fs.HandleFAllocater = (*File)(nil)
+	_ fs.InodeEmbedder  = (*File)(nil)
+	_ fs.NodeGetattrer  = (*File)(nil)
+	_ fs.NodeSetattrer  = (*File)(nil)
+	_ fs.NodeReader     = (*File)(nil)
+	_ fs.NodeWriter     = (*File)(nil)
+	_ fs.NodeFsyncer    = (*File)(nil)
+	_ fs.NodeAllocater = (*File)(nil)
 )
 
-// Attr returns file attributes.
-func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
+// Getattr returns file attributes.
+func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	// Read directly from disk to get fresh inode state.
 	// In multi-node scenarios, another node may have updated the inode.
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
@@ -879,46 +1040,50 @@ func (f *File) Attr(ctx context.Context, a *fuse.Attr) error {
 
 	// Disable FUSE kernel caching for cluster operation.
 	// Other nodes may modify attributes at any time.
-	a.Valid = 0
+	out.AttrValid = 0
 
-	a.Inode = uint64(ino.InodeNum)
-	a.Mode = os.FileMode(ino.Mode & 0777)
-	a.Nlink = ino.LinkCount
-	a.Uid = ino.UID
-	a.Gid = ino.GID
-	a.Size = ino.Size
-	a.Atime = time.Unix(0, ino.Atime)
-	a.Mtime = time.Unix(0, ino.Mtime)
-	a.Ctime = time.Unix(0, ino.Ctime)
-	a.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
+	out.Ino = uint64(ino.InodeNum)
+	out.Mode = uint32(fuse.S_IFREG | (ino.Mode & 0777))
+	out.Nlink = uint32(ino.LinkCount)
+	out.Uid = ino.UID
+	out.Gid = ino.GID
+	out.Size = ino.Size
+	out.Atime = uint64(ino.Atime / 1e9)
+	out.Atimensec = uint32(ino.Atime % 1e9)
+	out.Mtime = uint64(ino.Mtime / 1e9)
+	out.Mtimensec = uint32(ino.Mtime % 1e9)
+	out.Ctime = uint64(ino.Ctime / 1e9)
+	out.Ctimensec = uint32(ino.Ctime % 1e9)
+	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
+	out.Blksize = BlockSize
 
-	return nil
+	return 0
 }
 
 // Read reads file data.
-func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	// Read directly from disk to get fresh inode state.
 	// In multi-node scenarios, another node may have updated the inode.
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
-		return syscall.EIO
+		return nil, syscall.EIO
 	}
 
+	offset := uint64(off)
+
 	// Check bounds using the authoritative size from disk
-	if uint64(req.Offset) >= ino.Size {
-		resp.Data = nil
-		return nil
+	if offset >= ino.Size {
+		return fuse.ReadResultData(nil), 0
 	}
 
 	// Calculate how much to read
-	readSize := req.Size
-	if uint64(req.Offset)+uint64(readSize) > ino.Size {
-		readSize = int(ino.Size - uint64(req.Offset))
+	readSize := len(dest)
+	if offset+uint64(readSize) > ino.Size {
+		readSize = int(ino.Size - offset)
 	}
 
 	// Read data block by block
 	data := make([]byte, readSize)
-	offset := uint64(req.Offset)
 	bytesRead := 0
 
 	for bytesRead < readSize {
@@ -928,7 +1093,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		// Find physical block for this logical block (uses extent cache)
 		physBlock, err := f.fs.lookupPhysical(ino, blockNum)
 		if err != nil {
-			return syscall.EIO
+			return nil, syscall.EIO
 		}
 		if physBlock == 0 {
 			// Hole - return zeros
@@ -959,7 +1124,7 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 			n, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset)
 			if err != nil || n != storage.SectorSize {
 				storage.PutBuffer(buf)
-				return syscall.EIO
+				return nil, syscall.EIO
 			}
 
 			copyLen := storage.SectorSize - int(sectorOffset)
@@ -978,41 +1143,37 @@ func (f *File) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadR
 		offset += uint64(toRead)
 	}
 
-	resp.Data = data
-	return nil
+	return fuse.ReadResultData(data), 0
 }
 
 // Write writes file data.
 // Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
-func (f *File) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to extend the same file simultaneously, they may race
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
 	// we retry the operation.
 	for attempt := 0; attempt < MaxWriteRetries; attempt++ {
-		bytesWritten, err := f.writeInternal(ctx, req)
+		bytesWritten, err := f.writeInternal(ctx, data, uint64(off))
 		if err == errRetryWrite {
 			log.Printf("[DEBUG] Write inode %d: retry attempt %d due to concurrent modification",
 				f.inodeNum, attempt+1)
 			continue
 		}
 		if err != nil {
-			return err
+			return 0, errToErrno(err)
 		}
-		resp.Size = bytesWritten
-		return nil
+		return uint32(bytesWritten), 0
 	}
 
 	log.Printf("[ERROR] Write inode %d: concurrent modification detected after %d retries",
 		f.inodeNum, MaxWriteRetries)
-	return syscall.EAGAIN
+	return 0, syscall.EAGAIN
 }
 
 // writeInternal performs the actual write operation.
 // Returns errRetryWrite if a concurrent modification is detected and the caller should retry.
-func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, error) {
-	offset := uint64(req.Offset)
-	data := req.Data
+func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (int, error) {
 	bytesWritten := 0
 
 	// Track if we hold the inode lock
@@ -1330,8 +1491,8 @@ func (f *File) writeInternal(ctx context.Context, req *fuse.WriteRequest) (int, 
 	return bytesWritten, nil
 }
 
-// Setattr sets file attributes (used for truncate).
-func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
+// Setattr sets file attributes (used for truncate, chmod, etc.).
+func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	// Invalidate cache before modifying - ensures we read fresh data
 	f.fs.invalidateInode(f.inodeNum)
 
@@ -1344,64 +1505,43 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 	// Track what's changing for WAL
 	var mask journal.InodeUpdateMask
-	newSize := ino.Size
-	_ = newSize // Used for block calculations even if not in payload
-	newMtime := ino.Mtime
-	_ = newMtime // Suppress unused warning
-	newCtime := ino.Ctime
-	_ = newCtime // Suppress unused warning
-	newAtime := ino.Atime
-	_ = newAtime // Suppress unused warning
-	newMode := ino.Mode
-	_ = newMode // Suppress unused warning
-	newUID := ino.UID
-	_ = newUID // Suppress unused warning
-	newGID := ino.GID
-	_ = newGID // Suppress unused warning
 	truncating := false
 	blocksToFree := uint32(0)
 
-	if req.Valid.Size() {
+	if sz, ok := in.GetSize(); ok {
 		mask |= journal.InodeUpdateSize | journal.InodeUpdateMtime
-		newSize = req.Size
-		newMtime = now
-		if req.Size < ino.Size {
+		if sz < ino.Size {
 			truncating = true
 			// Calculate blocks being freed
 			oldBlocks := (ino.Size + BlockSize - 1) / BlockSize
-			newBlocks := (req.Size + BlockSize - 1) / BlockSize
+			newBlocks := (sz + BlockSize - 1) / BlockSize
 			if oldBlocks > newBlocks {
 				blocksToFree = uint32(oldBlocks - newBlocks)
 			}
 		}
 	}
 
-	if req.Valid.Mode() {
+	if mode, ok := in.GetMode(); ok {
 		mask |= journal.InodeUpdateMode | journal.InodeUpdateCtime
-		newMode = uint16(req.Mode & 0777)
-		newCtime = now
+		_ = mode // Used after WAL commit
 	}
 
-	if req.Valid.Uid() {
+	if uid, ok := in.GetUID(); ok {
 		mask |= journal.InodeUpdateUID | journal.InodeUpdateCtime
-		newUID = req.Uid
-		newCtime = now
+		_ = uid
 	}
 
-	if req.Valid.Gid() {
+	if gid, ok := in.GetGID(); ok {
 		mask |= journal.InodeUpdateGID | journal.InodeUpdateCtime
-		newGID = req.Gid
-		newCtime = now
+		_ = gid
 	}
 
-	if req.Valid.Atime() {
+	if _, ok := in.GetATime(); ok {
 		mask |= journal.InodeUpdateAtime
-		newAtime = req.Atime.UnixNano()
 	}
 
-	if req.Valid.Mtime() {
+	if _, ok := in.GetMTime(); ok {
 		mask |= journal.InodeUpdateMtime
-		newMtime = req.Mtime.UnixNano()
 	}
 
 	// === WAL: Begin transaction and log intent ===
@@ -1411,6 +1551,7 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 		// Log block freeing if truncating
 		if truncating && blocksToFree > 0 {
+			newSize, _ := in.GetSize()
 			if err := txn.LogBlockFree(&journal.BlockFreePayload{
 				InodeNum:   uint64(f.inodeNum),
 				StartBlock: uint64((newSize + BlockSize - 1) / BlockSize),
@@ -1438,38 +1579,38 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	// === End WAL transaction ===
 
 	// Now execute the actual operations (safe - recoverable if crash)
-	if req.Valid.Size() {
-		if req.Size < ino.Size {
+	if sz, ok := in.GetSize(); ok {
+		if sz < ino.Size {
 			// Truncate
-			if err := f.fs.extentMgr.Truncate(ctx, ino, req.Size); err != nil {
+			if err := f.fs.extentMgr.Truncate(ctx, ino, sz); err != nil {
 				return syscall.EIO
 			}
 		}
-		ino.Size = req.Size
+		ino.Size = sz
 		ino.Mtime = now
 	}
 
-	if req.Valid.Mode() {
-		ino.Mode = uint16(req.Mode & 0777)
+	if mode, ok := in.GetMode(); ok {
+		ino.Mode = uint16(mode & 0777)
 		ino.Ctime = now
 	}
 
-	if req.Valid.Uid() {
-		ino.UID = req.Uid
+	if uid, ok := in.GetUID(); ok {
+		ino.UID = uid
 		ino.Ctime = now
 	}
 
-	if req.Valid.Gid() {
-		ino.GID = req.Gid
+	if gid, ok := in.GetGID(); ok {
+		ino.GID = gid
 		ino.Ctime = now
 	}
 
-	if req.Valid.Atime() {
-		ino.Atime = req.Atime.UnixNano()
+	if atime, ok := in.GetATime(); ok {
+		ino.Atime = atime.UnixNano()
 	}
 
-	if req.Valid.Mtime() {
-		ino.Mtime = req.Mtime.UnixNano()
+	if mtime, ok := in.GetMTime(); ok {
+		ino.Mtime = mtime.UnixNano()
 	}
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
@@ -1479,36 +1620,40 @@ func (f *File) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 	// Cache the freshly-written inode for subsequent reads
 	f.fs.cacheInode(ino)
 
-	return f.Attr(ctx, &resp.Attr)
+	return f.Getattr(ctx, fh, out)
 }
 
 // Fsync flushes file data to disk.
-func (f *File) Fsync(ctx context.Context, req *fuse.FsyncRequest) error {
-	return f.fs.dev.Sync()
+func (f *File) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
+	if err := f.fs.dev.Sync(); err != nil {
+		return syscall.EIO
+	}
+	return 0
 }
 
-// FAllocate pre-allocates space for the file using unwritten (lazy-zero) extents.
-// Supports mode==0 (allocate and extend size) and FAllocateKeepSize (allocate only).
+// Allocate pre-allocates space for the file using unwritten (lazy-zero) extents.
+// Supports mode==0 (allocate and extend size) and FALLOC_FL_KEEP_SIZE (allocate only).
 // PUNCH_HOLE and ZERO_RANGE are not yet implemented.
-func (f *File) FAllocate(ctx context.Context, req *fuse.FAllocateRequest) error {
+func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
 	// Only support mode 0 (allocate) and KEEP_SIZE for now
-	if req.Mode != 0 && req.Mode != fuse.FAllocateKeepSize {
+	const FALLOC_FL_KEEP_SIZE = 0x01
+	if mode != 0 && mode != FALLOC_FL_KEEP_SIZE {
 		// PUNCH_HOLE and ZERO_RANGE not yet implemented
-		log.Printf("[DEBUG] FAllocate inode %d: unsupported mode %d", f.inodeNum, req.Mode)
+		log.Printf("[DEBUG] Allocate inode %d: unsupported mode %d", f.inodeNum, mode)
 		return syscall.EOPNOTSUPP
 	}
 
 	// Read current inode
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] FAllocate inode %d: read failed: %v", f.inodeNum, err)
+		log.Printf("[DEBUG] Allocate inode %d: read failed: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
 
 	// Acquire inode lock for allocation
 	if f.fs.lockMgr != nil {
 		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-			log.Printf("[DEBUG] FAllocate inode %d: lock failed: %v", f.inodeNum, err)
+			log.Printf("[DEBUG] Allocate inode %d: lock failed: %v", f.inodeNum, err)
 			return syscall.EIO
 		}
 		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
@@ -1516,18 +1661,18 @@ func (f *File) FAllocate(ctx context.Context, req *fuse.FAllocateRequest) error 
 		// Re-read inode after lock
 		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
 		if err != nil {
-			log.Printf("[DEBUG] FAllocate inode %d: re-read failed: %v", f.inodeNum, err)
+			log.Printf("[DEBUG] Allocate inode %d: re-read failed: %v", f.inodeNum, err)
 			return syscall.EIO
 		}
 	}
 
 	// Calculate block range
-	startBlock := req.Offset / BlockSize
-	endOffset := req.Offset + req.Length
+	startBlock := off / BlockSize
+	endOffset := off + size
 	endBlock := (endOffset + BlockSize - 1) / BlockSize // Round up
 
-	log.Printf("[DEBUG] FAllocate inode %d: offset=%d length=%d blocks=%d-%d",
-		f.inodeNum, req.Offset, req.Length, startBlock, endBlock-1)
+	log.Printf("[DEBUG] Allocate inode %d: offset=%d length=%d blocks=%d-%d",
+		f.inodeNum, off, size, startBlock, endBlock-1)
 
 	// Allocate unwritten extents for each block
 	for blockNum := startBlock; blockNum < endBlock; blockNum++ {
@@ -1540,15 +1685,15 @@ func (f *File) FAllocate(ctx context.Context, req *fuse.FAllocateRequest) error 
 		// Allocate as unwritten (lazy-zero)
 		_, err = f.fs.extentMgr.AllocateUnwritten(ctx, ino, blockNum, 1)
 		if err != nil {
-			log.Printf("[DEBUG] FAllocate inode %d: AllocateUnwritten block %d failed: %v",
+			log.Printf("[DEBUG] Allocate inode %d: AllocateUnwritten block %d failed: %v",
 				f.inodeNum, blockNum, err)
 			return syscall.ENOSPC
 		}
 	}
 
 	// Update file size if not KEEP_SIZE and new size is larger
-	if req.Mode == 0 {
-		newSize := req.Offset + req.Length
+	if mode == 0 {
+		newSize := off + size
 		if newSize > ino.Size {
 			ino.Size = newSize
 		}
@@ -1562,12 +1707,33 @@ func (f *File) FAllocate(ctx context.Context, req *fuse.FAllocateRequest) error 
 
 	// Write updated inode
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-		log.Printf("[DEBUG] FAllocate inode %d: write inode failed: %v", f.inodeNum, err)
+		log.Printf("[DEBUG] Allocate inode %d: write inode failed: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
 
-	log.Printf("[DEBUG] FAllocate inode %d: success, AllocatedBlocks=%d WrittenBlocks=%d Size=%d",
+	log.Printf("[DEBUG] Allocate inode %d: success, AllocatedBlocks=%d WrittenBlocks=%d Size=%d",
 		f.inodeNum, ino.AllocatedBlocks, ino.WrittenBlocks, ino.Size)
 
-	return nil
+	return 0
+}
+
+// errToErrno converts an error to syscall.Errno.
+func errToErrno(err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	if errno, ok := err.(syscall.Errno); ok {
+		return errno
+	}
+	// Map common errors
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return syscall.ENOENT
+	case errors.Is(err, os.ErrPermission):
+		return syscall.EPERM
+	case errors.Is(err, os.ErrExist):
+		return syscall.EEXIST
+	default:
+		return syscall.EIO
+	}
 }

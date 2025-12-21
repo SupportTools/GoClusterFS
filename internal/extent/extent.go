@@ -119,6 +119,12 @@ func (m *Manager) LookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64,
 		return 0, err
 	}
 
+	// Unwritten extents return zeros like holes for read operations.
+	// The extent exists (space is allocated) but data hasn't been written yet.
+	if ext.Flags&FlagUnwritten != 0 {
+		return 0, nil // Lazy-zero: treat as hole for reads
+	}
+
 	return ext.PhysicalBlock + offset, nil
 }
 
@@ -240,8 +246,85 @@ func (m *Manager) AllocateBlocks(ctx context.Context, ino *inode.Inode, logicalB
 
 	// Update inode stats
 	ino.AllocatedBlocks += uint64(len(blocks))
+	// Blocks allocated via AllocateBlocks are for immediate write, so also count as written.
+	// Unwritten extents (from fallocate) would use FlagUnwritten and not increment WrittenBlocks.
+	ino.WrittenBlocks += uint64(len(blocks))
 
 	return ext, nil
+}
+
+// AllocateUnwritten allocates physical blocks marked as unwritten (lazy-zero).
+// Unlike AllocateBlocks, this does NOT increment WrittenBlocks since no data is written.
+// Reads from unwritten blocks return zeros without disk I/O.
+// The first write to an unwritten block clears the Unwritten flag.
+func (m *Manager) AllocateUnwritten(ctx context.Context, ino *inode.Inode, logicalBlock, count uint64) (*Extent, error) {
+	// Check if already allocated
+	existing, _, err := m.Lookup(ino, logicalBlock)
+	if err == nil && existing != nil {
+		// Already has extent - return it (no-op for already allocated blocks)
+		return existing, nil
+	}
+
+	// Allocate physical blocks
+	blocks, err := m.bitmap.Alloc(ctx, int(count))
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate blocks: %w", err)
+	}
+
+	// Check if blocks are contiguous
+	if !areContiguous(blocks) {
+		for _, b := range blocks {
+			m.bitmap.Free(ctx, b)
+		}
+		return nil, fmt.Errorf("non-contiguous allocation not yet supported")
+	}
+
+	// Create extent with BOTH FlagAllocated and FlagUnwritten
+	ext := &Extent{
+		LogicalBlock:  logicalBlock,
+		PhysicalBlock: blocks[0],
+		Length:        uint64(len(blocks)),
+		Flags:         FlagAllocated | FlagUnwritten,
+	}
+
+	// Insert into inode
+	if err := m.Insert(ctx, ino, ext); err != nil {
+		for _, b := range blocks {
+			m.bitmap.Free(ctx, b)
+		}
+		return nil, err
+	}
+
+	// Update inode stats - only AllocatedBlocks, NOT WrittenBlocks
+	// Unwritten extents don't count toward written blocks until first write
+	ino.AllocatedBlocks += uint64(len(blocks))
+
+	return ext, nil
+}
+
+// ClearUnwritten clears the Unwritten flag for an extent and increments WrittenBlocks.
+// Called on first write to an unwritten block.
+// Returns true if the flag was cleared (first write), false if already written.
+func (m *Manager) ClearUnwritten(ino *inode.Inode, ext *Extent) bool {
+	if ext.Flags&FlagUnwritten == 0 {
+		return false // Already written, nothing to do
+	}
+
+	// Clear the flag
+	ext.Flags &^= FlagUnwritten
+
+	// Update the inline extent in inode
+	for i, inline := range ino.InlineExtents {
+		if inline.LogicalBlock == ext.LogicalBlock && inline.Length == ext.Length {
+			ino.InlineExtents[i].Flags = ext.Flags
+			break
+		}
+	}
+
+	// Increment WrittenBlocks
+	ino.WrittenBlocks += ext.Length
+
+	return true
 }
 
 // FreeExtent frees the physical blocks for an extent.
@@ -273,6 +356,10 @@ func (m *Manager) FreeExtent(ctx context.Context, ino *inode.Inode, logicalBlock
 	if ino.AllocatedBlocks >= ext.Length {
 		ino.AllocatedBlocks -= ext.Length
 	}
+	// Decrement WrittenBlocks for actually written extents (not unwritten)
+	if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
+		ino.WrittenBlocks -= ext.Length
+	}
 
 	return nil
 }
@@ -303,6 +390,10 @@ func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64
 				}
 			}
 			ino.AllocatedBlocks -= ext.Length
+			// Decrement WrittenBlocks for actually written extents (not unwritten)
+			if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
+				ino.WrittenBlocks -= ext.Length
+			}
 			*ext = inode.InlineExtent{} // Clear
 			ino.ExtentCount--
 		}
@@ -328,6 +419,10 @@ func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64
 				m.bitmap.Free(ctx, ext.PhysicalBlock+j)
 			}
 			ino.AllocatedBlocks -= ext.Length
+			// Decrement WrittenBlocks for actually written extents (not unwritten)
+			if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
+				ino.WrittenBlocks -= ext.Length
+			}
 			*ext = inode.InlineExtent{} // Clear
 			ino.ExtentCount--
 		} else if extEnd > lastBlock {
@@ -339,6 +434,10 @@ func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64
 				m.bitmap.Free(ctx, ext.PhysicalBlock+keepBlocks+j)
 			}
 			ino.AllocatedBlocks -= freeBlocks
+			// Decrement WrittenBlocks for freed portion if extent was written
+			if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= freeBlocks {
+				ino.WrittenBlocks -= freeBlocks
+			}
 			ext.Length = keepBlocks
 		}
 	}
@@ -347,6 +446,25 @@ func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64
 	ino.Size = newSize
 
 	return nil
+}
+
+// MaxAllocatedOffset returns the highest byte offset covered by allocated extents.
+// This is used to derive file size from extents, which eliminates race conditions
+// when multiple nodes write to the same file at different offsets - each node's
+// write creates/extends different extents, and the true size is always the max.
+func (m *Manager) MaxAllocatedOffset(ino *inode.Inode) uint64 {
+	max := uint64(0)
+	for _, ext := range ino.InlineExtents {
+		if ext.Length == 0 {
+			continue
+		}
+		// Calculate the end byte offset of this extent
+		end := (ext.LogicalBlock + ext.Length) * BlockSize
+		if end > max {
+			max = end
+		}
+	}
+	return max
 }
 
 // ListExtents returns all extents for an inode.
