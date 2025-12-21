@@ -82,10 +82,18 @@ type FS struct {
 }
 
 // Verify interface compliance at compile time
+// FS is the root directory node - it implements all directory operations
 var (
 	_ fs.InodeEmbedder = (*FS)(nil)
 	_ fs.NodeOnAdder   = (*FS)(nil)
 	_ fs.NodeStatfser  = (*FS)(nil)
+	_ fs.NodeGetattrer = (*FS)(nil)
+	_ fs.NodeLookuper  = (*FS)(nil)
+	_ fs.NodeReaddirer = (*FS)(nil)
+	_ fs.NodeCreater   = (*FS)(nil)
+	_ fs.NodeMkdirer   = (*FS)(nil)
+	_ fs.NodeUnlinker  = (*FS)(nil)
+	_ fs.NodeRmdirer   = (*FS)(nil)
 )
 
 // Config holds filesystem configuration.
@@ -293,21 +301,13 @@ func (f *FS) InitRoot(ctx context.Context) error {
 	return f.inodeTbl.Write(ctx, rootIno)
 }
 
-// OnAdd is called when the filesystem is mounted. It sets up the root directory.
+// OnAdd is called when the filesystem is mounted.
+// In go-fuse v2, the FS node passed to Mount() IS the root directory.
+// We don't need to add any children here - FS implements the directory
+// operations directly for the root.
 func (f *FS) OnAdd(ctx context.Context) {
-	// Create the root directory node and add it to the tree
-	rootDir := &Dir{
-		fs:       f,
-		inodeNum: inode.InodeRoot,
-	}
-
-	// Add the root directory as a persistent child of FS
-	// This establishes the directory tree root
-	ch := f.NewPersistentInode(ctx, rootDir, fs.StableAttr{
-		Mode: fuse.S_IFDIR,
-		Ino:  uint64(inode.InodeRoot),
-	})
-	f.AddChild("", ch, true)
+	// FS itself is the root directory node (inode 2).
+	// Nothing special needed here - FS implements all directory interfaces.
 }
 
 // Statfs returns filesystem statistics.
@@ -326,6 +326,484 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	out.Bsize = BlockSize
 	out.NameLen = 255
 	out.Frsize = BlockSize
+
+	return 0
+}
+
+// Getattr returns the root directory attributes.
+func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	ino, err := f.getInode(inode.InodeRoot)
+	if err != nil {
+		return syscall.EIO
+	}
+
+	// Disable FUSE kernel caching for cluster operation.
+	out.AttrValid = 0
+
+	out.Ino = uint64(ino.InodeNum)
+	out.Mode = uint32(fuse.S_IFDIR | (ino.Mode & 0777))
+	out.Nlink = uint32(ino.LinkCount)
+	out.Uid = ino.UID
+	out.Gid = ino.GID
+	out.Size = ino.Size
+	out.Atime = uint64(ino.Atime / 1e9)
+	out.Atimensec = uint32(ino.Atime % 1e9)
+	out.Mtime = uint64(ino.Mtime / 1e9)
+	out.Mtimensec = uint32(ino.Mtime % 1e9)
+	out.Ctime = uint64(ino.Ctime / 1e9)
+	out.Ctimensec = uint32(ino.Ctime % 1e9)
+	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
+	out.Blksize = BlockSize
+
+	return 0
+}
+
+// Lookup finds a child of the root directory by name.
+func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	dirIno, err := f.getInode(inode.InodeRoot)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+
+	childInodeNum, fileType, err := f.dirMgr.Lookup(ctx, dirIno, name)
+	if err != nil {
+		if err == dir.ErrNotFound {
+			return nil, syscall.ENOENT
+		}
+		return nil, syscall.EIO
+	}
+
+	// Disable FUSE kernel caching for cluster operation.
+	out.EntryValid = 0
+	out.AttrValid = 0
+
+	if fileType == dir.DT_DIR {
+		childDir := &Dir{fs: f, inodeNum: uint32(childInodeNum)}
+		ch := f.NewPersistentInode(ctx, childDir, fs.StableAttr{
+			Mode: fuse.S_IFDIR,
+			Ino:  childInodeNum,
+		})
+		return ch, 0
+	}
+
+	childFile := &File{fs: f, inodeNum: uint32(childInodeNum)}
+	ch := f.NewPersistentInode(ctx, childFile, fs.StableAttr{
+		Mode: fuse.S_IFREG,
+		Ino:  childInodeNum,
+	})
+	return ch, 0
+}
+
+// Readdir returns a DirStream for the root directory listing.
+func (f *FS) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	dirIno, err := f.getInode(inode.InodeRoot)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+
+	entries, err := f.dirMgr.List(ctx, dirIno)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+
+	var result []fuse.DirEntry
+	for _, entry := range entries {
+		mode := uint32(fuse.S_IFREG)
+		switch entry.FileType {
+		case dir.DT_DIR:
+			mode = fuse.S_IFDIR
+		case dir.DT_LNK:
+			mode = fuse.S_IFLNK
+		}
+
+		result = append(result, fuse.DirEntry{
+			Ino:  entry.InodeNum,
+			Name: entry.Name,
+			Mode: mode,
+		})
+	}
+
+	return &dirStream{entries: result}, 0
+}
+
+// Create creates a new file in the root directory.
+func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
+		node, fh, fuseFlags, errno = f.createFileInternal(ctx, name, flags, mode, out)
+		if errno == syscall.EAGAIN {
+			baseDelay := time.Millisecond * time.Duration(1<<attempt)
+			jitter := time.Duration(rand.Int63n(int64(baseDelay)))
+			backoff := baseDelay + jitter
+			log.Printf("[DEBUG] Create %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		return
+	}
+	log.Printf("[WARN] Create %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
+	return nil, nil, 0, syscall.EAGAIN
+}
+
+// createFileInternal implements file creation for the root directory.
+func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	inodeNum, err := f.inodeTbl.FindFreeSlot()
+	if err != nil {
+		return nil, nil, 0, syscall.ENOSPC
+	}
+
+	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+
+	uid := f.uid
+	gid := f.gid
+	caller, ok := fuse.FromContext(ctx)
+	if ok {
+		uid = caller.Uid
+		gid = caller.Gid
+	}
+
+	// WAL logging
+	var txn *journal.Transaction
+	if f.journal != nil {
+		txn = f.journal.Begin()
+		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
+			InodeNum:       uint64(inodeNum),
+			Mode:           mode,
+			UID:            uid,
+			GID:            gid,
+			ParentInodeNum: uint64(inode.InodeRoot),
+			NameHash:       hashString(name),
+		}); err != nil {
+			f.journal.Abort(txn)
+			return nil, nil, 0, syscall.EIO
+		}
+		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
+			ParentInodeNum: uint64(inode.InodeRoot),
+			ChildInodeNum:  uint64(inodeNum),
+			EntryType:      journal.DirEntryRegular,
+			Name:           name,
+		}); err != nil {
+			f.journal.Abort(txn)
+			return nil, nil, 0, syscall.EIO
+		}
+		if err := f.journal.Commit(txn); err != nil {
+			return nil, nil, 0, syscall.EIO
+		}
+	}
+
+	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+
+	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
+	if err != nil {
+		f.dirMgr.Remove(ctx, dirIno, name)
+		if err == inode.ErrInodeInUse {
+			return nil, nil, 0, syscall.EAGAIN
+		}
+		return nil, nil, 0, syscall.ENOSPC
+	}
+
+	now := time.Now().UnixNano()
+	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
+	childIno.UID = uid
+	childIno.GID = gid
+	childIno.LinkCount = 1
+	childIno.Atime = now
+	childIno.Mtime = now
+	childIno.Ctime = now
+
+	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
+		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		f.dirMgr.Remove(ctx, dirIno, name)
+		return nil, nil, 0, syscall.EIO
+	}
+
+	dirIno.Mtime = now
+	f.inodeTbl.Write(ctx, dirIno)
+
+	file := &File{fs: f, inodeNum: childIno.InodeNum}
+	ch := f.NewPersistentInode(ctx, file, fs.StableAttr{
+		Mode: fuse.S_IFREG,
+		Ino:  uint64(childIno.InodeNum),
+	})
+
+	out.EntryValid = 0
+	out.AttrValid = 0
+	out.Ino = uint64(childIno.InodeNum)
+	out.Mode = uint32(fuse.S_IFREG | (mode & 0777))
+	out.Nlink = 1
+	out.Uid = uid
+	out.Gid = gid
+	out.Size = 0
+	out.Atime = uint64(now / 1e9)
+	out.Atimensec = uint32(now % 1e9)
+	out.Mtime = uint64(now / 1e9)
+	out.Mtimensec = uint32(now % 1e9)
+	out.Ctime = uint64(now / 1e9)
+	out.Ctimensec = uint32(now % 1e9)
+	out.Blksize = BlockSize
+
+	return ch, nil, 0, 0
+}
+
+// Mkdir creates a new directory in the root directory.
+func (f *FS) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
+		node, errno := f.mkdirInternal(ctx, name, mode, out)
+		if errno == syscall.EAGAIN {
+			baseDelay := time.Millisecond * time.Duration(1<<attempt)
+			jitter := time.Duration(rand.Int63n(int64(baseDelay)))
+			backoff := baseDelay + jitter
+			log.Printf("[DEBUG] Mkdir %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+		return node, errno
+	}
+	log.Printf("[WARN] Mkdir %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
+	return nil, syscall.EAGAIN
+}
+
+// mkdirInternal implements directory creation for the root directory.
+func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	inodeNum, err := f.inodeTbl.FindFreeSlot()
+	if err != nil {
+		return nil, syscall.ENOSPC
+	}
+
+	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		return nil, syscall.EIO
+	}
+
+	uid := f.uid
+	gid := f.gid
+	caller, ok := fuse.FromContext(ctx)
+	if ok {
+		uid = caller.Uid
+		gid = caller.Gid
+	}
+
+	// WAL logging
+	var txn *journal.Transaction
+	if f.journal != nil {
+		txn = f.journal.Begin()
+		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
+			InodeNum:       uint64(inodeNum),
+			Mode:           mode | uint32(inode.S_IFDIR),
+			UID:            uid,
+			GID:            gid,
+			ParentInodeNum: uint64(inode.InodeRoot),
+			NameHash:       hashString(name),
+		}); err != nil {
+			f.journal.Abort(txn)
+			return nil, syscall.EIO
+		}
+		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
+			ParentInodeNum: uint64(inode.InodeRoot),
+			ChildInodeNum:  uint64(inodeNum),
+			EntryType:      journal.DirEntryDirectory,
+			Name:           name,
+		}); err != nil {
+			f.journal.Abort(txn)
+			return nil, syscall.EIO
+		}
+		if err := f.journal.Commit(txn); err != nil {
+			return nil, syscall.EIO
+		}
+	}
+
+	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
+		return nil, syscall.EIO
+	}
+
+	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
+	if err != nil {
+		f.dirMgr.Remove(ctx, dirIno, name)
+		if err == inode.ErrInodeInUse {
+			return nil, syscall.EAGAIN
+		}
+		return nil, syscall.ENOSPC
+	}
+
+	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(inode.InodeRoot)); err != nil {
+		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		f.dirMgr.Remove(ctx, dirIno, name)
+		return nil, syscall.EIO
+	}
+
+	now := time.Now().UnixNano()
+	childIno.Mode = inode.S_IFDIR | uint16(mode&0777)
+	childIno.UID = uid
+	childIno.GID = gid
+	childIno.Atime = now
+	childIno.Mtime = now
+	childIno.Ctime = now
+
+	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
+		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		f.dirMgr.Remove(ctx, dirIno, name)
+		return nil, syscall.EIO
+	}
+
+	dirIno.LinkCount++
+	dirIno.Mtime = now
+	f.inodeTbl.Write(ctx, dirIno)
+
+	childDir := &Dir{fs: f, inodeNum: childIno.InodeNum}
+	ch := f.NewPersistentInode(ctx, childDir, fs.StableAttr{
+		Mode: fuse.S_IFDIR,
+		Ino:  uint64(childIno.InodeNum),
+	})
+
+	out.EntryValid = 0
+	out.AttrValid = 0
+	out.Ino = uint64(childIno.InodeNum)
+	out.Mode = uint32(fuse.S_IFDIR | (mode & 0777))
+	out.Nlink = uint32(childIno.LinkCount)
+	out.Uid = uid
+	out.Gid = gid
+	out.Size = childIno.Size
+	out.Atime = uint64(now / 1e9)
+	out.Atimensec = uint32(now % 1e9)
+	out.Mtime = uint64(now / 1e9)
+	out.Mtimensec = uint32(now % 1e9)
+	out.Ctime = uint64(now / 1e9)
+	out.Ctimensec = uint32(now % 1e9)
+	out.Blksize = BlockSize
+
+	return ch, 0
+}
+
+// Unlink removes a file from the root directory.
+func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
+	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		return syscall.EIO
+	}
+
+	childInodeNum, fileType, err := f.dirMgr.Lookup(ctx, dirIno, name)
+	if err != nil {
+		if err == dir.ErrNotFound {
+			return syscall.ENOENT
+		}
+		return syscall.EIO
+	}
+
+	if fileType == dir.DT_DIR {
+		return syscall.EISDIR
+	}
+
+	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
+	if err != nil {
+		return syscall.EIO
+	}
+
+	// WAL logging
+	var txn *journal.Transaction
+	if f.journal != nil {
+		txn = f.journal.Begin()
+		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
+			ParentInodeNum: uint64(inode.InodeRoot),
+			ChildInodeNum:  childInodeNum,
+			Name:           name,
+		}); err != nil {
+			f.journal.Abort(txn)
+			return syscall.EIO
+		}
+		if err := f.journal.Commit(txn); err != nil {
+			return syscall.EIO
+		}
+	}
+
+	if err := f.dirMgr.Remove(ctx, dirIno, name); err != nil {
+		return syscall.EIO
+	}
+
+	childIno.LinkCount--
+	now := time.Now().UnixNano()
+	childIno.Ctime = now
+
+	if childIno.LinkCount == 0 {
+		if err := f.extentMgr.Truncate(ctx, childIno, 0); err != nil {
+			log.Printf("[DEBUG] Unlink %q: Truncate failed: %v", name, err)
+		}
+		f.inodeTbl.Free(ctx, childIno.InodeNum)
+	} else {
+		f.inodeTbl.Write(ctx, childIno)
+	}
+
+	dirIno.Mtime = now
+	f.inodeTbl.Write(ctx, dirIno)
+
+	return 0
+}
+
+// Rmdir removes an empty directory from the root directory.
+func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
+	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		return syscall.EIO
+	}
+
+	childInodeNum, fileType, err := f.dirMgr.Lookup(ctx, dirIno, name)
+	if err != nil {
+		if err == dir.ErrNotFound {
+			return syscall.ENOENT
+		}
+		return syscall.EIO
+	}
+
+	if fileType != dir.DT_DIR {
+		return syscall.ENOTDIR
+	}
+
+	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
+	if err != nil {
+		return syscall.EIO
+	}
+
+	isEmpty, err := f.dirMgr.IsEmpty(ctx, childIno)
+	if err != nil {
+		return syscall.EIO
+	}
+	if !isEmpty {
+		return syscall.ENOTEMPTY
+	}
+
+	// WAL logging
+	var txn *journal.Transaction
+	if f.journal != nil {
+		txn = f.journal.Begin()
+		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
+			ParentInodeNum: uint64(inode.InodeRoot),
+			ChildInodeNum:  childInodeNum,
+			Name:           name,
+		}); err != nil {
+			f.journal.Abort(txn)
+			return syscall.EIO
+		}
+		if err := f.journal.Commit(txn); err != nil {
+			return syscall.EIO
+		}
+	}
+
+	if err := f.dirMgr.Remove(ctx, dirIno, name); err != nil {
+		return syscall.EIO
+	}
+
+	if err := f.extentMgr.Truncate(ctx, childIno, 0); err != nil {
+		log.Printf("[DEBUG] Rmdir %q: Truncate failed: %v", name, err)
+	}
+	f.inodeTbl.Free(ctx, childIno.InodeNum)
+
+	now := time.Now().UnixNano()
+	dirIno.LinkCount--
+	dirIno.Mtime = now
+	f.inodeTbl.Write(ctx, dirIno)
 
 	return 0
 }
@@ -598,7 +1076,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 
 	// Phase 5: Initialize file inode attributes
 	now := time.Now().UnixNano()
-	childIno.Mode = uint16(mode & 0777)
+	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
 	childIno.UID = uid
 	childIno.GID = gid
 	childIno.LinkCount = 1
@@ -1020,14 +1498,32 @@ type File struct {
 
 // Verify interface compliance at compile time
 var (
-	_ fs.InodeEmbedder  = (*File)(nil)
-	_ fs.NodeGetattrer  = (*File)(nil)
-	_ fs.NodeSetattrer  = (*File)(nil)
-	_ fs.NodeReader     = (*File)(nil)
-	_ fs.NodeWriter     = (*File)(nil)
-	_ fs.NodeFsyncer    = (*File)(nil)
+	_ fs.InodeEmbedder = (*File)(nil)
+	_ fs.NodeOpener    = (*File)(nil)
+	_ fs.NodeGetattrer = (*File)(nil)
+	_ fs.NodeSetattrer = (*File)(nil)
+	_ fs.NodeReader    = (*File)(nil)
+	_ fs.NodeWriter    = (*File)(nil)
+	_ fs.NodeFsyncer   = (*File)(nil)
 	_ fs.NodeAllocater = (*File)(nil)
 )
+
+// Open opens the file for reading/writing.
+// Returns nil FileHandle to indicate the File node itself should be used as the handle.
+func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	// Verify the inode exists and is a regular file
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		return nil, 0, syscall.EIO
+	}
+	if !ino.IsFile() {
+		return nil, 0, syscall.EISDIR
+	}
+	// Return nil FileHandle - the File node itself implements Read/Write/etc.
+	// The fuse.FOPEN_KEEP_CACHE flag tells the kernel to keep cached data valid
+	// (we don't use it in cluster mode since other nodes may modify the file).
+	return nil, 0, 0
+}
 
 // Getattr returns file attributes.
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -1670,25 +2166,47 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 	startBlock := off / BlockSize
 	endOffset := off + size
 	endBlock := (endOffset + BlockSize - 1) / BlockSize // Round up
+	totalBlocks := endBlock - startBlock
 
-	log.Printf("[DEBUG] Allocate inode %d: offset=%d length=%d blocks=%d-%d",
-		f.inodeNum, off, size, startBlock, endBlock-1)
+	log.Printf("[DEBUG] Allocate inode %d: offset=%d length=%d blocks=%d-%d (total=%d)",
+		f.inodeNum, off, size, startBlock, endBlock-1, totalBlocks)
 
-	// Allocate unwritten extents for each block
-	for blockNum := startBlock; blockNum < endBlock; blockNum++ {
+	// Find contiguous ranges of unallocated blocks and allocate each as a single extent.
+	// This minimizes extent count and avoids hitting inline extent limits.
+	blockNum := startBlock
+	for blockNum < endBlock {
 		// Check if already allocated
-		_, _, err := f.fs.extentMgr.Lookup(ino, blockNum)
-		if err == nil {
-			continue // Already allocated, skip
+		_, _, lookupErr := f.fs.extentMgr.Lookup(ino, blockNum)
+		if lookupErr == nil {
+			// Already allocated, skip to next block
+			blockNum++
+			continue
 		}
 
-		// Allocate as unwritten (lazy-zero)
-		_, err = f.fs.extentMgr.AllocateUnwritten(ctx, ino, blockNum, 1)
-		if err != nil {
-			log.Printf("[DEBUG] Allocate inode %d: AllocateUnwritten block %d failed: %v",
-				f.inodeNum, blockNum, err)
+		// Find how many contiguous blocks starting from blockNum are unallocated
+		rangeStart := blockNum
+		rangeEnd := blockNum + 1
+		for rangeEnd < endBlock {
+			_, _, lookupErr := f.fs.extentMgr.Lookup(ino, rangeEnd)
+			if lookupErr == nil {
+				break // This block is allocated, stop the range
+			}
+			rangeEnd++
+		}
+
+		rangeCount := rangeEnd - rangeStart
+		log.Printf("[DEBUG] Allocate inode %d: allocating contiguous range blocks=%d-%d (count=%d)",
+			f.inodeNum, rangeStart, rangeEnd-1, rangeCount)
+
+		// Allocate the entire contiguous range as a single unwritten extent
+		_, allocErr := f.fs.extentMgr.AllocateUnwritten(ctx, ino, rangeStart, rangeCount)
+		if allocErr != nil {
+			log.Printf("[DEBUG] Allocate inode %d: AllocateUnwritten blocks %d-%d failed: %v",
+				f.inodeNum, rangeStart, rangeEnd-1, allocErr)
 			return syscall.ENOSPC
 		}
+
+		blockNum = rangeEnd
 	}
 
 	// Update file size if not KEEP_SIZE and new size is larger

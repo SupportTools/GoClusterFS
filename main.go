@@ -40,11 +40,11 @@ var currentBlock int64 = 1 // Start from block 1 to reserve block 0 for metadata
 
 // Compile-time interface checks
 var (
-	_ fs.InodeEmbedder = (*File)(nil)
-	_ fs.NodeGetattrer = (*File)(nil)
-	_ fs.NodeReader    = (*File)(nil)
-	_ fs.NodeWriter    = (*File)(nil)
-	_ fs.NodeFsyncer   = (*File)(nil)
+	_ fs.InodeEmbedder  = (*File)(nil)
+	_ fs.NodeGetattrer  = (*File)(nil)
+	_ fs.NodeReader     = (*File)(nil)
+	_ fs.NodeWriter     = (*File)(nil)
+	_ fs.NodeFsyncer    = (*File)(nil)
 	_ fs.NodeSetxattrer = (*File)(nil)
 )
 
