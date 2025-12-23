@@ -24,6 +24,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 )
@@ -54,6 +55,9 @@ func main() {
 		trimEnabled   = flag.Bool("trim", true, "Enable batched TRIM for freed blocks")
 		trimBatchSize = flag.Int("trim-batch", 256, "TRIM batch size (blocks before flush)")
 		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Max age before TRIM flush")
+
+		// SFB configuration (Sub-File Block containers for small files)
+		sfbEnabled = flag.Bool("sfb", true, "Enable SFB containers for small files (<64KB)")
 	)
 	flag.Parse()
 
@@ -247,8 +251,17 @@ func main() {
 		log.Println("TRIM: disabled")
 	}
 
-	// Create filesystem with journal and TRIM for crash consistency
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nodeUUID, dataOffset)
+	// Create SFB manager for small file optimization
+	var sfbMgr *sfb.Manager
+	if *sfbEnabled {
+		sfbMgr = sfb.NewManager(dev, bm, lockMgr)
+		log.Println("SFB: enabled (tiers: 4KB/8KB/16KB/64KB)")
+	} else {
+		log.Println("SFB: disabled (all files use full 1MB blocks)")
+	}
+
+	// Create filesystem with journal, TRIM, and SFB for crash consistency
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -369,6 +382,13 @@ func main() {
 		jStats := j.Stats()
 		log.Printf("Journal stats: commits=%d, bytes=%d, state=%v",
 			jStats.CommitCount, jStats.BytesWritten, jStats.State)
+	}
+
+	// Print final SFB stats
+	if sfbMgr != nil {
+		total, byTier := sfbMgr.GetContainerStats()
+		log.Printf("SFB stats: containers=%d (4KB=%d, 8KB=%d, 16KB=%d, 64KB=%d)",
+			total, byTier[0], byTier[1], byTier[2], byTier[3])
 	}
 
 	// Print final cache stats
