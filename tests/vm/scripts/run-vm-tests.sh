@@ -1375,6 +1375,80 @@ test_broadcast_directory_invalidation() {
     return 0
 }
 
+# Test: Broadcast multiple updates
+# Verifies that rapid successive updates are correctly broadcast between VMs.
+# VM 1 performs 5 rapid updates and VM 2 should see the final version.
+test_broadcast_multiple_updates() {
+    log_info "Testing broadcast multiple updates..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping broadcast multiple updates test (requires 2+ VMs)"
+        return 0
+    fi
+
+    local writer=1
+    local reader=2
+    local test_file="broadcast_rapid_$(date +%s).txt"
+
+    # Create initial file on writer VM
+    write_file_on_vm "$writer" "$test_file" "v0"
+    sleep 0.2  # Allow initial propagation
+
+    # Verify reader sees initial content
+    local max_attempts=20
+    local attempt=0
+    while [ $attempt -lt $max_attempts ]; do
+        local content=$(read_file_on_vm "$reader" "$test_file" 2>/dev/null || echo "")
+        if [ "$content" = "v0" ]; then
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        log_error "Reader VM cannot see initial file"
+        return 1
+    fi
+
+    # Perform 5 rapid updates on writer VM (50ms gaps)
+    local update_count=5
+    for i in $(seq 1 $update_count); do
+        write_file_on_vm "$writer" "$test_file" "v${i}"
+        sleep 0.05  # 50ms gap between updates
+    done
+
+    # Allow final broadcast to propagate
+    sleep 0.3
+
+    # Poll reader for final content (max 2 seconds)
+    local expected_final="v${update_count}"
+    max_attempts=20
+    attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        local content=$(read_file_on_vm "$reader" "$test_file" 2>/dev/null || echo "")
+        if [ "$content" = "$expected_final" ]; then
+            log_info "Reader VM sees final version after rapid updates"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        local actual=$(read_file_on_vm "$reader" "$test_file" 2>/dev/null || echo "")
+        log_error "Reader VM did not see final version. Got '$actual', expected '$expected_final'"
+        return 1
+    fi
+
+    # Clean up
+    ssh_run "$writer" "rm -f /mnt/goclusterfs/$test_file"
+
+    log_info "Broadcast multiple updates test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log_info "Testing rolling restart..."
@@ -2473,6 +2547,7 @@ main() {
     run_test "Network Partition" test_network_partition
     run_test "Broadcast Invalidation" test_broadcast_invalidation
     run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
+    run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
     run_test "Rolling Restart" test_rolling_restart
     run_test "Stress Random Failures" test_stress_random_failures
 

@@ -861,7 +861,7 @@ scenarios:
     environments:
       go: broadcast_test.go::TestBroadcastMultipleUpdates
       docker: run-tests.sh::test_broadcast_multiple_updates
-      vm: TODO
+      vm: run-vm-tests.sh::test_broadcast_multiple_updates
 
   - id: broadcast-bidirectional
     name: Broadcast bidirectional
