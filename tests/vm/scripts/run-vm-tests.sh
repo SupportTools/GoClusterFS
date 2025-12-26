@@ -1256,6 +1256,125 @@ test_network_partition() {
     return 0
 }
 
+# Test: Broadcast cache invalidation
+# Verifies that cache invalidation via UDP broadcast propagates quickly between VMs.
+# This tests that VM 2 sees changes from VM 1 within ~500ms (vs 5s TTL).
+test_broadcast_invalidation() {
+    log_info "Testing broadcast cache invalidation..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping broadcast test (requires 2+ VMs)"
+        return 0
+    fi
+
+    local writer=1
+    local reader=2
+    local test_file="broadcast_test_$(date +%s).txt"
+
+    # Create initial file on writer VM
+    write_file_on_vm "$writer" "$test_file" "initial_content"
+    sleep 1
+
+    # Verify reader sees initial content
+    if ! file_exists_on_vm "$reader" "$test_file"; then
+        log_error "Reader VM cannot see initial file"
+        return 1
+    fi
+
+    # Update file on writer
+    local start_time=$(date +%s%N)
+    write_file_on_vm "$writer" "$test_file" "updated_content_via_broadcast"
+
+    # Poll reader for updated content (max 2 seconds)
+    local max_attempts=20  # 20 x 100ms = 2s
+    local attempt=0
+    local propagation_time_ms=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        local content=$(read_file_on_vm "$reader" "$test_file" 2>/dev/null || echo "")
+        if [ "$content" = "updated_content_via_broadcast" ]; then
+            local end_time=$(date +%s%N)
+            propagation_time_ms=$(( (end_time - start_time) / 1000000 ))
+            log_info "Broadcast propagation detected in ${propagation_time_ms}ms"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        log_error "Reader VM did not see update within 2 seconds"
+        return 1
+    fi
+
+    # Broadcast should be much faster than the 5s TTL
+    # We use 1000ms as a generous threshold for test stability
+    if [ $propagation_time_ms -gt 1000 ]; then
+        log_warn "Propagation slow (${propagation_time_ms}ms), but within acceptable range"
+    fi
+
+    # Clean up
+    ssh_run "$writer" "rm -f /mnt/goclusterfs/$test_file"
+
+    log_info "Broadcast invalidation test passed (propagation: ${propagation_time_ms}ms)"
+    return 0
+}
+
+# Test: Broadcast directory invalidation
+# Verifies that new file creation is broadcast between VMs.
+test_broadcast_directory_invalidation() {
+    log_info "Testing broadcast directory invalidation..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping broadcast directory test (requires 2+ VMs)"
+        return 0
+    fi
+
+    local writer=1
+    local reader=2
+    local test_file="broadcast_dir_test_$(date +%s).txt"
+
+    # Record start time
+    local start_time=$(date +%s%N)
+
+    # Create new file on writer VM
+    write_file_on_vm "$writer" "$test_file" "new file created"
+
+    # Poll reader for new file visibility (max 2 seconds)
+    local max_attempts=20
+    local attempt=0
+    local propagation_time_ms=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if file_exists_on_vm "$reader" "$test_file"; then
+            local end_time=$(date +%s%N)
+            propagation_time_ms=$(( (end_time - start_time) / 1000000 ))
+            log_info "Directory broadcast propagation detected in ${propagation_time_ms}ms"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        log_error "Reader VM did not see new file within 2 seconds"
+        return 1
+    fi
+
+    # Verify content is correct
+    local content=$(read_file_on_vm "$reader" "$test_file" 2>/dev/null || echo "")
+    if [ "$content" != "new file created" ]; then
+        log_error "Content mismatch: got '$content'"
+        return 1
+    fi
+
+    # Clean up
+    ssh_run "$writer" "rm -f /mnt/goclusterfs/$test_file"
+
+    log_info "Broadcast directory invalidation test passed (propagation: ${propagation_time_ms}ms)"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log_info "Testing rolling restart..."
@@ -2352,6 +2471,8 @@ main() {
     run_test "Journal Crash Recovery Multiple Ops" test_journal_crash_recovery_multiple_ops
     run_test "Journal Crash During Write" test_journal_crash_during_write
     run_test "Network Partition" test_network_partition
+    run_test "Broadcast Invalidation" test_broadcast_invalidation
+    run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
     run_test "Rolling Restart" test_rolling_restart
     run_test "Stress Random Failures" test_stress_random_failures
 

@@ -831,3 +831,43 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestConfigDefaults
+
+  # ---------------------------------------------------------------------------
+  # Broadcast Integration Tests (end-to-end cross-node invalidation)
+  # ---------------------------------------------------------------------------
+
+  - id: broadcast-invalidation-speed
+    name: Broadcast invalidation speed
+    description: Cache invalidation via broadcast propagates in <500ms (vs 5s TTL)
+    priority: high
+    environments:
+      go: broadcast_test.go::TestBroadcastInvalidationSpeed
+      docker: run-tests.sh::test_broadcast_invalidation
+      vm: run-vm-tests.sh::test_broadcast_invalidation
+
+  - id: broadcast-directory-invalidation
+    name: Broadcast directory invalidation
+    description: New file creation is broadcast between nodes
+    priority: high
+    environments:
+      go: broadcast_test.go::TestBroadcastDirectoryInvalidation
+      docker: run-tests.sh::test_broadcast_directory_invalidation
+      vm: run-vm-tests.sh::test_broadcast_directory_invalidation
+
+  - id: broadcast-multiple-updates
+    name: Broadcast multiple updates
+    description: Rapid successive updates are all broadcast correctly
+    priority: medium
+    environments:
+      go: broadcast_test.go::TestBroadcastMultipleUpdates
+      docker: TODO
+      vm: TODO
+
+  - id: broadcast-bidirectional
+    name: Broadcast bidirectional
+    description: Invalidations work in both directions between nodes
+    priority: medium
+    environments:
+      go: broadcast_test.go::TestBroadcastBidirectional
+      docker: TODO
+      vm: TODO

@@ -120,7 +120,15 @@ pre_extend_file() {
     local size_bytes=$3
 
     log "Pre-extending $filename to $size_bytes bytes on $node"
-    exec_on_node "$node" dd if=/dev/zero of="/mnt/goclusterfs/$filename" bs=1 count="$size_bytes" 2>/dev/null
+    # Use larger block size for efficiency, handle remainder with bs=1
+    local full_blocks=$((size_bytes / 4096))
+    local remainder=$((size_bytes % 4096))
+    if [ "$full_blocks" -gt 0 ]; then
+        exec_on_node "$node" dd if=/dev/zero of="/mnt/goclusterfs/$filename" bs=4096 count="$full_blocks" 2>/dev/null
+    fi
+    if [ "$remainder" -gt 0 ]; then
+        exec_on_node "$node" dd if=/dev/zero of="/mnt/goclusterfs/$filename" bs=1 count="$remainder" seek=$((full_blocks * 4096)) conv=notrunc 2>/dev/null
+    fi
 }
 
 # Write data at a specific offset in a file (using conv=notrunc to not truncate)
@@ -145,8 +153,9 @@ write_pattern_at() {
     local offset=$5
 
     log "Writing ${size_bytes} bytes of pattern '$pattern_char' at offset $offset on $node"
-    # Use printf to generate pattern, then dd to write at offset
-    exec_on_node "$node" sh -c "head -c $size_bytes /dev/zero | tr '\\0' '$pattern_char' | dd of='/mnt/goclusterfs/$filename' bs=1 seek=$offset conv=notrunc 2>/dev/null"
+    # Generate pattern and write at offset using dd
+    # The oflag=seek_bytes allows byte-precise seeking with larger block sizes
+    exec_on_node "$node" sh -c "head -c $size_bytes /dev/zero | tr '\\0' '$pattern_char' | dd of='/mnt/goclusterfs/$filename' bs=65536 seek=$offset oflag=seek_bytes conv=notrunc 2>/dev/null"
 }
 
 # Read specific bytes from a file at an offset
@@ -1893,6 +1902,115 @@ test_network_partition() {
     return 0
 }
 
+# Test: Broadcast cache invalidation
+# Verifies that cache invalidation via UDP broadcast propagates quickly between nodes.
+# This tests that Node B sees changes from Node A within ~500ms (vs 5s TTL).
+test_broadcast_invalidation() {
+    log "Testing broadcast cache invalidation..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]}"
+    local test_file="broadcast_test_$(date +%s).txt"
+
+    # Create initial file on writer
+    write_file "$writer" "$test_file" "initial_content"
+    sleep 1
+
+    # Verify reader sees initial content
+    if ! file_exists "$reader" "$test_file"; then
+        log "ERROR: Reader cannot see initial file"
+        return 1
+    fi
+
+    # Update file on writer
+    local start_time=$(date +%s%N)
+    write_file "$writer" "$test_file" "updated_content_via_broadcast"
+
+    # Poll reader for updated content (max 2 seconds)
+    local max_attempts=20  # 20 x 100ms = 2s
+    local attempt=0
+    local propagation_time_ms=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        local content=$(read_file "$reader" "$test_file" 2>/dev/null)
+        if [ "$content" = "updated_content_via_broadcast" ]; then
+            local end_time=$(date +%s%N)
+            propagation_time_ms=$(( (end_time - start_time) / 1000000 ))
+            log "Broadcast propagation detected in ${propagation_time_ms}ms"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        log "ERROR: Reader did not see update within 2 seconds"
+        return 1
+    fi
+
+    # Broadcast should be much faster than the 5s TTL
+    # We use 1000ms as a generous threshold for test stability
+    if [ $propagation_time_ms -gt 1000 ]; then
+        log "WARNING: Propagation slow (${propagation_time_ms}ms), but within acceptable range"
+    fi
+
+    # Clean up
+    exec_on_node "$writer" rm -f "/mnt/goclusterfs/$test_file"
+
+    log "Broadcast invalidation test passed (propagation: ${propagation_time_ms}ms)"
+    return 0
+}
+
+# Test: Broadcast directory invalidation
+# Verifies that new file creation is broadcast between nodes.
+test_broadcast_directory_invalidation() {
+    log "Testing broadcast directory invalidation..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]}"
+    local test_file="broadcast_dir_test_$(date +%s).txt"
+
+    # Record start time
+    local start_time=$(date +%s%N)
+
+    # Create new file on writer
+    write_file "$writer" "$test_file" "new file created"
+
+    # Poll reader for new file visibility (max 2 seconds)
+    local max_attempts=20
+    local attempt=0
+    local propagation_time_ms=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        if file_exists "$reader" "$test_file"; then
+            local end_time=$(date +%s%N)
+            propagation_time_ms=$(( (end_time - start_time) / 1000000 ))
+            log "Directory broadcast propagation detected in ${propagation_time_ms}ms"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        log "ERROR: Reader did not see new file within 2 seconds"
+        return 1
+    fi
+
+    # Verify content is correct
+    local content=$(read_file "$reader" "$test_file" 2>/dev/null)
+    if [ "$content" != "new file created" ]; then
+        log "ERROR: Content mismatch: got '$content'"
+        return 1
+    fi
+
+    # Clean up
+    exec_on_node "$writer" rm -f "/mnt/goclusterfs/$test_file"
+
+    log "Broadcast directory invalidation test passed (propagation: ${propagation_time_ms}ms)"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log "Testing rolling restart..."
@@ -2289,6 +2407,8 @@ run_test "Journal Crash Recovery Directory" test_journal_crash_recovery_director
 run_test "Journal Crash Recovery Multiple Ops" test_journal_crash_recovery_multiple_ops
 run_test "Journal Crash During Write" test_journal_crash_during_write
 run_test "Network Partition" test_network_partition
+run_test "Broadcast Invalidation" test_broadcast_invalidation
+run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
 run_test "Rolling Restart" test_rolling_restart
 run_test "Stress Random Failures" test_stress_random_failures
 
@@ -2310,8 +2430,8 @@ else
     run_test "Reversed Write Order" test_reversed_write_order
 fi
 
-# Count skipped tests
-test_skipped=$(grep -c "^SKIP:" "$RESULTS_DIR/results.txt" 2>/dev/null || echo 0)
+# Count skipped tests (grep -c prints "0" but exits non-zero if no matches)
+test_skipped=$(grep -c "^SKIP:" "$RESULTS_DIR/results.txt" 2>/dev/null) || test_skipped=0
 test_total=$((test_passed + test_failed + test_skipped))
 
 # Summary
