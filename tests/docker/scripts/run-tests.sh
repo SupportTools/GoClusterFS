@@ -2011,6 +2011,75 @@ test_broadcast_directory_invalidation() {
     return 0
 }
 
+# Test: Broadcast multiple updates
+# Verifies that rapid successive updates are correctly broadcast between nodes.
+# Node 0 performs 5 rapid updates and Node 1 should see the final version.
+test_broadcast_multiple_updates() {
+    log "Testing broadcast multiple updates..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]}"
+    local test_file="broadcast_rapid_$(date +%s).txt"
+
+    # Create initial file on writer
+    write_file "$writer" "$test_file" "v0"
+    sleep 0.2  # Allow initial propagation
+
+    # Verify reader sees initial content
+    local max_attempts=20
+    local attempt=0
+    while [ $attempt -lt $max_attempts ]; do
+        local content=$(read_file "$reader" "$test_file" 2>/dev/null)
+        if [ "$content" = "v0" ]; then
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        log "ERROR: Reader cannot see initial file"
+        return 1
+    fi
+
+    # Perform 5 rapid updates on writer (50ms gaps)
+    local update_count=5
+    for i in $(seq 1 $update_count); do
+        write_file "$writer" "$test_file" "v${i}"
+        sleep 0.05  # 50ms gap between updates
+    done
+
+    # Allow final broadcast to propagate
+    sleep 0.3
+
+    # Poll reader for final content (max 2 seconds)
+    local expected_final="v${update_count}"
+    max_attempts=20
+    attempt=0
+
+    while [ $attempt -lt $max_attempts ]; do
+        local content=$(read_file "$reader" "$test_file" 2>/dev/null)
+        if [ "$content" = "$expected_final" ]; then
+            log "Reader sees final version after rapid updates"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ $attempt -ge $max_attempts ]; then
+        local actual=$(read_file "$reader" "$test_file" 2>/dev/null)
+        log "ERROR: Reader did not see final version. Got '$actual', expected '$expected_final'"
+        return 1
+    fi
+
+    # Clean up
+    exec_on_node "$writer" rm -f "/mnt/goclusterfs/$test_file"
+
+    log "Broadcast multiple updates test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log "Testing rolling restart..."
@@ -2409,6 +2478,7 @@ run_test "Journal Crash During Write" test_journal_crash_during_write
 run_test "Network Partition" test_network_partition
 run_test "Broadcast Invalidation" test_broadcast_invalidation
 run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
+run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Rolling Restart" test_rolling_restart
 run_test "Stress Random Failures" test_stress_random_failures
 

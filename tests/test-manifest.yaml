@@ -860,7 +860,7 @@ scenarios:
     priority: medium
     environments:
       go: broadcast_test.go::TestBroadcastMultipleUpdates
-      docker: TODO
+      docker: run-tests.sh::test_broadcast_multiple_updates
       vm: TODO
 
   - id: broadcast-bidirectional
