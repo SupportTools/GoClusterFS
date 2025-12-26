@@ -869,5 +869,5 @@ scenarios:
     priority: medium
     environments:
       go: broadcast_test.go::TestBroadcastBidirectional
-      docker: TODO
+      docker: run-tests.sh::test_broadcast_bidirectional
       vm: TODO

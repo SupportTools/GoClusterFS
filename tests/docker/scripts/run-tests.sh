@@ -2080,6 +2080,74 @@ test_broadcast_multiple_updates() {
     return 0
 }
 
+# Test: Broadcast bidirectional
+# Verifies that invalidations work in both directions between nodes.
+# Node 0 creates file_a, Node 1 creates file_b, both should see each other's file.
+test_broadcast_bidirectional() {
+    log "Testing broadcast bidirectional..."
+
+    local node0="${NODE_ARRAY[0]}"
+    local node1="${NODE_ARRAY[1]}"
+    local file_a="bidir_a_$(date +%s).txt"
+    local file_b="bidir_b_$(date +%s).txt"
+
+    # Node 0 creates file A
+    write_file "$node0" "$file_a" "from node 0"
+
+    # Node 1 creates file B
+    write_file "$node1" "$file_b" "from node 1"
+
+    # Allow broadcast propagation
+    sleep 0.3
+
+    # Poll for Node 1 to see file A (max 2 seconds)
+    local max_attempts=20
+    local attempt=0
+    local content_a=""
+
+    while [ $attempt -lt $max_attempts ]; do
+        content_a=$(read_file "$node1" "$file_a" 2>/dev/null)
+        if [ "$content_a" = "from node 0" ]; then
+            log "Node 1 sees file_a from Node 0"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$content_a" != "from node 0" ]; then
+        log "ERROR: Node 1 cannot read file_a. Got '$content_a'"
+        return 1
+    fi
+
+    # Poll for Node 0 to see file B (max 2 seconds)
+    max_attempts=20
+    attempt=0
+    local content_b=""
+
+    while [ $attempt -lt $max_attempts ]; do
+        content_b=$(read_file "$node0" "$file_b" 2>/dev/null)
+        if [ "$content_b" = "from node 1" ]; then
+            log "Node 0 sees file_b from Node 1"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$content_b" != "from node 1" ]; then
+        log "ERROR: Node 0 cannot read file_b. Got '$content_b'"
+        return 1
+    fi
+
+    # Clean up
+    exec_on_node "$node0" rm -f "/mnt/goclusterfs/$file_a"
+    exec_on_node "$node1" rm -f "/mnt/goclusterfs/$file_b"
+
+    log "Broadcast bidirectional test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log "Testing rolling restart..."
@@ -2479,6 +2547,7 @@ run_test "Network Partition" test_network_partition
 run_test "Broadcast Invalidation" test_broadcast_invalidation
 run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
+run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Rolling Restart" test_rolling_restart
 run_test "Stress Random Failures" test_stress_random_failures
 
