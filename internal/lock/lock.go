@@ -19,17 +19,34 @@
 package lock
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
+
+// getGoroutineID returns the current goroutine's ID.
+// This is used for per-goroutine lock order tracking.
+// Note: This is a common pattern for debugging/tracing, but should not be
+// used for program logic beyond tracking/debugging.
+func getGoroutineID() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	// Parse "goroutine 123 [...]"
+	b = bytes.TrimPrefix(b, []byte("goroutine "))
+	b = b[:bytes.IndexByte(b, ' ')]
+	n, _ := strconv.ParseUint(string(b), 10, 64)
+	return n
+}
 
 const (
 	// RecordSize is the size of each lock record.
@@ -123,9 +140,10 @@ type lockKey struct {
 }
 
 type heldLock struct {
-	Mode     LockMode
-	RecordID uint64 // Position in lock region
-	refCount int    // Number of goroutines from this node holding the lock
+	Mode       LockMode
+	RecordID   uint64         // Position in lock region
+	refCount   int            // Number of goroutines from this node holding the lock
+	goroutines map[uint64]int // Goroutine ID -> reference count for that goroutine
 }
 
 // Errors
@@ -172,11 +190,17 @@ func (m *Manager) SetOnAcquire(fn OnAcquireFunc) {
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 
+	gid := getGoroutineID()
+
 	m.mu.Lock()
 	// Check if we already hold this lock (same node) - just increment refCount
 	if held, ok := m.heldLocks[key]; ok {
 		held.refCount++
-		log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - reusing existing lock (refCount=%d)", lockType, resourceID, held.refCount)
+		if held.goroutines == nil {
+			held.goroutines = make(map[uint64]int)
+		}
+		held.goroutines[gid]++
+		log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - reusing existing lock (refCount=%d, gid=%d)", lockType, resourceID, held.refCount, gid)
 		m.mu.Unlock()
 		return nil
 	}
@@ -209,14 +233,23 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			if held, ok := m.heldLocks[key]; ok {
 				// Another goroutine beat us - just increment refCount
 				held.refCount++
-				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - late arrival, reusing (refCount=%d)", lockType, resourceID, held.refCount)
+				if held.goroutines == nil {
+					held.goroutines = make(map[uint64]int)
+				}
+				held.goroutines[gid]++
+				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - late arrival, reusing (refCount=%d, gid=%d)", lockType, resourceID, held.refCount, gid)
 				m.mu.Unlock()
 				// Release the on-disk lock we just acquired since we'll share the existing one
 				m.releaseRecord(recordID)
 				return nil
 			}
-			m.heldLocks[key] = &heldLock{Mode: mode, RecordID: recordID, refCount: 1}
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired distributed lock (retries=%d, dur=%v)", lockType, resourceID, retryCount, time.Since(startTime))
+			m.heldLocks[key] = &heldLock{
+				Mode:       mode,
+				RecordID:   recordID,
+				refCount:   1,
+				goroutines: map[uint64]int{gid: 1},
+			}
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired distributed lock (retries=%d, dur=%v, gid=%d)", lockType, resourceID, retryCount, time.Since(startTime), gid)
 
 			// Trigger cache invalidation callback for exclusive locks.
 			// We do this before returning so the caller reads fresh data.
@@ -272,26 +305,35 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 // the distributed lock when the last goroutine releases.
 func (m *Manager) Release(lockType LockType, resourceID uint64) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
+	gid := getGoroutineID()
 
 	m.mu.Lock()
 	held, ok := m.heldLocks[key]
 	if !ok {
-		log.Printf("[DEBUG] lock.Release: type=%d res=%d - NOT FOUND in heldLocks!", lockType, resourceID)
+		log.Printf("[DEBUG] lock.Release: type=%d res=%d gid=%d - NOT FOUND in heldLocks!", lockType, resourceID, gid)
 		m.mu.Unlock()
 		return ErrNotLockOwner
 	}
 
-	// Decrement reference count
+	// Decrement goroutine-specific count
+	if held.goroutines != nil {
+		held.goroutines[gid]--
+		if held.goroutines[gid] <= 0 {
+			delete(held.goroutines, gid)
+		}
+	}
+
+	// Decrement overall reference count
 	held.refCount--
 	if held.refCount > 0 {
 		// Other goroutines still using the lock
-		log.Printf("[DEBUG] lock.Release: type=%d res=%d - decremented refCount to %d", lockType, resourceID, held.refCount)
+		log.Printf("[DEBUG] lock.Release: type=%d res=%d gid=%d - decremented refCount to %d", lockType, resourceID, gid, held.refCount)
 		m.mu.Unlock()
 		return nil
 	}
 
 	// Last reference - release the distributed lock
-	log.Printf("[DEBUG] lock.Release: type=%d res=%d - last ref, releasing distributed lock", lockType, resourceID)
+	log.Printf("[DEBUG] lock.Release: type=%d res=%d gid=%d - last ref, releasing distributed lock", lockType, resourceID, gid)
 	delete(m.heldLocks, key)
 	recordID := held.RecordID
 	m.mu.Unlock()
@@ -411,11 +453,17 @@ func (m *Manager) isLockStale(record *Record) bool {
 }
 
 // checkLockOrder ensures we're acquiring locks in hierarchy order.
+// Only checks against locks held by the CURRENT goroutine to avoid
+// false positives when different goroutines hold different locks concurrently.
 func (m *Manager) checkLockOrder(newType LockType) error {
-	for key := range m.heldLocks {
-		if key.Type > newType {
-			return fmt.Errorf("%w: cannot acquire %v while holding %v",
-				ErrDeadlockRisk, newType, key.Type)
+	gid := getGoroutineID()
+	for key, held := range m.heldLocks {
+		// Only check order for locks held by THIS goroutine
+		if held.goroutines != nil && held.goroutines[gid] > 0 {
+			if key.Type > newType {
+				return fmt.Errorf("%w: cannot acquire %v while holding %v",
+					ErrDeadlockRisk, newType, key.Type)
+			}
 		}
 	}
 	return nil

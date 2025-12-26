@@ -445,6 +445,113 @@ func DeserializeBlockFree(buf []byte) (*BlockFreePayload, error) {
 }
 
 // ============================================================================
+// SFB (Sub-File Block) Operation Payloads
+// ============================================================================
+
+// SFBTier represents the SFB container tier (slot size).
+type SFBTier uint8
+
+const (
+	SFBTier4KB  SFBTier = 0 // 256 slots of 4KB each
+	SFBTier8KB  SFBTier = 1 // 128 slots of 8KB each
+	SFBTier16KB SFBTier = 2 //  64 slots of 16KB each
+	SFBTier64KB SFBTier = 3 //  16 slots of 64KB each
+)
+
+// SFBAllocPayload is logged when allocating an SFB slot.
+// Size: 24 bytes
+type SFBAllocPayload struct {
+	InodeNum       uint64  // Inode being allocated for
+	ContainerBlock uint64  // Block number of SFB container
+	SlotIndex      uint16  // Slot index within container
+	Tier           SFBTier // Container tier (determines slot size)
+	Reserved       [5]byte
+}
+
+// Serialize converts the payload to bytes.
+func (p *SFBAllocPayload) Serialize() []byte {
+	buf := make([]byte, 24)
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.ContainerBlock)
+	binary.LittleEndian.PutUint16(buf[16:18], p.SlotIndex)
+	buf[18] = byte(p.Tier)
+	return buf
+}
+
+// DeserializeSFBAlloc parses an SFBAllocPayload from bytes.
+func DeserializeSFBAlloc(buf []byte) (*SFBAllocPayload, error) {
+	if len(buf) < 24 {
+		return nil, ErrTxnTooSmall
+	}
+	return &SFBAllocPayload{
+		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
+		ContainerBlock: binary.LittleEndian.Uint64(buf[8:16]),
+		SlotIndex:      binary.LittleEndian.Uint16(buf[16:18]),
+		Tier:           SFBTier(buf[18]),
+	}, nil
+}
+
+// SFBFreePayload is logged when freeing an SFB slot.
+// Size: 16 bytes
+type SFBFreePayload struct {
+	ContainerBlock uint64 // Block number of SFB container
+	SlotIndex      uint16 // Slot index within container
+	Reserved       [6]byte
+}
+
+// Serialize converts the payload to bytes.
+func (p *SFBFreePayload) Serialize() []byte {
+	buf := make([]byte, 16)
+	binary.LittleEndian.PutUint64(buf[0:8], p.ContainerBlock)
+	binary.LittleEndian.PutUint16(buf[8:10], p.SlotIndex)
+	return buf
+}
+
+// DeserializeSFBFree parses an SFBFreePayload from bytes.
+func DeserializeSFBFree(buf []byte) (*SFBFreePayload, error) {
+	if len(buf) < 16 {
+		return nil, ErrTxnTooSmall
+	}
+	return &SFBFreePayload{
+		ContainerBlock: binary.LittleEndian.Uint64(buf[0:8]),
+		SlotIndex:      binary.LittleEndian.Uint16(buf[8:10]),
+	}, nil
+}
+
+// SFBMigratePayload is logged when migrating from SFB to full extent.
+// Size: 32 bytes
+type SFBMigratePayload struct {
+	InodeNum     uint64 // Inode being migrated
+	OldContainer uint64 // Old SFB container block
+	OldSlot      uint16 // Old slot index
+	Reserved     [6]byte
+	NewBlock     uint64 // New full 1MB block
+}
+
+// Serialize converts the payload to bytes.
+func (p *SFBMigratePayload) Serialize() []byte {
+	buf := make([]byte, 32)
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.OldContainer)
+	binary.LittleEndian.PutUint16(buf[16:18], p.OldSlot)
+	binary.LittleEndian.PutUint64(buf[24:32], p.NewBlock)
+	return buf
+}
+
+// DeserializeSFBMigrate parses an SFBMigratePayload from bytes.
+func DeserializeSFBMigrate(buf []byte) (*SFBMigratePayload, error) {
+	if len(buf) < 32 {
+		return nil, ErrTxnTooSmall
+	}
+	return &SFBMigratePayload{
+		InodeNum:     binary.LittleEndian.Uint64(buf[0:8]),
+		OldContainer: binary.LittleEndian.Uint64(buf[8:16]),
+		OldSlot:      binary.LittleEndian.Uint16(buf[16:18]),
+		NewBlock:     binary.LittleEndian.Uint64(buf[24:32]),
+	}, nil
+}
+
+// ============================================================================
 // Extent Operation Payloads
 // ============================================================================
 
@@ -679,4 +786,19 @@ func (txn *Transaction) LogSnapshotDelete(payload *SnapshotDeletePayload) error 
 // LogRefCountUpdate adds a reference count update to the transaction.
 func (txn *Transaction) LogRefCountUpdate(payload *RefCountUpdatePayload) error {
 	return txn.addEntry(TxnOpRefCountUpdate, payload.Serialize())
+}
+
+// LogSFBAlloc adds an SFB slot allocation to the transaction.
+func (txn *Transaction) LogSFBAlloc(payload *SFBAllocPayload) error {
+	return txn.addEntry(TxnOpSFBAlloc, payload.Serialize())
+}
+
+// LogSFBFree adds an SFB slot free to the transaction.
+func (txn *Transaction) LogSFBFree(payload *SFBFreePayload) error {
+	return txn.addEntry(TxnOpSFBFree, payload.Serialize())
+}
+
+// LogSFBMigrate adds an SFB to extent migration to the transaction.
+func (txn *Transaction) LogSFBMigrate(payload *SFBMigratePayload) error {
+	return txn.addEntry(TxnOpSFBMigrate, payload.Serialize())
 }

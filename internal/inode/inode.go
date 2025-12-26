@@ -490,6 +490,18 @@ func (inode *Inode) HasExtentTree() bool {
 	return (inode.Flags & FlagHasExtentTree) != 0
 }
 
+// Extent flag for SFB detection (must match extent.FlagSFB)
+const extentFlagSFB = 1 << 3
+
+// IsSFBBacked returns true if the inode's first extent is in an SFB container.
+// SFB (Sub-File Block) containers store small files (<64KB) efficiently.
+func (inode *Inode) IsSFBBacked() bool {
+	if inode.ExtentCount == 0 {
+		return false
+	}
+	return (inode.InlineExtents[0].Flags & extentFlagSFB) != 0
+}
+
 // Permissions returns the permission bits (lower 12 bits of Mode).
 func (inode *Inode) Permissions() uint16 {
 	return inode.Mode & 0o7777

@@ -29,9 +29,9 @@ ISO_NAME="alpine-virt-${ALPINE_VERSION}.0-x86_64.iso"
 ISO_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/x86_64/${ISO_NAME}"
 ISO_PATH="${VM_DIR}/${ISO_NAME}"
 
-# Shared storage
+# Shared storage (configurable via VM_CLUSTER_SIZE_MB environment variable)
 SHARED_DISK_PATH="${VM_DIR}/cluster.img"
-SHARED_DISK_SIZE_MB=100
+SHARED_DISK_SIZE_MB=${VM_CLUSTER_SIZE_MB:-500}
 
 # Network settings (each VM gets sequential ports)
 SSH_BASE_PORT=2222

@@ -84,8 +84,9 @@ type Manager struct {
 	pending []pendingBlock
 
 	// Background loop control
-	stopCh  chan struct{}
-	flushWg sync.WaitGroup
+	stopCh   chan struct{}
+	flushWg  sync.WaitGroup
+	stopOnce sync.Once // Ensures Stop() is idempotent
 
 	// Stats
 	blocksQueued    uint64
@@ -113,21 +114,24 @@ func (m *Manager) Start() {
 }
 
 // Stop stops the background loop and flushes pending TRIMs.
+// This function is idempotent - calling it multiple times is safe.
 func (m *Manager) Stop() error {
-	close(m.stopCh)
-	m.flushWg.Wait()
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+		m.flushWg.Wait()
 
-	// Final flush of any remaining blocks
-	m.mu.Lock()
-	defer m.mu.Unlock()
+		// Final flush of any remaining blocks
+		m.mu.Lock()
+		defer m.mu.Unlock()
 
-	if len(m.pending) > 0 {
-		log.Printf("[trim] final flush of %d pending blocks", len(m.pending))
-		m.flushLocked()
-	}
+		if len(m.pending) > 0 {
+			log.Printf("[trim] final flush of %d pending blocks", len(m.pending))
+			m.flushLocked()
+		}
 
-	log.Printf("[trim] stopped (queued=%d, discarded=%d, calls=%d)",
-		m.blocksQueued, m.blocksDiscarded, m.discardCalls)
+		log.Printf("[trim] stopped (queued=%d, discarded=%d, calls=%d)",
+			m.blocksQueued, m.blocksDiscarded, m.discardCalls)
+	})
 	return nil
 }
 

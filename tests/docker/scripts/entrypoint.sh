@@ -12,6 +12,10 @@ FORMAT_ON_START="${FORMAT_ON_START:-false}"
 DEBUG="${DEBUG:-false}"
 ORCHESTRATOR_MODE="${ORCHESTRATOR_MODE:-false}"
 
+# Flag file to track if this node has already formatted the filesystem
+# This prevents re-formatting on container restart
+FORMAT_DONE_FLAG="/tmp/.goclusterfs_formatted"
+
 log() {
     echo "[Node $NODE_ID] $(date '+%Y-%m-%d %H:%M:%S') $*"
 }
@@ -65,9 +69,17 @@ log "Device $DEVICE_PATH is ready (size: $(stat -c%s "$DEVICE_PATH") bytes)"
 # Build mount command arguments
 MOUNT_ARGS="-device $DEVICE_PATH -mount $MOUNT_POINT"
 
+# Only format if FORMAT_ON_START=true AND we haven't already formatted
+# This prevents data loss on container restart
 if [ "$FORMAT_ON_START" = "true" ]; then
-    log "Formatting filesystem (FORMAT_ON_START=true)"
-    MOUNT_ARGS="$MOUNT_ARGS -format"
+    if [ -f "$FORMAT_DONE_FLAG" ]; then
+        log "Skipping format (already done, flag exists at $FORMAT_DONE_FLAG)"
+    else
+        log "Formatting filesystem (FORMAT_ON_START=true, first run)"
+        MOUNT_ARGS="$MOUNT_ARGS -format"
+        # Create flag file to mark that formatting is done
+        touch "$FORMAT_DONE_FLAG"
+    fi
 fi
 
 if [ "$DEBUG" = "true" ]; then

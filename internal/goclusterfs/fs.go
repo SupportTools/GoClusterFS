@@ -9,6 +9,7 @@ package goclusterfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"math/rand"
@@ -27,6 +28,8 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
+	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
@@ -51,6 +54,16 @@ const MaxCreateRetries = 5
 // BlockSize is the size of data blocks (1MB).
 const BlockSize = 1 << 20
 
+// SFB (Sub-File Block) constants for small file storage.
+const (
+	// SFBMaxFileSize is the maximum file size that can use SFB storage.
+	// Files larger than this use regular extent allocation.
+	SFBMaxFileSize = 64 * 1024 // 64KB
+
+	// SFBHeaderSize is the size of the SFB container header.
+	SFBHeaderSize = 64
+)
+
 // FS represents the GoClusterFS filesystem root.
 // Embeds fs.Inode for go-fuse v2 node identity.
 type FS struct {
@@ -63,14 +76,16 @@ type FS struct {
 	sb  *superblock.Superblock
 
 	// Managers
-	lockMgr   *lock.Manager
-	bitmapMgr *bitmap.Region
-	inodeTbl  *inode.Table
-	extentMgr *extent.Manager
-	dirMgr    *dir.Manager
-	cacheMgr  *cache.Manager   // Inode cache for read optimization
-	journal   *journal.Journal // Per-node journal for crash consistency (WAL)
-	trimMgr   *trim.Manager    // TRIM manager for batched block discards
+	lockMgr      *lock.Manager
+	bitmapMgr    *bitmap.Region
+	inodeTbl     *inode.Table
+	extentMgr    *extent.Manager
+	dirMgr       *dir.Manager
+	cacheMgr     *cache.Manager     // Inode cache for read optimization
+	journal      *journal.Journal   // Per-node journal for crash consistency (WAL)
+	trimMgr      *trim.Manager      // TRIM manager for batched block discards
+	sfbMgr       *sfb.Manager       // SFB manager for small file storage (optional)
+	refcountReg  *refcount.Region   // Reference count table for CoW/snapshots (optional)
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -163,22 +178,26 @@ func NewWithComponents(
 	cacheMgr *cache.Manager,
 	j *journal.Journal, // May be nil for backward compatibility
 	tm *trim.Manager, // May be nil if TRIM is disabled
+	sfbMgr *sfb.Manager, // May be nil if SFB is disabled
+	refcountReg *refcount.Region, // May be nil if snapshots not enabled
 	nodeUUID [16]byte,
 	dataOffset uint64,
 ) *FS {
 	return &FS{
-		dev:        dev,
-		bitmapMgr:  bm,
-		inodeTbl:   inodeTbl,
-		extentMgr:  extentMgr,
-		dirMgr:     dirMgr,
-		cacheMgr:   cacheMgr,
-		journal:    j,
-		trimMgr:    tm,
-		nodeUUID:   nodeUUID,
-		dataOffset: dataOffset,
-		uid:        uint32(os.Getuid()),
-		gid:        uint32(os.Getgid()),
+		dev:         dev,
+		bitmapMgr:   bm,
+		inodeTbl:    inodeTbl,
+		extentMgr:   extentMgr,
+		dirMgr:      dirMgr,
+		cacheMgr:    cacheMgr,
+		journal:     j,
+		trimMgr:     tm,
+		sfbMgr:      sfbMgr,
+		refcountReg: refcountReg,
+		nodeUUID:    nodeUUID,
+		dataOffset:  dataOffset,
+		uid:         uint32(os.Getuid()),
+		gid:         uint32(os.Getgid()),
 	}
 }
 
@@ -360,16 +379,29 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 
 // Lookup finds a child of the root directory by name.
 func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("[DEBUG] FS.Lookup: name=%q", name)
+
 	dirIno, err := f.getInode(inode.InodeRoot)
 	if err != nil {
+		log.Printf("[DEBUG] FS.Lookup: failed to get root inode: %v", err)
 		return nil, syscall.EIO
 	}
 
 	childInodeNum, fileType, err := f.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
 		if err == dir.ErrNotFound {
+			log.Printf("[DEBUG] FS.Lookup: %q not found", name)
 			return nil, syscall.ENOENT
 		}
+		log.Printf("[DEBUG] FS.Lookup: error: %v", err)
+		return nil, syscall.EIO
+	}
+	log.Printf("[DEBUG] FS.Lookup: found %q -> inode %d, type %d", name, childInodeNum, fileType)
+
+	// Read the child inode to populate attributes
+	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
+	if err != nil {
+		log.Printf("[DEBUG] FS.Lookup: failed to read child inode %d: %v", childInodeNum, err)
 		return nil, syscall.EIO
 	}
 
@@ -377,25 +409,51 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 	out.EntryValid = 0
 	out.AttrValid = 0
 
+	// Populate attributes - REQUIRED even with AttrValid=0
+	// The kernel uses these for the initial stat response
+	out.Attr.Ino = childInodeNum
+	out.Attr.Nlink = uint32(childIno.LinkCount)
+	out.Attr.Uid = childIno.UID
+	out.Attr.Gid = childIno.GID
+	out.Attr.Atime = uint64(childIno.Atime / 1e9)
+	out.Attr.Atimensec = uint32(childIno.Atime % 1e9)
+	out.Attr.Mtime = uint64(childIno.Mtime / 1e9)
+	out.Attr.Mtimensec = uint32(childIno.Mtime % 1e9)
+	out.Attr.Ctime = uint64(childIno.Ctime / 1e9)
+	out.Attr.Ctimensec = uint32(childIno.Ctime % 1e9)
+
 	if fileType == dir.DT_DIR {
+		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0777))
+		out.Attr.Size = BlockSize
+		out.Attr.Blocks = 1 * (BlockSize / 512)
+		out.Attr.Blksize = BlockSize
+
 		childDir := &Dir{fs: f, inodeNum: uint32(childInodeNum)}
 		ch := f.NewPersistentInode(ctx, childDir, fs.StableAttr{
 			Mode: fuse.S_IFDIR,
 			Ino:  childInodeNum,
 		})
+		log.Printf("[DEBUG] FS.Lookup: returning dir inode %d", childInodeNum)
 		return ch, 0
 	}
+
+	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0777))
+	out.Attr.Size = childIno.Size
+	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
+	out.Attr.Blksize = BlockSize
 
 	childFile := &File{fs: f, inodeNum: uint32(childInodeNum)}
 	ch := f.NewPersistentInode(ctx, childFile, fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  childInodeNum,
 	})
+	log.Printf("[DEBUG] FS.Lookup: returning file inode %d, size=%d", childInodeNum, childIno.Size)
 	return ch, 0
 }
 
 // Readdir returns a DirStream for the root directory listing.
 func (f *FS) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("[DEBUG] FS.Readdir: root directory")
 	dirIno, err := f.getInode(inode.InodeRoot)
 	if err != nil {
 		return nil, syscall.EIO
@@ -860,16 +918,29 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 
 // Lookup finds a child by name.
 func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	log.Printf("[DEBUG] Lookup: dir=%d name=%q", d.inodeNum, name)
+
 	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
+		log.Printf("[DEBUG] Lookup: failed to get dir inode: %v", err)
 		return nil, syscall.EIO
 	}
 
 	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
 		if err == dir.ErrNotFound {
+			log.Printf("[DEBUG] Lookup: %q not found", name)
 			return nil, syscall.ENOENT
 		}
+		log.Printf("[DEBUG] Lookup: error: %v", err)
+		return nil, syscall.EIO
+	}
+	log.Printf("[DEBUG] Lookup: found %q -> inode %d, type %d", name, childInodeNum, fileType)
+
+	// Read the child inode to populate attributes
+	childIno, err := d.fs.inodeTbl.Read(uint32(childInodeNum))
+	if err != nil {
+		log.Printf("[DEBUG] Lookup: failed to read child inode %d: %v", childInodeNum, err)
 		return nil, syscall.EIO
 	}
 
@@ -878,20 +949,45 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	out.EntryValid = 0
 	out.AttrValid = 0
 
+	// Populate attributes - REQUIRED even with AttrValid=0
+	// The kernel uses these for the initial stat response
+	out.Attr.Ino = childInodeNum
+	out.Attr.Nlink = uint32(childIno.LinkCount)
+	out.Attr.Uid = childIno.UID
+	out.Attr.Gid = childIno.GID
+	out.Attr.Atime = uint64(childIno.Atime / 1e9)
+	out.Attr.Atimensec = uint32(childIno.Atime % 1e9)
+	out.Attr.Mtime = uint64(childIno.Mtime / 1e9)
+	out.Attr.Mtimensec = uint32(childIno.Mtime % 1e9)
+	out.Attr.Ctime = uint64(childIno.Ctime / 1e9)
+	out.Attr.Ctimensec = uint32(childIno.Ctime % 1e9)
+
 	if fileType == dir.DT_DIR {
+		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0777))
+		out.Attr.Size = BlockSize // Directories have fixed size
+		out.Attr.Blocks = 1 * (BlockSize / 512)
+		out.Attr.Blksize = BlockSize
+
 		childDir := &Dir{fs: d.fs, inodeNum: uint32(childInodeNum)}
 		ch := d.NewPersistentInode(ctx, childDir, fs.StableAttr{
 			Mode: fuse.S_IFDIR,
 			Ino:  childInodeNum,
 		})
+		log.Printf("[DEBUG] Lookup: returning dir inode %d", childInodeNum)
 		return ch, 0
 	}
+
+	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0777))
+	out.Attr.Size = childIno.Size
+	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
+	out.Attr.Blksize = BlockSize
 
 	childFile := &File{fs: d.fs, inodeNum: uint32(childInodeNum)}
 	ch := d.NewPersistentInode(ctx, childFile, fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  childInodeNum,
 	})
+	log.Printf("[DEBUG] Lookup: returning file inode %d, size=%d", childInodeNum, childIno.Size)
 	return ch, 0
 }
 
@@ -921,6 +1017,7 @@ func (ds *dirStream) Close() {}
 
 // Readdir returns a DirStream for directory listing.
 func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	log.Printf("[DEBUG] Readdir: dir=%d", d.inodeNum)
 	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return nil, syscall.EIO
@@ -941,6 +1038,7 @@ func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			mode = fuse.S_IFLNK
 		}
 
+		log.Printf("[DEBUG] Readdir: entry %q inode=%d type=%d", entry.Name, entry.InodeNum, entry.FileType)
 		result = append(result, fuse.DirEntry{
 			Ino:  entry.InodeNum,
 			Name: entry.Name,
@@ -1511,14 +1609,18 @@ var (
 // Open opens the file for reading/writing.
 // Returns nil FileHandle to indicate the File node itself should be used as the handle.
 func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	log.Printf("[DEBUG] File.Open: inode=%d flags=%d", f.inodeNum, flags)
 	// Verify the inode exists and is a regular file
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
+		log.Printf("[DEBUG] File.Open: read failed: %v", err)
 		return nil, 0, syscall.EIO
 	}
 	if !ino.IsFile() {
+		log.Printf("[DEBUG] File.Open: not a file")
 		return nil, 0, syscall.EISDIR
 	}
+	log.Printf("[DEBUG] File.Open: success, Size=%d", ino.Size)
 	// Return nil FileHandle - the File node itself implements Read/Write/etc.
 	// The fuse.FOPEN_KEEP_CACHE flag tells the kernel to keep cached data valid
 	// (we don't use it in cluster mode since other nodes may modify the file).
@@ -1527,12 +1629,16 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 
 // Getattr returns file attributes.
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	log.Printf("[DEBUG] File.Getattr: inode=%d", f.inodeNum)
 	// Read directly from disk to get fresh inode state.
 	// In multi-node scenarios, another node may have updated the inode.
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
+		log.Printf("[DEBUG] File.Getattr: read failed: %v", err)
 		return syscall.EIO
 	}
+
+	log.Printf("[DEBUG] File.Getattr: inode=%d Size=%d AllocatedBlocks=%d", f.inodeNum, ino.Size, ino.AllocatedBlocks)
 
 	// Disable FUSE kernel caching for cluster operation.
 	// Other nodes may modify attributes at any time.
@@ -1562,13 +1668,18 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 	// In multi-node scenarios, another node may have updated the inode.
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
+		log.Printf("[DEBUG] Read inode %d: Read failed: %v", f.inodeNum, err)
 		return nil, syscall.EIO
 	}
+
+	log.Printf("[DEBUG] Read inode %d: Size=%d AllocatedBlocks=%d Extents=[%+v, %+v]",
+		f.inodeNum, ino.Size, ino.AllocatedBlocks, ino.InlineExtents[0], ino.InlineExtents[1])
 
 	offset := uint64(off)
 
 	// Check bounds using the authoritative size from disk
 	if offset >= ino.Size {
+		log.Printf("[DEBUG] Read inode %d: offset %d >= Size %d, returning empty", f.inodeNum, offset, ino.Size)
 		return fuse.ReadResultData(nil), 0
 	}
 
@@ -1702,6 +1813,80 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		return 0, syscall.EIO
 	}
 
+	// === SFB (Sub-File Block) handling for small files ===
+	// Check if this file uses SFB storage or could benefit from it.
+	newEndOffset := offset + uint64(len(data))
+
+	// Case 1: File is already SFB-backed
+	if ino.IsSFBBacked() {
+		if newEndOffset > SFBMaxFileSize {
+			// Write would exceed SFB limit - migrate to regular extent first
+			if err := f.migrateToExtent(ctx, ino); err != nil {
+				log.Printf("[DEBUG] Write inode %d: SFB migration failed: %v", f.inodeNum, err)
+				return 0, err
+			}
+			// Re-read inode after migration
+			ino, err = f.fs.inodeTbl.Read(f.inodeNum)
+			if err != nil {
+				return 0, syscall.EIO
+			}
+			// Fall through to regular extent write path below
+		} else {
+			// Write fits in SFB - use SFB write path
+			return f.writeSFB(ctx, ino, data, offset)
+		}
+	}
+
+	// Case 2: New file (no extents) that fits in SFB
+	if ino.ExtentCount == 0 && newEndOffset <= SFBMaxFileSize && f.fs.sfbMgr != nil {
+		// Allocate SFB slot for this small file
+		containerBlock, slotIndex, err := f.fs.sfbMgr.AllocateSlot(ctx, newEndOffset)
+		if err == nil {
+			// Journal the SFB allocation
+			if f.fs.journal != nil {
+				txn := f.fs.journal.Begin()
+				tier, _ := sfb.TierForSize(newEndOffset)
+				if err := txn.LogSFBAlloc(&journal.SFBAllocPayload{
+					InodeNum:       uint64(f.inodeNum),
+					ContainerBlock: containerBlock,
+					SlotIndex:      slotIndex,
+					Tier:           journal.SFBTier(tier),
+				}); err != nil {
+					f.fs.journal.Abort(txn)
+					// Free the slot on journal failure
+					_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
+					return 0, err
+				}
+				if err := f.fs.journal.Commit(txn); err != nil {
+					_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
+					return 0, err
+				}
+			}
+
+			// Store the SFB reference in the inode's first extent
+			tier, _ := sfb.TierForSize(newEndOffset)
+			ino.InlineExtents[0] = inode.InlineExtent{
+				LogicalBlock:  0,
+				PhysicalBlock: sfb.PackPhysicalBlock(containerBlock, slotIndex),
+				Length:        1,
+				Flags:         extent.FlagAllocated | extent.FlagSFB | (uint32(tier) << 4),
+			}
+			ino.ExtentCount = 1
+			ino.AllocatedBlocks = 0 // SFB doesn't count as full blocks
+
+			if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+				_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
+				return 0, err
+			}
+
+			// Now write using SFB path
+			return f.writeSFB(ctx, ino, data, offset)
+		}
+		// SFB allocation failed (e.g., no space) - fall through to regular extent path
+		log.Printf("[DEBUG] Write inode %d: SFB allocation failed, using extent: %v", f.inodeNum, err)
+	}
+
+	// Regular extent-based write path for large files
 	for bytesWritten < len(data) {
 		blockNum := offset / BlockSize
 		blockOffset := offset % BlockSize
@@ -1740,7 +1925,15 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				}
 			}
 
-			// Allocate block while holding lock
+			// Release inode lock before allocation to respect lock ordering:
+			// bitmap (6) must be acquired before inode (8)
+			// AllocateBlocks acquires bitmap lock internally
+			if lockHeld && f.fs.lockMgr != nil {
+				f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+				lockHeld = false
+			}
+
+			// Allocate block (acquires bitmap lock internally, then releases it)
 			ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
 			if err != nil {
 				// Check for extent conflicts indicating concurrent allocation
@@ -1751,6 +1944,23 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				}
 				log.Printf("[DEBUG] Write inode %d: AllocateBlocks failed: %v", f.inodeNum, err)
 				return 0, syscall.ENOSPC
+			}
+
+			// Re-acquire inode lock after allocation
+			if f.fs.lockMgr != nil {
+				if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+					log.Printf("[DEBUG] Write inode %d: failed to re-acquire lock after allocation: %v", f.inodeNum, err)
+					return 0, syscall.EIO
+				}
+				lockHeld = true
+
+				// Re-read inode after re-acquiring lock to verify state
+				freshIno, readErr := f.fs.inodeTbl.Read(f.inodeNum)
+				if readErr != nil {
+					log.Printf("[DEBUG] Write inode %d: re-read after allocation failed: %v", f.inodeNum, readErr)
+					return 0, syscall.EIO
+				}
+				ino = freshIno
 			}
 			extOffset = 0
 
@@ -1767,6 +1977,90 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 
 	handleExtent:
+		// === Copy-on-Write for Shared Blocks (Snapshot Support) ===
+		// If this extent is shared with a snapshot (FlagShared + RefCount > 1),
+		// we must allocate a new block before writing to preserve snapshot data.
+		if ext.Flags&extent.FlagShared != 0 && f.fs.refcountReg != nil {
+			// Check if CoW is actually needed (refcount > 1)
+			needsCoW, cowErr := f.fs.extentMgr.NeedsCoW(ctx, ext, f.fs.refcountReg)
+			if cowErr != nil {
+				log.Printf("[DEBUG] Write inode %d: CoW check failed for block %d: %v",
+					f.inodeNum, ext.PhysicalBlock, cowErr)
+				return 0, syscall.EIO
+			}
+
+			if needsCoW {
+				// Need exclusive inode lock for CoW (modifies extent tree)
+				if !lockHeld && f.fs.lockMgr != nil {
+					if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+						log.Printf("[DEBUG] Write inode %d: failed to acquire lock for CoW: %v", f.inodeNum, err)
+						return 0, syscall.EIO
+					}
+					lockHeld = true
+
+					// Re-read inode after acquiring lock
+					freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+					if err != nil {
+						log.Printf("[DEBUG] Write inode %d: re-read for CoW failed: %v", f.inodeNum, err)
+						return 0, syscall.EIO
+					}
+					if freshIno.MetaGeneration != ino.MetaGeneration {
+						log.Printf("[DEBUG] Write inode %d: MetaGeneration changed during CoW", f.inodeNum)
+						return 0, errRetryWrite
+					}
+					ino = freshIno
+
+					// Re-lookup extent - another node may have already done CoW
+					ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum)
+					if err != nil {
+						log.Printf("[DEBUG] Write inode %d: extent lookup for CoW failed: %v", f.inodeNum, err)
+						return 0, syscall.EIO
+					}
+
+					// Re-check if CoW is still needed (another node may have done it)
+					needsCoW, cowErr = f.fs.extentMgr.NeedsCoW(ctx, ext, f.fs.refcountReg)
+					if cowErr != nil {
+						log.Printf("[DEBUG] Write inode %d: CoW re-check failed: %v", f.inodeNum, cowErr)
+						return 0, syscall.EIO
+					}
+				}
+
+				// Perform CoW if still needed
+				if needsCoW {
+					cowResult, cowErr := f.fs.extentMgr.CopyOnWrite(ctx, ino, ext, blockNum, f.fs.dataOffset, f.fs.refcountReg)
+					if cowErr != nil {
+						log.Printf("[DEBUG] Write inode %d: CoW failed for block %d: %v",
+							f.inodeNum, ext.PhysicalBlock, cowErr)
+						return 0, syscall.EIO
+					}
+
+					if cowResult.WasShared {
+						log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
+							f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
+
+						// Decrement refcount on old block (async, will be freed if reaches 0)
+						newCount, decErr := f.fs.refcountReg.Decrement(ctx, cowResult.OldPhysBlock)
+						if decErr != nil {
+							// Log but don't fail - the write succeeded, refcount is secondary
+							log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
+								f.inodeNum, cowResult.OldPhysBlock, decErr)
+						} else if newCount == 0 {
+							// Block is no longer referenced - queue for TRIM if enabled
+							log.Printf("[DEBUG] Write inode %d: old block %d refcount reached 0 (can be freed)",
+								f.inodeNum, cowResult.OldPhysBlock)
+						}
+
+						// Re-lookup extent to get updated physical block
+						ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum)
+						if cowErr != nil {
+							log.Printf("[DEBUG] Write inode %d: extent lookup after CoW failed: %v", f.inodeNum, cowErr)
+							return 0, syscall.EIO
+						}
+					}
+				}
+			}
+		}
+
 		// Check if this is an unwritten extent (from fallocate).
 		// If so, we need to clear the Unwritten flag on first write.
 		if ext.Flags&extent.FlagUnwritten != 0 {
@@ -1987,6 +2281,204 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	return bytesWritten, nil
 }
 
+// writeSFB handles writes to files stored in SFB containers.
+// SFB (Sub-File Block) stores small files (<64KB) efficiently in shared 1MB blocks.
+func (f *File) writeSFB(ctx context.Context, ino *inode.Inode, data []byte, offset uint64) (int, error) {
+	// Verify the file is SFB-backed
+	if !ino.IsSFBBacked() {
+		return 0, errors.New("file is not SFB-backed")
+	}
+
+	// Get the SFB extent (should be the first inline extent)
+	if ino.ExtentCount == 0 {
+		return 0, errors.New("SFB file has no extent")
+	}
+
+	ext := &ino.InlineExtents[0]
+	containerBlock, slotIndex := sfb.UnpackPhysicalBlock(ext.PhysicalBlock)
+
+	// Determine slot size from tier
+	tier := sfb.Tier((ext.Flags >> 4) & 0x3) // Tier stored in bits 4-5 of flags
+	slotSize, _ := tier.Info()
+	if slotSize == 0 {
+		// Fallback: determine from container if tier not in flags
+		slotSize = 64 * 1024 // Assume max slot size
+	}
+
+	// Check if write would exceed slot size (needs migration to full extent)
+	newSize := offset + uint64(len(data))
+	if newSize > uint64(slotSize) {
+		log.Printf("[DEBUG] SFB write inode %d: size %d exceeds slot %d, needs migration",
+			f.inodeNum, newSize, slotSize)
+		return 0, errors.New("write exceeds SFB slot size - migration needed")
+	}
+
+	// Calculate the physical offset within the container block
+	// Container layout: [Header 64B][Slot 0][Slot 1]...[Slot N]
+	slotOffset := uint64(SFBHeaderSize) + uint64(slotIndex)*uint64(slotSize)
+	diskOffset := int64(f.fs.dataOffset + containerBlock*BlockSize + slotOffset + offset)
+
+	// Acquire SFB container lock (Level 7 in lock hierarchy)
+	if f.fs.lockMgr != nil {
+		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, containerBlock, lock.LockModeExclusive); err != nil {
+			log.Printf("[DEBUG] SFB write inode %d: failed to acquire container lock: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+		defer f.fs.lockMgr.Release(lock.LockTypeSFBContainer, containerBlock)
+	}
+
+	// Write data to slot using aligned I/O
+	bytesWritten := 0
+	buf := storage.GetBuffer(storage.SectorSize)
+	defer storage.PutBuffer(buf)
+
+	alignedOffset := diskOffset &^ (storage.SectorSize - 1)
+	sectorOffset := diskOffset - alignedOffset
+
+	for bytesWritten < len(data) {
+		// Read existing sector
+		if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
+			// New sector - zero it
+			for i := range buf.Bytes() {
+				buf.Bytes()[i] = 0
+			}
+		}
+
+		// Modify
+		copyLen := storage.SectorSize - int(sectorOffset)
+		if copyLen > len(data)-bytesWritten {
+			copyLen = len(data) - bytesWritten
+		}
+		copy(buf.Bytes()[sectorOffset:], data[bytesWritten:bytesWritten+copyLen])
+
+		// Write back
+		if _, err := f.fs.dev.WriteAt(buf.Bytes(), alignedOffset); err != nil {
+			log.Printf("[DEBUG] SFB write inode %d: WriteAt failed: %v", f.inodeNum, err)
+			return bytesWritten, syscall.EIO
+		}
+
+		bytesWritten += copyLen
+		alignedOffset += storage.SectorSize
+		sectorOffset = 0
+	}
+
+	// Update inode size if extended
+	if newSize > ino.Size {
+		ino.Size = newSize
+		ino.Mtime = time.Now().UnixNano()
+
+		// Journal the update
+		if f.fs.journal != nil {
+			txn := f.fs.journal.Begin()
+			if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
+				InodeNum:   uint64(f.inodeNum),
+				UpdateMask: journal.InodeUpdateSize | journal.InodeUpdateMtime,
+			}); err != nil {
+				f.fs.journal.Abort(txn)
+				return bytesWritten, err
+			}
+			if err := f.fs.journal.Commit(txn); err != nil {
+				return bytesWritten, err
+			}
+		}
+
+		// Write inode
+		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+			return bytesWritten, err
+		}
+	}
+
+	return bytesWritten, nil
+}
+
+// migrateToExtent migrates an SFB-backed file to regular extent allocation.
+// Called when a small file grows beyond the SFB slot size (64KB).
+func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
+	if !ino.IsSFBBacked() {
+		return nil // Already using extents
+	}
+
+	ext := &ino.InlineExtents[0]
+	oldContainer, oldSlot := sfb.UnpackPhysicalBlock(ext.PhysicalBlock)
+
+	// Determine old slot size
+	tier := sfb.Tier((ext.Flags >> 4) & 0x3)
+	oldSlotSize, _ := tier.Info()
+	if oldSlotSize == 0 {
+		oldSlotSize = 64 * 1024
+	}
+
+	// Allocate a new full 1MB block
+	newBlocks, err := f.fs.bitmapMgr.Alloc(ctx, 1)
+	if err != nil {
+		return fmt.Errorf("failed to allocate block for migration: %w", err)
+	}
+	newBlock := newBlocks[0]
+
+	// Read data from old SFB slot
+	slotOffset := uint64(SFBHeaderSize) + uint64(oldSlot)*uint64(oldSlotSize)
+	oldDiskOffset := int64(f.fs.dataOffset + oldContainer*BlockSize + slotOffset)
+
+	slotData := make([]byte, ino.Size)
+	if _, err := f.fs.dev.ReadAt(slotData, oldDiskOffset); err != nil {
+		// Best effort - continue with partial data
+		log.Printf("[WARN] Migration read incomplete for inode %d: %v", f.inodeNum, err)
+	}
+
+	// Write data to new block
+	newDiskOffset := int64(f.fs.dataOffset + newBlock*BlockSize)
+	if _, err := f.fs.dev.WriteAt(slotData, newDiskOffset); err != nil {
+		// Release the allocated block on failure
+		_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+		return fmt.Errorf("failed to write migrated data: %w", err)
+	}
+
+	// Journal the migration
+	if f.fs.journal != nil {
+		txn := f.fs.journal.Begin()
+		if err := txn.LogSFBMigrate(&journal.SFBMigratePayload{
+			InodeNum:     uint64(f.inodeNum),
+			OldContainer: oldContainer,
+			OldSlot:      oldSlot,
+			NewBlock:     newBlock,
+		}); err != nil {
+			f.fs.journal.Abort(txn)
+			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+			return err
+		}
+		if err := f.fs.journal.Commit(txn); err != nil {
+			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+			return err
+		}
+	}
+
+	// Update extent to point to new block (clear SFB flag)
+	ext.PhysicalBlock = newBlock
+	ext.LogicalBlock = 0
+	ext.Length = 1
+	ext.Flags = extent.FlagAllocated // Clear SFB flag
+
+	// Update inode
+	ino.AllocatedBlocks = 1
+	ino.Mtime = time.Now().UnixNano()
+
+	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+		return err
+	}
+
+	// Free the old SFB slot (if sfbMgr is available)
+	if f.fs.sfbMgr != nil {
+		if err := f.fs.sfbMgr.FreeSlot(ctx, oldContainer, oldSlot); err != nil {
+			log.Printf("[WARN] Failed to free old SFB slot %d:%d: %v", oldContainer, oldSlot, err)
+		}
+	}
+
+	log.Printf("[INFO] Migrated inode %d from SFB (%d:%d) to extent (block %d)",
+		f.inodeNum, oldContainer, oldSlot, newBlock)
+
+	return nil
+}
+
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	// Invalidate cache before modifying - ensures we read fresh data
@@ -2146,21 +2638,10 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		return syscall.EIO
 	}
 
-	// Acquire inode lock for allocation
-	if f.fs.lockMgr != nil {
-		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-			log.Printf("[DEBUG] Allocate inode %d: lock failed: %v", f.inodeNum, err)
-			return syscall.EIO
-		}
-		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
-
-		// Re-read inode after lock
-		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
-		if err != nil {
-			log.Printf("[DEBUG] Allocate inode %d: re-read failed: %v", f.inodeNum, err)
-			return syscall.EIO
-		}
-	}
+	// Note: We don't hold the inode lock during block allocation to respect lock ordering.
+	// Lock order: bitmap (6) must be acquired before inode (8).
+	// AllocateUnwritten acquires bitmap lock internally.
+	// We acquire the inode lock only at the end to update metadata atomically.
 
 	// Calculate block range
 	startBlock := off / BlockSize
@@ -2207,6 +2688,22 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		}
 
 		blockNum = rangeEnd
+	}
+
+	// Acquire inode lock for metadata update
+	if f.fs.lockMgr != nil {
+		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+			log.Printf("[DEBUG] Allocate inode %d: lock failed: %v", f.inodeNum, err)
+			return syscall.EIO
+		}
+		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+
+		// Re-read inode after lock to get latest state
+		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
+		if err != nil {
+			log.Printf("[DEBUG] Allocate inode %d: re-read failed: %v", f.inodeNum, err)
+			return syscall.EIO
+		}
 	}
 
 	// Update file size if not KEEP_SIZE and new size is larger

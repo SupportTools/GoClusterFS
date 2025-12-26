@@ -73,6 +73,7 @@ type Journal struct {
 	// Background checkpoint goroutine
 	checkpointStop chan struct{}
 	checkpointWg   sync.WaitGroup
+	stopOnce       sync.Once // Ensures Stop() is idempotent
 
 	// Metrics
 	commitCount  uint64
@@ -133,21 +134,27 @@ func (j *Journal) Start() {
 }
 
 // Stop stops background checkpoint processing and closes the journal.
+// This function is idempotent - calling it multiple times is safe.
 func (j *Journal) Stop() error {
-	close(j.checkpointStop)
-	j.checkpointWg.Wait()
+	var stopErr error
+	j.stopOnce.Do(func() {
+		close(j.checkpointStop)
+		j.checkpointWg.Wait()
 
-	// Mark journal clean on orderly shutdown
-	j.mu.Lock()
-	defer j.mu.Unlock()
+		// Mark journal clean on orderly shutdown
+		j.mu.Lock()
+		defer j.mu.Unlock()
 
-	if len(j.activeTxns) == 0 {
-		if err := j.region.MarkClean(); err != nil {
-			return fmt.Errorf("failed to mark journal clean: %w", err)
+		if len(j.activeTxns) == 0 {
+			if err := j.region.MarkClean(); err != nil {
+				stopErr = fmt.Errorf("failed to mark journal clean: %w", err)
+				return
+			}
 		}
-	}
 
-	return j.region.Close()
+		stopErr = j.region.Close()
+	})
+	return stopErr
 }
 
 // checkpointLoop periodically checkpoints completed transactions.

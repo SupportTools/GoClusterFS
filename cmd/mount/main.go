@@ -261,7 +261,8 @@ func main() {
 	}
 
 	// Create filesystem with journal, TRIM, and SFB for crash consistency
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, nodeUUID, dataOffset)
+	// NOTE: refcountReg is nil until snapshot feature is fully enabled
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, nil, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{

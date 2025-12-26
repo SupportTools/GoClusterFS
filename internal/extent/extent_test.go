@@ -8,6 +8,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -1229,5 +1230,330 @@ func TestFreeExtent_HandlesUnwrittenCorrectly(t *testing.T) {
 	// WrittenBlocks should still be 0 (wasn't written, so no decrement)
 	if ino.WrittenBlocks != 0 {
 		t.Errorf("Expected WrittenBlocks=0, got %d", ino.WrittenBlocks)
+	}
+}
+
+// ============================================================================
+// Copy-on-Write (CoW) Tests (for snapshot support)
+// ============================================================================
+
+// createTestSetupWithRefcount creates a test setup including a refcount region.
+func createTestSetupWithRefcount(tb testing.TB) (*Manager, *refcount.Region, *inode.Inode, func()) {
+	tb.Helper()
+
+	// Need larger device for refcount region (at least 10MB)
+	dev, cleanup := createTestDevice(tb, 100<<20) // 100MB
+
+	var uuid [16]byte
+	// Layout: 0-1MB bitmap, 1-2MB refcount, 2MB+ data blocks
+	bitmapOffset := uint64(0)
+	refcountOffset := uint64(1 << 20)  // 1MB
+	refcountSize := uint64(1 << 20)    // 1MB for refcounts
+
+	bm := bitmap.NewRegion(dev, bitmapOffset, 1000, nil, uuid) // 1000 blocks
+	refcountReg := refcount.NewRegion(dev, refcountOffset, refcountSize, nil)
+	mgr := NewManager(dev, bm, nil)
+
+	ino := &inode.Inode{
+		Magic:    inode.InodeMagic,
+		InodeNum: 10,
+		Mode:     inode.S_IFREG | 0o644,
+	}
+
+	return mgr, refcountReg, ino, cleanup
+}
+
+// inlineExtentToExtent converts an inode.InlineExtent to an Extent.
+func inlineExtentToExtent(ie *inode.InlineExtent) *Extent {
+	return &Extent{
+		LogicalBlock:  ie.LogicalBlock,
+		PhysicalBlock: ie.PhysicalBlock,
+		Length:        ie.Length,
+		Flags:         ie.Flags,
+	}
+}
+
+// TestNeedsCoW_NoRefcountRegion verifies NeedsCoW returns false when no refcount region exists.
+func TestNeedsCoW_NoRefcountRegion(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate block and set FlagShared
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+	ext.Flags |= FlagShared
+
+	// NeedsCoW should return false when refcountReg is nil
+	needsCoW, err := mgr.NeedsCoW(ctx, ext, nil)
+	if err != nil {
+		t.Fatalf("NeedsCoW failed: %v", err)
+	}
+	if needsCoW {
+		t.Error("NeedsCoW should return false when refcountReg is nil")
+	}
+}
+
+// TestNeedsCoW_NotShared verifies NeedsCoW returns false for non-shared extents.
+func TestNeedsCoW_NotShared(t *testing.T) {
+	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate block without FlagShared
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	// NeedsCoW should return false for non-shared extent
+	needsCoW, err := mgr.NeedsCoW(ctx, ext, refcountReg)
+	if err != nil {
+		t.Fatalf("NeedsCoW failed: %v", err)
+	}
+	if needsCoW {
+		t.Error("NeedsCoW should return false for non-shared extent")
+	}
+}
+
+// TestNeedsCoW_SharedWithRefCountOne verifies NeedsCoW returns false when RefCount == 1.
+func TestNeedsCoW_SharedWithRefCountOne(t *testing.T) {
+	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate block and set FlagShared
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+	ext.Flags |= FlagShared
+
+	// Set refcount to 1 (only one reference, no CoW needed)
+	err = refcountReg.Set(ctx, ext.PhysicalBlock, 1, 0)
+	if err != nil {
+		t.Fatalf("refcount.Set failed: %v", err)
+	}
+
+	// NeedsCoW should return false for RefCount == 1
+	needsCoW, err := mgr.NeedsCoW(ctx, ext, refcountReg)
+	if err != nil {
+		t.Fatalf("NeedsCoW failed: %v", err)
+	}
+	if needsCoW {
+		t.Error("NeedsCoW should return false when RefCount == 1")
+	}
+}
+
+// TestNeedsCoW_SharedWithRefCountTwo verifies NeedsCoW returns true when RefCount > 1.
+func TestNeedsCoW_SharedWithRefCountTwo(t *testing.T) {
+	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate block and set FlagShared
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+	ext.Flags |= FlagShared
+
+	// Set refcount to 2 (shared with snapshot)
+	err = refcountReg.Set(ctx, ext.PhysicalBlock, 2, 0)
+	if err != nil {
+		t.Fatalf("refcount.Set failed: %v", err)
+	}
+
+	// NeedsCoW should return true for RefCount > 1
+	needsCoW, err := mgr.NeedsCoW(ctx, ext, refcountReg)
+	if err != nil {
+		t.Fatalf("NeedsCoW failed: %v", err)
+	}
+	if !needsCoW {
+		t.Error("NeedsCoW should return true when RefCount > 1")
+	}
+}
+
+// TestMarkAllShared verifies MarkAllShared sets FlagShared on all extents.
+func TestMarkAllShared(t *testing.T) {
+	mgr, ino, cleanup := createTestSetup(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate two extents
+	ext1, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks(0) failed: %v", err)
+	}
+	ext2, err := mgr.AllocateBlocks(ctx, ino, 1, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks(1) failed: %v", err)
+	}
+
+	// Verify neither is shared initially
+	if ext1.Flags&FlagShared != 0 {
+		t.Error("ext1 should not be shared initially")
+	}
+	if ext2.Flags&FlagShared != 0 {
+		t.Error("ext2 should not be shared initially")
+	}
+
+	// Mark all shared
+	mgr.MarkAllShared(ino)
+
+	// Verify both inline extents are now marked shared
+	if ino.InlineExtents[0].Flags&FlagShared == 0 {
+		t.Error("InlineExtents[0] should be shared after MarkAllShared")
+	}
+	if ino.InlineExtents[1].Flags&FlagShared == 0 {
+		t.Error("InlineExtents[1] should be shared after MarkAllShared")
+	}
+}
+
+// TestCopyOnWrite_Success verifies CopyOnWrite allocates a new block and copies data.
+func TestCopyOnWrite_Success(t *testing.T) {
+	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate a single block
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	originalPhysBlock := ext.PhysicalBlock
+
+	// Set up as shared with refcount > 1
+	ext.Flags |= FlagShared
+	err = refcountReg.Set(ctx, ext.PhysicalBlock, 2, 0)
+	if err != nil {
+		t.Fatalf("refcount.Set failed: %v", err)
+	}
+
+	// Update inode's inline extent to reflect shared flag
+	ino.InlineExtents[0].Flags |= FlagShared
+
+	// Data offset for writes (2MB in our test layout)
+	dataOffset := uint64(2 << 20)
+
+	// Convert inline extent to Extent for CopyOnWrite
+	extPtr := inlineExtentToExtent(&ino.InlineExtents[0])
+
+	// Perform CoW
+	result, err := mgr.CopyOnWrite(ctx, ino, extPtr, 0, dataOffset, refcountReg)
+	if err != nil {
+		t.Fatalf("CopyOnWrite failed: %v", err)
+	}
+
+	// Verify result
+	if !result.WasShared {
+		t.Error("CopyOnWrite should report WasShared=true")
+	}
+	if result.OldPhysBlock != originalPhysBlock {
+		t.Errorf("OldPhysBlock = %d, want %d", result.OldPhysBlock, originalPhysBlock)
+	}
+	if result.NewPhysBlock == originalPhysBlock {
+		t.Error("NewPhysBlock should be different from OldPhysBlock")
+	}
+
+	// Verify extent was updated
+	if ino.InlineExtents[0].PhysicalBlock != result.NewPhysBlock {
+		t.Errorf("Extent PhysicalBlock = %d, want %d",
+			ino.InlineExtents[0].PhysicalBlock, result.NewPhysBlock)
+	}
+
+	// Verify FlagShared was cleared
+	if ino.InlineExtents[0].Flags&FlagShared != 0 {
+		t.Error("FlagShared should be cleared after CoW")
+	}
+}
+
+// TestCopyOnWrite_AlreadyPrivate verifies CoW returns quickly for non-shared blocks.
+func TestCopyOnWrite_AlreadyPrivate(t *testing.T) {
+	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Allocate a single block (NOT shared)
+	ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+	if err != nil {
+		t.Fatalf("AllocateBlocks failed: %v", err)
+	}
+
+	originalPhysBlock := ext.PhysicalBlock
+
+	// Set refcount to 1 (private)
+	err = refcountReg.Set(ctx, ext.PhysicalBlock, 1, 0)
+	if err != nil {
+		t.Fatalf("refcount.Set failed: %v", err)
+	}
+
+	// Data offset for writes
+	dataOffset := uint64(2 << 20)
+
+	// Convert inline extent to Extent for CopyOnWrite
+	extPtr := inlineExtentToExtent(&ino.InlineExtents[0])
+
+	// Perform CoW - should be no-op
+	result, err := mgr.CopyOnWrite(ctx, ino, extPtr, 0, dataOffset, refcountReg)
+	if err != nil {
+		t.Fatalf("CopyOnWrite failed: %v", err)
+	}
+
+	// Verify no actual CoW was performed
+	if result.WasShared {
+		t.Error("CopyOnWrite should report WasShared=false for private block")
+	}
+
+	// Block should remain the same (extPtr points to a copy, check inode directly)
+	if ino.InlineExtents[0].PhysicalBlock != originalPhysBlock {
+		t.Error("Extent PhysicalBlock should remain unchanged for private block")
+	}
+}
+
+// TestCopyOnWrite_MultiBlockExtent verifies CoW fails for multi-block extents (not yet supported).
+func TestCopyOnWrite_MultiBlockExtent(t *testing.T) {
+	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Insert a multi-block extent manually
+	ext := &Extent{
+		LogicalBlock:  0,
+		PhysicalBlock: 100,
+		Length:        5, // Multi-block
+		Flags:         FlagAllocated | FlagShared,
+	}
+	err := mgr.Insert(ctx, ino, ext)
+	if err != nil {
+		t.Fatalf("Insert failed: %v", err)
+	}
+
+	// Set refcount > 1 to trigger CoW
+	err = refcountReg.Set(ctx, 100, 2, 0)
+	if err != nil {
+		t.Fatalf("refcount.Set failed: %v", err)
+	}
+
+	dataOffset := uint64(2 << 20)
+
+	// Convert inline extent to Extent for CopyOnWrite
+	extPtr := inlineExtentToExtent(&ino.InlineExtents[0])
+
+	// CoW should fail for multi-block extent
+	_, err = mgr.CopyOnWrite(ctx, ino, extPtr, 0, dataOffset, refcountReg)
+	if err != ErrCoWMultiBlock {
+		t.Errorf("CopyOnWrite should return ErrCoWMultiBlock, got %v", err)
 	}
 }

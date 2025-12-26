@@ -91,6 +91,17 @@ docker-clean-test:
 	rm -rf tests/docker/results/*
 	@echo "Docker cleanup complete"
 
+# Run multi-node tests with larger storage (10GB) - for stress testing
+test-multinode-docker-10gb: docker-build-test
+	@echo "Running multi-node Docker tests with 10GB storage..."
+	CLUSTER_SIZE_MB=10240 $(MAKE) test-multinode-docker
+
+# Run multi-node tests with very large storage (100GB) - for production-scale testing
+test-multinode-docker-100gb: docker-build-test
+	@echo "Running multi-node Docker tests with 100GB storage..."
+	@echo "WARNING: This will create a 100GB sparse file and may take a long time"
+	CLUSTER_SIZE_MB=102400 $(MAKE) test-multinode-docker
+
 # =============================================================================
 # VM Multi-Node Tests (QEMU-based)
 # =============================================================================
@@ -186,9 +197,11 @@ help:
 	@echo "    test-parity-report - Detailed test coverage report"
 	@echo ""
 	@echo "  Docker Multi-Node Tests:"
-	@echo "    test-multinode-docker - Run multi-node tests in Docker"
-	@echo "    docker-build-test     - Build Docker test images only"
-	@echo "    docker-clean-test     - Clean up Docker test resources"
+	@echo "    test-multinode-docker      - Run multi-node tests in Docker (500MB)"
+	@echo "    test-multinode-docker-10gb - Run multi-node tests with 10GB storage"
+	@echo "    test-multinode-docker-100gb- Run multi-node tests with 100GB storage"
+	@echo "    docker-build-test          - Build Docker test images only"
+	@echo "    docker-clean-test          - Clean up Docker test resources"
 	@echo ""
 	@echo "  VM Multi-Node Tests (QEMU):"
 	@echo "    test-multinode-vm     - Run multi-node tests in QEMU VMs (2 nodes)"

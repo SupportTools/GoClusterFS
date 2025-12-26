@@ -24,6 +24,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -43,6 +44,7 @@ const (
 	FlagAllocated = 1 << 0 // Physical block is allocated
 	FlagUnwritten = 1 << 1 // Allocated but lazy-zero (not yet written)
 	FlagShared    = 1 << 2 // Shared with snapshot (requires CoW)
+	FlagSFB       = 1 << 3 // Stored in SFB container (not full block)
 )
 
 // Errors
@@ -52,7 +54,16 @@ var (
 	ErrExtentOverlap     = errors.New("extent overlap detected")
 	ErrInvalidExtent     = errors.New("invalid extent")
 	ErrBlockNotAllocated = errors.New("block not allocated")
+	ErrCoWRequired       = errors.New("copy-on-write required for shared block")
+	ErrCoWMultiBlock     = errors.New("CoW on multi-block extents not yet supported")
 )
+
+// CoWResult contains the result of a copy-on-write operation.
+type CoWResult struct {
+	OldPhysBlock uint64 // Original physical block (for refcount decrement)
+	NewPhysBlock uint64 // New physical block after CoW
+	WasShared    bool   // True if CoW was actually performed
+}
 
 // Extent represents a contiguous range of blocks.
 type Extent struct {
@@ -588,6 +599,30 @@ func (e *Extent) IsShared() bool {
 	return (e.Flags & FlagShared) != 0
 }
 
+// IsSFB returns true if the extent is stored in an SFB container.
+func (e *Extent) IsSFB() bool {
+	return (e.Flags & FlagSFB) != 0
+}
+
+// ContainerBlock extracts the SFB container block number from PhysicalBlock.
+// Only valid when FlagSFB is set. High 48 bits contain the container block.
+func (e *Extent) ContainerBlock() uint64 {
+	return e.PhysicalBlock >> 16
+}
+
+// SlotIndex extracts the SFB slot index from PhysicalBlock.
+// Only valid when FlagSFB is set. Low 16 bits contain the slot index.
+func (e *Extent) SlotIndex() uint16 {
+	return uint16(e.PhysicalBlock & 0xFFFF)
+}
+
+// SetSFBLocation packs container block and slot index into PhysicalBlock
+// and sets the FlagSFB flag.
+func (e *Extent) SetSFBLocation(containerBlock uint64, slotIndex uint16) {
+	e.PhysicalBlock = (containerBlock << 16) | uint64(slotIndex)
+	e.Flags |= FlagSFB | FlagAllocated
+}
+
 // BlocksForSize calculates the number of blocks needed for a given byte size.
 func BlocksForSize(size uint64) uint64 {
 	if size == 0 {
@@ -661,4 +696,100 @@ func (m *Manager) RemoveExtentForRecovery(ctx context.Context, ino *inode.Inode,
 	}
 
 	return nil
+}
+
+// NeedsCoW checks if a write to the given extent requires copy-on-write.
+// Returns true if the block is shared (refcount > 1) and must be copied.
+func (m *Manager) NeedsCoW(ctx context.Context, ext *Extent, refcountReg *refcount.Region) (bool, error) {
+	if refcountReg == nil {
+		return false, nil
+	}
+	if ext.Flags&FlagShared == 0 {
+		return false, nil
+	}
+	entry, err := refcountReg.Get(ctx, ext.PhysicalBlock)
+	if err != nil {
+		return false, fmt.Errorf("refcount read failed for block %d: %w", ext.PhysicalBlock, err)
+	}
+	return entry.NeedsCoW(), nil
+}
+
+// CopyOnWrite performs copy-on-write for a shared block.
+// Allocates a new block, copies data, and updates the extent.
+// The caller must decrement the old block's refcount after this returns.
+func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent,
+	logicalBlock uint64, dataOffset uint64, refcountReg *refcount.Region) (*CoWResult, error) {
+
+	offsetInExtent := logicalBlock - ext.LogicalBlock
+	result := &CoWResult{
+		OldPhysBlock: ext.PhysicalBlock + offsetInExtent,
+		WasShared:    false,
+	}
+
+	needsCoW, err := m.NeedsCoW(ctx, ext, refcountReg)
+	if err != nil {
+		return nil, err
+	}
+	if !needsCoW {
+		result.NewPhysBlock = result.OldPhysBlock
+		return result, nil
+	}
+
+	// Only support single-block extents for now
+	if ext.Length != 1 {
+		return nil, ErrCoWMultiBlock
+	}
+
+	log.Printf("[CoW] Block %d is shared, performing copy-on-write", result.OldPhysBlock)
+
+	// Allocate new block
+	newBlocks, err := m.bitmap.Alloc(ctx, 1)
+	if err != nil {
+		return nil, fmt.Errorf("CoW alloc failed: %w", err)
+	}
+	newPhysBlock := newBlocks[0]
+
+	// Copy data from old to new block
+	buf := storage.GetBuffer(BlockSize)
+	defer storage.PutBuffer(buf)
+
+	oldOffset := int64(dataOffset + result.OldPhysBlock*BlockSize)
+	newOffset := int64(dataOffset + newPhysBlock*BlockSize)
+
+	if _, err := m.dev.ReadAt(buf.Bytes(), oldOffset); err != nil {
+		m.bitmap.Free(ctx, newPhysBlock)
+		return nil, fmt.Errorf("CoW read failed: %w", err)
+	}
+	if _, err := m.dev.WriteAt(buf.Bytes(), newOffset); err != nil {
+		m.bitmap.Free(ctx, newPhysBlock)
+		return nil, fmt.Errorf("CoW write failed: %w", err)
+	}
+
+	// Update extent to point to new block
+	ext.PhysicalBlock = newPhysBlock
+	ext.Flags &^= FlagShared
+
+	// Update inline extent in inode
+	for i := range ino.InlineExtents {
+		inline := &ino.InlineExtents[i]
+		if inline.LogicalBlock == ext.LogicalBlock {
+			inline.PhysicalBlock = newPhysBlock
+			inline.Flags &^= FlagShared
+			break
+		}
+	}
+
+	result.NewPhysBlock = newPhysBlock
+	result.WasShared = true
+	log.Printf("[CoW] Copied block %d -> %d", result.OldPhysBlock, newPhysBlock)
+	return result, nil
+}
+
+// MarkAllShared sets FlagShared on all extents of an inode.
+func (m *Manager) MarkAllShared(ino *inode.Inode) {
+	for i := range ino.InlineExtents {
+		if ino.InlineExtents[i].Length > 0 {
+			ino.InlineExtents[i].Flags |= FlagShared
+		}
+	}
 }

@@ -138,8 +138,8 @@ func validateAlignment(buf []byte, offset int64) error {
 	if len(buf)%SectorSize != 0 {
 		return fmt.Errorf("buffer length %d is not aligned to sector size %d", len(buf), SectorSize)
 	}
-	// Check buffer memory alignment
-	if uintptr(unsafe.Pointer(&buf[0]))%SectorSize != 0 {
+	// Check buffer memory alignment (only if buffer is non-empty)
+	if len(buf) > 0 && uintptr(unsafe.Pointer(&buf[0]))%SectorSize != 0 {
 		return fmt.Errorf("buffer memory address is not aligned to sector size %d", SectorSize)
 	}
 	return nil

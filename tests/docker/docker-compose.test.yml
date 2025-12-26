@@ -10,10 +10,13 @@ services:
     image: busybox:latest
     volumes:
       - shared-data:/data
+    environment:
+      - CLUSTER_SIZE_MB=${CLUSTER_SIZE_MB:-500}
     command: >
       sh -c "
-        echo 'Creating 100MB cluster image...' &&
-        dd if=/dev/zero of=/data/cluster.img bs=1M count=100 &&
+        SIZE_MB=$${CLUSTER_SIZE_MB:-500} &&
+        echo \"Creating $${SIZE_MB}MB cluster image...\" &&
+        dd if=/dev/zero of=/data/cluster.img bs=1M count=$${SIZE_MB} &&
         echo 'Image created successfully'
       "
     networks:
