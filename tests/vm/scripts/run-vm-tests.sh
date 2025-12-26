@@ -1449,6 +1449,79 @@ test_broadcast_multiple_updates() {
     return 0
 }
 
+# Test: Broadcast bidirectional
+# Verifies that invalidations work in both directions between VMs.
+# VM 1 creates file_a, VM 2 creates file_b, both should see each other's file.
+test_broadcast_bidirectional() {
+    log_info "Testing broadcast bidirectional..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping broadcast bidirectional test (requires 2+ VMs)"
+        return 0
+    fi
+
+    local vm1=1
+    local vm2=2
+    local file_a="bidir_a_$(date +%s).txt"
+    local file_b="bidir_b_$(date +%s).txt"
+
+    # VM 1 creates file A
+    write_file_on_vm "$vm1" "$file_a" "from vm 1"
+
+    # VM 2 creates file B
+    write_file_on_vm "$vm2" "$file_b" "from vm 2"
+
+    # Allow broadcast propagation
+    sleep 0.3
+
+    # Poll for VM 2 to see file A (max 2 seconds)
+    local max_attempts=20
+    local attempt=0
+    local content_a=""
+
+    while [ $attempt -lt $max_attempts ]; do
+        content_a=$(read_file_on_vm "$vm2" "$file_a" 2>/dev/null || echo "")
+        if [ "$content_a" = "from vm 1" ]; then
+            log_info "VM 2 sees file_a from VM 1"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$content_a" != "from vm 1" ]; then
+        log_error "VM 2 cannot read file_a. Got '$content_a'"
+        return 1
+    fi
+
+    # Poll for VM 1 to see file B (max 2 seconds)
+    max_attempts=20
+    attempt=0
+    local content_b=""
+
+    while [ $attempt -lt $max_attempts ]; do
+        content_b=$(read_file_on_vm "$vm1" "$file_b" 2>/dev/null || echo "")
+        if [ "$content_b" = "from vm 2" ]; then
+            log_info "VM 1 sees file_b from VM 2"
+            break
+        fi
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$content_b" != "from vm 2" ]; then
+        log_error "VM 1 cannot read file_b. Got '$content_b'"
+        return 1
+    fi
+
+    # Clean up
+    ssh_run "$vm1" "rm -f /mnt/goclusterfs/$file_a"
+    ssh_run "$vm2" "rm -f /mnt/goclusterfs/$file_b"
+
+    log_info "Broadcast bidirectional test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log_info "Testing rolling restart..."
@@ -2548,6 +2621,7 @@ main() {
     run_test "Broadcast Invalidation" test_broadcast_invalidation
     run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
     run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
+    run_test "Broadcast Bidirectional" test_broadcast_bidirectional
     run_test "Rolling Restart" test_rolling_restart
     run_test "Stress Random Failures" test_stress_random_failures
 
