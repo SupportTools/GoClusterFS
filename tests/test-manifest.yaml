@@ -664,3 +664,73 @@ scenarios:
     priority: go_only
     environments:
       go: integration_test.go::TestMultiBlockFileStatBlocks
+
+  # ===========================================================================
+  # SFB (SUB-FILE BLOCK) CONTAINERS
+  # ===========================================================================
+  # SFB provides efficient storage for small files by packing them into shared
+  # 1MB blocks. Tiers: 4KB (256 slots), 8KB (128), 16KB (64), 64KB (16).
+  # Files >64KB migrate to full extent allocation.
+
+  - id: sfb-small-file-allocation
+    name: SFB small file allocation
+    description: Small files (≤64KB) can be created and read back with SFB enabled
+    priority: high
+    environments:
+      go: sfb_test.go::TestSFBSmallFileAllocation
+      docker: TODO - Requires SFB flag support in test harness
+      vm: TODO - Requires SFB flag support in test harness
+
+  - id: sfb-tier-selection
+    name: SFB tier selection
+    description: Files at tier boundaries (4KB/8KB/16KB/64KB) are handled correctly
+    priority: high
+    environments:
+      go: sfb_test.go::TestSFBTierSelection
+      docker: TODO
+      vm: TODO
+
+  - id: sfb-data-integrity
+    name: SFB data integrity
+    description: Random data written to SFB-backed files is correctly read back
+    priority: high
+    environments:
+      go: sfb_test.go::TestSFBDataIntegrity
+      docker: TODO
+      vm: TODO
+
+  - id: sfb-multiple-small-files
+    name: SFB multiple small files
+    description: Multiple small files can share SFB containers efficiently
+    priority: high
+    environments:
+      go: sfb_test.go::TestSFBMultipleSmallFiles
+      docker: TODO
+      vm: TODO
+
+  - id: sfb-migration-at-64kb
+    name: SFB to extent migration
+    description: Files growing beyond 64KB migrate from SFB to full extent allocation
+    priority: high
+    environments:
+      go: sfb_test.go::TestSFBMigrationAt64KB
+      docker: TODO
+      vm: TODO
+
+  - id: sfb-persistence
+    name: SFB persistence
+    description: SFB-backed files survive unmount/remount cycles
+    priority: high
+    environments:
+      go: sfb_test.go::TestSFBPersistence
+      docker: TODO
+      vm: TODO
+
+  - id: sfb-overwrite
+    name: SFB overwrite
+    description: Overwriting SFB-backed files works correctly
+    priority: medium
+    environments:
+      go: sfb_test.go::TestSFBOverwrite
+      docker: TODO
+      vm: TODO

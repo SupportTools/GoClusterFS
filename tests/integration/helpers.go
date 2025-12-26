@@ -271,12 +271,11 @@ func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 
 // Unmount unmounts the filesystem using fusermount.
 func (m *MountedFS) Unmount() error {
-	// Cancel the context to signal the mount process
-	if m.cancel != nil {
-		m.cancel()
-	}
-
-	// Use fusermount to unmount
+	// Use fusermount to unmount FIRST.
+	// This triggers the go-fuse server to exit cleanly, allowing
+	// the mount command to run its shutdown code (journal checkpoint, etc.)
+	// Do NOT cancel the context first - that would SIGKILL the process
+	// and skip the clean shutdown path where journal checkpointing happens.
 	cmd := exec.Command("fusermount", "-u", m.MountPoint)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -284,9 +283,9 @@ func (m *MountedFS) Unmount() error {
 		m.t.Logf("fusermount output: %s", output)
 	}
 
-	// Wait for mount process to exit
+	// Wait for mount process to exit cleanly
 	if m.MountCmd != nil && m.MountCmd.Process != nil {
-		// Give it a moment to exit cleanly
+		// Give it time to run clean shutdown (journal checkpoint, etc.)
 		done := make(chan error, 1)
 		go func() {
 			done <- m.MountCmd.Wait()
@@ -294,9 +293,13 @@ func (m *MountedFS) Unmount() error {
 
 		select {
 		case <-done:
-			// Process exited
-		case <-time.After(5 * time.Second):
-			// Force kill if it doesn't exit
+			// Process exited cleanly
+		case <-time.After(10 * time.Second):
+			// Force kill only as last resort after generous timeout
+			m.t.Log("Warning: mount process did not exit in time, force killing")
+			if m.cancel != nil {
+				m.cancel()
+			}
 			m.MountCmd.Process.Kill()
 		}
 	}
@@ -462,4 +465,72 @@ func (m *MountedFS) Kill() error {
 		return fmt.Errorf("mount process not running")
 	}
 	return m.MountCmd.Process.Kill()
+}
+
+// OpenFile opens a file in the mounted filesystem for read/write operations.
+func (m *MountedFS) OpenFile(name string) (*os.File, error) {
+	return os.OpenFile(m.Path(name), os.O_RDWR, 0644)
+}
+
+// FormatAndMountWithSFB formats and mounts with SFB (Sub-File Block) containers enabled.
+// SFB provides efficient storage for small files by packing them into shared 1MB blocks.
+func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
+	args := []string{
+		"-device", m.ImagePath,
+		"-mount", m.MountPoint,
+		"-format",
+		"-sfb=true",
+	}
+	if debug {
+		args = append(args, "-debug")
+	}
+
+	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
+	m.MountCmd.Stdout = os.Stdout
+	m.MountCmd.Stderr = os.Stderr
+
+	if err := m.MountCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start mount command: %v", err)
+	}
+
+	// Wait for mount to become accessible
+	if err := m.WaitForMount(10 * time.Second); err != nil {
+		m.Unmount() // Try to clean up
+		return err
+	}
+
+	m.t.Logf("Formatted and mounted at %s with SFB enabled", m.MountPoint)
+	return nil
+}
+
+// MountWithSFB mounts the filesystem with SFB enabled (no format).
+func (m *MountedFS) MountWithSFB(debug bool) error {
+	args := []string{
+		"-device", m.ImagePath,
+		"-mount", m.MountPoint,
+		"-sfb=true",
+	}
+	if debug {
+		args = append(args, "-debug")
+	}
+
+	// Create a fresh context for this mount operation
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+
+	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
+	m.MountCmd.Stdout = os.Stdout
+	m.MountCmd.Stderr = os.Stderr
+
+	if err := m.MountCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start mount command: %v", err)
+	}
+
+	// Wait for mount to become accessible
+	if err := m.WaitForMount(10 * time.Second); err != nil {
+		m.Unmount() // Try to clean up
+		return err
+	}
+
+	m.t.Logf("Mounted at %s with SFB enabled", m.MountPoint)
+	return nil
 }
