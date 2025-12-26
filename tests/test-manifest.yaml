@@ -734,3 +734,100 @@ scenarios:
       go: sfb_test.go::TestSFBOverwrite
       docker: TODO
       vm: TODO
+
+  # ===========================================================================
+  # CACHE BROADCAST TESTS (Phase 4: Cache Coherency)
+  # ===========================================================================
+  # Network broadcast provides near-instant (<100ms) cross-node cache
+  # invalidation using UDP multicast with unicast fallback.
+
+  - id: broadcast-protocol
+    name: Broadcast protocol serialization
+    description: Message serialization/deserialization and HMAC authentication
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/protocol_test.go::TestMessageSerialization
+
+  - id: broadcast-hmac
+    name: Broadcast HMAC authentication
+    description: HMAC signing and verification for broadcast messages
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/protocol_test.go::TestMessageHMAC
+
+  - id: broadcast-deduplication
+    name: Broadcast message deduplication
+    description: Duplicate messages are detected and dropped
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterDuplication
+
+  - id: broadcast-handle-inode
+    name: Broadcast handle inode invalidation
+    description: Inode invalidation messages trigger handler callback
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterHandleInvalidateInode
+
+  - id: broadcast-handle-extent
+    name: Broadcast handle extent invalidation
+    description: Extent invalidation messages trigger handler callback
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterHandleInvalidateExtent
+
+  - id: broadcast-handle-all
+    name: Broadcast handle invalidate all
+    description: InvalidateAll messages clear the cache
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterHandleInvalidateAll
+
+  - id: broadcast-ignore-own
+    name: Broadcast ignores own messages
+    description: Broadcaster ignores messages from itself
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterIgnoresOwnMessages
+
+  - id: broadcast-duplicate-drop
+    name: Broadcast duplicate message drop
+    description: Duplicate messages are detected and dropped with stats tracking
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterDuplicateMessages
+
+  - id: broadcast-disabled
+    name: Broadcast disabled mode
+    description: Broadcaster operates correctly when disabled
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterDisabled
+
+  - id: broadcast-concurrent-dedup
+    name: Broadcast concurrent deduplication
+    description: Deduplication is thread-safe under concurrent access
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestConcurrentDeduplication
+
+  - id: broadcast-transport-disabled
+    name: Broadcast transport disabled mode
+    description: Transport handles disabled state gracefully
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestTransportDisabled
+
+  - id: broadcast-peer-management
+    name: Broadcast peer management
+    description: Transport can add and remove peers for unicast fallback
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestTransportPeerManagement
+
+  - id: broadcast-config-defaults
+    name: Broadcast config defaults
+    description: Default configuration values are correct
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestConfigDefaults
