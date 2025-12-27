@@ -82,11 +82,11 @@ type FS struct {
 	inodeTbl    *inode.Table
 	extentMgr   *extent.Manager
 	dirMgr      *dir.Manager
-	cacheMgr    *cache.Manager   // Inode cache for read optimization
-	journal     *journal.Journal // Per-node journal for crash consistency (WAL)
-	trimMgr     *trim.Manager    // TRIM manager for batched block discards
-	sfbMgr      *sfb.Manager     // SFB manager for small file storage (optional)
-	refcountReg *refcount.Region // Reference count table for CoW/snapshots (optional)
+	cacheMgr    *cache.Manager     // Inode cache for read optimization
+	journal     *journal.Journal   // Per-node journal for crash consistency (WAL)
+	trimMgr     *trim.Manager      // TRIM manager for batched block discards
+	sfbMgr      *sfb.Manager       // SFB manager for small file storage (optional)
+	refcountReg *refcount.Region   // Reference count table for CoW/snapshots (optional)
 	snapshotReg *snapshot.Registry // Snapshot registry for managing snapshot descriptors
 	snapshotWkr *snapshot.Worker   // Background worker for async refcount updates
 

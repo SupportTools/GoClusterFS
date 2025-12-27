@@ -52,12 +52,12 @@ type JobResult struct {
 
 // Worker processes background refcount jobs for snapshots.
 type Worker struct {
-	mu          sync.RWMutex
-	registry    *Registry
-	refRegion   *refcount.Region
-	extentMgr   *extent.Manager
-	inodeTable  *inode.Table
-	bitmapMgr   *bitmap.Region // For freeing blocks when refcount reaches 0
+	mu         sync.RWMutex
+	registry   *Registry
+	refRegion  *refcount.Region
+	extentMgr  *extent.Manager
+	inodeTable *inode.Table
+	bitmapMgr  *bitmap.Region // For freeing blocks when refcount reaches 0
 
 	jobQueue    chan *Job
 	resultChan  chan *JobResult
