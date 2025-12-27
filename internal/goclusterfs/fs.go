@@ -30,6 +30,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
+	"github.com/supporttools/GoClusterFS/internal/snapshot"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
@@ -86,6 +87,8 @@ type FS struct {
 	trimMgr     *trim.Manager    // TRIM manager for batched block discards
 	sfbMgr      *sfb.Manager     // SFB manager for small file storage (optional)
 	refcountReg *refcount.Region // Reference count table for CoW/snapshots (optional)
+	snapshotReg *snapshot.Registry // Snapshot registry for managing snapshot descriptors
+	snapshotWkr *snapshot.Worker   // Background worker for async refcount updates
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -201,9 +204,51 @@ func NewWithComponents(
 	}
 }
 
+// InitSnapshots initializes the snapshot subsystem.
+// Call this after NewWithComponents to enable snapshot functionality.
+// Parameters:
+//   - snapshotOffset: byte offset where snapshot region starts on device
+//   - snapshotSize: size of snapshot region in bytes
+//
+// This must be called before any snapshot operations can succeed.
+func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uint64) error {
+	if f.refcountReg == nil {
+		return fmt.Errorf("refcount region must be initialized before snapshots")
+	}
+
+	// Create snapshot registry
+	f.snapshotReg = snapshot.NewRegistry(f.dev, snapshotOffset, snapshotSize, f.lockMgr)
+
+	// Scan registry to rebuild state
+	stats, err := f.snapshotReg.Scan(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to scan snapshot registry: %w", err)
+	}
+	log.Printf("[snapshot] Registry scan: %d active, %d creating, %d deleting",
+		stats.ActiveCount, stats.CreatingCount, stats.DeletingCount)
+
+	// Create and start background worker
+	cfg := snapshot.DefaultWorkerConfig()
+	f.snapshotWkr = snapshot.NewWorker(f.snapshotReg, f.refcountReg, f.extentMgr, f.inodeTbl, cfg)
+	f.snapshotWkr.Start()
+
+	// Recover any incomplete jobs from crash
+	if err := f.snapshotWkr.RecoverIncompleteJobs(ctx); err != nil {
+		log.Printf("[snapshot] Warning: failed to recover incomplete jobs: %v", err)
+		// Continue anyway - snapshots may be in inconsistent state but won't crash
+	}
+
+	return nil
+}
+
 // Close closes the filesystem and releases resources.
 func (f *FS) Close() error {
-	// Stop TRIM manager first to flush pending discards
+	// Stop snapshot worker first to complete pending jobs
+	if f.snapshotWkr != nil {
+		f.snapshotWkr.Stop()
+	}
+
+	// Stop TRIM manager to flush pending discards
 	if f.trimMgr != nil {
 		if err := f.trimMgr.Stop(); err != nil {
 			log.Printf("Warning: failed to stop TRIM manager cleanly: %v", err)
@@ -1596,14 +1641,16 @@ type File struct {
 
 // Verify interface compliance at compile time
 var (
-	_ fs.InodeEmbedder = (*File)(nil)
-	_ fs.NodeOpener    = (*File)(nil)
-	_ fs.NodeGetattrer = (*File)(nil)
-	_ fs.NodeSetattrer = (*File)(nil)
-	_ fs.NodeReader    = (*File)(nil)
-	_ fs.NodeWriter    = (*File)(nil)
-	_ fs.NodeFsyncer   = (*File)(nil)
-	_ fs.NodeAllocater = (*File)(nil)
+	_ fs.InodeEmbedder  = (*File)(nil)
+	_ fs.NodeOpener     = (*File)(nil)
+	_ fs.NodeGetattrer  = (*File)(nil)
+	_ fs.NodeSetattrer  = (*File)(nil)
+	_ fs.NodeReader     = (*File)(nil)
+	_ fs.NodeWriter     = (*File)(nil)
+	_ fs.NodeFsyncer    = (*File)(nil)
+	_ fs.NodeAllocater  = (*File)(nil)
+	_ fs.NodeSetxattrer = (*File)(nil)
+	_ fs.NodeGetxattrer = (*File)(nil)
 )
 
 // Open opens the file for reading/writing.
@@ -2730,6 +2777,154 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		f.inodeNum, ino.AllocatedBlocks, ino.WrittenBlocks, ino.Size)
 
 	return 0
+}
+
+// Setxattr sets an extended attribute on the file.
+// Used for snapshot creation via user.snapshot attribute.
+func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	log.Printf("[DEBUG] File.Setxattr: inode=%d attr=%s", f.inodeNum, attr)
+
+	switch attr {
+	case "user.snapshot":
+		return f.createSnapshot(ctx, string(data))
+	case "user.snapshot.delete":
+		return f.deleteSnapshot(ctx, string(data))
+	default:
+		return syscall.ENODATA
+	}
+}
+
+// Getxattr gets an extended attribute from the file.
+func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	log.Printf("[DEBUG] File.Getxattr: inode=%d attr=%s", f.inodeNum, attr)
+
+	switch attr {
+	case "user.snapshots":
+		return f.listSnapshots(ctx, dest)
+	default:
+		return 0, syscall.ENODATA
+	}
+}
+
+// createSnapshot creates a new snapshot of this file.
+func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
+	if f.fs.snapshotReg == nil || f.fs.snapshotWkr == nil {
+		log.Printf("[DEBUG] createSnapshot: snapshot subsystem not initialized")
+		return syscall.ENOTSUP
+	}
+
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		return syscall.EIO
+	}
+
+	// Mark all extents as shared BEFORE creating snapshot (CoW active immediately)
+	f.fs.extentMgr.MarkAllShared(ino)
+	ino.Flags |= inode.FlagHasSnapshot
+	ino.MetaGeneration++
+
+	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+		return syscall.EIO
+	}
+
+	blockNums := collectBlockNumbers(ino)
+
+	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
+		ino.ExtentTreeRoot, uint64(len(blockNums)), ino.Size, snapshot.FlagReadOnly)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrSnapshotExists) {
+			return syscall.EEXIST
+		}
+		if errors.Is(err, snapshot.ErrNameTooLong) {
+			return syscall.ENAMETOOLONG
+		}
+		return syscall.EIO
+	}
+
+	// Queue background refcount increment (returns immediately)
+	if _, err := f.fs.snapshotWkr.QueueCreateJob(ctx, desc.SnapshotID, f.inodeNum, blockNums); err != nil {
+		log.Printf("[snapshot] Warning: queue job failed: %v", err)
+	}
+
+	log.Printf("[snapshot] Created '%s' (ID=%d) for inode %d", name, desc.SnapshotID, f.inodeNum)
+	return 0
+}
+
+// deleteSnapshot deletes a snapshot by name.
+func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
+	if f.fs.snapshotReg == nil || f.fs.snapshotWkr == nil {
+		return syscall.ENOTSUP
+	}
+
+	desc, err := f.fs.snapshotReg.GetByName(ctx, name)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrSnapshotNotFound) {
+			return syscall.ENOENT
+		}
+		return syscall.EIO
+	}
+
+	if desc.TargetInode != f.inodeNum {
+		return syscall.EINVAL
+	}
+
+	if err := f.fs.snapshotReg.Delete(ctx, desc.SnapshotID); err != nil {
+		return syscall.EIO
+	}
+
+	ino, _ := f.fs.inodeTbl.Read(f.inodeNum)
+	blockNums := collectBlockNumbers(ino)
+
+	if _, err := f.fs.snapshotWkr.QueueDeleteJob(ctx, desc.SnapshotID, blockNums); err != nil {
+		log.Printf("[snapshot] Warning: queue delete job failed: %v", err)
+	}
+
+	log.Printf("[snapshot] Deleting '%s' (ID=%d)", name, desc.SnapshotID)
+	return 0
+}
+
+// listSnapshots returns snapshot names for this file.
+func (f *File) listSnapshots(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	if f.fs.snapshotReg == nil {
+		return 0, syscall.ENOTSUP
+	}
+
+	snapshots, err := f.fs.snapshotReg.ListForInode(ctx, f.inodeNum)
+	if err != nil {
+		return 0, syscall.EIO
+	}
+
+	var result string
+	for i, snap := range snapshots {
+		if i > 0 {
+			result += "\n"
+		}
+		result += fmt.Sprintf("%s:%s", snap.GetName(), snap.State.String())
+	}
+
+	if len(dest) == 0 {
+		return uint32(len(result)), 0
+	}
+
+	n := copy(dest, result)
+	return uint32(n), 0
+}
+
+// collectBlockNumbers extracts physical block numbers from an inode.
+func collectBlockNumbers(ino *inode.Inode) []uint64 {
+	if ino == nil {
+		return nil
+	}
+	var blocks []uint64
+	for i := 0; i < inode.MaxInlineExtents; i++ {
+		ext := &ino.InlineExtents[i]
+		if ext.Length > 0 {
+			for j := uint64(0); j < ext.Length; j++ {
+				blocks = append(blocks, ext.PhysicalBlock+j)
+			}
+		}
+	}
+	return blocks
 }
 
 // errToErrno converts an error to syscall.Errno.

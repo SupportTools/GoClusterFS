@@ -388,6 +388,63 @@ func (r *Registry) ListForInode(ctx context.Context, inodeNum uint32) ([]*Descri
 	return snapshots, nil
 }
 
+// GetChildren returns all snapshots whose ParentID matches the given snapshot ID.
+// Used for merge-up during middle snapshot deletion.
+func (r *Registry) GetChildren(ctx context.Context, snapshotID uint64) ([]*Descriptor, error) {
+	if snapshotID == InvalidSnapshotID {
+		return nil, ErrInvalidID
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var children []*Descriptor
+	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
+		desc, err := r.readDescriptor(slot)
+		if err != nil {
+			continue
+		}
+		if desc.IsValid() && desc.ParentID == snapshotID {
+			children = append(children, desc)
+		}
+	}
+
+	return children, nil
+}
+
+// UpdateParentID updates the parent ID of a snapshot.
+// Used during merge-up when deleting a middle snapshot - children are re-parented
+// to their grandparent (the deleted snapshot's parent).
+func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID uint64) error {
+	if snapshotID == InvalidSnapshotID {
+		return ErrInvalidID
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Acquire distributed lock if available
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
+			return fmt.Errorf("failed to acquire snapshot lock: %w", err)
+		}
+		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+	}
+
+	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
+		desc, err := r.readDescriptor(slot)
+		if err != nil {
+			continue
+		}
+		if desc.IsValid() && desc.SnapshotID == snapshotID {
+			desc.ParentID = newParentID
+			return r.writeDescriptor(slot, desc)
+		}
+	}
+
+	return ErrSnapshotNotFound
+}
+
 // UpdateState updates the state of a snapshot.
 func (r *Registry) UpdateState(ctx context.Context, snapshotID uint64, newState State) error {
 	if snapshotID == InvalidSnapshotID {

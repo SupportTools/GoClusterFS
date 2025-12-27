@@ -871,3 +871,157 @@ scenarios:
       go: broadcast_test.go::TestBroadcastBidirectional
       docker: run-tests.sh::test_broadcast_bidirectional
       vm: run-vm-tests.sh::test_broadcast_bidirectional
+
+  # ===========================================================================
+  # SNAPSHOT TESTS (Phase 7: Snapshots)
+  # ===========================================================================
+  # O(1) snapshot creation with background refcount updates.
+  # Snapshots are created via xattr interface: setfattr -n user.snapshot -v "name"
+
+  - id: snapshot-creation
+    name: Snapshot creation via xattr
+    description: Create snapshot using extended attributes, verify O(1) performance
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotCreation
+      docker: TODO - Requires xattr support in test harness
+      vm: TODO - Requires xattr support in test harness
+
+  - id: snapshot-cow
+    name: Snapshot Copy-on-Write
+    description: Writing to snapshotted file allocates new blocks via CoW
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotCoW
+      docker: TODO
+      vm: TODO
+
+  - id: snapshot-data-integrity
+    name: Snapshot data integrity
+    description: Both snapshot and live file retain correct data after modification
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotDataIntegrity
+      docker: TODO
+      vm: TODO
+
+  - id: snapshot-delete
+    name: Snapshot deletion
+    description: Delete snapshot via removexattr, verify background cleanup
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotDelete
+      docker: TODO
+      vm: TODO
+
+  - id: snapshot-persistence
+    name: Snapshot persistence
+    description: Snapshots survive unmount/remount cycles
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotPersistence
+      docker: TODO
+      vm: TODO
+
+  - id: snapshot-multiple
+    name: Multiple snapshots
+    description: Multiple snapshots of same file coexist correctly
+    priority: medium
+    environments:
+      go: snapshot_test.go::TestSnapshotMultiple
+      docker: TODO
+      vm: TODO
+
+  - id: snapshot-large-file
+    name: Large file snapshot
+    description: Snapshotting multi-block file is still O(1)
+    priority: medium
+    environments:
+      go: snapshot_test.go::TestSnapshotLargeFile
+      docker: TODO
+      vm: TODO
+
+  - id: snapshot-invalid-file
+    name: Invalid snapshot targets
+    description: Snapshot operations on non-existent files fail correctly
+    priority: medium
+    environments:
+      go: snapshot_test.go::TestSnapshotInvalidFile
+      docker: TODO
+      vm: TODO
+
+  # Snapshot unit tests (go_only)
+  - id: snapshot-worker-start-stop
+    name: Snapshot worker lifecycle
+    description: Worker starts and stops correctly
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestWorkerStartStop
+
+  - id: snapshot-worker-create-job
+    name: Snapshot create job processing
+    description: Background worker processes refcount increment jobs
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestWorkerQueueCreateJob
+
+  - id: snapshot-worker-delete-job
+    name: Snapshot delete job processing
+    description: Background worker processes refcount decrement jobs
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestWorkerQueueDeleteJob
+
+  # Task #4712: Snapshot deletion (leaf + merge-up)
+  - id: snapshot-leaf-deletion
+    name: Leaf snapshot deletion
+    description: Delete leaf snapshot, decrement refcounts, free blocks where refcount=0
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestLeafSnapshotDeletion
+
+  - id: snapshot-middle-deletion-mergeup
+    name: Middle snapshot merge-up
+    description: Delete middle snapshot, re-parent children to grandparent
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestMiddleSnapshotDeletionMergeUp
+
+  - id: snapshot-get-children
+    name: Registry GetChildren
+    description: Find all snapshots with a given parent ID
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestGetChildren
+
+  - id: snapshot-update-parent-id
+    name: Registry UpdateParentID
+    description: Update parent ID for merge-up operations
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestUpdateParentID
+
+  - id: snapshot-multiple-children-mergeup
+    name: Multiple children merge-up
+    description: Re-parent multiple children during middle snapshot deletion
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestMultipleChildrenMergeUp
+
+  - id: snapshot-middle-deletion-integration
+    name: Middle snapshot deletion (integration)
+    description: End-to-end test deleting middle snapshot via xattr
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotMiddleDeletion
+      docker: TODO  # Requires snapshot xattr support
+      vm: TODO      # Requires snapshot xattr support
+
+  - id: snapshot-delete-and-reuse
+    name: Snapshot delete and block reuse
+    description: After snapshot deletion, blocks are freed and can be reused
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotDeleteAndReuse
+      docker: TODO  # Requires CoW and block tracking
+      vm: TODO      # Requires CoW and block tracking
