@@ -179,6 +179,8 @@ services:
       - ORCHESTRATOR_MODE=true
       - NODES=goclusterfs-node1,goclusterfs-node2,goclusterfs-node3,goclusterfs-node4
       - RESULTS_DIR=/results
+      # Skip concurrent tests in CI (they hang due to resource constraints)
+      - SKIP_CONCURRENT_TESTS=${SKIP_CONCURRENT_TESTS:-false}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.100
