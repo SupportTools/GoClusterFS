@@ -38,13 +38,14 @@ jobs:
           docker compose -f tests/docker/docker-compose.test.yml run --rm storage-init
 
       - name: Run multi-node tests
-        env:
-          SKIP_CONCURRENT_TESTS: "true"
         run: |
-          # Start the test cluster detached (no --exit-code-from as it implies --abort-on-container-exit)
-          # The test intentionally kills containers to test recovery, so we can't abort on exit
           # Skip concurrent tests in CI - they hang due to resource constraints (see Task #5176)
           # These tests pass locally and are covered by VM tests
+          # Export ensures docker-compose can interpolate the variable
+          export SKIP_CONCURRENT_TESTS="true"
+
+          # Start the test cluster detached (no --exit-code-from as it implies --abort-on-container-exit)
+          # The test intentionally kills containers to test recovery, so we can't abort on exit
           docker compose -f tests/docker/docker-compose.test.yml up -d \
             node1 node2 node3 node4 orchestrator
 
