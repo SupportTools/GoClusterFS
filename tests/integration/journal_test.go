@@ -260,6 +260,9 @@ func TestJournalCrashRecoveryMultipleOps(t *testing.T) {
 // TestJournalCrashDuringWrite tests crash during an active write operation.
 // Task #4819 implemented: See TestJournalCrashRecoveryFile comment.
 func TestJournalCrashDuringWrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping crash test in short mode - requires slow FUSE remount")
+	}
 
 	mfs := NewMountedFS(t, 30)
 
