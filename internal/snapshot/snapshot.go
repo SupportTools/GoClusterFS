@@ -144,21 +144,21 @@ var (
 //	76      48    Name (null-terminated UTF-8 string)
 //	124     4     Checksum (CRC32C of bytes 0-123)
 type Descriptor struct {
-	Magic          uint32              // 0x534E4150 "SNAP"
-	SnapshotID     uint64              // Unique snapshot identifier
-	ParentID       uint64              // Parent snapshot (0 for root)
-	TargetInode    uint32              // Inode number of snapshotted file
-	State          State               // Current state
-	Flags          Flags               // Snapshot flags
-	Reserved1      uint16              // Alignment padding
-	ExtentTreeRoot uint64              // Extent tree root block
-	TotalBlocks    uint64              // Number of blocks at snapshot time
-	TotalSize      uint64              // File size at snapshot time
-	CreateTime     int64               // Creation timestamp
-	DeleteTime     int64               // Deletion timestamp (0 if active)
-	RefCountJobID  uint64              // Background refcount job ID
+	Magic          uint32                   // 0x534E4150 "SNAP"
+	SnapshotID     uint64                   // Unique snapshot identifier
+	ParentID       uint64                   // Parent snapshot (0 for root)
+	TargetInode    uint32                   // Inode number of snapshotted file
+	State          State                    // Current state
+	Flags          Flags                    // Snapshot flags
+	Reserved1      uint16                   // Alignment padding
+	ExtentTreeRoot uint64                   // Extent tree root block
+	TotalBlocks    uint64                   // Number of blocks at snapshot time
+	TotalSize      uint64                   // File size at snapshot time
+	CreateTime     int64                    // Creation timestamp
+	DeleteTime     int64                    // Deletion timestamp (0 if active)
+	RefCountJobID  uint64                   // Background refcount job ID
 	Name           [MaxSnapshotNameLen]byte // Snapshot name
-	Checksum       uint32              // CRC32C checksum
+	Checksum       uint32                   // CRC32C checksum
 }
 
 // IsValid returns true if this is a valid snapshot descriptor.

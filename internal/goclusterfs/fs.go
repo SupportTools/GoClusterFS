@@ -76,16 +76,16 @@ type FS struct {
 	sb  *superblock.Superblock
 
 	// Managers
-	lockMgr      *lock.Manager
-	bitmapMgr    *bitmap.Region
-	inodeTbl     *inode.Table
-	extentMgr    *extent.Manager
-	dirMgr       *dir.Manager
-	cacheMgr     *cache.Manager     // Inode cache for read optimization
-	journal      *journal.Journal   // Per-node journal for crash consistency (WAL)
-	trimMgr      *trim.Manager      // TRIM manager for batched block discards
-	sfbMgr       *sfb.Manager       // SFB manager for small file storage (optional)
-	refcountReg  *refcount.Region   // Reference count table for CoW/snapshots (optional)
+	lockMgr     *lock.Manager
+	bitmapMgr   *bitmap.Region
+	inodeTbl    *inode.Table
+	extentMgr   *extent.Manager
+	dirMgr      *dir.Manager
+	cacheMgr    *cache.Manager   // Inode cache for read optimization
+	journal     *journal.Journal // Per-node journal for crash consistency (WAL)
+	trimMgr     *trim.Manager    // TRIM manager for batched block discards
+	sfbMgr      *sfb.Manager     // SFB manager for small file storage (optional)
+	refcountReg *refcount.Region // Reference count table for CoW/snapshots (optional)
 
 	// Configuration
 	nodeUUID   [16]byte

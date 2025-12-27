@@ -1247,8 +1247,8 @@ func createTestSetupWithRefcount(tb testing.TB) (*Manager, *refcount.Region, *in
 	var uuid [16]byte
 	// Layout: 0-1MB bitmap, 1-2MB refcount, 2MB+ data blocks
 	bitmapOffset := uint64(0)
-	refcountOffset := uint64(1 << 20)  // 1MB
-	refcountSize := uint64(1 << 20)    // 1MB for refcounts
+	refcountOffset := uint64(1 << 20) // 1MB
+	refcountSize := uint64(1 << 20)   // 1MB for refcounts
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, 1000, nil, uuid) // 1000 blocks
 	refcountReg := refcount.NewRegion(dev, refcountOffset, refcountSize, nil)

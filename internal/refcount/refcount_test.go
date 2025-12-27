@@ -754,10 +754,10 @@ func TestMultipleSectors(t *testing.T) {
 		refcount uint32
 		flags    EntryFlags
 	}{
-		{0, 1, FlagNone},                                   // First sector
-		{EntriesPerSector - 1, 2, FlagSnapshot},            // End of first sector
-		{EntriesPerSector, 3, FlagCowPending},              // Start of second sector
-		{EntriesPerSector * 2, 4, FlagMetadata},            // Start of third sector
+		{0, 1, FlagNone},                                        // First sector
+		{EntriesPerSector - 1, 2, FlagSnapshot},                 // End of first sector
+		{EntriesPerSector, 3, FlagCowPending},                   // Start of second sector
+		{EntriesPerSector * 2, 4, FlagMetadata},                 // Start of third sector
 		{EntriesPerSector*3 + 50, 5, FlagSnapshot | FlagPinned}, // Fourth sector
 	}
 
@@ -820,11 +820,11 @@ func TestBatchAcrossSectors(t *testing.T) {
 
 	// Batch increment blocks from different sectors
 	blockNums := []uint64{
-		0,                       // Sector 0
-		EntriesPerSector,        // Sector 1
-		EntriesPerSector * 2,    // Sector 2
-		EntriesPerSector/2,      // Middle of sector 0
-		EntriesPerSector + 100,  // Middle of sector 1
+		0,                      // Sector 0
+		EntriesPerSector,       // Sector 1
+		EntriesPerSector * 2,   // Sector 2
+		EntriesPerSector / 2,   // Middle of sector 0
+		EntriesPerSector + 100, // Middle of sector 1
 	}
 
 	counts, err := region.IncrementBatch(ctx, blockNums)
