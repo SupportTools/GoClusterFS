@@ -2782,15 +2782,17 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 }
 
 // Setxattr sets an extended attribute on the file.
-// Used for snapshot creation via user.snapshot attribute.
+// Used for snapshot creation via user.snapshot attribute and clone creation via user.clone.
 func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
-	log.Printf("[DEBUG] File.Setxattr: inode=%d attr=%s", f.inodeNum, attr)
-
 	switch attr {
 	case "user.snapshot":
 		return f.createSnapshot(ctx, string(data))
 	case "user.snapshot.delete":
 		return f.deleteSnapshot(ctx, string(data))
+	case "user.clone":
+		return f.createClone(ctx, string(data))
+	case "user.snapshot.clone":
+		return f.createCloneFromSnapshot(ctx, string(data))
 	default:
 		return syscall.ENODATA
 	}
@@ -2903,6 +2905,146 @@ func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
 	return 0
 }
 
+// createClone creates a writable clone of this file at the specified destination path.
+// The clone shares physical blocks with the source until either is modified, at which
+// point Copy-on-Write allocates new blocks for the modified data.
+func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
+	log.Printf("[clone] Creating clone of inode %d at %s", f.inodeNum, destPath)
+
+	// Parse destination path
+	parentPath, cloneName, err := parseClonePath(destPath)
+	if err != nil {
+		log.Printf("[clone] Invalid path %s: %v", destPath, err)
+		return syscall.EINVAL
+	}
+
+	// Phase 1: Only support clones in root directory
+	if parentPath != "/" {
+		log.Printf("[clone] Subdirectory clones not yet supported: %s", parentPath)
+		return syscall.ENOTSUP
+	}
+
+	// Read source inode
+	srcIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		log.Printf("[clone] Failed to read source inode: %v", err)
+		return syscall.EIO
+	}
+
+	// Get root directory inode
+	rootIno, err := f.fs.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		log.Printf("[clone] Failed to read root inode: %v", err)
+		return syscall.EIO
+	}
+
+	// Check if destination already exists
+	if _, _, err := f.fs.dirMgr.Lookup(ctx, rootIno, cloneName); err == nil {
+		log.Printf("[clone] Destination already exists: %s", cloneName)
+		return syscall.EEXIST
+	}
+
+	// Mark source extents as shared (enables CoW on source)
+	f.fs.extentMgr.MarkAllShared(srcIno)
+	srcIno.Flags |= inode.FlagHasSnapshot
+	srcIno.MetaGeneration++
+	if err := f.fs.inodeTbl.Write(ctx, srcIno); err != nil {
+		log.Printf("[clone] Failed to update source inode: %v", err)
+		return syscall.EIO
+	}
+
+	// Find free inode slot for clone (two-phase allocation)
+	cloneInodeNum, err := f.fs.inodeTbl.FindFreeSlot()
+	if err != nil {
+		log.Printf("[clone] No free inode slots: %v", err)
+		return syscall.ENOSPC
+	}
+
+	// Add directory entry for clone
+	if err := f.fs.dirMgr.Add(ctx, rootIno, cloneName, uint64(cloneInodeNum), dir.DT_REG); err != nil {
+		log.Printf("[clone] Failed to add directory entry: %v", err)
+		return syscall.EIO
+	}
+
+	// Claim the inode slot
+	cloneIno, err := f.fs.inodeTbl.ClaimSlot(ctx, cloneInodeNum)
+	if err != nil {
+		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
+		if err == inode.ErrInodeInUse {
+			log.Printf("[clone] Inode slot collision, retry needed")
+			return syscall.EAGAIN
+		}
+		log.Printf("[clone] Failed to claim inode slot: %v", err)
+		return syscall.ENOSPC
+	}
+
+	// Copy extents with FlagShared set
+	f.fs.extentMgr.CopyExtentsForClone(srcIno, cloneIno)
+
+	// Copy attributes from source
+	now := time.Now().UnixNano()
+	cloneIno.Mode = srcIno.Mode
+	cloneIno.UID = srcIno.UID
+	cloneIno.GID = srcIno.GID
+	cloneIno.Size = srcIno.Size
+	cloneIno.LinkCount = 1
+	cloneIno.Flags = inode.FlagHasSnapshot
+	cloneIno.Atime = now
+	cloneIno.Mtime = now
+	cloneIno.Ctime = now
+
+	// Write clone inode
+	if err := f.fs.inodeTbl.Write(ctx, cloneIno); err != nil {
+		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
+		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
+		log.Printf("[clone] Failed to write clone inode: %v", err)
+		return syscall.EIO
+	}
+
+	// Queue background refcount increment for shared blocks
+	blockNums := collectBlockNumbers(srcIno)
+	if len(blockNums) > 0 && f.fs.snapshotWkr != nil {
+		if _, err := f.fs.snapshotWkr.QueueCreateJob(ctx, 0, f.inodeNum, blockNums); err != nil {
+			log.Printf("[clone] Warning: queue refcount job failed: %v", err)
+		}
+	}
+
+	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, f.inodeNum)
+	return 0
+}
+
+// createCloneFromSnapshot creates a writable clone from a named snapshot.
+// Format: "snapshot_name:/path/to/clone"
+func (f *File) createCloneFromSnapshot(ctx context.Context, data string) syscall.Errno {
+	parts := strings.SplitN(data, ":", 2)
+	if len(parts) != 2 {
+		log.Printf("[clone] Invalid snapshot clone format: %s", data)
+		return syscall.EINVAL
+	}
+	snapName, destPath := parts[0], parts[1]
+
+	log.Printf("[clone] Creating clone from snapshot '%s' at %s", snapName, destPath)
+
+	if f.fs.snapshotReg == nil {
+		return syscall.ENOTSUP
+	}
+
+	desc, err := f.fs.snapshotReg.GetByName(ctx, snapName)
+	if err != nil {
+		if errors.Is(err, snapshot.ErrSnapshotNotFound) {
+			return syscall.ENOENT
+		}
+		return syscall.EIO
+	}
+
+	if desc.TargetInode != f.inodeNum {
+		log.Printf("[clone] Snapshot '%s' belongs to inode %d, not %d", snapName, desc.TargetInode, f.inodeNum)
+		return syscall.EINVAL
+	}
+
+	return f.createClone(ctx, destPath)
+}
+
 // listSnapshots returns snapshot names for this file.
 func (f *File) listSnapshots(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
 	if f.fs.snapshotReg == nil {
@@ -2945,6 +3087,23 @@ func collectBlockNumbers(ino *inode.Inode) []uint64 {
 		}
 	}
 	return blocks
+}
+
+// parseClonePath splits an absolute path into parent directory path and filename.
+// Returns (parentPath, filename, error). For paths in root directory, parentPath is "/".
+func parseClonePath(path string) (string, string, error) {
+	if !strings.HasPrefix(path, "/") {
+		return "", "", fmt.Errorf("path must be absolute")
+	}
+	path = strings.TrimPrefix(path, "/")
+	if path == "" {
+		return "", "", fmt.Errorf("path cannot be empty")
+	}
+	lastSlash := strings.LastIndex(path, "/")
+	if lastSlash == -1 {
+		return "/", path, nil // File in root directory
+	}
+	return "/" + path[:lastSlash], path[lastSlash+1:], nil
 }
 
 // errToErrno converts an error to syscall.Errno.

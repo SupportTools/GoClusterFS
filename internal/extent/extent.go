@@ -393,8 +393,23 @@ func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64
 				continue
 			}
 
-			log.Printf("[DEBUG] extent.Truncate: freeing extent[%d] physBlock=%d len=%d", i, ext.PhysicalBlock, ext.Length)
-			// Free all blocks
+			log.Printf("[DEBUG] extent.Truncate: freeing extent[%d] physBlock=%d len=%d flags=%d", i, ext.PhysicalBlock, ext.Length, ext.Flags)
+
+			// For shared extents (from clones/snapshots), don't free the block.
+			// The refcount system ensures the block is kept until all references are gone.
+			if ext.Flags&FlagShared != 0 {
+				log.Printf("[DEBUG] extent.Truncate: skipping shared extent (refcount will manage)")
+				// Just update accounting and clear the extent
+				ino.AllocatedBlocks -= ext.Length
+				if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
+					ino.WrittenBlocks -= ext.Length
+				}
+				*ext = inode.InlineExtent{} // Clear
+				ino.ExtentCount--
+				continue
+			}
+
+			// Free all blocks (not shared)
 			for j := uint64(0); j < ext.Length; j++ {
 				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+j); err != nil {
 					log.Printf("[DEBUG] extent.Truncate: bitmap.Free(%d) failed: %v", ext.PhysicalBlock+j, err)
@@ -792,4 +807,19 @@ func (m *Manager) MarkAllShared(ino *inode.Inode) {
 			ino.InlineExtents[i].Flags |= FlagShared
 		}
 	}
+}
+
+// CopyExtentsForClone copies all extents from src to dst with FlagShared set.
+// Used when creating writable clones - the clone shares blocks with the source
+// until either is modified, at which point CoW allocates new blocks.
+func (m *Manager) CopyExtentsForClone(src *inode.Inode, dst *inode.Inode) {
+	for i := range src.InlineExtents {
+		if src.InlineExtents[i].Length > 0 {
+			dst.InlineExtents[i] = src.InlineExtents[i]
+			dst.InlineExtents[i].Flags |= FlagShared
+		}
+	}
+	dst.ExtentCount = src.ExtentCount
+	dst.AllocatedBlocks = src.AllocatedBlocks
+	dst.WrittenBlocks = src.WrittenBlocks
 }

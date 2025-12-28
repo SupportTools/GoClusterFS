@@ -585,3 +585,293 @@ func TestSnapshotDeleteAndReuse(t *testing.T) {
 
 	t.Log("Snapshot delete and block reuse test passed")
 }
+
+// =============================================================================
+// WRITABLE CLONE TESTS (Task #4713)
+// =============================================================================
+
+// TestCloneBasic tests creating a writable clone via extended attributes.
+func TestCloneBasic(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	// Write a file to clone
+	content := []byte("Original content for cloning")
+	if err := mfs.WriteFile("source.txt", content); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Create clone via setxattr
+	filePath := mfs.Path("source.txt")
+	clonePath := "/clone.txt"
+
+	start := time.Now()
+	err := unix.Setxattr(filePath, "user.clone", []byte(clonePath), 0)
+	duration := time.Since(start)
+
+	if err != nil {
+		if err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP {
+			t.Skip("Clone xattr not supported")
+		}
+		t.Fatalf("Setxattr for clone creation failed: %v", err)
+	}
+
+	// Verify O(1) performance
+	if duration > 100*time.Millisecond {
+		t.Errorf("Clone creation took %v, should be <100ms", duration)
+	}
+	t.Logf("Clone created in %v", duration)
+
+	// Wait for background refcount job
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify clone exists and has same content
+	cloneContent, err := mfs.ReadFile("clone.txt")
+	if err != nil {
+		t.Fatalf("ReadFile for clone failed: %v", err)
+	}
+
+	if !bytes.Equal(content, cloneContent) {
+		t.Errorf("Clone content mismatch: got %q, want %q", cloneContent, content)
+	}
+
+	t.Log("Basic clone test passed")
+}
+
+// TestCloneCoW tests that writing to a clone triggers Copy-on-Write.
+func TestCloneCoW(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	// Write original file
+	originalContent := []byte("Original content that will be cloned")
+	if err := mfs.WriteFile("source.txt", originalContent); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Create clone
+	filePath := mfs.Path("source.txt")
+	err := unix.Setxattr(filePath, "user.clone", []byte("/clone.txt"), 0)
+	if err != nil {
+		if err == syscall.ENOTSUP {
+			t.Skip("Clone not supported")
+		}
+		t.Fatalf("Failed to create clone: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Modify the clone
+	modifiedContent := []byte("Modified clone content - should trigger CoW")
+	if err := mfs.WriteFile("clone.txt", modifiedContent); err != nil {
+		t.Fatalf("WriteFile to clone failed: %v", err)
+	}
+
+	// Verify source is unchanged
+	sourceContent, err := mfs.ReadFile("source.txt")
+	if err != nil {
+		t.Fatalf("ReadFile for source failed: %v", err)
+	}
+	if !bytes.Equal(originalContent, sourceContent) {
+		t.Errorf("Source content changed after clone write: got %q, want %q", sourceContent, originalContent)
+	}
+
+	// Verify clone has new content
+	cloneContent, err := mfs.ReadFile("clone.txt")
+	if err != nil {
+		t.Fatalf("ReadFile for clone failed: %v", err)
+	}
+	if !bytes.Equal(modifiedContent, cloneContent) {
+		t.Errorf("Clone content mismatch: got %q, want %q", cloneContent, modifiedContent)
+	}
+
+	t.Log("Clone CoW test passed")
+}
+
+// TestCloneSourceCoW tests that writing to source after clone triggers CoW.
+func TestCloneSourceCoW(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	// Write original file
+	originalContent := []byte("Original content before clone")
+	if err := mfs.WriteFile("source.txt", originalContent); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Create clone
+	filePath := mfs.Path("source.txt")
+	err := unix.Setxattr(filePath, "user.clone", []byte("/clone.txt"), 0)
+	if err != nil {
+		if err == syscall.ENOTSUP {
+			t.Skip("Clone not supported")
+		}
+		t.Fatalf("Failed to create clone: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Modify the source (should trigger CoW, keeping clone intact)
+	modifiedSource := []byte("Modified source content - clone should be unchanged")
+	if err := mfs.WriteFile("source.txt", modifiedSource); err != nil {
+		t.Fatalf("WriteFile to source failed: %v", err)
+	}
+
+	// Verify source has new content
+	sourceContent, err := mfs.ReadFile("source.txt")
+	if err != nil {
+		t.Fatalf("ReadFile for source failed: %v", err)
+	}
+	if !bytes.Equal(modifiedSource, sourceContent) {
+		t.Errorf("Source content mismatch: got %q, want %q", sourceContent, modifiedSource)
+	}
+
+	// Verify clone still has original content
+	cloneContent, err := mfs.ReadFile("clone.txt")
+	if err != nil {
+		t.Fatalf("ReadFile for clone failed: %v", err)
+	}
+	if !bytes.Equal(originalContent, cloneContent) {
+		t.Errorf("Clone content changed after source write: got %q, want %q", cloneContent, originalContent)
+	}
+
+	t.Log("Clone source CoW test passed")
+}
+
+// TestCloneDataIntegrity tests both files retain correct data after modifications.
+func TestCloneDataIntegrity(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	// Write original file
+	originalContent := []byte("Original data for integrity test")
+	if err := mfs.WriteFile("source.txt", originalContent); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	// Create clone
+	filePath := mfs.Path("source.txt")
+	err := unix.Setxattr(filePath, "user.clone", []byte("/clone.txt"), 0)
+	if err != nil {
+		if err == syscall.ENOTSUP {
+			t.Skip("Clone not supported")
+		}
+		t.Fatalf("Failed to create clone: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Modify both files
+	newSourceContent := []byte("New source data - completely different")
+	newCloneContent := []byte("New clone data - also different")
+
+	if err := mfs.WriteFile("source.txt", newSourceContent); err != nil {
+		t.Fatalf("WriteFile to source failed: %v", err)
+	}
+	if err := mfs.WriteFile("clone.txt", newCloneContent); err != nil {
+		t.Fatalf("WriteFile to clone failed: %v", err)
+	}
+
+	// Verify both have their correct content
+	sourceContent, _ := mfs.ReadFile("source.txt")
+	cloneContent, _ := mfs.ReadFile("clone.txt")
+
+	if !bytes.Equal(newSourceContent, sourceContent) {
+		t.Errorf("Source content wrong: got %q, want %q", sourceContent, newSourceContent)
+	}
+	if !bytes.Equal(newCloneContent, cloneContent) {
+		t.Errorf("Clone content wrong: got %q, want %q", cloneContent, newCloneContent)
+	}
+
+	t.Log("Clone data integrity test passed")
+}
+
+// TestCloneDestinationExists tests that cloning to existing file fails.
+func TestCloneDestinationExists(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	// Create two files
+	if err := mfs.WriteFile("source.txt", []byte("source")); err != nil {
+		t.Fatalf("WriteFile source failed: %v", err)
+	}
+	if err := mfs.WriteFile("existing.txt", []byte("existing")); err != nil {
+		t.Fatalf("WriteFile existing failed: %v", err)
+	}
+
+	// Try to clone to existing file
+	filePath := mfs.Path("source.txt")
+	err := unix.Setxattr(filePath, "user.clone", []byte("/existing.txt"), 0)
+
+	if err == nil {
+		t.Fatal("Expected error when cloning to existing file, got nil")
+	}
+	if err != syscall.EEXIST {
+		t.Logf("Got error %v (may be EEXIST in different form)", err)
+	}
+
+	t.Log("Clone destination exists test passed")
+}
+
+// TestCloneFromSnapshot tests creating a clone from a named snapshot.
+func TestCloneFromSnapshot(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	// Write original file
+	originalContent := []byte("Original content for snapshot")
+	if err := mfs.WriteFile("source.txt", originalContent); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	filePath := mfs.Path("source.txt")
+
+	// Create a snapshot
+	err := unix.Setxattr(filePath, "user.snapshot", []byte("snap1"), 0)
+	if err != nil {
+		if err == syscall.ENOTSUP {
+			t.Skip("Snapshot not supported")
+		}
+		t.Fatalf("Failed to create snapshot: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Modify the source after snapshot
+	modifiedContent := []byte("Modified after snapshot")
+	if err := mfs.WriteFile("source.txt", modifiedContent); err != nil {
+		t.Fatalf("WriteFile after snapshot failed: %v", err)
+	}
+
+	// Create clone from the snapshot
+	err = unix.Setxattr(filePath, "user.snapshot.clone", []byte("snap1:/clone.txt"), 0)
+	if err != nil {
+		if err == syscall.ENOTSUP {
+			t.Skip("Snapshot clone not supported")
+		}
+		t.Fatalf("Failed to create clone from snapshot: %v", err)
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify clone exists
+	cloneContent, err := mfs.ReadFile("clone.txt")
+	if err != nil {
+		t.Fatalf("ReadFile for clone failed: %v", err)
+	}
+
+	t.Logf("Clone content: %q", cloneContent)
+	t.Log("Clone from snapshot test passed")
+}

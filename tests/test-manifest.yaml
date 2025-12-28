@@ -1025,3 +1025,54 @@ scenarios:
       go: snapshot_test.go::TestSnapshotDeleteAndReuse
       docker: TODO  # Requires CoW and block tracking
       vm: TODO      # Requires CoW and block tracking
+
+  # ===========================================================================
+  # WRITABLE CLONE TESTS (Task #4713)
+  # ===========================================================================
+  # Writable clones create independent files that share physical blocks.
+  # Created via xattr interface: setfattr -n user.clone -v "/path/to/clone"
+
+  - id: clone-basic
+    name: Clone file via xattr
+    description: Create clone using extended attributes, verify clone appears in directory
+    priority: high
+    environments:
+      go: snapshot_test.go::TestCloneBasic
+      docker: TODO  # Requires xattr support
+      vm: TODO      # Requires xattr support
+
+  - id: clone-cow
+    name: Clone Copy-on-Write
+    description: Writing to clone allocates new blocks, source unchanged
+    priority: high
+    environments:
+      go: snapshot_test.go::TestCloneCoW
+      docker: TODO
+      vm: TODO
+
+  - id: clone-source-cow
+    name: Clone source CoW
+    description: Writing to source after clone triggers CoW, clone unchanged
+    priority: high
+    environments:
+      go: snapshot_test.go::TestCloneSourceCoW
+      docker: TODO
+      vm: TODO
+
+  - id: clone-data-integrity
+    name: Clone data integrity
+    description: Both files retain correct data after independent modifications
+    priority: high
+    environments:
+      go: snapshot_test.go::TestCloneDataIntegrity
+      docker: TODO
+      vm: TODO
+
+  - id: clone-from-snapshot
+    name: Clone from snapshot
+    description: Create writable clone from named snapshot via xattr
+    priority: high
+    environments:
+      go: snapshot_test.go::TestCloneFromSnapshot
+      docker: TODO
+      vm: TODO
