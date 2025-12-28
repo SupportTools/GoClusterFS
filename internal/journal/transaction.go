@@ -35,6 +35,12 @@ const (
 
 	// TxnTypeCheckpoint marks a checkpoint record.
 	TxnTypeCheckpoint TxnType = 4
+
+	// TxnTypeIntentComplete marks that a committed intent has been fully executed.
+	// This is used for crash recovery to distinguish:
+	// - Intent committed but not executed (replay needed)
+	// - Intent committed AND executed (skip on recovery)
+	TxnTypeIntentComplete TxnType = 5
 )
 
 // String returns a human-readable representation of the transaction type.
@@ -48,6 +54,8 @@ func (t TxnType) String() string {
 		return "Abort"
 	case TxnTypeCheckpoint:
 		return "Checkpoint"
+	case TxnTypeIntentComplete:
+		return "IntentComplete"
 	default:
 		return "Unknown"
 	}
@@ -316,4 +324,103 @@ func IterateEntries(buf []byte, fn func(entry *TxnEntry, payload []byte) error) 
 	}
 
 	return nil
+}
+
+// =============================================================================
+// Intent Completion Records
+// =============================================================================
+
+const (
+	// IntentCompletionMagic identifies a valid intent completion record.
+	// "INTC" in little-endian: 0x43544E49
+	IntentCompletionMagic uint32 = 0x43544E49
+
+	// IntentCompletionSize is the fixed size of an intent completion record (32 bytes).
+	// This fits in a single sector and contains:
+	// - Magic (4 bytes)
+	// - IntentSeq (8 bytes) - sequence number of the completed intent
+	// - Timestamp (8 bytes) - when the intent was completed
+	// - Checksum (4 bytes) - CRC32C of the record
+	// - Reserved (8 bytes) - for future use
+	IntentCompletionSize = 32
+)
+
+// IntentCompletion is the on-disk record marking that a committed intent
+// has been fully executed. This allows recovery to distinguish between:
+// - Crash after intent committed but before execution started
+// - Crash during execution (partial operations)
+// - Successful completion (operations fully applied)
+//
+// Layout (32 bytes):
+//
+//	Offset  Size  Field
+//	------  ----  -----
+//	0       4     Magic (0x43544E49 "INTC")
+//	4       8     IntentSeq (sequence number of the completed intent)
+//	12      8     Timestamp (Unix nanoseconds when completed)
+//	20      4     Checksum (CRC32C of record excluding checksum field)
+//	24      8     Reserved
+type IntentCompletion struct {
+	Magic     uint32
+	IntentSeq uint64
+	Timestamp int64
+	Checksum  uint32
+	Reserved  uint64
+}
+
+// NewIntentCompletion creates a new intent completion record.
+func NewIntentCompletion(intentSeq uint64) *IntentCompletion {
+	return &IntentCompletion{
+		Magic:     IntentCompletionMagic,
+		IntentSeq: intentSeq,
+		Timestamp: time.Now().UnixNano(),
+	}
+}
+
+// Serialize converts the intent completion to bytes for writing to disk.
+// Computes and stores the checksum.
+func (ic *IntentCompletion) Serialize() []byte {
+	buf := make([]byte, IntentCompletionSize)
+
+	binary.LittleEndian.PutUint32(buf[0:4], ic.Magic)
+	binary.LittleEndian.PutUint64(buf[4:12], ic.IntentSeq)
+	binary.LittleEndian.PutUint64(buf[12:20], uint64(ic.Timestamp))
+	// Checksum at 20:24 - computed below
+	binary.LittleEndian.PutUint64(buf[24:32], ic.Reserved)
+
+	// Compute checksum over everything except the checksum field
+	crc := storage.CRC32C(buf[:20])
+	crc = storage.CRC32CWithSeed(crc, buf[24:32])
+	binary.LittleEndian.PutUint32(buf[20:24], crc)
+	ic.Checksum = crc
+
+	return buf
+}
+
+// DeserializeIntentCompletion parses an intent completion record from bytes.
+func DeserializeIntentCompletion(buf []byte) (*IntentCompletion, error) {
+	if len(buf) < IntentCompletionSize {
+		return nil, ErrTxnTooSmall
+	}
+
+	ic := &IntentCompletion{
+		Magic:     binary.LittleEndian.Uint32(buf[0:4]),
+		IntentSeq: binary.LittleEndian.Uint64(buf[4:12]),
+		Timestamp: int64(binary.LittleEndian.Uint64(buf[12:20])),
+		Checksum:  binary.LittleEndian.Uint32(buf[20:24]),
+		Reserved:  binary.LittleEndian.Uint64(buf[24:32]),
+	}
+
+	if ic.Magic != IntentCompletionMagic {
+		return nil, errors.New("invalid intent completion magic")
+	}
+
+	// Validate checksum
+	expectedCRC := storage.CRC32C(buf[:20])
+	expectedCRC = storage.CRC32CWithSeed(expectedCRC, buf[24:32])
+	if ic.Checksum != expectedCRC {
+		return nil, errors.New("intent completion checksum mismatch")
+	}
+
+	return ic, nil
 }

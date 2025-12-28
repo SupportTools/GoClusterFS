@@ -30,12 +30,14 @@ type RecoveredEntry struct {
 
 // RecoveryStats tracks statistics about the recovery process.
 type RecoveryStats struct {
-	TxnScanned      int
-	TxnCommitted    int
-	TxnIncomplete   int
-	EntriesReplayed int
-	BytesScanned    uint32
-	Errors          int
+	TxnScanned         int
+	TxnCommitted       int
+	TxnIncomplete      int
+	EntriesReplayed    int
+	BytesScanned       uint32
+	Errors             int
+	IntentCompletions  int // Number of intent completion records found
+	IntentsSkipped     int // Number of intents skipped (already completed)
 }
 
 // RecoveryHandler is called for each committed transaction during replay.
@@ -85,7 +87,81 @@ func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
 	return stats, nil
 }
 
+// scanForCompletions scans the journal for IntentCompletion records.
+// This is Phase 1 of the two-phase recovery protocol.
+// Records are identified by IntentCompletionMagic (0x43544E49 "INTC").
+func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, completed map[uint64]bool, stats *RecoveryStats) error {
+	pos := head
+	for {
+		// Check if we've reached the tail
+		if pos == tail {
+			break
+		}
+
+		// Handle wrap-around
+		if pos >= dataAreaSize {
+			pos = 0
+		}
+
+		// Calculate bytes remaining to scan
+		var remaining uint32
+		if tail > pos {
+			remaining = tail - pos
+		} else {
+			remaining = dataAreaSize - pos + tail
+		}
+
+		if remaining < 4 {
+			// Not enough data for even a magic number
+			break
+		}
+
+		// Read one sector to examine the magic number
+		sectorBuf := make([]byte, storage.SectorSize)
+		n, err := region.ReadAt(sectorBuf, pos)
+		if err != nil || n < 4 {
+			break
+		}
+
+		// Check magic number to determine record type
+		magic := uint32(sectorBuf[0]) | uint32(sectorBuf[1])<<8 | uint32(sectorBuf[2])<<16 | uint32(sectorBuf[3])<<24
+
+		if magic == IntentCompletionMagic {
+			// This is an IntentCompletion record
+			ic, err := DeserializeIntentCompletion(sectorBuf)
+			if err == nil {
+				completed[ic.IntentSeq] = true
+				stats.IntentCompletions++
+			}
+			// Advance by one aligned sector (IntentCompletion is padded to 512 bytes)
+			pos += storage.SectorSize
+		} else if magic == TxnMagic {
+			// This is a transaction - skip it (we'll process in phase 2)
+			header, err := DeserializeTxnHeader(sectorBuf[:TxnHeaderSize])
+			if err != nil || header.TotalLength < TxnHeaderSize || header.TotalLength > remaining {
+				break
+			}
+			// Advance by aligned transaction length
+			alignedLen := ((header.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
+			pos += alignedLen
+		} else {
+			// Unknown record type - corruption or end of valid data
+			break
+		}
+
+		// Handle wrap-around
+		if pos >= dataAreaSize {
+			pos = pos - dataAreaSize
+		}
+	}
+
+	return nil
+}
+
 // scanJournal scans the journal from head to tail, recovering transactions.
+// It implements the two-phase intent logging recovery protocol:
+// Phase 1: Scan for IntentCompletion records to find completed intents
+// Phase 2: Replay only transactions without matching completion records
 func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) error {
 	sb := region.Superblock()
 	head := sb.HeadOffset
@@ -97,6 +173,13 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 		return nil
 	}
 
+	// Phase 1: Scan for intent completion records
+	completedIntents := make(map[uint64]bool)
+	if err := scanForCompletions(region, head, tail, dataAreaSize, completedIntents, stats); err != nil {
+		return fmt.Errorf("phase 1 completion scan failed: %w", err)
+	}
+
+	// Phase 2: Replay transactions that are not completed
 	pos := head
 	for {
 		// Check if we've reached the tail
@@ -138,6 +221,18 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 		if n < TxnHeaderSize {
 			stats.TxnIncomplete++
 			break
+		}
+
+		// Check magic number to determine record type
+		magic := uint32(initialBuf[0]) | uint32(initialBuf[1])<<8 | uint32(initialBuf[2])<<16 | uint32(initialBuf[3])<<24
+
+		// Skip IntentCompletion records (already processed in Phase 1)
+		if magic == IntentCompletionMagic {
+			pos += storage.SectorSize
+			if pos >= dataAreaSize {
+				pos = pos - dataAreaSize
+			}
+			continue
 		}
 
 		// Parse header
@@ -184,6 +279,20 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 		// Only replay committed transactions
 		if txnHeader.Type == TxnTypeCommit {
 			stats.TxnCommitted++
+
+			// Check if this intent has already been completed
+			// (has a matching IntentCompletion record)
+			if completedIntents[txnHeader.Seq] {
+				stats.IntentsSkipped++
+				// Skip to next record without replaying
+				alignedLen := ((txnHeader.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
+				pos = pos + alignedLen
+				stats.BytesScanned += alignedLen
+				if pos >= dataAreaSize {
+					pos = pos - dataAreaSize
+				}
+				continue
+			}
 
 			// Parse entries
 			recoveredTxn, err := parseTxnEntries(txnHeader, txnBuf)

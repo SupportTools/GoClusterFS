@@ -231,7 +231,9 @@ func (j *Journal) Begin() *Transaction {
 // 3. Flush superblock with updated tail offset to disk
 // 4. Fsync journal (COMMIT POINT - barrier ensuring durability)
 // 5. Mark transaction as committed in memory
-func (j *Journal) Commit(txn *Transaction) error {
+//
+// Returns the transaction sequence number for use with CompleteIntent().
+func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
@@ -240,16 +242,16 @@ func (j *Journal) Commit(txn *Transaction) error {
 	// Verify this transaction belongs to us
 	active, ok := j.activeTxns[seq]
 	if !ok {
-		return fmt.Errorf("transaction %d not found in active set", seq)
+		return 0, fmt.Errorf("transaction %d not found in active set", seq)
 	}
 	if active.txn != txn {
-		return fmt.Errorf("transaction %d mismatch", seq)
+		return 0, fmt.Errorf("transaction %d mismatch", seq)
 	}
 
 	// Serialize the transaction
 	data, err := txn.Serialize()
 	if err != nil {
-		return fmt.Errorf("failed to serialize transaction: %w", err)
+		return 0, fmt.Errorf("failed to serialize transaction: %w", err)
 	}
 
 	// Check space
@@ -257,42 +259,42 @@ func (j *Journal) Commit(txn *Transaction) error {
 	if uint32(len(data)) > available {
 		// Try to force checkpoint to free space
 		if err := j.forceCheckpoint(); err != nil {
-			return ErrJournalFull
+			return 0, ErrJournalFull
 		}
 		available = j.region.AvailableSpace()
 		if uint32(len(data)) > available {
-			return ErrJournalFull
+			return 0, ErrJournalFull
 		}
 	}
 
 	// Mark journal dirty before writing
 	if j.region.State() == JournalStateClean {
 		if err := j.region.MarkDirty(); err != nil {
-			return fmt.Errorf("failed to mark journal dirty: %w", err)
+			return 0, fmt.Errorf("failed to mark journal dirty: %w", err)
 		}
 	}
 
 	// Write to ring buffer
 	written, err := j.region.WriteAt(data)
 	if err != nil {
-		return fmt.Errorf("failed to write transaction: %w", err)
+		return 0, fmt.Errorf("failed to write transaction: %w", err)
 	}
 	if written != uint32(len(data)) {
-		return fmt.Errorf("short write: %d < %d", written, len(data))
+		return 0, fmt.Errorf("short write: %d < %d", written, len(data))
 	}
 
 	// Flush superblock with updated tail offset to disk
 	// This is CRITICAL for crash consistency - the tail offset must be
 	// persisted so recovery can find the transaction data.
 	if err := j.region.FlushSuperblock(); err != nil {
-		return fmt.Errorf("failed to flush superblock: %w", err)
+		return 0, fmt.Errorf("failed to flush superblock: %w", err)
 	}
 
 	// COMMIT POINT - sync to disk
 	// After this barrier, the transaction is guaranteed durable.
 	if j.config.CommitMode == CommitSync {
 		if err := j.region.Sync(); err != nil {
-			return fmt.Errorf("failed to sync journal: %w", err)
+			return 0, fmt.Errorf("failed to sync journal: %w", err)
 		}
 	}
 
@@ -308,7 +310,7 @@ func (j *Journal) Commit(txn *Transaction) error {
 		j.updateOldestActive()
 	}
 
-	return nil
+	return seq, nil
 }
 
 // Abort abandons a transaction without committing.
@@ -322,6 +324,78 @@ func (j *Journal) Abort(txn *Transaction) {
 	if seq == j.oldestActiveSeq {
 		j.updateOldestActive()
 	}
+}
+
+// CompleteIntent writes an intent completion record to the journal.
+// This marks that the operations from a previously committed transaction
+// have been fully executed and do not need to be replayed on recovery.
+//
+// The intent logging protocol:
+// 1. Begin transaction and log operations (intent)
+// 2. Commit transaction (INTENT POINT - operations are now guaranteed to happen)
+// 3. Execute operations idempotently
+// 4. CompleteIntent (COMPLETION POINT - operations are done, skip on recovery)
+//
+// If the system crashes between steps 2 and 4, recovery will replay the
+// operations. The idempotent execution ensures correctness regardless of
+// how many times operations are replayed.
+func (j *Journal) CompleteIntent(intentSeq uint64) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	// Create completion record
+	completion := NewIntentCompletion(intentSeq)
+	data := completion.Serialize()
+
+	// Pad to sector alignment for O_DIRECT compatibility
+	alignedSize := ((IntentCompletionSize + 511) / 512) * 512
+	alignedData := make([]byte, alignedSize)
+	copy(alignedData, data)
+
+	// Check space
+	available := j.region.AvailableSpace()
+	if uint32(alignedSize) > available {
+		if err := j.forceCheckpoint(); err != nil {
+			return ErrJournalFull
+		}
+		available = j.region.AvailableSpace()
+		if uint32(alignedSize) > available {
+			return ErrJournalFull
+		}
+	}
+
+	// Mark journal dirty before writing
+	if j.region.State() == JournalStateClean {
+		if err := j.region.MarkDirty(); err != nil {
+			return fmt.Errorf("failed to mark journal dirty: %w", err)
+		}
+	}
+
+	// Write to ring buffer
+	written, err := j.region.WriteAt(alignedData)
+	if err != nil {
+		return fmt.Errorf("failed to write intent completion: %w", err)
+	}
+	if written != uint32(alignedSize) {
+		return fmt.Errorf("short write: %d < %d", written, alignedSize)
+	}
+
+	// Flush superblock with updated tail offset
+	if err := j.region.FlushSuperblock(); err != nil {
+		return fmt.Errorf("failed to flush superblock: %w", err)
+	}
+
+	// Sync to disk
+	if j.config.CommitMode == CommitSync {
+		if err := j.region.Sync(); err != nil {
+			return fmt.Errorf("failed to sync journal: %w", err)
+		}
+	}
+
+	// Update metrics
+	j.bytesWritten += uint64(written)
+
+	return nil
 }
 
 // forceCheckpoint tries to checkpoint to free journal space.

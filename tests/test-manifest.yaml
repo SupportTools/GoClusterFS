@@ -456,6 +456,71 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  # ---------------------------------------------------------------------------
+  # Intent Logging Tests (Two-Phase Commit Protocol)
+  # ---------------------------------------------------------------------------
+  # Intent logging ensures operations are logged BEFORE execution.
+  # The two-phase protocol: Commit (INTENT POINT) → Execute → CompleteIntent (COMPLETION POINT)
+  # Recovery replays only transactions without matching completion records.
+
+  - id: intent-completion-serialize
+    name: IntentCompletion serialization
+    description: IntentCompletion record serializes and deserializes correctly
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestIntentCompletionSerializeDeserialize
+
+  - id: intent-completion-bad-magic
+    name: IntentCompletion bad magic rejection
+    description: Invalid magic number is detected and rejected
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestIntentCompletionBadMagic
+
+  - id: intent-completion-bad-checksum
+    name: IntentCompletion bad checksum rejection
+    description: Corrupted checksum is detected and rejected
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestIntentCompletionBadChecksum
+
+  - id: intent-completion-too-short
+    name: IntentCompletion buffer validation
+    description: Short buffer is detected and rejected
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestIntentCompletionTooShort
+
+  - id: intent-completion-magic-value
+    name: IntentCompletion magic value
+    description: Magic constant is correct (0x43544E49 "INTC")
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestIntentCompletionMagic
+
+  - id: intent-completion-timestamp
+    name: IntentCompletion timestamp accuracy
+    description: Timestamp is set correctly at creation time
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestIntentCompletionTimestamp
+
+  - id: journal-complete-intent
+    name: Journal CompleteIntent method
+    description: CompleteIntent writes completion record to journal
+    priority: go_only
+    environments:
+      go: internal/journal/intent_test.go::TestJournalCompleteIntent
+
+  - id: recovery-with-intent-completion
+    name: Two-phase recovery protocol
+    description: Recovery skips transactions with matching completion records
+    priority: high
+    environments:
+      go: internal/journal/intent_test.go::TestRecoveryWithIntentCompletion
+      docker: TODO  # Would require simulating crash with partial execution
+      vm: TODO      # Better suited for VM testing with actual crash simulation
+
   # ===========================================================================
   # VM-ONLY TESTS (Require QEMU/KVM features)
   # ===========================================================================

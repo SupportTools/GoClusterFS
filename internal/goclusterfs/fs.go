@@ -578,8 +578,9 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 		gid = caller.Gid
 	}
 
-	// WAL logging
+	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if f.journal != nil {
 		txn = f.journal.Begin()
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
@@ -602,10 +603,14 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 			f.journal.Abort(txn)
 			return nil, nil, 0, syscall.EIO
 		}
-		if err := f.journal.Commit(txn); err != nil {
+		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
+		var commitErr error
+		intentSeq, commitErr = f.journal.Commit(txn)
+		if commitErr != nil {
 			return nil, nil, 0, syscall.EIO
 		}
 	}
+	// === End WAL transaction - intent is now durable ===
 
 	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
 		return nil, nil, 0, syscall.EIO
@@ -679,6 +684,13 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 	out.Ctimensec = uint32(now % 1e9)
 	out.Blksize = BlockSize
 
+	// === WAL: Mark intent complete ===
+	if f.journal != nil && intentSeq > 0 {
+		if err := f.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] Create %q: CompleteIntent failed: %v", name, err)
+		}
+	}
+
 	return ch, nil, 0, 0
 }
 
@@ -720,8 +732,9 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 		gid = caller.Gid
 	}
 
-	// WAL logging
+	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if f.journal != nil {
 		txn = f.journal.Begin()
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
@@ -744,10 +757,14 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 			f.journal.Abort(txn)
 			return nil, syscall.EIO
 		}
-		if err := f.journal.Commit(txn); err != nil {
+		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
+		var commitErr error
+		intentSeq, commitErr = f.journal.Commit(txn)
+		if commitErr != nil {
 			return nil, syscall.EIO
 		}
 	}
+	// === End WAL transaction - intent is now durable ===
 
 	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
 		return nil, syscall.EIO
@@ -827,6 +844,13 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 	out.Ctimensec = uint32(now % 1e9)
 	out.Blksize = BlockSize
 
+	// === WAL: Mark intent complete ===
+	if f.journal != nil && intentSeq > 0 {
+		if err := f.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] Mkdir %q: CompleteIntent failed: %v", name, err)
+		}
+	}
+
 	return ch, 0
 }
 
@@ -854,8 +878,9 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	// WAL logging
+	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if f.journal != nil {
 		txn = f.journal.Begin()
 		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
@@ -866,10 +891,13 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 			f.journal.Abort(txn)
 			return syscall.EIO
 		}
-		if err := f.journal.Commit(txn); err != nil {
+		var commitErr error
+		intentSeq, commitErr = f.journal.Commit(txn)
+		if commitErr != nil {
 			return syscall.EIO
 		}
 	}
+	// === End WAL transaction - intent is now durable ===
 
 	if err := f.dirMgr.Remove(ctx, dirIno, name); err != nil {
 		return syscall.EIO
@@ -890,6 +918,13 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 
 	dirIno.Mtime = now
 	f.inodeTbl.Write(ctx, dirIno)
+
+	// === WAL: Mark intent complete ===
+	if f.journal != nil && intentSeq > 0 {
+		if err := f.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] Unlink %q: CompleteIntent failed: %v", name, err)
+		}
+	}
 
 	return 0
 }
@@ -926,8 +961,9 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOTEMPTY
 	}
 
-	// WAL logging
+	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if f.journal != nil {
 		txn = f.journal.Begin()
 		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
@@ -938,10 +974,13 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 			f.journal.Abort(txn)
 			return syscall.EIO
 		}
-		if err := f.journal.Commit(txn); err != nil {
+		var commitErr error
+		intentSeq, commitErr = f.journal.Commit(txn)
+		if commitErr != nil {
 			return syscall.EIO
 		}
 	}
+	// === End WAL transaction - intent is now durable ===
 
 	if err := f.dirMgr.Remove(ctx, dirIno, name); err != nil {
 		return syscall.EIO
@@ -956,6 +995,13 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 	dirIno.LinkCount--
 	dirIno.Mtime = now
 	f.inodeTbl.Write(ctx, dirIno)
+
+	// === WAL: Mark intent complete ===
+	if f.journal != nil && intentSeq > 0 {
+		if err := f.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] Rmdir %q: CompleteIntent failed: %v", name, err)
+		}
+	}
 
 	return 0
 }
@@ -1207,6 +1253,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if d.fs.journal != nil {
 		txn = d.fs.journal.Begin()
 
@@ -1237,8 +1284,10 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 		}
 
 		// COMMIT POINT: After this, the operation WILL complete (even after crash)
-		if err := d.fs.journal.Commit(txn); err != nil {
-			log.Printf("[DEBUG] Create %q: journal commit failed: %v", name, err)
+		var commitErr error
+		intentSeq, commitErr = d.fs.journal.Commit(txn)
+		if commitErr != nil {
+			log.Printf("[DEBUG] Create %q: journal commit failed: %v", name, commitErr)
 			return nil, nil, 0, syscall.EIO
 		}
 	}
@@ -1331,6 +1380,17 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 	out.Ctimensec = uint32(now % 1e9)
 	out.Blksize = BlockSize
 
+	// === WAL: Mark intent complete ===
+	// All operations have been successfully executed; mark the intent as complete
+	// so recovery won't replay it.
+	if d.fs.journal != nil && intentSeq > 0 {
+		if err := d.fs.journal.CompleteIntent(intentSeq); err != nil {
+			// Log but don't fail - the operation completed successfully,
+			// worst case is it gets replayed idempotently on recovery
+			log.Printf("[DEBUG] Create %q: CompleteIntent failed: %v", name, err)
+		}
+	}
+
 	return ch, nil, 0, 0
 }
 
@@ -1401,6 +1461,7 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if d.fs.journal != nil {
 		txn = d.fs.journal.Begin()
 
@@ -1435,8 +1496,10 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 		// from the directory inode's extent info.
 
 		// COMMIT POINT: After this, the operation WILL complete (even after crash)
-		if err := d.fs.journal.Commit(txn); err != nil {
-			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", name, err)
+		var commitErr error
+		intentSeq, commitErr = d.fs.journal.Commit(txn)
+		if commitErr != nil {
+			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", name, commitErr)
 			return nil, syscall.EIO
 		}
 	}
@@ -1539,6 +1602,17 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 	out.Ctimensec = uint32(now % 1e9)
 	out.Blksize = BlockSize
 
+	// === WAL: Mark intent complete ===
+	// All operations have been successfully executed; mark the intent as complete
+	// so recovery won't replay it.
+	if d.fs.journal != nil && intentSeq > 0 {
+		if err := d.fs.journal.CompleteIntent(intentSeq); err != nil {
+			// Log but don't fail - the operation completed successfully,
+			// worst case is it gets replayed idempotently on recovery
+			log.Printf("[DEBUG] Mkdir %q: CompleteIntent failed: %v", name, err)
+		}
+	}
+
 	return ch, 0
 }
 
@@ -1608,6 +1682,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if d.fs.journal != nil {
 		txn = d.fs.journal.Begin()
 
@@ -1675,7 +1750,9 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		}
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
-		if err := d.fs.journal.Commit(txn); err != nil {
+		var commitErr error
+		intentSeq, commitErr = d.fs.journal.Commit(txn)
+		if commitErr != nil {
 			return syscall.EIO
 		}
 	}
@@ -1713,6 +1790,13 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 	// Cache the updated parent directory inode
 	d.fs.cacheInode(dirIno)
+
+	// === WAL: Mark intent complete ===
+	if d.fs.journal != nil && intentSeq > 0 {
+		if err := d.fs.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] removeEntry %q: CompleteIntent failed: %v", name, err)
+		}
+	}
 
 	return 0
 }
@@ -1977,7 +2061,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// Allocate SFB slot for this small file
 		containerBlock, slotIndex, err := f.fs.sfbMgr.AllocateSlot(ctx, newEndOffset)
 		if err == nil {
-			// Journal the SFB allocation
+			// === WAL: Log intent to allocate SFB slot ===
+			var sfbIntentSeq uint64
 			if f.fs.journal != nil {
 				txn := f.fs.journal.Begin()
 				tier, _ := sfb.TierForSize(newEndOffset)
@@ -1992,9 +2077,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
 					return 0, err
 				}
-				if err := f.fs.journal.Commit(txn); err != nil {
+				// === COMMIT POINT ===
+				var commitErr error
+				sfbIntentSeq, commitErr = f.fs.journal.Commit(txn)
+				if commitErr != nil {
 					_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
-					return 0, err
+					return 0, commitErr
 				}
 			}
 
@@ -2014,8 +2102,17 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return 0, err
 			}
 
-			// Now write using SFB path
-			return f.writeSFB(ctx, ino, data, offset)
+			// Write data using SFB path
+			written, writeErr := f.writeSFB(ctx, ino, data, offset)
+
+			// === WAL: Mark SFB allocation intent complete ===
+			if f.fs.journal != nil && sfbIntentSeq > 0 {
+				if err := f.fs.journal.CompleteIntent(sfbIntentSeq); err != nil {
+					log.Printf("[DEBUG] Write inode %d SFB alloc: CompleteIntent failed: %v", f.inodeNum, err)
+				}
+			}
+
+			return written, writeErr
 		}
 		// SFB allocation failed (e.g., no space) - fall through to regular extent path
 		log.Printf("[DEBUG] Write inode %d: SFB allocation failed, using extent: %v", f.inodeNum, err)
@@ -2341,6 +2438,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	newMtime := time.Now().UnixNano()
 
 	// === WAL: Log extent allocations and inode update before committing metadata ===
+	var intentSeq uint64
 	if f.fs.journal != nil && (len(allocatedExtents) > 0 || newSize != ino.Size) {
 		txn = f.fs.journal.Begin()
 
@@ -2371,8 +2469,10 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
-		if err := f.fs.journal.Commit(txn); err != nil {
-			log.Printf("[DEBUG] Write inode %d: journal commit failed: %v", f.inodeNum, err)
+		var commitErr error
+		intentSeq, commitErr = f.fs.journal.Commit(txn)
+		if commitErr != nil {
+			log.Printf("[DEBUG] Write inode %d: journal commit failed: %v", f.inodeNum, commitErr)
 			return 0, syscall.EIO
 		}
 		txn = nil // Mark as committed so defer doesn't abort
@@ -2411,6 +2511,15 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	// This is fire-and-forget - doesn't block the write operation.
 	if f.fs.cacheMgr != nil {
 		f.fs.cacheMgr.BroadcastInvalidateInode(uint32(f.inodeNum), ino.DataGeneration, ino.MetaGeneration)
+	}
+
+	// === WAL: Mark intent complete ===
+	// Now that all metadata and data have been persisted, mark the intent as complete.
+	// On recovery, this prevents replaying already-completed operations.
+	if f.fs.journal != nil && intentSeq > 0 {
+		if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] Write inode %d: CompleteIntent failed: %v", f.inodeNum, err)
+		}
 	}
 
 	return bytesWritten, nil
@@ -2498,11 +2607,12 @@ func (f *File) writeSFB(ctx context.Context, ino *inode.Inode, data []byte, offs
 	}
 
 	// Update inode size if extended
+	var intentSeq uint64
 	if newSize > ino.Size {
 		ino.Size = newSize
 		ino.Mtime = time.Now().UnixNano()
 
-		// Journal the update
+		// === WAL: Log intent to update inode size ===
 		if f.fs.journal != nil {
 			txn := f.fs.journal.Begin()
 			if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
@@ -2512,14 +2622,24 @@ func (f *File) writeSFB(ctx context.Context, ino *inode.Inode, data []byte, offs
 				f.fs.journal.Abort(txn)
 				return bytesWritten, err
 			}
-			if err := f.fs.journal.Commit(txn); err != nil {
-				return bytesWritten, err
+			// === COMMIT POINT ===
+			var commitErr error
+			intentSeq, commitErr = f.fs.journal.Commit(txn)
+			if commitErr != nil {
+				return bytesWritten, commitErr
 			}
 		}
 
 		// Write inode
 		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 			return bytesWritten, err
+		}
+	}
+
+	// === WAL: Mark intent complete ===
+	if f.fs.journal != nil && intentSeq > 0 {
+		if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] writeSFB inode %d: CompleteIntent failed: %v", f.inodeNum, err)
 		}
 	}
 
@@ -2568,7 +2688,8 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 		return fmt.Errorf("failed to write migrated data: %w", err)
 	}
 
-	// Journal the migration
+	// === WAL: Log intent to migrate from SFB to extent ===
+	var intentSeq uint64
 	if f.fs.journal != nil {
 		txn := f.fs.journal.Begin()
 		if err := txn.LogSFBMigrate(&journal.SFBMigratePayload{
@@ -2581,9 +2702,12 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
 			return err
 		}
-		if err := f.fs.journal.Commit(txn); err != nil {
+		// === COMMIT POINT ===
+		var commitErr error
+		intentSeq, commitErr = f.fs.journal.Commit(txn)
+		if commitErr != nil {
 			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
-			return err
+			return commitErr
 		}
 	}
 
@@ -2605,6 +2729,13 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	if f.fs.sfbMgr != nil {
 		if err := f.fs.sfbMgr.FreeSlot(ctx, oldContainer, oldSlot); err != nil {
 			log.Printf("[WARN] Failed to free old SFB slot %d:%d: %v", oldContainer, oldSlot, err)
+		}
+	}
+
+	// === WAL: Mark intent complete ===
+	if f.fs.journal != nil && intentSeq > 0 {
+		if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] migrateToExtent inode %d: CompleteIntent failed: %v", f.inodeNum, err)
 		}
 	}
 
@@ -2669,6 +2800,7 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
+	var intentSeq uint64
 	if f.fs.journal != nil && mask != 0 {
 		txn = f.fs.journal.Begin()
 
@@ -2695,7 +2827,9 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		}
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
-		if err := f.fs.journal.Commit(txn); err != nil {
+		var commitErr error
+		intentSeq, commitErr = f.fs.journal.Commit(txn)
+		if commitErr != nil {
 			return syscall.EIO
 		}
 	}
@@ -2742,6 +2876,13 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 	// Cache the freshly-written inode for subsequent reads
 	f.fs.cacheInode(ino)
+
+	// === WAL: Mark intent complete ===
+	if f.fs.journal != nil && intentSeq > 0 {
+		if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+			log.Printf("[DEBUG] Setattr inode %d: CompleteIntent failed: %v", f.inodeNum, err)
+		}
+	}
 
 	return f.Getattr(ctx, fh, out)
 }

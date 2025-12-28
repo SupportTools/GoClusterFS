@@ -97,7 +97,7 @@ func TestJournalBeginCommit(t *testing.T) {
 	txn.LogInodeCreate(testInodePayload(100))
 
 	// Commit
-	if err := j.Commit(txn); err != nil {
+	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
 
@@ -145,7 +145,7 @@ func TestJournalMultipleTransactions(t *testing.T) {
 			t.Errorf("Transaction %d seq = %d, want %d", i, txn.Seq(), i)
 		}
 		txn.LogInodeCreate(testInodePayload(100 + i))
-		if err := j.Commit(txn); err != nil {
+		if _, err := j.Commit(txn); err != nil {
 			t.Fatalf("Commit %d failed: %v", i, err)
 		}
 	}
@@ -177,13 +177,13 @@ func TestJournalConcurrentTransactions(t *testing.T) {
 	txn3.LogInodeCreate(testInodePayload(102))
 
 	// Commit out of order
-	if err := j.Commit(txn2); err != nil {
+	if _, err := j.Commit(txn2); err != nil {
 		t.Fatalf("Commit txn2 failed: %v", err)
 	}
-	if err := j.Commit(txn1); err != nil {
+	if _, err := j.Commit(txn1); err != nil {
 		t.Fatalf("Commit txn1 failed: %v", err)
 	}
-	if err := j.Commit(txn3); err != nil {
+	if _, err := j.Commit(txn3); err != nil {
 		t.Fatalf("Commit txn3 failed: %v", err)
 	}
 
@@ -204,7 +204,7 @@ func TestJournalCommitWrongTxn(t *testing.T) {
 	fakeTxn := NewTransaction(999, [16]byte{}, 1)
 
 	// Should fail
-	err := j.Commit(fakeTxn)
+	_, err := j.Commit(fakeTxn)
 	if err == nil {
 		t.Error("Expected error when committing unknown transaction")
 	}
@@ -222,7 +222,7 @@ func TestJournalMarksDirtyOnCommit(t *testing.T) {
 	// Commit a transaction
 	txn := j.Begin()
 	txn.LogInodeCreate(testInodePayload(100))
-	if err := j.Commit(txn); err != nil {
+	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestJournalCleanOnStop(t *testing.T) {
 
 	txn := j1.Begin()
 	txn.LogInodeCreate(testInodePayload(100))
-	if err := j1.Commit(txn); err != nil {
+	if _, err := j1.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
 
@@ -280,7 +280,7 @@ func TestJournalStartStop(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		txn := j.Begin()
 		txn.LogInodeCreate(testInodePayload(uint64(100 + i)))
-		if err := j.Commit(txn); err != nil {
+		if _, err := j.Commit(txn); err != nil {
 			t.Fatalf("Commit failed: %v", err)
 		}
 	}
@@ -299,7 +299,7 @@ func TestJournalAsyncCommitMode(t *testing.T) {
 	// Commit should work in async mode
 	txn := j.Begin()
 	txn.LogInodeCreate(testInodePayload(100))
-	if err := j.Commit(txn); err != nil {
+	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit in async mode failed: %v", err)
 	}
 
@@ -332,7 +332,7 @@ func TestJournalAvailableSpace(t *testing.T) {
 	// After commit, space should decrease
 	txn := j.Begin()
 	txn.LogInodeCreate(testInodePayload(100))
-	if err := j.Commit(txn); err != nil {
+	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
 
@@ -354,7 +354,7 @@ func TestJournalLargeTransaction(t *testing.T) {
 		txn.LogDirAddEntry(testDirAddPayload(1, 100+i, "file"+string(rune('a'+int(i%26)))))
 	}
 
-	if err := j.Commit(txn); err != nil {
+	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit large transaction failed: %v", err)
 	}
 
@@ -382,7 +382,7 @@ func TestJournalStats(t *testing.T) {
 	// After commit
 	txn := j.Begin()
 	txn.LogInodeCreate(testInodePayload(100))
-	j.Commit(txn)
+	j.Commit(txn) //nolint:errcheck
 
 	stats = j.Stats()
 	if stats.TailOffset == 0 {
@@ -440,7 +440,7 @@ func TestJournalOpen(t *testing.T) {
 	// Commit something
 	txn := j1.Begin()
 	txn.LogInodeCreate(testInodePayload(100))
-	j1.Commit(txn)
+	j1.Commit(txn) //nolint:errcheck
 	j1.Stop()
 
 	// Open
