@@ -24,6 +24,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/trim"
@@ -58,6 +59,9 @@ func main() {
 
 		// SFB configuration (Sub-File Block containers for small files)
 		sfbEnabled = flag.Bool("sfb", true, "Enable SFB containers for small files (<64KB)")
+
+		// Snapshot configuration
+		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
 	)
 	flag.Parse()
 
@@ -85,22 +89,28 @@ func main() {
 	log.Printf("Device: %s (%d MB)", *devicePath, devSize/(1024*1024))
 
 	// Layout configuration
-	// 0-1MB: Reserved (superblock area)
-	// 1-2MB: Bitmap region
-	// 2-3MB: Inode table
-	// 3-4MB: Node registry (for distributed lock coordination)
-	// 4-5MB: Lock region (CAS-based distributed locks)
-	// 5-9MB: Journal region (4MB per node slot)
-	// 9MB+: Data blocks (1MB each)
+	// 0-1MB:   Reserved (superblock area)
+	// 1-2MB:   Bitmap region
+	// 2-3MB:   Inode table
+	// 3-4MB:   Node registry (for distributed lock coordination)
+	// 4-5MB:   Lock region (CAS-based distributed locks)
+	// 5-9MB:   Journal region (4MB per node slot)
+	// 9-10MB:  Refcount region (block reference counts for CoW)
+	// 10-11MB: Snapshot registry (snapshot descriptors)
+	// 11MB+:   Data blocks (1MB each)
 	const (
 		bitmapOffset       = 1 * 1024 * 1024
 		inodeOffset        = 2 * 1024 * 1024
 		nodeRegistryOffset = 3 * 1024 * 1024
 		lockOffset         = 4 * 1024 * 1024
-		lockSize           = 1 * 1024 * 1024 // 1MB for lock records
-		journalOffset      = 5 * 1024 * 1024 // Journal region start
-		journalSize        = 4 * 1024 * 1024 // 4MB journal slot
-		dataOffset         = 9 * 1024 * 1024
+		lockSize           = 1 * 1024 * 1024  // 1MB for lock records
+		journalOffset      = 5 * 1024 * 1024  // Journal region start
+		journalSize        = 4 * 1024 * 1024  // 4MB journal slot
+		refcountOffset     = 9 * 1024 * 1024  // Refcount region start
+		refcountSize       = 1 * 1024 * 1024  // 1MB for refcounts
+		snapshotOffset     = 10 * 1024 * 1024 // Snapshot registry start
+		snapshotSize       = 1 * 1024 * 1024  // 1MB for snapshot descriptors
+		dataOffset         = 11 * 1024 * 1024 // Data blocks start
 	)
 
 	// Calculate capacities
@@ -109,7 +119,7 @@ func main() {
 	inodeCount := uint64(4096)                      // Fixed for now
 
 	if totalBlocks < 1 {
-		log.Fatalf("Device too small: need at least 10MB, have %d MB", devSize/(1024*1024))
+		log.Fatalf("Device too small: need at least 12MB, have %d MB", devSize/(1024*1024))
 	}
 
 	log.Printf("Layout: %d data blocks (%d MB), %d inodes", totalBlocks, totalBlocks, inodeCount)
@@ -260,9 +270,15 @@ func main() {
 		log.Println("SFB: disabled (all files use full 1MB blocks)")
 	}
 
-	// Create filesystem with journal, TRIM, and SFB for crash consistency
-	// NOTE: refcountReg is nil until snapshot feature is fully enabled
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, nil, nodeUUID, dataOffset)
+	// Create refcount region for snapshot CoW support
+	var refcountReg *refcount.Region
+	if *snapshotsEnabled {
+		refcountReg = refcount.NewRegion(dev, refcountOffset, totalBlocks, lockMgr)
+		log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
+	}
+
+	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -291,6 +307,17 @@ func main() {
 	rootIno, err := inodeTbl.Read(inode.InodeRoot)
 	if err != nil || rootIno.Magic != inode.InodeMagic {
 		log.Fatalf("Filesystem not formatted. Use -format to initialize.")
+	}
+
+	// Initialize snapshot subsystem after verifying filesystem is valid
+	if *snapshotsEnabled {
+		if err := gfs.InitSnapshots(ctx, snapshotOffset, snapshotSize); err != nil {
+			log.Fatalf("Failed to initialize snapshots: %v", err)
+		}
+		log.Printf("Snapshots: enabled (registry at %dMB, %dMB capacity)",
+			snapshotOffset/(1024*1024), snapshotSize/(1024*1024))
+	} else {
+		log.Println("Snapshots: disabled")
 	}
 
 	// Configure go-fuse mount options
@@ -325,18 +352,9 @@ func main() {
 		<-sigChan
 		log.Println("Received signal, unmounting...")
 
-		// Stop TRIM manager first to flush pending discards
-		if trimMgr != nil {
-			if err := trimMgr.Stop(); err != nil {
-				log.Printf("Warning: Failed to stop TRIM manager: %v", err)
-			}
-		}
-
-		// Stop journal to ensure all transactions are checkpointed
-		if j != nil {
-			if err := j.Stop(); err != nil {
-				log.Printf("Warning: Failed to stop journal: %v", err)
-			}
+		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
+		if err := gfs.Close(); err != nil {
+			log.Printf("Warning: Failed to close filesystem: %v", err)
 		}
 
 		// Stop broadcaster to notify peers
@@ -353,17 +371,9 @@ func main() {
 	// Wait for filesystem to be unmounted - this blocks until unmount
 	server.Wait()
 
-	// Clean shutdown
-	if trimMgr != nil {
-		if err := trimMgr.Stop(); err != nil {
-			log.Printf("Warning: Failed to stop TRIM manager on exit: %v", err)
-		}
-	}
-
-	if j != nil {
-		if err := j.Stop(); err != nil {
-			log.Printf("Warning: Failed to stop journal on exit: %v", err)
-		}
+	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
+	if err := gfs.Close(); err != nil {
+		log.Printf("Warning: Failed to close filesystem on exit: %v", err)
 	}
 
 	if err := cacheMgr.StopBroadcast(); err != nil {

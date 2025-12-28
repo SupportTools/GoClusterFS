@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1641,16 +1642,17 @@ type File struct {
 
 // Verify interface compliance at compile time
 var (
-	_ fs.InodeEmbedder  = (*File)(nil)
-	_ fs.NodeOpener     = (*File)(nil)
-	_ fs.NodeGetattrer  = (*File)(nil)
-	_ fs.NodeSetattrer  = (*File)(nil)
-	_ fs.NodeReader     = (*File)(nil)
-	_ fs.NodeWriter     = (*File)(nil)
-	_ fs.NodeFsyncer    = (*File)(nil)
-	_ fs.NodeAllocater  = (*File)(nil)
-	_ fs.NodeSetxattrer = (*File)(nil)
-	_ fs.NodeGetxattrer = (*File)(nil)
+	_ fs.InodeEmbedder     = (*File)(nil)
+	_ fs.NodeOpener        = (*File)(nil)
+	_ fs.NodeGetattrer     = (*File)(nil)
+	_ fs.NodeSetattrer     = (*File)(nil)
+	_ fs.NodeReader        = (*File)(nil)
+	_ fs.NodeWriter        = (*File)(nil)
+	_ fs.NodeFsyncer       = (*File)(nil)
+	_ fs.NodeAllocater     = (*File)(nil)
+	_ fs.NodeSetxattrer    = (*File)(nil)
+	_ fs.NodeGetxattrer    = (*File)(nil)
+	_ fs.NodeRemovexattrer = (*File)(nil)
 )
 
 // Open opens the file for reading/writing.
@@ -2804,6 +2806,24 @@ func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 	default:
 		return 0, syscall.ENODATA
 	}
+}
+
+// Removexattr removes an extended attribute from the file.
+// Used for snapshot deletion via user.snapshot.<name> pattern.
+func (f *File) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	log.Printf("[DEBUG] File.Removexattr: inode=%d attr=%s", f.inodeNum, attr)
+
+	// Handle user.snapshot.<name> for snapshot deletion
+	const snapshotPrefix = "user.snapshot."
+	if strings.HasPrefix(attr, snapshotPrefix) {
+		snapName := strings.TrimPrefix(attr, snapshotPrefix)
+		if snapName == "" {
+			return syscall.EINVAL
+		}
+		return f.deleteSnapshot(ctx, snapName)
+	}
+
+	return syscall.ENODATA
 }
 
 // createSnapshot creates a new snapshot of this file.

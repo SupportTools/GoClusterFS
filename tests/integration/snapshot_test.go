@@ -473,7 +473,9 @@ func TestSnapshotMiddleDeletion(t *testing.T) {
 	t.Logf("All snapshots created: %s", string(snapListBuf[:n]))
 
 	// Delete the middle snapshot (snap-2)
+	t.Logf("Calling Removexattr for snap-2...")
 	err = unix.Removexattr(filePath, "user.snapshot.snap-2")
+	t.Logf("Removexattr returned: err=%v", err)
 	if err != nil && err != syscall.ENODATA {
 		t.Fatalf("Removexattr for middle snapshot deletion failed: %v", err)
 	}
