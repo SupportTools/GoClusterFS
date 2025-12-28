@@ -30,14 +30,14 @@ type RecoveredEntry struct {
 
 // RecoveryStats tracks statistics about the recovery process.
 type RecoveryStats struct {
-	TxnScanned         int
-	TxnCommitted       int
-	TxnIncomplete      int
-	EntriesReplayed    int
-	BytesScanned       uint32
-	Errors             int
-	IntentCompletions  int // Number of intent completion records found
-	IntentsSkipped     int // Number of intents skipped (already completed)
+	TxnScanned        int
+	TxnCommitted      int
+	TxnIncomplete     int
+	EntriesReplayed   int
+	BytesScanned      uint32
+	Errors            int
+	IntentCompletions int // Number of intent completion records found
+	IntentsSkipped    int // Number of intents skipped (already completed)
 }
 
 // RecoveryHandler is called for each committed transaction during replay.
