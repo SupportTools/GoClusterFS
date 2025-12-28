@@ -31,7 +31,7 @@ ISO_PATH="${VM_DIR}/${ISO_NAME}"
 
 # Shared storage (configurable via VM_CLUSTER_SIZE_MB environment variable)
 SHARED_DISK_PATH="${VM_DIR}/cluster.img"
-SHARED_DISK_SIZE_MB=${VM_CLUSTER_SIZE_MB:-500}
+SHARED_DISK_SIZE_MB=${VM_CLUSTER_SIZE_MB:-1024}
 
 # Network settings (each VM gets sequential ports)
 SSH_BASE_PORT=2222
@@ -129,9 +129,16 @@ download_iso() {
 # Shared Disk Management
 # =============================================================================
 create_shared_disk() {
+    local expected_bytes=$((SHARED_DISK_SIZE_MB * 1024 * 1024))
+
     if [[ -f "${SHARED_DISK_PATH}" ]]; then
-        log_info "Shared disk already exists: ${SHARED_DISK_PATH}"
-        return 0
+        local actual_bytes=$(stat -c%s "${SHARED_DISK_PATH}" 2>/dev/null || echo 0)
+        if [[ "$actual_bytes" -eq "$expected_bytes" ]]; then
+            log_info "Shared disk already exists with correct size: ${SHARED_DISK_PATH}"
+            return 0
+        fi
+        log_warn "Shared disk size mismatch (have: $((actual_bytes/1024/1024))MB, want: ${SHARED_DISK_SIZE_MB}MB), recreating..."
+        rm -f "${SHARED_DISK_PATH}"
     fi
 
     log_info "Creating ${SHARED_DISK_SIZE_MB}MB shared disk image..."
@@ -492,6 +499,50 @@ wait_vm_healthy() {
 
     log_error "VM $vm_id failed to become healthy within ${timeout}s"
     return 1
+}
+
+# Ensure a VM is running and healthy, restarting if necessary.
+# This function makes tests resilient to prior test failures by verifying
+# the VM is accessible before proceeding. If the VM is unreachable, it
+# restarts the VM and waits for it to become healthy.
+ensure_vm_running() {
+    local vm_id="$1"
+    local ssh_port=$(get_vm_ssh_port "$vm_id")
+
+    # Check if VM is reachable via SSH
+    if sshpass -p "testpass123" ssh ${SSH_OPTIONS} -p "$ssh_port" "${SSH_USER}@127.0.0.1" "true" 2>/dev/null; then
+        # VM is healthy, check if GoClusterFS is mounted
+        if sshpass -p "testpass123" ssh ${SSH_OPTIONS} -p "$ssh_port" "${SSH_USER}@127.0.0.1" "mountpoint -q /mnt/goclusterfs" 2>/dev/null; then
+            return 0  # Fully healthy
+        fi
+        # SSH works but GoClusterFS not mounted - remount
+        log_info "VM $vm_id SSH OK but GoClusterFS not mounted, remounting..."
+        setup_goclusterfs "$vm_id" false
+        return 0
+    fi
+
+    # VM not reachable - restart it
+    log_warn "VM $vm_id not reachable, restarting..."
+    kill_vm "$vm_id" 2>/dev/null || true
+    start_vm "$vm_id" false
+    if ! wait_vm_healthy "$vm_id" 120; then
+        log_error "Failed to restart VM $vm_id"
+        return 1
+    fi
+    setup_goclusterfs "$vm_id" false
+    return 0
+}
+
+# Ensure all cluster VMs are running and healthy.
+# Called at the start of tests that require multiple VMs to be operational.
+ensure_cluster_healthy() {
+    local node_count="${1:-2}"
+    for vm_id in $(seq 1 "$node_count"); do
+        if ! ensure_vm_running "$vm_id"; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 # =============================================================================

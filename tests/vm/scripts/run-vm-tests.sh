@@ -78,7 +78,9 @@ pre_extend_file_on_vm() {
     local size_bytes=$3
 
     log_info "Pre-extending $filename to $size_bytes bytes on VM $vm_id"
-    ssh_run "$vm_id" "dd if=/dev/zero of=/mnt/goclusterfs/$filename bs=1 count=$size_bytes 2>/dev/null"
+    # Use truncate for instant file creation (sparse file), then fill with zeros using efficient block size
+    # This is MUCH faster than dd with bs=1 which does one syscall per byte
+    ssh_run "$vm_id" "truncate -s $size_bytes /mnt/goclusterfs/$filename && dd if=/dev/zero of=/mnt/goclusterfs/$filename bs=4096 count=$((size_bytes / 4096 + 1)) conv=notrunc 2>/dev/null && truncate -s $size_bytes /mnt/goclusterfs/$filename"
 }
 
 # Write pattern at specific offset on VM
@@ -91,7 +93,17 @@ write_pattern_at_on_vm() {
     local offset=$5
 
     log_info "VM $vm_id: Writing $size_bytes bytes of '$pattern_char' at offset $offset"
-    ssh_run "$vm_id" "head -c $size_bytes /dev/zero | tr '\\0' '$pattern_char' | dd of=/mnt/goclusterfs/$filename bs=1 seek=$offset conv=notrunc 2>/dev/null"
+    # Write pattern data using efficient block size (4KB) with calculated block offset
+    # For offsets not aligned to 4096, we need special handling
+    if [ $((offset % 4096)) -eq 0 ]; then
+        # Offset is block-aligned, use efficient bs=4096
+        local block_offset=$((offset / 4096))
+        local block_count=$(( (size_bytes + 4095) / 4096 ))
+        ssh_run "$vm_id" "head -c $size_bytes /dev/zero | tr '\\0' '$pattern_char' | dd of=/mnt/goclusterfs/$filename bs=4096 seek=$block_offset conv=notrunc 2>/dev/null"
+    else
+        # Non-aligned offset: use bs=1 but only for this case (still needed for precise positioning)
+        ssh_run "$vm_id" "head -c $size_bytes /dev/zero | tr '\\0' '$pattern_char' | dd of=/mnt/goclusterfs/$filename bs=1 seek=$offset conv=notrunc 2>/dev/null"
+    fi
 }
 
 # Read bytes at specific offset on VM
@@ -662,6 +674,9 @@ test_journal_recovery_large_file() {
         return 0
     fi
 
+    # Ensure all VMs are running before test (may have been killed by previous test)
+    ensure_cluster_healthy 2
+
     local vm_a=1
     local vm_b=2
     local filename="large-recovery.txt"
@@ -825,8 +840,8 @@ test_journal_recovery_idempotency() {
     log_info "Cleanup: Restarting VM A and VM B..."
     start_vm "$vm_a"
     start_vm "$vm_b"
-    wait_for_vm_ssh "$vm_a"
-    wait_for_vm_ssh "$vm_b"
+    wait_vm_healthy "$vm_a"
+    wait_vm_healthy "$vm_b"
     setup_goclusterfs "$vm_a"
     setup_goclusterfs "$vm_b"
 
@@ -839,6 +854,9 @@ test_journal_recovery_idempotency() {
 # Matches Go test: TestJournalCrashRecoveryFile
 test_journal_crash_recovery_file() {
     log_info "Testing journal crash recovery for file operations..."
+
+    # Ensure VM 1 is running before test (may have been killed by previous test)
+    ensure_vm_running 1
 
     # This test works with a single VM - we test crash/recovery on VM 1
     local vm_a=1
@@ -865,7 +883,7 @@ test_journal_crash_recovery_file() {
     # Phase 3: Restart - this triggers journal recovery
     log_info "Phase 3: Restarting VM to trigger journal recovery..."
     start_vm "$vm_a"
-    wait_for_vm_ssh "$vm_a"
+    wait_vm_healthy "$vm_a"
     setup_goclusterfs "$vm_a"
 
     # Phase 4: Verify file was recovered
@@ -896,6 +914,9 @@ test_journal_crash_recovery_file() {
 test_journal_crash_recovery_directory() {
     log_info "Testing journal crash recovery for directory operations..."
 
+    # Ensure VM 1 is running before test (may have been killed by previous test)
+    ensure_vm_running 1
+
     # This test works with a single VM
     local vm_a=1
     local dirname="recovered_dir"
@@ -906,13 +927,13 @@ test_journal_crash_recovery_directory() {
     log_info "Phase 1: Creating directory and nested file on VM A..."
 
     # Create directory
-    run_on_vm "$vm_a" "mkdir -p /mnt/goclusterfs/$dirname"
+    ssh_run_password "$vm_a" "mkdir -p /mnt/goclusterfs/$dirname"
 
     # Create nested file
     write_file_on_vm "$vm_a" "$nested_file" "$content"
 
     # Verify directory exists before crash
-    if ! run_on_vm "$vm_a" "test -d /mnt/goclusterfs/$dirname"; then
+    if ! ssh_run_password "$vm_a" "test -d /mnt/goclusterfs/$dirname"; then
         log_error "Directory should exist before crash"
         return 1
     fi
@@ -933,14 +954,14 @@ test_journal_crash_recovery_directory() {
     # Phase 3: Restart - this triggers journal recovery
     log_info "Phase 3: Restarting VM to trigger journal recovery..."
     start_vm "$vm_a"
-    wait_for_vm_ssh "$vm_a"
+    wait_vm_healthy "$vm_a"
     setup_goclusterfs "$vm_a"
 
     # Phase 4: Verify directory structure was recovered
     log_info "Phase 4: Verifying directory recovery..."
 
     # Verify directory exists and is a directory
-    if ! run_on_vm "$vm_a" "test -d /mnt/goclusterfs/$dirname"; then
+    if ! ssh_run_password "$vm_a" "test -d /mnt/goclusterfs/$dirname"; then
         log_error "Directory should exist after crash recovery"
         return 1
     fi
@@ -971,6 +992,9 @@ test_journal_crash_recovery_directory() {
 test_journal_crash_recovery_multiple_ops() {
     log_info "Testing journal crash recovery for multiple operations..."
 
+    # Ensure VM 1 is running before test (may have been killed by previous test)
+    ensure_vm_running 1
+
     local vm_a=1
 
     # Perform multiple operations
@@ -990,20 +1014,20 @@ test_journal_crash_recovery_multiple_ops() {
 
     # 3. Create directory
     log_info "Creating testdir..."
-    if ! run_on_vm "$vm_a" "mkdir -p $MOUNT_POINT/testdir"; then
+    if ! ssh_run_password "$vm_a" "mkdir -p $GOCLUSTERFS_MOUNT/testdir"; then
         log_error "Failed to create testdir"
         return 1
     fi
 
     # 4. Create nested file
     log_info "Creating testdir/nested.txt..."
-    if ! run_on_vm "$vm_a" "echo -n 'nested' > $MOUNT_POINT/testdir/nested.txt"; then
+    if ! ssh_run_password "$vm_a" "echo -n 'nested' > $GOCLUSTERFS_MOUNT/testdir/nested.txt"; then
         log_error "Failed to create nested file"
         return 1
     fi
 
     # Force sync
-    run_on_vm "$vm_a" "sync" 2>/dev/null || true
+    ssh_run_password "$vm_a" "sync" 2>/dev/null || true
 
     log_info "All operations complete, simulating crash..."
 
@@ -1016,7 +1040,7 @@ test_journal_crash_recovery_multiple_ops() {
     start_vm "$vm_a"
 
     # Wait for VM to come back
-    if ! wait_for_vm "$vm_a" 60; then
+    if ! wait_vm_healthy "$vm_a" 60; then
         log_error "VM $vm_a failed to come back after restart"
         return 1
     fi
@@ -1049,7 +1073,7 @@ test_journal_crash_recovery_multiple_ops() {
     log_info "file2.txt recovered successfully"
 
     # Verify testdir is a directory
-    if ! run_on_vm "$vm_a" "test -d $MOUNT_POINT/testdir"; then
+    if ! ssh_run_password "$vm_a" "test -d $GOCLUSTERFS_MOUNT/testdir"; then
         log_error "testdir not recovered as directory"
         return 1
     fi
@@ -1057,7 +1081,7 @@ test_journal_crash_recovery_multiple_ops() {
 
     # Verify nested file
     local nested_content
-    nested_content=$(run_on_vm "$vm_a" "cat $MOUNT_POINT/testdir/nested.txt" 2>/dev/null)
+    nested_content=$(ssh_run_password "$vm_a" "cat $GOCLUSTERFS_MOUNT/testdir/nested.txt" 2>/dev/null)
     if [[ "$nested_content" != "nested" ]]; then
         log_error "testdir/nested.txt content mismatch after crash recovery"
         log_error "Expected: 'nested', Got: '$nested_content'"
@@ -1075,6 +1099,9 @@ test_journal_crash_recovery_multiple_ops() {
 test_journal_crash_during_write() {
     log_info "Testing journal crash during active write operation..."
 
+    # Ensure VM 1 is running before test (may have been killed by previous test)
+    ensure_vm_running 1
+
     local vm_a=1
     local baseline_content="This file was created and synced before the crash"
 
@@ -1086,7 +1113,7 @@ test_journal_crash_during_write() {
     fi
 
     # Force sync to ensure baseline is committed to journal
-    run_on_vm "$vm_a" "sync" 2>/dev/null || true
+    ssh_run_password "$vm_a" "sync" 2>/dev/null || true
     sleep 1
 
     log_info "Baseline file created and synced"
@@ -1095,7 +1122,7 @@ test_journal_crash_during_write() {
     log_info "Starting rapid writes..."
     local write_count=0
     for i in $(seq 1 20); do
-        run_on_vm "$vm_a" "echo -n 'Rapid write $i' > $MOUNT_POINT/rapid_$(printf '%04d' $i).txt" 2>/dev/null &
+        ssh_run_password "$vm_a" "echo -n 'Rapid write $i' > $GOCLUSTERFS_MOUNT/rapid_$(printf '%04d' $i).txt" 2>/dev/null &
         ((write_count++))
     done
 
@@ -1116,7 +1143,7 @@ test_journal_crash_during_write() {
     start_vm "$vm_a"
 
     # Wait for VM to come back
-    if ! wait_for_vm "$vm_a" 60; then
+    if ! wait_vm_healthy "$vm_a" 60; then
         log_error "VM $vm_a failed to come back after restart"
         return 1
     fi
@@ -1139,11 +1166,11 @@ test_journal_crash_during_write() {
 
     # Count how many rapid files were recovered (some may be lost, which is expected)
     local recovered_count
-    recovered_count=$(run_on_vm "$vm_a" "ls $MOUNT_POINT 2>/dev/null | grep -c '^rapid_'" || echo "0")
+    recovered_count=$(ssh_run_password "$vm_a" "ls $GOCLUSTERFS_MOUNT 2>/dev/null | grep -c '^rapid_'" || echo "0")
     log_info "Recovered $recovered_count/$write_count rapid files (some in-flight writes may be lost, which is expected)"
 
     # The key assertion: filesystem is consistent (we can read/list without errors)
-    if ! run_on_vm "$vm_a" "ls -la $MOUNT_POINT" >/dev/null 2>&1; then
+    if ! ssh_run_password "$vm_a" "ls -la $GOCLUSTERFS_MOUNT" >/dev/null 2>&1; then
         log_error "Filesystem inconsistent after crash recovery"
         return 1
     fi
@@ -1267,6 +1294,9 @@ test_broadcast_invalidation() {
         return 0
     fi
 
+    # Ensure all VMs are running before test (may have been killed by previous test)
+    ensure_cluster_healthy 2
+
     local writer=1
     local reader=2
     local test_file="broadcast_test_$(date +%s).txt"
@@ -1330,6 +1360,9 @@ test_broadcast_directory_invalidation() {
         return 0
     fi
 
+    # Ensure all VMs are running before test (may have been killed by previous test)
+    ensure_cluster_healthy 2
+
     local writer=1
     local reader=2
     local test_file="broadcast_dir_test_$(date +%s).txt"
@@ -1385,6 +1418,9 @@ test_broadcast_multiple_updates() {
         log_warn "Skipping broadcast multiple updates test (requires 2+ VMs)"
         return 0
     fi
+
+    # Ensure all VMs are running before test (may have been killed by previous test)
+    ensure_cluster_healthy 2
 
     local writer=1
     local reader=2
@@ -1460,6 +1496,9 @@ test_broadcast_bidirectional() {
         return 0
     fi
 
+    # Ensure all VMs are running before test (may have been killed by previous test)
+    ensure_cluster_healthy 2
+
     local vm1=1
     local vm2=2
     local file_a="bidir_a_$(date +%s).txt"
@@ -1525,6 +1564,9 @@ test_broadcast_bidirectional() {
 # Test 4: Rolling restart
 test_rolling_restart() {
     log_info "Testing rolling restart..."
+
+    # Ensure all VMs are running before test (may have been killed by previous test)
+    ensure_cluster_healthy "$NODE_COUNT"
 
     # Write a file
     write_file_on_vm 1 "rolling_test.txt" "Rolling restart test"

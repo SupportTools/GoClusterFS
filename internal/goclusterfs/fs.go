@@ -363,7 +363,17 @@ func (f *FS) InitRoot(ctx context.Context) error {
 	}
 
 	// Write inode back
-	return f.inodeTbl.Write(ctx, rootIno)
+	if err := f.inodeTbl.Write(ctx, rootIno); err != nil {
+		return err
+	}
+
+	// CRITICAL: Update the cache with the freshly-initialized root inode.
+	// InitDirectory sets Size=BlockSize and allocates extent data.
+	// Without this, Readdir will get stale cached data with Size=0,
+	// causing it to return an empty directory listing.
+	f.cacheInode(rootIno)
+
+	return nil
 }
 
 // OnAdd is called when the filesystem is mounted.
@@ -625,8 +635,27 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 		return nil, nil, 0, syscall.EIO
 	}
 
-	dirIno.Mtime = now
-	f.inodeTbl.Write(ctx, dirIno)
+	// Update cache with freshly-created file inode
+	f.cacheInode(childIno)
+
+	// CRITICAL: Re-read parent directory inode before updating Mtime.
+	// dirMgr.Add() may have allocated a new block and updated extent fields.
+	// Only Size is copied back to dirIno; extent fields are stale.
+	// Writing the stale dirIno would overwrite the correct extent data on disk.
+	dirIno, err = f.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		log.Printf("[DEBUG] Create %q: Re-read root inode failed: %v", name, err)
+		// The file was created successfully, just log the error
+	} else {
+		dirIno.Mtime = now
+		f.inodeTbl.Write(ctx, dirIno)
+		// Update cache with parent directory inode
+		f.cacheInode(dirIno)
+		// Broadcast invalidation so other nodes refresh their directory cache
+		if f.cacheMgr != nil {
+			f.cacheMgr.BroadcastInvalidateInode(uint32(inode.InodeRoot), dirIno.DataGeneration, dirIno.MetaGeneration)
+		}
+	}
 
 	file := &File{fs: f, inodeNum: childIno.InodeNum}
 	ch := f.NewPersistentInode(ctx, file, fs.StableAttr{
@@ -753,9 +782,28 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 		return nil, syscall.EIO
 	}
 
-	dirIno.LinkCount++
-	dirIno.Mtime = now
-	f.inodeTbl.Write(ctx, dirIno)
+	// Update cache with freshly-initialized child directory inode
+	f.cacheInode(childIno)
+
+	// CRITICAL: Re-read parent directory inode before updating LinkCount/Mtime.
+	// dirMgr.Add() may have allocated a new block and updated extent fields.
+	// Only Size is copied back to dirIno; extent fields are stale.
+	// Writing the stale dirIno would overwrite the correct extent data on disk.
+	dirIno, err = f.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: Re-read root inode failed: %v", name, err)
+		// The child directory was created successfully, just log the error
+	} else {
+		dirIno.LinkCount++
+		dirIno.Mtime = now
+		f.inodeTbl.Write(ctx, dirIno)
+		// Update cache with parent directory inode
+		f.cacheInode(dirIno)
+		// Broadcast invalidation so other nodes refresh their directory cache
+		if f.cacheMgr != nil {
+			f.cacheMgr.BroadcastInvalidateInode(uint32(inode.InodeRoot), dirIno.DataGeneration, dirIno.MetaGeneration)
+		}
+	}
 
 	childDir := &Dir{fs: f, inodeNum: childIno.InodeNum}
 	ch := f.NewPersistentInode(ctx, childDir, fs.StableAttr{
@@ -1237,9 +1285,27 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 		return nil, nil, 0, syscall.EIO
 	}
 
-	// Update directory mtime
-	dirIno.Mtime = now
-	d.fs.inodeTbl.Write(ctx, dirIno)
+	// Update cache with freshly-created file inode
+	d.fs.cacheInode(childIno)
+
+	// CRITICAL: Re-read parent directory inode before updating Mtime.
+	// dirMgr.Add() may have allocated a new block and updated extent fields.
+	// Only Size is copied back to dirIno; extent fields are stale.
+	// Writing the stale dirIno would overwrite the correct extent data on disk.
+	dirIno, err = d.fs.inodeTbl.Read(d.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Create %q: Re-read parent inode %d failed: %v", name, d.inodeNum, err)
+		// The file was created successfully, just log the error
+	} else {
+		dirIno.Mtime = now
+		d.fs.inodeTbl.Write(ctx, dirIno)
+		// Update cache with parent directory inode
+		d.fs.cacheInode(dirIno)
+		// Broadcast invalidation so other nodes refresh their directory cache
+		if d.fs.cacheMgr != nil {
+			d.fs.cacheMgr.BroadcastInvalidateInode(uint32(d.inodeNum), dirIno.DataGeneration, dirIno.MetaGeneration)
+		}
+	}
 
 	// Create the file node
 	file := &File{fs: d.fs, inodeNum: childIno.InodeNum}
@@ -1424,10 +1490,30 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 		return nil, syscall.EIO
 	}
 
-	// Increment parent link count (for ..)
-	dirIno.LinkCount++
-	dirIno.Mtime = now
-	d.fs.inodeTbl.Write(ctx, dirIno)
+	// Update cache with freshly-initialized child directory inode
+	d.fs.cacheInode(childIno)
+
+	// CRITICAL: Re-read parent directory inode before updating LinkCount/Mtime.
+	// dirMgr.Add() may have allocated a new block and updated extent fields.
+	// Only Size is copied back to dirIno; extent fields are stale.
+	// Writing the stale dirIno would overwrite the correct extent data on disk.
+	dirIno, err = d.fs.inodeTbl.Read(d.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: Re-read parent inode %d failed: %v", name, d.inodeNum, err)
+		// The child directory was created successfully, just log the error
+		// and skip updating parent LinkCount/Mtime
+	} else {
+		// Increment parent link count (for ..)
+		dirIno.LinkCount++
+		dirIno.Mtime = now
+		d.fs.inodeTbl.Write(ctx, dirIno)
+		// Update cache with parent directory inode
+		d.fs.cacheInode(dirIno)
+		// Broadcast invalidation so other nodes refresh their directory cache
+		if d.fs.cacheMgr != nil {
+			d.fs.cacheMgr.BroadcastInvalidateInode(uint32(d.inodeNum), dirIno.DataGeneration, dirIno.MetaGeneration)
+		}
+	}
 
 	// Create the directory node
 	childDir := &Dir{fs: d.fs, inodeNum: childIno.InodeNum}
