@@ -1,4 +1,5 @@
 # Build artifacts
+goclusterfs
 goclusterfs-mount
 GoClusterFS
 
@@ -24,3 +25,4 @@ mount
 # VM test runtime artifacts
 tests/vm/runtime/
 tests/vm/results/
+fsck
