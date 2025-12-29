@@ -573,6 +573,38 @@ file_exists_on_vm() {
     ssh_run_password "$vm_id" "test -f ${GOCLUSTERFS_MOUNT}/$filename"
 }
 
+# Clean up test files from the GoClusterFS filesystem
+# This removes all files and directories from the mount point to reclaim disk space
+# Should be called before each test to ensure a clean state
+cleanup_test_files() {
+    local vm_id="${1:-1}"  # Default to VM 1 (shared filesystem, so only need to clean from one node)
+
+    log_info "Cleaning up test files from GoClusterFS..."
+
+    # Check if VM is reachable and GoClusterFS is mounted
+    if ! ssh_run_password "$vm_id" "mountpoint -q ${GOCLUSTERFS_MOUNT}" 2>/dev/null; then
+        log_warn "GoClusterFS not mounted on VM $vm_id, skipping cleanup"
+        return 0
+    fi
+
+    # Remove all files and directories from mount point
+    # Use find to avoid "argument list too long" errors with many files
+    # Also handles hidden files (.*) safely
+    ssh_run_password "$vm_id" "find ${GOCLUSTERFS_MOUNT} -mindepth 1 -delete 2>/dev/null || rm -rf ${GOCLUSTERFS_MOUNT}/* ${GOCLUSTERFS_MOUNT}/.[!.]* 2>/dev/null" || true
+
+    # Sync to ensure blocks are freed
+    ssh_run_password "$vm_id" "sync"
+
+    # Log free space for debugging
+    local free_space
+    free_space=$(ssh_run_password "$vm_id" "df -h ${GOCLUSTERFS_MOUNT} 2>/dev/null | tail -1 | awk '{print \$4}'" 2>/dev/null) || true
+    if [[ -n "$free_space" ]]; then
+        log_info "Free space after cleanup: $free_space"
+    fi
+
+    return 0
+}
+
 # =============================================================================
 # Cleanup
 # =============================================================================

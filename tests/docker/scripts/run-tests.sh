@@ -2,10 +2,33 @@
 # GoClusterFS Docker Test Runner
 # Orchestrates multi-node tests from within the orchestrator container
 
-set -e
-
 RESULTS_DIR="${RESULTS_DIR:-/results}"
 NODES="${NODES:-node1,node2,node3,node4}"
+
+# Ensure JUnit report is generated even on early failure
+generate_emergency_junit() {
+    local exit_code=$1
+    local error_message="${2:-Script terminated unexpectedly}"
+
+    # Only generate if no junit.xml exists yet
+    if [ ! -f "$RESULTS_DIR/junit.xml" ]; then
+        mkdir -p "$RESULTS_DIR"
+        cat > "$RESULTS_DIR/junit.xml" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="GoClusterFS Docker Multi-Node Tests" tests="1" failures="1" errors="0" skipped="0">
+  <testcase name="TestSetup" classname="docker.multinode">
+    <failure message="$error_message">Exit code: $exit_code</failure>
+  </testcase>
+</testsuite>
+EOF
+        echo "FAIL: TestSetup - $error_message" > "$RESULTS_DIR/results.txt"
+    fi
+}
+
+# Trap to generate JUnit on any exit
+trap 'generate_emergency_junit $? "Script exited with code $?"' EXIT
+
+set -e
 
 log() {
     echo "[Orchestrator] $(date '+%Y-%m-%d %H:%M:%S') $*"

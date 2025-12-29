@@ -55,6 +55,9 @@ run_test() {
     log_info "Running test: $test_name"
     log_info "=========================================="
 
+    # Clean up test files from previous test to reclaim disk space
+    cleanup_test_files 1
+
     if $test_func; then
         log_success "PASSED: $test_name"
         test_passed=$((test_passed + 1))
