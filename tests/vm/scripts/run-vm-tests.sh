@@ -1684,6 +1684,7 @@ test_power_failure() {
 # Test 7: O_DIRECT validation
 test_odirect_validation() {
     log_info "Testing O_DIRECT behavior..."
+    ensure_cluster_healthy 2
 
     # Write a file and verify O_DIRECT is being used
     # This test checks that cache coherency works correctly
@@ -1715,6 +1716,7 @@ test_odirect_validation() {
 # Test 8: Large file handling
 test_large_file() {
     log_info "Testing large file handling..."
+    ensure_cluster_healthy 2
 
     # Create a 1MB file (multiple blocks)
     local size_kb=1024
@@ -1741,6 +1743,7 @@ test_large_file() {
 # Creates 100+ files in a directory to test directory listing and metadata handling
 test_many_files() {
     log_info "Testing many files in directory..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local num_files=100
@@ -1801,6 +1804,7 @@ test_many_files() {
 # Creates deeply nested directory structure (a/b/c/d) with file at deepest level
 test_nested_directories() {
     log_info "Testing nested directory hierarchy..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local base_dir="/mnt/goclusterfs"
@@ -1854,6 +1858,7 @@ test_nested_directories() {
 # Creates an empty directory and removes it, verifying deletion
 test_delete_directory() {
     log_info "Testing delete empty directory..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local dirname="emptydir_test"
@@ -1893,6 +1898,7 @@ test_delete_directory() {
 # Creates a file and truncates it to a smaller size, verifying the operation
 test_truncate_file() {
     log_info "Testing file truncation..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local filename="truncate_test.txt"
@@ -1946,6 +1952,7 @@ test_truncate_file() {
 # Creates a file with initial content, appends more data, and verifies the combined result
 test_append_file() {
     log_info "Testing file append operation..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local filename="append_test.txt"
@@ -1995,6 +2002,7 @@ test_append_file() {
 # Note: Rename is not yet implemented in GoClusterFS - test skips if operation fails
 test_rename_file() {
     log_info "Testing file rename operation..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local oldname="oldname.txt"
@@ -2053,6 +2061,7 @@ test_rename_file() {
 # Rapidly creates, reads, verifies, and deletes files to stress test the filesystem
 test_stress_single_node() {
     log_info "Running single-node stress test..."
+    ensure_cluster_healthy 2
 
     local vm_id=1
     local iterations=100  # Reduced from Go's 200 for faster test execution
@@ -2115,6 +2124,7 @@ test_stress_single_node() {
 # Based on Go TestMultiNodeConcurrentDirectoryOps which creates files not directories
 test_concurrent_directory_ops() {
     log_info "Testing concurrent directory operations across VMs..."
+    ensure_cluster_healthy 2
 
     # Need at least 2 VMs for this test
     if [[ $NODE_COUNT -lt 2 ]]; then
@@ -2218,6 +2228,7 @@ test_stability() {
     fi
 
     log_info "Running stability test for ${STABILITY_DURATION_MINUTES} minutes..."
+    ensure_cluster_healthy 2
 
     local end_time=$((SECONDS + STABILITY_DURATION_MINUTES * 60))
     local iteration=0
@@ -2271,6 +2282,7 @@ test_stability() {
 # Test 10: Two VMs write to same file at different offsets
 test_concurrent_same_file_writes() {
     log_info "Testing concurrent same-file writes (2 VMs)..."
+    ensure_cluster_healthy 2
 
     local filename="samefile_2vm.txt"
     local chunk_size=$((400 * 1024))  # 400KB each
@@ -2314,6 +2326,7 @@ test_concurrent_same_file_writes() {
 # Test 11: Three VMs write to same file at different offsets
 test_concurrent_same_file_writes_3vms() {
     log_info "Testing concurrent same-file writes (3 VMs)..."
+    ensure_cluster_healthy 3
 
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
@@ -2361,6 +2374,7 @@ test_concurrent_same_file_writes_3vms() {
 # Test 12: Mixed size writes - one within file, one extending
 test_mixed_size_writes() {
     log_info "Testing mixed size writes..."
+    ensure_cluster_healthy 2
 
     local filename="mixed_writes.txt"
     local initial_size=$((500 * 1024))  # 500KB initial
@@ -2403,6 +2417,7 @@ test_mixed_size_writes() {
 # Test 13: Overlapping block writes (all within same 1MB block)
 test_overlapping_block_writes() {
     log_info "Testing overlapping block writes..."
+    ensure_cluster_healthy 3
 
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
@@ -2450,6 +2465,7 @@ test_overlapping_block_writes() {
 # Test 14: Write stress test - multiple rounds
 test_concurrent_write_stress() {
     log_info "Testing concurrent write stress (multiple rounds)..."
+    ensure_cluster_healthy 3
 
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
@@ -2500,6 +2516,7 @@ test_concurrent_write_stress() {
 # Test 15: Reversed write order (high offset first)
 test_reversed_write_order() {
     log_info "Testing reversed write order..."
+    ensure_cluster_healthy 2
 
     local filename="reversed_order.txt"
     local chunk_size=$((400 * 1024))  # 400KB each
@@ -2536,6 +2553,7 @@ test_reversed_write_order() {
 # Test 16: Power failure during concurrent writes
 test_concurrent_writes_power_failure() {
     log_info "Testing power failure during concurrent writes..."
+    ensure_cluster_healthy 2
 
     local filename="concurrent_power_fail.txt"
     local chunk_size=$((400 * 1024))  # 400KB each
