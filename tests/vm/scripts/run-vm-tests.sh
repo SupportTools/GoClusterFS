@@ -705,8 +705,10 @@ test_journal_recovery_large_file() {
     sleep 2
 
     # Phase 3: Wait for heartbeat to become stale
-    log_info "Phase 3: Waiting for heartbeat timeout (25s)..."
-    sleep 25
+    # Theoretical minimum: 20s (stale detection) + 5s (scan interval) = 25s
+    # Adding margin for: clock skew, recovery processing, filesystem sync
+    log_info "Phase 3: Waiting for heartbeat timeout and recovery (40s)..."
+    sleep 40
 
     # Phase 4: Verify large file is recovered on VM B
     log_info "Phase 4: Verifying large file recovery on VM B..."
