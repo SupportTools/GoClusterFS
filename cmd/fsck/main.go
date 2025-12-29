@@ -159,9 +159,9 @@ func printPhases() {
 	fmt.Println("GoClusterFS fsck phases:")
 	fmt.Println()
 	phases := []struct {
-		num   int
-		name  string
-		desc  string
+		num  int
+		name string
+		desc string
 	}{
 		{1, "Superblock", "Validates magic, version, region bounds, checksum"},
 		{2, "Bitmap", "Checks sector checksums, counts allocated blocks"},
