@@ -20,9 +20,9 @@ const (
 	InodeMagic uint32 = 0x494E4F44 // "INOD"
 
 	// Reserved inodes
-	InodeInvalid     uint32 = 0 // Invalid/marker
-	InodeBadBlocks   uint32 = 1 // Bad block list
-	InodeRoot        uint32 = 2 // Root directory
+	InodeInvalid   uint32 = 0 // Invalid/marker
+	InodeBadBlocks uint32 = 1 // Bad block list
+	InodeRoot      uint32 = 2 // Root directory
 
 	// File type masks
 	S_IFMT   uint16 = 0o170000 // File type mask

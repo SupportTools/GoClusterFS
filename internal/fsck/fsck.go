@@ -92,12 +92,12 @@ func (s Severity) String() string {
 
 // Problem represents a single consistency issue found during checking.
 type Problem struct {
-	Phase    Phase    // Which phase found the problem
-	Severity Severity // How serious the problem is
-	Location string   // Where the problem was found (e.g., "inode 42")
-	Message  string   // Description of the problem
-	Repairable bool   // Whether the problem can be automatically repaired
-	Repaired   bool   // Whether the problem was repaired (if Mode == Repair)
+	Phase      Phase    // Which phase found the problem
+	Severity   Severity // How serious the problem is
+	Location   string   // Where the problem was found (e.g., "inode 42")
+	Message    string   // Description of the problem
+	Repairable bool     // Whether the problem can be automatically repaired
+	Repaired   bool     // Whether the problem was repaired (if Mode == Repair)
 }
 
 func (p Problem) String() string {
@@ -175,17 +175,17 @@ type Result struct {
 	RepairedCount int
 
 	// Structure counts (discovered during check)
-	TotalBlocks      uint64
-	AllocatedBlocks  uint64
-	FreeBlocks       uint64
-	TotalInodes      uint64
-	UsedInodes       uint64
-	FreeInodes       uint64
-	DirectoryCount   uint64
-	FileCount        uint64
-	SnapshotCount    uint32
-	OrphanedInodes   uint64
-	OrphanedBlocks   uint64
+	TotalBlocks     uint64
+	AllocatedBlocks uint64
+	FreeBlocks      uint64
+	TotalInodes     uint64
+	UsedInodes      uint64
+	FreeInodes      uint64
+	DirectoryCount  uint64
+	FileCount       uint64
+	SnapshotCount   uint32
+	OrphanedInodes  uint64
+	OrphanedBlocks  uint64
 }
 
 // AddProblem adds a new problem to the result.
@@ -320,34 +320,34 @@ func DefaultOptions() Options {
 
 // Checker performs filesystem consistency checks.
 type Checker struct {
-	dev     *storage.Device
-	opts    Options
-	result  *Result
+	dev    *storage.Device
+	opts   Options
+	result *Result
 
 	// Parsed superblock (set after Phase 1)
 	sbData *SuperblockData
 
 	// Collected data for cross-validation
-	bitmapAllocated   map[uint64]bool // blocks marked allocated in bitmap
-	inodeBlocks       map[uint64]int  // block -> reference count from inodes
-	inodeUsed         map[uint32]bool // inode numbers that are in use
-	dirEntryRefs      map[uint32]int  // inode -> reference count from dir entries
-	refcountEntries   map[uint64]uint32 // block -> refcount from table
-	snapshotInodes    map[uint32]bool // inodes referenced by snapshots
+	bitmapAllocated map[uint64]bool   // blocks marked allocated in bitmap
+	inodeBlocks     map[uint64]int    // block -> reference count from inodes
+	inodeUsed       map[uint32]bool   // inode numbers that are in use
+	dirEntryRefs    map[uint32]int    // inode -> reference count from dir entries
+	refcountEntries map[uint64]uint32 // block -> refcount from table
+	snapshotInodes  map[uint32]bool   // inodes referenced by snapshots
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
 type SuperblockData struct {
-	Magic           [12]byte
-	Version         uint32
-	UUID            [16]byte
-	FeatureFlags    uint64
-	RequiredFlags   uint64
-	BlockSize       uint32
-	TotalBlocks     uint64
-	MetaBlockSize   uint32
-	MaxNodes        uint32
-	InodeSize       uint32
+	Magic         [12]byte
+	Version       uint32
+	UUID          [16]byte
+	FeatureFlags  uint64
+	RequiredFlags uint64
+	BlockSize     uint32
+	TotalBlocks   uint64
+	MetaBlockSize uint32
+	MaxNodes      uint32
+	InodeSize     uint32
 
 	// Region offsets
 	NodeRegistryOffset  uint64
