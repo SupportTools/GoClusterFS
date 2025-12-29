@@ -431,11 +431,11 @@ scenarios:
 
   - id: journal-crash-during-write
     name: Crash during write
-    description: System recovers from crash mid-write
-    priority: high
+    description: System recovers from crash mid-write (requires accurate crash simulation)
+    priority: vm_only  # Docker kill doesn't accurately simulate power failure
     environments:
       go: journal_test.go::TestJournalCrashDuringWrite
-      docker: run-tests.sh::test_journal_crash_during_write
+      docker: SKIPPED  # Docker kill doesn't accurately simulate power failure
       vm: run-vm-tests.sh::test_journal_crash_during_write
 
   - id: journal-disabled

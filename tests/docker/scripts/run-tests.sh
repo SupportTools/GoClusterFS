@@ -2565,7 +2565,12 @@ run_test "Journal Recovery Idempotency" test_journal_recovery_idempotency
 run_test "Journal Crash Recovery File" test_journal_crash_recovery_file
 run_test "Journal Crash Recovery Directory" test_journal_crash_recovery_directory
 run_test "Journal Crash Recovery Multiple Ops" test_journal_crash_recovery_multiple_ops
-run_test "Journal Crash During Write" test_journal_crash_during_write
+# Skip "Journal Crash During Write" in Docker - docker kill doesn't accurately simulate power failure
+# This test is covered by VM tests which use QEMU SIGKILL for accurate crash simulation
+# See: tests/vm/scripts/run-vm-tests.sh:1104 test_journal_crash_during_write
+log "SKIPPING: Journal Crash During Write (covered by VM tests)"
+echo "SKIP: Journal Crash During Write" >> "$RESULTS_DIR/results.txt"
+
 run_test "Network Partition" test_network_partition
 run_test "Broadcast Invalidation" test_broadcast_invalidation
 run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
