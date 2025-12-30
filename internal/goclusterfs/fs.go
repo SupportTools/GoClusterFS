@@ -1883,9 +1883,15 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 
 // Read reads file data.
 func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	// Read directly from disk to get fresh inode state.
-	// In multi-node scenarios, another node may have updated the inode.
-	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	// Use cached inode with validation for better performance.
+	// The cache manager handles TTL-based staleness checks and generation
+	// counter validation, automatically refreshing stale entries from disk.
+	// This is safe in multi-node scenarios because:
+	// - Cache entries have TTL-based expiry (default 5s)
+	// - Generation counters detect modifications by other nodes
+	// - Lock acquisition triggers cache invalidation
+	// - Broadcast invalidation propagates changes between nodes
+	ino, err := f.fs.getInode(f.inodeNum)
 	if err != nil {
 		log.Printf("[DEBUG] Read inode %d: Read failed: %v", f.inodeNum, err)
 		return nil, syscall.EIO
