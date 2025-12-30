@@ -3,6 +3,7 @@ package journal
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -16,8 +17,12 @@ type Config struct {
 
 	// CommitMode controls when journal writes are synced.
 	// Sync mode (default) fsyncs after every commit for maximum safety.
-	// Async mode batches syncs for better performance.
+	// Async mode skips syncs entirely (use only for testing).
+	// Batch mode groups syncs for better performance with durability.
 	CommitMode CommitMode
+
+	// BatchConfig controls batch commit behavior when CommitMode is CommitBatch.
+	BatchConfig BatchConfig
 
 	// CheckpointInterval is how often to checkpoint completed transactions.
 	// Default: 5 seconds
@@ -33,19 +38,46 @@ type CommitMode int
 
 const (
 	// CommitSync fsyncs journal after every transaction commit.
-	// Safest mode - guarantees durability.
+	// Safest mode - guarantees durability but highest latency.
 	CommitSync CommitMode = iota
 
-	// CommitAsync batches journal syncs for better performance.
-	// Transactions may be lost on crash between syncs.
+	// CommitAsync skips journal syncs entirely for maximum performance.
+	// WARNING: Transactions may be lost on crash. Use only for testing
+	// or when durability is not required.
 	CommitAsync
+
+	// CommitBatch groups journal syncs for better performance while
+	// still providing durability guarantees within a time window.
+	// Syncs occur when MaxBatchTransactions is reached OR MaxBatchAge
+	// expires, whichever comes first.
+	CommitBatch
 )
+
+// BatchConfig controls batch commit behavior when CommitMode is CommitBatch.
+type BatchConfig struct {
+	// MaxBatchTransactions triggers a sync after this many uncommitted transactions.
+	// Default: 32
+	MaxBatchTransactions int
+
+	// MaxBatchAge triggers a sync after this duration since first uncommitted transaction.
+	// Default: 100ms
+	MaxBatchAge time.Duration
+}
+
+// DefaultBatchConfig returns the default batch commit configuration.
+func DefaultBatchConfig() BatchConfig {
+	return BatchConfig{
+		MaxBatchTransactions: 32,
+		MaxBatchAge:          100 * time.Millisecond,
+	}
+}
 
 // DefaultConfig returns the default journal configuration.
 func DefaultConfig() Config {
 	return Config{
 		SlotSize:           DefaultJournalSlotSize,
 		CommitMode:         CommitSync,
+		BatchConfig:        DefaultBatchConfig(),
 		CheckpointInterval: 5 * time.Second,
 		FullThreshold:      75,
 	}
@@ -75,9 +107,19 @@ type Journal struct {
 	checkpointWg   sync.WaitGroup
 	stopOnce       sync.Once // Ensures Stop() is idempotent
 
+	// Batch commit tracking (for CommitBatch mode)
+	batchMu            sync.Mutex      // Protects batch state
+	batchPendingCount  int             // Number of commits since last sync
+	batchFirstCommit   time.Time       // Time of first commit in current batch
+	batchSyncCond      *sync.Cond      // Signals waiting goroutines when batch syncs
+	batchSyncTimer     *time.Timer     // Timer for MaxBatchAge
+	batchSyncInFlight  bool            // True if a batch sync is in progress
+	batchSyncWaiters   []chan struct{} // Channels waiting for current batch sync
+
 	// Metrics
 	commitCount  uint64
 	bytesWritten uint64
+	batchSyncs   uint64 // Number of batch syncs performed
 }
 
 // ActiveTxn tracks an in-progress transaction.
@@ -103,6 +145,7 @@ func Open(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: region.Superblock().LastCheckpointSeq,
 	}
+	j.batchSyncCond = sync.NewCond(&j.batchMu)
 
 	return j, nil
 }
@@ -123,6 +166,7 @@ func Init(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: 0,
 	}
+	j.batchSyncCond = sync.NewCond(&j.batchMu)
 
 	return j, nil
 }
@@ -138,6 +182,11 @@ func (j *Journal) Start() {
 func (j *Journal) Stop() error {
 	var stopErr error
 	j.stopOnce.Do(func() {
+		// Flush any pending batch commits before stopping
+		if j.config.CommitMode == CommitBatch {
+			j.flushBatch()
+		}
+
 		close(j.checkpointStop)
 		j.checkpointWg.Wait()
 
@@ -235,22 +284,24 @@ func (j *Journal) Begin() *Transaction {
 // Returns the transaction sequence number for use with CompleteIntent().
 func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	j.mu.Lock()
-	defer j.mu.Unlock()
 
 	seq := txn.Seq()
 
 	// Verify this transaction belongs to us
 	active, ok := j.activeTxns[seq]
 	if !ok {
+		j.mu.Unlock()
 		return 0, fmt.Errorf("transaction %d not found in active set", seq)
 	}
 	if active.txn != txn {
+		j.mu.Unlock()
 		return 0, fmt.Errorf("transaction %d mismatch", seq)
 	}
 
 	// Serialize the transaction
 	data, err := txn.Serialize()
 	if err != nil {
+		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to serialize transaction: %w", err)
 	}
 
@@ -259,10 +310,12 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	if uint32(len(data)) > available {
 		// Try to force checkpoint to free space
 		if err := j.forceCheckpoint(); err != nil {
+			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
 		available = j.region.AvailableSpace()
 		if uint32(len(data)) > available {
+			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
 	}
@@ -270,6 +323,7 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// Mark journal dirty before writing
 	if j.region.State() == JournalStateClean {
 		if err := j.region.MarkDirty(); err != nil {
+			j.mu.Unlock()
 			return 0, fmt.Errorf("failed to mark journal dirty: %w", err)
 		}
 	}
@@ -277,9 +331,11 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// Write to ring buffer
 	written, err := j.region.WriteAt(data)
 	if err != nil {
+		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to write transaction: %w", err)
 	}
 	if written != uint32(len(data)) {
+		j.mu.Unlock()
 		return 0, fmt.Errorf("short write: %d < %d", written, len(data))
 	}
 
@@ -287,18 +343,12 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// This is CRITICAL for crash consistency - the tail offset must be
 	// persisted so recovery can find the transaction data.
 	if err := j.region.FlushSuperblock(); err != nil {
+		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to flush superblock: %w", err)
 	}
 
-	// COMMIT POINT - sync to disk
-	// After this barrier, the transaction is guaranteed durable.
-	if j.config.CommitMode == CommitSync {
-		if err := j.region.Sync(); err != nil {
-			return 0, fmt.Errorf("failed to sync journal: %w", err)
-		}
-	}
-
-	// Update metrics
+	// Update metrics and state BEFORE releasing lock
+	// This is safe because the journal data is already written
 	j.commitCount++
 	j.bytesWritten += uint64(written)
 
@@ -308,6 +358,29 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// Update oldest active
 	if seq == j.oldestActiveSeq {
 		j.updateOldestActive()
+	}
+
+	// Release lock BEFORE sync operations to avoid deadlock
+	// The sync operations (CommitSync/CommitBatch) may need to acquire
+	// other locks, so we must not hold j.mu during sync.
+	j.mu.Unlock()
+
+	// COMMIT POINT - sync to disk
+	// After this barrier, the transaction is guaranteed durable.
+	switch j.config.CommitMode {
+	case CommitSync:
+		// Sync immediately for maximum durability
+		if err := j.region.Sync(); err != nil {
+			return 0, fmt.Errorf("failed to sync journal: %w", err)
+		}
+	case CommitBatch:
+		// Batch mode: wait for periodic sync, reducing fsync frequency
+		// This amortizes fsync cost across multiple commits
+		if err := j.waitForBatchSync(); err != nil {
+			return 0, fmt.Errorf("failed batch sync: %w", err)
+		}
+	case CommitAsync:
+		// No sync - fastest but no durability guarantee
 	}
 
 	return seq, nil
@@ -324,6 +397,92 @@ func (j *Journal) Abort(txn *Transaction) {
 	if seq == j.oldestActiveSeq {
 		j.updateOldestActive()
 	}
+}
+
+// waitForBatchSync adds the caller to the batch and waits for sync.
+// Called by Commit() when in CommitBatch mode.
+// NOTE: Must NOT hold j.mu when calling this (releases j.mu before calling).
+func (j *Journal) waitForBatchSync() error {
+	j.batchMu.Lock()
+
+	// Track this commit in the batch
+	j.batchPendingCount++
+	isFirstInBatch := j.batchPendingCount == 1
+
+	// Start timer on first commit in batch
+	if isFirstInBatch {
+		j.batchFirstCommit = time.Now()
+		j.scheduleBatchTimer()
+	}
+
+	// Check if we should trigger immediate sync (hit transaction limit)
+	shouldSync := j.batchPendingCount >= j.config.BatchConfig.MaxBatchTransactions
+
+	if shouldSync {
+		// We hit the limit - perform sync now
+		j.batchMu.Unlock()
+		return j.flushBatch()
+	}
+
+	// Create a channel to wait on
+	waitCh := make(chan struct{})
+	j.batchSyncWaiters = append(j.batchSyncWaiters, waitCh)
+	j.batchMu.Unlock()
+
+	// Wait for batch sync to complete
+	<-waitCh
+	return nil
+}
+
+// scheduleBatchTimer starts a timer to trigger batch sync after MaxBatchAge.
+// Must be called with batchMu held.
+func (j *Journal) scheduleBatchTimer() {
+	if j.batchSyncTimer != nil {
+		j.batchSyncTimer.Stop()
+	}
+
+	j.batchSyncTimer = time.AfterFunc(j.config.BatchConfig.MaxBatchAge, func() {
+		j.flushBatch()
+	})
+}
+
+// flushBatch performs the actual sync and notifies all waiting goroutines.
+// This is called either by the timer (MaxBatchAge) or when hitting MaxBatchTransactions.
+func (j *Journal) flushBatch() error {
+	j.batchMu.Lock()
+
+	// Nothing to flush
+	if j.batchPendingCount == 0 {
+		j.batchMu.Unlock()
+		return nil
+	}
+
+	// Stop timer if running
+	if j.batchSyncTimer != nil {
+		j.batchSyncTimer.Stop()
+		j.batchSyncTimer = nil
+	}
+
+	// Capture waiters and reset batch state
+	waiters := j.batchSyncWaiters
+	j.batchSyncWaiters = nil
+	j.batchPendingCount = 0
+	j.batchFirstCommit = time.Time{}
+
+	j.batchMu.Unlock()
+
+	// Perform the actual sync (outside of lock)
+	err := j.region.Sync()
+
+	// Update metrics atomically (avoid acquiring j.mu which could cause contention)
+	atomic.AddUint64(&j.batchSyncs, 1)
+
+	// Notify all waiters
+	for _, ch := range waiters {
+		close(ch)
+	}
+
+	return err
 }
 
 // CompleteIntent writes an intent completion record to the journal.
@@ -465,6 +624,7 @@ func (j *Journal) Stats() JournalStats {
 		CommitCount:       j.commitCount,
 		BytesWritten:      j.bytesWritten,
 		LastCheckpointSeq: j.lastCheckpointSeq,
+		BatchSyncCount:    atomic.LoadUint64(&j.batchSyncs),
 	}
 }
 
@@ -478,6 +638,7 @@ type JournalStats struct {
 	CommitCount       uint64
 	BytesWritten      uint64
 	LastCheckpointSeq uint64
+	BatchSyncCount    uint64 // Number of batch syncs (CommitBatch mode only)
 }
 
 // Region returns the underlying journal region.

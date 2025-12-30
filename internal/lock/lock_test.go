@@ -499,3 +499,120 @@ func BenchmarkHashToRecord(b *testing.B) {
 		_ = mgr.hashToRecord(LockTypeInode, uint64(i))
 	}
 }
+
+// TestHintCacheOptimisticAcquire tests that the hint cache enables
+// optimistic lock acquisition after release.
+func TestHintCacheOptimisticAcquire(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+
+	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Initially, no hint cache hits (cache is empty)
+	hits, misses, _ := mgr.HintStats()
+	if hits != 0 || misses != 0 {
+		t.Errorf("initial stats should be zero: hits=%d, misses=%d", hits, misses)
+	}
+
+	// Acquire and release a lock - this populates the hint cache
+	err := mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
+	if err != nil {
+		t.Fatalf("first Acquire failed: %v", err)
+	}
+	err = mgr.Release(LockTypeInode, 100)
+	if err != nil {
+		t.Fatalf("first Release failed: %v", err)
+	}
+
+	// Second acquire should use the hint cache (optimistic path)
+	err = mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
+	if err != nil {
+		t.Fatalf("second Acquire failed: %v", err)
+	}
+	err = mgr.Release(LockTypeInode, 100)
+	if err != nil {
+		t.Fatalf("second Release failed: %v", err)
+	}
+
+	// Check that we had at least one hint hit
+	hits, misses, hitRate := mgr.HintStats()
+	t.Logf("Hint cache stats: hits=%d, misses=%d, hitRate=%.2f", hits, misses, hitRate)
+
+	// The second acquire should have hit the cache (sequence was correct)
+	if hits == 0 {
+		t.Error("expected at least one hint cache hit after release and re-acquire")
+	}
+}
+
+// TestHintCacheStats tests the HintStats method.
+func TestHintCacheStats(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+
+	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
+
+	// Test initial stats
+	hits, misses, hitRate := mgr.HintStats()
+	if hits != 0 || misses != 0 || hitRate != 0 {
+		t.Errorf("initial: hits=%d, misses=%d, rate=%.2f, want all zero", hits, misses, hitRate)
+	}
+}
+
+// BenchmarkLockAcquireRelease measures lock cycle time with hint cache.
+func BenchmarkLockAcquireRelease(b *testing.B) {
+	dev, cleanup := createTestDevice(b, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+
+	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
+
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mgr.Acquire(ctx, LockTypeInode, uint64(i%1000), LockModeExclusive)
+		mgr.Release(LockTypeInode, uint64(i%1000))
+	}
+	b.StopTimer()
+
+	hits, misses, hitRate := mgr.HintStats()
+	b.Logf("Hint cache: hits=%d, misses=%d, hitRate=%.2f", hits, misses, hitRate)
+}
+
+// BenchmarkLockRepeatedAcquire measures repeated access to same lock (hint cache hot path).
+func BenchmarkLockRepeatedAcquire(b *testing.B) {
+	dev, cleanup := createTestDevice(b, 10<<20)
+	defer cleanup()
+
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+
+	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
+
+	ctx := context.Background()
+
+	// Warm up the hint cache with one cycle
+	mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
+	mgr.Release(LockTypeInode, 100)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
+		mgr.Release(LockTypeInode, 100)
+	}
+	b.StopTimer()
+
+	hits, misses, hitRate := mgr.HintStats()
+	b.Logf("Hint cache (repeated lock 100): hits=%d, misses=%d, hitRate=%.2f", hits, misses, hitRate)
+}

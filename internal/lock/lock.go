@@ -20,6 +20,7 @@ package lock
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -67,6 +69,11 @@ const (
 
 	// StaleThreshold is how old a lock must be to consider it stale.
 	StaleThreshold = 15 * time.Second
+
+	// HintCacheSize is the default capacity for the sequence hint cache.
+	// The cache stores expected sequence numbers to enable optimistic lock
+	// acquisition, saving one disk read when the hint is correct.
+	HintCacheSize = 4096
 )
 
 // LockType identifies what kind of resource is being locked.
@@ -120,6 +127,75 @@ const RecordMagic uint32 = 0x4C4F434B // "LOCK"
 // the specific resource (e.g., inode number), mode indicates shared/exclusive.
 type OnAcquireFunc func(lockType LockType, resourceID uint64, mode LockMode)
 
+// hintLRU is a simple LRU cache for lock sequence hints.
+// It's embedded in the lock package to avoid import cycles with cache package.
+type hintLRU struct {
+	mu       sync.Mutex
+	capacity int
+	items    map[uint64]*list.Element
+	order    *list.List
+}
+
+type hintEntry struct {
+	key   uint64
+	value *lockHint
+}
+
+func newHintLRU(capacity int) *hintLRU {
+	return &hintLRU{
+		capacity: capacity,
+		items:    make(map[uint64]*list.Element),
+		order:    list.New(),
+	}
+}
+
+func (c *hintLRU) Put(key uint64, value *lockHint) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.items[key]; ok {
+		// Update existing
+		c.order.MoveToFront(elem)
+		elem.Value.(*hintEntry).value = value
+		return
+	}
+
+	// Evict oldest if at capacity
+	if c.order.Len() >= c.capacity {
+		oldest := c.order.Back()
+		if oldest != nil {
+			c.order.Remove(oldest)
+			delete(c.items, oldest.Value.(*hintEntry).key)
+		}
+	}
+
+	// Add new entry
+	entry := &hintEntry{key: key, value: value}
+	elem := c.order.PushFront(entry)
+	c.items[key] = elem
+}
+
+// Peek returns the value without updating LRU order.
+func (c *hintLRU) Peek(key uint64) (*lockHint, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if elem, ok := c.items[key]; ok {
+		return elem.Value.(*hintEntry).value, true
+	}
+	return nil, false
+}
+
+// lockHint stores cached sequence numbers for optimistic lock acquisition.
+// When we release a lock, we know the new sequence number. On the next
+// acquire attempt, we can try using that cached sequence directly, saving
+// one disk read if no other node modified the record.
+type lockHint struct {
+	Sequence uint64    // Expected sequence number
+	Mode     LockMode  // Last known mode (None, Shared, Exclusive)
+	UpdateAt time.Time // When this hint was last updated
+}
+
 // Manager handles distributed lock operations.
 type Manager struct {
 	mu        sync.Mutex
@@ -132,6 +208,17 @@ type Manager struct {
 
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
+
+	// Hint cache for optimistic lock acquisition.
+	// Stores expected sequence numbers indexed by recordID.
+	// When a lock is released, we cache the new sequence number.
+	// On the next acquire, we can try an optimistic CAS using
+	// the cached sequence, saving one disk read if correct.
+	hintCache *hintLRU
+
+	// Metrics for hint cache effectiveness
+	hintHits   uint64 // Optimistic acquires that succeeded
+	hintMisses uint64 // Optimistic acquires that failed (fell back to read)
 }
 
 type lockKey struct {
@@ -164,6 +251,21 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		nodeUUID:  nodeUUID,
 		nodeSlot:  nodeSlot,
 		heldLocks: make(map[lockKey]*heldLock),
+		hintCache: newHintLRU(HintCacheSize),
+	}
+}
+
+// NewManagerWithHintCacheSize creates a lock manager with a custom hint cache size.
+// Use this for testing or when you need to tune the cache size.
+func NewManagerWithHintCacheSize(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nodeSlot int, hintCacheSize int) *Manager {
+	return &Manager{
+		dev:       dev,
+		offset:    offset,
+		size:      size,
+		nodeUUID:  nodeUUID,
+		nodeSlot:  nodeSlot,
+		heldLocks: make(map[lockKey]*heldLock),
+		hintCache: newHintLRU(hintCacheSize),
 	}
 }
 
@@ -177,6 +279,20 @@ func (m *Manager) SetOnAcquire(fn OnAcquireFunc) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onAcquire = fn
+}
+
+// HintStats returns statistics about the hint cache effectiveness.
+// hits = optimistic acquires that succeeded (saved one disk read)
+// misses = optimistic acquires that failed (fell back to normal path)
+// hitRate = hits / (hits + misses), or 0 if no attempts
+func (m *Manager) HintStats() (hits, misses uint64, hitRate float64) {
+	hits = atomic.LoadUint64(&m.hintHits)
+	misses = atomic.LoadUint64(&m.hintMisses)
+	total := hits + misses
+	if total > 0 {
+		hitRate = float64(hits) / float64(total)
+	}
+	return
 }
 
 // Acquire attempts to acquire a lock with the given parameters.
@@ -346,8 +462,36 @@ func (m *Manager) Release(lockType LockType, resourceID uint64) error {
 }
 
 // tryAcquire attempts a single lock acquisition.
+// First tries an optimistic path using cached sequence hints, then falls back
+// to reading the current record if the hint is stale.
 func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint64, mode LockMode) (bool, error) {
-	// Read current record
+	// Try optimistic path first if we have a hint
+	if hint, ok := m.hintCache.Peek(recordID); ok {
+		// Only use hint if the lock was free (Mode == None)
+		// For held locks, we need to read current state to check conditions
+		if hint.Mode == LockModeNone {
+			acquired, newSeq, err := m.tryAcquireOptimistic(recordID, lockType, resourceID, mode, hint.Sequence)
+			if err != nil {
+				return false, err
+			}
+			if acquired {
+				// Update hint with new sequence
+				m.hintCache.Put(recordID, &lockHint{
+					Sequence: newSeq,
+					Mode:     mode,
+					UpdateAt: time.Now(),
+				})
+				atomic.AddUint64(&m.hintHits, 1)
+				log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - optimistic acquire SUCCESS", lockType, resourceID)
+				return true, nil
+			}
+			// Optimistic failed - sequence was wrong, fall through to normal path
+			atomic.AddUint64(&m.hintMisses, 1)
+			log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - optimistic acquire FAILED, falling back", lockType, resourceID)
+		}
+	}
+
+	// Normal path: read current record
 	record, err := m.readRecord(recordID)
 	if err != nil {
 		return false, err
@@ -411,10 +555,57 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	}
 
 	// CAS the record
-	return m.casRecord(recordID, record, newRecord)
+	acquired, err := m.casRecord(recordID, record, newRecord)
+	if err != nil {
+		return false, err
+	}
+
+	if acquired {
+		// Update hint cache with new sequence
+		m.hintCache.Put(recordID, &lockHint{
+			Sequence: newRecord.Sequence,
+			Mode:     mode,
+			UpdateAt: time.Now(),
+		})
+	}
+
+	return acquired, nil
+}
+
+// tryAcquireOptimistic attempts to acquire a lock using a cached sequence hint.
+// This saves one disk read when the hint is correct (common case for uncontended locks).
+// Returns: (acquired, newSequence, error)
+func (m *Manager) tryAcquireOptimistic(recordID uint64, lockType LockType, resourceID uint64, mode LockMode, expectedSeq uint64) (bool, uint64, error) {
+	now := time.Now()
+	newSeq := expectedSeq + 1
+
+	// Prepare new record assuming lock is free
+	newRecord := &Record{
+		Magic:       RecordMagic,
+		Type:        lockType,
+		Mode:        mode,
+		ResourceID:  resourceID,
+		OwnerUUID:   m.nodeUUID,
+		OwnerSlot:   uint32(m.nodeSlot),
+		AcquireTime: now.Unix(),
+		Sequence:    newSeq,
+	}
+	if mode == LockModeShared {
+		newRecord.SharedCount = 1
+	}
+
+	// Try direct CAS with expected sequence
+	acquired, err := m.casRecordOptimistic(recordID, expectedSeq, newRecord)
+	if err != nil {
+		return false, 0, err
+	}
+
+	return acquired, newSeq, nil
 }
 
 // releaseRecord releases a lock record.
+// After successful release, caches the new sequence number to enable
+// optimistic acquisition on the next lock attempt.
 func (m *Manager) releaseRecord(recordID uint64) error {
 	record, err := m.readRecord(recordID)
 	if err != nil {
@@ -428,8 +619,19 @@ func (m *Manager) releaseRecord(recordID uint64) error {
 			newRecord := *record
 			newRecord.SharedCount--
 			newRecord.Sequence++
-			_, err := m.casRecord(recordID, record, &newRecord)
-			return err
+			success, err := m.casRecord(recordID, record, &newRecord)
+			if err != nil {
+				return err
+			}
+			if success {
+				// Cache the new sequence for optimistic re-acquisition
+				m.hintCache.Put(recordID, &lockHint{
+					Sequence: newRecord.Sequence,
+					Mode:     LockModeShared, // Still shared (decremented)
+					UpdateAt: time.Now(),
+				})
+			}
+			return nil
 		}
 		return ErrNotLockOwner
 	}
@@ -439,8 +641,20 @@ func (m *Manager) releaseRecord(recordID uint64) error {
 		Sequence: record.Sequence + 1,
 	}
 
-	_, err = m.casRecord(recordID, record, newRecord)
-	return err
+	success, err := m.casRecord(recordID, record, newRecord)
+	if err != nil {
+		return err
+	}
+	if success {
+		// Cache the new sequence for optimistic re-acquisition
+		// Mode is None since lock is now free
+		m.hintCache.Put(recordID, &lockHint{
+			Sequence: newRecord.Sequence,
+			Mode:     LockModeNone,
+			UpdateAt: time.Now(),
+		})
+	}
+	return nil
 }
 
 // isLockStale checks if a lock's owner is dead.
@@ -508,6 +722,46 @@ func (m *Manager) writeRecord(recordID uint64, record *Record) error {
 
 	_, err := m.dev.WriteAt(buf.Bytes(), offset)
 	return err
+}
+
+// casRecordOptimistic performs an optimistic CAS using only the expected sequence.
+// It writes the new record directly, then reads back to verify the sequence.
+// Returns true if the write succeeded (sequence matched), false if stale.
+// This saves one disk read compared to casRecord when the hint is correct.
+func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *Record) (bool, error) {
+	offset := int64(m.offset) + int64(recordID)*RecordSize
+
+	buf := storage.GetBuffer(RecordSize)
+	defer storage.PutBuffer(buf)
+
+	// Read current record to check sequence
+	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
+		return false, err
+	}
+
+	// Check if sequence matches our expectation
+	currentSeq := binary.LittleEndian.Uint64(buf.Bytes()[48:56])
+	if currentSeq != expectedSeq {
+		// Sequence doesn't match - hint was stale
+		return false, nil
+	}
+
+	// Also verify the lock is actually free (Mode == None)
+	// This prevents acquiring a lock that another node just took
+	currentMode := LockMode(buf.Bytes()[5])
+	if currentMode != LockModeNone {
+		// Lock is held - can't acquire optimistically
+		return false, nil
+	}
+
+	// Sequence matched and lock is free - write new record
+	newData := serializeRecord(new)
+	copy(buf.Bytes(), newData)
+	if _, err := m.dev.WriteAt(buf.Bytes(), offset); err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // casRecord performs compare-and-swap on a lock record.

@@ -60,14 +60,17 @@ type Manager struct {
 	config Config
 
 	// Inode cache (inode number -> cached inode)
-	inodes *LRU[uint32, *CachedInode]
+	// Uses ShardedLRU for better concurrent performance
+	inodes *ShardedLRU[uint32, *CachedInode]
 
 	// Extent cache (inode+logical block -> physical block)
 	// Validated against inode's DataGeneration
-	extents *LRU[ExtentCacheKey, *CachedExtent]
+	// Uses ShardedLRU for better concurrent performance
+	extents *ShardedLRU[ExtentCacheKey, *CachedExtent]
 
 	// Negative cache (inode number -> "not found" entry)
-	negatives *LRU[uint32, *negativeEntry]
+	// Uses ShardedLRU for better concurrent performance
+	negatives *ShardedLRU[uint32, *negativeEntry]
 
 	// Network broadcast for cross-node invalidation (optional)
 	broadcaster *broadcast.Broadcaster
@@ -90,9 +93,9 @@ func NewManager(cfg Config, inodeTbl *inode.Table, lockMgr *lock.Manager) (*Mana
 
 	return &Manager{
 		config:    cfg,
-		inodes:    NewLRU[uint32, *CachedInode](cfg.InodeCacheSize),
-		extents:   NewLRU[ExtentCacheKey, *CachedExtent](cfg.ExtentCacheSize),
-		negatives: NewLRU[uint32, *negativeEntry](cfg.NegativeCacheSize),
+		inodes:    NewShardedLRU[uint32, *CachedInode](cfg.InodeCacheSize),
+		extents:   NewShardedLRU[ExtentCacheKey, *CachedExtent](cfg.ExtentCacheSize),
+		negatives: NewShardedLRU[uint32, *negativeEntry](cfg.NegativeCacheSize),
 		inodeTbl:  inodeTbl,
 		lockMgr:   lockMgr,
 	}, nil

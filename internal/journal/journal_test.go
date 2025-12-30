@@ -1,7 +1,9 @@
 package journal
 
 import (
+	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -454,5 +456,154 @@ func TestJournalOpen(t *testing.T) {
 	txn2 := j2.Begin()
 	if txn2.Seq() != 2 {
 		t.Errorf("After reopen, seq = %d, want 2", txn2.Seq())
+	}
+}
+
+func TestJournalBatchCommitMode(t *testing.T) {
+	config := DefaultConfig()
+	config.CommitMode = CommitBatch
+	config.BatchConfig = BatchConfig{
+		MaxBatchTransactions: 5,
+		MaxBatchAge:          50 * time.Millisecond,
+	}
+
+	j, cleanup := createTestJournal(t, config)
+	defer cleanup()
+
+	// Single commit should work (will wait for timer)
+	start := time.Now()
+	txn := j.Begin()
+	txn.LogInodeCreate(testInodePayload(100))
+	if _, err := j.Commit(txn); err != nil {
+		t.Fatalf("Commit in batch mode failed: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Should have waited approximately MaxBatchAge (timer triggered)
+	// Allow some slack for timing
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("Commit returned too quickly (%v), expected to wait for batch timer", elapsed)
+	}
+
+	stats := j.Stats()
+	if stats.CommitCount != 1 {
+		t.Errorf("CommitCount = %d, want 1", stats.CommitCount)
+	}
+	if stats.BatchSyncCount != 1 {
+		t.Errorf("BatchSyncCount = %d, want 1", stats.BatchSyncCount)
+	}
+}
+
+func TestJournalBatchTriggerByCount(t *testing.T) {
+	config := DefaultConfig()
+	config.CommitMode = CommitBatch
+	config.BatchConfig = BatchConfig{
+		MaxBatchTransactions: 3,
+		MaxBatchAge:          5 * time.Second, // Long timer - should not trigger
+	}
+
+	j, cleanup := createTestJournal(t, config)
+	defer cleanup()
+
+	// Commit MaxBatchTransactions transactions concurrently
+	// When the 3rd commit arrives, it should trigger immediate sync.
+	// NOTE: Batch mode is designed for concurrent commits from multiple goroutines.
+	// Sequential commits from the same goroutine would block on the first commit.
+	var wg sync.WaitGroup
+	errors := make(chan error, 3)
+
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			txn := j.Begin()
+			txn.LogInodeCreate(testInodePayload(uint64(100 + idx)))
+			if _, err := j.Commit(txn); err != nil {
+				errors <- fmt.Errorf("commit %d failed: %v", idx, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errors)
+	elapsed := time.Since(start)
+
+	// Check for errors
+	for err := range errors {
+		t.Error(err)
+	}
+
+	// Should have completed quickly (transaction count trigger, not timer)
+	if elapsed > 1*time.Second {
+		t.Errorf("Commits took too long (%v), expected quick sync on count trigger", elapsed)
+	}
+
+	stats := j.Stats()
+	if stats.CommitCount != 3 {
+		t.Errorf("CommitCount = %d, want 3", stats.CommitCount)
+	}
+	// At least one batch sync should have occurred
+	if stats.BatchSyncCount == 0 {
+		t.Error("BatchSyncCount should be > 0")
+	}
+}
+
+func TestJournalBatchConcurrent(t *testing.T) {
+	config := DefaultConfig()
+	config.CommitMode = CommitBatch
+	config.BatchConfig = BatchConfig{
+		MaxBatchTransactions: 10,
+		MaxBatchAge:          100 * time.Millisecond,
+	}
+
+	j, cleanup := createTestJournal(t, config)
+	defer cleanup()
+
+	// Launch multiple goroutines that commit concurrently
+	// They should share batch syncs
+	const numGoroutines = 5
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			txn := j.Begin()
+			txn.LogInodeCreate(testInodePayload(uint64(100 + id)))
+			if _, err := j.Commit(txn); err != nil {
+				errors <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	for err := range errors {
+		t.Errorf("Concurrent commit failed: %v", err)
+	}
+
+	stats := j.Stats()
+	if stats.CommitCount != numGoroutines {
+		t.Errorf("CommitCount = %d, want %d", stats.CommitCount, numGoroutines)
+	}
+
+	// Batch syncs should be much less than commit count
+	// (multiple commits share the same sync)
+	if stats.BatchSyncCount >= uint64(numGoroutines) {
+		t.Logf("Note: BatchSyncCount (%d) >= CommitCount (%d), batching might not be working optimally",
+			stats.BatchSyncCount, numGoroutines)
+	}
+}
+
+func TestJournalBatchConfigDefaults(t *testing.T) {
+	config := DefaultBatchConfig()
+
+	if config.MaxBatchTransactions != 32 {
+		t.Errorf("MaxBatchTransactions = %d, want 32", config.MaxBatchTransactions)
+	}
+	if config.MaxBatchAge != 100*time.Millisecond {
+		t.Errorf("MaxBatchAge = %v, want 100ms", config.MaxBatchAge)
 	}
 }
