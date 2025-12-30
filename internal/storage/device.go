@@ -26,14 +26,87 @@ const (
 
 	// MetadataBlockSize is used for metadata structures (4KB).
 	MetadataBlockSize = 4096
+
+	// NumIOShards is the number of lock shards for parallel I/O.
+	// Using 64 shards provides good parallelism without excessive memory overhead.
+	NumIOShards = 64
+
+	// IOShardSize is the byte range covered by each shard (1MB).
+	// This aligns with DefaultBlockSize so most operations hit a single shard.
+	IOShardSize = 1 << 20 // 1MB
 )
 
 // Device represents a block device opened with O_DIRECT.
+// I/O operations are protected by sharded locks to allow parallel access
+// to different regions of the device. Operations within the same 1MB region
+// are serialized, while operations to different regions can proceed in parallel.
 type Device struct {
-	mu   sync.Mutex
-	file *os.File
-	path string
-	size int64
+	ioShards [NumIOShards]sync.Mutex // Sharded locks for parallel I/O
+	closeMu  sync.RWMutex            // Protects close; held shared during I/O
+	file     *os.File
+	path     string
+	size     int64
+}
+
+// shardIndex returns the shard index for the given offset.
+func shardIndex(offset int64) int {
+	return int((offset / IOShardSize) % NumIOShards)
+}
+
+// lockIORange locks all shards covering the byte range [offset, offset+length).
+// Returns the start and end shard indices. Shards are locked in ascending order
+// to prevent deadlocks when multiple goroutines lock overlapping ranges.
+func (d *Device) lockIORange(offset int64, length int) (startShard, endShard int) {
+	startShard = shardIndex(offset)
+	endShard = shardIndex(offset + int64(length-1))
+
+	// Fast path: single shard (common case for block-aligned I/O)
+	if startShard == endShard {
+		d.ioShards[startShard].Lock()
+		return startShard, endShard
+	}
+
+	// Multi-shard: lock all affected shards in ascending order
+	// Handle potential wrap-around in shard indices
+	if startShard <= endShard {
+		for i := startShard; i <= endShard; i++ {
+			d.ioShards[i].Lock()
+		}
+	} else {
+		// Wrap-around case: lock from startShard to NumIOShards-1, then 0 to endShard
+		for i := startShard; i < NumIOShards; i++ {
+			d.ioShards[i].Lock()
+		}
+		for i := 0; i <= endShard; i++ {
+			d.ioShards[i].Lock()
+		}
+	}
+	return startShard, endShard
+}
+
+// unlockIORange unlocks all shards in the range [startShard, endShard].
+// Shards are unlocked in reverse order of locking.
+func (d *Device) unlockIORange(startShard, endShard int) {
+	// Fast path: single shard
+	if startShard == endShard {
+		d.ioShards[startShard].Unlock()
+		return
+	}
+
+	// Multi-shard: unlock in reverse order
+	if startShard <= endShard {
+		for i := endShard; i >= startShard; i-- {
+			d.ioShards[i].Unlock()
+		}
+	} else {
+		// Wrap-around case: unlock 0 to endShard, then startShard to NumIOShards-1
+		for i := endShard; i >= 0; i-- {
+			d.ioShards[i].Unlock()
+		}
+		for i := NumIOShards - 1; i >= startShard; i-- {
+			d.ioShards[i].Unlock()
+		}
+	}
 }
 
 // Open opens a block device with O_DIRECT for raw I/O.
@@ -69,9 +142,11 @@ func Open(path string) (*Device, error) {
 }
 
 // Close closes the device.
+// It waits for any in-progress I/O operations to complete before closing.
 func (d *Device) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Take exclusive close lock to block new I/O operations
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
 
 	if d.file != nil {
 		err := d.file.Close()
@@ -93,34 +168,54 @@ func (d *Device) Path() string {
 
 // ReadAt reads data from the device at the specified offset.
 // Both offset and len(buf) MUST be aligned to SectorSize.
+// Concurrent reads to different 1MB regions proceed in parallel.
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, err
 	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Acquire shared close lock to prevent device close during I/O
+	d.closeMu.RLock()
+	defer d.closeMu.RUnlock()
+
+	// Lock the affected shard(s)
+	startShard, endShard := d.lockIORange(offset, len(buf))
+	defer d.unlockIORange(startShard, endShard)
 
 	return d.file.ReadAt(buf, offset)
 }
 
 // WriteAt writes data to the device at the specified offset.
 // Both offset and len(buf) MUST be aligned to SectorSize.
+// Concurrent writes to different 1MB regions proceed in parallel.
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, err
 	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
 
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Acquire shared close lock to prevent device close during I/O
+	d.closeMu.RLock()
+	defer d.closeMu.RUnlock()
+
+	// Lock the affected shard(s)
+	startShard, endShard := d.lockIORange(offset, len(buf))
+	defer d.unlockIORange(startShard, endShard)
 
 	return d.file.WriteAt(buf, offset)
 }
 
 // Sync ensures all written data is persisted to the device.
+// This is a global operation that does not block concurrent I/O.
 func (d *Device) Sync() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// Acquire shared close lock to prevent device close during sync
+	d.closeMu.RLock()
+	defer d.closeMu.RUnlock()
 
 	return d.file.Sync()
 }

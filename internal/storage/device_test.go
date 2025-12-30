@@ -3,6 +3,8 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -187,5 +189,171 @@ func TestDeviceUnalignedOperations(t *testing.T) {
 	_, err = dev.WriteAt(unalignedBuf, 0)
 	if err == nil {
 		t.Error("WriteAt with unaligned buffer should fail")
+	}
+}
+
+// TestShardIndex verifies shard index calculation.
+func TestShardIndex(t *testing.T) {
+	tests := []struct {
+		offset int64
+		want   int
+	}{
+		{0, 0},                           // First shard
+		{IOShardSize - 1, 0},             // End of first shard
+		{IOShardSize, 1},                 // Start of second shard
+		{IOShardSize * 63, 63},           // Last shard
+		{IOShardSize * 64, 0},            // Wrap around to first shard
+		{IOShardSize * 65, 1},            // Wrap around to second shard
+		{IOShardSize*64 + IOShardSize/2, 0}, // Mid-block in wrapped shard
+	}
+
+	for _, tt := range tests {
+		got := shardIndex(tt.offset)
+		if got != tt.want {
+			t.Errorf("shardIndex(%d) = %d, want %d", tt.offset, got, tt.want)
+		}
+	}
+}
+
+// TestConcurrentShardedIO tests that operations to different shards run in parallel.
+func TestConcurrentShardedIO(t *testing.T) {
+	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
+	if tmpDir == "" {
+		tmpDir = "."
+	}
+
+	testFile := filepath.Join(tmpDir, "test_sharded_io.bin")
+
+	f, err := os.Create(testFile)
+	if err != nil {
+		t.Skipf("Cannot create test file: %v", err)
+	}
+
+	// Create file large enough for multiple shards (4 MB = 4 shards)
+	size := int64(4 * IOShardSize)
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		os.Remove(testFile)
+		t.Skipf("Cannot truncate test file: %v", err)
+	}
+	f.Close()
+	defer os.Remove(testFile)
+
+	dev, err := Open(testFile)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer dev.Close()
+
+	// Run concurrent writes to different shards
+	const numGoroutines = 4
+	var wg sync.WaitGroup
+	var writeCount atomic.Int32
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(shardNum int) {
+			defer wg.Done()
+
+			buf := NewAlignedBuffer(SectorSize)
+			// Write identifier to detect data correctness
+			buf.Bytes()[0] = byte(shardNum)
+
+			offset := int64(shardNum) * IOShardSize
+			_, err := dev.WriteAt(buf.Bytes(), offset)
+			if err != nil {
+				t.Errorf("WriteAt to shard %d failed: %v", shardNum, err)
+				return
+			}
+			writeCount.Add(1)
+		}(i)
+	}
+
+	wg.Wait()
+
+	if writeCount.Load() != numGoroutines {
+		t.Errorf("Expected %d writes, got %d", numGoroutines, writeCount.Load())
+	}
+
+	// Verify each shard has correct data
+	for i := 0; i < numGoroutines; i++ {
+		buf := NewAlignedBuffer(SectorSize)
+		offset := int64(i) * IOShardSize
+		_, err := dev.ReadAt(buf.Bytes(), offset)
+		if err != nil {
+			t.Errorf("ReadAt from shard %d failed: %v", i, err)
+			continue
+		}
+		if buf.Bytes()[0] != byte(i) {
+			t.Errorf("Shard %d has wrong data: got %d, want %d", i, buf.Bytes()[0], i)
+		}
+	}
+}
+
+// TestMultiShardIO tests operations that span multiple shards.
+func TestMultiShardIO(t *testing.T) {
+	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
+	if tmpDir == "" {
+		tmpDir = "."
+	}
+
+	testFile := filepath.Join(tmpDir, "test_multishard.bin")
+
+	f, err := os.Create(testFile)
+	if err != nil {
+		t.Skipf("Cannot create test file: %v", err)
+	}
+
+	// Create file large enough for cross-shard test
+	size := int64(3 * IOShardSize)
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		os.Remove(testFile)
+		t.Skipf("Cannot truncate test file: %v", err)
+	}
+	f.Close()
+	defer os.Remove(testFile)
+
+	dev, err := Open(testFile)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer dev.Close()
+
+	// Write data that spans two shards
+	// Start at offset IOShardSize - SectorSize and write 2 sectors
+	startOffset := IOShardSize - SectorSize
+	buf := NewAlignedBuffer(2 * SectorSize)
+	for i := 0; i < len(buf.Bytes()); i++ {
+		buf.Bytes()[i] = byte(i % 256)
+	}
+
+	n, err := dev.WriteAt(buf.Bytes(), int64(startOffset))
+	if err != nil {
+		t.Fatalf("Multi-shard write failed: %v", err)
+	}
+	if n != 2*SectorSize {
+		t.Errorf("Wrote %d bytes, expected %d", n, 2*SectorSize)
+	}
+
+	// Sync and read back
+	dev.Sync()
+
+	readBuf := NewAlignedBuffer(2 * SectorSize)
+	n, err = dev.ReadAt(readBuf.Bytes(), int64(startOffset))
+	if err != nil {
+		t.Fatalf("Multi-shard read failed: %v", err)
+	}
+	if n != 2*SectorSize {
+		t.Errorf("Read %d bytes, expected %d", n, 2*SectorSize)
+	}
+
+	// Verify data integrity
+	for i := 0; i < len(buf.Bytes()); i++ {
+		if readBuf.Bytes()[i] != buf.Bytes()[i] {
+			t.Errorf("Data mismatch at byte %d: got %d, want %d",
+				i, readBuf.Bytes()[i], buf.Bytes()[i])
+			break
+		}
 	}
 }
