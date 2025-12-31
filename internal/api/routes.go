@@ -30,7 +30,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, HealthResponse{
-		Status: "ok",
+		Status: HealthStatusOK,
 	})
 }
 
@@ -56,9 +56,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, StatusResponse{
-		Status:  "ok",
-		Version: "dev",
-		Uptime:  int64(s.Uptime().Seconds()),
+		Status:        "ok",
+		Version:       "dev",
+		UptimeSeconds: int64(s.Uptime().Seconds()),
 	})
 }
 
