@@ -3,8 +3,10 @@ package api
 import (
 	"crypto/subtle"
 	"log"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -139,4 +141,133 @@ func CORSMiddleware(origins []string) Middleware {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// RateLimiter implements a token bucket rate limiter per client IP.
+type RateLimiter struct {
+	mu      sync.Mutex
+	clients map[string]*tokenBucket
+	rate    float64 // tokens per second
+	burst   int     // max tokens (bucket capacity)
+}
+
+// tokenBucket tracks rate limit state for a single client.
+type tokenBucket struct {
+	tokens   float64
+	lastSeen time.Time
+}
+
+// NewRateLimiter creates a new rate limiter with the specified rate and burst.
+func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
+	rl := &RateLimiter{
+		clients: make(map[string]*tokenBucket),
+		rate:    requestsPerSecond,
+		burst:   burst,
+	}
+	// Start cleanup goroutine to prevent memory leaks
+	go rl.cleanup()
+	return rl
+}
+
+// Allow checks if a request from the given IP should be allowed.
+func (rl *RateLimiter) Allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	bucket, exists := rl.clients[ip]
+
+	if !exists {
+		// New client starts with a full bucket
+		rl.clients[ip] = &tokenBucket{
+			tokens:   float64(rl.burst) - 1, // Consume one token for this request
+			lastSeen: now,
+		}
+		return true
+	}
+
+	// Calculate tokens to add based on time elapsed
+	elapsed := now.Sub(bucket.lastSeen).Seconds()
+	bucket.tokens += elapsed * rl.rate
+	if bucket.tokens > float64(rl.burst) {
+		bucket.tokens = float64(rl.burst)
+	}
+	bucket.lastSeen = now
+
+	// Check if we have tokens available
+	if bucket.tokens < 1 {
+		return false
+	}
+
+	bucket.tokens--
+	return true
+}
+
+// cleanup removes stale entries to prevent memory leaks.
+func (rl *RateLimiter) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		rl.mu.Lock()
+		cutoff := time.Now().Add(-10 * time.Minute)
+		for ip, bucket := range rl.clients {
+			if bucket.lastSeen.Before(cutoff) {
+				delete(rl.clients, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+// RateLimitMiddleware returns a middleware that enforces rate limiting per client IP.
+// If limiter is nil, no rate limiting is applied.
+func RateLimitMiddleware(limiter *RateLimiter) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// If no limiter configured, skip rate limiting
+			if limiter == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Extract client IP
+			ip := getClientIP(r)
+
+			// Check rate limit
+			if !limiter.Allow(ip) {
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded", "please slow down")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// getClientIP extracts the client IP from the request.
+// It checks X-Forwarded-For and X-Real-IP headers first (for proxied requests),
+// then falls back to RemoteAddr.
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header (may contain multiple IPs)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Take the first IP (original client)
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Fall back to RemoteAddr (strip port)
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
 }

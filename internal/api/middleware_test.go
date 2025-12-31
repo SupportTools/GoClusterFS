@@ -322,3 +322,164 @@ func TestCORSMiddleware_Preflight(t *testing.T) {
 		t.Error("expected Access-Control-Allow-Methods header")
 	}
 }
+
+// Rate Limiting Tests
+
+func TestRateLimiter_Allow(t *testing.T) {
+	// Create a rate limiter with 10 req/s and burst of 5
+	rl := NewRateLimiter(10, 5)
+
+	// First 5 requests should be allowed (burst)
+	for i := 0; i < 5; i++ {
+		if !rl.Allow("192.168.1.1") {
+			t.Errorf("request %d should be allowed", i+1)
+		}
+	}
+
+	// 6th request should be denied (burst exhausted)
+	if rl.Allow("192.168.1.1") {
+		t.Error("6th request should be denied")
+	}
+
+	// Different IP should be allowed (separate bucket)
+	if !rl.Allow("192.168.1.2") {
+		t.Error("request from different IP should be allowed")
+	}
+}
+
+func TestRateLimiter_TokenRefill(t *testing.T) {
+	// Create a rate limiter with 1000 req/s (fast refill for testing)
+	rl := NewRateLimiter(1000, 2)
+
+	// Exhaust the bucket
+	rl.Allow("192.168.1.1")
+	rl.Allow("192.168.1.1")
+	if rl.Allow("192.168.1.1") {
+		t.Error("should be rate limited after exhausting burst")
+	}
+
+	// Wait for refill (at 1000/s, 1ms = 1 token)
+	time.Sleep(2 * time.Millisecond)
+
+	// Should be allowed again after refill
+	if !rl.Allow("192.168.1.1") {
+		t.Error("should be allowed after token refill")
+	}
+}
+
+func TestRateLimitMiddleware_Disabled(t *testing.T) {
+	// No rate limiting when not configured
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+	time.Sleep(10 * time.Millisecond)
+
+	// Make many requests - all should succeed
+	for i := 0; i < 50; i++ {
+		resp, err := http.Get("http://" + server.Addr() + "/health")
+		if err != nil {
+			t.Fatalf("request error: %v", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i, resp.StatusCode)
+		}
+	}
+}
+
+func TestRateLimitMiddleware_Enabled(t *testing.T) {
+	// Enable rate limiting with small burst for easy testing
+	cfg := DefaultConfig().WithListenAddr(":0").WithRateLimit(100, 3)
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+	time.Sleep(10 * time.Millisecond)
+
+	// First 3 requests should succeed (burst)
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get("http://" + server.Addr() + "/health")
+		if err != nil {
+			t.Fatalf("request error: %v", err)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("request %d: expected 200, got %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// 4th request should be rate limited
+	resp, err := http.Get("http://" + server.Addr() + "/health")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("4th request: expected 429, got %d", resp.StatusCode)
+	}
+
+	// Check Retry-After header
+	if retry := resp.Header.Get("Retry-After"); retry != "1" {
+		t.Errorf("expected Retry-After header '1', got %q", retry)
+	}
+}
+
+func TestGetClientIP_RemoteAddr(t *testing.T) {
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.168.1.100:12345"
+
+	ip := getClientIP(req)
+	if ip != "192.168.1.100" {
+		t.Errorf("expected '192.168.1.100', got %q", ip)
+	}
+}
+
+func TestGetClientIP_XForwardedFor(t *testing.T) {
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.50, 70.41.3.18, 150.172.238.178")
+
+	ip := getClientIP(req)
+	if ip != "203.0.113.50" {
+		t.Errorf("expected '203.0.113.50' (first IP), got %q", ip)
+	}
+}
+
+func TestGetClientIP_XRealIP(t *testing.T) {
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	req.Header.Set("X-Real-IP", "198.51.100.78")
+
+	ip := getClientIP(req)
+	if ip != "198.51.100.78" {
+		t.Errorf("expected '198.51.100.78', got %q", ip)
+	}
+}
+
+func TestGetClientIP_XForwardedForPrecedence(t *testing.T) {
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "10.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.50")
+	req.Header.Set("X-Real-IP", "198.51.100.78")
+
+	// X-Forwarded-For should take precedence
+	ip := getClientIP(req)
+	if ip != "203.0.113.50" {
+		t.Errorf("expected '203.0.113.50' (X-Forwarded-For takes precedence), got %q", ip)
+	}
+}

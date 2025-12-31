@@ -29,6 +29,9 @@ type Server struct {
 	// Stats provider for statistics collection (optional)
 	statsProvider StatsProvider
 
+	// Rate limiter (optional)
+	rateLimiter *RateLimiter
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -48,12 +51,18 @@ func NewServer(cfg Config) (*Server, error) {
 		router: http.NewServeMux(),
 	}
 
+	// Create rate limiter if enabled
+	if cfg.RateLimitEnabled {
+		s.rateLimiter = NewRateLimiter(cfg.RateLimitRequestsPerSecond, cfg.RateLimitBurst)
+	}
+
 	// Register routes
 	s.registerRoutes()
 
-	// Build middleware chain (order: logging -> CORS -> auth)
+	// Build middleware chain (order: rate limit -> logging -> CORS -> auth)
 	handler := Chain(
 		s.router,
+		RateLimitMiddleware(s.rateLimiter),
 		LoggingMiddleware,
 		CORSMiddleware(cfg.CORSOrigins),
 		AuthMiddleware(cfg.AuthToken, "/health", "/metrics"),
