@@ -23,6 +23,9 @@ type Server struct {
 	// Health checkers for component health reporting
 	healthCheckers []HealthChecker
 
+	// Status provider for filesystem status (optional)
+	statusProvider StatusProvider
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -179,4 +182,33 @@ func (s *Server) GetHealthCheckers() []HealthChecker {
 	checkers := make([]HealthChecker, len(s.healthCheckers))
 	copy(checkers, s.healthCheckers)
 	return checkers
+}
+
+// StatusProvider provides filesystem status information.
+type StatusProvider interface {
+	// MountPath returns the current mount path.
+	MountPath() string
+
+	// DevicePath returns the underlying device path.
+	DevicePath() string
+
+	// MountState returns the current mount state.
+	MountState() MountState
+
+	// Capacity returns storage capacity information.
+	Capacity() *CapacityInfo
+}
+
+// SetStatusProvider sets the status provider for filesystem status.
+func (s *Server) SetStatusProvider(provider StatusProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statusProvider = provider
+}
+
+// GetStatusProvider returns the current status provider.
+func (s *Server) GetStatusProvider() StatusProvider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.statusProvider
 }

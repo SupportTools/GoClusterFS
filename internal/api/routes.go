@@ -65,17 +65,32 @@ func (s *Server) handleAPIv1(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStatus handles GET /api/v1/status requests.
+// Returns comprehensive filesystem status including version, uptime, and capacity.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, StatusResponse{
+	build := GetBuildInfo()
+	resp := StatusResponse{
 		Status:        "ok",
-		Version:       "dev",
+		Version:       build.Version,
+		GitCommit:     build.GitCommit,
+		BuildTime:     build.BuildTime,
+		GoVersion:     build.GoVersion,
 		UptimeSeconds: int64(s.Uptime().Seconds()),
-	})
+	}
+
+	// Add filesystem status if provider is available
+	if provider := s.GetStatusProvider(); provider != nil {
+		resp.MountPath = provider.MountPath()
+		resp.DevicePath = provider.DevicePath()
+		resp.MountState = provider.MountState()
+		resp.Capacity = provider.Capacity()
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleStats handles GET /api/v1/stats/* requests.
