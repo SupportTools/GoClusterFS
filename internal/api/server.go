@@ -20,6 +20,9 @@ type Server struct {
 	router   *http.ServeMux
 	listener net.Listener
 
+	// Health checkers for component health reporting
+	healthCheckers []HealthChecker
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -159,4 +162,21 @@ func (s *Server) Uptime() time.Duration {
 		return 0
 	}
 	return time.Since(s.startTime)
+}
+
+// RegisterHealthChecker adds a health checker to the server.
+// Health checkers are called when the /health endpoint is accessed.
+func (s *Server) RegisterHealthChecker(checker HealthChecker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthCheckers = append(s.healthCheckers, checker)
+}
+
+// GetHealthCheckers returns a copy of the registered health checkers.
+func (s *Server) GetHealthCheckers() []HealthChecker {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	checkers := make([]HealthChecker, len(s.healthCheckers))
+	copy(checkers, s.healthCheckers)
+	return checkers
 }

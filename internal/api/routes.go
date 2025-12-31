@@ -22,16 +22,32 @@ func (s *Server) registerRoutes() {
 }
 
 // handleHealth handles GET /health requests.
-// This endpoint always returns 200 OK and is used for load balancer
-// health checks and basic connectivity verification.
+// Returns aggregate health status from all registered health checkers.
+// Status codes: 200 OK, 503 Service Unavailable (if unhealthy).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET or HEAD")
 		return
 	}
-	writeJSON(w, http.StatusOK, HealthResponse{
-		Status: HealthStatusOK,
-	})
+
+	checkers := s.GetHealthCheckers()
+	if len(checkers) == 0 {
+		// No checkers registered - just report API is OK
+		writeJSON(w, http.StatusOK, HealthResponse{
+			Status: HealthStatusOK,
+		})
+		return
+	}
+
+	// Aggregate health from all checkers
+	resp := AggregateHealth(r.Context(), checkers...)
+
+	// Return 503 if unhealthy, otherwise 200
+	status := http.StatusOK
+	if resp.Status == HealthStatusUnhealthy {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, resp)
 }
 
 // handleAPIv1 is the catch-all handler for /api/v1/* routes.
