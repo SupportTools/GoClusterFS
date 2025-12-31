@@ -270,15 +270,13 @@ func (s *Server) handleStatsAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMetrics handles GET /metrics requests for Prometheus scraping.
+// Delegates to the Prometheus metrics handler for proper metric exposition.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET")
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("# HELP goclusterfs_up Indicates if GoClusterFS is up\n"))
-	w.Write([]byte("# TYPE goclusterfs_up gauge\n"))
-	w.Write([]byte("goclusterfs_up 1\n"))
+	// Delegate to the Prometheus handler
+	s.GetMetricsHandler().ServeHTTP(w, r)
 }

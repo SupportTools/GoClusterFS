@@ -32,6 +32,9 @@ type Server struct {
 	// Rate limiter (optional)
 	rateLimiter *RateLimiter
 
+	// Prometheus metrics handler (lazily initialized)
+	metricsHandler http.Handler
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -261,4 +264,15 @@ func (s *Server) GetStatsProvider() StatsProvider {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.statsProvider
+}
+
+// GetMetricsHandler returns the Prometheus metrics HTTP handler.
+// The handler is lazily initialized on first call.
+func (s *Server) GetMetricsHandler() http.Handler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.metricsHandler == nil {
+		s.metricsHandler = s.MetricsHandler()
+	}
+	return s.metricsHandler
 }
