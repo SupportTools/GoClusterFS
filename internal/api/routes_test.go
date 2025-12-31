@@ -88,18 +88,19 @@ func TestRoutes_Metrics(t *testing.T) {
 	}
 }
 
-func TestRoutes_Stats_NotImplemented(t *testing.T) {
+func TestRoutes_Stats_NoProvider(t *testing.T) {
 	server := startTestServer(t)
 	defer server.Stop()
 
+	// Without a StatsProvider configured, stats endpoints return 503
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/stats/cache")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("expected status 501, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", resp.StatusCode)
 	}
 }
 

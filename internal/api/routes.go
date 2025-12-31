@@ -94,12 +94,179 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStats handles GET /api/v1/stats/* requests.
+// Routes to specific stats handlers based on the path suffix.
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET")
 		return
 	}
-	writeError(w, http.StatusNotImplemented, "stats endpoint not yet implemented", "")
+
+	// Extract the stats sub-path
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/stats")
+	path = strings.TrimSuffix(path, "/")
+
+	switch path {
+	case "", "/overview":
+		s.handleStatsOverview(w, r)
+	case "/cache":
+		s.handleStatsCache(w, r)
+	case "/journal":
+		s.handleStatsJournal(w, r)
+	case "/trim":
+		s.handleStatsTrim(w, r)
+	case "/lock":
+		s.handleStatsLock(w, r)
+	case "/sfb":
+		s.handleStatsSFB(w, r)
+	case "/cluster":
+		s.handleStatsCluster(w, r)
+	case "/all":
+		s.handleStatsAll(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "stats endpoint not found", "valid endpoints: cache, journal, trim, lock, sfb, cluster, all")
+	}
+}
+
+// handleStatsOverview handles GET /api/v1/stats requests.
+// Returns a summary of key statistics from all components.
+func (s *Server) handleStatsOverview(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	resp := StatsOverviewResponse{
+		Cache:   provider.CacheStats(),
+		Journal: provider.JournalStats(),
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleStatsCache handles GET /api/v1/stats/cache requests.
+// Returns detailed cache hit/miss statistics.
+func (s *Server) handleStatsCache(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.CacheStats()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "cache stats not available", "cache component not initialized")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStatsJournal handles GET /api/v1/stats/journal requests.
+// Returns journal transaction and space statistics.
+func (s *Server) handleStatsJournal(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.JournalStats()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "journal stats not available", "journal component not initialized")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStatsTrim handles GET /api/v1/stats/trim requests.
+// Returns TRIM/discard operation statistics.
+func (s *Server) handleStatsTrim(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.TrimStats()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "trim stats not available", "trim component not initialized")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStatsLock handles GET /api/v1/stats/lock requests.
+// Returns lock contention and hint cache statistics.
+func (s *Server) handleStatsLock(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.LockStats()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "lock stats not available", "lock component not initialized")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStatsSFB handles GET /api/v1/stats/sfb requests.
+// Returns Sparse File Bitmap (block allocation) statistics.
+func (s *Server) handleStatsSFB(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.SFBStats()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "sfb stats not available", "block allocator not initialized")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStatsCluster handles GET /api/v1/stats/cluster requests.
+// Returns cluster membership and node information.
+func (s *Server) handleStatsCluster(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.ClusterInfo()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "cluster info not available", "running in standalone mode")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleStatsAll handles GET /api/v1/stats/all requests.
+// Returns a combined snapshot of all available statistics.
+func (s *Server) handleStatsAll(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "stats not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.AllStats()
+	if stats == nil {
+		writeError(w, http.StatusServiceUnavailable, "failed to collect stats", "")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
 }
 
 // handleMetrics handles GET /metrics requests for Prometheus scraping.

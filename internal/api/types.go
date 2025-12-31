@@ -132,6 +132,75 @@ type MetricsStatsResponse struct {
 	Uptime    int64            `json:"uptime_seconds"`
 }
 
+// TrimStatsResponse is returned by GET /api/v1/stats/trim.
+type TrimStatsResponse struct {
+	TrimOperations    uint64 `json:"trim_operations"`
+	TrimBytes         uint64 `json:"trim_bytes"`
+	TrimBlocks        uint64 `json:"trim_blocks"`
+	PendingTrimBlocks uint64 `json:"pending_trim_blocks,omitempty"`
+	LastTrimAt        string `json:"last_trim_at,omitempty"`
+	TrimErrors        uint64 `json:"trim_errors,omitempty"`
+	TrimEnabled       bool   `json:"trim_enabled"`
+	BatchSize         int    `json:"batch_size,omitempty"`
+}
+
+// LockStatsResponse is returned by GET /api/v1/stats/lock.
+type LockStatsResponse struct {
+	HintCacheHits    uint64  `json:"hint_cache_hits"`
+	HintCacheMisses  uint64  `json:"hint_cache_misses"`
+	HintCacheHitRate float64 `json:"hint_cache_hit_rate"`
+	ActiveLocks      int     `json:"active_locks,omitempty"`
+	PendingLocks     int     `json:"pending_locks,omitempty"`
+}
+
+// SFBStatsResponse is returned by GET /api/v1/stats/sfb.
+type SFBStatsResponse struct {
+	TotalBlocks        uint64  `json:"total_blocks"`
+	AllocatedBlocks    uint64  `json:"allocated_blocks"`
+	FreeBlocks         uint64  `json:"free_blocks"`
+	AllocationPercent  float64 `json:"allocation_percent"`
+	FragmentationRatio float64 `json:"fragmentation_ratio,omitempty"`
+	LargestFreeExtent  uint64  `json:"largest_free_extent,omitempty"`
+	AllocationsTotal   uint64  `json:"allocations_total"`
+	DeallocationsTotal uint64  `json:"deallocations_total"`
+	AllocationFailures uint64  `json:"allocation_failures,omitempty"`
+}
+
+// ClusterPeerInfo contains information about a cluster peer node.
+type ClusterPeerInfo struct {
+	NodeID   string  `json:"node_id"`
+	Address  string  `json:"address"`
+	State    string  `json:"state"`
+	LastSeen string  `json:"last_seen,omitempty"`
+	Latency  float64 `json:"latency_ms,omitempty"`
+}
+
+// ClusterInfoResponse is returned by GET /api/v1/stats/cluster.
+type ClusterInfoResponse struct {
+	NodeID          string            `json:"node_id"`
+	NodeAddress     string            `json:"node_address,omitempty"`
+	Role            string            `json:"role"`
+	State           string            `json:"state"`
+	ClusterSize     int               `json:"cluster_size"`
+	HealthyNodes    int               `json:"healthy_nodes"`
+	LeaderID        string            `json:"leader_id,omitempty"`
+	LastHeartbeatAt string            `json:"last_heartbeat_at,omitempty"`
+	JoinedAt        string            `json:"joined_at,omitempty"`
+	Peers           []ClusterPeerInfo `json:"peers,omitempty"`
+}
+
+// AllStatsResponse is returned by GET /api/v1/stats/all.
+// Provides a combined snapshot of all statistics.
+type AllStatsResponse struct {
+	CollectedAt string                `json:"collected_at"`
+	Cache       *CacheStatsResponse   `json:"cache,omitempty"`
+	Journal     *JournalStatsResponse `json:"journal,omitempty"`
+	Trim        *TrimStatsResponse    `json:"trim,omitempty"`
+	Lock        *LockStatsResponse    `json:"lock,omitempty"`
+	SFB         *SFBStatsResponse     `json:"sfb,omitempty"`
+	Cluster     *ClusterInfoResponse  `json:"cluster,omitempty"`
+}
+
 // StatsOverviewResponse is returned by GET /api/v1/stats.
 // Provides a summary of all component stats.
 type StatsOverviewResponse struct {

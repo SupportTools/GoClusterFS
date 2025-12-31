@@ -26,6 +26,9 @@ type Server struct {
 	// Status provider for filesystem status (optional)
 	statusProvider StatusProvider
 
+	// Stats provider for statistics collection (optional)
+	statsProvider StatsProvider
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -211,4 +214,42 @@ func (s *Server) GetStatusProvider() StatusProvider {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.statusProvider
+}
+
+// StatsProvider provides statistics from the filesystem components.
+type StatsProvider interface {
+	// CacheStats returns cache statistics, or nil if not available.
+	CacheStats() *CacheStatsResponse
+
+	// JournalStats returns journal statistics, or nil if not available.
+	JournalStats() *JournalStatsResponse
+
+	// TrimStats returns TRIM/discard statistics, or nil if not available.
+	TrimStats() *TrimStatsResponse
+
+	// LockStats returns lock statistics, or nil if not available.
+	LockStats() *LockStatsResponse
+
+	// SFBStats returns Sparse File Bitmap statistics, or nil if not available.
+	SFBStats() *SFBStatsResponse
+
+	// ClusterInfo returns cluster information, or nil if not available.
+	ClusterInfo() *ClusterInfoResponse
+
+	// AllStats returns a combined snapshot of all statistics.
+	AllStats() *AllStatsResponse
+}
+
+// SetStatsProvider sets the stats provider for statistics collection.
+func (s *Server) SetStatsProvider(provider StatsProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statsProvider = provider
+}
+
+// GetStatsProvider returns the current stats provider.
+func (s *Server) GetStatsProvider() StatsProvider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.statsProvider
 }
