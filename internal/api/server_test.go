@@ -320,13 +320,15 @@ func TestServer_AddrBeforeStart(t *testing.T) {
 
 // mockStatsProvider implements StatsProvider for testing.
 type mockStatsProvider struct {
-	cache   *CacheStatsResponse
-	journal *JournalStatsResponse
-	trim    *TrimStatsResponse
-	lock    *LockStatsResponse
-	sfb     *SFBStatsResponse
-	cluster *ClusterInfoResponse
-	all     *AllStatsResponse
+	cache        *CacheStatsResponse
+	journal      *JournalStatsResponse
+	trim         *TrimStatsResponse
+	lock         *LockStatsResponse
+	sfb          *SFBStatsResponse
+	cluster      *ClusterInfoResponse
+	clusterNodes *ClusterNodesResponse
+	clusterLocks *ClusterLocksResponse
+	all          *AllStatsResponse
 }
 
 func (m *mockStatsProvider) CacheStats() *CacheStatsResponse     { return m.cache }
@@ -335,6 +337,8 @@ func (m *mockStatsProvider) TrimStats() *TrimStatsResponse       { return m.trim
 func (m *mockStatsProvider) LockStats() *LockStatsResponse       { return m.lock }
 func (m *mockStatsProvider) SFBStats() *SFBStatsResponse         { return m.sfb }
 func (m *mockStatsProvider) ClusterInfo() *ClusterInfoResponse   { return m.cluster }
+func (m *mockStatsProvider) ClusterNodes() *ClusterNodesResponse { return m.clusterNodes }
+func (m *mockStatsProvider) ClusterLocks() *ClusterLocksResponse { return m.clusterLocks }
 func (m *mockStatsProvider) AllStats() *AllStatsResponse         { return m.all }
 
 func TestServer_StatsEndpoints_NoProvider(t *testing.T) {
@@ -876,5 +880,385 @@ func TestServer_StatsMethodNotAllowed(t *testing.T) {
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected status 405, got %d", resp.StatusCode)
+	}
+}
+
+// Cluster endpoint tests
+
+func TestServer_ClusterNodesEndpoint(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	mockProvider := &mockStatsProvider{
+		clusterNodes: &ClusterNodesResponse{
+			ClusterID:    "test-cluster",
+			TotalNodes:   3,
+			HealthyNodes: 3,
+			LeaderID:     "node-1",
+			Nodes: []ClusterNodeInfo{
+				{
+					NodeID:        "node-1",
+					Address:       "192.168.1.1:7946",
+					Role:          "leader",
+					State:         "active",
+					LastHeartbeat: "2024-01-01T00:00:00Z",
+					IsSelf:        true,
+				},
+				{
+					NodeID:        "node-2",
+					Address:       "192.168.1.2:7946",
+					Role:          "follower",
+					State:         "active",
+					LastHeartbeat: "2024-01-01T00:00:00Z",
+					IsSelf:        false,
+					LatencyMs:     1.5,
+				},
+				{
+					NodeID:        "node-3",
+					Address:       "192.168.1.3:7946",
+					Role:          "follower",
+					State:         "active",
+					LastHeartbeat: "2024-01-01T00:00:00Z",
+					IsSelf:        false,
+					LatencyMs:     2.1,
+				},
+			},
+		},
+	}
+	server.SetStatsProvider(mockProvider)
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	resp, err := http.Get("http://" + server.Addr() + "/api/v1/cluster/nodes")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var nodes ClusterNodesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&nodes); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+
+	if nodes.TotalNodes != 3 {
+		t.Errorf("expected 3 total nodes, got %d", nodes.TotalNodes)
+	}
+	if nodes.ClusterID != "test-cluster" {
+		t.Errorf("expected cluster_id 'test-cluster', got %q", nodes.ClusterID)
+	}
+	if len(nodes.Nodes) != 3 {
+		t.Errorf("expected 3 nodes in list, got %d", len(nodes.Nodes))
+	}
+}
+
+func TestServer_ClusterLocksEndpoint(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	mockProvider := &mockStatsProvider{
+		clusterLocks: &ClusterLocksResponse{
+			ActiveLocks:  2,
+			PendingLocks: 1,
+			Locks: []DistributedLockInfo{
+				{
+					LockID:      "lock-1",
+					Resource:    "/data/file1.txt",
+					OwnerNodeID: "node-1",
+					AcquiredAt:  "2024-01-01T00:00:00Z",
+					LockType:    "exclusive",
+				},
+				{
+					LockID:      "lock-2",
+					Resource:    "/data/file2.txt",
+					OwnerNodeID: "node-2",
+					AcquiredAt:  "2024-01-01T00:01:00Z",
+					ExpiresAt:   "2024-01-01T00:11:00Z",
+					LockType:    "shared",
+				},
+			},
+		},
+	}
+	server.SetStatsProvider(mockProvider)
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	resp, err := http.Get("http://" + server.Addr() + "/api/v1/cluster/locks")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var locks ClusterLocksResponse
+	if err := json.NewDecoder(resp.Body).Decode(&locks); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+
+	if locks.ActiveLocks != 2 {
+		t.Errorf("expected 2 active locks, got %d", locks.ActiveLocks)
+	}
+	if locks.PendingLocks != 1 {
+		t.Errorf("expected 1 pending lock, got %d", locks.PendingLocks)
+	}
+	if len(locks.Locks) != 2 {
+		t.Errorf("expected 2 locks in list, got %d", len(locks.Locks))
+	}
+}
+
+func TestServer_ClusterStatusEndpoint(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	mockProvider := &mockStatsProvider{
+		cluster: &ClusterInfoResponse{
+			NodeID:       "node-1",
+			Role:         "leader",
+			State:        "active",
+			ClusterSize:  3,
+			HealthyNodes: 3,
+			LeaderID:     "node-1",
+		},
+	}
+	server.SetStatsProvider(mockProvider)
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// Test /api/v1/cluster/status
+	resp, err := http.Get("http://" + server.Addr() + "/api/v1/cluster/status")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var cluster ClusterInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cluster); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+
+	if cluster.NodeID != "node-1" {
+		t.Errorf("expected node_id 'node-1', got %q", cluster.NodeID)
+	}
+	if cluster.Role != "leader" {
+		t.Errorf("expected role 'leader', got %q", cluster.Role)
+	}
+}
+
+func TestServer_ClusterEndpoints_NoProvider(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	// No stats provider set
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	endpoints := []string{
+		"/api/v1/cluster/nodes",
+		"/api/v1/cluster/locks",
+		"/api/v1/cluster/status",
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint, func(t *testing.T) {
+			resp, err := http.Get("http://" + server.Addr() + endpoint)
+			if err != nil {
+				t.Fatalf("request error: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				t.Errorf("expected status 503, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestServer_ClusterEndpoints_NotAvailable(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	// Set empty provider (returns nil for all cluster data)
+	mockProvider := &mockStatsProvider{}
+	server.SetStatsProvider(mockProvider)
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	endpoints := []string{
+		"/api/v1/cluster/nodes",
+		"/api/v1/cluster/locks",
+		"/api/v1/cluster/status",
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint, func(t *testing.T) {
+			resp, err := http.Get("http://" + server.Addr() + endpoint)
+			if err != nil {
+				t.Fatalf("request error: %v", err)
+			}
+			defer resp.Body.Close()
+
+			// Should return 404 when running standalone (no cluster data)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("expected status 404, got %d", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestServer_ClusterUnknownEndpoint(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	mockProvider := &mockStatsProvider{}
+	server.SetStatsProvider(mockProvider)
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	resp, err := http.Get("http://" + server.Addr() + "/api/v1/cluster/unknown")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("expected status 404, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_ClusterMethodNotAllowed(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// POST should not be allowed
+	resp, err := http.Post("http://"+server.Addr()+"/api/v1/cluster/nodes", "application/json", nil)
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("expected status 405, got %d", resp.StatusCode)
+	}
+}
+
+func TestServer_ClusterDefaultRoute(t *testing.T) {
+	cfg := DefaultConfig().WithListenAddr(":0")
+	server, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+
+	mockProvider := &mockStatsProvider{
+		cluster: &ClusterInfoResponse{
+			NodeID:       "node-1",
+			Role:         "leader",
+			State:        "active",
+			ClusterSize:  1,
+			HealthyNodes: 1,
+		},
+	}
+	server.SetStatsProvider(mockProvider)
+
+	ctx := context.Background()
+	if err := server.Start(ctx); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	time.Sleep(10 * time.Millisecond)
+
+	// /api/v1/cluster (no path) should default to status
+	resp, err := http.Get("http://" + server.Addr() + "/api/v1/cluster")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	var cluster ClusterInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&cluster); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+
+	if cluster.NodeID != "node-1" {
+		t.Errorf("expected node_id 'node-1', got %q", cluster.NodeID)
 	}
 }

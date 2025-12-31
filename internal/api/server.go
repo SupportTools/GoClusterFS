@@ -248,6 +248,12 @@ type StatsProvider interface {
 	// ClusterInfo returns cluster information, or nil if not available.
 	ClusterInfo() *ClusterInfoResponse
 
+	// ClusterNodes returns detailed node information, or nil if not available.
+	ClusterNodes() *ClusterNodesResponse
+
+	// ClusterLocks returns active distributed locks, or nil if not available.
+	ClusterLocks() *ClusterLocksResponse
+
 	// AllStats returns a combined snapshot of all statistics.
 	AllStats() *AllStatsResponse
 }
