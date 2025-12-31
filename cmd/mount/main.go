@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -108,6 +109,12 @@ func main() {
 
 		// Snapshot configuration
 		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
+
+		// API server configuration
+		apiEnabled = flag.Bool("api", true, "Enable HTTP API server for management")
+		apiAddr    = flag.String("api-addr", ":8080", "API server listen address")
+		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled)")
+		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
 	)
 	flag.Parse()
 
@@ -398,23 +405,45 @@ func main() {
 	}
 
 	// Start API server for management and monitoring
-	apiCfg := api.DefaultConfig().WithListenAddr(":8080")
-	apiServer, err := api.NewServer(apiCfg)
-	if err != nil {
-		log.Printf("Warning: Failed to create API server: %v", err)
-	} else {
-		apiServer.SetStatusProvider(&fsStatusProvider{
-			mountPath:  *mountPoint,
-			devicePath: *devicePath,
-			dev:        dev,
-			bitmapMgr:  bm,
-		})
-		apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
-		if err := apiServer.Start(ctx); err != nil {
-			log.Printf("Warning: Failed to start API server: %v", err)
-		} else {
-			log.Printf("API server listening on %s", apiServer.Addr())
+	var apiServer *api.Server
+	if *apiEnabled {
+		// Parse CORS origins from comma-separated string
+		var corsOrigins []string
+		if *apiCORS != "" {
+			for _, origin := range strings.Split(*apiCORS, ",") {
+				origin = strings.TrimSpace(origin)
+				if origin != "" {
+					corsOrigins = append(corsOrigins, origin)
+				}
+			}
 		}
+
+		apiCfg := api.DefaultConfig().
+			WithListenAddr(*apiAddr).
+			WithAuthToken(*apiToken).
+			WithCORSOrigins(corsOrigins...)
+
+		var err error
+		apiServer, err = api.NewServer(apiCfg)
+		if err != nil {
+			log.Printf("Warning: Failed to create API server: %v", err)
+		} else {
+			apiServer.SetStatusProvider(&fsStatusProvider{
+				mountPath:  *mountPoint,
+				devicePath: *devicePath,
+				dev:        dev,
+				bitmapMgr:  bm,
+			})
+			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
+			if err := apiServer.Start(ctx); err != nil {
+				log.Printf("Warning: Failed to start API server: %v", err)
+			} else {
+				log.Printf("API server listening on %s (auth=%v, cors=%v)",
+					apiServer.Addr(), *apiToken != "", len(corsOrigins) > 0)
+			}
+		}
+	} else {
+		log.Println("API server: disabled")
 	}
 
 	// Handle signals for clean unmount
