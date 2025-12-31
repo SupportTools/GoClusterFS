@@ -42,9 +42,17 @@ func NewServer(cfg Config) (*Server, error) {
 	// Register routes
 	s.registerRoutes()
 
+	// Build middleware chain (order: logging -> CORS -> auth)
+	handler := Chain(
+		s.router,
+		LoggingMiddleware,
+		CORSMiddleware(cfg.CORSOrigins),
+		AuthMiddleware(cfg.AuthToken, "/health", "/metrics"),
+	)
+
 	// Create HTTP server
 	s.server = &http.Server{
-		Handler:      s.router,
+		Handler:      handler,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 		IdleTimeout:  cfg.IdleTimeout,
