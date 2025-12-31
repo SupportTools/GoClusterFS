@@ -17,6 +17,9 @@ type Collector struct {
 	journalProvider    JournalStatsProvider
 	filesystemProvider FilesystemStatsProvider
 	lockProvider       LockStatsProvider
+	trimProvider       TrimStatsProvider
+	sfbProvider        SFBStatsProvider
+	clusterProvider    ClusterInfoProvider
 
 	// Cached snapshot
 	cache      *Snapshot
@@ -60,6 +63,30 @@ func (c *Collector) SetLockProvider(provider LockStatsProvider) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lockProvider = provider
+	c.invalidateCache()
+}
+
+// SetTrimProvider sets the TRIM statistics provider.
+func (c *Collector) SetTrimProvider(provider TrimStatsProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.trimProvider = provider
+	c.invalidateCache()
+}
+
+// SetSFBProvider sets the Sparse File Bitmap statistics provider.
+func (c *Collector) SetSFBProvider(provider SFBStatsProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sfbProvider = provider
+	c.invalidateCache()
+}
+
+// SetClusterProvider sets the cluster information provider.
+func (c *Collector) SetClusterProvider(provider ClusterInfoProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clusterProvider = provider
 	c.invalidateCache()
 }
 
@@ -141,6 +168,18 @@ func (c *Collector) collectLocked() *Snapshot {
 		if c.lockProvider != nil {
 			snapshot.Lock = c.lockProvider.LockStats()
 		}
+
+		if c.trimProvider != nil {
+			snapshot.Trim = c.trimProvider.TrimStats()
+		}
+
+		if c.sfbProvider != nil {
+			snapshot.SFB = c.sfbProvider.SFBStats()
+		}
+
+		if c.clusterProvider != nil {
+			snapshot.Cluster = c.clusterProvider.ClusterInfo()
+		}
 	}
 
 	return snapshot
@@ -196,6 +235,45 @@ func (c *Collector) LockStats() *LockStats {
 		return nil
 	}
 	return provider.LockStats()
+}
+
+// TrimStats returns just the TRIM statistics.
+// Returns nil if no trim provider is set.
+func (c *Collector) TrimStats() *TrimStats {
+	c.mu.RLock()
+	provider := c.trimProvider
+	c.mu.RUnlock()
+
+	if provider == nil {
+		return nil
+	}
+	return provider.TrimStats()
+}
+
+// SFBStats returns just the Sparse File Bitmap statistics.
+// Returns nil if no SFB provider is set.
+func (c *Collector) SFBStats() *SFBStats {
+	c.mu.RLock()
+	provider := c.sfbProvider
+	c.mu.RUnlock()
+
+	if provider == nil {
+		return nil
+	}
+	return provider.SFBStats()
+}
+
+// ClusterInfo returns just the cluster information.
+// Returns nil if no cluster provider is set.
+func (c *Collector) ClusterInfo() *ClusterInfo {
+	c.mu.RLock()
+	provider := c.clusterProvider
+	c.mu.RUnlock()
+
+	if provider == nil {
+		return nil
+	}
+	return provider.ClusterInfo()
 }
 
 // Config returns the collector's configuration.

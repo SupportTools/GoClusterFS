@@ -41,6 +41,33 @@ func (m *mockLockProvider) LockStats() *LockStats {
 	return m.stats
 }
 
+// mockTrimProvider implements TrimStatsProvider for testing.
+type mockTrimProvider struct {
+	stats *TrimStats
+}
+
+func (m *mockTrimProvider) TrimStats() *TrimStats {
+	return m.stats
+}
+
+// mockSFBProvider implements SFBStatsProvider for testing.
+type mockSFBProvider struct {
+	stats *SFBStats
+}
+
+func (m *mockSFBProvider) SFBStats() *SFBStats {
+	return m.stats
+}
+
+// mockClusterProvider implements ClusterInfoProvider for testing.
+type mockClusterProvider struct {
+	info *ClusterInfo
+}
+
+func (m *mockClusterProvider) ClusterInfo() *ClusterInfo {
+	return m.info
+}
+
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -432,5 +459,144 @@ func TestCollector_SetConfig(t *testing.T) {
 
 	if collector.Config().CacheTTL != 5*time.Second {
 		t.Errorf("expected new TTL 5s, got %v", collector.Config().CacheTTL)
+	}
+}
+
+func TestCollector_NewProviders(t *testing.T) {
+	cfg := DefaultConfig()
+	collector := NewCollector(cfg)
+
+	// Set all new providers
+	trimStats := &TrimStats{
+		TrimOperations: 100,
+		TrimBytes:      1024 * 1024,
+		TrimBlocks:     256,
+		TrimEnabled:    true,
+	}
+	collector.SetTrimProvider(&mockTrimProvider{stats: trimStats})
+
+	sfbStats := &SFBStats{
+		TotalBlocks:       10000,
+		AllocatedBlocks:   7500,
+		FreeBlocks:        2500,
+		AllocationPercent: 75.0,
+	}
+	collector.SetSFBProvider(&mockSFBProvider{stats: sfbStats})
+
+	clusterInfo := &ClusterInfo{
+		NodeID:       "node-1",
+		Role:         "primary",
+		State:        "active",
+		ClusterSize:  3,
+		HealthyNodes: 3,
+	}
+	collector.SetClusterProvider(&mockClusterProvider{info: clusterInfo})
+
+	// Collect and verify
+	snapshot := collector.Collect()
+
+	// Verify TrimStats
+	if snapshot.Trim == nil {
+		t.Fatal("expected Trim to be set")
+	}
+	if snapshot.Trim.TrimOperations != 100 {
+		t.Errorf("expected TrimOperations 100, got %d", snapshot.Trim.TrimOperations)
+	}
+	if !snapshot.Trim.TrimEnabled {
+		t.Error("expected TrimEnabled true")
+	}
+
+	// Verify SFBStats
+	if snapshot.SFB == nil {
+		t.Fatal("expected SFB to be set")
+	}
+	if snapshot.SFB.TotalBlocks != 10000 {
+		t.Errorf("expected TotalBlocks 10000, got %d", snapshot.SFB.TotalBlocks)
+	}
+	if snapshot.SFB.AllocationPercent != 75.0 {
+		t.Errorf("expected AllocationPercent 75.0, got %f", snapshot.SFB.AllocationPercent)
+	}
+
+	// Verify ClusterInfo
+	if snapshot.Cluster == nil {
+		t.Fatal("expected Cluster to be set")
+	}
+	if snapshot.Cluster.NodeID != "node-1" {
+		t.Errorf("expected NodeID 'node-1', got %q", snapshot.Cluster.NodeID)
+	}
+	if snapshot.Cluster.ClusterSize != 3 {
+		t.Errorf("expected ClusterSize 3, got %d", snapshot.Cluster.ClusterSize)
+	}
+}
+
+func TestCollector_DirectStatsNewProviders(t *testing.T) {
+	cfg := DefaultConfig()
+	collector := NewCollector(cfg)
+
+	// No providers - should return nil
+	if collector.TrimStats() != nil {
+		t.Error("expected nil TrimStats with no provider")
+	}
+	if collector.SFBStats() != nil {
+		t.Error("expected nil SFBStats with no provider")
+	}
+	if collector.ClusterInfo() != nil {
+		t.Error("expected nil ClusterInfo with no provider")
+	}
+
+	// Set providers and verify direct access
+	collector.SetTrimProvider(&mockTrimProvider{
+		stats: &TrimStats{TrimOperations: 42, TrimEnabled: true},
+	})
+	collector.SetSFBProvider(&mockSFBProvider{
+		stats: &SFBStats{TotalBlocks: 999},
+	})
+	collector.SetClusterProvider(&mockClusterProvider{
+		info: &ClusterInfo{NodeID: "test-node", State: "active"},
+	})
+
+	if stats := collector.TrimStats(); stats == nil || stats.TrimOperations != 42 {
+		t.Error("expected TrimStats with TrimOperations 42")
+	}
+	if stats := collector.SFBStats(); stats == nil || stats.TotalBlocks != 999 {
+		t.Error("expected SFBStats with TotalBlocks 999")
+	}
+	if info := collector.ClusterInfo(); info == nil || info.NodeID != "test-node" {
+		t.Error("expected ClusterInfo with NodeID 'test-node'")
+	}
+}
+
+func TestClusterInfo_WithPeers(t *testing.T) {
+	cfg := DefaultConfig()
+	collector := NewCollector(cfg)
+
+	clusterInfo := &ClusterInfo{
+		NodeID:       "node-1",
+		NodeAddress:  "192.168.1.10:8080",
+		Role:         "primary",
+		State:        "active",
+		ClusterSize:  3,
+		HealthyNodes: 3,
+		LeaderID:     "node-1",
+		Peers: []PeerInfo{
+			{NodeID: "node-2", Address: "192.168.1.11:8080", State: "active", Latency: 1.5},
+			{NodeID: "node-3", Address: "192.168.1.12:8080", State: "active", Latency: 2.1},
+		},
+	}
+	collector.SetClusterProvider(&mockClusterProvider{info: clusterInfo})
+
+	snapshot := collector.Collect()
+
+	if snapshot.Cluster == nil {
+		t.Fatal("expected Cluster to be set")
+	}
+	if len(snapshot.Cluster.Peers) != 2 {
+		t.Errorf("expected 2 peers, got %d", len(snapshot.Cluster.Peers))
+	}
+	if snapshot.Cluster.Peers[0].NodeID != "node-2" {
+		t.Errorf("expected first peer NodeID 'node-2', got %q", snapshot.Cluster.Peers[0].NodeID)
+	}
+	if snapshot.Cluster.Peers[1].Latency != 2.1 {
+		t.Errorf("expected second peer Latency 2.1, got %f", snapshot.Cluster.Peers[1].Latency)
 	}
 }

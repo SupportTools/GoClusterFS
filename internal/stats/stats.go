@@ -67,6 +67,15 @@ type Snapshot struct {
 
 	// Lock contains lock contention statistics.
 	Lock *LockStats `json:"lock,omitempty"`
+
+	// Trim contains TRIM/discard operation statistics.
+	Trim *TrimStats `json:"trim,omitempty"`
+
+	// SFB contains Sparse File Bitmap (block allocation) statistics.
+	SFB *SFBStats `json:"sfb,omitempty"`
+
+	// Cluster contains cluster membership and node information.
+	Cluster *ClusterInfo `json:"cluster,omitempty"`
 }
 
 // CacheStats contains aggregated cache statistics.
@@ -178,6 +187,114 @@ type LockStats struct {
 	PendingLocks int `json:"pending_locks,omitempty"`
 }
 
+// TrimStats contains TRIM/discard operation statistics.
+type TrimStats struct {
+	// TrimOperations is the total number of TRIM operations performed.
+	TrimOperations uint64 `json:"trim_operations"`
+
+	// TrimBytes is the total bytes trimmed.
+	TrimBytes uint64 `json:"trim_bytes"`
+
+	// TrimBlocks is the total blocks trimmed.
+	TrimBlocks uint64 `json:"trim_blocks"`
+
+	// PendingTrimBlocks is blocks queued for TRIM.
+	PendingTrimBlocks uint64 `json:"pending_trim_blocks,omitempty"`
+
+	// LastTrimAt is when the last TRIM operation occurred.
+	LastTrimAt time.Time `json:"last_trim_at,omitempty"`
+
+	// TrimErrors is the count of failed TRIM operations.
+	TrimErrors uint64 `json:"trim_errors,omitempty"`
+
+	// TrimEnabled indicates if TRIM is enabled.
+	TrimEnabled bool `json:"trim_enabled"`
+
+	// BatchSize is the current batch size for TRIM operations.
+	BatchSize int `json:"batch_size,omitempty"`
+}
+
+// SFBStats contains Sparse File Bitmap (block allocation) statistics.
+type SFBStats struct {
+	// TotalBlocks is the total number of blocks in the bitmap.
+	TotalBlocks uint64 `json:"total_blocks"`
+
+	// AllocatedBlocks is the number of blocks currently allocated.
+	AllocatedBlocks uint64 `json:"allocated_blocks"`
+
+	// FreeBlocks is the number of blocks available for allocation.
+	FreeBlocks uint64 `json:"free_blocks"`
+
+	// AllocationPercent is the percentage of blocks allocated (0.0-100.0).
+	AllocationPercent float64 `json:"allocation_percent"`
+
+	// FragmentationRatio estimates fragmentation (0.0-1.0, higher = more fragmented).
+	FragmentationRatio float64 `json:"fragmentation_ratio,omitempty"`
+
+	// LargestFreeExtent is the size of the largest contiguous free region in blocks.
+	LargestFreeExtent uint64 `json:"largest_free_extent,omitempty"`
+
+	// AllocationsTotal is the total number of allocation operations.
+	AllocationsTotal uint64 `json:"allocations_total"`
+
+	// DeallocationsTotal is the total number of deallocation operations.
+	DeallocationsTotal uint64 `json:"deallocations_total"`
+
+	// AllocationFailures is the count of failed allocations (e.g., no space).
+	AllocationFailures uint64 `json:"allocation_failures,omitempty"`
+}
+
+// ClusterInfo contains cluster node and membership information.
+type ClusterInfo struct {
+	// NodeID is this node's unique identifier.
+	NodeID string `json:"node_id"`
+
+	// NodeAddress is this node's network address.
+	NodeAddress string `json:"node_address,omitempty"`
+
+	// Role is this node's role (e.g., "primary", "replica", "standalone").
+	Role string `json:"role"`
+
+	// State is this node's current state (e.g., "active", "syncing", "offline").
+	State string `json:"state"`
+
+	// ClusterSize is the total number of nodes in the cluster.
+	ClusterSize int `json:"cluster_size"`
+
+	// HealthyNodes is the number of nodes currently healthy.
+	HealthyNodes int `json:"healthy_nodes"`
+
+	// LeaderID is the current cluster leader's ID (if applicable).
+	LeaderID string `json:"leader_id,omitempty"`
+
+	// LastHeartbeatAt is when the last heartbeat was received/sent.
+	LastHeartbeatAt time.Time `json:"last_heartbeat_at,omitempty"`
+
+	// JoinedAt is when this node joined the cluster.
+	JoinedAt time.Time `json:"joined_at,omitempty"`
+
+	// Peers contains information about peer nodes.
+	Peers []PeerInfo `json:"peers,omitempty"`
+}
+
+// PeerInfo contains information about a cluster peer node.
+type PeerInfo struct {
+	// NodeID is the peer's unique identifier.
+	NodeID string `json:"node_id"`
+
+	// Address is the peer's network address.
+	Address string `json:"address"`
+
+	// State is the peer's current state.
+	State string `json:"state"`
+
+	// LastSeen is when the peer was last seen.
+	LastSeen time.Time `json:"last_seen,omitempty"`
+
+	// Latency is the round-trip latency to this peer in milliseconds.
+	Latency float64 `json:"latency_ms,omitempty"`
+}
+
 // CacheStatsProvider is implemented by components that provide cache statistics.
 type CacheStatsProvider interface {
 	// CacheStats returns current cache statistics.
@@ -204,4 +321,25 @@ type LockStatsProvider interface {
 	// LockStats returns current lock statistics.
 	// Returns nil if lock statistics are not available.
 	LockStats() *LockStats
+}
+
+// TrimStatsProvider is implemented by components that provide TRIM statistics.
+type TrimStatsProvider interface {
+	// TrimStats returns current TRIM/discard statistics.
+	// Returns nil if TRIM statistics are not available.
+	TrimStats() *TrimStats
+}
+
+// SFBStatsProvider is implemented by components that provide block allocation statistics.
+type SFBStatsProvider interface {
+	// SFBStats returns current Sparse File Bitmap statistics.
+	// Returns nil if SFB statistics are not available.
+	SFBStats() *SFBStats
+}
+
+// ClusterInfoProvider is implemented by components that provide cluster information.
+type ClusterInfoProvider interface {
+	// ClusterInfo returns current cluster membership and node information.
+	// Returns nil if cluster information is not available.
+	ClusterInfo() *ClusterInfo
 }
