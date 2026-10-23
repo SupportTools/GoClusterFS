@@ -198,12 +198,12 @@ func TestShardIndex(t *testing.T) {
 		offset int64
 		want   int
 	}{
-		{0, 0},                           // First shard
-		{IOShardSize - 1, 0},             // End of first shard
-		{IOShardSize, 1},                 // Start of second shard
-		{IOShardSize * 63, 63},           // Last shard
-		{IOShardSize * 64, 0},            // Wrap around to first shard
-		{IOShardSize * 65, 1},            // Wrap around to second shard
+		{0, 0},                              // First shard
+		{IOShardSize - 1, 0},                // End of first shard
+		{IOShardSize, 1},                    // Start of second shard
+		{IOShardSize * 63, 63},              // Last shard
+		{IOShardSize * 64, 0},               // Wrap around to first shard
+		{IOShardSize * 65, 1},               // Wrap around to second shard
 		{IOShardSize*64 + IOShardSize/2, 0}, // Mid-block in wrapped shard
 	}
 

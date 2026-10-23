@@ -4,7 +4,7 @@
 # =============================================================================
 # Stage 1: Builder - Compile the goclusterfs-mount binary
 # =============================================================================
-FROM golang:1.21-bookworm AS builder
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /build
 

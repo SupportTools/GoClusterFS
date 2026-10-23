@@ -108,13 +108,13 @@ type Journal struct {
 	stopOnce       sync.Once // Ensures Stop() is idempotent
 
 	// Batch commit tracking (for CommitBatch mode)
-	batchMu            sync.Mutex      // Protects batch state
-	batchPendingCount  int             // Number of commits since last sync
-	batchFirstCommit   time.Time       // Time of first commit in current batch
-	batchSyncCond      *sync.Cond      // Signals waiting goroutines when batch syncs
-	batchSyncTimer     *time.Timer     // Timer for MaxBatchAge
-	batchSyncInFlight  bool            // True if a batch sync is in progress
-	batchSyncWaiters   []chan struct{} // Channels waiting for current batch sync
+	batchMu           sync.Mutex      // Protects batch state
+	batchPendingCount int             // Number of commits since last sync
+	batchFirstCommit  time.Time       // Time of first commit in current batch
+	batchSyncCond     *sync.Cond      // Signals waiting goroutines when batch syncs
+	batchSyncTimer    *time.Timer     // Timer for MaxBatchAge
+	batchSyncInFlight bool            // True if a batch sync is in progress
+	batchSyncWaiters  []chan struct{} // Channels waiting for current batch sync
 
 	// Metrics
 	commitCount  uint64

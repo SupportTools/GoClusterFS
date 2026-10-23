@@ -58,13 +58,13 @@ func (g *Gauge) Value() int64 {
 // Histogram tracks the distribution of values using predefined buckets.
 // It's lock-free for recording values but requires a lock to read stats.
 type Histogram struct {
-	buckets     []uint64   // Upper bounds for each bucket
-	counts      []uint64   // Count of values in each bucket
-	sum         uint64     // Sum of all values (for average calculation)
-	count       uint64     // Total count of values
-	min         uint64     // Minimum value seen
-	max         uint64     // Maximum value seen
-	minSet      uint32     // Whether min has been set
+	buckets []uint64 // Upper bounds for each bucket
+	counts  []uint64 // Count of values in each bucket
+	sum     uint64   // Sum of all values (for average calculation)
+	count   uint64   // Total count of values
+	min     uint64   // Minimum value seen
+	max     uint64   // Maximum value seen
+	minSet  uint32   // Whether min has been set
 }
 
 // NewHistogram creates a histogram with the given bucket upper bounds.
@@ -144,21 +144,21 @@ func (s HistogramStats) String() string {
 // DefaultLatencyBuckets are bucket boundaries in microseconds for latency histograms.
 // Covers 10µs to 10s range.
 var DefaultLatencyBuckets = []uint64{
-	10,      // 10µs
-	50,      // 50µs
-	100,     // 100µs
-	250,     // 250µs
-	500,     // 500µs
-	1000,    // 1ms
-	2500,    // 2.5ms
-	5000,    // 5ms
-	10000,   // 10ms
-	25000,   // 25ms
-	50000,   // 50ms
-	100000,  // 100ms
-	250000,  // 250ms
-	500000,  // 500ms
-	1000000, // 1s
+	10,       // 10µs
+	50,       // 50µs
+	100,      // 100µs
+	250,      // 250µs
+	500,      // 500µs
+	1000,     // 1ms
+	2500,     // 2.5ms
+	5000,     // 5ms
+	10000,    // 10ms
+	25000,    // 25ms
+	50000,    // 50ms
+	100000,   // 100ms
+	250000,   // 250ms
+	500000,   // 500ms
+	1000000,  // 1s
 	10000000, // 10s
 }
 
