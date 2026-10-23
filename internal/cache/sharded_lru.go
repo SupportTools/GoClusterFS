@@ -194,7 +194,7 @@ type Cache[K comparable, V any] interface {
 
 // Verify interface compliance at compile time.
 var (
-	_ Cache[int, string]    = (*LRU[int, string])(nil)
-	_ Cache[int, string]    = (*ShardedLRU[int, string])(nil)
-	_ atomic.Value          // Import check for atomic (used in stats aggregation)
+	_ Cache[int, string] = (*LRU[int, string])(nil)
+	_ Cache[int, string] = (*ShardedLRU[int, string])(nil)
+	_ atomic.Value       // Import check for atomic (used in stats aggregation)
 )
