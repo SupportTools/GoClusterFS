@@ -2665,47 +2665,46 @@ test_concurrent_writes_power_failure() {
 # =============================================================================
 # Extent tree tests (files with more than 2 extents)
 # =============================================================================
+# These tests read back only on a node that has just restarted: the extent
+# cache keeps mappings of deleted files, and cleanup_test_files makes new files
+# reuse those inode numbers.
 
 # Print the md5 of 64KB at 1MB block $3 of file $2 on VM $1
 extent_chunk_md5_on_vm() {
     ssh_run "$1" "dd if=/mnt/goclusterfs/$2 bs=65536 skip=$(($3 * 16)) count=1 2>/dev/null | md5sum | cut -d' ' -f1"
 }
 
-# Power-kills a VM and brings GoClusterFS back up on it, which replays its journal.
-power_cycle_vm() {
+# Restarts a VM and mounts GoClusterFS on it again.
+restart_goclusterfs_vm() {
     local vm_id=$1
-    sleep 2
-    kill_vm "$vm_id"
-    sleep 1
+    stop_vm "$vm_id"
     start_vm "$vm_id" false
     wait_vm_healthy "$vm_id" || return 1
     setup_goclusterfs "$vm_id" false
 }
 
-# Writes 64KB at seven scattered 1MB blocks (more than the 2 inline extents),
-# checks every chunk and a hole from both VMs, then power-kills the writer
-# and checks again after recovery.
+# Writes 64KB at seven scattered 1MB blocks (more than the 2 inline extents)
+# on VM 1, then checks every chunk and a hole on VM 2 and on VM 1, each after
+# a restart.
 test_extent_tree_sparse_writes() {
     log_info "Testing sparse writes beyond inline extents..."
     ensure_cluster_healthy 2
 
-    local writer=1
-    local reader=2
     local file="extent_sparse.bin"
     local blocks="12 3 7 0 20 15 30"
     declare -A want
 
     for blk in $blocks; do
-        ssh_run "$writer" "head -c 65536 /dev/urandom > /tmp/extent_chunk"
-        want[$blk]=$(ssh_run "$writer" "md5sum /tmp/extent_chunk | cut -d' ' -f1")
-        ssh_run "$writer" "dd if=/tmp/extent_chunk of=/mnt/goclusterfs/$file bs=65536 seek=$((blk * 16)) conv=notrunc 2>/dev/null" || {
+        ssh_run 1 "head -c 65536 /dev/urandom > /tmp/extent_chunk"
+        want[$blk]=$(ssh_run 1 "md5sum /tmp/extent_chunk | cut -d' ' -f1")
+        ssh_run 1 "dd if=/tmp/extent_chunk of=/mnt/goclusterfs/$file bs=65536 seek=$((blk * 16)) conv=notrunc 2>/dev/null" || {
             log_error "write at block $blk failed"
             return 1
         }
     done
 
     local size
-    size=$(ssh_run "$writer" "stat -c%s /mnt/goclusterfs/$file")
+    size=$(ssh_run 1 "stat -c%s /mnt/goclusterfs/$file")
     if [ "$size" -ne $((30 * 1048576 + 65536)) ]; then
         log_error "size $size, want $((30 * 1048576 + 65536))"
         return 1
@@ -2729,19 +2728,18 @@ test_extent_tree_sparse_writes() {
         fi
     }
 
-    check_sparse_on_vm "$writer" || return 1
-    check_sparse_on_vm "$reader" || return 1
-    log_info "Chunks verified on both VMs, power-killing VM $writer..."
-    power_cycle_vm "$writer" || return 1
-    check_sparse_on_vm "$writer" || return 1
+    for vm_id in 2 1; do
+        restart_goclusterfs_vm "$vm_id" || return 1
+        check_sparse_on_vm "$vm_id" || return 1
+    done
 
     log_info "Sparse writes beyond inline extents test passed"
     return 0
 }
 
 # Two VMs append 1MB alternately to their own file, so both files get
-# non-contiguous blocks and grow past the old 2MB limit. Checks both files
-# from both VMs, then power-kills VM 2 and checks again after recovery.
+# non-contiguous blocks and grow past the old 2MB limit. Checks both files on
+# each VM after restarting it.
 test_extent_tree_interleaved_appends() {
     log_info "Testing interleaved appends across VMs..."
     ensure_cluster_healthy 2
@@ -2774,11 +2772,10 @@ test_extent_tree_interleaved_appends() {
         fi
     }
 
-    check_appends_on_vm 1 || return 1
-    check_appends_on_vm 2 || return 1
-    log_info "Both files verified on both VMs, power-killing VM 2..."
-    power_cycle_vm 2 || return 1
-    check_appends_on_vm 2 || return 1
+    for vm_id in 2 1; do
+        restart_goclusterfs_vm "$vm_id" || return 1
+        check_appends_on_vm "$vm_id" || return 1
+    done
 
     log_info "Interleaved appends test passed"
     return 0

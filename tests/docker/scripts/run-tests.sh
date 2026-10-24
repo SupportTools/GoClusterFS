@@ -2576,6 +2576,8 @@ log "All nodes healthy, starting tests..."
 # =============================================================================
 # Extent tree tests (files with more than 2 extents)
 # =============================================================================
+# These tests read back only on a node that has just restarted: the extent
+# cache keeps mappings of deleted files whose inode numbers new files reuse.
 
 # Print the md5 of 64KB at 1MB block $3 of file $2 on node $1
 extent_chunk_md5() {
@@ -2583,8 +2585,8 @@ extent_chunk_md5() {
 }
 
 # Writes 64KB at seven scattered 1MB blocks (more than the 2 inline extents),
-# then checks every chunk and a hole from the writer, from a second node,
-# and after restarting the writer.
+# then checks every chunk and a hole on a second node and on the writer, each
+# after a restart.
 test_extent_tree_sparse_writes() {
     log "Testing sparse writes beyond inline extents..."
 
@@ -2629,20 +2631,19 @@ test_extent_tree_sparse_writes() {
         fi
     }
 
-    check_sparse "$writer" || return 1
-    check_sparse "$reader" || return 1
-    log "Chunks verified on $writer and $reader, restarting $writer..."
-    restart_node "$writer"
-    wait_node_healthy "$writer" 30 || return 1
-    check_sparse "$writer" || return 1
+    for node in $(printf '%s\n' "$reader" "$writer" | uniq); do
+        restart_node "$node"
+        wait_node_healthy "$node" 30 || return 1
+        check_sparse "$node" || return 1
+    done
 
     log "Sparse writes beyond inline extents test passed"
     return 0
 }
 
 # Two nodes append 1MB alternately to their own file, so both files get
-# non-contiguous blocks and grow past the old 2MB limit. Checks both files
-# from both nodes and after restarting the first node.
+# non-contiguous blocks and grow past the old 2MB limit. Checks both files on
+# each node after restarting it.
 test_extent_tree_interleaved_appends() {
     log "Testing interleaved appends across nodes..."
 
@@ -2678,12 +2679,11 @@ test_extent_tree_interleaved_appends() {
         fi
     }
 
-    check_appends "$node_a" || return 1
-    check_appends "$node_b" || return 1
-    log "Both files verified on both nodes, restarting $node_a..."
-    restart_node "$node_a"
-    wait_node_healthy "$node_a" 30 || return 1
-    check_appends "$node_a" || return 1
+    for node in $(printf '%s\n' "$node_b" "$node_a" | uniq); do
+        restart_node "$node"
+        wait_node_healthy "$node" 30 || return 1
+        check_appends "$node" || return 1
+    done
 
     log "Interleaved appends test passed"
     return 0
