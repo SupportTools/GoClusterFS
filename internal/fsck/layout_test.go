@@ -84,7 +84,11 @@ func TestFsckBitmapAcceptsUnwrittenSectors(t *testing.T) {
 		t.Errorf("phase 2 problems on a freshly formatted device: %v", problems)
 	}
 
-	writeSector(t, dev, 1<<20, []byte{0xff})
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSector(t, dev, int64(sb.BlockBitmapOffset), []byte{0xff})
 	problems := phaseProblems(dev, fsck.PhaseBitmap)
 	if len(problems) == 0 || !strings.Contains(problems[0].Message, "checksum mismatch") {
 		t.Errorf("phase 2 problems = %v, want a checksum mismatch in sector 0", problems)

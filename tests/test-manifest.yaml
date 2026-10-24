@@ -464,6 +464,31 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesLegacyLayout
 
+  - id: mount-refuses-layout-v2
+    name: Mount and fsck refuse layout v2
+    description: On a v2 image, whose fixed 1 MB regions hold 4096 inodes and overflow refcounts past 128 GB, mount and fsck exit with a message to copy the data off and reformat
+    priority: go_only
+    environments:
+      go: layout_test.go::TestMountRefusesLayoutV2
+
+  - id: more-than-4096-files
+    name: More than 4096 files
+    description: A volume formatted with -bytes-per-inode 65536 holds 4200 files in 42 directories across a remount, statfs reports the larger inode count, and fsck is clean
+    priority: high
+    environments:
+      go: layout_test.go::TestMoreThan4096Files
+      docker: run-tests.sh::test_more_than_4096_files
+      vm: run-vm-tests.sh::test_more_than_4096_files
+
+  - id: large-volume-high-block-snapshot
+    name: 200 GB volume with snapshots of data past 128 GB
+    description: On a 200 GB sparse image, more than 4096 files and a snapshot, copy on write and clone of data past block 130816, where layout v2's refcount table ended, survive a remount, and fsck is clean
+    priority: high
+    environments:
+      go: layout_test.go::TestLargeVolumeSnapshotsHighBlocks
+      docker: TODO  # needs a 200 GB sparse shared image; the Docker cluster shares a 768 MB image
+      vm: TODO  # needs a 200 GB sparse shared disk; the VM cluster shares a 1 GB disk
+
   - id: crashed-peer-journal-replay
     name: Peer replays a crashed node's journal from its slot
     description: After node B crashes, node A finds B's journal through B's registry slot and replays it
