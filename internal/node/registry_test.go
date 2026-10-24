@@ -1195,3 +1195,30 @@ func writeLocalSlotAt(t *testing.T, reg *Registry, idx int, pid int, heartbeat t
 	}
 	return slot
 }
+
+func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	defer func(old time.Duration) { releaseLeaseBudget = old }(releaseLeaseBudget)
+	releaseLeaseBudget = claimSettle
+
+	reg := NewRegistry(dev, 0)
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5}, HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
+	if err := reg.writeSlot(0, gone); err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := reg.readSlotRaw(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err := reg.ReleaseSlot(0, raw, func() error {
+		time.Sleep(2 * claimSettle)
+		return nil
+	})
+	if released || err == nil {
+		t.Fatalf("ReleaseSlot after a slow reset = %v, %v; want an error", released, err)
+	}
+	if slot, err := reg.readSlot(0); err != nil || slot.State != NodeStateDead || slot.RecoveryOwner != reg.localUUID {
+		t.Errorf("slot after the abandoned release: %+v, %v; want dead under this registry's lease", slot, err)
+	}
+}

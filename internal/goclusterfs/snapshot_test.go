@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -71,7 +72,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
-	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, locks)
+	refs := refcount.NewRegion(dev, snapFSRefcountOffset, refcount.SizeForBlocks(snapFSDataBlocks), snapFSDataBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, snapFSDataOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, snapFSDataOffset)
 	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, locks, slot); err != nil {
@@ -298,6 +299,43 @@ func TestSnapshotRefusesUncountedSharing(t *testing.T) {
 	checkFile(t, f, pattern(1, BlockSize))
 }
 
+// On a volume larger than its refcount region, blocks past the region cannot
+// be shared. Refusing must leave the file as it was, off the copy-on-write path.
+func TestSnapshotRefusesBlocksPastRefcountRegion(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	noEntries := refcount.NewRegion(fsys.dev, snapFSRefcountOffset, 0, snapFSDataBlocks, fsys.lockMgr)
+	fsys.refcountReg = noEntries
+	fsys.extentMgr.SetRefcounts(noEntries)
+
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, pattern(1, 2*BlockSize), 0)
+
+	if errno := f.Setxattr(ctx, "user.snapshot", []byte("high"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("snapshot of blocks past the refcount region: errno %v, want ENOTSUP", errno)
+	}
+	if errno := f.Setxattr(ctx, "user.clone", []byte("/high-clone"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("clone of blocks past the refcount region: errno %v, want ENOTSUP", errno)
+	}
+	ino, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.InlineExtents[0].Flags&extent.FlagShared != 0 || ino.Flags&inode.FlagHasSnapshot != 0 {
+		t.Fatalf("refused share marked the file shared: extent flags %#x, inode flags %#x", ino.InlineExtents[0].Flags, ino.Flags)
+	}
+
+	free := fsys.bitmapMgr.FreeCount()
+	writeAt(t, f, pattern(2, 4096), 10)
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Fatalf("write after a refused snapshot allocated %d blocks, want 0", free-got)
+	}
+	checkFile(t, f, overwritten(pattern(1, 2*BlockSize), 10, pattern(2, 4096)))
+}
+
 // A new mount cleans up a snapshot a crash left half created or half deleted,
 // and the file keeps its blocks.
 func TestSnapshotRecoveryAfterCrash(t *testing.T) {
@@ -412,6 +450,136 @@ func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
 	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
 	setxattr(t, &File{fs: after, inodeNum: f.inodeNum}, "user.snapshot.clone", "race:/race-clone")
 	checkFile(t, lookupFile(t, after, "race-clone"), original)
+}
+
+// Node A decides to write a block in place, then node B snapshots the file
+// before A writes the data. The snapshot must keep the data from before the
+// write, whether the block was never shared or shared once by a snapshot that
+// is gone.
+func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
+	for _, onceShared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("onceShared=%v", onceShared), func(t *testing.T) {
+			path := newSnapshotFSImage(t)
+			nodeA := openSnapshotFS(t, path)
+			if err := nodeA.InitRoot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			original := pattern(1, BlockSize)
+			f := newRegularFile(t, nodeA)
+			writeAt(t, f, original, 0)
+			if onceShared {
+				setxattr(t, f, "user.snapshot", "gone")
+				if errno := f.Removexattr(context.Background(), "user.snapshot.gone"); errno != 0 {
+					t.Fatalf("delete snapshot: %v", errno)
+				}
+				waitSnapshotGone(t, nodeA, "gone")
+			}
+
+			nodeB := openSnapshotFS(t, path)
+			t.Cleanup(func() { beforeInPlaceWrite = nil })
+			beforeInPlaceWrite = func() {
+				beforeInPlaceWrite = nil
+				setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+			}
+			writeAt(t, f, pattern(2, 4096), 0)
+			if beforeInPlaceWrite != nil {
+				t.Fatal("node A's write never reached an in-place write")
+			}
+
+			checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, overwritten(original, 0, pattern(2, 4096)))
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			checkFile(t, lookupFile(t, nodeB, "mid-clone"), original)
+		})
+	}
+}
+
+// Node A changes the file after node B's snapshot counted its blocks and before
+// it marks the file shared. The snapshot shares the file as changed, and once
+// the snapshot is gone every block the file no longer maps is free again.
+func TestSnapshotRetriesWhenFileChangesWhileSharing(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		onceShared bool
+		change     func(t *testing.T, f *File)
+		want       func(original []byte) []byte
+	}{
+		{"in-place write", false,
+			func(t *testing.T, f *File) { writeAt(t, f, pattern(2, 4096), 0) },
+			func(o []byte) []byte { return overwritten(o, 0, pattern(2, 4096)) }},
+		{"copy on write", true,
+			func(t *testing.T, f *File) { writeAt(t, f, pattern(2, 4096), 0) },
+			func(o []byte) []byte { return overwritten(o, 0, pattern(2, 4096)) }},
+		{"truncate", false,
+			func(t *testing.T, f *File) { truncateFile(t, f, BlockSize) },
+			func(o []byte) []byte { return o[:BlockSize] }},
+		{"truncate once shared", true,
+			func(t *testing.T, f *File) { truncateFile(t, f, BlockSize) },
+			func(o []byte) []byte { return o[:BlockSize] }},
+		{"append", false,
+			func(t *testing.T, f *File) { writeAt(t, f, pattern(3, 4096), 2*BlockSize) },
+			func(o []byte) []byte { return append(bytes.Clone(o), pattern(3, 4096)...) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newSnapshotFSImage(t)
+			nodeA := openSnapshotFS(t, path)
+			ctx := context.Background()
+			if err := nodeA.InitRoot(ctx); err != nil {
+				t.Fatal(err)
+			}
+			original := pattern(1, 2*BlockSize)
+			f := newRegularFile(t, nodeA)
+			writeAt(t, f, original, 0)
+			if tc.onceShared {
+				setxattr(t, f, "user.snapshot", "gone")
+				if errno := f.Removexattr(ctx, "user.snapshot.gone"); errno != 0 {
+					t.Fatalf("delete snapshot: %v", errno)
+				}
+				waitSnapshotGone(t, nodeA, "gone")
+			}
+			before := []uint64{physicalBlock(t, nodeA, f.inodeNum, 0), physicalBlock(t, nodeA, f.inodeNum, 1)}
+
+			nodeB := openSnapshotFS(t, path)
+			t.Cleanup(func() { beforeShareMark = nil })
+			beforeShareMark = func() {
+				beforeShareMark = nil
+				tc.change(t, f)
+			}
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+			if beforeShareMark != nil {
+				t.Fatal("the snapshot never reached the point between counting and marking")
+			}
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			clone := lookupFile(t, nodeB, "mid-clone")
+			checkFile(t, clone, tc.want(original))
+
+			if errno := f.Removexattr(ctx, "user.snapshot.mid"); errno != 0 {
+				t.Fatalf("delete snapshot: %v", errno)
+			}
+			waitSnapshotGone(t, nodeA, "mid")
+			nodeB.discardInode(ctx, clone.inodeNum)
+			ino, err := nodeA.inodeTbl.Read(f.inodeNum)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mapped, err := nodeA.extentMgr.DataBlocks(ino)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range mapped {
+				if got := refcountOf(t, nodeA, b); got > 1 {
+					t.Errorf("block %d of the file counts %d owners, want 1", b, got)
+				}
+			}
+			for _, b := range before {
+				if slices.Contains(mapped, b) {
+					continue
+				}
+				if free, err := nodeA.bitmapMgr.IsFree(b); err != nil || !free {
+					t.Errorf("block %d is unmapped but still allocated (refcount %d, err=%v)", b, refcountOf(t, nodeA, b), err)
+				}
+			}
+		})
+	}
 }
 
 // An image written by an older version, with an old snapshot and an old clone

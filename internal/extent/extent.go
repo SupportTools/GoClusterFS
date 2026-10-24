@@ -374,6 +374,27 @@ func (m *Manager) HasUncountedSharing(ino *inode.Inode) (bool, error) {
 	return uncounted, err
 }
 
+// MarkSharingCounted adds FlagCounted to the extents of ino an older version
+// shared. Call it only once the refcounts of their blocks count every owner.
+func (m *Manager) MarkSharingCounted(ino *inode.Inode) (bool, error) {
+	uncounted, err := m.HasUncountedSharing(ino)
+	if err != nil || !uncounted {
+		return false, err
+	}
+	e, err := m.edit(context.Background(), ino)
+	if err != nil {
+		return false, err
+	}
+	if err := e.updateAll(func(x *Extent) {
+		if x.Flags&FlagShared != 0 {
+			x.Flags |= FlagCounted
+		}
+	}); err != nil {
+		return false, err
+	}
+	return true, e.commit()
+}
+
 // Delete unmaps every block of an inode that is being freed and frees the
 // blocks now, since no inode write will follow to commit the change.
 func (m *Manager) Delete(ctx context.Context, ino *inode.Inode) error {

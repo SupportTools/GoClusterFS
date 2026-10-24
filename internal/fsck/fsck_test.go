@@ -20,7 +20,7 @@ import (
 
 // testDevice creates a temporary file-backed device for testing.
 // Uses a directory that supports O_DIRECT (not tmpfs).
-func testDevice(t *testing.T, sizeMB int) (*storage.Device, func()) {
+func testDevice(t testing.TB, sizeMB int) (*storage.Device, func()) {
 	t.Helper()
 
 	// Create temp directory in /tmp (not tmpfs, which doesn't support O_DIRECT)
@@ -65,7 +65,7 @@ func testDevice(t *testing.T, sizeMB int) (*storage.Device, func()) {
 }
 
 // writeSuperblock writes a valid superblock to the device.
-func writeSuperblock(t *testing.T, dev *storage.Device, totalBlocks uint64) {
+func writeSuperblock(t testing.TB, dev *storage.Device, totalBlocks uint64) {
 	t.Helper()
 
 	const (
@@ -120,7 +120,7 @@ func writeSuperblock(t *testing.T, dev *storage.Device, totalBlocks uint64) {
 
 // initRootInode writes a minimal root directory inode.
 // Uses aligned I/O by reading the full sector, modifying, and writing back.
-func initRootInode(t *testing.T, dev *storage.Device) {
+func initRootInode(t testing.TB, dev *storage.Device) {
 	t.Helper()
 
 	const (

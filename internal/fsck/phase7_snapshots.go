@@ -3,7 +3,8 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 const (
@@ -66,7 +67,8 @@ type SnapshotDescriptor struct {
 //   - State is valid (0-3)
 //   - No duplicate snapshot IDs
 //   - No duplicate names
-//   - Snapshot count matches superblock counter
+//
+// The superblock snapshot counter is not compared: the runtime never updates it.
 func (c *Checker) checkSnapshots() error {
 	if c.sbData == nil {
 		return fmt.Errorf("superblock not validated")
@@ -75,16 +77,9 @@ func (c *Checker) checkSnapshots() error {
 	sb := c.sbData
 	snapshotOffset := sb.SnapshotRegOffset
 	snapshotSize := sb.SnapshotRegSize
-	expectedCount := sb.SnapshotCount
 
-	// Check if snapshot registry exists
 	if snapshotSize == 0 {
 		c.logf("  Snapshot registry not present (size=0)\n")
-		if expectedCount > 0 {
-			c.addProblem(PhaseSnapshots, Error, "snapshot count",
-				fmt.Sprintf("superblock says %d snapshots but registry size is 0", expectedCount),
-				true)
-		}
 		return nil
 	}
 
@@ -92,9 +87,8 @@ func (c *Checker) checkSnapshots() error {
 
 	c.logf("  Snapshot registry offset: 0x%X\n", snapshotOffset)
 	c.logf("  Snapshot registry size: %d bytes (%d sectors)\n", snapshotSize, totalSectors)
-	c.logf("  Expected snapshot count: %d\n", expectedCount)
 
-	sectorBuf := make([]byte, SnapshotSectorSize)
+	sectorBuf := storage.NewAlignedBuffer(SnapshotSectorSize).Bytes()
 	checksumErrors := 0
 	invalidDescriptors := 0
 	activeSnapshots := uint32(0)
@@ -107,41 +101,16 @@ func (c *Checker) checkSnapshots() error {
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := snapshotOffset + sectorIdx*SnapshotSectorSize
 
-		n, err := c.dev.ReadAt(sectorBuf, int64(sectorOffset))
-		if err != nil {
-			c.addProblem(PhaseSnapshots, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("read error: %v", err),
-				false)
-			continue
-		}
-		if n != SnapshotSectorSize {
-			c.addProblem(PhaseSnapshots, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("short read: %d bytes", n),
-				false)
+		if err := c.readSector(sectorBuf, sectorOffset); err != nil {
+			c.addProblem(PhaseSnapshots, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
 			continue
 		}
 
-		// Validate sector checksum
-		dataLen := SnapshotDescriptorsPerSector * SnapshotDescriptorSize
-		storedChecksum := binary.LittleEndian.Uint32(sectorBuf[dataLen:])
-		computedChecksum := crc32.Checksum(sectorBuf[:dataLen], crc32.MakeTable(crc32.Castagnoli))
-
-		if storedChecksum != computedChecksum {
+		if !sectorChecksumValid(sectorBuf) {
 			checksumErrors++
 			c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
-					storedChecksum, computedChecksum),
-				true)
-
-			if c.opts.Mode == Repair {
-				binary.LittleEndian.PutUint32(sectorBuf[dataLen:], computedChecksum)
-				if _, err := c.dev.WriteAt(sectorBuf, int64(sectorOffset)); err != nil {
-					c.logf("  Failed to repair sector %d: %v\n", sectorIdx, err)
-				} else {
-					c.result.Problems[len(c.result.Problems)-1].Repaired = true
-					c.result.RepairedCount++
-				}
-			}
+				"checksum mismatch: the runtime cannot read the snapshots in this sector",
+				false)
 		}
 
 		// Process each descriptor
@@ -168,7 +137,7 @@ func (c *Checker) checkSnapshots() error {
 			if desc.State > SnapshotStateDeleting {
 				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("snapshot %d", desc.SnapshotID),
 					fmt.Sprintf("invalid state: %d", desc.State),
-					true)
+					false)
 			}
 
 			// Check for duplicate IDs
@@ -223,13 +192,11 @@ func (c *Checker) checkSnapshots() error {
 			}
 
 			// Validate descriptor checksum
-			descChecksum := binary.LittleEndian.Uint32(descBuf[124:128])
-			descComputedChecksum := crc32.Checksum(descBuf[:124], crc32.MakeTable(crc32.Castagnoli))
-			if descChecksum != descComputedChecksum {
+			if computed := storage.CRC32C(descBuf[:124]); desc.Checksum != computed {
 				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("snapshot %d", desc.SnapshotID),
 					fmt.Sprintf("descriptor checksum mismatch: stored=0x%08X, computed=0x%08X",
-						descChecksum, descComputedChecksum),
-					true)
+						desc.Checksum, computed),
+					false)
 			}
 		}
 	}
@@ -238,15 +205,8 @@ func (c *Checker) checkSnapshots() error {
 		if !dataInodes[num] {
 			c.addProblem(PhaseSnapshots, Warning, fmt.Sprintf("inode %d", num),
 				"snapshot data inode belongs to no snapshot (left by a crash during snapshot creation)",
-				true)
+				false)
 		}
-	}
-
-	// Compare with superblock counter
-	if activeSnapshots != expectedCount {
-		c.addProblem(PhaseSnapshots, Error, "snapshot count",
-			fmt.Sprintf("superblock says %d snapshots, found %d active", expectedCount, activeSnapshots),
-			true)
 	}
 
 	c.result.SnapshotCount = activeSnapshots

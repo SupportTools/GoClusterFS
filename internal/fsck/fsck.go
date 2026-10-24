@@ -18,6 +18,7 @@
 package fsck
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -92,19 +93,23 @@ func (s Severity) String() string {
 
 // Problem represents a single consistency issue found during checking.
 type Problem struct {
-	Phase      Phase    // Which phase found the problem
-	Severity   Severity // How serious the problem is
-	Location   string   // Where the problem was found (e.g., "inode 42")
-	Message    string   // Description of the problem
-	Repairable bool     // Whether the problem can be automatically repaired
-	Repaired   bool     // Whether the problem was repaired (if Mode == Repair)
+	Phase       Phase    // Which phase found the problem
+	Severity    Severity // How serious the problem is
+	Location    string   // Where the problem was found (e.g., "inode 42")
+	Message     string   // Description of the problem
+	Repairable  bool     // Whether the problem can be automatically repaired
+	Repaired    bool     // Whether the problem was repaired (if Mode == Repair)
+	WouldRepair bool     // Whether a dry run found that repair would fix it
 }
 
 func (p Problem) String() string {
 	status := ""
-	if p.Repaired {
+	switch {
+	case p.Repaired:
 		status = " [FIXED]"
-	} else if p.Repairable && !p.Repaired {
+	case p.WouldRepair:
+		status = " [WOULD FIX]"
+	case p.Repairable:
 		status = " [FIXABLE]"
 	}
 	return fmt.Sprintf("[%s] %s: %s: %s%s",
@@ -220,6 +225,48 @@ func (r *Result) HasErrors() bool {
 	return r.ErrorCount > 0 || r.CriticalCount > 0 || r.FatalCount > 0
 }
 
+// UnrepairedErrors counts the problems of severity Error or worse that are
+// still on disk.
+func (r *Result) UnrepairedErrors() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.unrepairedErrors()
+}
+
+func (r *Result) unrepairedErrors() int {
+	n := 0
+	for _, p := range r.Problems {
+		if p.Severity >= Error && !p.Repaired {
+			n++
+		}
+	}
+	return n
+}
+
+// Exit codes of goclusterfs-fsck. As with fsck(8), they are bits: a repair
+// that fixed some errors and left others exits 5.
+const (
+	ExitClean       = 0  // no errors (warnings may remain)
+	ExitCorrected   = 1  // errors were repaired
+	ExitUncorrected = 4  // errors remain on disk
+	ExitOperational = 8  // I/O failure, or the check could not finish or was refused
+	ExitUsage       = 16 // usage error
+)
+
+func (r *Result) ExitCode() int {
+	code := ExitClean
+	if r.RepairedCount > 0 {
+		code |= ExitCorrected
+	}
+	switch {
+	case r.Aborted:
+		code |= ExitOperational
+	case r.UnrepairedErrors() > 0:
+		code |= ExitUncorrected
+	}
+	return code
+}
+
 // IsClean returns true if no problems of any kind were found.
 func (r *Result) IsClean() bool {
 	r.mu.Lock()
@@ -235,6 +282,8 @@ func (r *Result) Summary() string {
 	status := "CLEAN"
 	if r.Aborted {
 		status = "ABORTED"
+	} else if r.RepairedCount > 0 && r.unrepairedErrors() == 0 {
+		status = "REPAIRED"
 	} else if r.FatalCount > 0 || r.CriticalCount > 0 {
 		status = "ERRORS FOUND"
 	} else if r.ErrorCount > 0 {
@@ -305,6 +354,13 @@ type Options struct {
 
 	// SkipPhases allows skipping specific phases (for testing).
 	SkipPhases map[Phase]bool
+
+	// DryRun makes Repair report what it would change without writing.
+	DryRun bool
+
+	// AllowUncleanNodes lets Repair run although a node left the filesystem
+	// without unmounting. Repair never runs while a node has it mounted.
+	AllowUncleanNodes bool
 }
 
 // DefaultOptions returns the default fsck options.
@@ -328,14 +384,20 @@ type Checker struct {
 	sbData *SuperblockData
 
 	// Collected data for cross-validation
-	bitmapAllocated map[uint64]bool   // blocks marked allocated in bitmap
-	inodeBlocks     map[uint64]int    // block -> reference count from inodes
-	inodeUsed       map[uint32]bool   // inode numbers that are in use
-	dirEntryRefs    map[uint32]int    // inode -> reference count from dir entries
-	refcountEntries map[uint64]uint32 // block -> refcount from table
-	snapshotInodes  map[uint32]bool   // inodes referenced by snapshots
-	snapshotData    map[uint32]bool   // inodes holding a snapshot's captured extents
+	bitmapAllocated map[uint64]bool // blocks marked allocated in bitmap
+	inodeBlocks     map[uint64]int  // block -> reference count from inodes
+	inodeUsed       map[uint32]bool // inode numbers that are in use
+	dirEntryRefs    map[uint32]int  // inode -> reference count from dir entries
+	snapshotInodes  map[uint32]bool // inodes referenced by snapshots
+	snapshotData    map[uint32]bool // inodes holding a snapshot's captured extents
+	sfbContainers   map[uint64]bool // blocks holding small files of older versions
 	extentTrees     map[uint32]*extentTree
+	uncounted       map[uint32]int  // inodes an older version shared -> problem index
+	uncountedRefs   map[uint64]int  // block -> references from extents an older version shared
+	uncountedPast   map[uint32]bool // inodes an older version shared with blocks past the refcount table
+	refsIncomplete  []string        // why inodeBlocks may miss references
+	superblockFix   func() error    // runs once repair knows no node uses the filesystem
+	registry        []byte          // node registry as startRepair last saw it
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
@@ -400,10 +462,13 @@ func New(dev *storage.Device, opts Options) *Checker {
 		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
 		dirEntryRefs:    make(map[uint32]int),
-		refcountEntries: make(map[uint64]uint32),
 		snapshotInodes:  make(map[uint32]bool),
 		snapshotData:    make(map[uint32]bool),
+		sfbContainers:   make(map[uint64]bool),
 		extentTrees:     make(map[uint32]*extentTree),
+		uncounted:       make(map[uint32]int),
+		uncountedRefs:   make(map[uint64]int),
+		uncountedPast:   make(map[uint32]bool),
 	}
 }
 
@@ -441,7 +506,8 @@ func (c *Checker) Check() *Result {
 				Message:  err.Error(),
 			})
 
-			if c.opts.StopOnFatal {
+			// Later phases read regions the superblock places.
+			if c.opts.StopOnFatal || p.phase == PhaseSuperblock || errors.Is(err, errRepairStopped) {
 				c.result.Aborted = true
 				c.result.AbortReason = fmt.Sprintf("%s failed: %v", p.phase, err)
 				break
@@ -450,6 +516,14 @@ func (c *Checker) Check() *Result {
 
 		c.result.CompletedPhase = p.phase
 		c.logf("%s: Complete\n", p.phase)
+
+		if p.phase == PhaseSuperblock {
+			if err := c.startRepair(); err != nil {
+				c.result.Aborted = true
+				c.result.AbortReason = err.Error()
+				break
+			}
+		}
 	}
 
 	c.result.EndTime = time.Now()

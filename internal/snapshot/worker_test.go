@@ -87,7 +87,7 @@ func newWorkerEnv(t *testing.T) *workerEnv {
 		t:    t,
 		ctx:  context.Background(),
 		reg:  NewRegistry(dev, testSnapshotStart, testSnapshotSize, nil),
-		refs: refcount.NewRegion(dev, testRefcountStart, testDataBlocks, nil),
+		refs: refcount.NewRegion(dev, testRefcountStart, refcount.SizeForBlocks(testDataBlocks), testDataBlocks, nil),
 		bm:   bitmap.NewRegion(dev, testBitmapStart, testDataBlocks, nil, nodeUUID),
 		tbl:  inode.NewTable(dev, testInodeStart, testInodeSize, nil, nodeUUID),
 		done: make(chan *JobResult, 64),

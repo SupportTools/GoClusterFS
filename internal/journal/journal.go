@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -667,16 +668,16 @@ func (j *Journal) Region() *Region {
 // 4. Resets the journal to clean state
 //
 // Returns:
-// - nil, nil if no recovery was needed
+// - nil, nil if the journal was never initialized or is clean
 // - result, nil if recovery succeeded
-// - nil, error if recovery failed
+// - nil, error if the journal header is damaged or recovery failed
 func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handler RecoveryHandler) (*ScanRecoveryResult, error) {
-	// Try to open the journal region for recovery (no UUID validation)
 	region, err := OpenRegionForRecovery(dev, regionOffset, regionSize)
-	if err != nil {
-		// Journal doesn't exist or is corrupt - no recovery needed
-		// This is normal for fresh filesystems
+	if errors.Is(err, ErrJournalUninitialized) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("journal at offset %d: %w", regionOffset, err)
 	}
 
 	// Check if recovery is needed

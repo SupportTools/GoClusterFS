@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -155,19 +156,25 @@ func (m *Manager) Stats() Stats {
 	return stats
 }
 
+// String summarizes cache sizes and hit rates.
+func (s Stats) String() string {
+	return fmt.Sprintf("inodes=%d (hit=%.1f%%), extents=%d (hit=%.1f%%)",
+		s.InodeCacheSize, s.InodeHitRate, s.ExtentCacheSize, s.ExtentHitRate)
+}
+
 // Stats holds cache statistics for monitoring and debugging.
 type Stats struct {
 	// Inode cache stats
 	InodeCacheSize   int
 	InodeCacheHits   uint64
 	InodeCacheMisses uint64
-	InodeHitRate     float64
+	InodeHitRate     float64 // percent, 0-100
 
 	// Extent cache stats
 	ExtentCacheSize   int
 	ExtentCacheHits   uint64
 	ExtentCacheMisses uint64
-	ExtentHitRate     float64
+	ExtentHitRate     float64 // percent, 0-100
 
 	// Negative cache stats
 	NegativeCacheSize int

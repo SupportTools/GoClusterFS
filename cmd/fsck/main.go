@@ -9,18 +9,26 @@
 //
 // Modes:
 //
-//	-check (default): Report problems without making changes
-//	-repair: Fix problems automatically where possible
-//	-force: Continue despite fatal errors (data recovery mode)
+//	(default): Report problems without making changes
+//	-repair: Fix the problems marked [FIXABLE]
+//	-repair -dry-run: Report what -repair would change, write nothing
+//	-force: Keep checking after a fatal error; with -repair, repair even if
+//	        a stopped node's journal still needs replay
+//	-list-slots: List node registry slots with their lease and journal
+//	-release-slot N: Free the slot of a node that will not return; with
+//	        -discard-journal, reset its journal and free it
 //
-// Exit Codes:
+// Exit codes, bits as with fsck(8):
 //
-//	0: Filesystem is clean
-//	1: Errors were found (and possibly repaired)
-//	2: Usage error or unrecoverable failure
+//	0: No errors (warnings may remain)
+//	1: Errors were repaired, or -release-slot -discard-journal freed a slot
+//	4: Errors remain on disk
+//	8: I/O failure, or the check could not finish or was refused
+//	16: Usage error
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -32,8 +40,9 @@ import (
 
 func main() {
 	var (
-		repair       = flag.Bool("repair", false, "Repair problems automatically where possible")
-		force        = flag.Bool("force", false, "Continue despite fatal errors (data recovery)")
+		repair       = flag.Bool("repair", false, "Repair problems automatically where possible (see Repair below)")
+		dryRun       = flag.Bool("dry-run", false, "With -repair, report what would change without writing")
+		force        = flag.Bool("force", false, "Keep checking after a fatal error; with -repair, repair even if a stopped node's journal still needs replay; with -release-slot, discard a journal a mount could replay")
 		verbose      = flag.Bool("verbose", false, "Enable verbose progress output")
 		quiet        = flag.Bool("quiet", false, "Only print errors and summary")
 		stopOnFatal  = flag.Bool("stop-on-fatal", true, "Stop checking when a fatal error is found")
@@ -42,6 +51,10 @@ func main() {
 		summaryOnly  = flag.Bool("summary", false, "Only print final summary")
 		showProblems = flag.Bool("show-problems", true, "Show individual problems found")
 		showVersion  = flag.Bool("version", false, "Print version and exit")
+
+		listSlots      = flag.Bool("list-slots", false, "List node registry slots with their lease and journal, then exit")
+		releaseSlotN   = flag.Int("release-slot", -1, "Check that registry slot N can be released and print what releasing it discards")
+		discardJournal = flag.Bool("discard-journal", false, "With -release-slot, reset the slot's journal and free the slot")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <device>\n\n", os.Args[0])
@@ -52,10 +65,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s /dev/sdb                     # Check /dev/sdb\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -repair /path/to/disk.img    # Check and repair\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -verbose -repair /dev/sdc    # Verbose repair\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "\nExit codes:\n")
-		fmt.Fprintf(os.Stderr, "  0: Filesystem is clean\n")
-		fmt.Fprintf(os.Stderr, "  1: Errors were found\n")
-		fmt.Fprintf(os.Stderr, "  2: Usage error or fatal failure\n")
+		fmt.Fprintf(os.Stderr, "  %s -repair -dry-run /dev/sdc     # Show what repair would change\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -list-slots /dev/sdb          # Show node registry slots\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -release-slot 3 /dev/sdb      # Show what releasing slot 3 discards\n", os.Args[0])
+		fmt.Fprint(os.Stderr, repairHelp)
+		fmt.Fprint(os.Stderr, slotsHelp)
+		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
+		fmt.Fprintf(os.Stderr, "  0: No errors (warnings may remain)\n")
+		fmt.Fprintf(os.Stderr, "  1: Errors were repaired, or -release-slot -discard-journal freed a slot\n")
+		fmt.Fprintf(os.Stderr, "  4: Errors remain on disk\n")
+		fmt.Fprintf(os.Stderr, "  8: I/O failure, or the check could not finish or was refused\n")
+		fmt.Fprintf(os.Stderr, "  16: Usage error\n")
 	}
 	flag.Parse()
 
@@ -73,7 +93,23 @@ func main() {
 	// Validate arguments
 	if flag.NArg() != 1 {
 		flag.Usage()
-		os.Exit(2)
+		os.Exit(fsck.ExitUsage)
+	}
+	if *dryRun && !*repair {
+		fmt.Fprintln(os.Stderr, "Error: -dry-run needs -repair")
+		os.Exit(fsck.ExitUsage)
+	}
+	releasing := *releaseSlotN != -1
+	switch {
+	case *discardJournal && !releasing:
+		fmt.Fprintln(os.Stderr, "Error: -discard-journal needs -release-slot")
+		os.Exit(fsck.ExitUsage)
+	case releasing && *releaseSlotN < 0:
+		fmt.Fprintln(os.Stderr, "Error: -release-slot needs a slot number")
+		os.Exit(fsck.ExitUsage)
+	case *listSlots && releasing, (*listSlots || releasing) && *repair:
+		fmt.Fprintln(os.Stderr, "Error: -list-slots, -release-slot and -repair run separately")
+		os.Exit(fsck.ExitUsage)
 	}
 	devicePath := flag.Arg(0)
 
@@ -81,8 +117,7 @@ func main() {
 	mode := fsck.CheckOnly
 	if *repair {
 		mode = fsck.Repair
-	}
-	if *force {
+	} else if *force {
 		mode = fsck.Force
 	}
 
@@ -95,17 +130,39 @@ func main() {
 	dev, err := storage.Open(devicePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: Failed to open device: %v\n", err)
-		os.Exit(2)
+		os.Exit(fsck.ExitOperational)
 	}
 	defer dev.Close()
 
+	if *listSlots || releasing {
+		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose})
+		if *listSlots {
+			err = printSlots(os.Stdout, checker)
+		} else {
+			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *discardJournal, *force)
+		}
+		switch {
+		case errors.Is(err, fsck.ErrNoSuchSlot):
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(fsck.ExitUsage)
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(fsck.ExitOperational)
+		case *discardJournal:
+			os.Exit(fsck.ExitCorrected)
+		}
+		os.Exit(fsck.ExitClean)
+	}
+
 	// Configure fsck options
 	opts := fsck.Options{
-		Mode:        mode,
-		Verbose:     *verbose,
-		Output:      os.Stdout,
-		StopOnFatal: *stopOnFatal,
-		SkipPhases:  make(map[fsck.Phase]bool),
+		Mode:              mode,
+		Verbose:           *verbose,
+		Output:            os.Stdout,
+		StopOnFatal:       *stopOnFatal && !*force,
+		SkipPhases:        make(map[fsck.Phase]bool),
+		DryRun:            *dryRun,
+		AllowUncleanNodes: *force,
 	}
 
 	// Handle skip-phase
@@ -120,7 +177,11 @@ func main() {
 	if !*quiet {
 		devSize := dev.Size()
 		fmt.Printf("GoClusterFS fsck - %s (%d MB)\n", devicePath, devSize/(1024*1024))
-		fmt.Printf("Mode: %s\n\n", mode)
+		if *dryRun {
+			fmt.Printf("Mode: %s (dry run, nothing is written)\n\n", mode)
+		} else {
+			fmt.Printf("Mode: %s\n\n", mode)
+		}
 	}
 
 	// Create checker and run
@@ -146,20 +207,42 @@ func main() {
 		fmt.Println(result.Summary())
 	}
 
-	// Determine exit code
 	if result.Aborted {
 		fmt.Fprintf(os.Stderr, "fsck aborted: %s\n", result.AbortReason)
-		os.Exit(2)
 	}
-	if result.HasErrors() {
-		if mode == fsck.Repair && result.RepairedCount > 0 {
-			fmt.Printf("Repaired %d of %d problems\n",
-				result.RepairedCount, result.ErrorCount+result.CriticalCount)
+	if mode == fsck.Repair {
+		wouldRepair := 0
+		for _, p := range result.Problems {
+			if p.WouldRepair {
+				wouldRepair++
+			}
 		}
-		os.Exit(1)
+		if *dryRun {
+			fmt.Printf("Dry run: repair would fix %d problems; nothing was written\n", wouldRepair)
+		} else if result.RepairedCount > 0 {
+			fmt.Printf("Repaired %d problems; %d errors remain\n", result.RepairedCount, result.UnrepairedErrors())
+		}
 	}
-	os.Exit(0)
+	os.Exit(result.ExitCode())
 }
+
+const repairHelp = `
+Repair:
+  Unmount the filesystem on every node first. -repair refuses to run while a
+  node's heartbeat still moves, which it can take up to 11 seconds to rule out
+  right after an unmount, or while a stopped node's journal still needs replay
+  (-force overrides only the second check).
+
+  -repair rewrites block refcounts from the extents of every inode, snapshot
+  and clone, marks blocks that older versions shared as counted, and fixes the
+  superblock checksum when every other superblock field checks out. It never
+  frees blocks, deletes inodes or edits directories, and it leaves problems
+  not marked [FIXABLE] as they are. It skips the refcount rebuild when some
+  inode could not be read, since the rebuilt counts could then be too low.
+
+  Back up the device first (for example with dd) and run -repair -dry-run to
+  see what would change.
+`
 
 // printPhases lists all fsck phases.
 func printPhases() {
@@ -170,14 +253,14 @@ func printPhases() {
 		name string
 		desc string
 	}{
-		{1, "Superblock", "Validates magic, version, region bounds, checksum"},
+		{1, "Superblock", "Validates magic, version, sizes, the format v2 region layout, checksum"},
 		{2, "Bitmap", "Checks sector checksums, counts allocated blocks"},
-		{3, "Inodes", "Validates per-inode checksums, mode, link count"},
+		{3, "Inodes", "Validates per-inode checksums, mode, link count, extent trees"},
 		{4, "Extents", "Verifies block bounds, allocation, overlap detection"},
-		{5, "Refcounts", "Checks reference counts match extent usage"},
+		{5, "Refcounts", "Checks each block's refcount covers the inodes that map it"},
 		{6, "Directories", "Validates entries, detects orphaned inodes"},
-		{7, "Snapshots", "Verifies snapshot registry and descriptors"},
-		{8, "Cross-Validation", "Compares counters across all structures"},
+		{7, "Snapshots", "Verifies snapshot registry, descriptors and data inodes"},
+		{8, "Cross-Validation", "Finds leaked blocks, blocks mapped but free, unlinked inodes"},
 	}
 	for _, p := range phases {
 		fmt.Printf("  Phase %d (%s):\n", p.num, p.name)

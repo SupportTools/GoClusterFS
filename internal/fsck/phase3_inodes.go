@@ -3,7 +3,6 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -86,6 +85,7 @@ const (
 	ExtentFlagUnwritten uint32 = 1 << 1
 	ExtentFlagShared    uint32 = 1 << 2
 	ExtentFlagSFB       uint32 = 1 << 3
+	ExtentFlagCounted   uint32 = 1 << 6
 )
 
 // checkInodes validates the inode table (Phase 3).
@@ -126,17 +126,9 @@ func (c *Checker) checkInodes() error {
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
 
-		n, err := c.dev.ReadAt(sectorBuf, int64(sectorOffset))
-		if err != nil {
-			c.addProblem(PhaseInodes, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("read error: %v", err),
-				false)
-			continue
-		}
-		if n != InodeSectorSize {
-			c.addProblem(PhaseInodes, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("short read: %d bytes", n),
-				false)
+		if err := c.readSector(sectorBuf, sectorOffset); err != nil {
+			c.addProblem(PhaseInodes, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
+			c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode table sector %d", sectorIdx))
 			continue
 		}
 
@@ -162,6 +154,7 @@ func (c *Checker) checkInodes() error {
 					fmt.Sprintf("invalid magic: 0x%08X (expected 0x%08X or 0)",
 						inode.Magic, InodeMagic),
 					false)
+				c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode %d", inodeNum))
 				continue
 			}
 
@@ -172,24 +165,17 @@ func (c *Checker) checkInodes() error {
 			if inode.InodeNum != inodeNum {
 				c.addProblem(PhaseInodes, Error, fmt.Sprintf("inode %d", inodeNum),
 					fmt.Sprintf("stored inode number %d doesn't match position", inode.InodeNum),
-					true)
+					false)
 			}
 
-			// Validate checksum
-			storedChecksum := inode.Checksum
-			computedChecksum := crc32.Checksum(inodeBuf[:InodeSize-4], crc32.MakeTable(crc32.Castagnoli))
-
-			if storedChecksum != computedChecksum {
+			// The runtime refuses to read such an inode, so its extents may be garbage.
+			if computed := storage.CRC32C(inodeBuf[:InodeSize-4]); inode.Checksum != computed {
 				checksumErrors++
 				c.addProblem(PhaseInodes, Error, fmt.Sprintf("inode %d", inodeNum),
 					fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
-						storedChecksum, computedChecksum),
-					true)
-
-				if c.opts.Mode == Repair {
-					binary.LittleEndian.PutUint32(inodeBuf[InodeSize-4:], computedChecksum)
-					// Note: Would need to write back the whole sector
-				}
+						inode.Checksum, computed),
+					false)
+				c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode %d", inodeNum))
 			}
 
 			// Validate mode (file type)
@@ -212,7 +198,7 @@ func (c *Checker) checkInodes() error {
 			if inode.LinkCount == 0 && (inode.Flags&FlagDeleted) == 0 {
 				c.addProblem(PhaseInodes, Warning, fmt.Sprintf("inode %d", inodeNum),
 					"link count is 0 but inode is not marked deleted",
-					true)
+					false)
 			}
 
 			// Validate block counts
@@ -220,7 +206,7 @@ func (c *Checker) checkInodes() error {
 				c.addProblem(PhaseInodes, Error, fmt.Sprintf("inode %d", inodeNum),
 					fmt.Sprintf("written blocks (%d) > allocated blocks (%d)",
 						inode.WrittenBlocks, inode.AllocatedBlocks),
-					true)
+					false)
 			}
 
 			if inode.Flags&FlagSnapshotData != 0 {
@@ -246,14 +232,6 @@ func (c *Checker) checkInodes() error {
 	c.logf("  Directories: %d\n", directoryCount)
 	c.logf("  Files: %d\n", fileCount)
 	c.logf("  Checksum errors: %d\n", checksumErrors)
-
-	// Compare with superblock counters
-	if freeInodes != sb.FreeInodes {
-		c.addProblem(PhaseInodes, Error, "free count",
-			fmt.Sprintf("superblock says %d free inodes, table shows %d",
-				sb.FreeInodes, freeInodes),
-			true)
-	}
 
 	return nil
 }
@@ -310,22 +288,39 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 		for _, block := range tree.nodes {
 			c.inodeBlocks[block]++
 		}
+		if tree.err != nil {
+			c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode %d extent tree", inodeNum))
+		}
 	}
 
 	for _, ext := range c.inodeExtents(inodeNum, inode) {
 		if ext.Length == 0 || (ext.Flags&ExtentFlagAllocated) == 0 {
 			continue
 		}
+		uncounted := ext.Flags&ExtentFlagShared != 0 && ext.Flags&ExtentFlagCounted == 0
+		if uncounted {
+			c.uncounted[inodeNum] = -1
+		}
 
-		// Skip SFB extents (sub-file blocks are packed differently)
+		// SFB containers hold many files and carry no refcounts.
 		if (ext.Flags & ExtentFlagSFB) != 0 {
+			c.sfbContainers[ext.PhysicalBlock>>16] = true
 			continue
 		}
 
-		// Record each block in the extent
+		// Phase 4 reports extents outside the device.
+		if ext.PhysicalBlock >= c.sbData.TotalBlocks || ext.Length > c.sbData.TotalBlocks-ext.PhysicalBlock {
+			continue
+		}
 		for j := uint64(0); j < ext.Length; j++ {
 			blockNum := ext.PhysicalBlock + j
 			c.inodeBlocks[blockNum]++
+			if uncounted {
+				c.uncountedRefs[blockNum]++
+			}
+		}
+		if uncounted && ext.PhysicalBlock+ext.Length > c.refcountCoverage() {
+			c.uncountedPast[inodeNum] = true
 		}
 	}
 }

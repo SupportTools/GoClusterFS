@@ -2294,7 +2294,7 @@ test_inode_reuse_stale_read() {
     old_ino=$(exec_on_node "$writer" stat -c %i "$dir/$old")
     exec_on_node "$reader" sh -c "cat $dir/$old > /dev/null"
 
-    # New files take the lowest free inode, so create files until one gets the old number.
+    # New files take the first free inode from this node's start, so create files until one gets the old number.
     local new
     new=$(exec_on_node "$writer" sh -c "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; done")
     if [[ -z "$new" ]]; then
@@ -3102,6 +3102,62 @@ test_snapshot_concurrent_creates() {
     return 0
 }
 
+# Node A overwrites a 2 MB file in 64 KB chunks with rounds of a, b, c while
+# node B snapshots it. Every snapshot must show one moment of the file (a
+# prefix of the next round, the rest of the round before) and never change.
+test_snapshot_during_writes() {
+    log "Testing snapshots on one node while another node overwrites the file..."
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]:-}"
+    if [ -z "$node_b" ]; then
+        log "SKIP: needs two nodes"
+        return 0
+    fi
+    local run=$$
+    local file=/mnt/goclusterfs/busy.bin
+
+    exec_on_node "$node_a" sh -c "head -c 2097152 /dev/zero | tr '\\000' c > $file" || return 1
+    exec_on_node "$node_a" sh -c "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/dev/null || exit 1; done; done; done" &
+    local writer=$!
+
+    local i clone sum
+    local clones=() sums=()
+    for i in $(seq 1 10); do
+        clone=/mnt/goclusterfs/busy_${run}_$i.bin
+        if ! exec_on_node "$node_b" setfattr -n user.snapshot -v "busy_${run}_$i" "$file" ||
+            ! exec_on_node "$node_b" setfattr -n user.snapshot.clone -v "busy_${run}_$i:/busy_${run}_$i.bin" "$file"; then
+            log "ERROR: snapshot $i on $node_b failed"
+            exec_on_node "$node_a" touch /tmp/busy.stop
+            wait "$writer"
+            return 1
+        fi
+        clones+=("$clone")
+        sums+=("$(exec_on_node "$node_b" sh -c "md5sum < $clone | cut -d' ' -f1")")
+    done
+    exec_on_node "$node_a" touch /tmp/busy.stop
+    wait "$writer" || { log "ERROR: writer on $node_a failed"; return 1; }
+
+    for i in "${!clones[@]}"; do
+        clone=${clones[$i]}
+        sum=$(exec_on_node "$node_b" sh -c "md5sum < $clone | cut -d' ' -f1")
+        if [ "$sum" != "${sums[$i]}" ]; then
+            log "ERROR: $clone changed after its snapshot was made"
+            return 1
+        fi
+        local shape
+        shape=$(exec_on_node "$node_b" sh -c "for k in \$(seq 0 31); do dd if=$clone bs=65536 skip=\$k count=1 2>/dev/null | tr -s abc | head -c 2; done")
+        if [ ${#shape} -ne 32 ] || ! [[ $shape =~ ^(b*a*|c*b*|a*c*)$ ]]; then
+            log "ERROR: $clone chunks read $shape; the file never looked like this"
+            return 1
+        fi
+    done
+
+    exec_on_node "$node_b" sh -c "for i in \$(seq 1 10); do setfattr -x user.snapshot.busy_${run}_\$i $file; rm -f /mnt/goclusterfs/busy_${run}_\$i.bin; done"
+    log "Snapshots during writes test passed"
+    return 0
+}
+
 run_test "Create and Read File" test_create_read_file
 run_test "Create Directory" test_create_directory
 run_test "File in Directory" test_file_in_directory
@@ -3123,6 +3179,7 @@ run_test "Snapshot Preserves Data" test_snapshot_preserves_data
 run_test "Clone In-Place Write" test_clone_in_place_write
 run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
+run_test "Snapshot During Writes" test_snapshot_during_writes
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"
