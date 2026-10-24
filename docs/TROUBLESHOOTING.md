@@ -120,9 +120,9 @@ head -c 16 /dev/device | hexdump -C
 
 ## Error Messages
 
-### "lock acquisition timed out"
+### Operations Hang Waiting for a Lock
 
-**Symptom**: Operations fail, and the mount log shows `lock acquisition timed out` (a lock wait passed 30 seconds).
+**Symptom**: File operations hang. The mount log shows many `lock.Acquire` lines for the same lock, or `TIMEOUT after N retries` once the waiting program is interrupted. Lock waits have no time limit.
 
 **Causes**:
 1. Another node holds the lock for a long operation, or is stalled
