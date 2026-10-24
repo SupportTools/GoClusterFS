@@ -322,15 +322,7 @@ func TestNewReadersDoNotKeepLeakedSharedLockFresh(t *testing.T) {
 	writer := newTestNode(dev, 0, 1<<20, 3)
 
 	requireAcquired(t, leaked, LockTypeInode, 2, LockModeShared)
-	recordID := leaked.hashToRecord(LockTypeInode, 2)
-	rec, err := leaked.readRecord(recordID)
-	if err != nil {
-		t.Fatalf("readRecord: %v", err)
-	}
-	rec.AcquireTime = time.Now().Add(-StaleThreshold + 2*time.Second).Unix()
-	if err := leaked.writeRecord(recordID, rec); err != nil {
-		t.Fatalf("writeRecord: %v", err)
-	}
+	ageRecord(t, leaked, LockTypeInode, 2, StaleThreshold-2*time.Second)
 
 	requireAcquired(t, reader, LockTypeInode, 2, LockModeShared)
 	if err := reader.Release(LockTypeInode, 2); err != nil {
