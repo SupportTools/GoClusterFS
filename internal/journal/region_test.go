@@ -22,22 +22,24 @@ func createTestDevice(t testing.TB, size int64) (*storage.Device, func()) {
 
 	// Allocate sparse file
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(path)
+		_ = f.Close()
+		_ = os.Remove(path)
 		t.Fatalf("Failed to truncate file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Open with O_DIRECT
 	dev, err := storage.Open(path)
 	if err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		t.Fatalf("Failed to open device: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(path)
+		_ = dev.Close()
+		_ = os.Remove(path)
 	}
 
 	return dev, cleanup
@@ -331,8 +333,12 @@ func TestRegionReset(t *testing.T) {
 	// Simulate some activity
 	region.NextSeq()
 	region.NextSeq()
-	region.MarkDirty()
-	region.WriteAt(make([]byte, 1000))
+	if err := region.MarkDirty(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := region.WriteAt(make([]byte, 1000)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Verify we have state
 	if region.State() != JournalStateDirty {

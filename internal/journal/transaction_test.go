@@ -195,9 +195,15 @@ func TestTransactionIterateEntries(t *testing.T) {
 	txn := NewTransaction(1, nodeUUID, 1)
 
 	// Add multiple entries
-	txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100})
-	txn.LogDirAddEntry(&DirAddEntryPayload{ParentInodeNum: 2, ChildInodeNum: 100, Name: "file"})
-	txn.LogBlockAlloc(&BlockAllocPayload{InodeNum: 100, StartBlock: 50, Count: 1})
+	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.LogDirAddEntry(&DirAddEntryPayload{ParentInodeNum: 2, ChildInodeNum: 100, Name: "file"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.LogBlockAlloc(&BlockAllocPayload{InodeNum: 100, StartBlock: 50, Count: 1}); err != nil {
+		t.Fatal(err)
+	}
 
 	data, err := txn.Serialize()
 	if err != nil {
@@ -228,7 +234,9 @@ func TestTransactionIterateEntries(t *testing.T) {
 func TestTransactionChecksumValidation(t *testing.T) {
 	nodeUUID := [16]byte{1, 2, 3, 4}
 	txn := NewTransaction(1, nodeUUID, 1)
-	txn.LogInodeDelete(&InodeDeletePayload{InodeNum: 50})
+	if err := txn.LogInodeDelete(&InodeDeletePayload{InodeNum: 50}); err != nil {
+		t.Fatal(err)
+	}
 
 	data, err := txn.Serialize()
 	if err != nil {
@@ -550,10 +558,18 @@ func TestMultipleOperationsInTransaction(t *testing.T) {
 	txn := NewTransaction(1, nodeUUID, 1)
 
 	// Simulate file creation: inode create + dir entry + block alloc + extent add
-	txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100, Mode: 0644, ParentInodeNum: 2})
-	txn.LogDirAddEntry(&DirAddEntryPayload{ParentInodeNum: 2, ChildInodeNum: 100, Name: "newfile"})
-	txn.LogBlockAlloc(&BlockAllocPayload{InodeNum: 100, StartBlock: 500, Count: 1})
-	txn.LogExtentAdd(&ExtentAddPayload{InodeNum: 100, FileBlock: 0, DiskBlock: 500, Length: 1})
+	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100, Mode: 0644, ParentInodeNum: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.LogDirAddEntry(&DirAddEntryPayload{ParentInodeNum: 2, ChildInodeNum: 100, Name: "newfile"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.LogBlockAlloc(&BlockAllocPayload{InodeNum: 100, StartBlock: 500, Count: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn.LogExtentAdd(&ExtentAddPayload{InodeNum: 100, FileBlock: 0, DiskBlock: 500, Length: 1}); err != nil {
+		t.Fatal(err)
+	}
 
 	if txn.EntryCount() != 4 {
 		t.Errorf("EntryCount = %d, want 4", txn.EntryCount())

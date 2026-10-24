@@ -2,6 +2,7 @@ package journal
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,12 +109,12 @@ type Journal struct {
 	stopOnce       sync.Once // Ensures Stop() is idempotent
 
 	// Batch commit tracking (for CommitBatch mode)
-	batchMu           sync.Mutex      // Protects batch state
-	batchPendingCount int             // Number of commits since last sync
-	batchFirstCommit  time.Time       // Time of first commit in current batch
-	batchSyncCond     *sync.Cond      // Signals waiting goroutines when batch syncs
-	batchSyncTimer    *time.Timer     // Timer for MaxBatchAge
-	batchSyncWaiters  []chan struct{} // Channels waiting for current batch sync
+	batchMu           sync.Mutex   // Protects batch state
+	batchPendingCount int          // Number of commits since last sync
+	batchFirstCommit  time.Time    // Time of first commit in current batch
+	batchSyncCond     *sync.Cond   // Signals waiting goroutines when batch syncs
+	batchSyncTimer    *time.Timer  // Timer for MaxBatchAge
+	batchSyncWaiters  []chan error // Each gets the result of the batch sync it waits for
 
 	// Metrics
 	commitCount  uint64
@@ -182,8 +183,9 @@ func (j *Journal) Stop() error {
 	var stopErr error
 	j.stopOnce.Do(func() {
 		// Flush any pending batch commits before stopping
+		var flushErr error
 		if j.config.CommitMode == CommitBatch {
-			j.flushBatch()
+			flushErr = j.flushBatch()
 		}
 
 		close(j.checkpointStop)
@@ -192,6 +194,12 @@ func (j *Journal) Stop() error {
 		// Mark journal clean on orderly shutdown
 		j.mu.Lock()
 		defer j.mu.Unlock()
+
+		// Leave the journal dirty so the next mount replays what may not have synced.
+		if flushErr != nil {
+			stopErr = fmt.Errorf("failed to flush batched commits: %w", flushErr)
+			return
+		}
 
 		if len(j.activeTxns) == 0 {
 			if err := j.region.MarkClean(); err != nil {
@@ -424,13 +432,12 @@ func (j *Journal) waitForBatchSync() error {
 	}
 
 	// Create a channel to wait on
-	waitCh := make(chan struct{})
+	waitCh := make(chan error, 1)
 	j.batchSyncWaiters = append(j.batchSyncWaiters, waitCh)
 	j.batchMu.Unlock()
 
 	// Wait for batch sync to complete
-	<-waitCh
-	return nil
+	return <-waitCh
 }
 
 // scheduleBatchTimer starts a timer to trigger batch sync after MaxBatchAge.
@@ -441,7 +448,9 @@ func (j *Journal) scheduleBatchTimer() {
 	}
 
 	j.batchSyncTimer = time.AfterFunc(j.config.BatchConfig.MaxBatchAge, func() {
-		j.flushBatch()
+		if err := j.flushBatch(); err != nil {
+			log.Printf("[ERROR] journal: batch sync failed: %v", err)
+		}
 	})
 }
 
@@ -478,7 +487,7 @@ func (j *Journal) flushBatch() error {
 
 	// Notify all waiters
 	for _, ch := range waiters {
-		close(ch)
+		ch <- err
 	}
 
 	return err

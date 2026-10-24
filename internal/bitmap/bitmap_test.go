@@ -27,21 +27,23 @@ func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		tb.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		tb.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -486,7 +488,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	testFile := filepath.Join(tmpDir, "test_bitmap_persist.bin")
-	defer os.Remove(testFile)
+	defer func() { _ = os.Remove(testFile) }()
 
 	// Create and allocate
 	func() {
@@ -495,16 +497,18 @@ func TestPersistence(t *testing.T) {
 			t.Skipf("Cannot create test file: %v", err)
 		}
 		if err := f.Truncate(10 << 20); err != nil {
-			f.Close()
+			_ = f.Close()
 			t.Skipf("Cannot truncate: %v", err)
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
 
 		dev, err := storage.Open(testFile)
 		if err != nil {
 			t.Skipf("O_DIRECT not supported: %v", err)
 		}
-		defer dev.Close()
+		defer func() { _ = dev.Close() }()
 
 		var uuid [16]byte
 		region := NewRegion(dev, 0, 100, nil, uuid)
@@ -512,9 +516,13 @@ func TestPersistence(t *testing.T) {
 		ctx := context.Background()
 
 		// Allocate blocks 0-9 and 50-59
-		region.Alloc(ctx, 10)
+		if _, err := region.Alloc(ctx, 10); err != nil {
+			t.Fatal(err)
+		}
 		for i := uint64(50); i < 60; i++ {
-			region.MarkAllocated(ctx, i)
+			if err := region.MarkAllocated(ctx, i); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}()
 
@@ -523,7 +531,7 @@ func TestPersistence(t *testing.T) {
 	if err != nil {
 		t.Skipf("Cannot reopen: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	var uuid [16]byte
 	region := NewRegion(dev, 0, 100, nil, uuid)
@@ -621,7 +629,9 @@ func BenchmarkAlloc(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.Alloc(ctx, 1)
+		if _, err := region.Alloc(ctx, 1); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -639,7 +649,9 @@ func BenchmarkFree(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.Free(ctx, blocks[i])
+		if err := region.Free(ctx, blocks[i]); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -665,6 +677,8 @@ func BenchmarkIsFree(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.IsFree(uint64(i % 10000))
+		if _, err := region.IsFree(uint64(i % 10000)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

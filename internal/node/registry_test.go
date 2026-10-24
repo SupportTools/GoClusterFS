@@ -127,21 +127,23 @@ func createTestDevice(t *testing.T, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		t.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -272,8 +274,12 @@ func TestRegistryMultipleNodes(t *testing.T) {
 	}
 
 	// Cleanup
-	reg1.Unregister(ctx)
-	reg2.Unregister(ctx)
+	if err := reg1.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg2.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRegistryGetActiveNodes(t *testing.T) {
@@ -307,7 +313,9 @@ func TestRegistryGetActiveNodes(t *testing.T) {
 		t.Errorf("expected 1 active node, got %d", len(active))
 	}
 
-	reg.Unregister(ctx)
+	if err := reg.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestIsHeartbeatStale(t *testing.T) {
@@ -645,7 +653,9 @@ func TestFailureDetectionLoop(t *testing.T) {
 	}
 
 	// Stop
-	reg2.Unregister(ctx)
+	if err := reg2.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMaxNodesMatchesSuperblock(t *testing.T) {
@@ -940,7 +950,10 @@ func TestRegisterLeavesLiveSlotOfOtherPIDNamespace(t *testing.T) {
 			case <-time.After(250 * time.Millisecond):
 				sibling.HeartbeatSeq++
 				sibling.HeartbeatTime = time.Now().Unix()
-				reg.writeSlot(0, sibling)
+				if err := reg.writeSlot(0, sibling); err != nil {
+					t.Error(err)
+					return
+				}
 			}
 		}
 	}()
@@ -1026,7 +1039,9 @@ func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
 	go func() {
 		time.Sleep(600 * time.Millisecond)
 		previous.HeartbeatTime = time.Now().Add(-2 * HeartbeatTimeout).Unix()
-		reg.writeSlot(2, previous)
+		if err := reg.writeSlot(2, previous); err != nil {
+			t.Error(err)
+		}
 	}()
 
 	slot, err := reg.Register(context.Background(), "node")
@@ -1105,7 +1120,9 @@ func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
 	}
 	defer reg.Stop()
 
-	dev.Close()
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-lost:
 	case <-time.After(HeartbeatTimeout):
