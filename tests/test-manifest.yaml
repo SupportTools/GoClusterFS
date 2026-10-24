@@ -1970,6 +1970,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestLateFenceLeavesStaleTakeoverAlone
 
+  - id: lock-timeout-logs-holder
+    name: Timed-out acquire logs the holder
+    description: An acquire that gives up logs at WARN which node holds the record and how
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTimedOutAcquireLogsHolder
+
   - id: lock-release-cached-parallel
     name: Unmount frees kept locks in parallel
     description: On slow storage ReleaseCached frees kept records in parallel, so 16 records take about as long as one

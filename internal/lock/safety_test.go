@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -832,5 +835,22 @@ func TestReleaseCachedWithSlowWritesRunsInParallel(t *testing.T) {
 	a.ReleaseCached()
 	if took := time.Since(start); took > 2*time.Second {
 		t.Fatalf("ReleaseCached of %d kept records took %v", len(records), took.Round(time.Millisecond))
+	}
+}
+
+// An acquire that gives up logs which node holds the record, so operators can find it.
+func TestTimedOutAcquireLogsHolder(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	requireAcquired(t, a, LockTypeInode, 28, LockModeExclusive)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	requireBlocked(t, b, LockTypeInode, 28, LockModeExclusive)
+	log.SetOutput(os.Stderr)
+	if got := logs.String(); !strings.Contains(got, "gave up waiting") || !strings.Contains(got, "write-locked by node slot 1") {
+		t.Fatalf("timeout log does not name the holder:\n%s", got)
 	}
 }

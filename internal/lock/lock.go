@@ -433,7 +433,8 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		// Only a deadline, or DefaultTimeout, ends the wait: FUSE cancels a request's
 		// context whenever the caller gets a signal, and the caller expects the op to finish.
 		if retryCount >= 3 && (errors.Is(ctx.Err(), context.DeadlineExceeded) || time.Since(startTime) > DefaultTimeout) {
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - TIMEOUT after %d retries (%v)", lockType, resourceID, retryCount, time.Since(startTime))
+			log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v (%d tries); record %d %s",
+				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), retryCount, recordID, m.describeHolder(recordID))
 			return ErrLockTimeout
 		}
 
@@ -685,6 +686,26 @@ func (m *Manager) ReleaseCached() {
 		})
 	}
 	wg.Wait()
+}
+
+// describeHolder says who holds a record, for logs.
+func (m *Manager) describeHolder(recordID uint64) string {
+	record, err := m.readRecord(recordID)
+	if err != nil {
+		return fmt.Sprintf("could not be read: %v", err)
+	}
+	who := fmt.Sprintf("node slot %d (%x)", record.OwnerSlot, record.OwnerUUID[:8])
+	if record.OwnerUUID == m.nodeUUID {
+		who = "this node"
+	}
+	held := time.Since(time.Unix(record.AcquireTime, 0)).Round(time.Second)
+	switch record.Mode {
+	case LockModeExclusive:
+		return fmt.Sprintf("is write-locked by %s, taken %v ago", who, held)
+	case LockModeShared:
+		return fmt.Sprintf("is read-locked by %d readers, latest %s, first taken %v ago", record.SharedCount, who, held)
+	}
+	return "is free"
 }
 
 // tryAcquire attempts a single lock acquisition.
