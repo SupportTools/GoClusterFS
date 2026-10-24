@@ -1251,6 +1251,82 @@ test_journal_recovery_multinode() {
     return 0
 }
 
+# Node A restarts while node B keeps creating files.
+# Matches Go test: TestMultiNodeRestartKeepsPeerJournal in journal_slots_test.go
+test_restart_keeps_peer_journal() {
+    log "Testing node restart while a peer keeps writing..."
+
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes"
+        return 0
+    fi
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]}"
+    local dir="/mnt/goclusterfs/peer-journal"
+
+    exec_on_node "$node_b" sh -c "rm -rf $dir /tmp/peer-writer.*; mkdir -p $dir"
+    docker exec -d "$node_b" sh -c "i=0
+        while [ ! -e /tmp/peer-writer.stop ] && [ \$i -lt 150 ]; do
+            i=\$((i + 1))
+            echo peer-\$i > $dir/peer-\$i || { echo fail \$i > /tmp/peer-writer.done; exit; }
+            sleep 0.05
+        done
+        echo ok \$i > /tmp/peer-writer.done"
+    sleep 1
+
+    local since
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    docker kill "$node_a" >/dev/null 2>&1 || true
+    sleep 1
+    docker start "$node_a" >/dev/null
+    if ! wait_node_healthy "$node_a" 60; then
+        exec_on_node "$node_b" touch /tmp/peer-writer.stop
+        return 1
+    fi
+    sleep 1
+    exec_on_node "$node_b" touch /tmp/peer-writer.stop
+
+    local status="" count=0
+    while [[ -z "$status" && $count -lt 30 ]]; do
+        status=$(exec_on_node "$node_b" cat /tmp/peer-writer.done 2>/dev/null || true)
+        sleep 1
+        count=$((count + 1))
+    done
+    log "Node B writer finished: ${status:-timeout}"
+    if [[ "$status" != ok* ]]; then
+        log "ERROR: Node B could not keep writing while node A restarted"
+        return 1
+    fi
+    local written=${status#ok }
+
+    local bad
+    bad=$(exec_on_node "$node_a" sh -c "k=1; while [ \$k -le $written ]; do
+        [ \"\$(cat $dir/peer-\$k 2>/dev/null)\" = peer-\$k ] || echo peer-\$k; k=\$((k + 1)); done")
+    if [[ -n "$bad" ]]; then
+        log "ERROR: Node A cannot read node B's files: $(echo $bad | head -c 300)"
+        return 1
+    fi
+
+    local offset_a offset_b uuid_b
+    offset_a=$(docker logs --since "$since" "$node_a" 2>&1 | grep -o 'Journal: initialized at offset [0-9]*' | tail -1)
+    offset_b=$(docker logs "$node_b" 2>&1 | grep -o 'Journal: initialized at offset [0-9]*' | tail -1)
+    uuid_b=$(docker logs "$node_b" 2>&1 | grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' | tail -1 | grep -o '[0-9a-f]*$')
+    log "Node A: $offset_a; node B: $offset_b (UUID $uuid_b)"
+    if [[ -z "$offset_a" || "$offset_a" == "$offset_b" ]]; then
+        log "ERROR: Node A and node B share a journal region"
+        return 1
+    fi
+    if docker logs --since "$since" "$node_a" 2>&1 | grep -q "from crashed node $uuid_b"; then
+        log "ERROR: Node A replayed live node B's journal during its restart"
+        return 1
+    fi
+
+    exec_on_node "$node_b" rm -rf "$dir"
+    log "Restart keeps peer journal test passed ($written files)"
+    return 0
+}
+
 # Test: Journal recovery with multiple files
 # Simulates crash: Node A creates 5 files, gets killed, Node B recovers all via journal
 test_journal_recovery_multiple_files() {
@@ -2719,6 +2795,7 @@ else
 fi
 run_test "Container Kill Recovery" test_container_kill_recovery
 run_test "Journal Recovery Multi-Node" test_journal_recovery_multinode
+run_test "Restart Keeps Peer Journal" test_restart_keeps_peer_journal
 run_test "Journal Recovery Multiple Files" test_journal_recovery_multiple_files
 run_test "Journal Recovery Large File" test_journal_recovery_large_file
 run_test "Journal Recovery Idempotency" test_journal_recovery_idempotency

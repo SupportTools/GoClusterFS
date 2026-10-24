@@ -384,6 +384,29 @@ scenarios:
       docker: run-tests.sh::test_journal_recovery_multinode
       vm: run-vm-tests.sh::test_journal_recovery_multinode
 
+  - id: multinode-restart-keeps-peer-journal
+    name: Restart while a peer writes keeps the peer's journal
+    description: Node A restarts while node B creates files. Each node journals in its own registry slot region, A does not replay B's live journal, and after B crashes A replays B's journal from B's slot.
+    priority: critical
+    environments:
+      go: journal_slots_test.go::TestMultiNodeRestartKeepsPeerJournal
+      docker: run-tests.sh::test_restart_keeps_peer_journal
+      vm: run-vm-tests.sh::test_restart_keeps_peer_journal
+
+  - id: mount-refuses-legacy-layout
+    name: Mount refuses the pre-v2 shared-journal layout
+    description: Mount exits with a clear message on an image formatted before per-node journals instead of misreading it
+    priority: go_only
+    environments:
+      go: journal_slots_test.go::TestMountRefusesLegacyLayout
+
+  - id: registry-slot-journal-region
+    name: Registry records each slot's journal region
+    description: Register stores a distinct journal region per slot, skips slots a peer is recovering, and yields a slot to a racing writer
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterRecordsJournalRegion
+
   - id: journal-recovery-multiple-files
     name: Recovery with multiple files
     description: Journal recovers multiple pending file operations
