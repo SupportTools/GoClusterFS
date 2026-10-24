@@ -73,6 +73,7 @@ var (
 	ErrRefCountUnderflow = errors.New("reference count underflow")
 	ErrInvalidChecksum   = errors.New("refcount sector checksum mismatch")
 	ErrAlreadyZero       = errors.New("reference count already zero")
+	ErrBlockPastRegion   = errors.New("block has no refcount entry: the refcount region is too small for this volume")
 )
 
 // Entry represents a single reference count entry.
@@ -107,6 +108,7 @@ type Region struct {
 	mu          sync.RWMutex
 	dev         *storage.Device
 	offset      uint64        // RefCount region start offset on device
+	capacity    uint64        // Blocks the region has entries for
 	totalBlocks uint64        // Total number of data blocks tracked
 	lockMgr     *lock.Manager // For distributed locking (optional)
 }
@@ -116,12 +118,17 @@ type Region struct {
 // Parameters:
 //   - dev: The storage device
 //   - offset: Byte offset where refcount region starts on device
+//   - size: Size of the refcount region in bytes; nothing past it is touched
 //   - totalBlocks: Total number of data blocks to track
 //   - lockMgr: Lock manager for distributed locking (can be nil for single-node)
-func NewRegion(dev *storage.Device, offset, totalBlocks uint64, lockMgr *lock.Manager) *Region {
+//
+// Blocks past the region's capacity read as having a single owner, and any
+// change to them fails with ErrBlockPastRegion.
+func NewRegion(dev *storage.Device, offset, size, totalBlocks uint64, lockMgr *lock.Manager) *Region {
 	return &Region{
 		dev:         dev,
 		offset:      offset,
+		capacity:    BlocksForSize(size),
 		totalBlocks: totalBlocks,
 		lockMgr:     lockMgr,
 	}
@@ -376,6 +383,17 @@ func (r *Region) updateBatch(ctx context.Context, blockNums []uint64, fn func(i 
 	sectors := make(map[uint64][]byte)
 	dirty := make(map[uint64]bool)
 	for i, blockNum := range blockNums {
+		if blockNum >= r.capacity {
+			entry := Entry{}
+			changed, err := fn(i, &entry)
+			if err != nil {
+				return err
+			}
+			if changed && entry != (Entry{}) {
+				return r.pastRegion(blockNum)
+			}
+			continue
+		}
 		sectorIdx := blockNum / EntriesPerSector
 		if _, ok := sectors[sectorIdx]; !ok {
 			data, err := r.readSector(sectorIdx)
@@ -409,7 +427,8 @@ func (r *Region) Scan(ctx context.Context) (stats ScanStats, err error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	numSectors := (r.totalBlocks + EntriesPerSector - 1) / EntriesPerSector
+	covered := r.coveredBlocks()
+	numSectors := (covered + EntriesPerSector - 1) / EntriesPerSector
 
 	for sectorIdx := uint64(0); sectorIdx < numSectors; sectorIdx++ {
 		sectorData, err := r.readSector(sectorIdx)
@@ -420,7 +439,7 @@ func (r *Region) Scan(ctx context.Context) (stats ScanStats, err error) {
 		baseBlock := sectorIdx * EntriesPerSector
 		for entryIdx := uint64(0); entryIdx < EntriesPerSector; entryIdx++ {
 			blockNum := baseBlock + entryIdx
-			if blockNum >= r.totalBlocks {
+			if blockNum >= covered {
 				break
 			}
 
@@ -441,6 +460,7 @@ func (r *Region) Scan(ctx context.Context) (stats ScanStats, err error) {
 		}
 	}
 
+	stats.FreeBlocks += r.totalBlocks - covered
 	stats.TotalBlocks = r.totalBlocks
 	return stats, nil
 }
@@ -460,8 +480,30 @@ func (r *Region) TotalBlocks() uint64 {
 	return r.totalBlocks
 }
 
+// CheckCovered returns an ErrBlockPastRegion error for the first block the
+// region has no entry for.
+func (r *Region) CheckCovered(blockNums []uint64) error {
+	for _, blockNum := range blockNums {
+		if blockNum >= r.capacity {
+			return r.pastRegion(blockNum)
+		}
+	}
+	return nil
+}
+
+func (r *Region) coveredBlocks() uint64 {
+	return min(r.totalBlocks, r.capacity)
+}
+
+func (r *Region) pastRegion(blockNum uint64) error {
+	return fmt.Errorf("%w: block %d, region covers blocks 0-%d", ErrBlockPastRegion, blockNum, r.capacity-1)
+}
+
 // readEntry reads a single entry from disk.
 func (r *Region) readEntry(blockNum uint64) (Entry, error) {
+	if blockNum >= r.capacity {
+		return Entry{}, nil
+	}
 	sectorIdx := blockNum / EntriesPerSector
 	entryIdx := blockNum % EntriesPerSector
 
@@ -475,6 +517,12 @@ func (r *Region) readEntry(blockNum uint64) (Entry, error) {
 
 // writeEntry writes a single entry to disk.
 func (r *Region) writeEntry(blockNum uint64, entry Entry) error {
+	if blockNum >= r.capacity {
+		if entry == (Entry{}) {
+			return nil
+		}
+		return r.pastRegion(blockNum)
+	}
 	sectorIdx := blockNum / EntriesPerSector
 	entryIdx := blockNum % EntriesPerSector
 
@@ -581,13 +629,18 @@ func SizeForBlocks(totalBlocks uint64) uint64 {
 	return numSectors * SectorSize
 }
 
+// BlocksForSize returns how many blocks a refcount region of size bytes has entries for.
+func BlocksForSize(size uint64) uint64 {
+	return size / SectorSize * EntriesPerSector
+}
+
 // Initialize initializes the refcount region with all counts set to 0.
 // This should be called during filesystem format.
 func (r *Region) Initialize(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	numSectors := (r.totalBlocks + EntriesPerSector - 1) / EntriesPerSector
+	numSectors := (r.coveredBlocks() + EntriesPerSector - 1) / EntriesPerSector
 
 	// Create an empty sector (all zeros)
 	emptyData := make([]byte, BytesPerSector)

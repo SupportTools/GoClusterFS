@@ -71,7 +71,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
-	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, locks)
+	refs := refcount.NewRegion(dev, snapFSRefcountOffset, refcount.SizeForBlocks(snapFSDataBlocks), snapFSDataBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, snapFSDataOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, snapFSDataOffset)
 	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, locks, slot); err != nil {
@@ -296,6 +296,43 @@ func TestSnapshotRefusesUncountedSharing(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	checkFile(t, f, pattern(1, BlockSize))
+}
+
+// On a volume larger than its refcount region, blocks past the region cannot
+// be shared. Refusing must leave the file as it was, off the copy-on-write path.
+func TestSnapshotRefusesBlocksPastRefcountRegion(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	noEntries := refcount.NewRegion(fsys.dev, snapFSRefcountOffset, 0, snapFSDataBlocks, fsys.lockMgr)
+	fsys.refcountReg = noEntries
+	fsys.extentMgr.SetRefcounts(noEntries)
+
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, pattern(1, 2*BlockSize), 0)
+
+	if errno := f.Setxattr(ctx, "user.snapshot", []byte("high"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("snapshot of blocks past the refcount region: errno %v, want ENOTSUP", errno)
+	}
+	if errno := f.Setxattr(ctx, "user.clone", []byte("/high-clone"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("clone of blocks past the refcount region: errno %v, want ENOTSUP", errno)
+	}
+	ino, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.InlineExtents[0].Flags&extent.FlagShared != 0 || ino.Flags&inode.FlagHasSnapshot != 0 {
+		t.Fatalf("refused share marked the file shared: extent flags %#x, inode flags %#x", ino.InlineExtents[0].Flags, ino.Flags)
+	}
+
+	free := fsys.bitmapMgr.FreeCount()
+	writeAt(t, f, pattern(2, 4096), 10)
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Fatalf("write after a refused snapshot allocated %d blocks, want 0", free-got)
+	}
+	checkFile(t, f, overwritten(pattern(1, 2*BlockSize), 10, pattern(2, 4096)))
 }
 
 // A new mount cleans up a snapshot a crash left half created or half deleted,

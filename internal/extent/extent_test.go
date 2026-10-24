@@ -1186,7 +1186,7 @@ func createTestSetupWithRefcount(tb testing.TB) (*Manager, *refcount.Region, *in
 	refcountSize := uint64(1 << 20)   // 1MB for refcounts
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, 1000, nil, uuid) // 1000 blocks
-	refcountReg := refcount.NewRegion(dev, refcountOffset, refcountSize, nil)
+	refcountReg := refcount.NewRegion(dev, refcountOffset, refcountSize, 1000, nil)
 	mgr := NewManager(dev, bm, nil, 2<<20)
 
 	ino := &inode.Inode{
@@ -1511,7 +1511,7 @@ func listExtents(tb testing.TB, mgr *Manager, ino *inode.Inode) []*Extent {
 
 func TestFreeKeepsSharedBlocks(t *testing.T) {
 	env := newTreeEnv(t, 0)
-	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, treeTestBlocks, nil)
+	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, refcount.SizeForBlocks(treeTestBlocks), treeTestBlocks, nil)
 	env.mgr.SetRefcounts(refs)
 	initial := env.bm.FreeCount()
 
@@ -1574,7 +1574,7 @@ func legacyShared(t *testing.T, env *treeEnv, refs *refcount.Region, count uint3
 
 func TestUncountedSharingIsNeverFreed(t *testing.T) {
 	env := newTreeEnv(t, 0)
-	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, treeTestBlocks, nil)
+	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, refcount.SizeForBlocks(treeTestBlocks), treeTestBlocks, nil)
 	env.mgr.SetRefcounts(refs)
 	truncate := func(ino *inode.Inode) {
 		t.Helper()
@@ -1616,7 +1616,7 @@ func TestUncountedSharingIsNeverFreed(t *testing.T) {
 // inode write may land, so the old block is released once.
 func TestConcurrentInlineCopyOnWrite(t *testing.T) {
 	env := newTreeEnv(t, 0)
-	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, treeTestBlocks, nil)
+	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, refcount.SizeForBlocks(treeTestBlocks), treeTestBlocks, nil)
 	env.mgr.SetRefcounts(refs)
 
 	src := env.newInode()
