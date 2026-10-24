@@ -1,8 +1,12 @@
 package journal
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 func TestRecoveryCleanJournal(t *testing.T) {
@@ -413,4 +417,73 @@ func TestRecoveryVerifiesChecksum(t *testing.T) {
 	if stats.TxnCommitted != 0 {
 		t.Errorf("TxnCommitted = %d, want 0", stats.TxnCommitted)
 	}
+}
+
+func TestScanAndRecoverNeverInitialized(t *testing.T) {
+	dev, cleanup := createTestDevice(t, DefaultJournalSlotSize)
+	defer cleanup()
+
+	result, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, nil)
+	if result != nil || err != nil {
+		t.Fatalf("ScanAndRecover on a zeroed region = %+v, %v; want nil, nil", result, err)
+	}
+}
+
+func TestScanAndRecoverDamagedHeader(t *testing.T) {
+	tests := []struct {
+		name   string
+		damage func(header []byte)
+		want   error
+	}{
+		{"bad checksum", func(h []byte) { h[100] ^= 0xFF }, ErrJournalChecksumMismatch},
+		{"bad magic", func(h []byte) { h[0] = 'X' }, ErrInvalidJournalMagic},
+		{"bad geometry", func(h []byte) {
+			binary.LittleEndian.PutUint32(h[92:96], 0)
+			binary.LittleEndian.PutUint32(h[JournalSuperblockSize-4:], storage.CRC32C(h[:JournalSuperblockSize-4]))
+		}, ErrJournalCorrupt},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, DefaultJournalSlotSize)
+			defer cleanup()
+			if _, err := InitRegion(dev, 0, DefaultJournalSlotSize, [16]byte{1}, 1); err != nil {
+				t.Fatalf("InitRegion failed: %v", err)
+			}
+			damaged := damageJournalHeader(t, dev, 0, tt.damage)
+
+			replayed := false
+			_, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, func(*RecoveredTxn) error {
+				replayed = true
+				return nil
+			})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("ScanAndRecover error = %v, want %v", err, tt.want)
+			}
+			if replayed {
+				t.Error("ScanAndRecover replayed transactions from a damaged journal")
+			}
+			if !bytes.Equal(readJournalHeader(t, dev, 0), damaged) {
+				t.Error("ScanAndRecover rewrote the damaged journal header")
+			}
+		})
+	}
+}
+
+func readJournalHeader(t *testing.T, dev *storage.Device, offset int64) []byte {
+	t.Helper()
+	buf := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := dev.ReadAt(buf.Bytes(), offset); err != nil {
+		t.Fatalf("read journal header: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func damageJournalHeader(t *testing.T, dev *storage.Device, offset int64, damage func(header []byte)) []byte {
+	t.Helper()
+	header := readJournalHeader(t, dev, offset)
+	damage(header)
+	if _, err := dev.WriteAt(header, offset); err != nil {
+		t.Fatalf("write journal header: %v", err)
+	}
+	return bytes.Clone(header)
 }

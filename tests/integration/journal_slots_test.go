@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -156,6 +157,80 @@ func TestNodeRestartReplaysOwnJournalAtMount(t *testing.T) {
 		t.Errorf("mount replayed the journal of node %s, want its own crashed journal %s", got, uuid)
 	}
 	verifyFiles(t, node, names)
+}
+
+// TestMountRefusesDamagedJournal damages the header of a node's journal slot.
+// Mount must fail and name the slot instead of starting a new journal over
+// it, and -skip-recovery must mount and start a new journal.
+func TestMountRefusesDamagedJournal(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 1, 50)
+	node := cluster.Node(0)
+	formatted := &syncBuffer{}
+	node.Log = formatted
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start: %v", err)
+	}
+	slot := mustMatch(t, slotRe, formatted, "registration")
+	offset := mustMatch(t, journalInitRe, formatted, "journal init")
+	if err := node.WriteFile("kept", []byte("kept")); err != nil {
+		t.Fatal(err)
+	}
+	if err := cluster.StopNode(0); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	damageJournalHeader(t, cluster.ImagePath, offset)
+
+	refused := &syncBuffer{}
+	node.Log = refused
+	if err := cluster.StartNode(0, false); err == nil {
+		t.Fatal("mount succeeded over a damaged journal header")
+	}
+	if out := refused.String(); !strings.Contains(out, "Journal recovery for slot "+slot+" failed") ||
+		!strings.Contains(out, journal.ErrJournalChecksumMismatch.Error()) {
+		t.Fatalf("mount output does not name slot %s and the checksum mismatch:\n%s", slot, out)
+	}
+
+	skipped := &syncBuffer{}
+	node.Log = skipped
+	node.ExtraArgs = []string{"-skip-recovery"}
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount with -skip-recovery: %v", err)
+	}
+	if got := mustMatch(t, journalInitRe, skipped, "journal init"); got != offset {
+		t.Errorf("-skip-recovery started a journal at offset %s, want slot %s's offset %s", got, slot, offset)
+	}
+	verifyFiles(t, node, []string{"kept"})
+
+	node.ExtraArgs = nil
+	if err := cluster.StopNode(0); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount after -skip-recovery started a new journal: %v", err)
+	}
+}
+
+func damageJournalHeader(t *testing.T, imagePath, offset string) {
+	t.Helper()
+	dev, err := storage.Open(imagePath)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	off, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil {
+		t.Fatalf("parse journal offset %q: %v", offset, err)
+	}
+	header := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := dev.ReadAt(header.Bytes(), off); err != nil {
+		t.Fatalf("read journal header: %v", err)
+	}
+	header.Bytes()[100] ^= 0xFF
+	if _, err := dev.WriteAt(header.Bytes(), off); err != nil {
+		t.Fatalf("write journal header: %v", err)
+	}
 }
 
 func verifyFiles(t *testing.T, node *MountedFS, names []string) {

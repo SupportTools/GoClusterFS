@@ -4,6 +4,7 @@ package journal
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -600,5 +602,26 @@ func TestRecoveryResult(t *testing.T) {
 	}
 	if result.EntriesSkipped != 3 {
 		t.Errorf("EntriesSkipped mismatch: got %d, want 3", result.EntriesSkipped)
+	}
+}
+
+func TestReplayJournalNeverInitializedAndDamaged(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 2*DefaultJournalSlotSize)
+	defer cleanup()
+	ctx := context.Background()
+	rctx := &RecoveryContext{Dev: dev}
+
+	fresh := &node.FailedNodeInfo{JournalOffset: 0, JournalSize: DefaultJournalSlotSize}
+	if _, err := ReplayJournal(ctx, rctx, fresh); err != nil {
+		t.Errorf("ReplayJournal on a never-initialized slot: %v", err)
+	}
+
+	damaged := &node.FailedNodeInfo{JournalOffset: DefaultJournalSlotSize, JournalSize: DefaultJournalSlotSize}
+	if _, err := InitRegion(dev, damaged.JournalOffset, damaged.JournalSize, [16]byte{2}, 1); err != nil {
+		t.Fatalf("InitRegion failed: %v", err)
+	}
+	damageJournalHeader(t, dev, int64(damaged.JournalOffset), func(h []byte) { h[0] = 'X' })
+	if _, err := ReplayJournal(ctx, rctx, damaged); !errors.Is(err, ErrInvalidJournalMagic) {
+		t.Errorf("ReplayJournal on a slot with a damaged header: error %v, want %v", err, ErrInvalidJournalMagic)
 	}
 }

@@ -166,7 +166,7 @@ func main() {
 		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := journal.ScanAndRecover(dev, journalOffset, journalSize, recoveryHandler)
 		if err != nil {
-			log.Fatalf("Journal recovery failed: %v", err)
+			log.Fatalf("Journal recovery for slot %d failed: %v (mount with -skip-recovery to discard this journal)", slotIdx, err)
 		}
 		if result != nil && result.WasNeeded {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",

@@ -466,6 +466,34 @@ scenarios:
       docker: run-tests.sh::test_restart_keeps_peer_journal
       vm: run-vm-tests.sh::test_restart_keeps_peer_journal
 
+  - id: mount-refuses-damaged-journal
+    name: Mount refuses a damaged journal slot
+    description: Mount fails and names the slot when its journal header has a bad checksum, instead of starting a new journal over it; -skip-recovery mounts and starts a new journal
+    priority: go_only
+    environments:
+      go: journal_slots_test.go::TestMountRefusesDamagedJournal
+
+  - id: journal-scan-never-initialized
+    name: Recovery scan of a never-initialized journal
+    description: ScanAndRecover treats an all-zero journal header as nothing to recover
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestScanAndRecoverNeverInitialized
+
+  - id: journal-scan-damaged-header
+    name: Recovery scan of a damaged journal header
+    description: ScanAndRecover returns the checksum, magic or geometry error, replays nothing and leaves the header as it was
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestScanAndRecoverDamagedHeader
+
+  - id: journal-replay-damaged-header
+    name: Peer replay of a never-initialized or damaged journal
+    description: ReplayJournal skips a never-initialized slot and returns an error for a slot with a damaged header
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayJournalNeverInitializedAndDamaged
+
   - id: survivor-releases-crashed-node-locks
     name: Survivor releases a crashed node's locks
     description: Node A crashes holding the root directory lock; node B proves A dead, takes over its locks for the replay and creates a file within 10s instead of waiting out the 15s lock staleness threshold
