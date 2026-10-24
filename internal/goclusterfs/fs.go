@@ -194,11 +194,13 @@ func NewWithComponents(
 	tm *trim.Manager, // May be nil if TRIM is disabled
 	sfbMgr *sfb.Manager, // May be nil if SFB is disabled
 	refcountReg *refcount.Region, // May be nil if snapshots not enabled
+	lockMgr *lock.Manager, // May be nil for single-node use
 	nodeUUID [16]byte,
 	dataOffset uint64,
 ) *FS {
 	return &FS{
 		dev:         dev,
+		lockMgr:     lockMgr,
 		bitmapMgr:   bm,
 		inodeTbl:    inodeTbl,
 		extentMgr:   extentMgr,
@@ -2095,6 +2097,52 @@ func (f *FS) zeroBlock(physBlock uint64) error {
 	return err
 }
 
+// allocateBlockLocked maps a new data block at blockNum and returns the inode
+// re-read under the inode lock, which stays held on success. The bitmap comes
+// before the inode in lock order, so the data block and any extent-tree blocks
+// are allocated before the lock is taken.
+func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockNum uint64) (*inode.Inode, *extent.Extent, error) {
+	blocks, err := f.fs.bitmapMgr.Alloc(ctx, 1)
+	if err != nil {
+		return nil, nil, syscall.ENOSPC
+	}
+	ext := &extent.Extent{LogicalBlock: blockNum, PhysicalBlock: blocks[0], Length: 1, Flags: extent.FlagAllocated}
+	treeCtx, releaseTree, err := f.fs.extentMgr.ReserveTreeBlocks(ctx, ino)
+	if err != nil {
+		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
+		return nil, nil, syscall.ENOSPC
+	}
+	defer releaseTree()
+
+	if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
+		return nil, nil, syscall.EIO
+	}
+	fail := func(errno error) (*inode.Inode, *extent.Extent, error) {
+		f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
+		return nil, nil, errno
+	}
+	fresh, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		return fail(syscall.EIO)
+	}
+	// Insert fails if another node mapped this block, or grew the tree past the reservation, meanwhile.
+	if err := f.fs.extentMgr.Insert(treeCtx, fresh, ext); err != nil {
+		f.fs.extentMgr.DiscardPending(ctx, fresh)
+		switch {
+		case errors.Is(err, extent.ErrExtentTreeFull):
+			return fail(syscall.EFBIG)
+		case errors.Is(err, extent.ErrCorruptTree):
+			return fail(syscall.EIO)
+		}
+		return fail(errRetryWrite)
+	}
+	fresh.AllocatedBlocks += ext.Length
+	fresh.WrittenBlocks += ext.Length
+	return fresh, ext, nil
+}
+
 // writeInternal performs the actual write operation.
 // Returns errRetryWrite if a concurrent modification is detected and the caller should retry.
 func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (int, error) {
@@ -2102,6 +2150,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 	// Track if we hold the inode lock
 	lockHeld := false
+	// ino has changes made under the inode lock that are not on disk yet
+	inoDirty := false
 	defer func() {
 		if lockHeld && f.fs.lockMgr != nil {
 			f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
@@ -2205,42 +2255,46 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			// bitmap (6) must be acquired before inode (8)
 			// AllocateBlocks acquires bitmap lock internally
 			if lockHeld && f.fs.lockMgr != nil {
+				// The inode is re-read after allocation, so persist changes made under the lock first.
+				if inoDirty {
+					if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
+						log.Printf("[DEBUG] Write inode %d: persisting inode before allocation failed: %v", f.inodeNum, err)
+						f.fs.extentMgr.DiscardPending(ctx, ino)
+						return 0, retryOnTreeConflict(err)
+					}
+					inoDirty = false
+				}
 				f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
 				lockHeld = false
 			}
 
-			// Allocate block (acquires bitmap lock internally, then releases it)
-			ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
-			if err != nil {
-				log.Printf("[DEBUG] Write inode %d: AllocateBlocks at block %d failed: %v", f.inodeNum, blockNum, err)
-				switch {
-				case errors.Is(err, extent.ErrExtentOverlap), errors.Is(err, extent.ErrStaleTree):
-					// Concurrent allocation by another node
-					return 0, errRetryWrite
-				case errors.Is(err, extent.ErrExtentTreeFull):
-					return 0, syscall.EFBIG
-				case errors.Is(err, extent.ErrCorruptTree):
-					return 0, syscall.EIO
-				default:
-					return 0, syscall.ENOSPC
-				}
-			}
-
-			// Re-acquire inode lock after allocation
 			if f.fs.lockMgr != nil {
-				if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-					log.Printf("[DEBUG] Write inode %d: failed to re-acquire lock after allocation: %v", f.inodeNum, err)
-					return 0, syscall.EIO
+				freshIno, newExt, allocErr := f.allocateBlockLocked(ctx, ino, blockNum)
+				if allocErr != nil {
+					log.Printf("[DEBUG] Write inode %d: allocating block %d failed: %v", f.inodeNum, blockNum, allocErr)
+					return 0, allocErr
 				}
 				lockHeld = true
-
-				// Re-read inode after re-acquiring lock to verify state
-				freshIno, readErr := f.fs.inodeTbl.Read(f.inodeNum)
-				if readErr != nil {
-					log.Printf("[DEBUG] Write inode %d: re-read after allocation failed: %v", f.inodeNum, readErr)
-					return 0, syscall.EIO
-				}
 				ino = freshIno
+				inoDirty = true
+				ext = newExt
+			} else {
+				// Allocate block (acquires bitmap lock internally, then releases it)
+				ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
+				if err != nil {
+					log.Printf("[DEBUG] Write inode %d: AllocateBlocks at block %d failed: %v", f.inodeNum, blockNum, err)
+					switch {
+					case errors.Is(err, extent.ErrExtentOverlap), errors.Is(err, extent.ErrStaleTree):
+						// Concurrent allocation by another node
+						return 0, errRetryWrite
+					case errors.Is(err, extent.ErrExtentTreeFull):
+						return 0, syscall.EFBIG
+					case errors.Is(err, extent.ErrCorruptTree):
+						return 0, syscall.EIO
+					default:
+						return 0, syscall.ENOSPC
+					}
+				}
 			}
 			extOffset = 0
 
@@ -2315,6 +2369,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					}
 
 					if cowResult.WasShared {
+						inoDirty = true
 						log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
 							f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
 
@@ -2373,6 +2428,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return 0, syscall.EIO
 			}
 			if cleared {
+				inoDirty = true
 				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
 					f.inodeNum, blockNum)
 			}
@@ -2486,6 +2542,10 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
 		}
 		return 0, syscall.EIO
+	}
+	// ino was read before the lock, so it can miss another node's extents.
+	if acquiredLockForSize {
+		ino = freshIno
 	}
 	// Use the freshest size from disk, then calculate new size as max(fresh_size, our_write_end)
 	newSize := freshIno.Size
@@ -3078,11 +3138,14 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 		}
 		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
 
-		// Re-read inode after lock to get latest state
-		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
+		// ino holds the new extents, so keep it only if no node wrote the inode since it was read.
+		fresh, err := f.fs.inodeTbl.Read(f.inodeNum)
 		if err != nil {
 			log.Printf("[DEBUG] Allocate inode %d: re-read failed: %v", f.inodeNum, err)
 			return syscall.EIO, nil
+		}
+		if fresh.MetaGeneration != ino.MetaGeneration {
+			return 0, extent.ErrStaleTree
 		}
 	}
 

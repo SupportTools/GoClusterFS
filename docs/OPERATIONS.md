@@ -244,7 +244,7 @@ Common causes of a stall:
 - Heavy swapping or a long GC pause
 - Storage I/O that queues instead of failing, for example a multipath or iSCSI path failover
 
-**Lock takeover is not atomic.** Taking a lock is a read followed by a write, not an atomic compare-and-swap. Two nodes that read a free record within one disk round trip of each other can both take it. This is rare but more likely on busy locks such as the block bitmap.
+**Lock takeover is not atomic.** Taking a lock is a read followed by a write, not an atomic compare-and-swap. Two nodes that read a free record within one disk round trip of each other can both take it. This is rare but more likely on busy locks such as the block bitmap. The same race can lose an update to a read lock's reader count. The lock then looks held until it is 15 seconds old, so writers to that directory or file can stall for up to 15 seconds.
 
 **Safe operating limits:**
 

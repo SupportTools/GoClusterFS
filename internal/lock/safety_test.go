@@ -313,3 +313,30 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 		}
 	}
 }
+
+func TestNewReadersDoNotKeepLeakedSharedLockFresh(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	leaked := newTestNode(dev, 0, 1<<20, 1)
+	reader := newTestNode(dev, 0, 1<<20, 2)
+	writer := newTestNode(dev, 0, 1<<20, 3)
+
+	requireAcquired(t, leaked, LockTypeInode, 2, LockModeShared)
+	recordID := leaked.hashToRecord(LockTypeInode, 2)
+	rec, err := leaked.readRecord(recordID)
+	if err != nil {
+		t.Fatalf("readRecord: %v", err)
+	}
+	rec.AcquireTime = time.Now().Add(-StaleThreshold + 2*time.Second).Unix()
+	if err := leaked.writeRecord(recordID, rec); err != nil {
+		t.Fatalf("writeRecord: %v", err)
+	}
+
+	requireAcquired(t, reader, LockTypeInode, 2, LockModeShared)
+	if err := reader.Release(LockTypeInode, 2); err != nil {
+		t.Fatalf("reader Release: %v", err)
+	}
+	time.Sleep(3 * time.Second)
+
+	requireAcquired(t, writer, LockTypeInode, 2, LockModeExclusive)
+}
