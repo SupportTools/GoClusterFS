@@ -17,9 +17,9 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 
 ## Requirements
 
-- Go 1.21 or later
+- Go 1.26 or later
 - Linux with FUSE support (`fusermount3`)
-- O_DIRECT-capable storage (not tmpfs)
+- O_DIRECT-capable storage (tmpfs supports O_DIRECT only on Linux 6.6 and later)
 - Root or `fuse` group membership
 - For multi-node: Shared block device (SAN, iSCSI, NVMe-oF, etc.)
 
@@ -30,54 +30,50 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 ```bash
 git clone https://github.com/supporttools/GoClusterFS.git
 cd GoClusterFS
-go build -o goclusterfs ./cmd/mount
+make build
 ```
 
-### Create and Format a Block Device
+This builds `goclusterfs-mount` and `goclusterfs-fsck` in the repo root.
+
+### Format and Mount
+
+Use a file as the block device. Keep it on a filesystem that supports O_DIRECT.
 
 ```bash
-# Create a file-backed block device (3GB example)
-dd if=/dev/zero of=VirtBlock.img bs=1M count=3000
-
-# Format the filesystem
-./goclusterfs -format -device ./VirtBlock.img
+truncate -s 1G disk.img
+mkdir -p mnt
+./goclusterfs-mount -device ./disk.img -mount ./mnt -format > mount.log 2>&1 &
+sleep 2
 ```
 
-### Mount
+`-format` wipes the device and then mounts it. The mount process keeps running until you unmount, and logs to `mount.log`.
+
+### Use It
 
 ```bash
-# Create mount point
-mkdir -p /mnt/goclusterfs
-
-# Mount with default settings
-./goclusterfs -device ./VirtBlock.img -mount /mnt/goclusterfs
-
-# Mount with journaling and network broadcast (multi-node)
-./goclusterfs -device ./VirtBlock.img -mount /mnt/goclusterfs \
-    -journal -broadcast -mcast-group 239.192.74.75
-
-# Unmount
-fusermount -u /mnt/goclusterfs
+echo "Hello, Cluster!" > mnt/hello.txt
+cat mnt/hello.txt
+df -h mnt
 ```
 
-### Verify
+### Unmount
 
 ```bash
-# Create a file
-echo "Hello, Cluster!" > /mnt/goclusterfs/test.txt
-
-# Check filesystem stats
-df -h /mnt/goclusterfs
+fusermount3 -u mnt
 ```
+
+The mount process exits after the unmount. To mount the same image again, run the mount command without `-format`.
 
 ## Command-Line Options
 
+These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the full list.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-device` | (required) | Path to block device |
-| `-mount` | (required) | Mount point directory |
-| `-format` | `false` | Format the device (destroys data) |
-| `-debug` | `false` | Enable debug logging |
+| `-device` | (required) | Path to block device or image file |
+| `-mount` | (required) | Mount point directory (must exist) |
+| `-format` | `false` | Format the device, then mount it (destroys data) |
+| `-debug` | `false` | Log every FUSE request |
 
 ### Cache Options
 
@@ -126,13 +122,15 @@ For clustered deployments:
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
 
+Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:
+
 ```bash
 # Node 1
-./goclusterfs -device /dev/shared/lun0 -mount /mnt/cluster \
+./goclusterfs-mount -device /dev/shared/lun0 -mount /mnt/cluster \
     -journal -broadcast -mcast-group 239.192.74.75
 
 # Node 2 (same block device, same options)
-./goclusterfs -device /dev/shared/lun0 -mount /mnt/cluster \
+./goclusterfs-mount -device /dev/shared/lun0 -mount /mnt/cluster \
     -journal -broadcast -mcast-group 239.192.74.75
 ```
 
@@ -146,18 +144,22 @@ For clustered deployments:
 
 ## Filesystem Check
 
-Run fsck to verify or repair the filesystem:
+Run fsck on an unmounted device. The device is a positional argument, and flags go before it:
 
 ```bash
 # Check only (read-only)
-./goclusterfs-fsck -device ./VirtBlock.img
+./goclusterfs-fsck ./disk.img
 
 # Check and repair
-./goclusterfs-fsck -device ./VirtBlock.img -repair
+./goclusterfs-fsck -repair ./disk.img
 
-# Force check (ignore clean flag)
-./goclusterfs-fsck -device ./VirtBlock.img -force
+# Keep going past fatal errors (data recovery)
+./goclusterfs-fsck -force ./disk.img
 ```
+
+Exit codes: `0` clean, `1` errors found, `2` usage error or fatal failure.
+
+**Known issue:** fsck does not work yet on volumes made with `goclusterfs-mount -format`. The mount tool does not write a superblock, so fsck stops at phase 1 with `invalid superblock magic` and exits with `2`.
 
 ## Architecture
 
@@ -166,7 +168,7 @@ GoClusterFS uses a layered architecture:
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    FUSE Layer                       │
-│              (bazil.org/fuse)                       │
+│              (hanwen/go-fuse v2)                    │
 ├─────────────────────────────────────────────────────┤
 │                 VFS Operations                      │
 │     (Dir, File, Attr, Read, Write, Lookup)          │

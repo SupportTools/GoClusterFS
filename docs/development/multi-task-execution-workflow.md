@@ -231,7 +231,7 @@ Follow implementation guidelines from [Task Execution Workflow](./task-execution
 ### 4.3 Build Verification (BLOCKER)
 
 ```bash
-go build -o GoClusterFS .
+make build
 ```
 
 **MUST PASS** - Zero errors. If fails, fix and retry.
@@ -258,20 +258,20 @@ When task affects filesystem operations:
 
 ```bash
 # Create test environment
-dd if=/dev/zero of=/tmp/test.img bs=1M count=100
-mkdir -p /tmp/testmount
+truncate -s 100M test.img
+mkdir -p testmount
 
 # Mount and test
-./GoClusterFS /tmp/testmount /tmp/test.img &
+./goclusterfs-mount -device ./test.img -mount ./testmount -format > mount.log 2>&1 &
 sleep 2
 
 # Verify operations
-ls -la /tmp/testmount
-echo "test" > /tmp/testmount/testfile
-cat /tmp/testmount/testfile
+ls -la testmount
+echo "test" > testmount/testfile
+cat testmount/testfile
 
 # Unmount
-fusermount -u /tmp/testmount
+fusermount3 -u testmount
 ```
 
 ### 4.7 Task Completion
@@ -397,7 +397,7 @@ Clear todo list for next batch
 
 | Phase | Gate | Command | Blocker |
 |-------|------|---------|---------|
-| Build | Binary compiles | `go build -o GoClusterFS .` | YES |
+| Build | Binary compiles | `make build` | YES |
 | Format | Code formatted | `gofmt -l .` | YES |
 | Test | All tests pass | `go test ./... -v` | YES |
 | FUSE | Mount/unmount works | Manual test | Conditional |

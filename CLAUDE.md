@@ -4,48 +4,95 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GoClusterFS is a FUSE-based clustered filesystem written in Go. It mounts a block device and exposes it as a filesystem, designed for shared storage scenarios across cluster nodes.
+GoClusterFS is a clustered FUSE filesystem written in Go. Several Linux nodes mount the same shared block device at the same time. Nodes coordinate through structures on the device itself: a node registry, CAS locks, and a write-ahead journal. All device I/O uses O_DIRECT, so no node trusts its own page cache. UDP multicast messages make cache invalidation faster, but correctness does not depend on them.
 
-## Build and Run Commands
+FUSE binding: `github.com/hanwen/go-fuse/v2`. Linux only.
+
+## Build and Run
 
 ```bash
-# Build the binary
-go build -o GoClusterFS .
-
-# Run (requires root or fuse group membership)
-./GoClusterFS <mountpoint> <block_device>
-
-# Example with a file-backed block device
-dd if=/dev/zero of=VirtBlock.img bs=1M count=3000  # Create 3GB virtual block
-./GoClusterFS /mnt/goclusterfs ./VirtBlock.img
-
-# Unmount
-fusermount -u /mnt/goclusterfs
+make build                 # ./goclusterfs-mount and ./goclusterfs-fsck
+go build ./... && go vet ./...
 ```
 
-## Architecture
+Run against a file-backed image. The image must sit on a filesystem that supports O_DIRECT (tmpfs only on Linux 6.6+).
 
-### Storage Layout
-- **Block size**: 1MB fixed blocks
-- **Block 0**: Reserved for metadata (file table serialized with `gob`)
-- **Blocks 1+**: File data (one block per file currently)
+```bash
+truncate -s 1G disk.img
+mkdir -p mnt
+./goclusterfs-mount -device ./disk.img -mount ./mnt -format   # first time only, wipes the volume
+./goclusterfs-mount -device ./disk.img -mount ./mnt           # later mounts
+fusermount3 -u mnt                                            # or Ctrl+C the mount process
+./goclusterfs-fsck ./disk.img                                 # device is a positional argument
+```
 
-### Core Types
-- `FS`: Root filesystem implementing `fs.FS` and `Statfs`
-- `Dir`: Root directory implementing `Attr`, `ReadDirAll`, `Lookup`, `Create`
-- `File`: File node implementing `Attr`, `ReadAll`, `Write`, `Flush`, `Setxattr`
-- `FileMetadata`: Persisted file info (inode, filename, size, block index)
+`goclusterfs-mount` stays in the foreground until the filesystem is unmounted. `-format` formats and then mounts. It logs a lot of `[DEBUG]` lines even without `-debug`, which only turns on go-fuse request tracing. Flags and defaults: `./goclusterfs-mount -h`, `./goclusterfs-fsck -h`, [docs/API-CONFIG.md](docs/API-CONFIG.md).
 
-### File Locking
-File locks are managed via extended attributes for cluster coordination:
-- Set lock: `setfattr -n user.lock -v <owner_id> <file>`
-- Release lock: `setfattr -n user.unlock -v <owner_id> <file>`
+## Code Map
 
-### Current Limitations
-- Single block per file (max 1MB file size)
-- No directory hierarchy (flat namespace)
-- No delete operation implemented
-- Metadata not checksummed
+| Path | What it does |
+|------|--------------|
+| `cmd/mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
+| `cmd/fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
+| `cmd/crctest` | Prints CRC32C test values |
+| `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
+| `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
+| `internal/superblock` | Superblock format (see limitations: `cmd/mount` does not write it) |
+| `internal/bitmap` | Block allocation bitmap, CRC32C per 4 KB sector |
+| `internal/inode` | Inode table, 256-byte inodes, CRC32C per sector |
+| `internal/extent` | File block mapping, up to 2 extents inline in the inode |
+| `internal/dir` | Directory entries |
+| `internal/lock` | Distributed CAS locks stored on the device |
+| `internal/node` | Node registry, heartbeats, failed-node detection |
+| `internal/journal` | Write-ahead journal, local and cross-node recovery |
+| `internal/cache` | Inode and extent caches, checked against on-disk generation counters |
+| `internal/cache/broadcast` | UDP multicast/unicast cache invalidation, optional HMAC |
+| `internal/refcount` | Per-block reference counts for copy-on-write |
+| `internal/snapshot` | Snapshot registry and background refcount worker |
+| `internal/sfb` | Small-file containers: 4/8/16/64 KB slots inside a 1 MB block |
+| `internal/trim` | Batched `BLKDISCARD` for freed blocks |
+| `internal/fsck` | The fsck phases |
+| `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
+
+## On-Disk Layout
+
+`cmd/mount/main.go` hardcodes this layout. Data blocks are 1 MB. Metadata I/O uses 4 KB sectors.
+
+| Offset | Size | Region |
+|--------|------|--------|
+| 0 | 1 MB | Reserved for the superblock (not written today) |
+| 1 MB | 1 MB | Block bitmap |
+| 2 MB | 1 MB | Inode table: 4096 inodes of 256 bytes; root is inode 2 |
+| 3 MB | 1 MB | Node registry |
+| 4 MB | 1 MB | Lock records |
+| 5 MB | 4 MB | Journal |
+| 9 MB | 1 MB | Block refcounts |
+| 10 MB | 1 MB | Snapshot registry |
+| 11 MB | rest | Data blocks |
+
+The smallest device is 12 MB.
+
+## Snapshots and Clones
+
+Snapshots and clones work through extended attributes on a file (`internal/goclusterfs/fs.go`, `File.Setxattr`):
+
+- `setfattr -n user.snapshot -v <name> <file>` creates a snapshot
+- `getfattr -n user.snapshots <file>` lists snapshots
+- `setfattr -n user.snapshot.delete -v <name> <file>` or `setfattr -x user.snapshot.<name> <file>` deletes one
+- `setfattr -n user.clone -v /<new-name> <file>` clones the file
+- `setfattr -n user.snapshot.clone -v <snapshot>:/<new-name> <file>` clones from a snapshot
+
+Clone paths are absolute from the filesystem root, and clones can only go in the root directory.
+
+## Current Limitations
+
+- Linux only. Needs FUSE and a backing store that supports O_DIRECT.
+- `cmd/mount` never writes a superblock, and `internal/superblock` describes a different layout from the one above. `goclusterfs-fsck` checks the superblock first, so it stops at phase 1 with `invalid superblock magic` on any volume made with `-format`.
+- Every node uses the same 4 MB journal region at 5 MB. `cmd/mount` does not give each node its own journal slot.
+- Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
+- The inode count is fixed at 4096.
+- SFB containers fail on real devices: `internal/sfb` writes buffers that are not 4 KB aligned, so `storage.WriteAt` rejects them and small files fall back to full 1 MB blocks.
+- No rename, symlinks, or hard links.
 
 ## Testing
 
@@ -109,3 +156,13 @@ For tests involving concurrent writes from multiple nodes, use the **pre-extensi
 4. Verify data at each offset after writes complete
 
 This avoids TOCTOU races in the distributed locking system.
+
+## Commands Config
+
+| Setting | Value |
+|---------|-------|
+| TaskForge Project ID | 88 |
+| Build command | `make build` |
+| Test command | `go test ./... -v` |
+| Lint command | `gofmt -l .` |
+| Tech stack | Go (FUSE filesystem) |
