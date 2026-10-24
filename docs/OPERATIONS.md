@@ -256,7 +256,9 @@ Common causes of a stall:
 - Heavy swapping or a long GC pause
 - Storage I/O that queues instead of failing, for example a multipath or iSCSI path failover
 
-**Lock takeover is not atomic.** Taking a lock is a read followed by a write, not an atomic compare-and-swap. Two nodes that read a free record within one disk round trip of each other can both take it. This is rare but more likely on busy locks such as the block bitmap. The same race can lose an update to a read lock's reader count. The lock then looks held until it is 15 seconds old, so writers to that directory or file can stall for up to 15 seconds.
+**Lock takeover relies on an I/O time limit.** Taking a lock is a read followed by a write, not an atomic compare-and-swap, so two nodes that read a free record at the same moment both write a claim. After writing its claim, a node waits 20 ms (`ClaimSettleDelay`), reads the record again, and keeps the lock only if its claim is still there. This is safe only if every node's read of a lock record and its following write land within 20 ms. A node that stalls or queues I/O between the two can still win alongside another node. Readers that join a record already held for reading skip the wait; losing that race over-counts readers, so writers to that directory or file can wait up to 15 seconds, but two writers still cannot overlap.
+
+**Nodes keep released locks briefly.** After its last user releases a lock, a node keeps it for 250 ms (`CacheGrace`), so repeated work on the same node does not pay the 20 ms wait again. Another node that wants the lock waits up to about 250 ms plus the 20 ms check and one 100 ms retry interval. A clean unmount releases kept locks at once.
 
 **Read locks are not renewed.** A node whose overlapping lookups keep a directory read-locked for more than 15 seconds can lose that lock to another node's writer. Its readers may then see a half-written directory. Two writers still cannot overlap.
 
@@ -268,6 +270,7 @@ Common causes of a stall:
 |-------|-----|
 | Keep node clocks within 1 second (chrony or NTP) | Clock skew S shortens the stale threshold to 15s − S |
 | No node may stall for 10 seconds or more while mounted | Leaves margin below the 15s threshold |
+| A 4KB read followed by a 4KB write of a lock record must complete within 20 ms | Lock takeover check (see above); slower storage can let two nodes take one lock |
 | Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
 | Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |
 

@@ -333,6 +333,27 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  # Docker/VM TODO: these need two nodes writing sub-block ranges of one block at
+  # the same moment and a byte-exact check after a remount; the Go tests run the
+  # real mount binary for both nodes.
+  - id: multinode-sub-block-writes
+    name: Sub-block writes to one block from two nodes
+    description: Two nodes write whole sectors (no extent lock) and halves of the same sectors (extent lock) of one block at once; every write survives
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeSubBlockWritesToOneBlock
+      docker: TODO
+      vm: TODO
+
+  - id: multinode-fallocated-block-writes
+    name: Writes to one fallocated block from two nodes
+    description: Two nodes write different sectors of one fallocated block at once; both survive and the rest reads as zeros
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeWritesToOneFallocatedBlock
+      docker: TODO
+      vm: TODO
+
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
     description: Multiple nodes write to same block at different offsets
@@ -1570,6 +1591,48 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestFailedWriteKeepsBlocksCommittedMidWrite
+
+  - id: lock-claim-overwritten-during-settle
+    name: Claim overwritten during settle wait
+    description: A node whose claim another node overwrites during the settle wait does not keep the lock
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestClaimOverwrittenDuringSettleIsNotHeld
+
+  - id: lock-released-hold-cached
+    name: Released hold cached for grace
+    description: After its last local holder releases, a node keeps the record for CacheGrace, and another node gets it soon after
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleasedHoldIsCachedForGrace
+
+  - id: lock-cached-rejoin-skips-settle
+    name: Cached rejoin skips settle wait
+    description: Re-acquiring a cached hold on the same node needs no disk I/O and no settle wait
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCachedHoldRejoinSkipsSettleWait
+
+  - id: lock-paused-node-drops-cached-hold
+    name: Paused node drops a cached hold taken over
+    description: A cached read hold older than renewAfter is released and acquired afresh, so a node waking from a pause does not reuse a record another node took over
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestPausedNodeDropsCachedHoldTakenOver
+
+  - id: lock-release-cached
+    name: Release cached holds
+    description: ReleaseCached lets other nodes take kept records at once
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
+
+  - id: lock-cancelled-context-waits
+    name: Cancelled context keeps waiting
+    description: A cancelled context (FUSE interrupt) does not end a lock wait; only a deadline or DefaultTimeout does
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCancelledContextStillWaitsForLock
 
   - id: lock-region-bounded
     name: Lock region stays bounded
