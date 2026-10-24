@@ -1537,9 +1537,6 @@ func TestStressRandomFailures(t *testing.T) {
 // inode lock around its read-modify-write of the extents, or the later inode
 // write drops the other node's extent and its data.
 func TestMultiNodeConcurrentFirstWriteToSameBlock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("two nodes can still both take a free inode lock (about 1 file in 150 loses a write) until lock claims are confirmed")
-	}
 	cluster := NewMultiNodeCluster(t, 2, 100)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("Failed to format and start first node: %v", err)
@@ -1747,4 +1744,64 @@ func TestMultiNodeWritesToOneFallocatedBlock(t *testing.T) {
 			t.Fatalf("%s: a node's write was lost or the block was not zero-filled", name(i))
 		}
 	}
+}
+
+// TestMultiNodeReaderNeverSeesUncommittedBlocks has node A write a new file of
+// fresh blocks while node B keeps reading it. A writes those blocks without
+// the extent lock, so B must only ever see a hole, the old size, or a block's
+// own data: never another block's data and never what the disk held before.
+func TestMultiNodeReaderNeverSeesUncommittedBlocks(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 100)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	const blocks, blockSize = 16, 1024 * 1024
+	old := bytes.Repeat([]byte{0xEE}, blocks*blockSize)
+	if err := cluster.Node(0).WriteFile("old.bin", old); err != nil {
+		t.Fatalf("write old.bin: %v", err)
+	}
+	if err := cluster.Node(0).Remove("old.bin"); err != nil {
+		t.Fatalf("remove old.bin: %v", err)
+	}
+
+	data := make([]byte, blocks*blockSize)
+	for i := range data {
+		data[i] = byte(i/blockSize + 1)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cluster.Node(0).WriteFile("fresh.bin", data) }()
+
+	reads := 0
+	for writing := true; writing; {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("node A write failed: %v", err)
+			}
+			writing = false
+		default:
+		}
+		got, err := cluster.Node(1).ReadFile("fresh.bin")
+		if err != nil {
+			continue
+		}
+		reads++
+		if len(got) > len(data) {
+			t.Fatalf("node B saw %d bytes, more than the %d written", len(got), len(data))
+		}
+		for off, b := range got {
+			if b != 0 && b != data[off] {
+				t.Fatalf("node B read byte %#x at offset %d (block %d), want 0 or %#x", b, off, off/blockSize, data[off])
+			}
+		}
+	}
+	t.Logf("node B read the file %d times while node A wrote it", reads)
 }
