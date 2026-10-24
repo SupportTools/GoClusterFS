@@ -394,6 +394,16 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
+  # Docker and VM tests run shell tools over docker exec and ssh, which cannot keep signalling the thread inside a FUSE call.
+  - id: multinode-create-with-signals
+    name: Creates survive signals during lock waits
+    description: Two nodes create files while the creating threads keep getting signals; no create or write fails
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeCreateWithSignals
+      docker: TODO
+      vm: TODO
+
   # The Docker and VM harnesses have no per-node mount flags, so they cannot run one node with -attr-timeout=0.
   - id: multinode-attr-timeout-zero
     name: Attribute timeout 0 shows remote size changes
@@ -1464,6 +1474,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/inode_update_test.go::TestUpdateInodeLockedWaitsForOtherNode
+
+  - id: write-survives-interrupt
+    name: Write finishes after an interrupt during a lock wait
+    description: A write whose request is cancelled while it waits for another node's inode lock finishes once the lock is free
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestWriteFinishesAfterInterruptDuringLockWait
 
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
