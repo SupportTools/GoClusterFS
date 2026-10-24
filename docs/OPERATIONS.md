@@ -226,7 +226,7 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 
 ### Interrupted File Operations
 
-GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait that cannot finish fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock.
+GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait that cannot finish fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock and the node that holds it.
 
 ### Distributed Lock Limits
 
