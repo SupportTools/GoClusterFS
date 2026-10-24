@@ -37,7 +37,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `cmd/crctest` | Prints CRC32C test values |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
-| `internal/superblock` | Superblock format (see limitations: `cmd/mount` does not write it) |
+| `internal/superblock` | Superblock format and the on-disk layout; `-format` writes it, mount reads it |
 | `internal/bitmap` | Block allocation bitmap, CRC32C per 4 KB sector |
 | `internal/inode` | Inode table, 256-byte inodes, CRC32C per sector |
 | `internal/extent` | File block mapping, up to 2 extents inline in the inode |
@@ -56,21 +56,21 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 
 ## On-Disk Layout
 
-`cmd/mount/main.go` hardcodes this layout. Data blocks are 1 MB. Metadata I/O uses 4 KB sectors.
+`internal/superblock` (`calculateLayout`) defines this layout, format version 2. `-format` writes it into the 4 KB superblock at offset 0, and mount takes every offset from there. Data blocks are 1 MB. Metadata I/O uses 4 KB sectors.
 
 | Offset | Size | Region |
 |--------|------|--------|
-| 0 | 1 MB | Reserved for the superblock (not written today) |
+| 0 | 1 MB | Superblock (first 4 KB) |
 | 1 MB | 1 MB | Block bitmap |
 | 2 MB | 1 MB | Inode table: 4096 inodes of 256 bytes; root is inode 2 |
-| 3 MB | 1 MB | Node registry |
+| 3 MB | 1 MB | Node registry: 64 slots of 4 KB |
 | 4 MB | 1 MB | Lock records |
-| 5 MB | 4 MB | Journal |
-| 9 MB | 1 MB | Block refcounts |
-| 10 MB | 1 MB | Snapshot registry |
-| 11 MB | rest | Data blocks |
+| 5 MB | 256 MB | Journals: 64 × 4 MB, one per registry slot |
+| 261 MB | 1 MB | Block refcounts |
+| 262 MB | 1 MB | Snapshot registry |
+| 263 MB | rest | Data blocks |
 
-The smallest device is 12 MB.
+The smallest device is 264 MB. Registry slot `i` owns the journal at `5 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes); copy the data off with the old build and reformat.
 
 ## Snapshots and Clones
 
@@ -87,8 +87,8 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 ## Current Limitations
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
-- `cmd/mount` never writes a superblock, and `internal/superblock` describes a different layout from the one above. `goclusterfs-fsck` checks the superblock first, so it stops at phase 1 with `invalid superblock magic` on any volume made with `-format`.
-- Every node uses the same 4 MB journal region at 5 MB. `cmd/mount` does not give each node its own journal slot.
+- At most 64 nodes mount a volume at once, one per registry slot. Heartbeats compare wall clocks, so node clocks must agree within a few seconds.
+- `goclusterfs-fsck` reports errors on healthy volumes: the superblock free block and inode counters are never updated after format, and phases 5 and 7 expect refcount and snapshot sector checksums the runtime does not write.
 - Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
 - The inode count is fixed at 4096.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.

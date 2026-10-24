@@ -170,6 +170,18 @@ rm /mnt/fs/.snapshots/snapshot_name
 
 ## Cluster Management
 
+### Node Requirements
+
+- **Clocks:** Nodes judge each other's heartbeats by wall clock. A node more than about 10 seconds ahead treats live peers as failed, replays their journals and takes their registry slots. Run NTP on every node.
+- **Restarts:** A restarted mount takes back the registry slot of a mount that exited on the same host (same hostname and kernel boot ID) and replays its journal before serving. In the same PID namespace it checks the old process ID; across PID namespaces it waits for the old slot's heartbeat to go stale.
+- **Node count:** The device has 64 registry slots, each with its own 4 MB journal. A crashed node's slot frees once another node replays its journal, or when the same host mounts again.
+
+### Known Gaps in Slot Ownership
+
+- Slot claims use a read-compare-write on the device, then re-read the slot after 100 ms. Two nodes can still both keep a slot if one node's write lands more than 100 ms after its read, for example during a storage stall.
+- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed. Another node can replay and reset its journal, or a new mount can take its slot. The paused node exits on its next heartbeat after it resumes, up to 1 second later, and can write to the journal region in that second.
+- A restarted container comes back in a new PID namespace, so its mount cannot prove by PID that the previous incarnation exited. It waits up to about 12 seconds for the old slot's heartbeat to go stale, then replays that journal before serving.
+
 ### Adding a New Node
 
 1. **Prepare the node**:
@@ -229,12 +241,46 @@ rm /mnt/fs/.snapshots/snapshot_name
    iscsiadm -m node -T <iqn> -p <ip> --logout
    ```
 
+### Distributed Lock Limits
+
+Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, SFB containers, snapshots) through lock records on the shared device. Read this before you run more than one node.
+
+**How a lock goes stale.** A lock record stores the wall-clock time it was taken. Nothing renews it. Any other node may take over a lock that is older than 15 seconds (`StaleThreshold`), judged by that node's own clock. This is how locks held by a crashed node get freed.
+
+**The hazard: a stalled node keeps writing.** If a node stops for more than 15 seconds while it holds a lock, another node takes the lock. When the stalled node resumes, it finishes its writes. No write path checks that the lock is still held, and there is no fencing token. The node only learns it lost the lock when it releases it (`ErrNotLockOwner`), and callers ignore that error. Two nodes then write the same metadata, which can double-allocate blocks or lose directory entries.
+
+Common causes of a stall:
+
+- VM pause, suspend, live migration, or a memory snapshot
+- `docker pause`, cgroup freezer, `SIGSTOP`, or a debugger on the mount process
+- Heavy swapping or a long GC pause
+- Storage I/O that queues instead of failing, for example a multipath or iSCSI path failover
+
+**Lock takeover is not atomic.** Taking a lock is a read followed by a write, not an atomic compare-and-swap. Two nodes that read a free record within one disk round trip of each other can both take it. This is rare but more likely on busy locks such as the block bitmap. The same race can lose an update to a read lock's reader count. The lock then looks held until it is 15 seconds old, so writers to that directory or file can stall for up to 15 seconds.
+
+**Read locks are not renewed.** A node whose overlapping lookups keep a directory read-locked for more than 15 seconds can lose that lock to another node's writer. Its readers may then see a half-written directory. Two writers still cannot overlap.
+
+**Locks share records.** The lock region has 256 records, and every lock maps to one of them, so unrelated files and the block bitmap can share a record. A node holding one of those locks blocks other nodes from all of them. If two nodes each hold one record and wait for the other's, both wait until one record is 15 seconds old; the takeover then lets both proceed, with the same risk as a stall. This needs nested locks whose records cross, roughly 1 in 65,000 pairs of overlapping operations.
+
+**Safe operating limits:**
+
+| Limit | Why |
+|-------|-----|
+| Keep node clocks within 1 second (chrony or NTP) | Clock skew S shortens the stale threshold to 15s − S |
+| No node may stall for 10 seconds or more while mounted | Leaves margin below the 15s threshold |
+| Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
+| Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |
+
+If a node did stall for more than 15 seconds while mounted (hung-task warnings in `dmesg`, a VM pause, a path failover), stop its mount process before it does more writes, then check the data from a healthy node.
+
+What is safe today: a node that crashes or is killed and stays down, and a clean unmount. Other nodes take over a crashed node's locks 15 seconds after it acquired them.
+
 ### Handling Node Failure
 
 When a node fails unexpectedly:
 
 1. **Other nodes continue operating** - Distributed locking handles failed node
-2. **Lock cleanup** - Stale locks are detected via heartbeat timeout
+2. **Lock cleanup** - Other nodes take over the failed node's locks once they are 15 seconds old (lock age, not node heartbeat)
 3. **No immediate action required** - System is self-healing
 
 **When failed node recovers**:

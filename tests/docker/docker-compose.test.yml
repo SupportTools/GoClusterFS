@@ -11,10 +11,10 @@ services:
     volumes:
       - shared-data:/data
     environment:
-      - CLUSTER_SIZE_MB=${CLUSTER_SIZE_MB:-500}
+      - CLUSTER_SIZE_MB=${CLUSTER_SIZE_MB:-768}
     command: >
       sh -c "
-        SIZE_MB=$${CLUSTER_SIZE_MB:-500} &&
+        SIZE_MB=$${CLUSTER_SIZE_MB:-768} &&
         echo \"Creating $${SIZE_MB}MB cluster image...\" &&
         dd if=/dev/zero of=/data/cluster.img bs=1M count=$${SIZE_MB} &&
         echo 'Image created successfully'
@@ -183,6 +183,7 @@ services:
       - RESULTS_DIR=/results
       # Skip concurrent tests in CI (they hang due to resource constraints)
       - SKIP_CONCURRENT_TESTS=${SKIP_CONCURRENT_TESTS:-false}
+      - TEST_GROUP=${TEST_GROUP:-}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.100

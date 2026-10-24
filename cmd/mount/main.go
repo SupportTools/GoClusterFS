@@ -27,6 +27,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
@@ -88,53 +89,48 @@ func main() {
 
 	log.Printf("Device: %s (%d MB)", *devicePath, devSize/(1024*1024))
 
-	// Layout configuration
-	// 0-1MB:   Reserved (superblock area)
-	// 1-2MB:   Bitmap region
-	// 2-3MB:   Inode table
-	// 3-4MB:   Node registry (for distributed lock coordination)
-	// 4-5MB:   Lock region (CAS-based distributed locks)
-	// 5-9MB:   Journal region (4MB per node slot)
-	// 9-10MB:  Refcount region (block reference counts for CoW)
-	// 10-11MB: Snapshot registry (snapshot descriptors)
-	// 11MB+:   Data blocks (1MB each)
-	const (
-		bitmapOffset       = 1 * 1024 * 1024
-		inodeOffset        = 2 * 1024 * 1024
-		nodeRegistryOffset = 3 * 1024 * 1024
-		lockOffset         = 4 * 1024 * 1024
-		lockSize           = 1 * 1024 * 1024  // 1MB for lock records
-		journalOffset      = 5 * 1024 * 1024  // Journal region start
-		journalSize        = 4 * 1024 * 1024  // 4MB journal slot
-		refcountOffset     = 9 * 1024 * 1024  // Refcount region start
-		refcountSize       = 1 * 1024 * 1024  // 1MB for refcounts
-		snapshotOffset     = 10 * 1024 * 1024 // Snapshot registry start
-		snapshotSize       = 1 * 1024 * 1024  // 1MB for snapshot descriptors
-		dataOffset         = 11 * 1024 * 1024 // Data blocks start
-	)
-
-	// Calculate capacities
-	dataSize := devSize - dataOffset
-	totalBlocks := uint64(dataSize / (1024 * 1024)) // 1MB blocks
-	inodeCount := uint64(4096)                      // Fixed for now
-
-	if totalBlocks < 1 {
-		log.Fatalf("Device too small: need at least 12MB, have %d MB", devSize/(1024*1024))
+	var sb *superblock.Superblock
+	if *format {
+		sb, err = superblock.Format(dev)
+	} else {
+		sb, err = superblock.Read(dev)
+	}
+	if err != nil {
+		log.Fatalf("Cannot use %s: %v", *devicePath, err)
 	}
 
-	log.Printf("Layout: %d data blocks (%d MB), %d inodes", totalBlocks, totalBlocks, inodeCount)
+	bitmapOffset := sb.BlockBitmapOffset
+	inodeOffset := sb.InodeTableOffset
+	nodeRegistryOffset := sb.NodeRegistryOffset
+	lockOffset, lockSize := sb.LockBitmapOffset, sb.LockBitmapSize
+	refcountOffset := sb.RefCountTableOffset
+	snapshotOffset, snapshotSize := sb.SnapshotRegOffset, sb.SnapshotRegSize
+	dataOffset := sb.DataRegionOffset
+	totalBlocks := sb.TotalBlocks
+	inodeCount := sb.InodeCount
+
+	log.Printf("Layout: v%d, %d data blocks (%d MB), %d inodes, %d node slots",
+		sb.Version, totalBlocks, totalBlocks, inodeCount, sb.MaxNodes)
 
 	ctx := context.Background()
 
 	// Create node registry for distributed coordination
 	nodeReg := node.NewRegistry(dev, nodeRegistryOffset)
+	nodeReg.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
 	hostname, _ := os.Hostname()
 	slotIdx, err := nodeReg.Register(ctx, hostname)
 	if err != nil {
 		log.Fatalf("Failed to register node: %v", err)
 	}
+	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
+		log.Fatalf("Node registry slot %d now belongs to node %x; stopping so two nodes never share a journal", slot, owner[:8])
+	})
+	if err := nodeReg.StartHeartbeat(); err != nil {
+		log.Fatalf("Failed to start node heartbeat: %v", err)
+	}
 	nodeUUID := nodeReg.LocalUUID()
 	log.Printf("Registered as node %d (UUID: %x)", slotIdx, nodeUUID[:8])
+	journalOffset, journalSize := nodeReg.LocalJournal()
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
@@ -161,8 +157,7 @@ func main() {
 		// Use per-transaction handler for self-recovery
 		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
 
-		// Scan for dirty journal and recover if needed
-		// This uses UUID-agnostic opening since the crashed node had a different UUID
+		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := journal.ScanAndRecover(dev, journalOffset, journalSize, recoveryHandler)
 		if err != nil {
 			log.Fatalf("Journal recovery failed: %v", err)
@@ -279,7 +274,7 @@ func main() {
 	}
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, nodeUUID, dataOffset)
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -354,6 +349,7 @@ func main() {
 		log.Println("Received signal, unmounting...")
 
 		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
+		nodeReg.Stop()
 		if err := gfs.Close(); err != nil {
 			log.Printf("Warning: Failed to close filesystem: %v", err)
 		}
@@ -373,6 +369,7 @@ func main() {
 	server.Wait()
 
 	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
+	nodeReg.Stop()
 	if err := gfs.Close(); err != nil {
 		log.Printf("Warning: Failed to close filesystem on exit: %v", err)
 	}

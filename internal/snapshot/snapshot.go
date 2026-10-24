@@ -261,9 +261,6 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 		return nil, ErrNameTooLong
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		// Use lock type for snapshot registry (we'll use a constant ID since registry is single)
@@ -272,6 +269,9 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 		}
 		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	// Find a free slot
 	slot, err := r.findFreeSlot()
@@ -420,9 +420,6 @@ func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID u
 		return ErrInvalidID
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
@@ -430,6 +427,9 @@ func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID u
 		}
 		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
 		desc, err := r.readDescriptor(slot)
@@ -451,9 +451,6 @@ func (r *Registry) UpdateState(ctx context.Context, snapshotID uint64, newState 
 		return ErrInvalidID
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
@@ -461,6 +458,9 @@ func (r *Registry) UpdateState(ctx context.Context, snapshotID uint64, newState 
 		}
 		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	// Find and update the descriptor
 	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
@@ -486,9 +486,6 @@ func (r *Registry) SetRefCountJobID(ctx context.Context, snapshotID, jobID uint6
 		return ErrInvalidID
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
@@ -496,6 +493,9 @@ func (r *Registry) SetRefCountJobID(ctx context.Context, snapshotID, jobID uint6
 		}
 		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
 		desc, err := r.readDescriptor(slot)
@@ -524,9 +524,6 @@ func (r *Registry) Remove(ctx context.Context, snapshotID uint64) error {
 		return ErrInvalidID
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
@@ -534,6 +531,9 @@ func (r *Registry) Remove(ctx context.Context, snapshotID uint64) error {
 		}
 		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
 		desc, err := r.readDescriptor(slot)

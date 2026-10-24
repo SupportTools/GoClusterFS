@@ -9,10 +9,9 @@ import (
 
 // Recovery errors
 var (
-	ErrRecoveryFailed     = errors.New("journal recovery failed")
-	ErrCorruptTxn         = errors.New("corrupt transaction found")
-	ErrUnexpectedEnd      = errors.New("unexpected end of journal data")
-	ErrRecoveryInProgress = errors.New("another recovery already in progress")
+	ErrRecoveryFailed = errors.New("journal recovery failed")
+	ErrCorruptTxn     = errors.New("corrupt transaction found")
+	ErrUnexpectedEnd  = errors.New("unexpected end of journal data")
 )
 
 // RecoveredTxn represents a transaction found during recovery.
@@ -54,15 +53,21 @@ type RecoveryHandler func(txn *RecoveredTxn) error
 // 3. Scan from head to tail
 // 4. For each committed transaction, call handler
 // 5. On success, mark state as Clean and reset pointers
+//
+// A journal left Recovering by a failed or interrupted replay is replayed
+// again from the first transaction not yet replayed: the head moves past
+// each transaction once its handler returns.
 func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
+	return RecoverChecked(region, handler, nil)
+}
+
+// RecoverChecked is Recover with check called before each transaction and
+// before the final reset. Replay stops, leaving the journal Recovering, as
+// soon as check fails; cross-node replay uses it to stop once it loses the
+// slot's recovery lease.
+func RecoverChecked(region *Region, handler RecoveryHandler, check func() error) (*RecoveryStats, error) {
 	if !region.NeedsRecovery() {
 		return &RecoveryStats{}, nil
-	}
-
-	// Prevent concurrent recovery
-	state := region.State()
-	if state == JournalStateRecovering {
-		return nil, ErrRecoveryInProgress
 	}
 
 	// Mark as recovering
@@ -73,10 +78,20 @@ func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
 	stats := &RecoveryStats{}
 
 	// Scan and recover
-	err := scanJournal(region, handler, stats)
-	if err != nil {
-		// Recovery failed - leave in recovering state for manual intervention
+	advance := func(seq uint64, next uint32) error {
+		if err := region.Sync(); err != nil {
+			return err
+		}
+		return region.Checkpoint(seq, next)
+	}
+	if err := scanJournal(region, handler, stats, check, advance); err != nil {
+		// Leave the journal Recovering so the next attempt resumes it
 		return stats, fmt.Errorf("recovery failed: %w", err)
+	}
+	if check != nil {
+		if err := check(); err != nil {
+			return stats, fmt.Errorf("recovery stopped before reset: %w", err)
+		}
 	}
 
 	// Success - reset the journal
@@ -157,7 +172,11 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 // It implements the two-phase intent logging recovery protocol:
 // Phase 1: Scan for IntentCompletion records to find completed intents
 // Phase 2: Replay only transactions without matching completion records
-func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) error {
+// scanJournal replays committed, uncompleted transactions. check runs before
+// each one and before recording it; advance, when set, records progress after
+// each one is applied, once its writes are flushed.
+func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
+	check func() error, advance func(seq uint64, next uint32) error) error {
 	sb := region.Superblock()
 	head := sb.HeadOffset
 	tail := sb.TailOffset
@@ -291,6 +310,12 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 				return fmt.Errorf("failed to parse txn entries: %w", err)
 			}
 
+			if check != nil {
+				if err := check(); err != nil {
+					return fmt.Errorf("replay stopped before txn %d: %w", txnHeader.Seq, err)
+				}
+			}
+
 			// Call recovery handler
 			if handler != nil {
 				if err := handler(recoveredTxn); err != nil {
@@ -300,6 +325,21 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 			}
 
 			stats.EntriesReplayed += len(recoveredTxn.Entries)
+
+			if check != nil {
+				if err := check(); err != nil {
+					return fmt.Errorf("replay stopped after txn %d: %w", txnHeader.Seq, err)
+				}
+			}
+			if advance != nil {
+				next := pos + ((txnHeader.TotalLength+storage.SectorSize-1)/storage.SectorSize)*storage.SectorSize
+				if next >= dataAreaSize {
+					next -= dataAreaSize
+				}
+				if err := advance(txnHeader.Seq, next); err != nil {
+					return fmt.Errorf("failed to record replay of txn %d: %w", txnHeader.Seq, err)
+				}
+			}
 		}
 
 		// Advance position (account for sector alignment)
@@ -393,7 +433,7 @@ func DryRunRecover(region *Region) ([]*RecoveredTxn, *RecoveryStats, error) {
 	}
 
 	// Don't mark as recovering for dry run
-	if err := scanJournal(region, handler, stats); err != nil {
+	if err := scanJournal(region, handler, stats, nil, nil); err != nil {
 		return nil, stats, err
 	}
 

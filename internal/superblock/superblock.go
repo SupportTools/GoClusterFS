@@ -21,10 +21,11 @@ const (
 	Magic = "GOCLUSTERFS"
 
 	// CurrentVersion is the format version this code produces.
-	CurrentVersion uint32 = 1
+	// Version 2 gives each node slot its own journal region.
+	CurrentVersion uint32 = 2
 
 	// MinSupportedVersion is the oldest format we can read.
-	MinSupportedVersion uint32 = 1
+	MinSupportedVersion uint32 = 2
 )
 
 // Feature flags - optional features (can mount without understanding)
@@ -50,7 +51,7 @@ var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots
 var (
 	ErrInvalidMagic     = errors.New("invalid superblock magic")
 	ErrNewerVersion     = errors.New("superblock version newer than supported - upgrade GoClusterFS")
-	ErrTooOldVersion    = errors.New("superblock version too old - run migration tool")
+	ErrTooOldVersion    = errors.New("superblock version too old - reformat with -format")
 	ErrChecksumMismatch = errors.New("superblock checksum mismatch - possible corruption")
 	ErrUnknownRequired  = errors.New("superblock requires features this version doesn't support")
 )

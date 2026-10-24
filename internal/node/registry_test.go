@@ -2,12 +2,15 @@ package node
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 func TestSlotSerializeDeserialize(t *testing.T) {
@@ -642,4 +645,394 @@ func TestFailureDetectionLoop(t *testing.T) {
 
 	// Stop
 	reg2.Unregister(ctx)
+}
+
+func TestMaxNodesMatchesSuperblock(t *testing.T) {
+	if MaxNodes != superblock.MaxNodes {
+		t.Errorf("node.MaxNodes = %d, superblock.MaxNodes = %d", MaxNodes, superblock.MaxNodes)
+	}
+}
+
+func TestRegisterRecordsJournalRegion(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	for want := 0; want < 3; want++ {
+		reg := NewRegistry(dev, 0)
+		reg.SetJournalArea(1<<20, 4<<20)
+		slot, err := reg.Register(ctx, "node")
+		if err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if slot != want {
+			t.Fatalf("slot = %d, want %d", slot, want)
+		}
+
+		offset, size := reg.LocalJournal()
+		if wantOffset := uint64(1<<20 + want*4<<20); offset != wantOffset || size != 4<<20 {
+			t.Errorf("slot %d journal at %d size %d, want %d size %d", slot, offset, size, wantOffset, 4<<20)
+		}
+		onDisk, err := reg.readSlot(slot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if onDisk.JournalOffset != offset || onDisk.JournalSize != size {
+			t.Errorf("slot %d records journal at %d size %d, want %d size %d",
+				slot, onDisk.JournalOffset, onDisk.JournalSize, offset, size)
+		}
+	}
+}
+
+func TestRegisterSkipsSlotUnderRecovery(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	for i, started := range []time.Duration{0, 2 * recoveryLease} {
+		dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{byte(9 + i)},
+			HeartbeatTime: time.Now().Add(-time.Hour).Unix(), RecoveryOwner: [16]byte{7},
+			RecoveryStart: time.Now().Add(-started).Unix()}
+		if err := reg.writeSlot(i, dead); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 1 {
+		t.Errorf("Register took slot %d, want slot 1, whose recovery lease lapsed", slot)
+	}
+}
+
+func TestRegisterYieldsSlotToRacingWriter(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	result := make(chan int, 1)
+	go func() {
+		slot, err := reg.Register(context.Background(), "slow")
+		if err != nil {
+			t.Errorf("Register: %v", err)
+		}
+		result <- slot
+	}()
+
+	time.Sleep(claimSettle / 3)
+	racer := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}
+	if err := reg.writeSlot(0, racer); err != nil {
+		t.Fatal(err)
+	}
+
+	if slot := <-result; slot == 0 {
+		t.Error("Register kept slot 0 after another node overwrote the claim")
+	}
+}
+
+func TestClearFailedSlotKeepsNewOwner(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	failed := [16]byte{1}
+	newOwner := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{2}, HeartbeatTime: time.Now().Unix()}
+	if err := reg.writeSlot(3, newOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reg.clearFailedSlot(3, failed); err != nil {
+		t.Fatalf("clearFailedSlot: %v", err)
+	}
+	slot, err := reg.readSlot(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot.UUID != newOwner.UUID || slot.State != NodeStateActive {
+		t.Errorf("slot after clear: state %v uuid %x, want the new owner kept", slot.State, slot.UUID)
+	}
+}
+
+func TestUnregisterKeepsNewOwner(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	reg := NewRegistry(dev, 0)
+	slot, err := reg.Register(ctx, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newOwner := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{2}, HeartbeatTime: time.Now().Unix()}
+	if err := reg.writeSlot(slot, newOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reg.Unregister(ctx); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	got, err := reg.readSlot(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UUID != newOwner.UUID {
+		t.Errorf("Unregister cleared slot %d now owned by %x", slot, newOwner.UUID)
+	}
+}
+
+func writeLocalSlot(t *testing.T, reg *Registry, idx int, pid int, procStart int64) {
+	t.Helper()
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{byte(idx + 1)},
+		HeartbeatTime: time.Now().Unix(), BootID: reg.bootID, PID: uint32(pid), ProcStart: procStart,
+		PIDNamespace: reg.pidNS}
+	copy(slot.Hostname[:], "node")
+	if err := reg.writeSlot(idx, slot); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func exitedPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("cannot run true: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+func TestRegisterReclaimsSlotOfExitedLocalProcess(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) {
+		t.Skip("no kernel boot ID")
+	}
+	writeLocalSlot(t, reg, 0, os.Getppid(), 1)
+	writeLocalSlot(t, reg, 1, os.Getpid(), processStart)
+	writeLocalSlot(t, reg, 3, exitedPID(t), 1)
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 3 {
+		t.Errorf("Register took slot %d, want slot 3 of the exited local mount", slot)
+	}
+}
+
+func TestRecoveryOfExitedLocalProcessSkipsHeartbeatTimeout(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) {
+		t.Skip("no kernel boot ID")
+	}
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalSlot(t, reg, 2, exitedPID(t), 1)
+	writeLocalSlot(t, reg, 3, os.Getppid(), 1)
+
+	var recovered []int
+	reg.SetRecoveryHandler(func(info *FailedNodeInfo) error {
+		recovered = append(recovered, info.SlotIndex)
+		return nil
+	})
+	reg.detectAndRecoverFailedNodes()
+
+	if len(recovered) != 1 || recovered[0] != 2 {
+		t.Errorf("recovered slots %v, want only slot 2 of the exited local mount", recovered)
+	}
+}
+
+func TestRecoveryLeaseBlocksOthersUntilItLapses(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	failed := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{5},
+		RecoveryOwner: [16]byte{6}, RecoveryStart: time.Now().Unix()}
+	if err := reg.writeSlot(4, failed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout); !errors.Is(err, ErrSlotTaken) {
+		t.Fatalf("acquire during another node's lease: err = %v, want ErrSlotTaken", err)
+	}
+
+	failed.RecoveryStart = time.Now().Add(-2 * recoveryLease).Unix()
+	if err := reg.writeSlot(4, failed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout); err != nil {
+		t.Fatalf("acquire after the lease lapsed: %v", err)
+	}
+	slot, err := reg.readSlot(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot.RecoveryOwner != reg.LocalUUID() || time.Since(time.Unix(slot.RecoveryStart, 0)) > time.Minute {
+		t.Errorf("lease owner %x started %v, want this node now", slot.RecoveryOwner, time.Unix(slot.RecoveryStart, 0))
+	}
+}
+
+func TestHeartbeatReportsLostSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	lost := make(chan [16]byte, 1)
+	reg.SetSlotLostHandler(func(slot int, owner [16]byte) { lost <- owner })
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Stop()
+
+	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{8}, HeartbeatTime: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case owner := <-lost:
+		if owner != ([16]byte{8}) {
+			t.Errorf("lost slot to %x, want 08", owner)
+		}
+	case <-time.After(3 * HeartbeatInterval):
+		t.Error("heartbeat did not report the lost slot")
+	}
+}
+
+func writeOtherNamespaceSlot(t *testing.T, reg *Registry, idx int, heartbeat time.Time) *Slot {
+	t.Helper()
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{byte(idx + 1)},
+		HeartbeatTime: heartbeat.Unix(), BootID: reg.bootID, PID: 1, ProcStart: 1,
+		PIDNamespace: reg.pidNS + 1}
+	copy(slot.Hostname[:], "node")
+	if err := reg.writeSlot(idx, slot); err != nil {
+		t.Fatal(err)
+	}
+	return slot
+}
+
+func TestRegisterLeavesLiveSlotOfOtherPIDNamespace(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	sibling := writeOtherNamespaceSlot(t, reg, 0, time.Now())
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(250 * time.Millisecond):
+				sibling.HeartbeatSeq++
+				sibling.HeartbeatTime = time.Now().Unix()
+				reg.writeSlot(0, sibling)
+			}
+		}
+	}()
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot == 0 {
+		t.Error("Register took the live slot of a mount in another PID namespace with the same hostname")
+	}
+}
+
+func TestRegisterTakesOtherPIDNamespaceSlotOnceStale(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	writeOtherNamespaceSlot(t, reg, 2, time.Now().Add(-HeartbeatTimeout+time.Second))
+
+	start := time.Now()
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 2 {
+		t.Errorf("Register took slot %d, want slot 2 of this host's previous container once its heartbeat went stale", slot)
+	}
+	t.Logf("waited %v for the slot to go stale", time.Since(start))
+}
+
+func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	failed := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5},
+		HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
+	if err := reg.writeSlot(4, failed); err != nil {
+		t.Fatal(err)
+	}
+	info, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := info.CheckLease(); err != nil {
+		t.Fatalf("CheckLease right after acquire: %v", err)
+	}
+
+	held, _ := reg.readSlot(4)
+	held.RecoveryStart = time.Now().Add(-recoveryLease / 2).Unix()
+	if err := reg.writeSlot(4, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := info.CheckLease(); err != nil {
+		t.Fatalf("CheckLease halfway through the lease: %v", err)
+	}
+	if renewed, _ := reg.readSlot(4); time.Since(time.Unix(renewed.RecoveryStart, 0)) > 5*time.Second {
+		t.Errorf("lease not renewed: started %v", time.Unix(renewed.RecoveryStart, 0))
+	}
+
+	held.RecoveryOwner = [16]byte{6}
+	if err := reg.writeSlot(4, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := info.CheckLease(); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("CheckLease after another node took over: err = %v, want ErrLeaseLost", err)
+	}
+}
+
+func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	previous := writeOtherNamespaceSlot(t, reg, 2, time.Now())
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		previous.HeartbeatTime = time.Now().Add(-2 * HeartbeatTimeout).Unix()
+		reg.writeSlot(2, previous)
+	}()
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 2 {
+		t.Errorf("Register took slot %d, want slot 2, which went stale after the first scan", slot)
+	}
 }

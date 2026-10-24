@@ -130,9 +130,6 @@ func (r *Region) Get(ctx context.Context, blockNum uint64) (Entry, error) {
 		return Entry{}, ErrBlockOutOfRange
 	}
 
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	// Acquire distributed lock if available (shared mode for read)
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeShared); err != nil {
@@ -140,6 +137,9 @@ func (r *Region) Get(ctx context.Context, blockNum uint64) (Entry, error) {
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	return r.readEntry(blockNum)
 }
@@ -151,9 +151,6 @@ func (r *Region) Increment(ctx context.Context, blockNum uint64) (uint32, error)
 		return 0, ErrBlockOutOfRange
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
@@ -161,6 +158,9 @@ func (r *Region) Increment(ctx context.Context, blockNum uint64) (uint32, error)
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	entry, err := r.readEntry(blockNum)
 	if err != nil {
@@ -188,9 +188,6 @@ func (r *Region) Decrement(ctx context.Context, blockNum uint64) (uint32, error)
 		return 0, ErrBlockOutOfRange
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
@@ -198,6 +195,9 @@ func (r *Region) Decrement(ctx context.Context, blockNum uint64) (uint32, error)
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	entry, err := r.readEntry(blockNum)
 	if err != nil {
@@ -224,9 +224,6 @@ func (r *Region) Set(ctx context.Context, blockNum uint64, count uint32, flags E
 		return ErrBlockOutOfRange
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
@@ -234,6 +231,9 @@ func (r *Region) Set(ctx context.Context, blockNum uint64, count uint32, flags E
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	entry := Entry{
 		RefCount: count,
@@ -248,9 +248,6 @@ func (r *Region) SetFlags(ctx context.Context, blockNum uint64, flags EntryFlags
 		return ErrBlockOutOfRange
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
@@ -258,6 +255,9 @@ func (r *Region) SetFlags(ctx context.Context, blockNum uint64, flags EntryFlags
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	entry, err := r.readEntry(blockNum)
 	if err != nil {
@@ -282,9 +282,6 @@ func (r *Region) IncrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 		}
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
@@ -292,6 +289,9 @@ func (r *Region) IncrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	results := make([]uint32, len(blockNums))
 
@@ -344,9 +344,6 @@ func (r *Region) DecrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 		}
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
@@ -354,6 +351,9 @@ func (r *Region) DecrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	results := make([]uint32, len(blockNums))
 

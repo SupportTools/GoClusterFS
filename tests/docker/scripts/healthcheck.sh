@@ -10,8 +10,8 @@ if ! grep -q "$MOUNT_POINT" /proc/mounts; then
     exit 1
 fi
 
-# Check if mount point is accessible (can list directory)
-if ! ls "$MOUNT_POINT" > /dev/null 2>&1; then
+# stat, not ls: a readdir every 2s on every node reads the whole 1MB root directory block
+if ! stat "$MOUNT_POINT" > /dev/null 2>&1; then
     echo "UNHEALTHY: Cannot access $MOUNT_POINT"
     exit 1
 fi

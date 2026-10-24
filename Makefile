@@ -78,7 +78,7 @@ test-multinode-docker: docker-build-test
 	@echo "Phase 1: Initializing shared storage..."
 	$(DOCKER_COMPOSE_TEST) run --rm storage-init
 	@echo "Phase 2: Starting nodes in background..."
-	$(DOCKER_COMPOSE_TEST) up --no-deps -d node1 node2 node3 node4
+	$(DOCKER_COMPOSE_TEST) up -d node1 node2 node3 node4
 	@echo "Phase 3: Waiting for nodes to be healthy..."
 	@sleep 5
 	@for node in goclusterfs-node1 goclusterfs-node2 goclusterfs-node3 goclusterfs-node4; do \

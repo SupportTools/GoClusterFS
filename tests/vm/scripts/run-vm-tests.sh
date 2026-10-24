@@ -581,6 +581,87 @@ test_journal_recovery_multinode() {
     return 0
 }
 
+# VM A's mount restarts while VM B keeps creating files.
+# Matches Go test: TestMultiNodeRestartKeepsPeerJournal in journal_slots_test.go
+test_restart_keeps_peer_journal() {
+    log_info "Testing mount restart while a peer keeps writing..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_info "SKIP: Need at least 2 VMs"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+
+    local vm_a=1
+    local vm_b=2
+    local dir="/mnt/goclusterfs/peer-journal"
+
+    ssh_run "$vm_b" "rm -rf $dir /tmp/peer-writer.*; mkdir -p $dir"
+    ssh_run "$vm_b" "nohup sh -c 'i=0
+        while [ ! -e /tmp/peer-writer.stop ] && [ \$i -lt 150 ]; do
+            i=\$((i + 1))
+            echo peer-\$i > $dir/peer-\$i || { echo fail \$i > /tmp/peer-writer.done; exit; }
+            sleep 0.05
+        done
+        echo ok \$i > /tmp/peer-writer.done' >/dev/null 2>&1 &"
+    sleep 1
+
+    local slot_before
+    slot_before=$(ssh_run "$vm_a" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1")
+    ssh_run "$vm_a" "pkill -9 goclusterfs-mount; sleep 1; umount -l /mnt/goclusterfs 2>/dev/null; true"
+    if ! setup_goclusterfs "$vm_a" false; then
+        ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
+        return 1
+    fi
+    sleep 1
+    ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
+
+    local status="" count=0
+    while [[ -z "$status" && $count -lt 30 ]]; do
+        status=$(ssh_run "$vm_b" "cat /tmp/peer-writer.done 2>/dev/null" || true)
+        sleep 1
+        count=$((count + 1))
+    done
+    log_info "VM B writer finished: ${status:-timeout}"
+    if [[ "$status" != ok* ]]; then
+        log_error "VM B could not keep writing while VM A restarted"
+        return 1
+    fi
+    local written=${status#ok }
+
+    local bad
+    bad=$(ssh_run "$vm_a" "k=1; while [ \$k -le $written ]; do
+        [ \"\$(cat $dir/peer-\$k 2>/dev/null)\" = peer-\$k ] || echo peer-\$k; k=\$((k + 1)); done")
+    if [[ -n "$bad" ]]; then
+        log_error "VM A cannot read VM B's files: $(echo $bad | head -c 300)"
+        return 1
+    fi
+
+    local offset_a offset_b uuid_b
+    offset_a=$(ssh_run "$vm_a" "grep -o 'Journal: initialized at offset [0-9]*' /var/log/goclusterfs.log | tail -1")
+    offset_b=$(ssh_run "$vm_b" "grep -o 'Journal: initialized at offset [0-9]*' /var/log/goclusterfs.log | tail -1")
+    uuid_b=$(ssh_run "$vm_b" "grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' /var/log/goclusterfs.log | tail -1" | grep -o '[0-9a-f]*$')
+    log_info "VM A: $offset_a; VM B: $offset_b (UUID $uuid_b)"
+    if [[ -z "$offset_a" || "$offset_a" == "$offset_b" ]]; then
+        log_error "VM A and VM B share a journal region"
+        return 1
+    fi
+    if ssh_run "$vm_a" "grep -q 'from crashed node $uuid_b' /var/log/goclusterfs.log"; then
+        log_error "VM A replayed live VM B's journal during its restart"
+        return 1
+    fi
+    local slot_after
+    slot_after=$(ssh_run "$vm_a" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1")
+    if [[ "$slot_after" != "$slot_before" ]]; then
+        log_error "VM A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount"
+        return 1
+    fi
+
+    ssh_run "$vm_b" "rm -rf $dir"
+    log_info "Restart keeps peer journal test passed ($written files)"
+    return 0
+}
+
 # Test: Journal recovery with multiple files
 # Simulates crash: VM A creates 5 files, gets killed, VM B recovers all via journal
 test_journal_recovery_multiple_files() {
@@ -2374,6 +2455,48 @@ test_stability() {
 # Concurrent Same-File Write Tests (using pre-extension pattern)
 # =============================================================================
 
+# Two VMs write different ranges of each new file's first block at once.
+# Without the inode lock the later inode write drops the other VM's extent.
+test_concurrent_first_write_same_block() {
+    log_info "Testing concurrent first writes to the same block (2 VMs)..."
+    ensure_cluster_healthy 2
+
+    local files=10
+    local size=65536
+    local offset0=262144
+    local offset1=524288
+
+    for i in $(seq 1 $files); do
+        ssh_run 1 "touch /mnt/goclusterfs/first_write_$i.bin"
+    done
+    sleep 2
+
+    for i in $(seq 1 $files); do
+        write_pattern_at_on_vm 1 "first_write_$i.bin" "A" "$size" "$offset0" &
+        write_pattern_at_on_vm 2 "first_write_$i.bin" "B" "$size" "$offset1" &
+        wait
+    done
+    sleep 2
+
+    # Restart the reader so cached extents from earlier files with the same inode numbers cannot hide the result.
+    stop_vm 1
+    start_vm 1 false
+    wait_vm_healthy 1 || return 1
+    setup_goclusterfs 1 false
+
+    local lost=0
+    for i in $(seq 1 $files); do
+        verify_pattern_at_on_vm 1 "first_write_$i.bin" "A" "$offset0" 4096 || lost=$((lost + 1))
+        verify_pattern_at_on_vm 1 "first_write_$i.bin" "B" "$offset1" 4096 || lost=$((lost + 1))
+    done
+    if [[ $lost -gt 0 ]]; then
+        log_error "$lost of $((files * 2)) concurrent first writes lost"
+        return 1
+    fi
+    log_success "All concurrent first writes survived"
+    return 0
+}
+
 # Test 10: Two VMs write to same file at different offsets
 test_concurrent_same_file_writes() {
     log_info "Testing concurrent same-file writes (2 VMs)..."
@@ -2888,6 +3011,7 @@ main() {
     run_test "Concurrent File Creation" test_concurrent_file_creation
     run_test "VM Kill Recovery" test_vm_kill_recovery
     run_test "Journal Recovery Multi-Node" test_journal_recovery_multinode
+    run_test "Restart Keeps Peer Journal" test_restart_keeps_peer_journal
     run_test "Journal Recovery Multiple Files" test_journal_recovery_multiple_files
     run_test "Journal Recovery Large File" test_journal_recovery_large_file
     run_test "Journal Recovery Idempotency" test_journal_recovery_idempotency
@@ -2920,6 +3044,7 @@ main() {
     run_test "Long-Running Stability" test_stability
 
     # Run concurrent same-file write tests (using pre-extension pattern)
+    run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
     run_test "Concurrent Same-File Writes (2 VMs)" test_concurrent_same_file_writes
     run_test "Concurrent Same-File Writes (3 VMs)" test_concurrent_same_file_writes_3vms
     run_test "Mixed Size Writes" test_mixed_size_writes

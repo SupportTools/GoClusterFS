@@ -1601,3 +1601,80 @@ func TestStressRandomFailures(t *testing.T) {
 
 	t.Logf("Stress test completed: %d files created", filesCreated)
 }
+
+// TestMultiNodeConcurrentFirstWriteToSameBlock has two nodes write different
+// ranges of a new file's first block at the same time. Each node must take the
+// inode lock around its read-modify-write of the extents, or the later inode
+// write drops the other node's extent and its data.
+func TestMultiNodeConcurrentFirstWriteToSameBlock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("two nodes can still both take a free inode lock (about 1 file in 150 loses a write) until lock claims are confirmed")
+	}
+	cluster := NewMultiNodeCluster(t, 2, 100)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	const files = 20
+	name := func(i int) string { return fmt.Sprintf("first_write_%02d.bin", i) }
+	for i := 0; i < files; i++ {
+		if err := cluster.Node(0).WriteFile(name(i), nil); err != nil {
+			t.Fatalf("Failed to create %s: %v", name(i), err)
+		}
+	}
+	// Outlast the kernel's 1s attribute cache so node 1 sees the files.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Offsets past 64KB keep the files off the SFB path.
+	const offset0, offset1 = 256 * 1024, 512 * 1024
+	data0 := bytes.Repeat([]byte("N0"), 32*1024)
+	data1 := bytes.Repeat([]byte("N1"), 32*1024)
+
+	for i := 0; i < files; i++ {
+		errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+			if idx == 0 {
+				return node.WriteFileAt(name(i), data0, offset0)
+			}
+			return node.WriteFileAt(name(i), data1, offset1)
+		})
+		for idx, err := range errs {
+			if err != nil {
+				t.Fatalf("%s: node %d write failed: %v", name(i), idx, err)
+			}
+		}
+	}
+
+	// Read from a freshly mounted node so no cached extents hide the result.
+	cluster.StopAllNodes()
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("Failed to remount node 0: %v", err)
+	}
+
+	lost := 0
+	for i := 0; i < files; i++ {
+		got, err := cluster.Node(0).ReadFile(name(i))
+		if err != nil {
+			t.Fatalf("Failed to read %s: %v", name(i), err)
+		}
+		if len(got) < offset1+len(data1) {
+			t.Errorf("%s: size %d, want at least %d", name(i), len(got), offset1+len(data1))
+			lost++
+			continue
+		}
+		ok0 := bytes.Equal(got[offset0:offset0+len(data0)], data0)
+		ok1 := bytes.Equal(got[offset1:offset1+len(data1)], data1)
+		if !ok0 || !ok1 {
+			t.Errorf("%s: node 0 data intact=%v, node 1 data intact=%v", name(i), ok0, ok1)
+			lost++
+		}
+	}
+	if lost > 0 {
+		t.Fatalf("%d of %d files lost a node's write", lost, files)
+	}
+}

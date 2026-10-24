@@ -260,9 +260,22 @@ md5_portion() {
 test_passed=0
 test_failed=0
 
+# CI runs the suite as two parallel jobs. TEST_GROUP=1 or 2 runs one half; empty runs everything.
+in_test_group() {
+    [[ -z "$TEST_GROUP" ]] && return 0
+    local group=1
+    case "$1" in
+        "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|"Inode Reuse Stale Read"|"Rolling Restart")
+            group=2 ;;
+    esac
+    [[ "$group" == "$TEST_GROUP" ]]
+}
+
 run_test() {
     local test_name=$1
     local test_func=$2
+
+    in_test_group "$test_name" || return 0
 
     log "=========================================="
     log "Running test: $test_name"
@@ -565,13 +578,11 @@ test_many_files() {
     # Create test directory
     exec_on_node "$node" mkdir -p "/mnt/goclusterfs/$test_dir"
 
-    # Create 100 files with unique content
+    # One docker exec per loop: an exec per file costs more than the file operation
     log "Creating $num_files files..."
-    for i in $(seq 0 $((num_files - 1))); do
-        local filename=$(printf "file_%03d.txt" "$i")
-        local content="Content of file $i"
-        exec_on_node "$node" sh -c "echo '$content' > /mnt/goclusterfs/$test_dir/$filename"
-    done
+    exec_on_node "$node" sh -c 'for i in $(seq 0 $(($2 - 1))); do
+            echo "Content of file $i" > "$(printf "%s/file_%03d.txt" "$1" "$i")"
+        done' sh "/mnt/goclusterfs/$test_dir" "$num_files"
 
     # Count files in directory
     local count
@@ -582,21 +593,15 @@ test_many_files() {
     fi
     log "File count verified: $count files"
 
-    # Verify each file has correct content
-    local verify_errors=0
-    for i in $(seq 0 $((num_files - 1))); do
-        local filename=$(printf "file_%03d.txt" "$i")
-        local expected="Content of file $i"
-        local actual
-        actual=$(exec_on_node "$node" cat "/mnt/goclusterfs/$test_dir/$filename")
-        if [[ "$actual" != "$expected" ]]; then
-            log "ERROR: Content mismatch for $filename: expected '$expected', got '$actual'"
-            ((verify_errors++))
-        fi
-    done
-
-    if [[ "$verify_errors" -gt 0 ]]; then
-        log "ERROR: $verify_errors files had content mismatches"
+    local mismatches
+    mismatches=$(exec_on_node "$node" sh -c 'for i in $(seq 0 $(($2 - 1))); do
+            f=$(printf "%s/file_%03d.txt" "$1" "$i")
+            got=$(cat "$f")
+            [ "$got" = "Content of file $i" ] || echo "Content mismatch for $f: got '\''$got'\''"
+        done' sh "/mnt/goclusterfs/$test_dir" "$num_files")
+    if [[ -n "$mismatches" ]]; then
+        log "ERROR: content mismatches:"
+        log "$mismatches"
         return 1
     fi
 
@@ -908,38 +913,24 @@ test_stress_single_node() {
 
     log "Running $iterations create/read/delete iterations..."
 
-    for i in $(seq 1 $iterations); do
-        local filename=$(printf "stress_%04d.txt" $i)
-        local content="Stress test iteration $i"
-
-        # Create file
-        if ! exec_on_node "$node" sh -c "echo -n '$content' > /mnt/goclusterfs/$filename" 2>/dev/null; then
-            log "ERROR: Iteration $i: Failed to create file"
-            ((errors++))
-            continue
-        fi
-
-        # Read and verify
-        local readback
-        readback=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename" 2>/dev/null)
-        if [[ "$readback" != "$content" ]]; then
-            log "ERROR: Iteration $i: Content mismatch. Expected: '$content', Got: '$readback'"
-            ((errors++))
-            continue
-        fi
-
-        # Delete
-        if ! exec_on_node "$node" rm "/mnt/goclusterfs/$filename" 2>/dev/null; then
-            log "ERROR: Iteration $i: Failed to delete file"
-            ((errors++))
-            continue
-        fi
-
-        # Progress logging every 25 iterations
-        if [[ $((i % 25)) -eq 0 ]]; then
-            log "Progress: $i/$iterations iterations completed"
-        fi
-    done
+    # One docker exec for the whole loop: an exec per step costs more than the file operation
+    local failures
+    failures=$(exec_on_node "$node" sh -c 'for i in $(seq 1 $1); do
+            f=$(printf "/mnt/goclusterfs/stress_%04d.txt" "$i")
+            want="Stress test iteration $i"
+            if ! printf "%s" "$want" > "$f" 2>/dev/null; then
+                echo "Iteration $i: Failed to create file"; continue
+            fi
+            got=$(cat "$f" 2>/dev/null)
+            if [ "$got" != "$want" ]; then
+                echo "Iteration $i: Content mismatch. Expected: '\''$want'\'', Got: '\''$got'\''"; continue
+            fi
+            rm "$f" 2>/dev/null || echo "Iteration $i: Failed to delete file"
+        done' sh "$iterations")
+    if [[ -n "$failures" ]]; then
+        log "ERROR: $failures"
+        errors=$(echo "$failures" | wc -l)
+    fi
 
     # Verify no stress test files remain
     local remaining
@@ -1248,6 +1239,89 @@ test_journal_recovery_multinode() {
     fi
 
     log "Multi-node journal recovery test passed"
+    return 0
+}
+
+# Node A restarts while node B keeps creating files.
+# Matches Go test: TestMultiNodeRestartKeepsPeerJournal in journal_slots_test.go
+test_restart_keeps_peer_journal() {
+    log "Testing node restart while a peer keeps writing..."
+
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes"
+        return 0
+    fi
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]}"
+    local dir="/mnt/goclusterfs/peer-journal"
+
+    exec_on_node "$node_b" sh -c "rm -rf $dir /tmp/peer-writer.*; mkdir -p $dir"
+    docker exec -d "$node_b" sh -c "i=0
+        while [ ! -e /tmp/peer-writer.stop ] && [ \$i -lt 150 ]; do
+            i=\$((i + 1))
+            echo peer-\$i > $dir/peer-\$i || { echo fail \$i > /tmp/peer-writer.done; exit; }
+            sleep 0.05
+        done
+        echo ok \$i > /tmp/peer-writer.done"
+    sleep 1
+
+    local since slot_before
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    slot_before=$(docker logs "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
+    docker kill "$node_a" >/dev/null 2>&1 || true
+    sleep 1
+    docker start "$node_a" >/dev/null
+    if ! wait_node_healthy "$node_a" 60; then
+        exec_on_node "$node_b" touch /tmp/peer-writer.stop
+        return 1
+    fi
+    sleep 1
+    exec_on_node "$node_b" touch /tmp/peer-writer.stop
+
+    local status="" count=0
+    while [[ -z "$status" && $count -lt 30 ]]; do
+        status=$(exec_on_node "$node_b" cat /tmp/peer-writer.done 2>/dev/null || true)
+        sleep 1
+        count=$((count + 1))
+    done
+    log "Node B writer finished: ${status:-timeout}"
+    if [[ "$status" != ok* ]]; then
+        log "ERROR: Node B could not keep writing while node A restarted"
+        return 1
+    fi
+    local written=${status#ok }
+
+    local bad
+    bad=$(exec_on_node "$node_a" sh -c "k=1; while [ \$k -le $written ]; do
+        [ \"\$(cat $dir/peer-\$k 2>/dev/null)\" = peer-\$k ] || echo peer-\$k; k=\$((k + 1)); done")
+    if [[ -n "$bad" ]]; then
+        log "ERROR: Node A cannot read node B's files: $(echo $bad | head -c 300)"
+        return 1
+    fi
+
+    local offset_a offset_b uuid_b
+    offset_a=$(docker logs --since "$since" "$node_a" 2>&1 | grep -o 'Journal: initialized at offset [0-9]*' | tail -1)
+    offset_b=$(docker logs "$node_b" 2>&1 | grep -o 'Journal: initialized at offset [0-9]*' | tail -1)
+    uuid_b=$(docker logs "$node_b" 2>&1 | grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' | tail -1 | grep -o '[0-9a-f]*$')
+    log "Node A: $offset_a; node B: $offset_b (UUID $uuid_b)"
+    if [[ -z "$offset_a" || "$offset_a" == "$offset_b" ]]; then
+        log "ERROR: Node A and node B share a journal region"
+        return 1
+    fi
+    if docker logs --since "$since" "$node_a" 2>&1 | grep -q "from crashed node $uuid_b"; then
+        log "ERROR: Node A replayed live node B's journal during its restart"
+        return 1
+    fi
+    local slot_after
+    slot_after=$(docker logs --since "$since" "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
+    if [[ "$slot_after" != "$slot_before" ]]; then
+        log "ERROR: Node A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount"
+        return 1
+    fi
+
+    exec_on_node "$node_b" rm -rf "$dir"
+    log "Restart keeps peer journal test passed ($written files)"
     return 0
 }
 
@@ -1694,12 +1768,8 @@ test_journal_crash_recovery_multiple_ops() {
     log "Restarting container..."
     docker start "$node_a" >/dev/null 2>&1
 
-    # Wait for container and remount
-    sleep 2
-    if ! docker exec "$node_a" mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        # May need to explicitly remount after restart
-        start_goclusterfs "$node_a" false
-        sleep 2
+    if ! wait_node_healthy "$node_a" 60; then
+        return 1
     fi
 
     # Verify all operations were recovered
@@ -1792,11 +1862,8 @@ test_journal_crash_during_write() {
     log "Restarting container after crash..."
     docker start "$node_a" >/dev/null 2>&1
 
-    # Wait for container and remount
-    sleep 2
-    if ! docker exec "$node_a" mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        start_goclusterfs "$node_a" false
-        sleep 2
+    if ! wait_node_healthy "$node_a" 60; then
+        return 1
     fi
 
     # Baseline file MUST be recovered
@@ -1849,6 +1916,46 @@ test_concurrent_writes() {
     done
 
     log "All concurrent writes verified"
+    return 0
+}
+
+# Two nodes write different ranges of each new file's first block at once.
+# Without the inode lock the later inode write drops the other node's extent.
+test_concurrent_first_write_same_block() {
+    log "Testing concurrent first writes to the same block from two nodes..."
+    local writer0="${NODE_ARRAY[0]}"
+    local writer1="${NODE_ARRAY[1]}"
+    local reader="${NODE_ARRAY[2]}"
+    local files=10
+    local size=65536
+    local offset0=262144
+    local offset1=524288
+
+    for i in $(seq 1 $files); do
+        exec_on_node "$writer0" touch "/mnt/goclusterfs/first_write_$i.bin"
+    done
+    sleep 2
+
+    for i in $(seq 1 $files); do
+        write_pattern_at "$writer0" "first_write_$i.bin" A "$size" "$offset0" &
+        write_pattern_at "$writer1" "first_write_$i.bin" B "$size" "$offset1" &
+        wait
+    done
+
+    # Restart the reader so cached extents from earlier files with the same inode numbers cannot hide the result.
+    restart_node "$reader"
+    wait_node_healthy "$reader" 30 || return 1
+
+    local lost=0
+    for i in $(seq 1 $files); do
+        verify_pattern_at "$reader" "first_write_$i.bin" A "$offset0" 4096 || lost=$((lost + 1))
+        verify_pattern_at "$reader" "first_write_$i.bin" B "$offset1" 4096 || lost=$((lost + 1))
+    done
+    if [ "$lost" -gt 0 ]; then
+        log "ERROR: $lost of $((files * 2)) concurrent first writes lost"
+        return 1
+    fi
+    log "All concurrent first writes survived"
     return 0
 }
 
@@ -2753,8 +2860,10 @@ else
     run_test "Concurrent File Creation" test_concurrent_file_creation
     run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 fi
+run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
 run_test "Container Kill Recovery" test_container_kill_recovery
 run_test "Journal Recovery Multi-Node" test_journal_recovery_multinode
+run_test "Restart Keeps Peer Journal" test_restart_keeps_peer_journal
 run_test "Journal Recovery Multiple Files" test_journal_recovery_multiple_files
 run_test "Journal Recovery Large File" test_journal_recovery_large_file
 run_test "Journal Recovery Idempotency" test_journal_recovery_idempotency

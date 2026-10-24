@@ -1,6 +1,7 @@
 package fsck
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -20,10 +21,12 @@ const (
 	BitmapBitsPerSector = BitmapBytesPerSector * 8 // 32736
 )
 
+var zeroSector [BitmapSectorSize]byte
+
 // checkBitmap validates the block allocation bitmap (Phase 2).
 //
 // Checks performed:
-//   - All sectors have valid CRC32C checksums
+//   - Sectors covering TotalBlocks have valid CRC32C checksums or are all zero (never written)
 //   - Bitmap size matches TotalBlocks from superblock
 //   - Track which blocks are allocated (for cross-validation)
 func (c *Checker) checkBitmap() error {
@@ -56,7 +59,7 @@ func (c *Checker) checkBitmap() error {
 	allocatedCount := uint64(0)
 	checksumErrors := 0
 
-	for sectorIdx := uint64(0); sectorIdx < actualSectors; sectorIdx++ {
+	for sectorIdx := uint64(0); sectorIdx < min(actualSectors, expectedSectors); sectorIdx++ {
 		sectorOffset := bitmapOffset + sectorIdx*BitmapSectorSize
 
 		n, err := c.dev.ReadAt(sectorBuf, int64(sectorOffset))
@@ -77,7 +80,7 @@ func (c *Checker) checkBitmap() error {
 		storedChecksum := binary.LittleEndian.Uint32(sectorBuf[BitmapBytesPerSector:])
 		computedChecksum := crc32.Checksum(sectorBuf[:BitmapBytesPerSector], crc32.MakeTable(crc32.Castagnoli))
 
-		if storedChecksum != computedChecksum {
+		if storedChecksum != computedChecksum && !bytes.Equal(sectorBuf, zeroSector[:]) {
 			checksumErrors++
 			c.addProblem(PhaseBitmap, Error, fmt.Sprintf("sector %d", sectorIdx),
 				fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
