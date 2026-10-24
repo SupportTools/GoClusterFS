@@ -3,6 +3,7 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -58,6 +59,8 @@ type refcountFix struct {
 //     fewer would free a block another inode still maps
 //   - Blocks count no more owners than inodes map them; more would leak them
 //   - No refcount overflow (0xFFFFFFFF)
+//   - No block past the table, which has no count for it, is mapped by
+//     several inodes that count their sharing
 //
 // In repair mode, and only when every inode's extents were read, the counts
 // are rebuilt from those references, and extents an older version shared
@@ -111,6 +114,11 @@ func (c *Checker) checkRefcounts() error {
 			}
 		}
 	}
+	if covered := c.refcountCoverage(); sb.TotalBlocks > covered {
+		c.addProblem(PhaseRefcounts, Warning, "refcount table",
+			fmt.Sprintf("has entries for blocks 0-%d of %d; snapshots and clones of files with data in higher blocks fail", covered-1, sb.TotalBlocks), false)
+		c.checkSharingPastTable(covered)
+	}
 	c.reportUncounted()
 
 	c.logf("  Shared blocks (refcount > 1): %d\n", sharedBlocks)
@@ -141,6 +149,32 @@ func (c *Checker) checkRefcounts() error {
 		}
 	}
 	return c.markSharingCounted()
+}
+
+// refcountCoverage returns how many blocks the refcount table has entries for.
+func (c *Checker) refcountCoverage() uint64 {
+	return c.sbData.RefCountTableSize / RefcountSectorSize * RefcountEntriesPerSector
+}
+
+// checkSharingPastTable reports blocks past the refcount table that inodes share
+// with counts, which the first delete frees. Only-uncounted sharing is never freed.
+func (c *Checker) checkSharingPastTable(covered uint64) {
+	var blocks []uint64
+	for block, refs := range c.inodeBlocks {
+		if block >= covered && refs > 1 && c.uncountedRefs[block] < refs {
+			blocks = append(blocks, block)
+		}
+	}
+	slices.Sort(blocks)
+	for _, block := range blocks[:min(len(blocks), 10)] {
+		c.addProblem(PhaseRefcounts, Critical, fmt.Sprintf("block %d", block),
+			fmt.Sprintf("mapped by %d inodes but past the refcount table, which has no count for it: deleting one of them frees a block the others still map",
+				c.inodeBlocks[block]), false)
+	}
+	if len(blocks) > 10 {
+		c.addProblem(PhaseRefcounts, Critical, "blocks",
+			fmt.Sprintf("%d more blocks past the refcount table are mapped by several inodes", len(blocks)-10), false)
+	}
 }
 
 // checkRefcount compares one block's count with the inodes that map it. It

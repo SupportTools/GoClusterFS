@@ -392,10 +392,12 @@ type Checker struct {
 	snapshotData    map[uint32]bool // inodes holding a snapshot's captured extents
 	sfbContainers   map[uint64]bool // blocks holding small files of older versions
 	extentTrees     map[uint32]*extentTree
-	uncounted       map[uint32]int // inodes an older version shared -> problem index
-	refsIncomplete  []string       // why inodeBlocks may miss references
-	superblockFix   func() error   // runs once repair knows no node uses the filesystem
-	registry        []byte         // node registry as startRepair last saw it
+	uncounted       map[uint32]int  // inodes an older version shared -> problem index
+	uncountedRefs   map[uint64]int  // block -> references from extents an older version shared
+	uncountedPast   map[uint32]bool // inodes an older version shared with blocks past the refcount table
+	refsIncomplete  []string        // why inodeBlocks may miss references
+	superblockFix   func() error    // runs once repair knows no node uses the filesystem
+	registry        []byte          // node registry as startRepair last saw it
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
@@ -465,6 +467,8 @@ func New(dev *storage.Device, opts Options) *Checker {
 		sfbContainers:   make(map[uint64]bool),
 		extentTrees:     make(map[uint32]*extentTree),
 		uncounted:       make(map[uint32]int),
+		uncountedRefs:   make(map[uint64]int),
+		uncountedPast:   make(map[uint32]bool),
 	}
 }
 
