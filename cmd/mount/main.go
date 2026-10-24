@@ -123,7 +123,7 @@ func main() {
 		log.Fatalf("Failed to register node: %v", err)
 	}
 	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
-		log.Fatalf("Node registry slot %d now belongs to node %x; stopping so two nodes never share a journal", slot, owner[:8])
+		log.Fatalf("Node registry slot %d was taken over or marked dead (owner %x); stopping so two nodes never share a journal", slot, owner[:8])
 	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		log.Fatalf("Failed to start node heartbeat: %v", err)
@@ -134,6 +134,11 @@ func main() {
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
+	nodeReg.SetOwnerDeadHandler(func(owner [16]byte) {
+		if _, err := lockMgr.ReclaimOwner(owner); err != nil {
+			log.Printf("Warning: Failed to release the locks of dead node %x: %v", owner[:8], err)
+		}
+	})
 
 	// Create managers with distributed locking enabled
 	// NOTE: Managers must be created BEFORE journal recovery so we can replay transactions

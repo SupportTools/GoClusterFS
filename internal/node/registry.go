@@ -94,6 +94,10 @@ type Registry struct {
 	pidNS      uint64
 	onSlotLost func(slot int, owner [16]byte)
 
+	onOwnerDead func(owner [16]byte)
+	deadOwners  [][16]byte
+	sightings   map[int]sighting
+
 	// Cross-node recovery
 	recoveryHandler      RecoveryHandler
 	failureCheckInterval time.Duration // How often to scan for failed nodes
@@ -142,6 +146,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		stopCh:               make(chan struct{}),
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
+		sightings:            make(map[int]sighting),
 		bootID:               readBootID(),
 		pidNS:                readPIDNamespace(),
 	}
@@ -166,6 +171,34 @@ func (r *Registry) SetSlotLostHandler(fn func(slot int, owner [16]byte)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onSlotLost = fn
+}
+
+// SetOwnerDeadHandler sets what to call with the UUID of a node proven dead
+// whose slot this node took over, for example to release that node's locks.
+// It is called right away for a dead previous incarnation that Register took
+// the slot of.
+func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte)) {
+	r.mu.Lock()
+	r.onOwnerDead = fn
+	pending := r.deadOwners
+	r.deadOwners = nil
+	r.mu.Unlock()
+
+	for _, owner := range pending {
+		fn(owner)
+	}
+}
+
+func (r *Registry) ownerDead(owner [16]byte) {
+	r.mu.Lock()
+	fn := r.onOwnerDead
+	if fn == nil {
+		r.deadOwners = append(r.deadOwners, owner)
+	}
+	r.mu.Unlock()
+	if fn != nil {
+		fn(owner)
+	}
 }
 
 // SetJournalArea makes Register record a journal region in the claimed slot:
@@ -250,6 +283,9 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 			return -1, err
 		}
 		r.localSlot = i
+		if r.deadLocalOwner(slot) {
+			r.deadOwners = append(r.deadOwners, slot.UUID)
+		}
 		return i, nil
 	}
 	return -1, nil
@@ -378,8 +414,9 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 		case <-ticker.C:
 			r.mu.Lock()
 			slot, err := r.readSlot(slotIdx)
-			takenOver := err == nil && slot.UUID != r.localUUID && !lost
-			if err == nil && slot.UUID == r.localUUID {
+			ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
+			takenOver := err == nil && !ours && !lost
+			if ours {
 				slot.HeartbeatSeq = seq
 				slot.HeartbeatTime = time.Now().Unix()
 				r.writeSlot(slotIdx, slot)
@@ -672,12 +709,14 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			r.mu.Unlock()
 			continue
 		}
+		r.observe(i, slot)
 
-		// Stale heartbeats need 2x timeout for consensus
-		if !r.failed(slot, 2*HeartbeatTimeout) {
+		// Stale heartbeats need 2x timeout for consensus, and none this node saw advance lately.
+		if !r.failed(slot, 2*HeartbeatTimeout) || (r.recentlyAlive(i) && !r.deadLocalOwner(slot)) {
 			r.mu.Unlock()
 			continue
 		}
+		dead := r.provenDead(i, slot)
 
 		// Skip if already recovering
 		if r.recoveryInProgress[i] {
@@ -694,6 +733,9 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			delete(r.recoveryInProgress, i)
 			r.mu.Unlock()
 			continue // Another node beat us to it
+		}
+		if dead {
+			r.ownerDead(info.UUID)
 		}
 
 		if err := handler(info); err != nil {
