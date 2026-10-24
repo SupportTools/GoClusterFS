@@ -145,6 +145,7 @@ func main() {
 	// NOTE: Managers must be created BEFORE journal recovery so we can replay transactions
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, lockMgr, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, lockMgr, nodeUUID)
+	inodeTbl.SetAllocationStart(slotIdx, node.MaxNodes)
 	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)

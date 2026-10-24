@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"sync"
 	"syscall"
 
@@ -147,12 +148,26 @@ type Table struct {
 	nodeUUID    [16]byte      // This node's UUID
 	treeFlusher TreeFlusher
 	syncDevice  func() error
+	scanStart   uint64 // FindFreeSlot's first slot, as an offset from InodeFirstUsable
 }
 
 // SetTreeFlusher sets the writer for pending extent-tree changes.
 // It must be set before any inode with an extent tree is modified.
 func (t *Table) SetTreeFlusher(f TreeFlusher) {
 	t.treeFlusher = f
+}
+
+// SetAllocationStart makes FindFreeSlot start at this node's part of the table,
+// so nodes that create files at once rarely race for the same free inode. Node
+// slots map to bit-reversed fractions of the table (slot 0 at 0, 1 at 1/2, 2
+// at 1/4, 3 at 3/4, ...), which keeps the first few nodes far apart.
+func (t *Table) SetAllocationStart(slot, slots int) {
+	if slot < 0 || slots < 2 || slot >= slots {
+		return
+	}
+	width := bits.Len(uint(slots - 1))
+	fraction := bits.Reverse64(uint64(slot)) >> (64 - width)
+	t.scanStart = (t.totalInodes - uint64(InodeFirstUsable)) * fraction >> width
 }
 
 // NewTable creates a new inode table manager.
@@ -299,7 +314,9 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	for num := InodeFirstUsable; uint64(num) < t.totalInodes; num++ {
+	usable := t.totalInodes - uint64(InodeFirstUsable)
+	for i := uint64(0); i < usable; i++ {
+		num := InodeFirstUsable + uint32((t.scanStart+i)%usable)
 		inode, err := t.readInodeUnlocked(num)
 		if err != nil {
 			continue // Skip unreadable inodes
