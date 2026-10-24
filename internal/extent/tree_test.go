@@ -665,3 +665,23 @@ func TestNodeCacheEvictsOldest(t *testing.T) {
 		t.Errorf("cache size %d exceeds max %d", c.size, c.max)
 	}
 }
+
+func TestTruncateSFBDoesNotFreeBitmapBlocks(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	if _, err := env.bm.Alloc(env.ctx, 8); err != nil {
+		t.Fatal(err)
+	}
+	free := env.bm.FreeCount()
+
+	// Container 0, slot 7 packs to physical value 7, which is an allocated bitmap block.
+	ino := env.newInode()
+	sfbExt := Extent{Length: 1}
+	sfbExt.SetSFBLocation(0, 7)
+	env.insert(ino, sfbExt)
+	if err := env.mgr.Truncate(env.ctx, ino, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.bm.FreeCount(); got != free {
+		t.Fatalf("truncating an SFB file changed free blocks from %d to %d", free, got)
+	}
+}
