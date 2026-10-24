@@ -46,8 +46,7 @@ func TestJournalCrashRecoveryFile(t *testing.T) {
 		t.Fatalf("Kill failed: %v", err)
 	}
 
-	// Wait for process to die
-	time.Sleep(500 * time.Millisecond)
+	_ = mfs.MountCmd.Wait()
 
 	// Cleanup stale mount (fusermount -u may fail, that's ok)
 	cleanupStaleFuseMount(mfs.MountPoint)
@@ -107,7 +106,7 @@ func TestJournalCrashRecoveryDirectory(t *testing.T) {
 	if err := mfs.Kill(); err != nil {
 		t.Fatalf("Kill failed: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	_ = mfs.MountCmd.Wait()
 	cleanupStaleFuseMount(mfs.MountPoint)
 
 	t.Log("Remounting after crash...")
@@ -237,7 +236,7 @@ func TestJournalCrashRecoveryMultipleOps(t *testing.T) {
 	if err := mfs.Kill(); err != nil {
 		t.Fatalf("Kill failed: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	_ = mfs.MountCmd.Wait()
 	cleanupStaleFuseMount(mfs.MountPoint)
 
 	// Remount
@@ -312,7 +311,7 @@ func TestJournalCrashDuringWrite(t *testing.T) {
 	if err := mfs.Kill(); err != nil {
 		t.Fatalf("Kill failed: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
+	_ = mfs.MountCmd.Wait()
 	cleanupStaleFuseMount(mfs.MountPoint)
 
 	// Remount
