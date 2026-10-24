@@ -279,8 +279,9 @@ func TestFsckReleasesDeadSlot(t *testing.T) {
 
 	expectFsck(t, 0, "damaged: journal superblock checksum mismatch", "-list-slots", image)
 	expectFsck(t, 16, "-discard-journal needs -release-slot", "-discard-journal", image)
+	expectFsck(t, 16, "no such node registry slot", "-release-slot", "64", image)
 	expectFsck(t, 0, "Nothing was written", "-release-slot", slot, image)
-	expectFsck(t, 0, "Released slot "+slot, "-release-slot", slot, "-discard-journal", image)
+	expectFsck(t, 1, "Released slot "+slot, "-release-slot", slot, "-discard-journal", image)
 
 	restarted := &syncBuffer{}
 	mfs.Log = restarted

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -20,16 +21,15 @@ func TestReleaseSlot(t *testing.T) {
 	var sb *superblock.Superblock
 	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
 	ctx := context.Background()
-	checker := func() *fsck.Checker { return fsck.New(dev, fsck.Options{Output: &bytes.Buffer{}}) }
 	refused := func(slot int, reason string) {
 		t.Helper()
-		if _, err := checker().PlanRelease(slot); err == nil || !strings.Contains(err.Error(), reason) {
+		if _, err := newChecker(dev).PlanRelease(slot, false); err == nil || !strings.Contains(err.Error(), reason) {
 			t.Fatalf("PlanRelease(%d) error = %v, want one containing %q", slot, err, reason)
 		}
 	}
 
 	gone := node.NewRegistry(dev, sb.NodeRegistryOffset)
-	goneSlot, err := gone.Register(ctx, "gone")
+	slot, err := gone.Register(ctx, "gone")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,30 +44,26 @@ func TestReleaseSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	gone.Stop()
-	refused(goneSlot, "mounted by node 1 (live)")
+	refused(slot, "mounted by node 1 (live)")
 	if err := live.Unregister(ctx); err != nil {
 		t.Fatal(err)
 	}
-	refused(goneSlot, "node 0 (gone) may still be alive")
+	refused(slot, "node 0 (gone) may still be alive")
+	setHeartbeat(t, dev, sb, slot, time.Now().Add(-30*time.Second))
+	refused(slot, "may still be alive")
 
-	editSlot(t, dev, sb, goneSlot, func(slot []byte) {
-		binary.LittleEndian.PutUint32(slot[4:8], uint32(node.NodeStateDead))
-		binary.LittleEndian.PutUint64(slot[172:180], uint64(time.Now().Unix()))
+	editSlot(t, dev, sb, slot, func(s []byte) {
+		binary.LittleEndian.PutUint32(s[4:8], uint32(node.NodeStateDead))
+		binary.LittleEndian.PutUint64(s[172:180], uint64(time.Now().Unix()))
 	})
-	refused(goneSlot, "may still be alive")
-
-	editSlot(t, dev, sb, goneSlot, func(slot []byte) {
-		binary.LittleEndian.PutUint64(slot[172:180], uint64(time.Now().Add(-time.Hour).Unix()))
+	refused(slot, "may still be alive")
+	editSlot(t, dev, sb, slot, func(s []byte) {
+		binary.LittleEndian.PutUint64(s[172:180], uint64(time.Now().Add(-time.Hour).Unix()))
 	})
-	journalAt := int64(sb.JournalRegionOffset + uint64(goneSlot)*sb.JournalSlotSize())
-	header := journal.NewJournalSuperblock([16]byte{1}, 1, 1<<20)
-	header.State = journal.JournalStateDirty
-	damaged := header.Serialize()
-	damaged[100] ^= 0xFF
-	writeSector(t, dev, journalAt, damaged)
+	journalAt := damageJournal(t, dev, sb, slot)
 
-	c := checker()
-	plan, err := c.PlanRelease(goneSlot)
+	c := newChecker(dev)
+	plan, err := c.PlanRelease(slot, false)
 	if err != nil {
 		t.Fatalf("PlanRelease of an expired slot with a damaged journal: %v", err)
 	}
@@ -78,69 +74,171 @@ func TestReleaseSlot(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 
-	slots, err := checker().Slots()
+	slots, err := newChecker(dev).Slots()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s := slots[goneSlot]; s.InUse() || !s.JournalFresh {
-		t.Errorf("after release slot %d is in use=%v with journal %q", goneSlot, s.InUse(), s.Journal)
+	if s := slots[slot]; s.InUse() || !s.JournalFresh {
+		t.Errorf("after release slot %d is in use=%v with journal %q", slot, s.InUse(), s.Journal)
 	}
 	replacement := node.NewRegistry(dev, sb.NodeRegistryOffset)
-	if got, err := replacement.Register(ctx, "replacement"); err != nil || got != goneSlot {
-		t.Fatalf("a new node registered in slot %d (%v), want released slot %d", got, err, goneSlot)
+	if got, err := replacement.Register(ctx, "replacement"); err != nil || got != slot {
+		t.Fatalf("a new node registered in slot %d (%v), want released slot %d", got, err, slot)
 	}
 	if result, err := journal.ScanAndRecover(dev, uint64(journalAt), sb.JournalSlotSize(), nil); result != nil || err != nil {
 		t.Errorf("mount recovery of the released journal = %+v, %v; want nothing to recover", result, err)
 	}
 }
 
-// A node that registers between the plan and the release stops the release
-// before it writes anything.
-func TestReleaseSlotStopsWhenRegistryChanges(t *testing.T) {
+func TestReleaseSlotRefusals(t *testing.T) {
+	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
+	slot := goneNode(t, dev, sb)
+
+	if _, err := newChecker(dev).PlanRelease(node.MaxNodes, false); !errors.Is(err, fsck.ErrNoSuchSlot) {
+		t.Errorf("PlanRelease of slot %d: %v, want %v", node.MaxNodes, err, fsck.ErrNoSuchSlot)
+	}
+
+	j, err := journal.Init(dev, sb.JournalRegionOffset+uint64(slot)*sb.JournalSlotSize(), sb.JournalSlotSize(),
+		[16]byte{1}, 1, journal.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := j.Begin()
+	if err := txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Commit(txn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newChecker(dev).PlanRelease(slot, false); err == nil || !strings.Contains(err.Error(), "mount a node to replay it") {
+		t.Errorf("PlanRelease of a replayable journal: %v", err)
+	}
+	if plan, err := newChecker(dev).PlanRelease(slot, true); err != nil || plan.Discards != "1 committed transaction that was never replayed" {
+		t.Errorf("PlanRelease with force: plan %+v, error %v", plan, err)
+	}
+
+	slotAt := int64(sb.NodeRegistryOffset) + int64(slot)*node.SlotSize
+	corrupt := readSector(t, dev, slotAt)
+	corrupt[100] ^= 0xFF
+	writeSector(t, dev, slotAt, corrupt)
+	if _, err := newChecker(dev).PlanRelease(slot, true); err == nil || !strings.Contains(err.Error(), "unreadable") {
+		t.Errorf("PlanRelease of an unreadable slot: %v", err)
+	}
+
+	writeSector(t, dev, 0, []byte("not a superblock"))
+	if _, err := newChecker(dev).PlanRelease(slot, true); err == nil || !strings.Contains(err.Error(), "mount would reject the superblock") {
+		t.Errorf("PlanRelease with a bad superblock: %v", err)
+	}
+}
+
+// A node that takes the slot between the registry check and the lease stops
+// the release before the journal is touched. Once fsck holds the lease, a
+// mounting node takes another slot.
+func TestReleaseSlotLease(t *testing.T) {
 	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
 	var sb *superblock.Superblock
 	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
 	ctx := context.Background()
+	release := func(slot int) error {
+		t.Helper()
+		c := newChecker(dev)
+		plan, err := c.PlanRelease(slot, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.Release(plan)
+	}
 
-	gone := node.NewRegistry(dev, sb.NodeRegistryOffset)
-	goneSlot, err := gone.Register(ctx, "gone")
+	slot := goneNode(t, dev, sb)
+	journalAt := damageJournal(t, dev, sb, slot)
+	damaged := readSector(t, dev, journalAt)
+	var late *node.Registry
+	t.Cleanup(fsck.SetReleaseHooks(func() {
+		late = node.NewRegistry(dev, sb.NodeRegistryOffset)
+		if got, err := late.Register(ctx, "late"); err != nil || got != slot {
+			t.Errorf("late node took slot %d (%v), want the stale slot %d", got, err, slot)
+		}
+	}, nil))
+	if err := release(slot); err == nil || !strings.Contains(err.Error(), "its journal was not touched") {
+		t.Fatalf("Release after a node took the slot: %v", err)
+	}
+	if !bytes.Equal(readSector(t, dev, journalAt), damaged) {
+		t.Error("Release reset the journal of a slot another node took")
+	}
+	if err := late.Unregister(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	slot = goneNode(t, dev, sb)
+	damageJournal(t, dev, sb, slot)
+	t.Cleanup(fsck.SetReleaseHooks(nil, func() {
+		if got, err := node.NewRegistry(dev, sb.NodeRegistryOffset).Register(ctx, "during"); err != nil || got == slot {
+			t.Errorf("node mounting during the release took slot %d (%v)", got, err)
+		}
+	}))
+	if err := release(slot); err != nil {
+		t.Fatalf("Release while a node mounts: %v", err)
+	}
+
+	slot = goneNode(t, dev, sb)
+	damageJournal(t, dev, sb, slot)
+	t.Cleanup(fsck.SetReleaseHooks(nil, func() {
+		setHeartbeat(t, dev, sb, slot, time.Now())
+	}))
+	if err := release(slot); err == nil || !strings.Contains(err.Error(), "its journal is reset but the slot is not free") {
+		t.Fatalf("Release of a slot written during the lease: %v", err)
+	}
+}
+
+func newChecker(dev *storage.Device) *fsck.Checker {
+	return fsck.New(dev, fsck.Options{Output: &bytes.Buffer{}})
+}
+
+// goneNode registers a node that stopped an hour ago and returns its slot.
+func goneNode(t *testing.T, dev *storage.Device, sb *superblock.Superblock) int {
+	t.Helper()
+	slot, err := node.NewRegistry(dev, sb.NodeRegistryOffset).Register(context.Background(), "gone")
 	if err != nil {
 		t.Fatal(err)
 	}
-	editSlot(t, dev, sb, goneSlot, func(slot []byte) {
-		binary.LittleEndian.PutUint64(slot[32:40], uint64(time.Now().Add(-time.Hour).Unix()))
-	})
-	journalAt := int64(sb.JournalRegionOffset + uint64(goneSlot)*sb.JournalSlotSize())
-	writeSector(t, dev, journalAt, []byte("not a journal"))
+	setHeartbeat(t, dev, sb, slot, time.Now().Add(-time.Hour))
+	return slot
+}
 
-	c := fsck.New(dev, fsck.Options{Output: &bytes.Buffer{}})
-	plan, err := c.PlanRelease(goneSlot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := node.NewRegistry(dev, sb.NodeRegistryOffset).Register(ctx, "late"); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Release(plan); err == nil || !strings.Contains(err.Error(), "changed since fsck checked it") {
-		t.Fatalf("Release after a node registered: %v", err)
-	}
-	header := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
-	if _, err := dev.ReadAt(header, journalAt); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.HasPrefix(header, []byte("not a journal")) {
-		t.Error("Release reset the journal although it stopped")
-	}
+// damageJournal writes a dirty journal header with a bad checksum into slot's
+// journal and returns the journal's offset.
+func damageJournal(t *testing.T, dev *storage.Device, sb *superblock.Superblock, slot int) int64 {
+	t.Helper()
+	at := int64(sb.JournalRegionOffset + uint64(slot)*sb.JournalSlotSize())
+	header := journal.NewJournalSuperblock([16]byte{1}, 1, 1<<20)
+	header.State = journal.JournalStateDirty
+	damaged := header.Serialize()
+	damaged[100] ^= 0xFF
+	writeSector(t, dev, at, damaged)
+	return at
+}
+
+func setHeartbeat(t *testing.T, dev *storage.Device, sb *superblock.Superblock, slot int, at time.Time) {
+	t.Helper()
+	editSlot(t, dev, sb, slot, func(s []byte) { binary.LittleEndian.PutUint64(s[32:40], uint64(at.Unix())) })
 }
 
 func editSlot(t *testing.T, dev *storage.Device, sb *superblock.Superblock, slot int, edit func(slot []byte)) {
 	t.Helper()
 	off := int64(sb.NodeRegistryOffset) + int64(slot)*node.SlotSize
-	buf := storage.NewAlignedBuffer(node.SlotSize).Bytes()
-	if _, err := dev.ReadAt(buf, off); err != nil {
-		t.Fatal(err)
-	}
+	buf := readSector(t, dev, off)
 	edit(buf)
 	binary.LittleEndian.PutUint32(buf[node.SlotSize-4:], storage.CRC32C(buf[:node.SlotSize-4]))
 	writeSector(t, dev, off, buf)
+}
+
+func readSector(t *testing.T, dev *storage.Device, offset int64) []byte {
+	t.Helper()
+	buf := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
+	if _, err := dev.ReadAt(buf, offset); err != nil {
+		t.Fatal(err)
+	}
+	return buf
 }

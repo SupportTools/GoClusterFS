@@ -668,12 +668,12 @@ func serializeSlot(slot *Slot) []byte {
 	return buf
 }
 
-// deserializeSlot parses a Slot from bytes.
 // ParseSlot decodes one raw registry slot.
 func ParseSlot(buf []byte) (*Slot, error) {
 	return deserializeSlot(buf)
 }
 
+// deserializeSlot parses a Slot from bytes.
 func deserializeSlot(buf []byte) (*Slot, error) {
 	if len(buf) < SlotSize {
 		return nil, ErrInvalidSlot
@@ -895,16 +895,44 @@ func (r *Registry) clearFailedSlot(slotIdx int, uuid [16]byte) error {
 	return err
 }
 
-// ReleaseSlot empties slot slotIdx if it still holds expected, the raw slot
-// bytes the caller checked, and reports whether it did. Only fsck calls it,
-// for a slot whose node will not return.
-func (r *Registry) ReleaseSlot(slotIdx int, expected []byte) (bool, error) {
+// ReleaseSlot frees slot slotIdx, whose node will not return, if the slot
+// still holds expected, the raw bytes the caller checked. Like a peer that
+// replays a crashed node's journal, it first takes the slot's recovery lease,
+// so neither Register nor failure detection touches the slot while reset
+// clears its journal; then it empties the slot. It returns false without
+// running reset if the slot changed or another node won the lease.
+func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error) (bool, error) {
 	if slotIdx < 0 || slotIdx >= MaxNodes {
 		return false, fmt.Errorf("slot index out of range: %d", slotIdx)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.casSlot(slotIdx, expected, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
+
+	slot, err := deserializeSlot(expected)
+	if err != nil {
+		return false, err
+	}
+	slot.Magic = SlotMagic
+	slot.State = NodeStateDead
+	slot.RecoveryOwner = r.localUUID
+	slot.RecoveryStart = time.Now().Unix()
+	leased := serializeSlot(slot)
+	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
+		return false, err
+	}
+	time.Sleep(claimSettle)
+	if current, _, err := r.readSlotRaw(slotIdx); err != nil || !bytes.Equal(current, leased) {
+		return false, err
+	}
+
+	if err := reset(); err != nil {
+		return false, err
+	}
+	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
+	if err == nil && !ok {
+		err = fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
+	}
+	return ok, err
 }
 
 // GetFailedNodes returns information about nodes that have failed (stale heartbeat).

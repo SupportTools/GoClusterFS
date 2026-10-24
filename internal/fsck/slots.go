@@ -9,11 +9,19 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // ReleaseMargin is how long a slot's lease must have been over before fsck
 // releases the slot, so a node that is only slow, or whose clock lags, keeps it.
 const ReleaseMargin = time.Minute
+
+// ErrNoSuchSlot means a release named a slot the registry does not have.
+var ErrNoSuchSlot = errors.New("no such node registry slot")
+
+// Test hooks: beforeReleaseWrites runs after Release checks the registry, and
+// whileReleaseHoldsLease runs once Release holds the slot's recovery lease.
+var beforeReleaseWrites, whileReleaseHoldsLease func()
 
 // SlotStatus describes a node registry slot and its journal.
 type SlotStatus struct {
@@ -71,15 +79,20 @@ type ReleasePlan struct {
 	Discards string // what resetting the slot's journal throws away
 }
 
-// PlanRelease checks that slot i can be released: no node runs, the slot is
-// readable, and its lease ended ReleaseMargin ago. It writes nothing.
-func (c *Checker) PlanRelease(i int) (*ReleasePlan, error) {
+// PlanRelease checks that slot i can be released: mount would accept the
+// superblock, no node runs, the slot is readable, its lease ended
+// ReleaseMargin ago, and, unless force is set, a mount could not replay its
+// journal instead. It writes nothing.
+func (c *Checker) PlanRelease(i int, force bool) (*ReleasePlan, error) {
+	if _, err := superblock.Read(c.dev); err != nil {
+		return nil, fmt.Errorf("release refused: mount would reject the superblock (%v); run fsck first", err)
+	}
 	slots, err := c.Slots()
 	if err != nil {
 		return nil, err
 	}
 	if i < 0 || i >= len(slots) {
-		return nil, fmt.Errorf("slot %d does not exist; slots are 0 to %d", i, len(slots)-1)
+		return nil, fmt.Errorf("%w: slot %d; slots are 0 to %d", ErrNoSuchSlot, i, len(slots)-1)
 	}
 	for _, s := range slots {
 		if s.Running {
@@ -94,12 +107,17 @@ func (c *Checker) PlanRelease(i int) (*ReleasePlan, error) {
 		return nil, fmt.Errorf("release refused: %s may still be alive; run again after %s",
 			s.Name(), after.Format(time.DateTime))
 	}
-	return &ReleasePlan{Slot: s, Discards: discards(c.slotJournal(i))}, nil
+	discards, replayable := journalContents(c.slotJournal(i))
+	if replayable && !force {
+		return nil, fmt.Errorf("release refused: slot %d's journal holds %s, which a mount can replay; "+
+			"mount a node to replay it, or add -force to discard it", i, discards)
+	}
+	return &ReleasePlan{Slot: s, Discards: discards}, nil
 }
 
-// Release resets the plan's journal and empties its registry slot, so a node
-// can register there with a new journal. It stops if any registry slot
-// changed since PlanRelease watched the registry.
+// Release takes the plan's slot under a recovery lease, resets its journal
+// and empties the slot, so a node can register there with a new journal. It
+// writes nothing if any registry slot changed since PlanRelease watched it.
 func (c *Checker) Release(plan *ReleasePlan) error {
 	i := plan.Slot.Index
 	now, err := c.readRegistry()
@@ -107,22 +125,32 @@ func (c *Checker) Release(plan *ReleasePlan) error {
 		return fmt.Errorf("read the node registry: %w", err)
 	}
 	if changed := changedSlots(c.registry, now); len(changed) > 0 {
-		return fmt.Errorf("release stopped: node registry slot %d changed since fsck checked it; run again", changed[0])
+		return fmt.Errorf("release stopped: node registry slot %d changed since fsck checked it; nothing was written", changed[0])
+	}
+	if beforeReleaseWrites != nil {
+		beforeReleaseWrites()
 	}
 
-	offset, _ := c.journalArea(i)
-	if _, err := c.dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), int64(offset)); err != nil {
-		return fmt.Errorf("reset the journal of slot %d: %w", i, err)
+	reset := false
+	resetJournal := func() error {
+		if whileReleaseHoldsLease != nil {
+			whileReleaseHoldsLease()
+		}
+		offset, _ := c.journalArea(i)
+		if _, err := c.dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), int64(offset)); err != nil {
+			return fmt.Errorf("reset the journal: %w", err)
+		}
+		reset = true
+		return c.dev.Sync()
 	}
-	if err := c.dev.Sync(); err != nil {
-		return fmt.Errorf("sync: %w", err)
-	}
-	released, err := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).ReleaseSlot(i, plan.Slot.raw)
-	if err != nil {
+	released, err := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).ReleaseSlot(i, plan.Slot.raw, resetJournal)
+	switch {
+	case err != nil && reset:
+		return fmt.Errorf("release slot %d: %w; its journal is reset but the slot is not free, run again", i, err)
+	case err != nil:
 		return fmt.Errorf("release slot %d: %w", i, err)
-	}
-	if !released {
-		return fmt.Errorf("slot %d changed while fsck released it: its journal is reset but the slot is not; run again", i)
+	case !released:
+		return fmt.Errorf("release stopped: another node took slot %d since fsck checked it; its journal was not touched", i)
 	}
 	return c.dev.Sync()
 }
@@ -150,24 +178,29 @@ func journalState(region *journal.Region, err error) string {
 	return strings.ToLower(region.State().String())
 }
 
-// discards says what resetting a journal throws away.
-func discards(region *journal.Region, err error) string {
+// journalContents says what resetting a journal throws away, and whether a
+// mount could replay all of it instead.
+func journalContents(region *journal.Region, err error) (discards string, replayable bool) {
 	switch {
 	case errors.Is(err, journal.ErrJournalUninitialized):
-		return "nothing: the journal was never initialized"
+		return "nothing: the journal was never initialized", false
 	case err != nil:
-		return "the whole journal, unread: " + rootCause(err).Error()
+		return "the whole journal, unread: " + rootCause(err).Error(), false
 	case region.State() == journal.JournalStateClean:
-		return "nothing: the journal is clean"
+		return "nothing: the journal is clean", false
 	case !region.NeedsRecovery():
-		return "the whole journal, unread: its state is " + strings.ToLower(region.State().String())
+		return "the whole journal, unread: its state is " + strings.ToLower(region.State().String()), false
 	}
-	txns, _, err := journal.DryRunRecover(region)
-	what := fmt.Sprintf("%d committed transactions that were never replayed", len(txns))
+	_, stats, err := journal.DryRunRecover(region)
+	pending := stats.TxnCommitted - stats.IntentsSkipped
+	discards = fmt.Sprintf("%d committed transactions that were never replayed", pending)
+	if pending == 1 {
+		discards = "1 committed transaction that was never replayed"
+	}
 	if err != nil {
-		what += fmt.Sprintf(", and whatever follows a record fsck cannot read (%v)", err)
+		return discards + fmt.Sprintf(", and whatever follows a record fsck cannot read (%v)", err), false
 	}
-	return what
+	return discards, pending > 0
 }
 
 func rootCause(err error) error {

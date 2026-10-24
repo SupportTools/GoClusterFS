@@ -13,16 +13,18 @@ import (
 
 const slotsHelp = `
 Node registry slots:
-  Every mounted node holds a registry slot with its own journal. A crashed
-  node's slot frees once another node replays its journal, or when the same
-  host mounts again. -list-slots shows each slot that is in use or whose
-  journal needs attention.
+  Every mounted node holds a registry slot with its own journal. When a node
+  crashes, a peer replays its journal and frees the slot, or a mount on any
+  host takes the slot and replays the journal first. A slot whose journal
+  cannot be replayed, for example because its header is damaged, stays
+  taken. -list-slots shows each slot that is in use or whose journal needs
+  attention.
 
-  -release-slot N frees the slot of a node that will not return, for example
-  one whose journal header is damaged. It refuses while any node has the
-  filesystem mounted, or until a minute after the slot's lease ended, and
-  prints what releasing would discard. Add -discard-journal to reset the
-  slot's journal and free the slot.
+  -release-slot N checks that slot N can be freed and prints what freeing it
+  would discard. It refuses while any node has the filesystem mounted, until
+  a minute after the slot's lease ended, and, without -force, while a mount
+  could still replay the journal. Add -discard-journal to reset the slot's
+  journal and free the slot; fsck then exits 1.
 `
 
 // printSlots lists the slots that are in use or whose journal was written
@@ -57,8 +59,8 @@ func printSlots(out io.Writer, checker *fsck.Checker) error {
 
 // releaseSlot checks slot i and prints what releasing it discards. With
 // discard set it also releases the slot.
-func releaseSlot(out io.Writer, checker *fsck.Checker, i int, discard bool) error {
-	plan, err := checker.PlanRelease(i)
+func releaseSlot(out io.Writer, checker *fsck.Checker, i int, discard, force bool) error {
+	plan, err := checker.PlanRelease(i, force)
 	if err != nil {
 		return err
 	}

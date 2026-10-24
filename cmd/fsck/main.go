@@ -21,13 +21,14 @@
 // Exit codes, bits as with fsck(8):
 //
 //	0: No errors (warnings may remain)
-//	1: Errors were repaired
+//	1: Errors were repaired, or -release-slot -discard-journal freed a slot
 //	4: Errors remain on disk
 //	8: I/O failure, or the check could not finish or was refused
 //	16: Usage error
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -41,7 +42,7 @@ func main() {
 	var (
 		repair       = flag.Bool("repair", false, "Repair problems automatically where possible (see Repair below)")
 		dryRun       = flag.Bool("dry-run", false, "With -repair, report what would change without writing")
-		force        = flag.Bool("force", false, "Keep checking after a fatal error; with -repair, repair even if a stopped node's journal still needs replay")
+		force        = flag.Bool("force", false, "Keep checking after a fatal error; with -repair, repair even if a stopped node's journal still needs replay; with -release-slot, discard a journal a mount could replay")
 		verbose      = flag.Bool("verbose", false, "Enable verbose progress output")
 		quiet        = flag.Bool("quiet", false, "Only print errors and summary")
 		stopOnFatal  = flag.Bool("stop-on-fatal", true, "Stop checking when a fatal error is found")
@@ -71,7 +72,7 @@ func main() {
 		fmt.Fprint(os.Stderr, slotsHelp)
 		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
 		fmt.Fprintf(os.Stderr, "  0: No errors (warnings may remain)\n")
-		fmt.Fprintf(os.Stderr, "  1: Errors were repaired\n")
+		fmt.Fprintf(os.Stderr, "  1: Errors were repaired, or -release-slot -discard-journal freed a slot\n")
 		fmt.Fprintf(os.Stderr, "  4: Errors remain on disk\n")
 		fmt.Fprintf(os.Stderr, "  8: I/O failure, or the check could not finish or was refused\n")
 		fmt.Fprintf(os.Stderr, "  16: Usage error\n")
@@ -138,11 +139,17 @@ func main() {
 		if *listSlots {
 			err = printSlots(os.Stdout, checker)
 		} else {
-			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *discardJournal)
+			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *discardJournal, *force)
 		}
-		if err != nil {
+		switch {
+		case errors.Is(err, fsck.ErrNoSuchSlot):
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(fsck.ExitUsage)
+		case err != nil:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(fsck.ExitOperational)
+		case *discardJournal:
+			os.Exit(fsck.ExitCorrected)
 		}
 		os.Exit(fsck.ExitClean)
 	}
