@@ -308,6 +308,52 @@ func TestMultiNodeCrashRecovery(t *testing.T) {
 	t.Log("Crash recovery test completed - filesystem remains functional after crash")
 }
 
+// TestMultiNodeCreateWithSignals creates files on two nodes while the test
+// process keeps signalling itself, as the Go runtime does for preemption. Each
+// signal interrupts the FUSE request in flight; no create or write may fail.
+func TestMultiNodeCreateWithSignals(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 200)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+
+	stop := make(chan struct{})
+	signalled := make(chan struct{})
+	go func() {
+		defer close(signalled)
+		tick := time.NewTicker(200 * time.Microsecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				_ = syscall.Kill(os.Getpid(), syscall.SIGURG)
+			}
+		}
+	}()
+
+	const perNode = 60
+	errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+		for i := 0; i < perNode; i++ {
+			if err := node.WriteFile(fmt.Sprintf("sig-%d-%02d", idx, i), []byte("x")); err != nil {
+				return fmt.Errorf("file %d: %w", i, err)
+			}
+		}
+		return nil
+	})
+	close(stop)
+	<-signalled
+	for idx, err := range errs {
+		if err != nil {
+			t.Errorf("Node %d: %v", idx, err)
+		}
+	}
+}
+
 // TestMultiNodeConcurrentDirectoryOps tests multiple nodes performing directory operations
 // concurrently. Both nodes create files in the root directory and verify all files appear.
 func TestMultiNodeConcurrentDirectoryOps(t *testing.T) {
