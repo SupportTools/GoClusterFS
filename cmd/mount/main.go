@@ -274,8 +274,12 @@ func main() {
 	}
 
 	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write.
-	refcountReg := refcount.NewRegion(dev, refcountOffset, totalBlocks, lockMgr)
+	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
 	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
+	if covered := refcount.BlocksForSize(sb.RefCountTableSize); totalBlocks > covered {
+		log.Printf("[WARN] Refcount: region covers blocks 0-%d of %d; snapshots and clones of files with data in higher blocks fail",
+			covered-1, totalBlocks)
+	}
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)

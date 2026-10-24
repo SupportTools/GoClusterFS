@@ -519,6 +519,13 @@ scenarios:
     environments:
       go: internal/lock/reclaim_test.go::TestAdoptOwnerHoldsDeadNodesLocksUntilReleased
 
+  - id: refcount-blocks-past-region
+    name: Refcounts never write past their region
+    description: On a 200 GiB volume, changes to blocks the 1 MB refcount region has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the snapshot registry after the region is unchanged
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheSnapshotRegistryAlone
+
   - id: registry-slot-journal-region
     name: Registry records each slot's journal region
     description: Register stores a distinct journal region in each slot

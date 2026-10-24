@@ -71,7 +71,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
-	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, locks)
+	refs := refcount.NewRegion(dev, snapFSRefcountOffset, refcount.SizeForBlocks(snapFSDataBlocks), snapFSDataBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, snapFSDataOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, snapFSDataOffset)
 	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, locks, slot); err != nil {

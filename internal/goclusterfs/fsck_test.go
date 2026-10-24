@@ -71,7 +71,7 @@ func openFormattedFS(t *testing.T, path string) *FS {
 	inodeTbl := inode.NewTable(dev, sb.InodeTableOffset, sb.InodeCount*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
-	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.TotalBlocks, locks)
+	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
 	if err := fsys.InitSnapshots(ctx, sb.SnapshotRegOffset, sb.SnapshotRegSize, locks, slot); err != nil {

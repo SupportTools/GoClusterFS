@@ -82,7 +82,7 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 	tbl := inode.NewTable(dev, fuzzInodes, 4096*inode.InodeSize, nil, uuid)
 	mgr := extent.NewManager(dev, bm, nil, fuzzDataOffset)
 	tbl.SetTreeFlusher(mgr)
-	refs := refcount.NewRegion(dev, fuzzRefcounts, fuzzBlocks, nil)
+	refs := refcount.NewRegion(dev, fuzzRefcounts, refcount.SizeForBlocks(fuzzBlocks), fuzzBlocks, nil)
 	mgr.SetRefcounts(refs)
 	dirs := dir.NewManager(dev, tbl, mgr, nil, fuzzDataOffset)
 

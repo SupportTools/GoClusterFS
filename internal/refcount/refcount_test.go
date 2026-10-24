@@ -1,12 +1,16 @@
 package refcount
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // createTestDevice creates a test file for O_DIRECT testing.
@@ -157,7 +161,7 @@ func TestNewRegion(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20) // 10MB
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 
 	if region == nil {
 		t.Fatal("NewRegion returned nil")
@@ -172,7 +176,7 @@ func TestGetEntry(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Get entry from uninitialized region - should be zero
@@ -193,7 +197,7 @@ func TestGetOutOfRange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	_, err := region.Get(ctx, 100)
@@ -211,7 +215,7 @@ func TestIncrement(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Increment from 0
@@ -246,7 +250,7 @@ func TestIncrementOverflow(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set to max value
@@ -266,7 +270,7 @@ func TestIncrementOutOfRange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	_, err := region.Increment(ctx, 100)
@@ -279,7 +283,7 @@ func TestDecrement(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set initial count to 5
@@ -311,7 +315,7 @@ func TestDecrementUnderflow(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Try to decrement from 0 - should underflow
@@ -325,7 +329,7 @@ func TestDecrementOutOfRange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	_, err := region.Decrement(ctx, 100)
@@ -338,7 +342,7 @@ func TestSet(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set count and flags
@@ -364,7 +368,7 @@ func TestSetOutOfRange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	err := region.Set(ctx, 100, 1, FlagNone)
@@ -377,7 +381,7 @@ func TestSetFlags(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set initial count
@@ -409,7 +413,7 @@ func TestSetFlagsOutOfRange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	err := region.SetFlags(ctx, 100, FlagSnapshot)
@@ -422,7 +426,7 @@ func TestIncrementBatch(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Increment batch
@@ -461,7 +465,7 @@ func TestIncrementBatchEmpty(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	counts, err := region.IncrementBatch(ctx, nil)
@@ -485,7 +489,7 @@ func TestIncrementBatchOutOfRange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	_, err := region.IncrementBatch(ctx, []uint64{50, 100})
@@ -498,7 +502,7 @@ func TestIncrementBatchOverflow(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set one block to max
@@ -518,7 +522,7 @@ func TestDecrementBatch(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set initial counts
@@ -552,7 +556,7 @@ func TestDecrementBatchUnderflow(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set block 0 to 1, leave block 5 at 0
@@ -572,7 +576,7 @@ func TestShareAndRelease(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 	blocks := []uint64{3, 700}
 	count := func(block uint64) uint32 {
@@ -627,7 +631,7 @@ func TestScan(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 100, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(100), 100, nil)
 	ctx := context.Background()
 
 	// Set up mixed refcounts:
@@ -682,7 +686,7 @@ func TestInitialize(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// First set some values
@@ -763,7 +767,7 @@ func TestPersistence(t *testing.T) {
 		}
 		defer func() { _ = dev.Close() }()
 
-		region := NewRegion(dev, 0, 1000, nil)
+		region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 		ctx := context.Background()
 
 		// Set various refcounts and flags
@@ -788,7 +792,7 @@ func TestPersistence(t *testing.T) {
 	}
 	defer func() { _ = dev.Close() }()
 
-	region := NewRegion(dev, 0, 1000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	tests := []struct {
@@ -822,7 +826,7 @@ func TestMultipleSectors(t *testing.T) {
 
 	// Create region spanning multiple sectors
 	totalBlocks := uint64(EntriesPerSector*3 + 100) // 3 full sectors + partial
-	region := NewRegion(dev, 0, totalBlocks, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(totalBlocks), totalBlocks, nil)
 	ctx := context.Background()
 
 	// Set entries in different sectors
@@ -892,7 +896,7 @@ func TestBatchAcrossSectors(t *testing.T) {
 	defer cleanup()
 
 	totalBlocks := uint64(EntriesPerSector * 3)
-	region := NewRegion(dev, 0, totalBlocks, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(totalBlocks), totalBlocks, nil)
 	ctx := context.Background()
 
 	// Batch increment blocks from different sectors
@@ -933,7 +937,7 @@ func TestRegionOffset(t *testing.T) {
 
 	// Test region at a non-zero offset
 	offset := uint64(50 * SectorSize) // 50 sectors into device
-	region := NewRegion(dev, offset, 1000, nil)
+	region := NewRegion(dev, offset, SizeForBlocks(1000), 1000, nil)
 	ctx := context.Background()
 
 	// Set some values
@@ -952,13 +956,75 @@ func TestRegionOffset(t *testing.T) {
 	}
 }
 
+// A 200 GiB volume has 204537 blocks, but its 1 MB refcount region holds entries
+// for 130816. The sectors of the other blocks would fall in the snapshot registry.
+func TestBlocksPastRegionLeaveTheSnapshotRegistryAlone(t *testing.T) {
+	ctx := context.Background()
+	dev, cleanup := createTestDevice(t, 200<<30)
+	defer cleanup()
+	sb, err := superblock.Format(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := BlocksForSize(sb.RefCountTableSize)
+	last := sb.TotalBlocks - 1
+	if last < first {
+		t.Fatalf("all %d blocks fit the %d-byte refcount region", sb.TotalBlocks, sb.RefCountTableSize)
+	}
+
+	// The registry's first sector holds a descriptor sector: data and a CRC32C, like a refcount sector.
+	registry := storage.NewAlignedBuffer(int(sb.SnapshotRegSize))
+	for i := range SectorSize - ChecksumSize {
+		registry.Bytes()[i] = byte(i%251 + 1)
+	}
+	binary.LittleEndian.PutUint32(registry.Bytes()[SectorSize-ChecksumSize:], storage.CRC32C(registry.Bytes()[:SectorSize-ChecksumSize]))
+	if _, err := dev.WriteAt(registry.Bytes(), int64(sb.SnapshotRegOffset)); err != nil {
+		t.Fatal(err)
+	}
+
+	region := NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, nil)
+
+	if _, err := region.Increment(ctx, first); !errors.Is(err, ErrBlockPastRegion) {
+		t.Errorf("Increment(%d) = %v, want ErrBlockPastRegion", first, err)
+	}
+	if err := region.Share(ctx, []uint64{first - 1, last}); !errors.Is(err, ErrBlockPastRegion) {
+		t.Errorf("Share(%d, %d) = %v, want ErrBlockPastRegion", first-1, last, err)
+	}
+	if err := region.Set(ctx, last, 2, 0); !errors.Is(err, ErrBlockPastRegion) {
+		t.Errorf("Set(%d) = %v, want ErrBlockPastRegion", last, err)
+	}
+	if err := region.SetFlags(ctx, first, FlagSnapshot); !errors.Is(err, ErrBlockPastRegion) {
+		t.Errorf("SetFlags(%d) = %v, want ErrBlockPastRegion", first, err)
+	}
+	if entry, err := region.Get(ctx, first); err != nil || entry != (Entry{}) {
+		t.Errorf("Get(%d) = %+v, %v, want a single owner", first, entry, err)
+	}
+	if free, err := region.Release(ctx, []uint64{first, last}); err != nil || len(free) != 2 {
+		t.Errorf("Release(%d, %d) = %v, %v, want both free", first, last, free, err)
+	}
+	if entry, _ := region.Get(ctx, first-1); entry.RefCount != 0 {
+		t.Errorf("failed Share left block %d with count %d", first-1, entry.RefCount)
+	}
+	if stats, err := region.Scan(ctx); err != nil || stats.FreeBlocks != sb.TotalBlocks {
+		t.Errorf("Scan = %+v, %v, want all %d blocks free", stats, err, sb.TotalBlocks)
+	}
+
+	after := storage.NewAlignedBuffer(int(sb.SnapshotRegSize))
+	if _, err := dev.ReadAt(after.Bytes(), int64(sb.SnapshotRegOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after.Bytes(), registry.Bytes()) {
+		t.Error("refcount updates for blocks past the region changed the snapshot registry")
+	}
+}
+
 // Benchmarks
 
 func BenchmarkGet(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 10<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 10000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(10000), 10000, nil)
 	ctx := context.Background()
 
 	b.ResetTimer()
@@ -973,7 +1039,7 @@ func BenchmarkIncrement(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 100<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, uint64(b.N+1), nil)
+	region := NewRegion(dev, 0, SizeForBlocks(uint64(b.N+1)), uint64(b.N+1), nil)
 	ctx := context.Background()
 
 	b.ResetTimer()
@@ -988,7 +1054,7 @@ func BenchmarkDecrement(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 100<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, uint64(b.N+1), nil)
+	region := NewRegion(dev, 0, SizeForBlocks(uint64(b.N+1)), uint64(b.N+1), nil)
 	ctx := context.Background()
 
 	// Pre-set all counts to 1
@@ -1010,7 +1076,7 @@ func BenchmarkIncrementBatch(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 100<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 10000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(10000), 10000, nil)
 	ctx := context.Background()
 
 	// Create batch of 100 blocks
@@ -1031,7 +1097,7 @@ func BenchmarkScan(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 100<<20)
 	defer cleanup()
 
-	region := NewRegion(dev, 0, 10000, nil)
+	region := NewRegion(dev, 0, SizeForBlocks(10000), 10000, nil)
 	ctx := context.Background()
 
 	// Set some values
