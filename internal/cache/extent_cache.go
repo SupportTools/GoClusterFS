@@ -160,7 +160,7 @@ func (m *Manager) LookupPhysicalCached(extMgr *extent.Manager, ino *inode.Inode,
 		return 0, err
 	}
 
-	// Cache the result (including holes which have phys=0)
+	// Cache the result (including holes, which map to extent.Hole)
 	m.CacheExtent(ino.InodeNum, logicalBlock, phys, ino.DataGeneration)
 
 	return phys, nil

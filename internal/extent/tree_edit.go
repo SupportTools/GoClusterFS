@@ -292,16 +292,6 @@ func (e *editor) set(i int, exts []Extent) {
 	e.changed = true
 }
 
-func (e *editor) find(lb uint64) (leaf, idx int, ok bool, err error) {
-	leaf = route(e.leaves, lb)
-	exts, err := e.extentsAt(leaf)
-	if err != nil {
-		return 0, 0, false, err
-	}
-	idx, ok = find(exts, lb)
-	return leaf, idx, ok, nil
-}
-
 type piece struct {
 	leaf int
 	ext  Extent
@@ -359,20 +349,6 @@ func (e *editor) removeRange(from, to uint64) ([]Extent, error) {
 		removed = append(removed, cut...)
 	}
 	return removed, nil
-}
-
-// update applies fn to the extent containing lb and reports whether one exists.
-func (e *editor) update(lb uint64, fn func(*Extent)) (bool, error) {
-	leaf, idx, ok, err := e.find(lb)
-	if err != nil || !ok {
-		return false, err
-	}
-	exts, err := e.mutable(leaf)
-	if err != nil {
-		return false, err
-	}
-	fn(&exts[idx])
-	return true, nil
 }
 
 func (e *editor) updateAll(fn func(*Extent)) error {

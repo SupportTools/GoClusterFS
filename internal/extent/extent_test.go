@@ -425,13 +425,13 @@ func TestLookupPhysical(t *testing.T) {
 		t.Errorf("Physical = %d, want %d", phys, expected)
 	}
 
-	// Lookup hole (not allocated) should return 0
+	// Lookup hole (not allocated) should return Hole
 	phys, err = mgr.LookupPhysical(ino, 5)
 	if err != nil {
 		t.Fatalf("LookupPhysical hole failed: %v", err)
 	}
-	if phys != 0 {
-		t.Errorf("Physical for hole = %d, want 0", phys)
+	if phys != Hole {
+		t.Errorf("Physical for hole = %d, want Hole", phys)
 	}
 }
 
@@ -928,9 +928,9 @@ func TestAllocateUnwritten_DoesNotIncrementWrittenBlocks(t *testing.T) {
 	}
 }
 
-// TestClearUnwritten_ClearsFlagAndIncrementsWritten verifies that ClearUnwritten
-// properly clears the flag and increments WrittenBlocks.
-func TestClearUnwritten_ClearsFlagAndIncrementsWritten(t *testing.T) {
+// TestClearUnwritten_ClearsOnlyThatBlock verifies that writing one block of a
+// multi-block unwritten extent leaves the other blocks reading as holes.
+func TestClearUnwritten_ClearsOnlyThatBlock(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10*1024*1024)
 	defer cleanup()
 
@@ -939,46 +939,39 @@ func TestClearUnwritten_ClearsFlagAndIncrementsWritten(t *testing.T) {
 	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
-	ino := &inode.Inode{
-		Magic:           inode.InodeMagic,
-		InodeNum:        100,
-		AllocatedBlocks: 0,
-		WrittenBlocks:   0,
-	}
-
-	// Allocate unwritten extent
-	ext, err := mgr.AllocateUnwritten(ctx, ino, 0, 1)
+	ino := &inode.Inode{Magic: inode.InodeMagic, InodeNum: 100}
+	ext, err := mgr.AllocateUnwritten(ctx, ino, 0, 3)
 	if err != nil {
 		t.Fatalf("AllocateUnwritten failed: %v", err)
 	}
-
-	// Verify starting state
-	if ino.WrittenBlocks != 0 {
-		t.Fatalf("Expected WrittenBlocks=0 before clear, got %d", ino.WrittenBlocks)
+	if ext.Length != 3 {
+		t.Fatalf("want one 3-block extent, got length %d", ext.Length)
 	}
 
-	// Clear unwritten flag
-	cleared, err := mgr.ClearUnwritten(ino, ext)
+	cleared, err := mgr.ClearUnwritten(ctx, ino, 1)
+	if err != nil || !cleared {
+		t.Fatalf("ClearUnwritten(1) = %v, %v; want true, nil", cleared, err)
+	}
+	for lb, want := range []uint64{Hole, ext.PhysicalBlock + 1, Hole} {
+		if got, err := mgr.LookupPhysical(ino, uint64(lb)); err != nil || got != want {
+			t.Errorf("LookupPhysical(%d) = %d, %v; want %d", lb, got, err, want)
+		}
+	}
+	if ino.WrittenBlocks != 1 || ino.AllocatedBlocks != 3 {
+		t.Errorf("WrittenBlocks=%d AllocatedBlocks=%d, want 1 and 3", ino.WrittenBlocks, ino.AllocatedBlocks)
+	}
+
+	for _, lb := range []uint64{0, 2} {
+		if cleared, err := mgr.ClearUnwritten(ctx, ino, lb); err != nil || !cleared {
+			t.Fatalf("ClearUnwritten(%d) = %v, %v; want true, nil", lb, cleared, err)
+		}
+	}
+	exts, err := mgr.ListExtents(ino)
 	if err != nil {
-		t.Fatalf("ClearUnwritten failed: %v", err)
+		t.Fatal(err)
 	}
-	if !cleared {
-		t.Error("ClearUnwritten should return true for first clear")
-	}
-
-	// Verify FlagUnwritten is now cleared
-	if ext.Flags&FlagUnwritten != 0 {
-		t.Errorf("Expected FlagUnwritten to be cleared, got flags=%d", ext.Flags)
-	}
-
-	// FlagAllocated should still be set
-	if ext.Flags&FlagAllocated == 0 {
-		t.Errorf("Expected FlagAllocated to remain set, got flags=%d", ext.Flags)
-	}
-
-	// Verify WrittenBlocks was incremented
-	if ino.WrittenBlocks != 1 {
-		t.Errorf("Expected WrittenBlocks=1 after clear, got %d", ino.WrittenBlocks)
+	if len(exts) != 1 || exts[0].Length != 3 || exts[0].Flags != FlagAllocated {
+		t.Errorf("written blocks should merge back into one 3-block extent, got %d extents", len(exts))
 	}
 }
 
@@ -1014,7 +1007,7 @@ func TestClearUnwritten_NoOpIfAlreadyWritten(t *testing.T) {
 	initialWrittenBlocks := ino.WrittenBlocks
 
 	// ClearUnwritten should be no-op
-	cleared, err := mgr.ClearUnwritten(ino, ext)
+	cleared, err := mgr.ClearUnwritten(ctx, ino, 0)
 	if err != nil {
 		t.Fatalf("ClearUnwritten failed: %v", err)
 	}
@@ -1029,9 +1022,9 @@ func TestClearUnwritten_NoOpIfAlreadyWritten(t *testing.T) {
 	}
 }
 
-// TestLookupPhysical_ReturnsZeroForUnwritten verifies that LookupPhysical
-// returns 0 (hole) for unwritten extents.
-func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
+// TestLookupPhysical_ReturnsHoleForUnwritten verifies that LookupPhysical
+// returns Hole for unwritten extents.
+func TestLookupPhysical_ReturnsHoleForUnwritten(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10*1024*1024)
 	defer cleanup()
 
@@ -1051,13 +1044,13 @@ func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
 		t.Fatalf("AllocateUnwritten failed: %v", err)
 	}
 
-	// LookupPhysical should return 0 (treat as hole for reads)
+	// LookupPhysical should return Hole (treat as hole for reads)
 	physBlock, err := mgr.LookupPhysical(ino, 0)
 	if err != nil {
 		t.Fatalf("LookupPhysical failed: %v", err)
 	}
-	if physBlock != 0 {
-		t.Errorf("Expected physBlock=0 for unwritten extent, got %d", physBlock)
+	if physBlock != Hole {
+		t.Errorf("Expected Hole for unwritten extent, got %d", physBlock)
 	}
 
 	// But Lookup should find the extent
@@ -1070,7 +1063,7 @@ func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
 	}
 
 	// Now clear unwritten and LookupPhysical should return the real block
-	cleared, err := mgr.ClearUnwritten(ino, foundExt)
+	cleared, err := mgr.ClearUnwritten(ctx, ino, 0)
 	if err != nil {
 		t.Fatalf("ClearUnwritten failed: %v", err)
 	}
@@ -1082,7 +1075,6 @@ func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupPhysical after clear failed: %v", err)
 	}
-	// Note: ext.PhysicalBlock could be 0 (valid block number), so we compare directly
 	if physBlock != ext.PhysicalBlock {
 		t.Errorf("Expected physBlock=%d after clearing unwritten, got %d", ext.PhysicalBlock, physBlock)
 	}

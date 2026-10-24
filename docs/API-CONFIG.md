@@ -72,7 +72,7 @@ These flags are passed when starting `goclusterfs`:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-sfb` | bool | `true` | Enable Small File Block containers |
+| `-sfb` | bool | `true` | Ignored. SFB containers are disabled |
 | `-snapshots` | bool | `true` | Enable O(1) file snapshots |
 
 ---
@@ -550,15 +550,7 @@ Optimize for consistency:
 
 ### Small Files (< 64KB)
 
-Enable SFB optimization:
-
-```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -sfb \
-    -journal
-```
-
-SFB (Small File Block) containers pack multiple small files into single blocks, reducing fragmentation and improving locality.
+SFB containers are disabled, so small files use full 1 MB blocks. `-sfb` is accepted and ignored.
 
 ### Large File Streaming
 

@@ -12,7 +12,6 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Network Cache Invalidation**: UDP multicast for near-instant cross-node cache updates
 - **Copy-on-Write Snapshots**: O(1) file snapshots with refcount-based block sharing
 - **Thin Provisioning**: Allocate-on-write with TRIM/BLKDISCARD support
-- **Small File Optimization**: SFB containers pack files under 64KB efficiently
 - **8-Phase fsck**: Comprehensive filesystem consistency checker with repair mode
 
 ## Requirements
@@ -111,7 +110,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-sfb` | `true` | Enable Small File Block containers |
+| `-sfb` | `true` | Ignored. SFB containers are disabled and every file uses full blocks |
 | `-snapshots` | `true` | Enable O(1) file snapshots |
 
 ## Multi-Node Setup

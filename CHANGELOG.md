@@ -22,7 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Inode cache with generation-based coherency checks, and an extent cache.
 - UDP multicast cache invalidation between nodes, with optional HMAC authentication (`-broadcast-secret`).
 - Batched TRIM of freed blocks (`-trim`).
-- Experimental: SFB containers for files under 64 KB (`-sfb`). Container I/O uses unaligned buffers that `O_DIRECT` rejects, so files fall back to normal extents.
+- SFB containers for files under 64 KB, disabled: every file uses normal extents and `-sfb` has no effect. A file that an older build stored in an SFB slot stays readable, moves to a full block on its next write or truncate, and frees its slot when deleted.
 - Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Copy-on-write does not trigger yet, so a snapshot does not preserve data, and an in-place write to a clone changes the source file.
 - Experimental: `goclusterfs-fsck` consistency checker with a repair mode. It fails on newly formatted volumes because `-format` does not write a superblock.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
@@ -45,6 +45,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- After a partial write into a fallocated range, reads of the other fallocated blocks, and of the rest of the written block, returned old disk contents. They now return zeros.
 - Writes failed with `EAGAIN` once a file needed a third extent, so most files over 2 MB could not be written. Extents past the first two now go in an on-disk extent tree, and adjacent extents merge.
 - `goclusterfs-fsck` phase 4 never checked file extents, because it read inodes into unaligned buffers that `O_DIRECT` rejects.
 - A node could serve a stale cached inode after another node freed and reused its inode number. Inode generations now survive free and reuse, and opening a file reloads its inode from disk.
