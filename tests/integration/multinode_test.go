@@ -312,7 +312,7 @@ func TestMultiNodeCrashRecovery(t *testing.T) {
 // TestMultiNodeCreateDuringDirectoryGrowth checks that no entries are lost when two
 // nodes create files in one directory while it grows past its first block.
 func TestMultiNodeCreateDuringDirectoryGrowth(t *testing.T) {
-	cluster := NewMultiNodeCluster(t, 2, 50)
+	cluster := NewMultiNodeCluster(t, 2, 200)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("Failed to format and start first node: %v", err)
 	}
@@ -320,8 +320,8 @@ func TestMultiNodeCreateDuringDirectoryGrowth(t *testing.T) {
 		t.Fatalf("Failed to start second node: %v", err)
 	}
 
-	// A directory block holds 15 entries with 255-byte names, so 20 creates grow
-	// each directory to exactly two blocks. Each directory is one chance to race.
+	// A 1 MB directory block holds 15 entries with 255-byte names, so 20 creates
+	// grow each directory to exactly two blocks. Each directory is one chance to race.
 	const dirs, perNode = 50, 10
 	prefix := strings.Repeat("x", 248)
 	name := func(d, node, i int) string { return fmt.Sprintf("d%02d/%s-%d-%04d", d, prefix, node, i) }
