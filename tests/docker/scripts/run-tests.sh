@@ -2304,6 +2304,8 @@ test_inode_reuse_stale_read() {
     fi
 
     exec_on_node "$writer" sh -c "head -c 204800 /dev/zero | tr '\\0' p > $dir/reuse_pad.bin && head -c 307200 /dev/zero | tr '\\0' n > $dir/$new"
+    # The healthcheck's ls can leave a pre-write size in the reader's 1s kernel attribute cache.
+    sleep 1.5
     local want got
     want=$(exec_on_node "$writer" sh -c "md5sum < $dir/$new")
     got=$(exec_on_node "$reader" sh -c "md5sum < $dir/$new")
@@ -2337,6 +2339,8 @@ test_extent_cache_coherency() {
     # The padding file takes the freed block, so the rewrite lands in another one.
     exec_on_node "$writer" sh -c "truncate -s 0 $dir/$trunc && head -c 307200 /dev/zero | tr '\\0' p > $dir/extent_pad.bin && head -c 307200 /dev/zero | tr '\\0' n > $dir/$trunc"
     exec_on_node "$writer" sh -c "head -c 4096 /dev/zero | tr '\\0' b | dd of=$dir/$holes bs=1M seek=1 conv=notrunc 2>/dev/null"
+    # The healthcheck's ls can leave a mid-rewrite size in the reader's 1s kernel attribute cache.
+    sleep 1.5
 
     local f want got failed=0
     for f in "$trunc" "$holes"; do

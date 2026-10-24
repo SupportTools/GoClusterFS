@@ -1199,6 +1199,13 @@ scenarios:
     environments:
       go: internal/cache/extent_cache_test.go::TestInvalidateExtentsForInodeDropsCachedInode
 
+  - id: extent-cache-stale-miss
+    name: Stale extent lookups count as misses
+    description: A cached mapping for an older inode version is removed and counted as a miss, not a hit
+    priority: go_only
+    environments:
+      go: internal/cache/extent_cache_test.go::TestGetExtentCountsStaleEntryAsMiss
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself

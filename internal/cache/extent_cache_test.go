@@ -36,3 +36,20 @@ func TestInvalidateExtentsForInodeDropsCachedInode(t *testing.T) {
 		t.Error("inode 3 still cached after InvalidateExtentsForInode")
 	}
 }
+
+func TestGetExtentCountsStaleEntryAsMiss(t *testing.T) {
+	mgr, err := NewManager(DefaultConfig(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.CacheExtent(&inode.Inode{InodeNum: 3, MetaGeneration: 4}, 0, 100)
+	mgr.GetExtent(&inode.Inode{InodeNum: 3, MetaGeneration: 5}, 0)
+
+	if _, hits, misses, _ := mgr.ExtentCacheStats(); hits != 0 || misses != 1 {
+		t.Errorf("stale lookup counted hits=%d misses=%d, want 0 and 1", hits, misses)
+	}
+	if size, _, _, _ := mgr.ExtentCacheStats(); size != 0 {
+		t.Errorf("stale entry still cached, size=%d", size)
+	}
+}
