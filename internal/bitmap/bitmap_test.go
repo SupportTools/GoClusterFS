@@ -2,6 +2,7 @@ package bitmap
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -422,6 +423,62 @@ func TestAllocatedCount(t *testing.T) {
 	}
 }
 
+func TestFreeCountReadsDisk(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	ctx := context.Background()
+	const total = BitsPerSector + 100
+	nodeA := NewRegion(dev, 0, total, nil, [16]byte{1})
+
+	blocks, err := nodeA.Alloc(ctx, 5)
+	if err != nil {
+		t.Fatalf("Alloc failed: %v", err)
+	}
+	for _, b := range []uint64{BitsPerSector, total - 1} {
+		if err := nodeA.MarkAllocated(ctx, b); err != nil {
+			t.Fatalf("MarkAllocated(%d) failed: %v", b, err)
+		}
+	}
+
+	nodeB := NewRegion(dev, 0, total, nil, [16]byte{2})
+	if got := nodeB.FreeCount(); got != total-7 {
+		t.Errorf("FreeCount() of a new region = %d, want %d", got, total-7)
+	}
+
+	if err := nodeB.Free(ctx, blocks[0]); err != nil {
+		t.Fatalf("Free failed: %v", err)
+	}
+	if got := nodeA.FreeCount(); got != total-6 {
+		t.Errorf("FreeCount() after another region freed a block = %d, want %d", got, total-6)
+	}
+}
+
+func TestFreeCountUnreadableSector(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	ctx := context.Background()
+	const total = BitsPerSector + 100
+	region := NewRegion(dev, 0, total, nil, [16]byte{})
+	if _, err := region.Alloc(ctx, 3); err != nil {
+		t.Fatalf("Alloc failed: %v", err)
+	}
+
+	corrupt := storage.NewAlignedBuffer(SectorSize)
+	corrupt.Bytes()[0] = 0xFF
+	if _, err := dev.WriteAt(corrupt.Bytes(), SectorSize); err != nil {
+		t.Fatalf("WriteAt failed: %v", err)
+	}
+
+	if got := region.FreeCount(); got != BitsPerSector-3 {
+		t.Errorf("FreeCount() with an unreadable second sector = %d, want %d", got, BitsPerSector-3)
+	}
+	if _, _, err := region.Scan(ctx); !errors.Is(err, ErrInvalidChecksum) {
+		t.Errorf("Scan() error = %v, want %v", err, ErrInvalidChecksum)
+	}
+}
+
 func TestPersistence(t *testing.T) {
 	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
 	if tmpDir == "" {
@@ -583,6 +640,19 @@ func BenchmarkFree(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		region.Free(ctx, blocks[i])
+	}
+}
+
+func BenchmarkFreeCountFullBitmap(b *testing.B) {
+	const sectors = 256 // the 1MB bitmap region cmd/mount reserves
+	dev, cleanup := createTestDevice(b, sectors*SectorSize)
+	defer cleanup()
+
+	region := NewRegion(dev, 0, sectors*BitsPerSector, nil, [16]byte{})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		region.FreeCount()
 	}
 }
 

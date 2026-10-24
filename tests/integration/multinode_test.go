@@ -1745,3 +1745,39 @@ func TestMultiNodeWritesToOneFallocatedBlock(t *testing.T) {
 		}
 	}
 }
+
+// TestMultiNodeStatfsFreeBlocks checks that each node's statfs includes blocks
+// the other node allocated and freed.
+func TestMultiNodeStatfsFreeBlocks(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	const fileBlocks = 5
+	writer, remover := cluster.Node(0), cluster.Node(1)
+	start := statfs(t, remover).Bfree
+	if err := writer.WriteFile("five-blocks.bin", make([]byte, fileBlocks*1024*1024)); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	for i := range cluster.NodeCount() {
+		if got := statfs(t, cluster.Node(i)).Bfree; got != start-fileBlocks {
+			t.Errorf("node %d: Bfree after node 0 wrote %d blocks = %d, want %d", i, fileBlocks, got, start-fileBlocks)
+		}
+	}
+
+	if err := remover.Remove("five-blocks.bin"); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+	for i := range cluster.NodeCount() {
+		if got := statfs(t, cluster.Node(i)).Bfree; got != start {
+			t.Errorf("node %d: Bfree after node 1 removed the file = %d, want %d", i, got, start)
+		}
+	}
+}

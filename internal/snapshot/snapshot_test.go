@@ -2,9 +2,11 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -257,8 +259,8 @@ func TestRegistryCreate(t *testing.T) {
 	if desc.GetName() != "snap1" {
 		t.Errorf("Name = %q, want %q", desc.GetName(), "snap1")
 	}
-	if desc.ExtentTreeRoot != 1000 {
-		t.Errorf("ExtentTreeRoot = %d, want 1000", desc.ExtentTreeRoot)
+	if desc.DataInode != 1000 {
+		t.Errorf("DataInode = %d, want 1000", desc.DataInode)
 	}
 	if desc.TotalBlocks != 50 {
 		t.Errorf("TotalBlocks = %d, want 50", desc.TotalBlocks)
@@ -681,8 +683,8 @@ func TestRegistryPersistence(t *testing.T) {
 	if desc.State != StateActive {
 		t.Errorf("State = %v, want %v", desc.State, StateActive)
 	}
-	if desc.ExtentTreeRoot != 1000 {
-		t.Errorf("ExtentTreeRoot = %d, want 1000", desc.ExtentTreeRoot)
+	if desc.DataInode != 1000 {
+		t.Errorf("DataInode = %d, want 1000", desc.DataInode)
 	}
 }
 
@@ -740,7 +742,7 @@ func TestMultipleSectors(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		name := fmt.Sprintf("snap%d", i)
 		_, err := registry.Create(ctx, name, uint32(100+i), InvalidSnapshotID,
-			uint64(1000+i), uint64(50+i), uint64(1024*(i+1)), FlagReadOnly)
+			uint32(1000+i), uint64(50+i), uint64(1024*(i+1)), FlagReadOnly)
 		if err != nil {
 			t.Fatalf("Create(%s) failed: %v", name, err)
 		}
@@ -848,5 +850,182 @@ func BenchmarkList(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		registry.List(ctx)
+	}
+}
+
+// Two mounted nodes each create a snapshot; the IDs must differ because a
+// delete by ID would otherwise remove the other node's snapshot.
+func TestRegistryIDsUniqueAcrossNodes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	nodeA := NewRegistry(dev, 0, 10*SectorSize, nil)
+	nodeB := NewRegistry(dev, 0, 10*SectorSize, nil)
+	for slot, r := range []*Registry{nodeA, nodeB} {
+		r.SetNodeSlot(slot)
+		if _, err := r.Scan(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err := nodeA.Create(ctx, "from-a", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := nodeB.Create(ctx, "from-b", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.SnapshotID == b.SnapshotID {
+		t.Fatalf("both nodes created snapshot ID %d", a.SnapshotID)
+	}
+}
+
+func TestRegistryActivateRequiresCreating(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	registry := NewRegistry(dev, 0, 10*SectorSize, nil)
+	ctx := context.Background()
+
+	desc, err := registry.Create(ctx, "rolled-back", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Delete(ctx, desc.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Activate(ctx, desc.SnapshotID); !errors.Is(err, ErrSnapshotInvalidState) {
+		t.Fatalf("Activate of a deleting snapshot: got %v, want ErrSnapshotInvalidState", err)
+	}
+	if got, err := registry.Get(ctx, desc.SnapshotID); err != nil || got.State != StateDeleting {
+		t.Fatalf("snapshot after refused Activate: %+v, %v; want deleting", got, err)
+	}
+
+	fresh, err := registry.Create(ctx, "fresh", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Activate(ctx, fresh.SnapshotID); err != nil {
+		t.Fatalf("Activate of a creating snapshot: %v", err)
+	}
+	// Another node's mount must not roll back a snapshot that became active.
+	if err := registry.Abandon(ctx, fresh.SnapshotID); !errors.Is(err, ErrSnapshotInvalidState) {
+		t.Fatalf("Abandon of an active snapshot: got %v, want ErrSnapshotInvalidState", err)
+	}
+	if got, err := registry.Get(ctx, fresh.SnapshotID); err != nil || got.State != StateActive {
+		t.Fatalf("snapshot after refused Abandon: %+v, %v; want active", got, err)
+	}
+}
+
+// Two nodes create snapshots at the same time with no lock between them, as
+// when the distributed lock fails to exclude them. Node slots alone must keep
+// every snapshot in its own slot with its own ID.
+func TestRegistryConcurrentCreatesAcrossNodes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 4<<20)
+	defer cleanup()
+	ctx := context.Background()
+	const perNode = 20
+
+	var nodes []*Registry
+	for slot := range 2 {
+		r := NewRegistry(dev, 0, 10*SectorSize, nil)
+		r.SetNodeSlot(slot)
+		if _, err := r.Scan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		nodes = append(nodes, r)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*perNode)
+	for n, r := range nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perNode {
+				if _, err := r.Create(ctx, fmt.Sprintf("node%d-%d", n, i), 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	all, err := nodes[0].List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2*perNode {
+		t.Fatalf("%d snapshots on disk, want %d", len(all), 2*perNode)
+	}
+	names := make(map[uint64]string)
+	for _, d := range all {
+		if other, dup := names[d.SnapshotID]; dup {
+			t.Fatalf("snapshots %q and %q share ID %d", other, d.GetName(), d.SnapshotID)
+		}
+		names[d.SnapshotID] = d.GetName()
+	}
+}
+
+// Older versions numbered snapshots 1, 2, 3... New IDs must land above every
+// one of them, and a node that takes over a departed node's slot must never
+// reuse that node's IDs.
+func TestRegistryIDsAfterOlderImagesAndSlotReuse(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	old := NewRegistry(dev, 0, 10*SectorSize, nil)
+	for i := range 70 {
+		if _, err := old.Create(ctx, fmt.Sprintf("old-%d", i), 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Rewrite them with the sequential IDs an older version would have assigned.
+	all, err := old.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := uint64(0); slot < old.maxDescriptors; slot++ {
+		d, err := old.readDescriptor(slot)
+		if err != nil || d.IsFree() {
+			continue
+		}
+		var n int
+		fmt.Sscanf(d.GetName(), "old-%d", &n)
+		d.SnapshotID = uint64(n + 1)
+		if err := old.writeDescriptor(slot, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(all) != 70 {
+		t.Fatalf("%d old snapshots, want 70", len(all))
+	}
+
+	create := func(slot int, name string) uint64 {
+		t.Helper()
+		r := NewRegistry(dev, 0, 10*SectorSize, nil)
+		r.SetNodeSlot(slot)
+		if _, err := r.Scan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		d, err := r.Create(ctx, name, 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.SnapshotID
+	}
+	first := create(5, "from-slot-5")
+	if first <= 70 || first%64 != 5 {
+		t.Fatalf("ID %d after IDs 1-70 from an older image, want above 70 and ending in slot 5", first)
+	}
+	// A new node takes over slot 5 after the first owner left.
+	second := create(5, "slot-5-new-owner")
+	if second <= first || second%64 != 5 {
+		t.Fatalf("new owner of slot 5 got ID %d after %d, want a higher ID ending in slot 5", second, first)
 	}
 }

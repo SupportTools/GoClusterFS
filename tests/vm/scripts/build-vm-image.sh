@@ -121,7 +121,7 @@ EOF
     log_info "Installing packages..."
     sudo chroot "${MOUNT_POINT}" /bin/sh -c "
         apk update
-        apk add --no-cache openssh fuse3 util-linux procps openrc e2fsprogs
+        apk add --no-cache openssh fuse3 util-linux procps openrc e2fsprogs attr
 
         # Configure SSH
         ssh-keygen -A

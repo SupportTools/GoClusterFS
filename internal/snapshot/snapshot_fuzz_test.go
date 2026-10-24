@@ -10,17 +10,17 @@ import (
 
 func FuzzDecodeDescriptor(f *testing.F) {
 	active := Descriptor{
-		Magic:          DescriptorMagic,
-		SnapshotID:     7,
-		ParentID:       3,
-		TargetInode:    42,
-		State:          StateActive,
-		Flags:          FlagReadOnly,
-		ExtentTreeRoot: 1234,
-		TotalBlocks:    5,
-		TotalSize:      5 << 20,
-		CreateTime:     1_700_000_000,
-		RefCountJobID:  9,
+		Magic:         DescriptorMagic,
+		SnapshotID:    7,
+		ParentID:      3,
+		TargetInode:   42,
+		State:         StateActive,
+		Flags:         FlagReadOnly | FlagHasData,
+		DataInode:     1234,
+		TotalBlocks:   5,
+		TotalSize:     5 << 20,
+		CreateTime:    1_700_000_000,
+		RefCountJobID: 9,
 	}
 	if err := active.SetName("nightly"); err != nil {
 		f.Fatal(err)

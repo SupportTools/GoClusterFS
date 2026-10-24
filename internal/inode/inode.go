@@ -64,6 +64,7 @@ const (
 	FlagSync          uint16 = 1 << 3 // Synchronous updates
 	FlagImmutable     uint16 = 1 << 4 // Cannot be modified
 	FlagAppend        uint16 = 1 << 5 // Append-only
+	FlagSnapshotData  uint16 = 1 << 6 // Holds a snapshot's frozen extents; in no directory
 )
 
 // Errors
@@ -271,6 +272,16 @@ func (t *Table) writeWithTree(inode *Inode) (func(), error) {
 		}
 	}
 	return committed, nil
+}
+
+// staleExtents reports whether writing inode would replace extents another
+// write changed since inode was read, such as a copy-on-write whose old block
+// was already released.
+func staleExtents(inode, onDisk *Inode) bool {
+	if inode.HasExtentTree() || onDisk.HasExtentTree() {
+		return !sameExtentTree(inode, onDisk)
+	}
+	return onDisk.InlineExtents != inode.committedInline
 }
 
 func sameExtentTree(a, b *Inode) bool {
@@ -506,7 +517,7 @@ func (t *Table) writeInodeSector(inode *Inode, checkTree bool) error {
 	start := inodeOffset * InodeSize
 	if checkTree {
 		onDisk, err := deserializeInode(buf.Bytes()[start : start+InodeSize])
-		if err == nil && (inode.HasExtentTree() || onDisk.HasExtentTree()) && !sameExtentTree(inode, onDisk) {
+		if err == nil && staleExtents(inode, onDisk) {
 			return fmt.Errorf("%w: inode %d", ErrTreeConflict, inode.InodeNum)
 		}
 	}

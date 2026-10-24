@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
+- Run `goclusterfs-fsck` before the first mount after upgrading an image that has snapshots or clones. Phase 5 reports blocks shared by more files than their refcount allows.
+- Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. This version never frees such blocks, so deleting those files leaks their space. It also refuses to snapshot or clone them (`ENOTSUP`), and in-place writes to an old clone still change its source. To get files this version can snapshot and free, copy each affected file with `cp` and delete the original.
+- Snapshots made by older versions captured no data. They still list and delete, but cloning one fails with `ENOTSUP`.
 
 ### Added
 
@@ -26,7 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - UDP multicast cache invalidation between nodes, with optional HMAC authentication (`-broadcast-secret`).
 - Batched TRIM of freed blocks (`-trim`).
 - SFB containers for files under 64 KB, disabled: every file uses normal extents and `-sfb` has no effect. A file that an older build stored in an SFB slot stays readable, moves to a full block on its next write or truncate, and frees its slot when deleted.
-- Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Copy-on-write does not trigger yet, so a snapshot does not preserve data, and an in-place write to a clone changes the source file.
+- Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Read a snapshot by cloning it with `user.snapshot.clone`.
 - Experimental: `goclusterfs-fsck` consistency checker with a repair mode. It reports errors on healthy volumes: the superblock free counters are not updated after format, and it expects refcount and snapshot sector checksums the runtime does not write.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
@@ -53,6 +56,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - All nodes wrote the same journal region. A restarting node replayed and then reset the journal of nodes still writing, and no node could replay a crashed node's journal. Each node registry slot now owns a 4 MB journal, and a crashed node's journal is replayed through its slot.
 - Nodes never sent registry heartbeats, so a node mounting more than 10 seconds after another took the live node's registry slot.
 - After a partial write into a fallocated range, reads of the other fallocated blocks, and of the rest of the written block, returned old disk contents. They now return zeros.
+- Snapshots and clones never copied on write: block refcounts stopped at 1, so a snapshot kept nothing and a write to a clone changed its source. Each snapshot now keeps the blocks it captured in a hidden inode, a write to a shared block copies it first, and a block is freed only when its last owner lets go.
+- Deleting a snapshot after its file changed failed with a refcount underflow and left the snapshot deleting forever, because the delete used the file's current blocks.
 - Writes failed with `EAGAIN` once a file needed a third extent, so most files over 2 MB could not be written. Extents past the first two now go in an on-disk extent tree, and adjacent extents merge.
 - `goclusterfs-fsck` phase 4 never checked file extents, because it read inodes into unaligned buffers that `O_DIRECT` rejects.
 - A node could serve a stale cached inode after another node freed and reused its inode number. Inode generations now survive free and reuse, and opening a file reloads its inode from disk.
