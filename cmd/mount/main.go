@@ -323,8 +323,8 @@ func main() {
 
 	// Configure go-fuse mount options
 	// AttrTimeout and EntryTimeout control kernel-side caching
-	attrTimeout := 1 * time.Second
-	entryTimeout := 1 * time.Second
+	attrTimeout := time.Duration(0)
+	entryTimeout := time.Duration(0)
 
 	mountOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{

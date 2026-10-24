@@ -43,6 +43,8 @@ These flags are passed when starting `goclusterfs`:
 | `-cache-strict` | bool | `false` | Enable strict cache mode (always validate against disk) |
 | `-cache-ttl` | duration | `5s` | Cache entry TTL before revalidation required |
 
+The kernel does not cache file attributes or directory entries: the mount sets the FUSE attribute and entry timeouts to 0, so every `stat` and path lookup reaches GoClusterFS. Opening a file reads its inode from disk, so a node sees another node's completed writes when it next opens the file. Reads through a file that is already open use the inode cache and see other nodes' changes within `-cache-ttl`, or sooner when broadcast is enabled.
+
 ### Journal Flags
 
 | Flag | Type | Default | Description |
@@ -143,7 +145,7 @@ Time after which a cached inode must be revalidated against disk.
 | Memory | ~3.2 MB (for defaults) |
 | Recommended | 50,000 - 500,000 |
 
-The maximum number of extent mappings to cache. Extent cache maps (inode, logical block) → physical block.
+The maximum number of extent mappings to cache. Extent cache maps (inode, logical block) → physical block. A cached mapping is only used with the inode version it was looked up with, so any inode write by any node makes it stale.
 
 **Sizing guidance**:
 - Large files benefit more from extent caching

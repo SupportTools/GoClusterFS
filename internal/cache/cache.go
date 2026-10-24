@@ -36,6 +36,15 @@ func (c *CachedInode) IsStale(diskDataGen, diskMetaGen uint64) bool {
 	return c.DataGeneration != diskDataGen || c.MetaGeneration != diskMetaGen
 }
 
+// newerThan reports whether c holds a later version of the inode than in.
+// DataGeneration only changes when the inode number is reused, so it orders first.
+func (c *CachedInode) newerThan(in *inode.Inode) bool {
+	if c.DataGeneration != in.DataGeneration {
+		return c.DataGeneration > in.DataGeneration
+	}
+	return c.MetaGeneration > in.MetaGeneration
+}
+
 // NeedsValidation returns true if the cache entry needs revalidation against disk.
 func (c *CachedInode) NeedsValidation(ttl time.Duration, strictMode bool) bool {
 	if strictMode {

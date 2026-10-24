@@ -100,13 +100,14 @@ func (m *Manager) InvalidateAll() {
 }
 
 // CacheInode explicitly caches an inode.
-// Use this after reading an inode from disk in a write path,
-// so subsequent reads can benefit from the cached data.
+// Use this after reading or writing an inode, so subsequent reads can
+// benefit from the cached data. A newer cached copy is kept.
 func (m *Manager) CacheInode(in *inode.Inode) {
 	m.cacheInode(in)
 }
 
-// cacheInode adds an inode to the cache (internal helper).
+// cacheInode adds an inode to the cache unless a newer copy is already cached.
+// A disk read can finish after a local write cached a later version.
 func (m *Manager) cacheInode(in *inode.Inode) {
 	now := time.Now()
 	cached := &CachedInode{
@@ -116,7 +117,7 @@ func (m *Manager) cacheInode(in *inode.Inode) {
 		CachedAt:       now,
 		LastValidated:  now,
 	}
-	m.inodes.Put(in.InodeNum, cached)
+	m.inodes.PutIf(in.InodeNum, cached, func(old *CachedInode) bool { return !old.newerThan(in) })
 	m.negatives.Delete(in.InodeNum)
 }
 

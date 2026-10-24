@@ -67,6 +67,11 @@ func (s *ShardedLRU[K, V]) Put(key K, value V) (evictedKey K, evictedValue V, ev
 	return s.shards[s.shard(key)].Put(key, value)
 }
 
+// PutIf stores value unless key is already present and replace(old) returns false.
+func (s *ShardedLRU[K, V]) PutIf(key K, value V, replace func(old V) bool) bool {
+	return s.shards[s.shard(key)].PutIf(key, value, replace)
+}
+
 // Delete removes an entry from the cache.
 func (s *ShardedLRU[K, V]) Delete(key K) (V, bool) {
 	return s.shards[s.shard(key)].Delete(key)

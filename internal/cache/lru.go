@@ -85,6 +85,23 @@ func (l *LRU[K, V]) Put(key K, value V) (evictedKey K, evictedValue V, evicted b
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	return l.putLocked(key, value)
+}
+
+// PutIf stores value unless key is already present and replace(old) returns false.
+// The check and the store are atomic. Returns whether value was stored.
+func (l *LRU[K, V]) PutIf(key K, value V, replace func(old V) bool) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if elem, exists := l.items[key]; exists && !replace(elem.Value.(*lruEntry[K, V]).value) {
+		return false
+	}
+	l.putLocked(key, value)
+	return true
+}
+
+func (l *LRU[K, V]) putLocked(key K, value V) (evictedKey K, evictedValue V, evicted bool) {
 	if l.capacity == 0 {
 		return
 	}
