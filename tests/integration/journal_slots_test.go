@@ -2,12 +2,17 @@ package integration
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
+	"os"
+	"os/exec"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -212,4 +217,27 @@ func (w *fileWriter) stop() ([]string, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.acked, w.err
+}
+
+func TestMountRefusesLegacyLayout(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	img, err := os.OpenFile(mfs.ImagePath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootInode := make([]byte, 4)
+	binary.LittleEndian.PutUint32(rootInode, inode.InodeMagic)
+	_, err = img.WriteAt(rootInode, 2<<20+2*inode.InodeSize)
+	img.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := exec.Command(mfs.BinaryPath, "-device", mfs.ImagePath, "-mount", mfs.MountPoint).CombinedOutput()
+	if err == nil {
+		t.Fatalf("mount accepted a pre-v2 image:\n%s", out)
+	}
+	if !strings.Contains(string(out), "pre-v2 layout") {
+		t.Errorf("mount output does not explain the layout change:\n%s", out)
+	}
 }

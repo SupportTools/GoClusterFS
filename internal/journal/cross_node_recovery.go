@@ -65,12 +65,20 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 	log.Printf("[Recovery] Journal region: offset=%d, size=%d",
 		info.JournalOffset, info.JournalSize)
 
-	// Open the failed node's journal region
-	region, err := OpenRegion(rctx.Dev, info.JournalOffset, info.JournalSize, info.UUID)
+	// The region belongs to the slot and may hold a dirty journal from the slot's previous owner.
+	region, err := OpenRegionForRecovery(rctx.Dev, info.JournalOffset, info.JournalSize)
+	if errors.Is(err, ErrInvalidJournalMagic) {
+		log.Printf("[Recovery] No journal in region, nothing to replay")
+		result.Duration = time.Since(start)
+		return result, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to open journal region: %w", err)
 	}
 	defer region.Close()
+	if owner := region.Superblock().NodeUUID; owner != info.UUID {
+		log.Printf("[Recovery] Journal was written by earlier slot owner %x", owner[:4])
+	}
 
 	// Check if recovery is needed
 	if !region.NeedsRecovery() {

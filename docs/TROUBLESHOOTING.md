@@ -112,6 +112,14 @@ hexdump -C /dev/device | head -20
 ./goclusterfs-fsck -device /dev/device -repair
 ```
 
+### "device has the pre-v2 layout"
+
+**Symptom**: Mount exits with `Cannot use <device>: device has the pre-v2 layout, where all nodes share one journal`.
+
+**Cause**: An older GoClusterFS build formatted the device. In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
+
+**Solution**: Copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
+
 ---
 
 ## Error Messages

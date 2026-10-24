@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 func TestSlotSerializeDeserialize(t *testing.T) {
@@ -642,4 +643,136 @@ func TestFailureDetectionLoop(t *testing.T) {
 
 	// Stop
 	reg2.Unregister(ctx)
+}
+
+func TestMaxNodesMatchesSuperblock(t *testing.T) {
+	if MaxNodes != superblock.MaxNodes {
+		t.Errorf("node.MaxNodes = %d, superblock.MaxNodes = %d", MaxNodes, superblock.MaxNodes)
+	}
+}
+
+func TestRegisterRecordsJournalRegion(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	for want := 0; want < 3; want++ {
+		reg := NewRegistry(dev, 0)
+		reg.SetJournalArea(1<<20, 4<<20)
+		slot, err := reg.Register(ctx, "node")
+		if err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if slot != want {
+			t.Fatalf("slot = %d, want %d", slot, want)
+		}
+
+		offset, size := reg.LocalJournal()
+		if wantOffset := uint64(1<<20 + want*4<<20); offset != wantOffset || size != 4<<20 {
+			t.Errorf("slot %d journal at %d size %d, want %d size %d", slot, offset, size, wantOffset, 4<<20)
+		}
+		onDisk, err := reg.readSlot(slot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if onDisk.JournalOffset != offset || onDisk.JournalSize != size {
+			t.Errorf("slot %d records journal at %d size %d, want %d size %d",
+				slot, onDisk.JournalOffset, onDisk.JournalSize, offset, size)
+		}
+	}
+}
+
+func TestRegisterSkipsSlotUnderRecovery(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{9},
+		HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
+	if err := reg.writeSlot(0, dead); err != nil {
+		t.Fatal(err)
+	}
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot == 0 {
+		t.Error("Register claimed a slot that a peer is recovering")
+	}
+}
+
+func TestRegisterYieldsSlotToRacingWriter(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	result := make(chan int, 1)
+	go func() {
+		slot, err := reg.Register(context.Background(), "slow")
+		if err != nil {
+			t.Errorf("Register: %v", err)
+		}
+		result <- slot
+	}()
+
+	time.Sleep(claimSettle / 3)
+	racer := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}
+	if err := reg.writeSlot(0, racer); err != nil {
+		t.Fatal(err)
+	}
+
+	if slot := <-result; slot == 0 {
+		t.Error("Register kept slot 0 after another node overwrote the claim")
+	}
+}
+
+func TestClearFailedSlotKeepsNewOwner(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	failed := [16]byte{1}
+	newOwner := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{2}, HeartbeatTime: time.Now().Unix()}
+	if err := reg.writeSlot(3, newOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reg.clearFailedSlot(3, failed); err != nil {
+		t.Fatalf("clearFailedSlot: %v", err)
+	}
+	slot, err := reg.readSlot(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot.UUID != newOwner.UUID || slot.State != NodeStateActive {
+		t.Errorf("slot after clear: state %v uuid %x, want the new owner kept", slot.State, slot.UUID)
+	}
+}
+
+func TestUnregisterKeepsNewOwner(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	reg := NewRegistry(dev, 0)
+	slot, err := reg.Register(ctx, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newOwner := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{2}, HeartbeatTime: time.Now().Unix()}
+	if err := reg.writeSlot(slot, newOwner); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := reg.Unregister(ctx); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	got, err := reg.readSlot(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UUID != newOwner.UUID {
+		t.Errorf("Unregister cleared slot %d now owned by %x", slot, newOwner.UUID)
+	}
 }

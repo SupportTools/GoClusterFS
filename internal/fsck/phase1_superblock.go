@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"hash/crc32"
 
+	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
@@ -25,6 +28,7 @@ var expectedMagic = [12]byte{'G', 'O', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'F', '
 //   - All region offsets are 4KB-aligned
 //   - All region sizes are multiples of 4KB
 //   - No region overlaps
+//   - Journal region splits into one journal per node registry slot
 //   - All regions fit within device
 //   - Checksum (CRC32C) is valid
 func (c *Checker) checkSuperblock() error {
@@ -88,6 +92,7 @@ func (c *Checker) checkSuperblock() error {
 	if err := c.validateRegions(sb, devSize); err != nil {
 		return err
 	}
+	c.checkJournalSlots(sb)
 
 	// Validate checksum
 	checksumOffset := SuperblockSize - 4
@@ -254,6 +259,31 @@ func (c *Checker) validateRegions(sb *SuperblockData, devSize uint64) error {
 
 	c.logf("  Region validation: complete\n")
 	return nil
+}
+
+// checkJournalSlots validates that the journal region splits into one journal
+// per node registry slot.
+func (c *Checker) checkJournalSlots(sb *SuperblockData) {
+	if sb.MaxNodes == 0 || sb.JournalRegionSize%uint64(sb.MaxNodes) != 0 {
+		c.addProblem(PhaseSuperblock, Critical, "journal_region",
+			fmt.Sprintf("%d bytes do not split into %d node journals", sb.JournalRegionSize, sb.MaxNodes),
+			false)
+		return
+	}
+	if slots := sb.NodeRegistrySize / node.SlotSize; uint64(sb.MaxNodes) > slots {
+		c.addProblem(PhaseSuperblock, Critical, "node_registry",
+			fmt.Sprintf("%d node journals but the registry holds %d node slots", sb.MaxNodes, slots),
+			false)
+	}
+	slotSize := sb.JournalRegionSize / uint64(sb.MaxNodes)
+	if slotSize%storage.SectorSize != 0 || slotSize < journal.JournalDataOffset+storage.SectorSize {
+		c.addProblem(PhaseSuperblock, Critical, "journal_region",
+			fmt.Sprintf("node journal size %d is not a multiple of %d bytes of at least %d",
+				slotSize, storage.SectorSize, journal.JournalDataOffset+storage.SectorSize),
+			false)
+		return
+	}
+	c.logf("  Node journals: %d x %d bytes (OK)\n", sb.MaxNodes, slotSize)
 }
 
 // ValidateSuperblockQuick does a quick superblock validation without full fsck.

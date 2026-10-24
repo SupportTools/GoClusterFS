@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // MountedFS manages a temporary mounted GoClusterFS instance for testing.
@@ -109,7 +111,7 @@ func NewMountedFS(t *testing.T, sizeMB int) *MountedFS {
 	return mfs
 }
 
-// allocateImage creates a sparse file of the specified size.
+// allocateImage creates a sparse file with sizeMB of data space after the metadata regions.
 func allocateImage(path string, sizeMB int) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
@@ -117,7 +119,7 @@ func allocateImage(path string, sizeMB int) error {
 	}
 	defer f.Close()
 
-	return f.Truncate(int64(sizeMB) * 1024 * 1024)
+	return f.Truncate(superblock.MinDeviceSize + int64(sizeMB)*1024*1024)
 }
 
 // Format formats the filesystem by running mount with -format and then killing it
