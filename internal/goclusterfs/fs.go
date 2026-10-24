@@ -1840,6 +1840,8 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		return nil, 0, syscall.EISDIR
 	}
 	log.Printf("[DEBUG] File.Open: success, Size=%d", ino.Size)
+	// Close-to-open consistency: reads through this handle start from the on-disk inode.
+	f.fs.cacheInode(ino)
 	// Return nil FileHandle - the File node itself implements Read/Write/etc.
 	// The fuse.FOPEN_KEEP_CACHE flag tells the kernel to keep cached data valid
 	// (we don't use it in cluster mode since other nodes may modify the file).

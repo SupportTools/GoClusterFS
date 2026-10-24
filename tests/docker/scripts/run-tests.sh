@@ -2171,6 +2171,46 @@ test_broadcast_bidirectional() {
     return 0
 }
 
+# Test: Read after cross-node inode reuse
+# Node 0 deletes a file node 1 has read and creates a new file with the same inode number.
+# Node 1 must read the new file's full content, not the old size or old data block.
+test_inode_reuse_stale_read() {
+    log "Testing read after cross-node inode reuse..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]}"
+    local dir=/mnt/goclusterfs
+    local old="reuse_old_$(date +%s).bin"
+
+    exec_on_node "$writer" sh -c "head -c 204800 /dev/zero | tr '\\0' o > $dir/$old"
+    local old_ino
+    old_ino=$(exec_on_node "$writer" stat -c %i "$dir/$old")
+    exec_on_node "$reader" sh -c "cat $dir/$old > /dev/null"
+
+    # New files take the lowest free inode, so create files until one gets the old number.
+    local new
+    new=$(exec_on_node "$writer" sh -c "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; done")
+    if [[ -z "$new" ]]; then
+        log "ERROR: No new file reused inode $old_ino"
+        exec_on_node "$writer" sh -c "rm -f $dir/reuse_new_*.bin"
+        return 1
+    fi
+
+    exec_on_node "$writer" sh -c "head -c 204800 /dev/zero | tr '\\0' p > $dir/reuse_pad.bin && head -c 307200 /dev/zero | tr '\\0' n > $dir/$new"
+    local want got
+    want=$(exec_on_node "$writer" sh -c "md5sum < $dir/$new")
+    got=$(exec_on_node "$reader" sh -c "md5sum < $dir/$new")
+    exec_on_node "$writer" sh -c "rm -f $dir/reuse_new_*.bin $dir/reuse_pad.bin"
+
+    if [[ "$got" != "$want" ]]; then
+        log "ERROR: $reader read wrong data from $new (inode $old_ino): md5 '$got', want '$want'"
+        return 1
+    fi
+
+    log "Inode reuse stale read test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log "Testing rolling restart..."
@@ -2576,6 +2616,7 @@ run_test "Broadcast Invalidation" test_broadcast_invalidation
 run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
+run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
 run_test "Rolling Restart" test_rolling_restart
 run_test "Stress Random Failures" test_stress_random_failures
 

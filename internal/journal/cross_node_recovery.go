@@ -183,6 +183,10 @@ func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, payload []byte
 		GID:       p.GID,
 		LinkCount: 1,
 	}
+	if err == nil {
+		ino.DataGeneration = existing.DataGeneration + 1
+		ino.MetaGeneration = existing.MetaGeneration + 1
+	}
 
 	now := time.Now().UnixNano()
 	ino.Atime = now
