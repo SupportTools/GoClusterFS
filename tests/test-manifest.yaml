@@ -650,7 +650,7 @@ scenarios:
 
   - id: extent-tree-snapshot
     name: Snapshot and clone of a fragmented file
-    description: A clone of a file with more than 2 extents gets its own extent tree; blocks it shares survive truncating and deleting the source, and deleting the snapshot frees nothing in use
+    description: A clone of a file with more than 2 extents gets its own extent tree; blocks it shares survive truncating and deleting the source, and deleting the snapshot frees only its own extent tree node
     priority: high
     # Docker/VM TODO: snapshot and clone tests need xattr support in those harnesses, like the other snapshot scenarios.
     environments:
@@ -1287,19 +1287,145 @@ scenarios:
     environments:
       go: internal/snapshot/worker_test.go::TestWorkerStartStop
 
-  - id: snapshot-worker-create-job
-    name: Snapshot create job processing
-    description: Background worker processes refcount increment jobs
+  - id: snapshot-worker-recovery
+    name: Snapshot recovery after a crash
+    description: On mount, snapshots left creating or deleting give back their captured blocks and disappear, without touching blocks the live file still maps
     priority: go_only
     environments:
-      go: internal/snapshot/worker_test.go::TestWorkerQueueCreateJob
+      go: internal/snapshot/worker_test.go::TestRecoverIncompleteSnapshots
 
   - id: snapshot-worker-delete-job
     name: Snapshot delete job processing
-    description: Background worker processes refcount decrement jobs
+    description: Background worker frees the snapshot's own blocks, keeps blocks the live file still maps, and removes the descriptor
     priority: go_only
     environments:
       go: internal/snapshot/worker_test.go::TestWorkerQueueDeleteJob
+
+  - id: snapshot-queue-canceled-context
+    name: Snapshot delete queued from a canceled request
+    description: A delete job queued with an already canceled request context still runs
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestWorkerQueuesJobsWithCanceledContext
+
+  - id: refcount-share-release
+    name: Block reference sharing
+    description: Sharing a block counts the existing owner, and releasing reports a block as free only when its last owner lets go
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestShareAndRelease
+
+  - id: extent-free-shared-blocks
+    name: Freeing shared blocks
+    description: Truncating one of two files that share a block keeps the block allocated until the other file lets go
+    priority: go_only
+    environments:
+      go: internal/extent/extent_test.go::TestFreeKeepsSharedBlocks
+
+  - id: snapshot-refuses-uncounted-sharing
+    name: Snapshot of a file shared by an older version
+    description: Snapshotting or cloning a file whose blocks an older version shared without refcounts fails with ENOTSUP and leaves nothing behind
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotRefusesUncountedSharing
+
+  - id: extent-uncounted-sharing-never-freed
+    name: Blocks shared by an older version stay allocated
+    description: Truncating a file that shares blocks without refcounts, with a count of 0 or 1, never frees them
+    priority: go_only
+    environments:
+      go: internal/extent/extent_test.go::TestUncountedSharingIsNeverFreed
+
+  - id: extent-concurrent-inline-cow
+    name: Two nodes copy the same shared block
+    description: When two copies of an inline inode copy the same shared block, the second inode write fails with a tree conflict and the old block is released once
+    priority: go_only
+    environments:
+      go: internal/extent/extent_test.go::TestConcurrentInlineCopyOnWrite
+
+  - id: snapshot-concurrent-cow-across-nodes
+    name: Two nodes copy one shared block through the write path
+    description: Node A commits its copy of a shared block first; node B's commit fails, B frees only its own copy and retries in place, and the old block loses exactly one owner
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestConcurrentCopyOnWriteAcrossNodes
+
+  - id: snapshot-old-image-safe
+    name: Old snapshot and old clone after upgrading
+    description: On an image with an older version's snapshot and clone of one file, writes and deleting the snapshot, clone and source never free a block another inode maps
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestOldSnapshotAndCloneNeverFreeSharedBlocks
+
+  - id: snapshot-old-sharing-cow
+    name: Copy-on-write of blocks an older version shared
+    description: Writing a file and one of its clones from an older version copies the uncounted block but never releases it, so the other clone keeps its data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestOldSharingCopiesWithoutReleasing
+
+  - id: snapshot-delete-job-requires-deleting
+    name: Delete job only for deleting snapshots
+    description: A delete job for an active snapshot fails and leaves the snapshot, its data inode and refcounts alone
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestDeleteJobRequiresDeletingState
+
+  - id: snapshot-failed-write-releases-once
+    name: Failed write after a mid-write copy commit
+    description: When the final inode write fails after a mid-write persist committed one copied block, each old block loses the file's ownership once across the retry, and uncounted blocks from an older version lose none
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestFailedWriteReleasesCommittedCopiesOnce
+
+  - id: snapshot-stale-copy-after-cow
+    name: Stale inode copy after a copy-on-write
+    description: An inode copy read before a copy-on-write committed cannot write the old mapping back; a real chmod retries and keeps the copy
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestStaleCopyCannotUndoCopyOnWrite
+
+  - id: inode-stale-inline-copy
+    name: Stale inline inode copy
+    description: Writing an inode copy whose inline extents changed on disk since it was read fails with ErrTreeConflict
+    priority: go_only
+    environments:
+      go: internal/inode/inode_test.go::TestStaleCopyCannotUndoInlineExtentChange
+
+  - id: snapshot-recovery-after-crash
+    name: Snapshot cleanup on mount after a crash
+    description: A mount removes a snapshot left half created or half deleted, frees its data inode, and the file's blocks drop back to one owner
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotRecoveryAfterCrash
+
+  - id: snapshot-ids-unique-across-nodes
+    name: Snapshot IDs across nodes
+    description: Two mounted nodes creating snapshots get different IDs
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestRegistryIDsUniqueAcrossNodes
+
+  - id: snapshot-ids-after-older-images
+    name: Snapshot IDs on an older image and after slot reuse
+    description: New IDs land above the sequential IDs an older version assigned, and a node that takes over a departed node's slot never reuses its IDs
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestRegistryIDsAfterOlderImagesAndSlotReuse
+
+  - id: snapshot-activate-requires-creating
+    name: Snapshot activation after a rollback
+    description: A snapshot another node rolled back cannot be marked active
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestRegistryActivateRequiresCreating
+
+  - id: snapshot-cow-in-process
+    name: Snapshot and clone copy-on-write
+    description: Snapshots keep their data through in-place writes, appends and truncates; clone writes never reach the source; deleting a snapshot after an overwrite frees exactly its blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotKeepsDataThroughWrites
 
   # Task #4712: Snapshot deletion (leaf + merge-up)
   - id: snapshot-leaf-deletion
@@ -1396,6 +1522,49 @@ scenarios:
       go: snapshot_test.go::TestCloneDataIntegrity
       docker: TODO
       vm: TODO
+
+  - id: snapshot-preserves-data
+    name: Snapshot keeps its data
+    description: After a snapshot, in-place overwrite, append and truncate of the file; a clone of the snapshot read on another node holds the original data
+    priority: critical
+    environments:
+      go: snapshot_test.go::TestSnapshotPreservesData
+      docker: run-tests.sh::test_snapshot_preserves_data
+      vm: run-vm-tests.sh::test_snapshot_preserves_data
+
+  - id: clone-in-place-write
+    name: In-place write to a clone
+    description: dd conv=notrunc into a clone, and into its source, changes only the file written
+    priority: critical
+    environments:
+      go: snapshot_test.go::TestCloneInPlaceWrite
+      docker: run-tests.sh::test_clone_in_place_write
+      vm: run-vm-tests.sh::test_clone_in_place_write
+
+  - id: snapshot-delete-after-overwrite
+    name: Snapshot delete after overwrite
+    description: Deleting a snapshot after the file was overwritten finishes, frees the snapshot's blocks, and leaves the file intact
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotDeleteAfterOverwrite
+      docker: run-tests.sh::test_snapshot_delete_after_overwrite
+      vm: run-vm-tests.sh::test_snapshot_delete_after_overwrite
+
+  - id: snapshot-concurrent-creates-across-nodes
+    name: Concurrent snapshots on two nodes
+    description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotConcurrentCreatesAcrossNodes
+      docker: run-tests.sh::test_snapshot_concurrent_creates
+      vm: run-vm-tests.sh::test_snapshot_concurrent_creates
+
+  - id: snapshot-registry-concurrent-creates
+    name: Registry creates from two nodes at once
+    description: Two registries create snapshots concurrently with no lock between them; node slots keep every slot and ID apart
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestRegistryConcurrentCreatesAcrossNodes
 
   - id: clone-from-snapshot
     name: Clone from snapshot

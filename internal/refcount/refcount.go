@@ -1,11 +1,13 @@
 // Package refcount implements block reference counting for GoClusterFS snapshots.
 //
 // Reference counting enables Copy-on-Write (CoW) semantics for snapshots:
-//   - RefCount = 1: Block is exclusive to one file, can modify in place
-//   - RefCount > 1: Block is shared (via snapshot), must CoW before writing
+//   - RefCount = 0 or 1: Block has one owner and can be modified in place.
+//     New blocks start at 0, so allocation never touches this region.
+//   - RefCount > 1: Block is shared by that many owners (files, clones,
+//     snapshots) and must be copied before writing.
 //
-// This allows O(1) snapshot creation - just increment refcounts of all blocks.
-// When a write targets a shared block, allocate a new block and copy data.
+// Share adds an owner and Release drops one; a block goes back to the bitmap
+// only when Release reports that its last owner let go.
 //
 // Layout: Each entry is 8 bytes (4-byte count + 2-byte flags + 2-byte reserved).
 // Entries are stored in 4KB sectors with a CRC32C checksum at the end.
@@ -272,61 +274,18 @@ func (r *Region) SetFlags(ctx context.Context, blockNum uint64, flags EntryFlags
 // This is more efficient than calling Increment individually for each block.
 // Returns the new counts after incrementing.
 func (r *Region) IncrementBatch(ctx context.Context, blockNums []uint64) ([]uint32, error) {
-	if len(blockNums) == 0 {
-		return nil, nil
-	}
-
-	for _, blockNum := range blockNums {
-		if blockNum >= r.totalBlocks {
-			return nil, ErrBlockOutOfRange
-		}
-	}
-
-	// Acquire distributed lock if available
-	if r.lockMgr != nil {
-		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
-			return nil, fmt.Errorf("failed to acquire refcount lock: %w", err)
-		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	results := make([]uint32, len(blockNums))
-
-	// Group blocks by sector for efficient I/O
-	sectorCache := make(map[uint64][]byte)
-
-	for i, blockNum := range blockNums {
-		sectorIdx := blockNum / EntriesPerSector
-
-		// Load sector if not cached
-		if _, ok := sectorCache[sectorIdx]; !ok {
-			sectorData, err := r.readSector(sectorIdx)
-			if err != nil {
-				return nil, err
-			}
-			sectorCache[sectorIdx] = sectorData
+	err := r.updateBatch(ctx, blockNums, func(i int, e *Entry) (bool, error) {
+		if e.RefCount == 0xFFFFFFFF {
+			return false, ErrRefCountOverflow
 		}
-
-		// Read and increment entry
-		entry := decodeEntry(sectorCache[sectorIdx], blockNum%EntriesPerSector)
-		if entry.RefCount == 0xFFFFFFFF {
-			return nil, ErrRefCountOverflow
-		}
-		entry.RefCount++
-		results[i] = entry.RefCount
-		encodeEntry(sectorCache[sectorIdx], blockNum%EntriesPerSector, entry)
+		e.RefCount++
+		results[i] = e.RefCount
+		return true, nil
+	})
+	if err != nil || len(blockNums) == 0 {
+		return nil, err
 	}
-
-	// Write back modified sectors
-	for sectorIdx, sectorData := range sectorCache {
-		if err := r.writeSector(sectorIdx, sectorData); err != nil {
-			return nil, err
-		}
-	}
-
 	return results, nil
 }
 
@@ -334,20 +293,72 @@ func (r *Region) IncrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 // Returns the new counts after decrementing.
 // Returns ErrRefCountUnderflow if any block's count is already zero.
 func (r *Region) DecrementBatch(ctx context.Context, blockNums []uint64) ([]uint32, error) {
-	if len(blockNums) == 0 {
-		return nil, nil
+	results := make([]uint32, len(blockNums))
+	err := r.updateBatch(ctx, blockNums, func(i int, e *Entry) (bool, error) {
+		if e.RefCount == 0 {
+			return false, ErrRefCountUnderflow
+		}
+		e.RefCount--
+		results[i] = e.RefCount
+		return true, nil
+	})
+	if err != nil || len(blockNums) == 0 {
+		return nil, err
 	}
+	return results, nil
+}
 
+// Share adds one owner, such as a snapshot or a clone, to each block. Blocks
+// are allocated with a count of 0, which like 1 means a single owner, so the
+// first share of a block sets its count to 2.
+func (r *Region) Share(ctx context.Context, blockNums []uint64) error {
+	return r.updateBatch(ctx, blockNums, func(_ int, e *Entry) (bool, error) {
+		if e.RefCount == 0xFFFFFFFF {
+			return false, ErrRefCountOverflow
+		}
+		e.RefCount = max(e.RefCount, 1) + 1
+		return true, nil
+	})
+}
+
+// Release drops one owner from each block and returns the blocks that no
+// owner holds any more. The caller must free those in the bitmap.
+func (r *Region) Release(ctx context.Context, blockNums []uint64) ([]uint64, error) {
+	var free []uint64
+	err := r.updateBatch(ctx, blockNums, func(i int, e *Entry) (bool, error) {
+		if e.RefCount > 1 {
+			e.RefCount--
+			return true, nil
+		}
+		free = append(free, blockNums[i])
+		if *e == (Entry{}) {
+			return false, nil
+		}
+		*e = Entry{}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return free, nil
+}
+
+// updateBatch applies fn to the entry of each block under the region lock and
+// writes back the sectors fn changed. Nothing is written if fn fails.
+func (r *Region) updateBatch(ctx context.Context, blockNums []uint64, fn func(i int, e *Entry) (bool, error)) error {
+	if len(blockNums) == 0 {
+		return nil
+	}
 	for _, blockNum := range blockNums {
 		if blockNum >= r.totalBlocks {
-			return nil, ErrBlockOutOfRange
+			return ErrBlockOutOfRange
 		}
 	}
 
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
-			return nil, fmt.Errorf("failed to acquire refcount lock: %w", err)
+			return fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
 		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
 	}
@@ -355,41 +366,34 @@ func (r *Region) DecrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	results := make([]uint32, len(blockNums))
-
-	// Group blocks by sector for efficient I/O
-	sectorCache := make(map[uint64][]byte)
-
+	sectors := make(map[uint64][]byte)
+	dirty := make(map[uint64]bool)
 	for i, blockNum := range blockNums {
 		sectorIdx := blockNum / EntriesPerSector
-
-		// Load sector if not cached
-		if _, ok := sectorCache[sectorIdx]; !ok {
-			sectorData, err := r.readSector(sectorIdx)
+		if _, ok := sectors[sectorIdx]; !ok {
+			data, err := r.readSector(sectorIdx)
 			if err != nil {
-				return nil, err
+				return err
 			}
-			sectorCache[sectorIdx] = sectorData
+			sectors[sectorIdx] = data
 		}
-
-		// Read and decrement entry
-		entry := decodeEntry(sectorCache[sectorIdx], blockNum%EntriesPerSector)
-		if entry.RefCount == 0 {
-			return nil, ErrRefCountUnderflow
+		entry := decodeEntry(sectors[sectorIdx], blockNum%EntriesPerSector)
+		changed, err := fn(i, &entry)
+		if err != nil {
+			return err
 		}
-		entry.RefCount--
-		results[i] = entry.RefCount
-		encodeEntry(sectorCache[sectorIdx], blockNum%EntriesPerSector, entry)
-	}
-
-	// Write back modified sectors
-	for sectorIdx, sectorData := range sectorCache {
-		if err := r.writeSector(sectorIdx, sectorData); err != nil {
-			return nil, err
+		if changed {
+			encodeEntry(sectors[sectorIdx], blockNum%EntriesPerSector, entry)
+			dirty[sectorIdx] = true
 		}
 	}
 
-	return results, nil
+	for sectorIdx := range dirty {
+		if err := r.writeSector(sectorIdx, sectors[sectorIdx]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Scan reads all reference counts and returns statistics.
