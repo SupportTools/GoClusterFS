@@ -223,19 +223,18 @@ func DeserializeJournalSuperblock(buf []byte) (*JournalSuperblock, error) {
 		return nil, ErrJournalTooSmall
 	}
 
-	// Verify checksum first
-	storedChecksum := binary.LittleEndian.Uint32(buf[JournalSuperblockSize-4:])
-	computedChecksum := storage.CRC32C(buf[:JournalSuperblockSize-4])
-	if storedChecksum != computedChecksum {
-		return nil, ErrJournalChecksumMismatch
-	}
-
 	sb := &JournalSuperblock{}
 
 	// Identity
 	copy(sb.Magic[:], buf[0:12])
 	if string(sb.Magic[:]) != JournalMagic {
 		return nil, ErrInvalidJournalMagic
+	}
+
+	storedChecksum := binary.LittleEndian.Uint32(buf[JournalSuperblockSize-4:])
+	computedChecksum := storage.CRC32C(buf[:JournalSuperblockSize-4])
+	if storedChecksum != computedChecksum {
+		return nil, ErrJournalChecksumMismatch
 	}
 	sb.Version = binary.LittleEndian.Uint32(buf[12:16])
 

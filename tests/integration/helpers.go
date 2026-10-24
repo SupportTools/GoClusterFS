@@ -5,19 +5,23 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // MountedFS manages a temporary mounted GoClusterFS instance for testing.
 type MountedFS struct {
 	ImagePath  string
 	MountPoint string
-	ExtraArgs  []string // Appended to the mount command by Mount
+	ExtraArgs  []string  // Appended to the mount command by Mount
+	Log        io.Writer // Also receives the mount process output when set
 	MountCmd   *exec.Cmd
 	BinaryPath string
 	t          *testing.T
@@ -107,7 +111,7 @@ func NewMountedFS(t *testing.T, sizeMB int) *MountedFS {
 	return mfs
 }
 
-// allocateImage creates a sparse file of the specified size.
+// allocateImage creates a sparse file with sizeMB of data space after the metadata regions.
 func allocateImage(path string, sizeMB int) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0644)
 	if err != nil {
@@ -115,7 +119,7 @@ func allocateImage(path string, sizeMB int) error {
 	}
 	defer f.Close()
 
-	return f.Truncate(int64(sizeMB) * 1024 * 1024)
+	return f.Truncate(superblock.MinDeviceSize + int64(sizeMB)*1024*1024)
 }
 
 // Format formats the filesystem by running mount with -format and then killing it
@@ -182,6 +186,13 @@ func (m *MountedFS) Format() error {
 	return nil
 }
 
+func (m *MountedFS) output() io.Writer {
+	if m.Log == nil {
+		return os.Stdout
+	}
+	return io.MultiWriter(os.Stdout, m.Log)
+}
+
 // Mount mounts the filesystem in the background.
 func (m *MountedFS) Mount(debug bool) error {
 	args := []string{
@@ -197,8 +208,8 @@ func (m *MountedFS) Mount(debug bool) error {
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
-	m.MountCmd.Stdout = os.Stdout
-	m.MountCmd.Stderr = os.Stderr
+	m.MountCmd.Stdout = m.output()
+	m.MountCmd.Stderr = m.MountCmd.Stdout
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
@@ -227,8 +238,8 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	}
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
-	m.MountCmd.Stdout = os.Stdout
-	m.MountCmd.Stderr = os.Stderr
+	m.MountCmd.Stdout = m.output()
+	m.MountCmd.Stderr = m.MountCmd.Stdout
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
@@ -488,8 +499,8 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	}
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
-	m.MountCmd.Stdout = os.Stdout
-	m.MountCmd.Stderr = os.Stderr
+	m.MountCmd.Stdout = m.output()
+	m.MountCmd.Stderr = m.MountCmd.Stdout
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
@@ -520,8 +531,8 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
-	m.MountCmd.Stdout = os.Stdout
-	m.MountCmd.Stderr = os.Stderr
+	m.MountCmd.Stdout = m.output()
+	m.MountCmd.Stderr = m.MountCmd.Stdout
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
