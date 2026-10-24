@@ -309,6 +309,9 @@ func IterateEntries(buf []byte, fn func(entry *TxnEntry, payload []byte) error) 
 			return err
 		}
 
+		if entry.Length < TxnEntryHeaderSize {
+			return ErrCorruptTxn
+		}
 		if offset+int(entry.Length) > len(buf) {
 			return ErrTxnTooSmall
 		}
