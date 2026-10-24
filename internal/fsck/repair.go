@@ -59,6 +59,14 @@ func (c *Checker) reportUncounted() {
 	}
 	slices.Sort(nums)
 	for _, num := range nums {
+		// Marked counted, blocks past the table would be freed on their first release.
+		if c.uncountedPast[num] {
+			c.addProblem(PhaseRefcounts, Warning, fmt.Sprintf("inode %d", num),
+				"shares blocks the way older versions did, some past the refcount table; repair leaves the sharing uncounted, so snapshots and clones of it fail and its shared blocks are never freed",
+				false)
+			delete(c.uncounted, num)
+			continue
+		}
 		c.addProblem(PhaseRefcounts, Warning, fmt.Sprintf("inode %d", num),
 			"shares blocks the way older versions did, without counting the owners; snapshots and clones of it fail until repaired",
 			true)

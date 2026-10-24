@@ -297,7 +297,8 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 		if ext.Length == 0 || (ext.Flags&ExtentFlagAllocated) == 0 {
 			continue
 		}
-		if ext.Flags&ExtentFlagShared != 0 && ext.Flags&ExtentFlagCounted == 0 {
+		uncounted := ext.Flags&ExtentFlagShared != 0 && ext.Flags&ExtentFlagCounted == 0
+		if uncounted {
 			c.uncounted[inodeNum] = -1
 		}
 
@@ -314,6 +315,12 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 		for j := uint64(0); j < ext.Length; j++ {
 			blockNum := ext.PhysicalBlock + j
 			c.inodeBlocks[blockNum]++
+			if uncounted {
+				c.uncountedRefs[blockNum]++
+			}
+		}
+		if uncounted && ext.PhysicalBlock+ext.Length > c.refcountCoverage() {
+			c.uncountedPast[inodeNum] = true
 		}
 	}
 }

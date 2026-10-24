@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +25,16 @@ import (
 // newFormattedImage formats an image the way goclusterfs-mount -format does.
 func newFormattedImage(t *testing.T) string {
 	t.Helper()
+	return newFormattedImageOfSize(t, superblock.MinDeviceSize+64<<20)
+}
+
+func newFormattedImageOfSize(t *testing.T, size int64) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "fs.img")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(path, superblock.MinDeviceSize+64<<20); err != nil {
+	if err := os.Truncate(path, size); err != nil {
 		t.Fatal(err)
 	}
 	dev, err := storage.Open(path)
@@ -295,6 +301,72 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 
 	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
 		t.Fatalf("problems after using the repaired image:%s", problemList(r))
+	}
+}
+
+// On a 200 GiB volume the 1 MB refcount table has entries for blocks 0-130815
+// only. Several inodes counting on a share of a higher block lose data when
+// one is deleted, and marking older sharing of such blocks counted would
+// cause the same, so repair leaves that sharing alone.
+func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
+	path := newFormattedImageOfSize(t, 200<<30)
+	fsys := openFormattedFS(t, path)
+	ctx := context.Background()
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	covered := sb.RefCountTableSize / 4096 * 511
+	counted, older := covered+5, covered+9
+
+	share := func(name string, block uint64, flags uint32) *File {
+		f := createFile(t, fsys, name)
+		if _, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error {
+			ino.InlineExtents[0] = inode.InlineExtent{PhysicalBlock: block, Length: 1, Flags: extent.FlagAllocated | flags}
+			ino.ExtentCount, ino.Size, ino.AllocatedBlocks, ino.WrittenBlocks = 1, 4096, 1, 1
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	for _, block := range []uint64{counted, older} {
+		if err := fsys.bitmapMgr.MarkAllocated(ctx, block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	share("counted-a", counted, extent.FlagShared|extent.FlagCounted)
+	share("counted-b", counted, extent.FlagShared|extent.FlagCounted)
+	oldA := share("older-a", older, extent.FlagShared)
+	share("older-b", older, extent.FlagShared)
+
+	check := runFsck(t, fsys, fsck.DefaultOptions())
+	problems := problemList(check)
+	for _, want := range []string{
+		fmt.Sprintf("has entries for blocks 0-%d of %d", covered-1, sb.TotalBlocks),
+		fmt.Sprintf("block %d: mapped by 2 inodes but past the refcount table", counted),
+		fmt.Sprintf("inode %d: shares blocks the way older versions did, some past the refcount table", oldA.inodeNum),
+	} {
+		if !strings.Contains(problems, want) {
+			t.Errorf("fsck did not report %q:%s", want, problems)
+		}
+	}
+	if strings.Contains(problems, fmt.Sprintf("block %d: mapped by", older)) {
+		t.Errorf("block %d is only shared without counts, so it is never freed, yet fsck reported it:%s", older, problems)
+	}
+	if check.ExitCode() != fsck.ExitUncorrected {
+		t.Errorf("check exit %d, want %d", check.ExitCode(), fsck.ExitUncorrected)
+	}
+
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	runFsck(t, fsys, repair)
+	ino, err := fsys.inodeTbl.Read(oldA.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.InlineExtents[0].Flags&extent.FlagCounted != 0 {
+		t.Fatalf("repair marked older sharing of block %d counted, so its first release would free it", older)
 	}
 }
 

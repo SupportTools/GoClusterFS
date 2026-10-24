@@ -535,6 +535,13 @@ scenarios:
     environments:
       go: internal/lock/reclaim_test.go::TestAdoptOwnerHoldsDeadNodesLocksUntilReleased
 
+  - id: fsck-sharing-past-refcount-table
+    name: fsck reports sharing the refcount table cannot count
+    description: On a 200 GiB volume fsck warns that the refcount table covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckReportsSharingPastRefcountTable
+
   - id: registry-slot-journal-region
     name: Registry records each slot's journal region
     description: Register stores a distinct journal region in each slot
