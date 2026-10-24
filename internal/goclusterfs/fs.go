@@ -2500,8 +2500,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// one node's changes being overwritten by another's stale read.
 		// Whole sectors of a plain block are written without reading them, so they need no lock.
 		wholeSectors := blockOffset%storage.SectorSize == 0 && toWrite%storage.SectorSize == 0
+		skipExtentLock := newBlock || (plainBlock && wholeSectors)
 		extentLockHeld := false
-		if f.fs.lockMgr != nil && !newBlock && !(plainBlock && wholeSectors) {
+		if f.fs.lockMgr != nil && !skipExtentLock {
 			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
 				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
