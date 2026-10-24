@@ -770,6 +770,10 @@ func (r *Registry) leaseCheck(slotIdx int, uuid [16]byte) func() error {
 		if success, err := r.casSlot(slotIdx, raw, serializeSlot(slot)); err != nil || !success {
 			return ErrLeaseLost
 		}
+		time.Sleep(claimSettle)
+		if current, err := r.readSlot(slotIdx); err != nil || current.RecoveryOwner != r.localUUID {
+			return ErrLeaseLost
+		}
 		return nil
 	}
 }
