@@ -1159,6 +1159,23 @@ scenarios:
       docker: TODO - the kernel serializes writes to one file per mount, so a shell version checks nothing the Go mount test does not
       vm: TODO - same reason as docker
 
+  # chmod has no multi-node side, and the Go test runs it through a real mount.
+  - id: chmod-keeps-file-type
+    name: chmod keeps the file type
+    description: chmod on a file, a directory and the mount root changes only permission bits; the file stays readable, stat shows the right type, and fsck is clean
+    priority: medium
+    environments:
+      go: chmod_test.go::TestChmodKeepsFileType
+      docker: TODO - single-node FUSE behavior already covered by the Go mount test
+      vm: TODO - same reason as docker
+
+  - id: cache-stats-hit-rate
+    name: Cache stats hit rate is a percentage
+    description: The unmount cache summary prints hit rates between 0 and 100 percent
+    priority: go_only
+    environments:
+      go: internal/cache/stats_test.go::TestStatsStringShowsHitRatePercent
+
   # Block 0 belongs to the root directory on a formatted volume, so FUSE cannot reach this case.
   - id: read-physical-block-zero
     name: Data in physical block 0 is readable

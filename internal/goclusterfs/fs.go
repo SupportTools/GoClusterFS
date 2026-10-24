@@ -130,6 +130,7 @@ var (
 	_ fs.NodeMkdirer   = (*FS)(nil)
 	_ fs.NodeUnlinker  = (*FS)(nil)
 	_ fs.NodeRmdirer   = (*FS)(nil)
+	_ fs.NodeSetattrer = (*FS)(nil)
 )
 
 // Config holds filesystem configuration.
@@ -1109,6 +1110,7 @@ var (
 	_ fs.NodeMkdirer   = (*Dir)(nil)
 	_ fs.NodeUnlinker  = (*Dir)(nil)
 	_ fs.NodeRmdirer   = (*Dir)(nil)
+	_ fs.NodeSetattrer = (*Dir)(nil)
 )
 
 // Getattr returns directory attributes.
@@ -1136,6 +1138,56 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
 	out.Blksize = BlockSize
 
+	return 0
+}
+
+// Setattr applies chmod, chown and utimes to the directory.
+func (d *Dir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if errno := d.fs.setattrDir(ctx, d.inodeNum, in); errno != 0 {
+		return errno
+	}
+	return d.Getattr(ctx, fh, out)
+}
+
+// Setattr applies chmod, chown and utimes to the root directory.
+func (f *FS) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	if errno := f.setattrDir(ctx, inode.InodeRoot, in); errno != 0 {
+		return errno
+	}
+	return f.Getattr(ctx, fh, out)
+}
+
+func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) syscall.Errno {
+	if _, ok := in.GetSize(); ok {
+		return syscall.EISDIR
+	}
+	now := time.Now().UnixNano()
+	updated, err := f.updateInode(ctx, num, func(ino *inode.Inode) error {
+		if mode, ok := in.GetMode(); ok {
+			ino.Mode = inode.S_IFDIR | uint16(mode&0777)
+			ino.Ctime = now
+		}
+		if uid, ok := in.GetUID(); ok {
+			ino.UID = uid
+			ino.Ctime = now
+		}
+		if gid, ok := in.GetGID(); ok {
+			ino.GID = gid
+			ino.Ctime = now
+		}
+		if atime, ok := in.GetATime(); ok {
+			ino.Atime = atime.UnixNano()
+		}
+		if mtime, ok := in.GetMTime(); ok {
+			ino.Mtime = mtime.UnixNano()
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("[DEBUG] Setattr directory inode %d failed: %v", num, err)
+		return syscall.EIO
+	}
+	f.cacheInode(updated)
 	return 0
 }
 
@@ -3007,7 +3059,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 
 	if mode, ok := in.GetMode(); ok {
-		ino.Mode = uint16(mode & 0777)
+		ino.Mode = inode.S_IFREG | uint16(mode&0777)
 		ino.Ctime = now
 	}
 
