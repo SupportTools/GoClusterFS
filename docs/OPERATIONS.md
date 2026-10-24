@@ -293,6 +293,12 @@ When a node fails unexpectedly:
 ./goclusterfs -device /dev/device -mount /mnt/cluster -journal -broadcast
 ```
 
+### Damaged Journal Slot
+
+If a mount exits with `Journal recovery for slot N failed`, that slot's journal header is damaged and its transactions cannot be replayed. Mount once with `-skip-recovery` on the same host, before it reboots: the mount discards the journal and starts a new one, and later mounts work normally. Then run fsck, because discarded transactions may have been only partly applied.
+
+A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` once a minute and the slot stays taken. No tool frees it yet; the other 63 slots are unaffected.
+
 ### Emergency: All Nodes Down
 
 If all nodes go down simultaneously:

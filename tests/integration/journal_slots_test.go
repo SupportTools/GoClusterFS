@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -216,10 +217,12 @@ func damageJournalHeader(t *testing.T, imagePath, offset string) {
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
-	var off int64
-	fmt.Sscan(offset, &off)
+	off, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil {
+		t.Fatalf("parse journal offset %q: %v", offset, err)
+	}
 	header := storage.NewAlignedBuffer(storage.SectorSize)
 	if _, err := dev.ReadAt(header.Bytes(), off); err != nil {
 		t.Fatalf("read journal header: %v", err)
