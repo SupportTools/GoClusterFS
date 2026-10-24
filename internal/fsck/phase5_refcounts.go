@@ -40,8 +40,8 @@ const (
 //
 // Checks performed:
 //   - Each sector has valid CRC32C checksum
-//   - RefCount > 0 for blocks marked allocated in bitmap
-//   - RefCount == 0 for free blocks
+//   - RefCount == 0 for free blocks (0 or 1 means one owner, so an
+//     allocated block may have either)
 //   - RefCount > 1 implies FlagShared should be set in extent
 //   - No refcount overflow (0xFFFFFFFF)
 //   - Cross-validate with extent references from Phase 4
@@ -133,34 +133,16 @@ func (c *Checker) checkRefcounts() error {
 			isAllocatedInBitmap := c.bitmapAllocated[blockNum]
 			refsFromInodes := c.inodeBlocks[blockNum]
 
-			if isAllocatedInBitmap {
-				// Allocated block should have refcount >= 1
-				if entry.RefCount == 0 {
-					c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("block %d", blockNum),
-						"block allocated in bitmap but refcount is 0",
-						true)
-					inconsistentEntries++
-				}
-			} else {
-				// Free block should have refcount == 0
-				if entry.RefCount != 0 {
-					c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("block %d", blockNum),
-						fmt.Sprintf("block free in bitmap but refcount is %d", entry.RefCount),
-						true)
-					inconsistentEntries++
-				}
-			}
-
-			// Cross-validate with inode references
-			if refsFromInodes > 0 && entry.RefCount == 0 {
+			if !isAllocatedInBitmap && entry.RefCount != 0 {
 				c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("block %d", blockNum),
-					fmt.Sprintf("referenced by %d inode(s) but refcount is 0", refsFromInodes),
+					fmt.Sprintf("block free in bitmap but refcount is %d", entry.RefCount),
 					true)
+				inconsistentEntries++
 			}
 
-			// Check for shared blocks without proper refcount
+			// An undercounted block is freed while another inode still maps it.
 			if refsFromInodes > 1 && entry.RefCount < uint32(refsFromInodes) {
-				c.addProblem(PhaseRefcounts, Warning, fmt.Sprintf("block %d", blockNum),
+				c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("block %d", blockNum),
 					fmt.Sprintf("referenced by %d inodes but refcount is only %d", refsFromInodes, entry.RefCount),
 					true)
 			}

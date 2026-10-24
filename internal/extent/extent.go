@@ -46,6 +46,9 @@ const (
 	FlagUnwritten = 1 << 1 // Allocated but lazy-zero (not yet written)
 	FlagShared    = 1 << 2 // Shared with snapshot (requires CoW)
 	FlagSFB       = 1 << 3 // Stored in SFB container (not full block)
+	// FlagCounted marks sharing that refcounts track. Older versions set
+	// FlagShared alone and never counted the owners.
+	FlagCounted = 1 << 6
 )
 
 // Hole is what LookupPhysical returns for a logical block with no data on disk.
@@ -66,6 +69,9 @@ type CoWResult struct {
 	OldPhysBlock uint64 // Original physical block (for refcount decrement)
 	NewPhysBlock uint64 // New physical block after CoW
 	WasShared    bool   // True if CoW was actually performed
+	// Uncounted means an older version shared the old block without counting
+	// its owners, so it must never be released.
+	Uncounted bool
 }
 
 // Extent represents a contiguous range of blocks.
@@ -86,8 +92,16 @@ type Manager struct {
 	leafCap    int // extents per leaf before it splits
 	indexCap   int // leaves per tree
 
+	refs *refcount.Region // nil when snapshots are disabled
+
 	deferredMu sync.Mutex
 	deferred   []uint64 // frees postponed by lock order
+}
+
+// SetRefcounts makes frees respect block sharing: a block shared by a
+// snapshot or clone goes back to the bitmap only after its last owner frees it.
+func (m *Manager) SetRefcounts(refs *refcount.Region) {
+	m.refs = refs
 }
 
 // NewManager creates a new extent manager. dataOffset is the device offset of
@@ -315,9 +329,8 @@ func (m *Manager) unmap(ctx context.Context, ino *inode.Inode, from, to uint64) 
 
 // release updates block accounting for removed extents and queues their
 // blocks to be freed when the inode write commits: if that write loses a
-// conflict, the inode on disk still maps them. Shared blocks stay allocated for
-// the refcount system, and SFB extents point into containers rather than at
-// bitmap blocks.
+// conflict, the inode on disk still maps them. SFB extents point into
+// containers rather than at bitmap blocks.
 func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Extent) {
 	var blocks []uint64
 	for _, x := range removed {
@@ -325,22 +338,40 @@ func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Exten
 		if x.Flags&FlagUnwritten == 0 {
 			ino.WrittenBlocks -= min(ino.WrittenBlocks, x.Length)
 		}
-		if x.Flags&(FlagShared|FlagSFB) != 0 {
-			continue
-		}
-		for j := uint64(0); j < x.Length; j++ {
-			blocks = append(blocks, x.PhysicalBlock+j)
+		if x.Flags&FlagSFB == 0 {
+			blocks = append(blocks, m.ownedBlocks(x)...)
 		}
 	}
 	if len(blocks) == 0 {
 		return
 	}
-	p := pendingOf(ino)
-	if p == nil {
-		p = &pendingTree{base: committedTree(ino)}
-		ino.PendingTree = p
-	}
+	p := ensurePending(ino)
 	p.release = append(p.release, blocks...)
+}
+
+// ownedBlocks returns the blocks of x that frees may give back. Nobody knows
+// how many inodes share an uncounted block, so it stays allocated.
+func (m *Manager) ownedBlocks(x Extent) []uint64 {
+	if x.Flags&FlagShared != 0 && (x.Flags&FlagCounted == 0 || m.refs == nil) {
+		return nil
+	}
+	blocks := make([]uint64, x.Length)
+	for j := range blocks {
+		blocks[j] = x.PhysicalBlock + uint64(j)
+	}
+	return blocks
+}
+
+// HasUncountedSharing reports whether ino shares blocks the way older versions
+// did, without refcounts. Such blocks cannot be shared again safely.
+func (m *Manager) HasUncountedSharing(ino *inode.Inode) (bool, error) {
+	uncounted := false
+	err := m.forEach(ino, func(x Extent) {
+		if x.Flags&FlagShared != 0 && x.Flags&FlagCounted == 0 {
+			uncounted = true
+		}
+	})
+	return uncounted, err
 }
 
 // Delete unmaps every block of an inode that is being freed and frees the
@@ -529,7 +560,10 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 	if err != nil {
 		return nil, err
 	}
-	result := &CoWResult{OldPhysBlock: cur.PhysicalBlock + offset}
+	result := &CoWResult{
+		OldPhysBlock: cur.PhysicalBlock + offset,
+		Uncounted:    cur.Flags&FlagShared != 0 && cur.Flags&FlagCounted == 0,
+	}
 	block := Extent{logicalBlock, result.OldPhysBlock, 1, cur.Flags}
 
 	needsCoW, err := m.NeedsCoW(ctx, &block, refcountReg)
@@ -564,12 +598,17 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 		return nil, fmt.Errorf("CoW write failed: %w", err)
 	}
 
-	private := Extent{logicalBlock, newPhysBlock, 1, cur.Flags &^ FlagShared}
+	private := Extent{logicalBlock, newPhysBlock, 1, cur.Flags &^ (FlagShared | FlagCounted)}
 	if err := m.remap(ctx, ino, private); err != nil {
 		m.bitmap.Free(ctx, newPhysBlock)
 		return nil, err
 	}
+	// The caller releases the old block after the inode write, so that write
+	// must fail if another node copied the block first.
+	ensurePending(ino)
 	*ext = private
+	// Readers keep cached block mappings until DataGeneration changes.
+	ino.DataGeneration++
 
 	result.NewPhysBlock = newPhysBlock
 	result.WasShared = true
@@ -599,7 +638,7 @@ func (m *Manager) MarkAllShared(ino *inode.Inode) error {
 	if err != nil {
 		return err
 	}
-	if err := e.updateAll(func(x *Extent) { x.Flags |= FlagShared }); err != nil {
+	if err := e.updateAll(func(x *Extent) { x.Flags |= FlagShared | FlagCounted }); err != nil {
 		return err
 	}
 	return e.commit()
@@ -615,7 +654,7 @@ func (m *Manager) CopyExtentsForClone(ctx context.Context, src *inode.Inode, dst
 	}
 	all := []Extent{}
 	if err := m.forEach(src, func(x Extent) {
-		x.Flags |= FlagShared
+		x.Flags |= FlagShared | FlagCounted
 		all = append(all, x)
 	}); err != nil {
 		return err

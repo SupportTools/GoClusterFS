@@ -40,6 +40,7 @@ const (
 	FlagHasExtentTree uint16 = 1 << 0
 	FlagHasSnapshot   uint16 = 1 << 1
 	FlagDeleted       uint16 = 1 << 2
+	FlagSnapshotData  uint16 = 1 << 6
 )
 
 // InodeData holds parsed inode information.
@@ -220,6 +221,10 @@ func (c *Checker) checkInodes() error {
 					fmt.Sprintf("written blocks (%d) > allocated blocks (%d)",
 						inode.WrittenBlocks, inode.AllocatedBlocks),
 					true)
+			}
+
+			if inode.Flags&FlagSnapshotData != 0 {
+				c.snapshotData[inodeNum] = true
 			}
 
 			// Record extents for cross-validation

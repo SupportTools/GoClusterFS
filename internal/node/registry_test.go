@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1035,4 +1036,145 @@ func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
 	if slot != 2 {
 		t.Errorf("Register took slot %d, want slot 2, which went stale after the first scan", slot)
 	}
+}
+
+func TestDetectionReleasesLocksOnlyOfProvenDeadNodes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalSlot(t, reg, 2, exitedPID(t), 1)
+	slow := writeLocalSlotAt(t, reg, 3, os.Getppid(), time.Now().Add(-3*HeartbeatTimeout))
+
+	var events []string
+	reg.SetRecoveryHandler(func(info *FailedNodeInfo) error {
+		events = append(events, fmt.Sprintf("replay %d", info.SlotIndex))
+		return nil
+	})
+	reg.SetOwnerDeadHandler(func(owner [16]byte) func() {
+		events = append(events, fmt.Sprintf("adopt %x", owner[:1]))
+		return func() { events = append(events, fmt.Sprintf("release %x", owner[:1])) }
+	})
+	reg.detectAndRecoverFailedNodes()
+
+	want := []string{"adopt 03", "replay 2", "release 03", "replay 3"}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Errorf("events %v, want %v: only the exited node's locks are taken, and held through its replay", events, want)
+	}
+	if slow.UUID != ([16]byte{4}) {
+		t.Fatalf("slow node UUID %x", slow.UUID)
+	}
+}
+
+func TestRegisterReportsItsDeadPreviousIncarnation(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	writeLocalSlot(t, reg, 0, exitedPID(t), 1)
+	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 0 {
+		t.Fatalf("Register = %d, %v; want slot 0 of the exited mount", slot, err)
+	}
+
+	if owner, ok := reg.DeadPreviousOwner(); !ok || owner != ([16]byte{1}) {
+		t.Errorf("DeadPreviousOwner = %x, %v; want the previous incarnation 01", owner, ok)
+	}
+}
+
+func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	lost := make(chan struct{}, 1)
+	reg.SetSlotLostHandler(func(int, [16]byte) { lost <- struct{}{} })
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Stop()
+
+	dev.Close()
+	select {
+	case <-lost:
+	case <-time.After(HeartbeatTimeout):
+		t.Error("node kept running while its heartbeats failed; peers would prove it dead and take its locks")
+	}
+}
+
+func TestHeartbeatStopsWhenSlotIsMarkedDead(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	lost := make(chan struct{}, 1)
+	reg.SetSlotLostHandler(func(int, [16]byte) { lost <- struct{}{} })
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Stop()
+
+	own, err := reg.readSlot(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own.State = NodeStateDead
+	if err := reg.writeSlot(slot, own); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lost:
+	case <-time.After(3 * HeartbeatInterval):
+		t.Error("heartbeat kept running in a slot another node marked dead")
+	}
+}
+
+func TestOwnClockDecidesDeathNotWallClock(t *testing.T) {
+	reg := &Registry{sightings: make(map[int]sighting)}
+	slot := &Slot{UUID: [16]byte{4}, State: NodeStateActive, HeartbeatSeq: 1,
+		HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
+
+	reg.observe(1, slot)
+	if reg.provenDead(1, slot) {
+		t.Error("a heartbeat first seen just now counted as dead because its wall-clock time is old")
+	}
+
+	reg.sightings[1] = sighting{uuid: slot.UUID, seq: 1, beat: slot.HeartbeatTime,
+		since: time.Now().Add(-(HeartbeatTimeout + deathMargin + time.Second))}
+	if !reg.provenDead(1, slot) {
+		t.Error("a heartbeat unchanged past timeout plus margin by this node's clock did not count as dead")
+	}
+
+	slot.HeartbeatSeq++
+	reg.observe(1, slot)
+	if reg.provenDead(1, slot) || !reg.recentlyAlive(1) {
+		t.Error("a heartbeat that advanced still counted as dead")
+	}
+}
+
+func writeLocalSlotAt(t *testing.T, reg *Registry, idx int, pid int, heartbeat time.Time) *Slot {
+	t.Helper()
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{byte(idx + 1)},
+		HeartbeatTime: heartbeat.Unix(), BootID: reg.bootID, PID: uint32(pid), ProcStart: 1,
+		PIDNamespace: reg.pidNS}
+	copy(slot.Hostname[:], "node")
+	if err := reg.writeSlot(idx, slot); err != nil {
+		t.Fatal(err)
+	}
+	return slot
 }

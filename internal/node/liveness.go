@@ -11,6 +11,19 @@ import (
 // recoveryLease is how long a peer may hold a dead slot's recovery before others take it over.
 const recoveryLease = 60 * time.Second
 
+// deathMargin is added to HeartbeatTimeout before this node's own clock counts
+// an unchanged heartbeat as proof that its node is dead rather than slow.
+const deathMargin = HeartbeatTimeout / 2
+
+// sighting is what failure detection last saw in a slot, timed by this node's monotonic clock.
+type sighting struct {
+	uuid      [16]byte
+	seq       uint64
+	beat      int64
+	since     time.Time
+	changedAt time.Time
+}
+
 var processStart = time.Now().UnixNano()
 
 func readBootID() (id [16]byte) {
@@ -63,4 +76,36 @@ func (r *Registry) failed(slot *Slot, timeout time.Duration) bool {
 		return time.Since(time.Unix(slot.RecoveryStart, 0)) > recoveryLease
 	}
 	return false
+}
+
+// observe records a slot's heartbeat as failure detection sees it. Called with r.mu held.
+func (r *Registry) observe(slotIdx int, slot *Slot) {
+	last, seen := r.sightings[slotIdx]
+	if seen && last.uuid == slot.UUID && last.seq == slot.HeartbeatSeq && last.beat == slot.HeartbeatTime {
+		return
+	}
+	now := time.Now()
+	next := sighting{uuid: slot.UUID, seq: slot.HeartbeatSeq, beat: slot.HeartbeatTime, since: now}
+	if seen && last.uuid == slot.UUID {
+		next.changedAt = now
+	}
+	r.sightings[slotIdx] = next
+}
+
+// recentlyAlive reports whether this node saw the slot's heartbeat advance within
+// HeartbeatTimeout, whatever the heartbeat's wall-clock time says. Called with r.mu held.
+func (r *Registry) recentlyAlive(slotIdx int) bool {
+	last, seen := r.sightings[slotIdx]
+	return seen && !last.changedAt.IsZero() && time.Since(last.changedAt) < HeartbeatTimeout
+}
+
+// provenDead reports whether a slot's node is dead, not merely slow: its mount
+// process is gone, or this node has seen the same heartbeat for longer than
+// HeartbeatTimeout plus deathMargin. Called with r.mu held.
+func (r *Registry) provenDead(slotIdx int, slot *Slot) bool {
+	if r.deadLocalOwner(slot) {
+		return true
+	}
+	last, seen := r.sightings[slotIdx]
+	return seen && last.uuid == slot.UUID && time.Since(last.since) >= HeartbeatTimeout+deathMargin
 }

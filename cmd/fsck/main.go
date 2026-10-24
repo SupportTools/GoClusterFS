@@ -27,6 +27,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/version"
 )
 
 func main() {
@@ -40,6 +41,7 @@ func main() {
 		listPhases   = flag.Bool("list-phases", false, "List fsck phases and exit")
 		summaryOnly  = flag.Bool("summary", false, "Only print final summary")
 		showProblems = flag.Bool("show-problems", true, "Show individual problems found")
+		showVersion  = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <device>\n\n", os.Args[0])
@@ -56,6 +58,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  2: Usage error or fatal failure\n")
 	}
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("goclusterfs-fsck", version.String())
+		os.Exit(0)
+	}
 
 	// Handle list-phases request
 	if *listPhases {

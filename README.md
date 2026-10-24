@@ -23,6 +23,17 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - For multi-node: Shared block device (SAN, iSCSI, NVMe-oF, etc.)
 - A device of at least 264 MB: the layout reserves 256 MB for 64 node journals of 4 MB
 
+## Limits and Status
+
+- **Linux only.** GoClusterFS needs FUSE and O_DIRECT.
+- **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
+- **Name lookups are slow.** Each lookup reads the whole directory from disk and scans it entry by entry. In one test on a single node, a lookup took about 25 ms, and `ls -l` on a 1,000-file directory took about 47 seconds.
+- **On-disk format version 2** since [#15](https://github.com/SupportTools/GoClusterFS/pull/15). Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
+- **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
+- **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
+- **fsck is experimental.** It reports errors on healthy volumes. See [Filesystem Check](#filesystem-check).
+- **Cluster safety limits.** Node clocks, node stalls, and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
+
 ## Quick Start
 
 ### Build

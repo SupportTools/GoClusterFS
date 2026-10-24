@@ -23,6 +23,9 @@ const (
 	// SnapshotMagic identifies a valid snapshot descriptor.
 	SnapshotMagic uint32 = 0x534E4150 // "SNAP"
 
+	// SnapshotFlagHasData marks descriptors whose DataInode holds the captured extents.
+	SnapshotFlagHasData uint8 = 1 << 4
+
 	// MaxSnapshotNameLen is the maximum length of a snapshot name.
 	MaxSnapshotNameLen = 48
 )
@@ -37,20 +40,20 @@ const (
 
 // SnapshotDescriptor holds parsed snapshot information.
 type SnapshotDescriptor struct {
-	Magic          uint32
-	SnapshotID     uint64
-	ParentID       uint64
-	TargetInode    uint32
-	State          uint8
-	Flags          uint8
-	ExtentTreeRoot uint64
-	TotalBlocks    uint64
-	TotalSize      uint64
-	CreateTime     int64
-	DeleteTime     int64
-	RefCountJobID  uint64
-	Name           string
-	Checksum       uint32
+	Magic         uint32
+	SnapshotID    uint64
+	ParentID      uint64
+	TargetInode   uint32
+	State         uint8
+	Flags         uint8
+	DataInode     uint32
+	TotalBlocks   uint64
+	TotalSize     uint64
+	CreateTime    int64
+	DeleteTime    int64
+	RefCountJobID uint64
+	Name          string
+	Checksum      uint32
 }
 
 // checkSnapshots validates the snapshot registry (Phase 7).
@@ -99,6 +102,7 @@ func (c *Checker) checkSnapshots() error {
 	// Track snapshot IDs and names for duplicate detection
 	seenIDs := make(map[uint64]bool)
 	seenNames := make(map[string]uint64) // name -> snapshot ID
+	dataInodes := make(map[uint32]bool)
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := snapshotOffset + sectorIdx*SnapshotSectorSize
@@ -197,6 +201,16 @@ func (c *Checker) checkSnapshots() error {
 				c.snapshotInodes[desc.TargetInode] = true
 			}
 
+			if desc.Flags&SnapshotFlagHasData != 0 && desc.DataInode != 0 {
+				if !c.snapshotData[desc.DataInode] {
+					c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("snapshot %d", desc.SnapshotID),
+						fmt.Sprintf("data inode %d is not a snapshot data inode", desc.DataInode),
+						false)
+				}
+				dataInodes[desc.DataInode] = true
+				c.snapshotInodes[desc.DataInode] = true
+			}
+
 			// Validate parent reference (if not root snapshot)
 			if desc.ParentID != 0 && !seenIDs[desc.ParentID] {
 				// Parent might come later - this is a forward reference issue
@@ -217,6 +231,14 @@ func (c *Checker) checkSnapshots() error {
 						descChecksum, descComputedChecksum),
 					true)
 			}
+		}
+	}
+
+	for num := range c.snapshotData {
+		if !dataInodes[num] {
+			c.addProblem(PhaseSnapshots, Warning, fmt.Sprintf("inode %d", num),
+				"snapshot data inode belongs to no snapshot (left by a crash during snapshot creation)",
+				true)
 		}
 	}
 
@@ -247,7 +269,7 @@ func parseSnapshotDescriptor(buf []byte) *SnapshotDescriptor {
 	desc.State = buf[24]
 	desc.Flags = buf[25]
 	// Bytes 26-27 reserved
-	desc.ExtentTreeRoot = binary.LittleEndian.Uint64(buf[28:36])
+	desc.DataInode = binary.LittleEndian.Uint32(buf[28:32])
 	desc.TotalBlocks = binary.LittleEndian.Uint64(buf[36:44])
 	desc.TotalSize = binary.LittleEndian.Uint64(buf[44:52])
 	desc.CreateTime = int64(binary.LittleEndian.Uint64(buf[52:60]))

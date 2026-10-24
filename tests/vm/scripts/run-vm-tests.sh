@@ -1739,6 +1739,74 @@ test_extent_cache_coherency() {
     return 0
 }
 
+# Print the free 1MB blocks that statfs reports on VM $1
+statfs_free_blocks_on_vm() {
+    ssh_run "$1" "stat -f -c %f /mnt/goclusterfs"
+}
+
+# Writes 5 blocks, remounts on a restarted VM, and checks that statfs reports
+# the same free blocks as before the restart, not the whole volume.
+test_statfs_after_remount() {
+    log_info "Testing statfs free blocks across a remount..."
+    ensure_cluster_healthy 1
+
+    local file=/mnt/goclusterfs/statfs_remount.bin
+    local before written remounted
+    before=$(statfs_free_blocks_on_vm 1)
+    ssh_run 1 "dd if=/dev/urandom of=$file bs=1M count=5 2>/dev/null"
+    written=$(statfs_free_blocks_on_vm 1)
+    if (( before - written < 5 )); then
+        log_error "Writing 5 blocks lowered free blocks from $before to $written"
+        return 1
+    fi
+
+    restart_goclusterfs_vm 1 || return 1
+    remounted=$(statfs_free_blocks_on_vm 1)
+    ssh_run 1 "rm -f $file"
+
+    if [[ "$remounted" != "$written" ]]; then
+        log_error "$written free blocks before the restart, $remounted after"
+        return 1
+    fi
+
+    log_info "Statfs after remount test passed"
+    return 0
+}
+
+# Writes 5 blocks on VM 1 and removes the file on VM 2, checking after each
+# step that both VMs report the same free blocks.
+test_statfs_multinode() {
+    log_info "Testing statfs free blocks across nodes..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping statfs multi-node test (requires 2+ VMs)"
+        return 0
+    fi
+    ensure_cluster_healthy 2
+
+    local file=/mnt/goclusterfs/statfs_multinode.bin
+    local start on_writer on_remover
+    start=$(statfs_free_blocks_on_vm 2)
+    ssh_run 1 "dd if=/dev/urandom of=$file bs=1M count=5 2>/dev/null"
+    on_writer=$(statfs_free_blocks_on_vm 1)
+    on_remover=$(statfs_free_blocks_on_vm 2)
+    if [[ "$on_writer" != "$on_remover" ]] || (( start - on_remover < 5 )); then
+        log_error "After VM 1 wrote 5 blocks: VM 1 reports $on_writer free, VM 2 reports $on_remover, $start before"
+        return 1
+    fi
+
+    ssh_run 2 "rm -f $file"
+    on_writer=$(statfs_free_blocks_on_vm 1)
+    on_remover=$(statfs_free_blocks_on_vm 2)
+    if [[ "$on_writer" != "$start" || "$on_remover" != "$start" ]]; then
+        log_error "After VM 2 removed the file: VM 1 reports $on_writer free, VM 2 reports $on_remover, want $start"
+        return 1
+    fi
+
+    log_info "Statfs multi-node test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log_info "Testing rolling restart..."
@@ -2905,6 +2973,190 @@ test_extent_tree_sparse_writes() {
     return 0
 }
 
+md5_on_vm_matches() {
+    local vm_id=$1 path=$2 want=$3 got
+    got=$(ssh_run "$vm_id" "md5sum < $path | cut -d' ' -f1")
+    if [ "$got" != "$want" ]; then
+        log_error "VM $vm_id $path md5 $got, want $want"
+        return 1
+    fi
+}
+
+# Snapshots a file, then overwrites it in place, appends to it and truncates
+# it. A clone of the snapshot must hold the original data on both VMs. The
+# expected data is built with the same edits on a local copy.
+test_snapshot_preserves_data() {
+    log_info "Testing that a snapshot keeps its data..."
+    ensure_cluster_healthy 2
+
+    local file=/mnt/goclusterfs/snap_data.bin
+    local clone=/mnt/goclusterfs/snap_data_clone.bin
+
+    ssh_run 1 "rm -f $file $clone"
+    ssh_run 1 "head -c 3145728 /dev/urandom > /tmp/snap_orig && cp /tmp/snap_orig /tmp/snap_live && cp /tmp/snap_orig $file" || return 1
+    ssh_run 1 "setfattr -n user.snapshot -v snap_data_before $file" || {
+        log_error "snapshot failed"
+        return 1
+    }
+    ssh_run 1 "head -c 4096 /dev/urandom > /tmp/snap_patch && head -c 2097152 /dev/urandom > /tmp/snap_tail"
+    for target in "$file" /tmp/snap_live; do
+        ssh_run 1 "dd if=/tmp/snap_patch of=$target bs=4096 seek=257 conv=notrunc 2>/dev/null && cat /tmp/snap_tail >> $target && truncate -s 1572864 $target" || {
+            log_error "changing $target failed"
+            return 1
+        }
+    done
+    ssh_run 1 "setfattr -n user.snapshot.clone -v snap_data_before:/snap_data_clone.bin $file" || {
+        log_error "clone from snapshot failed"
+        return 1
+    }
+
+    local want_clone want_live
+    want_clone=$(ssh_run 1 "md5sum < /tmp/snap_orig | cut -d' ' -f1")
+    want_live=$(ssh_run 1 "md5sum < /tmp/snap_live | cut -d' ' -f1")
+    for vm_id in 2 1; do
+        restart_goclusterfs_vm "$vm_id" || return 1
+        md5_on_vm_matches "$vm_id" "$clone" "$want_clone" || return 1
+        md5_on_vm_matches "$vm_id" "$file" "$want_live" || return 1
+    done
+
+    ssh_run 1 "setfattr -x user.snapshot.snap_data_before $file"
+    log_info "Snapshot keeps its data test passed"
+    return 0
+}
+
+# Writes into a clone and into its source with dd conv=notrunc. Each write must
+# change only the file written, on both VMs.
+test_clone_in_place_write() {
+    log_info "Testing in-place writes to a clone and its source..."
+    ensure_cluster_healthy 2
+
+    local src=/mnt/goclusterfs/clone_src.bin
+    local clone=/mnt/goclusterfs/clone_inplace.bin
+
+    ssh_run 1 "rm -f $src $clone"
+    ssh_run 1 "head -c 2097152 /dev/urandom > /tmp/clone_src && cp /tmp/clone_src /tmp/clone_copy && cp /tmp/clone_src $src" || return 1
+    ssh_run 1 "setfattr -n user.clone -v /clone_inplace.bin $src" || {
+        log_error "clone failed"
+        return 1
+    }
+    ssh_run 1 "head -c 4096 /dev/urandom > /tmp/clone_patch_a && head -c 4096 /dev/urandom > /tmp/clone_patch_b"
+    ssh_run 1 "dd if=/tmp/clone_patch_a of=$clone bs=4096 conv=notrunc 2>/dev/null && dd if=/tmp/clone_patch_a of=/tmp/clone_copy bs=4096 conv=notrunc 2>/dev/null" || return 1
+    ssh_run 1 "dd if=/tmp/clone_patch_b of=$src bs=4096 seek=256 conv=notrunc 2>/dev/null && dd if=/tmp/clone_patch_b of=/tmp/clone_src bs=4096 seek=256 conv=notrunc 2>/dev/null" || return 1
+
+    local want_src want_clone
+    want_src=$(ssh_run 1 "md5sum < /tmp/clone_src | cut -d' ' -f1")
+    want_clone=$(ssh_run 1 "md5sum < /tmp/clone_copy | cut -d' ' -f1")
+    for vm_id in 2 1; do
+        restart_goclusterfs_vm "$vm_id" || return 1
+        md5_on_vm_matches "$vm_id" "$src" "$want_src" || return 1
+        md5_on_vm_matches "$vm_id" "$clone" "$want_clone" || return 1
+    done
+
+    log_info "In-place clone write test passed"
+    return 0
+}
+
+# Snapshots a file, overwrites both of its blocks, then deletes the snapshot.
+# The delete must finish and give back exactly the two blocks only the
+# snapshot held.
+test_snapshot_delete_after_overwrite() {
+    log_info "Testing snapshot delete after overwrite..."
+    ensure_cluster_healthy 2
+
+    local file=/mnt/goclusterfs/snap_delete.bin
+    local free_before free_now
+
+    ssh_run 1 "rm -f $file"
+    ssh_run 1 "head -c 2097152 /dev/urandom > $file" || return 1
+    free_before=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
+    ssh_run 1 "setfattr -n user.snapshot -v snap_delete_temp $file" || {
+        log_error "snapshot failed"
+        return 1
+    }
+    ssh_run 1 "head -c 2097152 /dev/urandom > /tmp/snap_new && dd if=/tmp/snap_new of=$file bs=1048576 conv=notrunc 2>/dev/null" || return 1
+    free_now=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
+    if [ "$free_now" -ne $((free_before - 2)) ]; then
+        log_error "$free_now free blocks after overwriting 2 snapshotted blocks, want $((free_before - 2))"
+        return 1
+    fi
+
+    ssh_run 1 "setfattr -x user.snapshot.snap_delete_temp $file" || {
+        log_error "snapshot delete failed"
+        return 1
+    }
+    local tries=0
+    while ssh_run 1 "getfattr --only-values -n user.snapshots $file 2>/dev/null | grep -q snap_delete_temp"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            log_error "snapshot still listed 10s after delete"
+            return 1
+        fi
+        sleep 0.1
+    done
+    free_now=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
+    if [ "$free_now" -ne "$free_before" ]; then
+        log_error "$free_now free blocks after deleting the snapshot, want $free_before"
+        return 1
+    fi
+    md5_on_vm_matches 1 "$file" "$(ssh_run 1 "md5sum < /tmp/snap_new | cut -d' ' -f1")" || return 1
+
+    log_info "Snapshot delete after overwrite test passed"
+    return 0
+}
+
+# Two VMs each take 10 snapshots of their own file at the same time. Each file
+# must list all of its snapshots, and deleting one VM's snapshots must leave
+# the other VM's alone.
+test_snapshot_concurrent_creates() {
+    log_info "Testing concurrent snapshot creation on two VMs..."
+    ensure_cluster_healthy 2
+
+    local run=$$
+    local file_a=/mnt/goclusterfs/conc_a.bin
+    local file_b=/mnt/goclusterfs/conc_b.bin
+
+    ssh_run 1 "rm -f $file_a && head -c 1048576 /dev/urandom > $file_a" || return 1
+    ssh_run 2 "rm -f $file_b && head -c 1048576 /dev/urandom > $file_b" || return 1
+
+    ssh_run 1 "for i in \$(seq 1 10); do setfattr -n user.snapshot -v conc_a_${run}_\$i $file_a || exit 1; done" &
+    local pid_a=$!
+    ssh_run 2 "for i in \$(seq 1 10); do setfattr -n user.snapshot -v conc_b_${run}_\$i $file_b || exit 1; done" &
+    local pid_b=$!
+    wait "$pid_a" || { log_error "snapshots on VM 1 failed"; return 1; }
+    wait "$pid_b" || { log_error "snapshots on VM 2 failed"; return 1; }
+
+    local count_a count_b
+    count_a=$(ssh_run 1 "getfattr --only-values -n user.snapshots $file_a 2>/dev/null | grep -c ':active'")
+    count_b=$(ssh_run 2 "getfattr --only-values -n user.snapshots $file_b 2>/dev/null | grep -c ':active'")
+    if [ "$count_a" -ne 10 ] || [ "$count_b" -ne 10 ]; then
+        log_error "$count_a and $count_b active snapshots, want 10 each"
+        return 1
+    fi
+
+    ssh_run 1 "for i in \$(seq 1 10); do setfattr -x user.snapshot.conc_a_${run}_\$i $file_a || exit 1; done" || {
+        log_error "deleting snapshots on VM 1 failed"
+        return 1
+    }
+    local tries=0
+    while ssh_run 1 "getfattr --only-values -n user.snapshots $file_a 2>/dev/null | grep -q conc_a_"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            log_error "VM 1 snapshots still listed 10s after delete"
+            return 1
+        fi
+        sleep 0.1
+    done
+    count_b=$(ssh_run 2 "getfattr --only-values -n user.snapshots $file_b 2>/dev/null | grep -c ':active'")
+    if [ "$count_b" -ne 10 ]; then
+        log_error "VM 2 lists $count_b snapshots after VM 1 deleted its own, want 10"
+        return 1
+    fi
+
+    ssh_run 2 "for i in \$(seq 1 10); do setfattr -x user.snapshot.conc_b_${run}_\$i $file_b; done"
+    log_info "Concurrent snapshot creation test passed"
+    return 0
+}
+
 # Two VMs append 1MB alternately to their own file, so both files get
 # non-contiguous blocks and grow past the old 2MB limit. Checks both files on
 # each VM after restarting it.
@@ -3006,6 +3258,10 @@ main() {
     run_test "Sequential Access" test_sequential_access
     run_test "Extent Tree Sparse Writes" test_extent_tree_sparse_writes
     run_test "Extent Tree Interleaved Appends" test_extent_tree_interleaved_appends
+    run_test "Snapshot Preserves Data" test_snapshot_preserves_data
+    run_test "Clone In-Place Write" test_clone_in_place_write
+    run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
+    run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation
@@ -3026,6 +3282,8 @@ main() {
     run_test "Broadcast Bidirectional" test_broadcast_bidirectional
     run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
     run_test "Extent Cache Coherency" test_extent_cache_coherency
+    run_test "Statfs After Remount" test_statfs_after_remount
+    run_test "Statfs Multi-Node" test_statfs_multinode
     run_test "Rolling Restart" test_rolling_restart
     run_test "Stress Random Failures" test_stress_random_failures
 

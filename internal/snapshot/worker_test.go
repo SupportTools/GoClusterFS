@@ -2,12 +2,14 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
@@ -18,11 +20,12 @@ const (
 	testBlockSize     = 1024 * 1024 // 1MB
 	testDeviceSize    = 100 * testBlockSize
 	testDataBlocks    = 50
+	testBitmapStart   = uint64(60 * testBlockSize)
+	testInodeStart    = uint64(70 * testBlockSize)
+	testInodeSize     = uint64(10 * testBlockSize)
 	testRefcountStart = uint64(80 * testBlockSize)
 	testSnapshotStart = uint64(90 * testBlockSize)
 	testSnapshotSize  = uint64(5 * 4096) // 5 sectors
-	testInodeStart    = uint64(70 * testBlockSize)
-	testInodeSize     = uint64(10 * testBlockSize)
 )
 
 // setupTestDevice creates a temporary device for testing.
@@ -61,73 +64,169 @@ func setupTestDevice(t *testing.T) (*storage.Device, string, func()) {
 	return dev, devPath, cleanup
 }
 
-// setupTestComponents creates all components needed for worker testing.
-const jobTimeout = 10 * time.Second
+// workerEnv holds a small filesystem: data blocks start at device offset 0.
+type workerEnv struct {
+	t    *testing.T
+	ctx  context.Context
+	reg  *Registry
+	refs *refcount.Region
+	bm   *bitmap.Region
+	tbl  *inode.Table
+	ext  *extent.Manager
+	w    *Worker
+	done chan *JobResult
+}
 
-// waitForJob polls done until the worker's background job has finished.
-func waitForJob(t *testing.T, done func() bool) {
+func newWorkerEnv(t *testing.T) *workerEnv {
 	t.Helper()
-	deadline := time.Now().Add(jobTimeout)
-	for !done() {
-		if time.Now().After(deadline) {
-			t.Fatalf("Background job did not finish within %v", jobTimeout)
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
+	dev, _, cleanup := setupTestDevice(t)
+	t.Cleanup(cleanup)
 
-func snapshotActive(reg *Registry, id uint64) func() bool {
-	return func() bool {
-		desc, err := reg.Get(context.Background(), id)
-		return err == nil && desc.State == StateActive
-	}
-}
-
-func snapshotRemoved(reg *Registry, id uint64) func() bool {
-	return func() bool {
-		_, err := reg.Get(context.Background(), id)
-		return err == ErrSnapshotNotFound
-	}
-}
-
-func setupTestComponents(t *testing.T, dev *storage.Device) (*Registry, *refcount.Region, *extent.Manager, *inode.Table) {
-	t.Helper()
-
-	// Create refcount region
-	refReg := refcount.NewRegion(dev, testRefcountStart, testDataBlocks, nil)
-
-	// Initialize refcount region
-	ctx := context.Background()
-	if err := refReg.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize refcount region: %v", err)
-	}
-
-	// Create snapshot registry
-	snapReg := NewRegistry(dev, testSnapshotStart, testSnapshotSize, nil)
-
-	// Initialize snapshot registry
-	if err := snapReg.Initialize(ctx); err != nil {
-		t.Fatalf("Failed to initialize snapshot registry: %v", err)
-	}
-
-	// Create extent manager (bitmap can be nil for tests not needing allocation)
-	extMgr := extent.NewManager(dev, nil, nil, 0)
-
-	// Create inode table
 	var nodeUUID [16]byte
-	inodeTbl := inode.NewTable(dev, testInodeStart, testInodeSize, nil, nodeUUID)
+	env := &workerEnv{
+		t:    t,
+		ctx:  context.Background(),
+		reg:  NewRegistry(dev, testSnapshotStart, testSnapshotSize, nil),
+		refs: refcount.NewRegion(dev, testRefcountStart, testDataBlocks, nil),
+		bm:   bitmap.NewRegion(dev, testBitmapStart, testDataBlocks, nil, nodeUUID),
+		tbl:  inode.NewTable(dev, testInodeStart, testInodeSize, nil, nodeUUID),
+		done: make(chan *JobResult, 64),
+	}
+	if err := env.reg.Initialize(env.ctx); err != nil {
+		t.Fatalf("initialize registry: %v", err)
+	}
+	env.ext = extent.NewManager(dev, env.bm, nil, 0)
+	env.ext.SetRefcounts(env.refs)
+	env.tbl.SetTreeFlusher(env.ext)
 
-	return snapReg, refReg, extMgr, inodeTbl
+	cfg := DefaultWorkerConfig()
+	cfg.OnJobComplete = func(r *JobResult) { env.done <- r }
+	env.w = NewWorker(env.reg, env.ext, env.tbl, cfg)
+	return env
+}
+
+func (env *workerEnv) start() {
+	env.w.Start()
+	env.t.Cleanup(env.w.Stop)
+}
+
+func (env *workerEnv) claim() *inode.Inode {
+	env.t.Helper()
+	num, err := env.tbl.FindFreeSlot()
+	if err != nil {
+		env.t.Fatal(err)
+	}
+	ino, err := env.tbl.ClaimSlot(env.ctx, num)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+	ino.Mode = inode.S_IFREG | 0o644
+	return ino
+}
+
+func (env *workerEnv) write(ino *inode.Inode) {
+	env.t.Helper()
+	if err := env.tbl.Write(env.ctx, ino); err != nil {
+		env.t.Fatalf("write inode %d: %v", ino.InodeNum, err)
+	}
+}
+
+func (env *workerEnv) file(blocks uint64) (*inode.Inode, []uint64) {
+	env.t.Helper()
+	ino := env.claim()
+	if _, err := env.ext.AllocateBlocks(env.ctx, ino, 0, blocks); err != nil {
+		env.t.Fatal(err)
+	}
+	env.write(ino)
+	data, err := env.ext.DataBlocks(ino)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+	return ino, data
+}
+
+// snapshot captures file the way createSnapshot does and leaves it in state.
+func (env *workerEnv) snapshot(file *inode.Inode, name string, state State) *Descriptor {
+	env.t.Helper()
+	data := env.claim()
+	data.Flags |= inode.FlagSnapshotData
+	env.write(data)
+	desc, err := env.reg.Create(env.ctx, name, file.InodeNum, 0, data.InodeNum, file.AllocatedBlocks, file.Size, FlagReadOnly)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+	blocks, err := env.ext.DataBlocks(file)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+	if err := env.refs.Share(env.ctx, blocks); err != nil {
+		env.t.Fatal(err)
+	}
+	if err := env.ext.CopyExtentsForClone(env.ctx, file, data); err != nil {
+		env.t.Fatal(err)
+	}
+	env.write(data)
+	if err := env.ext.MarkAllShared(file); err != nil {
+		env.t.Fatal(err)
+	}
+	env.write(file)
+	if state != StateCreating {
+		if err := env.reg.UpdateState(env.ctx, desc.SnapshotID, state); err != nil {
+			env.t.Fatal(err)
+		}
+	}
+	return desc
+}
+
+// remove marks a snapshot deleting, runs its delete job, and waits for it.
+func (env *workerEnv) remove(id uint64) {
+	env.t.Helper()
+	if err := env.reg.Delete(env.ctx, id); err != nil {
+		env.t.Fatal(err)
+	}
+	if _, err := env.w.QueueDeleteJob(env.ctx, id); err != nil {
+		env.t.Fatal(err)
+	}
+	env.wait(1)
+}
+
+func (env *workerEnv) wait(jobs int) {
+	env.t.Helper()
+	timeout := time.After(10 * time.Second)
+	for range jobs {
+		select {
+		case r := <-env.done:
+			if !r.Success {
+				env.t.Fatalf("job %d for snapshot %d failed: %v", r.JobID, r.SnapshotID, r.Error)
+			}
+		case <-timeout:
+			env.t.Fatalf("timed out waiting for %d snapshot job(s)", jobs)
+		}
+	}
+}
+
+func (env *workerEnv) allocated(block uint64) bool {
+	env.t.Helper()
+	ok, err := env.bm.IsAllocated(block)
+	if err != nil {
+		env.t.Fatal(err)
+	}
+	return ok
+}
+
+func (env *workerEnv) checkGone(desc *Descriptor) {
+	env.t.Helper()
+	if _, err := env.reg.Get(env.ctx, desc.SnapshotID); !errors.Is(err, ErrSnapshotNotFound) {
+		env.t.Errorf("snapshot %q still listed: %v", desc.GetName(), err)
+	}
+	if ino, err := env.tbl.Read(desc.DataInode); err != nil || ino.Magic != 0 {
+		env.t.Errorf("data inode %d of snapshot %q not freed (err=%v)", desc.DataInode, desc.GetName(), err)
+	}
 }
 
 func TestWorkerStartStop(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
+	env := newWorkerEnv(t)
+	worker := env.w
 
 	if worker.IsRunning() {
 		t.Error("Worker should not be running before Start()")
@@ -156,242 +255,75 @@ func TestWorkerStartStop(t *testing.T) {
 	}
 }
 
-func TestWorkerQueueCreateJob(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
-
-	// Create a snapshot first
-	desc, err := snapReg.Create(ctx, "test-snap", 100, 0, 0, 3, 1024, FlagReadOnly)
-	if err != nil {
-		t.Fatalf("Failed to create snapshot: %v", err)
-	}
-
-	cfg := DefaultWorkerConfig()
-	cfg.OnJobComplete = func(result *JobResult) {
-		t.Logf("Job %d completed: success=%v, duration=%v", result.JobID, result.Success, result.Duration)
-	}
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	worker.Start()
-	defer worker.Stop()
-
-	// Queue a create job
-	blockNums := []uint64{10, 11, 12}
-	jobID, err := worker.QueueCreateJob(ctx, desc.SnapshotID, 100, blockNums)
-	if err != nil {
-		t.Fatalf("Failed to queue create job: %v", err)
-	}
-
-	if jobID == 0 {
-		t.Error("Job ID should not be 0")
-	}
-
-	waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
-
-	// Verify refcounts were incremented
-	for _, blockNum := range blockNums {
-		entry, err := refReg.Get(ctx, blockNum)
-		if err != nil {
-			t.Errorf("Failed to get refcount for block %d: %v", blockNum, err)
-			continue
-		}
-		if entry.RefCount != 1 {
-			t.Errorf("Block %d refcount = %d, want 1", blockNum, entry.RefCount)
-		}
-	}
-
-	// Verify snapshot state changed to Active
-	updatedDesc, err := snapReg.Get(ctx, desc.SnapshotID)
-	if err != nil {
-		t.Fatalf("Failed to get snapshot: %v", err)
-	}
-	if updatedDesc.State != StateActive {
-		t.Errorf("Snapshot state = %v, want StateActive", updatedDesc.State)
-	}
-}
-
 func TestWorkerQueueDeleteJob(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
+	env := newWorkerEnv(t)
+	env.start()
+	initial := env.bm.FreeCount()
 
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
+	file, blocks := env.file(3)
+	snap := env.snapshot(file, "test-snap", StateActive)
 
-	// Create and complete a snapshot first
-	desc, err := snapReg.Create(ctx, "test-snap", 100, 0, 0, 3, 1024, FlagReadOnly)
-	if err != nil {
-		t.Fatalf("Failed to create snapshot: %v", err)
+	// The file lets go of its last two blocks; only the snapshot holds them now.
+	if err := env.ext.Truncate(env.ctx, file, extent.BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	env.write(file)
+	if !env.allocated(blocks[1]) || !env.allocated(blocks[2]) {
+		t.Fatal("truncating the file freed blocks the snapshot holds")
 	}
 
-	// Set up initial refcounts
-	blockNums := []uint64{20, 21, 22}
-	for _, blockNum := range blockNums {
-		if _, err := refReg.Increment(ctx, blockNum); err != nil {
-			t.Fatalf("Failed to increment refcount for block %d: %v", blockNum, err)
-		}
+	env.remove(snap.SnapshotID)
+	env.checkGone(snap)
+	if env.allocated(blocks[1]) || env.allocated(blocks[2]) {
+		t.Error("blocks only the snapshot held stay allocated")
 	}
-
-	// Mark snapshot as active, then delete
-	if err := snapReg.UpdateState(ctx, desc.SnapshotID, StateActive); err != nil {
-		t.Fatalf("Failed to update state: %v", err)
+	if !env.allocated(blocks[0]) {
+		t.Error("deleting the snapshot freed a block the file still maps")
 	}
-	if err := snapReg.Delete(ctx, desc.SnapshotID); err != nil {
-		t.Fatalf("Failed to delete snapshot: %v", err)
-	}
-
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	worker.Start()
-	defer worker.Stop()
-
-	// Queue delete job
-	jobID, err := worker.QueueDeleteJob(ctx, desc.SnapshotID, blockNums)
-	if err != nil {
-		t.Fatalf("Failed to queue delete job: %v", err)
-	}
-
-	if jobID == 0 {
-		t.Error("Job ID should not be 0")
-	}
-
-	waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
-
-	// Verify refcounts were decremented
-	for _, blockNum := range blockNums {
-		entry, err := refReg.Get(ctx, blockNum)
-		if err != nil {
-			t.Errorf("Failed to get refcount for block %d: %v", blockNum, err)
-			continue
-		}
-		if entry.RefCount != 0 {
-			t.Errorf("Block %d refcount = %d, want 0", blockNum, entry.RefCount)
-		}
-	}
-
-	// Verify snapshot was removed
-	_, err = snapReg.Get(ctx, desc.SnapshotID)
-	if err != ErrSnapshotNotFound {
-		t.Errorf("Snapshot should be removed, got err = %v", err)
-	}
-}
-
-func TestWorkerNotRunning(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
-
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	// Don't start the worker
-
-	_, err := worker.QueueCreateJob(ctx, 1, 100, []uint64{1, 2, 3})
-	if err == nil {
-		t.Error("QueueCreateJob should fail when worker not running")
-	}
-
-	_, err = worker.QueueDeleteJob(ctx, 1, []uint64{1, 2, 3})
-	if err == nil {
-		t.Error("QueueDeleteJob should fail when worker not running")
-	}
-}
-
-func TestWorkerEmptyBlockList(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
-
-	// Create snapshot
-	desc, err := snapReg.Create(ctx, "empty-snap", 100, 0, 0, 0, 0, FlagReadOnly)
-	if err != nil {
-		t.Fatalf("Failed to create snapshot: %v", err)
-	}
-
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	worker.Start()
-	defer worker.Stop()
-
-	// Queue create job with empty block list
-	_, err = worker.QueueCreateJob(ctx, desc.SnapshotID, 100, []uint64{})
-	if err != nil {
-		t.Fatalf("Failed to queue empty create job: %v", err)
-	}
-
-	waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
-
-	// Verify snapshot state changed to Active
-	updatedDesc, err := snapReg.Get(ctx, desc.SnapshotID)
-	if err != nil {
-		t.Fatalf("Failed to get snapshot: %v", err)
-	}
-	if updatedDesc.State != StateActive {
-		t.Errorf("Snapshot state = %v, want StateActive", updatedDesc.State)
+	if got := env.bm.FreeCount(); got != initial-1 {
+		t.Errorf("free blocks = %d, want %d", got, initial-1)
 	}
 }
 
 // TestWorkerQueuesJobsWithCanceledContext checks that a canceled FUSE request
 // context cannot drop a job for a snapshot that already exists.
 func TestWorkerQueuesJobsWithCanceledContext(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
+	env := newWorkerEnv(t)
+	file, _ := env.file(1)
+	var snaps []*Descriptor
+	for i := range 20 {
+		snaps = append(snaps, env.snapshot(file, fmt.Sprintf("snap%d", i), StateDeleting))
+	}
+	env.start()
 
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, DefaultWorkerConfig())
-	worker.Start()
-	defer worker.Stop()
-
-	canceled, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(env.ctx)
 	cancel()
+	for _, snap := range snaps {
+		if _, err := env.w.QueueDeleteJob(ctx, snap.SnapshotID); err != nil {
+			t.Fatalf("queue delete of %q: %v", snap.GetName(), err)
+		}
+	}
+	env.wait(len(snaps))
+	for _, snap := range snaps {
+		env.checkGone(snap)
+	}
+}
 
-	for i := 0; i < 20; i++ {
-		desc, err := snapReg.Create(context.Background(), fmt.Sprintf("snap-%d", i), 100, 0, 0, 0, 1024, FlagReadOnly)
-		if err != nil {
-			t.Fatalf("Failed to create snapshot %d: %v", i, err)
-		}
-
-		if _, err := worker.QueueCreateJob(canceled, desc.SnapshotID, 100, []uint64{}); err != nil {
-			t.Fatalf("QueueCreateJob %d with canceled context: %v", i, err)
-		}
-		waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
-
-		if err := snapReg.Delete(context.Background(), desc.SnapshotID); err != nil {
-			t.Fatalf("Failed to delete snapshot %d: %v", i, err)
-		}
-		if _, err := worker.QueueDeleteJob(canceled, desc.SnapshotID, []uint64{}); err != nil {
-			t.Fatalf("QueueDeleteJob %d with canceled context: %v", i, err)
-		}
-		waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
+func TestWorkerNotRunning(t *testing.T) {
+	env := newWorkerEnv(t)
+	if _, err := env.w.QueueDeleteJob(env.ctx, 1); !errors.Is(err, ErrWorkerStopped) {
+		t.Errorf("QueueDeleteJob on a stopped worker: got %v, want ErrWorkerStopped", err)
 	}
 }
 
 func TestWorkerPendingJobs(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-
-	cfg := DefaultWorkerConfig()
-	cfg.QueueSize = 10
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-
-	// Before starting, pending should be 0
-	if worker.PendingJobs() != 0 {
-		t.Errorf("PendingJobs = %d before start, want 0", worker.PendingJobs())
+	env := newWorkerEnv(t)
+	if env.w.PendingJobs() != 0 {
+		t.Errorf("PendingJobs = %d before start, want 0", env.w.PendingJobs())
 	}
-
-	worker.Start()
-	defer worker.Stop()
-
-	// After starting with no jobs, still 0
-	if worker.PendingJobs() != 0 {
-		t.Errorf("PendingJobs = %d after start, want 0", worker.PendingJobs())
+	env.start()
+	if env.w.PendingJobs() != 0 {
+		t.Errorf("PendingJobs = %d after start, want 0", env.w.PendingJobs())
 	}
 }
 
@@ -406,83 +338,70 @@ func TestDefaultWorkerConfig(t *testing.T) {
 	}
 }
 
-// TestLeafSnapshotDeletion tests deleting a snapshot with no children.
-// Expected behavior:
-// - Refcounts decremented
-// - Blocks with refcount=0 are freed via bitmap
-// - Snapshot descriptor removed
+// TestLeafSnapshotDeletion deletes the only owner left after the file is gone.
 func TestLeafSnapshotDeletion(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
+	env := newWorkerEnv(t)
+	env.start()
+	initial := env.bm.FreeCount()
 
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
-
-	// Create a snapshot (will be a leaf since it has no children)
-	desc, err := snapReg.Create(ctx, "leaf-snap", 100, 0, 0, 3, 1024, FlagReadOnly)
-	if err != nil {
-		t.Fatalf("Failed to create snapshot: %v", err)
+	file, blocks := env.file(2)
+	snap := env.snapshot(file, "leaf-snap", StateActive)
+	if err := env.ext.Delete(env.ctx, file); err != nil {
+		t.Fatal(err)
 	}
-
-	// Set up initial refcounts (simulating blocks used by snapshot)
-	blockNums := []uint64{30, 31, 32}
-	for _, blockNum := range blockNums {
-		if _, err := refReg.Increment(ctx, blockNum); err != nil {
-			t.Fatalf("Failed to increment refcount for block %d: %v", blockNum, err)
+	if err := env.tbl.Free(env.ctx, file.InodeNum); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range blocks {
+		if !env.allocated(b) {
+			t.Fatalf("deleting the file freed block %d that the snapshot holds", b)
 		}
 	}
 
-	// Mark as active then delete
-	if err := snapReg.UpdateState(ctx, desc.SnapshotID, StateActive); err != nil {
-		t.Fatalf("Failed to update state: %v", err)
+	env.remove(snap.SnapshotID)
+	env.checkGone(snap)
+	if got := env.bm.FreeCount(); got != initial {
+		t.Errorf("free blocks = %d, want %d", got, initial)
 	}
-	if err := snapReg.Delete(ctx, desc.SnapshotID); err != nil {
-		t.Fatalf("Failed to delete snapshot: %v", err)
+}
+
+func TestRecoverIncompleteSnapshots(t *testing.T) {
+	env := newWorkerEnv(t)
+	file, blocks := env.file(2)
+	active := env.snapshot(file, "active", StateActive)
+	creating := env.snapshot(file, "creating", StateCreating)
+	deleting := env.snapshot(file, "deleting", StateDeleting)
+	env.start()
+
+	if err := env.w.RecoverIncompleteJobs(env.ctx); err != nil {
+		t.Fatal(err)
 	}
+	env.wait(2)
 
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	worker.Start()
-	defer worker.Stop()
-
-	// Queue delete job
-	_, err = worker.QueueDeleteJob(ctx, desc.SnapshotID, blockNums)
-	if err != nil {
-		t.Fatalf("Failed to queue delete job: %v", err)
+	env.checkGone(creating)
+	env.checkGone(deleting)
+	if got, err := env.reg.Get(env.ctx, active.SnapshotID); err != nil || got.State != StateActive {
+		t.Fatalf("active snapshot after recovery: %+v, %v", got, err)
 	}
-
-	waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
-
-	// Verify refcounts are 0 (all decremented)
-	for _, blockNum := range blockNums {
-		entry, err := refReg.Get(ctx, blockNum)
+	for _, b := range blocks {
+		e, err := env.refs.Get(env.ctx, b)
 		if err != nil {
-			t.Errorf("Failed to get refcount for block %d: %v", blockNum, err)
-			continue
+			t.Fatal(err)
 		}
-		if entry.RefCount != 0 {
-			t.Errorf("Block %d refcount = %d, want 0", blockNum, entry.RefCount)
+		if !env.allocated(b) || e.RefCount != 2 {
+			t.Errorf("block %d: allocated=%v refcount=%d, want held by the file and one snapshot", b, env.allocated(b), e.RefCount)
 		}
-	}
-
-	// Verify snapshot is removed
-	_, err = snapReg.Get(ctx, desc.SnapshotID)
-	if err != ErrSnapshotNotFound {
-		t.Errorf("Expected ErrSnapshotNotFound, got %v", err)
 	}
 }
 
 // TestMiddleSnapshotDeletionMergeUp tests deleting a snapshot that has children.
 // Expected behavior:
 // - Children are re-parented to grandparent (merge-up)
-// - Refcounts decremented
 // - Snapshot descriptor removed
 func TestMiddleSnapshotDeletionMergeUp(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
+	env := newWorkerEnv(t)
+	snapReg, ctx := env.reg, env.ctx
+	env.start()
 
 	// Create parent snapshot (root)
 	rootSnap, err := snapReg.Create(ctx, "root-snap", 100, 0, 0, 2, 1024, FlagReadOnly)
@@ -511,35 +430,7 @@ func TestMiddleSnapshotDeletionMergeUp(t *testing.T) {
 		t.Fatalf("Failed to activate leaf: %v", err)
 	}
 
-	// Set up refcounts for middle snapshot's blocks
-	middleBlocks := []uint64{40, 41, 42}
-	for _, blockNum := range middleBlocks {
-		// Increment twice: once for middle, once simulating shared with leaf
-		if _, err := refReg.Increment(ctx, blockNum); err != nil {
-			t.Fatalf("Failed to increment refcount: %v", err)
-		}
-		if _, err := refReg.Increment(ctx, blockNum); err != nil {
-			t.Fatalf("Failed to increment refcount: %v", err)
-		}
-	}
-
-	// Delete middle snapshot
-	if err := snapReg.Delete(ctx, middleSnap.SnapshotID); err != nil {
-		t.Fatalf("Failed to delete middle snapshot: %v", err)
-	}
-
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	worker.Start()
-	defer worker.Stop()
-
-	// Queue delete job for middle snapshot
-	_, err = worker.QueueDeleteJob(ctx, middleSnap.SnapshotID, middleBlocks)
-	if err != nil {
-		t.Fatalf("Failed to queue delete job: %v", err)
-	}
-
-	waitForJob(t, snapshotRemoved(snapReg, middleSnap.SnapshotID))
+	env.remove(middleSnap.SnapshotID)
 
 	// Verify leaf snapshot was re-parented to root
 	updatedLeaf, err := snapReg.Get(ctx, leafSnap.SnapshotID)
@@ -549,18 +440,6 @@ func TestMiddleSnapshotDeletionMergeUp(t *testing.T) {
 	if updatedLeaf.ParentID != rootSnap.SnapshotID {
 		t.Errorf("Leaf ParentID = %d, want %d (should be re-parented to root)",
 			updatedLeaf.ParentID, rootSnap.SnapshotID)
-	}
-
-	// Verify refcounts decremented (should be 1 now, not 0, due to leaf sharing)
-	for _, blockNum := range middleBlocks {
-		entry, err := refReg.Get(ctx, blockNum)
-		if err != nil {
-			t.Errorf("Failed to get refcount for block %d: %v", blockNum, err)
-			continue
-		}
-		if entry.RefCount != 1 {
-			t.Errorf("Block %d refcount = %d, want 1 (shared with leaf)", blockNum, entry.RefCount)
-		}
 	}
 
 	// Verify middle snapshot is removed
@@ -582,11 +461,8 @@ func TestMiddleSnapshotDeletionMergeUp(t *testing.T) {
 
 // TestGetChildren verifies the GetChildren registry method.
 func TestGetChildren(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, _, _, _ := setupTestComponents(t, dev)
-	ctx := context.Background()
+	env := newWorkerEnv(t)
+	snapReg, ctx := env.reg, env.ctx
 
 	// Create parent snapshot
 	parent, err := snapReg.Create(ctx, "parent", 100, 0, 0, 1, 100, FlagReadOnly)
@@ -646,11 +522,8 @@ func TestGetChildren(t *testing.T) {
 
 // TestUpdateParentID verifies the UpdateParentID registry method.
 func TestUpdateParentID(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, _, _, _ := setupTestComponents(t, dev)
-	ctx := context.Background()
+	env := newWorkerEnv(t)
+	snapReg, ctx := env.reg, env.ctx
 
 	// Create a chain: grandparent -> parent -> child
 	grandparent, err := snapReg.Create(ctx, "grandparent", 100, 0, 0, 1, 100, FlagReadOnly)
@@ -697,11 +570,9 @@ func TestUpdateParentID(t *testing.T) {
 
 // TestMultipleChildrenMergeUp tests merge-up when a snapshot has multiple children.
 func TestMultipleChildrenMergeUp(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
-	ctx := context.Background()
+	env := newWorkerEnv(t)
+	snapReg, ctx := env.reg, env.ctx
+	env.start()
 
 	// Create: root -> middle -> {child1, child2, child3}
 	root, err := snapReg.Create(ctx, "root", 100, 0, 0, 1, 100, FlagReadOnly)
@@ -732,23 +603,7 @@ func TestMultipleChildrenMergeUp(t *testing.T) {
 		children = append(children, child)
 	}
 
-	// Delete middle
-	if err := snapReg.Delete(ctx, middle.SnapshotID); err != nil {
-		t.Fatalf("Failed to delete middle: %v", err)
-	}
-
-	cfg := DefaultWorkerConfig()
-	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, cfg)
-	worker.Start()
-	defer worker.Stop()
-
-	// Queue delete job
-	_, err = worker.QueueDeleteJob(ctx, middle.SnapshotID, []uint64{})
-	if err != nil {
-		t.Fatalf("Failed to queue delete job: %v", err)
-	}
-
-	waitForJob(t, snapshotRemoved(snapReg, middle.SnapshotID))
+	env.remove(middle.SnapshotID)
 
 	// Verify all children now point to root
 	for i, child := range children {
@@ -767,5 +622,35 @@ func TestMultipleChildrenMergeUp(t *testing.T) {
 	_, err = snapReg.Get(ctx, middle.SnapshotID)
 	if err != ErrSnapshotNotFound {
 		t.Errorf("Middle snapshot should be removed, got: %v", err)
+	}
+}
+
+// A delete job for a snapshot that is not marked deleting, such as one another
+// node activated after a mount listed it as creating, must leave it alone.
+func TestDeleteJobRequiresDeletingState(t *testing.T) {
+	env := newWorkerEnv(t)
+	env.start()
+	file, blocks := env.file(1)
+	snap := env.snapshot(file, "active", StateActive)
+
+	if _, err := env.w.QueueDeleteJob(env.ctx, snap.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-env.done:
+		if r.Success {
+			t.Fatal("delete job succeeded on an active snapshot")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("delete job did not finish")
+	}
+	if got, err := env.reg.Get(env.ctx, snap.SnapshotID); err != nil || got.State != StateActive {
+		t.Fatalf("snapshot after refused delete: %+v, %v; want active", got, err)
+	}
+	if ino, err := env.tbl.Read(snap.DataInode); err != nil || ino.Magic == 0 {
+		t.Fatalf("data inode %d freed by a refused delete (err=%v)", snap.DataInode, err)
+	}
+	if e, err := env.refs.Get(env.ctx, blocks[0]); err != nil || e.RefCount != 2 {
+		t.Fatalf("block refcount %+v, %v; want 2", e, err)
 	}
 }

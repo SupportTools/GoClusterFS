@@ -24,11 +24,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o goclusterfs-mount ./cmd/mount
 FROM debian:bookworm-slim AS runtime
 
 # Install runtime dependencies:
+# - attr: setfattr/getfattr for snapshot and clone tests
 # - fuse3: FUSE filesystem support
 # - iproute2: tc (traffic control) for network simulation
 # - iptables: Firewall rules for network partition simulation
 # - procps: ps, top for debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    attr \
     fuse3 \
     iproute2 \
     iptables \
