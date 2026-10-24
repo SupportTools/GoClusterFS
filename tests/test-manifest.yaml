@@ -1307,3 +1307,84 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/journal_fuzz_test.go::FuzzJournalScan
+
+  # ===========================================================================
+  # DISTRIBUTED LOCK SAFETY (internal/lock)
+  # Two or three lock managers share one device to act as separate nodes.
+  # ===========================================================================
+
+  # Docker/VM TODO: a shell test would have to freeze a node (docker pause, or
+  # SIGSTOP on the QEMU process) inside a lock-held section that lasts
+  # milliseconds, then resume it after StaleThreshold. Shell tests cannot target
+  # that window, so the Go test simulates the pause by aging the on-disk record.
+  - id: lock-stale-reclaim-paused-holder
+    name: Stale lock reclaimed from paused holder
+    description: A holder stalled past StaleThreshold loses its lock to another node without being told
+    priority: high
+    environments:
+      go: ../../internal/lock/safety_test.go::TestStaleLockIsReclaimedFromPausedHolder
+      docker: TODO
+      vm: TODO
+
+  - id: lock-paused-holder-release
+    name: Paused holder release keeps new holder's lock
+    description: A late Release from a holder whose lock was reclaimed returns ErrNotLockOwner and leaves the new holder's record intact
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestPausedHolderReleaseKeepsReclaimedLock
+
+  - id: lock-colliding-resources-excluded
+    name: Colliding resources exclude other nodes
+    description: A held record blocks other nodes from every resource that hashes to it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCollidingResourceIsBlockedWhileOtherNodeHoldsRecord
+
+  - id: lock-same-node-colliding-resources
+    name: One node holds colliding resources
+    description: A node can hold two resources that share a record; the record stays held until the last one is released
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestNodeHoldsCollidingResourcesUntilLastRelease
+
+  - id: lock-same-node-concurrent-acquire
+    name: Concurrent same-node acquire keeps the lock
+    description: Goroutines on one node acquiring the same lock at once leave it held on disk
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestConcurrentAcquireOnOneNodeKeepsOtherNodesOut
+
+  - id: lock-shared-release-by-count
+    name: Shared lock survives another reader's release
+    description: Releasing one reader's shared hold does not free the lock for writers while other readers hold it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSharedLockHeldAfterAnotherReaderReleases
+
+  - id: lock-exclusive-waits-same-node-readers
+    name: Exclusive waits for same-node readers
+    description: An exclusive request does not piggyback on a shared hold from the same node
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestExclusiveWaitsForSameNodeReaders
+
+  - id: lock-upgrade-same-goroutine
+    name: Shared to exclusive upgrade rejected
+    description: A goroutine holding a shared lock gets ErrDeadlockRisk when it asks for exclusive on the same record
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSameGoroutineCannotUpgradeSharedToExclusive
+
+  - id: lock-stale-shared-reclaim
+    name: Stale shared lock reclaim drops dead readers
+    description: Reclaiming a stale shared record resets the reader count so it can be fully released
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestStaleSharedLockReclaimResetsReaderCount
+
+  - id: lock-region-bounded
+    name: Lock region stays bounded
+    description: Many acquire/release cycles across resources and two nodes reuse the fixed region, leave no record held, and write nothing outside it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles
