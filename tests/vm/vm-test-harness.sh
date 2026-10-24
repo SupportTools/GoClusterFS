@@ -206,7 +206,7 @@ setup-interfaces -a
 ifup eth0
 printf '%s\n' "$repo/main" "$repo/community" > /etc/apk/repositories
 tries=0
-until apk add --no-cache openssh fuse3 gcompat; do
+until apk add --no-cache openssh fuse3 gcompat attr; do
     tries=$((tries + 1))
     [ "$tries" -lt 5 ] || exit 1
     sleep 3
