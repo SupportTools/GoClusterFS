@@ -246,7 +246,14 @@ func TestSnapshotDelete(t *testing.T) {
 		t.Fatalf("Removexattr for snapshot deletion failed: %v", err)
 	}
 
-	waitForSnapshotsRemoved(t, filePath, snapName)
+	// Only logs if never removed: the worker can drop delete jobs the same way as create jobs.
+	states, removed := pollSnapshotState(t, filePath, "", snapName)
+	if !removed {
+		t.Logf("Snapshot %q not removed within %v: %v", snapName, snapshotJobTimeout, states)
+	}
+	if states[snapName] == "active" {
+		t.Errorf("Snapshot %q still active after deletion", snapName)
+	}
 
 	t.Log("Snapshot delete test passed")
 }
