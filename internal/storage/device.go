@@ -130,13 +130,13 @@ func Open(path string) (*Device, error) {
 	// Get device size
 	size, err := file.Seek(0, io.SeekEnd)
 	if err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("failed to get device size: %w", err)
 	}
 
 	// Rewind to start
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		file.Close()
+		_ = file.Close()
 		return nil, fmt.Errorf("failed to seek to start: %w", err)
 	}
 

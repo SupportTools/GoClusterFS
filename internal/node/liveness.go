@@ -28,8 +28,11 @@ var processStart = time.Now().UnixNano()
 
 func readBootID() (id [16]byte) {
 	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
-	if err == nil {
-		hex.Decode(id[:], bytes.ReplaceAll(bytes.TrimSpace(b), []byte("-"), nil))
+	if err != nil {
+		return id
+	}
+	if _, err := hex.Decode(id[:], bytes.ReplaceAll(bytes.TrimSpace(b), []byte("-"), nil)); err != nil {
+		return [16]byte{}
 	}
 	return id
 }

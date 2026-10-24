@@ -87,13 +87,15 @@ func TestDeviceWithFile(t *testing.T) {
 	// Write 1MB of zeros
 	size := int64(1 << 20)
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		t.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
-	defer os.Remove(testFile)
+	defer func() { _ = os.Remove(testFile) }()
 
 	// Try to open with O_DIRECT
 	dev, err := Open(testFile)
@@ -101,7 +103,7 @@ func TestDeviceWithFile(t *testing.T) {
 		// O_DIRECT not supported on this filesystem
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	// Test Size()
 	if dev.Size() != size {
@@ -164,15 +166,19 @@ func TestDeviceUnalignedOperations(t *testing.T) {
 	if err != nil {
 		t.Skipf("Cannot create test file: %v", err)
 	}
-	f.Truncate(1 << 20)
-	f.Close()
-	defer os.Remove(testFile)
+	if err := f.Truncate(1 << 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(testFile) }()
 
 	dev, err := Open(testFile)
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	// Unaligned offset should fail
 	buf := NewAlignedBuffer(SectorSize)
@@ -234,18 +240,20 @@ func TestConcurrentShardedIO(t *testing.T) {
 	// Create file large enough for multiple shards (4 MB = 4 shards)
 	size := int64(4 * IOShardSize)
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		t.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
-	defer os.Remove(testFile)
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(testFile) }()
 
 	dev, err := Open(testFile)
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	// Run concurrent writes to different shards
 	const numGoroutines = 4
@@ -309,18 +317,20 @@ func TestMultiShardIO(t *testing.T) {
 	// Create file large enough for cross-shard test
 	size := int64(3 * IOShardSize)
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		t.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
-	defer os.Remove(testFile)
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(testFile) }()
 
 	dev, err := Open(testFile)
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	// Write data that spans two shards
 	// Start at offset IOShardSize - SectorSize and write 2 sectors
@@ -339,7 +349,9 @@ func TestMultiShardIO(t *testing.T) {
 	}
 
 	// Sync and read back
-	dev.Sync()
+	if err := dev.Sync(); err != nil {
+		t.Fatal(err)
+	}
 
 	readBuf := NewAlignedBuffer(2 * SectorSize)
 	n, err = dev.ReadAt(readBuf.Bytes(), int64(startOffset))
