@@ -853,9 +853,9 @@ scenarios:
   # ===========================================================================
   # SFB (SUB-FILE BLOCK) CONTAINERS
   # ===========================================================================
-  # SFB provides efficient storage for small files by packing them into shared
-  # 1MB blocks. Tiers: 4KB (256 slots), 8KB (128), 16KB (64), 64KB (16).
-  # Files >64KB migrate to full extent allocation.
+  # SFB allocation is disabled, so the sfb_test.go tests now cover small files on
+  # full blocks. The sfb-legacy tests use hand-made SFB inodes, which FUSE cannot
+  # create, to check that files older builds stored in slots stay safe.
 
   - id: sfb-small-file-allocation
     name: SFB small file allocation
@@ -919,6 +919,27 @@ scenarios:
       go: sfb_test.go::TestSFBOverwrite
       docker: TODO
       vm: TODO
+
+  - id: sfb-legacy-read
+    name: Read a legacy SFB inode
+    description: File.Read returns the data in an SFB slot instead of reading the packed container/slot value as a block number
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/data_safety_test.go::TestSFBInodeReadable
+
+  - id: sfb-legacy-migration
+    name: Legacy SFB inode migrates without data loss
+    description: Growing an SFB file past its slot copies its data to a full block with aligned I/O and frees the slot
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/data_safety_test.go::TestSFBMigrationKeepsData
+
+  - id: sfb-legacy-slot-free
+    name: Legacy SFB slot freed on unlink and truncate
+    description: Unlink through FS and Dir, and truncate, clear the file's slot in its container header
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/data_safety_test.go::TestSFBSlotFreed
 
   # ===========================================================================
   # CACHE BROADCAST TESTS (Phase 4: Cache Coherency)

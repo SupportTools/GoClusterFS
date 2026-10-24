@@ -368,8 +368,7 @@ Good for general workloads:
 ./goclusterfs -device /dev/device -mount /mnt/fs \
     -journal \
     -cache-ttl 5s \
-    -trim \
-    -sfb
+    -trim
 ```
 
 ### High Consistency
@@ -405,7 +404,6 @@ Disable advanced features for debugging:
     -journal=false \
     -broadcast=false \
     -trim=false \
-    -sfb=false \
     -snapshots=false \
     -debug
 ```

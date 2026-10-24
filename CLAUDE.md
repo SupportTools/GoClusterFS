@@ -49,7 +49,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/cache/broadcast` | UDP multicast/unicast cache invalidation, optional HMAC |
 | `internal/refcount` | Per-block reference counts for copy-on-write |
 | `internal/snapshot` | Snapshot registry and background refcount worker |
-| `internal/sfb` | Small-file containers: 4/8/16/64 KB slots inside a 1 MB block |
+| `internal/sfb` | Small-file containers (4/8/16/64 KB slots in a 1 MB block). Disabled: nothing allocates slots, `goclusterfs` only reads and migrates files older builds stored there |
 | `internal/trim` | Batched `BLKDISCARD` for freed blocks |
 | `internal/fsck` | The fsck phases |
 | `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
@@ -91,7 +91,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - Every node uses the same 4 MB journal region at 5 MB. `cmd/mount` does not give each node its own journal slot.
 - Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
 - The inode count is fixed at 4096.
-- SFB containers fail on real devices: `internal/sfb` writes buffers that are not 4 KB aligned, so `storage.WriteAt` rejects them and small files fall back to full 1 MB blocks.
+- SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - No rename, symlinks, or hard links.
 
 ## Testing
