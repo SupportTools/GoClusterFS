@@ -174,7 +174,7 @@ rm /mnt/fs/.snapshots/snapshot_name
 
 - **Clocks:** Nodes judge each other's heartbeats by wall clock. A node more than about 10 seconds ahead treats live peers as failed, replays their journals and takes their registry slots. Run NTP on every node.
 - **Restarts:** A restarted mount takes back the registry slot of a mount that exited on the same host (same hostname and kernel boot ID) and replays its journal before serving. In the same PID namespace it checks the old process ID; across PID namespaces it waits for the old slot's heartbeat to go stale.
-- **Crashed node's locks:** A node's lock records are released as soon as it is proven dead: its mount process is gone (same host and PID namespace), or its heartbeat has not changed for 15 seconds by the observing node's own clock. Otherwise they are freed once they are 15 seconds old. A paused node keeps its locks.
+- **Crashed node's locks:** Once a node is proven dead, the node replaying its journal takes over its exclusive locks and frees them after the replay, so no other node uses them mid-replay. Proven dead means its mount process is gone (same host and PID namespace), or its heartbeat is more than 20 seconds old and has not changed for 15 seconds by the observing node's own clock. A node paused for more than about 20 seconds therefore counts as dead; it exits on its next heartbeat. A dead node's shared locks, and the locks of a node not proven dead, are freed once they are 15 seconds old.
 - **Node count:** The device has 64 registry slots, each with its own 4 MB journal. A crashed node's slot frees once another node replays its journal, or when the same host mounts again.
 
 ### Known Gaps in Slot Ownership

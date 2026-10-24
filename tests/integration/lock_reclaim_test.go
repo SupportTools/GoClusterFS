@@ -44,16 +44,17 @@ func TestSurvivorReleasesCrashedNodeLocks(t *testing.T) {
 		t.Logf("node B created a file %v after node A crashed holding the root directory lock", took)
 	}
 
-	reclaimed := regexp.MustCompile(`reclaimed \d+ lock records of dead node ` + fmt.Sprintf("%x", uuidA[:8]))
-	if !reclaimed.MatchString(logB.String()) {
-		t.Error("node B did not log releasing node A's locks")
+	tookOver := regexp.MustCompile(`took over \d+ lock records of dead node ` + fmt.Sprintf("%x", uuidA[:8]))
+	if !tookOver.MatchString(logB.String()) {
+		t.Error("node B did not log taking over node A's locks")
 	}
 }
 
-// TestSlowNodeKeepsLocks pauses node A (alive, but its heartbeat stops) while
-// it holds the root directory lock. Node B must not take the lock while A's
-// process exists and A's heartbeat has not been silent for the heartbeat
-// timeout plus margin by B's own clock.
+// TestSlowNodeKeepsLocks pauses node A for 17s while it holds the root
+// directory lock: longer than the heartbeat timeout and B's own-clock check
+// (15s), shorter than the 20s after which failure detection treats a silent
+// node as dead. B must not take the lock before it goes stale, and must never
+// take over A's locks as a dead node's.
 func TestSlowNodeKeepsLocks(t *testing.T) {
 	cluster, uuidA, logB := startPairForLockTest(t)
 	pid := cluster.Node(0).PID()
@@ -70,6 +71,7 @@ func TestSlowNodeKeepsLocks(t *testing.T) {
 	result := make(chan error, 1)
 	go attempt(result)
 	paused := time.After(12 * time.Second)
+	resume := time.After(17 * time.Second)
 	for waiting := true; waiting; {
 		select {
 		case err := <-result:
@@ -82,8 +84,9 @@ func TestSlowNodeKeepsLocks(t *testing.T) {
 			waiting = false
 		}
 	}
+	<-resume
 	if regexp.MustCompile(`lock records of dead node ` + fmt.Sprintf("%x", uuidA[:8])).MatchString(logB.String()) {
-		t.Error("node B released the locks of a paused, live node")
+		t.Error("node B took over the locks of a paused, live node")
 	}
 
 	syscall.Kill(pid, syscall.SIGCONT)

@@ -1,34 +1,49 @@
 package lock
 
-import "log"
+import (
+	"log"
+	"time"
+)
 
-// ReclaimOwner releases the lock records held by owner and returns how many it
-// changed. Call it only once owner is proven dead (its process gone, or its
-// lease expired by this node's monotonic clock plus a margin): a slow node
-// that still runs would lose locks it is using.
+// adoptSettle is how long AdoptOwner waits before re-reading the records it
+// took, so a peer's racing stale takeover of one of them is noticed.
+const adoptSettle = 50 * time.Millisecond
+
+// AdoptOwner makes this node the holder of every exclusive lock record owner
+// holds and returns their IDs. Call it only once owner is proven dead, before
+// replaying owner's journal, and pass the result to ReleaseAdopted after the
+// replay: until then peers cannot take the locks of the dead node's unfinished
+// operations, while this node's own acquires reuse them.
 //
-// Exclusive records of owner are freed. A shared record names only its latest
-// reader, so when that reader is owner its one count is dropped and the record
-// is freed if it was the last; other readers' counts stay until they release
-// or the record goes stale.
-func (m *Manager) ReclaimOwner(owner [16]byte) (int, error) {
-	reclaimed := 0
+// Shared records are left to the staleness rule: OwnerUUID names only the
+// latest reader, who may have released already while others still read.
+func (m *Manager) AdoptOwner(owner [16]byte) ([]uint64, error) {
+	var taken []uint64
 	for recordID := uint64(0); recordID < m.size/RecordSize; recordID++ {
-		changed, err := m.reclaimRecord(recordID, owner)
+		ok, err := m.adoptRecord(recordID, owner)
 		if err != nil {
-			return reclaimed, err
+			return taken, err
 		}
-		if changed {
-			reclaimed++
+		if ok {
+			taken = append(taken, recordID)
 		}
 	}
-	if reclaimed > 0 {
-		log.Printf("lock: reclaimed %d lock records of dead node %x", reclaimed, owner[:8])
+	if len(taken) == 0 {
+		return nil, nil
 	}
-	return reclaimed, nil
+
+	time.Sleep(adoptSettle)
+	var adopted []uint64
+	for _, recordID := range taken {
+		if m.holdsExclusive(recordID) {
+			adopted = append(adopted, recordID)
+		}
+	}
+	log.Printf("lock: took over %d lock records of dead node %x", len(adopted), owner[:8])
+	return adopted, nil
 }
 
-func (m *Manager) reclaimRecord(recordID uint64, owner [16]byte) (bool, error) {
+func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
@@ -38,20 +53,15 @@ func (m *Manager) reclaimRecord(recordID uint64, owner [16]byte) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if record.Mode == LockModeNone || record.OwnerUUID != owner {
+		if record.Mode != LockModeExclusive || record.OwnerUUID != owner {
 			return false, nil
 		}
-
-		next := &Record{Sequence: record.Sequence + 1}
-		if record.Mode == LockModeShared && record.SharedCount > 1 {
-			kept := *record
-			kept.OwnerUUID = [16]byte{}
-			kept.SharedCount--
-			kept.Sequence++
-			next = &kept
-		}
-
-		ok, err := m.casRecord(recordID, record, next)
+		adopted := *record
+		adopted.OwnerUUID = m.nodeUUID
+		adopted.OwnerSlot = uint32(m.nodeSlot)
+		adopted.AcquireTime = time.Now().Unix()
+		adopted.Sequence++
+		ok, err := m.casRecord(recordID, record, &adopted)
 		if err != nil {
 			return false, err
 		}
@@ -59,4 +69,47 @@ func (m *Manager) reclaimRecord(recordID uint64, owner [16]byte) (bool, error) {
 			return true, nil
 		}
 	}
+}
+
+// ReleaseAdopted frees the records AdoptOwner returned that this node still
+// holds without using them itself; a record in use is freed by its own release.
+func (m *Manager) ReleaseAdopted(records []uint64) error {
+	for _, recordID := range records {
+		if err := m.releaseAdopted(recordID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) releaseAdopted(recordID uint64) error {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	m.mu.Lock()
+	_, inUse := m.records[recordID]
+	m.mu.Unlock()
+	if inUse {
+		return nil
+	}
+
+	for {
+		record, err := m.readRecord(recordID)
+		if err != nil {
+			return err
+		}
+		if record.Mode != LockModeExclusive || record.OwnerUUID != m.nodeUUID {
+			return nil
+		}
+		ok, err := m.casRecord(recordID, record, &Record{Sequence: record.Sequence + 1})
+		if err != nil || ok {
+			return err
+		}
+	}
+}
+
+func (m *Manager) holdsExclusive(recordID uint64) bool {
+	record, err := m.readRecord(recordID)
+	return err == nil && record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID
 }

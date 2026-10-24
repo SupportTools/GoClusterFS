@@ -94,9 +94,9 @@ type Registry struct {
 	pidNS      uint64
 	onSlotLost func(slot int, owner [16]byte)
 
-	onOwnerDead func(owner [16]byte)
-	deadOwners  [][16]byte
-	sightings   map[int]sighting
+	onOwnerDead  func(owner [16]byte) (release func())
+	deadPrevious *[16]byte
+	sightings    map[int]sighting
 
 	// Cross-node recovery
 	recoveryHandler      RecoveryHandler
@@ -173,32 +173,34 @@ func (r *Registry) SetSlotLostHandler(fn func(slot int, owner [16]byte)) {
 	r.onSlotLost = fn
 }
 
-// SetOwnerDeadHandler sets what to call with the UUID of a node proven dead
-// whose slot this node took over, for example to release that node's locks.
-// It is called right away for a dead previous incarnation that Register took
-// the slot of.
-func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte)) {
+// SetOwnerDeadHandler sets what failure detection calls, before replaying a
+// proven-dead node's journal, with that node's UUID; for example to take over
+// its locks. The returned function runs after the replay.
+func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte) (release func())) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.onOwnerDead = fn
-	pending := r.deadOwners
-	r.deadOwners = nil
-	r.mu.Unlock()
-
-	for _, owner := range pending {
-		fn(owner)
-	}
 }
 
-func (r *Registry) ownerDead(owner [16]byte) {
+// DeadPreviousOwner returns the UUID of the exited mount on this host whose
+// slot Register took, if any. Its journal is this node's to replay at mount.
+func (r *Registry) DeadPreviousOwner() ([16]byte, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.deadPrevious == nil {
+		return [16]byte{}, false
+	}
+	return *r.deadPrevious, true
+}
+
+func (r *Registry) ownerDead(owner [16]byte) func() {
 	r.mu.Lock()
 	fn := r.onOwnerDead
-	if fn == nil {
-		r.deadOwners = append(r.deadOwners, owner)
-	}
 	r.mu.Unlock()
-	if fn != nil {
-		fn(owner)
+	if fn == nil {
+		return func() {}
 	}
+	return fn(owner)
 }
 
 // SetJournalArea makes Register record a journal region in the claimed slot:
@@ -284,7 +286,7 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 		}
 		r.localSlot = i
 		if r.deadLocalOwner(slot) {
-			r.deadOwners = append(r.deadOwners, slot.UUID)
+			r.deadPrevious = &slot.UUID
 		}
 		return i, nil
 	}
@@ -406,6 +408,7 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 
 	seq := uint64(1)
 	lost := false
+	lastBeat := time.Now()
 
 	for {
 		select {
@@ -415,23 +418,33 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 			r.mu.Lock()
 			slot, err := r.readSlot(slotIdx)
 			ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
-			takenOver := err == nil && !ours && !lost
+			takenOver := err == nil && !ours
 			if ours {
 				slot.HeartbeatSeq = seq
 				slot.HeartbeatTime = time.Now().Unix()
-				r.writeSlot(slotIdx, slot)
+				if r.writeSlot(slotIdx, slot) == nil {
+					lastBeat = time.Now()
+				}
 				seq++
 			}
 			onSlotLost := r.onSlotLost
 			r.mu.Unlock()
 
-			if takenOver {
+			// Peers prove a silent node dead and take its locks; a node that cannot heartbeat must stop.
+			failing := time.Since(lastBeat) > HeartbeatTimeout/2
+			if (takenOver || failing) && !lost {
 				lost = true
-				if onSlotLost != nil {
-					onSlotLost(slotIdx, slot.UUID)
+				owner := r.localUUID
+				if takenOver {
+					owner = slot.UUID
 				} else {
-					log.Printf("ERROR: node registry slot %d was taken over by node %x; "+
-						"this node no longer owns its journal region", slotIdx, slot.UUID[:8])
+					log.Printf("ERROR: heartbeats to node registry slot %d have failed for %v", slotIdx, time.Since(lastBeat))
+				}
+				if onSlotLost != nil {
+					onSlotLost(slotIdx, owner)
+				} else {
+					log.Printf("ERROR: node registry slot %d is no longer this node's (owner %x); "+
+						"this node no longer owns its journal region", slotIdx, owner[:8])
 				}
 			}
 		}
@@ -734,11 +747,13 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			r.mu.Unlock()
 			continue // Another node beat us to it
 		}
+		release := func() {}
 		if dead {
-			r.ownerDead(info.UUID)
+			release = r.ownerDead(info.UUID)
 		}
-
-		if err := handler(info); err != nil {
+		err = handler(info)
+		release()
+		if err != nil {
 			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v",
 				i, info.UUID[:8], err, recoveryLease)
 			r.mu.Lock()

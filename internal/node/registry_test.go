@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1051,24 +1052,24 @@ func TestDetectionReleasesLocksOnlyOfProvenDeadNodes(t *testing.T) {
 	writeLocalSlot(t, reg, 2, exitedPID(t), 1)
 	slow := writeLocalSlotAt(t, reg, 3, os.Getppid(), time.Now().Add(-3*HeartbeatTimeout))
 
-	var replayed []int
-	var released [][16]byte
+	var events []string
 	reg.SetRecoveryHandler(func(info *FailedNodeInfo) error {
-		replayed = append(replayed, info.SlotIndex)
+		events = append(events, fmt.Sprintf("replay %d", info.SlotIndex))
 		return nil
 	})
-	reg.SetOwnerDeadHandler(func(owner [16]byte) { released = append(released, owner) })
+	reg.SetOwnerDeadHandler(func(owner [16]byte) func() {
+		events = append(events, fmt.Sprintf("adopt %x", owner[:1]))
+		return func() { events = append(events, fmt.Sprintf("release %x", owner[:1])) }
+	})
 	reg.detectAndRecoverFailedNodes()
 
-	if len(released) != 1 || released[0] != ([16]byte{3}) {
-		t.Errorf("released locks of %x, want only the exited node 03", released)
+	want := []string{"adopt 03", "replay 2", "release 03", "replay 3"}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Errorf("events %v, want %v: only the exited node's locks are taken, and held through its replay", events, want)
 	}
-	for _, owner := range released {
-		if owner == slow.UUID {
-			t.Error("released the locks of a node whose process is alive")
-		}
+	if slow.UUID != ([16]byte{4}) {
+		t.Fatalf("slow node UUID %x", slow.UUID)
 	}
-	t.Logf("replayed slots %v", replayed)
 }
 
 func TestRegisterReportsItsDeadPreviousIncarnation(t *testing.T) {
@@ -1084,10 +1085,31 @@ func TestRegisterReportsItsDeadPreviousIncarnation(t *testing.T) {
 		t.Fatalf("Register = %d, %v; want slot 0 of the exited mount", slot, err)
 	}
 
-	var released [][16]byte
-	reg.SetOwnerDeadHandler(func(owner [16]byte) { released = append(released, owner) })
-	if len(released) != 1 || released[0] != ([16]byte{1}) {
-		t.Errorf("released locks of %x, want the previous incarnation 01", released)
+	if owner, ok := reg.DeadPreviousOwner(); !ok || owner != ([16]byte{1}) {
+		t.Errorf("DeadPreviousOwner = %x, %v; want the previous incarnation 01", owner, ok)
+	}
+}
+
+func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	lost := make(chan struct{}, 1)
+	reg.SetSlotLostHandler(func(int, [16]byte) { lost <- struct{}{} })
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Stop()
+
+	dev.Close()
+	select {
+	case <-lost:
+	case <-time.After(HeartbeatTimeout):
+		t.Error("node kept running while its heartbeats failed; peers would prove it dead and take its locks")
 	}
 }
 

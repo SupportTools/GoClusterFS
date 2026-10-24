@@ -449,7 +449,7 @@ scenarios:
 
   - id: survivor-releases-crashed-node-locks
     name: Survivor releases a crashed node's locks
-    description: Node A crashes holding the root directory lock; node B proves A dead and creates a file within 10s instead of waiting out the 15s lock staleness threshold
+    description: Node A crashes holding the root directory lock; node B proves A dead, takes over its locks for the replay and creates a file within 10s instead of waiting out the 15s lock staleness threshold
     priority: high
     environments:
       go: lock_reclaim_test.go::TestSurvivorReleasesCrashedNodeLocks
@@ -458,19 +458,19 @@ scenarios:
 
   - id: slow-node-keeps-locks
     name: Paused but alive node keeps its locks
-    description: Node A is paused (SIGSTOP) holding the root directory lock; node B must not release A's locks while A's process exists
+    description: Node A is paused (SIGSTOP) for 17s holding the root directory lock; node B must not take the lock before it is stale, nor take over A's locks as a dead node's
     priority: high
     environments:
       go: lock_reclaim_test.go::TestSlowNodeKeepsLocks
       docker: TODO  # needs SIGSTOP on a mount process and a lock record written as that node; Go-only harness
       vm: TODO  # same as docker
 
-  - id: lock-reclaim-owner
-    name: ReclaimOwner frees only a dead node's holds
-    description: Exclusive records of the dead node are freed, its shared count is dropped, and other nodes' records stay
+  - id: lock-adopt-owner
+    name: Replaying node takes over a dead node's exclusive locks
+    description: AdoptOwner holds the dead node's exclusive records through the replay and ReleaseAdopted frees them; shared records and other nodes' records stay
     priority: go_only
     environments:
-      go: internal/lock/reclaim_test.go::TestReclaimOwnerFreesOnlyTheDeadNodesHolds
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerHoldsDeadNodesLocksUntilReleased
 
   - id: registry-slot-journal-region
     name: Registry records each slot's journal region
