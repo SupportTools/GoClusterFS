@@ -223,29 +223,46 @@ func TestNewSuperblock(t *testing.T) {
 		t.Errorf("MaxNodes = %d, want 64", sb.MaxNodes)
 	}
 
-	// Check layout order (each region should come after the previous)
-	// NodeRegistry starts at SuperblockSize (immediately after superblock)
-	if sb.NodeRegistryOffset < SuperblockSize {
-		t.Error("NodeRegistryOffset should be at or after superblock end")
+	want := []struct {
+		name         string
+		offset, size uint64
+	}{
+		{"block bitmap", 1 << 20, 1 << 20},
+		{"inode table", 2 << 20, 1 << 20},
+		{"node registry", 3 << 20, 1 << 20},
+		{"locks", 4 << 20, 1 << 20},
+		{"journals", 5 << 20, 64 * 4 << 20},
+		{"refcounts", 261 << 20, 1 << 20},
+		{"snapshots", 262 << 20, 1 << 20},
 	}
-	if sb.JournalRegionOffset <= sb.NodeRegistryOffset {
-		t.Error("JournalRegionOffset should be after node registry")
+	got := [][2]uint64{
+		{sb.BlockBitmapOffset, sb.BlockBitmapSize},
+		{sb.InodeTableOffset, sb.InodeTableSize},
+		{sb.NodeRegistryOffset, sb.NodeRegistrySize},
+		{sb.LockBitmapOffset, sb.LockBitmapSize},
+		{sb.JournalRegionOffset, sb.JournalRegionSize},
+		{sb.RefCountTableOffset, sb.RefCountTableSize},
+		{sb.SnapshotRegOffset, sb.SnapshotRegSize},
 	}
-	if sb.InodeTableOffset <= sb.LockBitmapOffset {
-		t.Error("InodeTableOffset should be after lock bitmap")
+	for i, w := range want {
+		if got[i] != [2]uint64{w.offset, w.size} {
+			t.Errorf("%s at %d size %d, want %d size %d", w.name, got[i][0], got[i][1], w.offset, w.size)
+		}
 	}
-	if sb.DataRegionOffset <= sb.SnapshotRegOffset {
-		t.Error("DataRegionOffset should be after snapshot region")
+	if sb.DataRegionOffset != 263<<20 {
+		t.Errorf("DataRegionOffset = %d, want %d", sb.DataRegionOffset, 263<<20)
 	}
-
-	// Check that data region starts within device
-	if int64(sb.DataRegionOffset) >= deviceSize {
-		t.Errorf("DataRegionOffset %d >= deviceSize %d", sb.DataRegionOffset, deviceSize)
+	if want := uint64(deviceSize-263<<20) >> 20; sb.TotalBlocks != want {
+		t.Errorf("TotalBlocks = %d, want %d", sb.TotalBlocks, want)
 	}
-
-	// Check that we have data blocks
-	if sb.TotalBlocks == 0 {
-		t.Error("TotalBlocks should be > 0")
+	if sb.JournalSlotSize() != 4<<20 {
+		t.Errorf("JournalSlotSize = %d, want 4MB", sb.JournalSlotSize())
+	}
+	if sb.InodeCount != 4096 {
+		t.Errorf("InodeCount = %d, want 4096", sb.InodeCount)
+	}
+	if New(MinDeviceSize).TotalBlocks != 1 {
+		t.Errorf("MinDeviceSize leaves %d data blocks, want 1", New(MinDeviceSize).TotalBlocks)
 	}
 
 	// Check timestamps
@@ -263,29 +280,6 @@ func TestNewSuperblock(t *testing.T) {
 	}
 	if allZero {
 		t.Error("UUID should be randomly generated, not all zeros")
-	}
-}
-
-func TestAlignUp(t *testing.T) {
-	tests := []struct {
-		n         uint64
-		alignment uint64
-		expected  uint64
-	}{
-		{0, 4096, 0},
-		{1, 4096, 4096},
-		{4095, 4096, 4096},
-		{4096, 4096, 4096},
-		{4097, 4096, 8192},
-		{1 << 20, 4096, 1 << 20}, // Already aligned
-		{(1 << 20) + 1, 4096, (1 << 20) + 4096},
-	}
-
-	for _, tt := range tests {
-		got := alignUp(tt.n, tt.alignment)
-		if got != tt.expected {
-			t.Errorf("alignUp(%d, %d) = %d, want %d", tt.n, tt.alignment, got, tt.expected)
-		}
 	}
 }
 
