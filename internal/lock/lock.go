@@ -228,6 +228,8 @@ type Manager struct {
 	gates map[uint64]*sync.Mutex
 	// yieldUntil holds records this node gave up and will not claim again before then.
 	yieldUntil map[uint64]time.Time
+	// beforeCASWrite, when set by a test, runs between a record CAS's read and its write.
+	beforeCASWrite func()
 
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
@@ -752,8 +754,7 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	if err != nil {
 		return false, err
 	}
-	// A shared add only raises the count of a record that is already shared; a lost
-	// race there can over-count readers, which delays writers but never admits two.
+	// Joins are not confirmed: a lost race can drop a reader's count and let a writer in during that read, never two writers.
 	if acquired && reason != "shared_add" {
 		if acquired, err = m.confirmClaim(recordID, mode, newRecord.Sequence); err != nil {
 			return false, err
@@ -780,7 +781,14 @@ func (m *Manager) confirmClaim(recordID uint64, mode LockMode, sequence uint64) 
 	if err != nil {
 		return false, err
 	}
-	return record.Mode == mode && record.OwnerUUID == m.nodeUUID && record.Sequence == sequence, nil
+	if record.Mode != mode {
+		return false, nil
+	}
+	if record.OwnerUUID == m.nodeUUID && record.Sequence == sequence {
+		return true, nil
+	}
+	// Readers on other nodes may have joined on top of a shared claim.
+	return mode == LockModeShared && record.Sequence > sequence, nil
 }
 
 // tryAcquireOptimistic attempts to acquire a lock using a cached sequence hint.
@@ -961,7 +969,7 @@ func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *
 	buf := storage.GetBuffer(RecordSize)
 	defer storage.PutBuffer(buf)
 
-	// Read current record to check sequence
+	start := time.Now()
 	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
 		return false, err
 	}
@@ -981,7 +989,9 @@ func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *
 		return false, nil
 	}
 
-	// Sequence matched and lock is free - write new record
+	if m.casWriteTooLate(recordID, start) {
+		return false, nil
+	}
 	newData := serializeRecord(new)
 	copy(buf.Bytes(), newData)
 	if _, err := m.dev.WriteAt(buf.Bytes(), offset); err != nil {
@@ -1001,7 +1011,7 @@ func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error
 	buf := storage.GetBuffer(RecordSize)
 	defer storage.PutBuffer(buf)
 
-	// Read current
+	start := time.Now()
 	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
 		return false, err
 	}
@@ -1013,13 +1023,28 @@ func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error
 		return false, nil
 	}
 
-	// Write new
+	if m.casWriteTooLate(recordID, start) {
+		return false, nil
+	}
 	copy(buf.Bytes(), newData)
 	if _, err := m.dev.WriteAt(buf.Bytes(), offset); err != nil {
 		return false, err
 	}
 
 	return true, nil
+}
+
+// casWriteTooLate reports whether a CAS write would land so long after its read
+// that another node's claim could have passed its settle wait in between.
+func (m *Manager) casWriteTooLate(recordID uint64, readStart time.Time) bool {
+	if m.beforeCASWrite != nil {
+		m.beforeCASWrite()
+	}
+	if elapsed := time.Since(readStart); elapsed > ClaimSettleDelay/2 {
+		log.Printf("[WARN] lock: record %d read was %v old at write time; retrying the update", recordID, elapsed)
+		return true
+	}
+	return false
 }
 
 // serializeRecord converts a Record to bytes.

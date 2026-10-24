@@ -571,3 +571,57 @@ func TestBusyNodeYieldsCachedRecord(t *testing.T) {
 	}
 	other.Release(LockTypeInode, 12)
 }
+
+// A reader joining another node's fresh shared claim during its settle wait
+// builds on that claim, so the first reader keeps it and the count stays exact.
+func TestSharedClaimSurvivesJoinDuringSettle(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	c := newTestNode(dev, 0, 1<<20, 3)
+	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
+	claimSettleDelay = 100 * time.Millisecond
+
+	errc := make(chan error, 1)
+	go func() { errc <- acquireWithin(a, 2*time.Second, LockTypeInode, 20, LockModeShared) }()
+	time.Sleep(20 * time.Millisecond)
+	requireAcquired(t, b, LockTypeInode, 20, LockModeShared)
+	if err := <-errc; err != nil {
+		t.Fatalf("node A shared Acquire: %v", err)
+	}
+	for _, m := range []*Manager{a, b} {
+		if err := m.Release(LockTypeInode, 20); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+		m.ReleaseCached()
+	}
+	if err := acquireWithin(c, 500*time.Millisecond, LockTypeInode, 20, LockModeExclusive); err != nil {
+		t.Fatalf("writer after both readers left: %v (a reader count leaked)", err)
+	}
+}
+
+// A claim whose write would land long after the read it was based on can
+// overwrite a claim another node has confirmed in the meantime, so it is dropped.
+func TestSlowClaimWriteIsAborted(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	var once sync.Once
+	bRead := make(chan struct{})
+	b.beforeCASWrite = func() {
+		once.Do(func() {
+			close(bRead)
+			time.Sleep(3 * ClaimSettleDelay / 2)
+		})
+	}
+
+	errb := make(chan error, 1)
+	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 21, LockModeExclusive) }()
+	<-bRead
+	requireAcquired(t, a, LockTypeInode, 21, LockModeExclusive)
+	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("node B with a slow write: got %v, want ErrLockTimeout while node A holds the lock", err)
+	}
+}

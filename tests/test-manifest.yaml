@@ -1860,6 +1860,27 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
 
+  - id: lock-busy-node-yields
+    name: Busy node yields a cached record
+    description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
+
+  - id: lock-shared-claim-join-during-settle
+    name: Shared claim survives a join during settle
+    description: A reader on another node joining a fresh shared claim during its settle wait does not leak a reader count
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSharedClaimSurvivesJoinDuringSettle
+
+  - id: lock-slow-claim-write-aborted
+    name: Slow claim write is aborted
+    description: A claim whose write would land more than half the settle delay after its read is dropped, so two nodes cannot both hold the lock
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlowClaimWriteIsAborted
+
   - id: lock-cancelled-context-waits
     name: Cancelled context keeps waiting
     description: A cancelled context (FUSE interrupt) does not end a lock wait; only a deadline or DefaultTimeout does

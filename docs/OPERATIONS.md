@@ -246,7 +246,7 @@ rm /mnt/fs/.snapshots/snapshot_name
 
 Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, SFB containers, snapshots) through lock records on the shared device. Read this before you run more than one node.
 
-**How a lock goes stale.** A lock record stores the wall-clock time it was taken. Nothing renews it. Any other node may take over a lock that is older than 15 seconds (`StaleThreshold`), judged by that node's own clock. This is how locks held by a crashed node get freed.
+**How a lock goes stale.** A lock record stores the wall-clock time it was taken. A node refreshes that time only when another operation on the same node joins a write lock it has held for more than 5 seconds. Any other node may take over a lock that is older than 15 seconds (`StaleThreshold`), judged by that node's own clock. This is how locks held by a crashed node get freed.
 
 **The hazard: a stalled node keeps writing.** If a node stops for more than 15 seconds while it holds a lock, another node takes the lock. When the stalled node resumes, it finishes its writes. No write path checks that the lock is still held, and there is no fencing token. The node only learns it lost the lock when it releases it (`ErrNotLockOwner`), and callers ignore that error. Two nodes then write the same metadata, which can double-allocate blocks or lose directory entries.
 
@@ -257,9 +257,11 @@ Common causes of a stall:
 - Heavy swapping or a long GC pause
 - Storage I/O that queues instead of failing, for example a multipath or iSCSI path failover
 
-**Lock takeover relies on an I/O time limit.** Taking a lock is a read followed by a write, not an atomic compare-and-swap, so two nodes that read a free record at the same moment both write a claim. After writing its claim, a node waits 20 ms (`ClaimSettleDelay`), reads the record again, and keeps the lock only if its claim is still there. This is safe only if every node's read of a lock record and its following write land within 20 ms. A node that stalls or queues I/O between the two can still win alongside another node. Readers that join a record already held for reading skip the wait; losing that race over-counts readers, so writers to that directory or file can wait up to 15 seconds, but two writers still cannot overlap.
+**Lock takeover relies on an I/O time limit.** Taking a lock is a read followed by a write, not an atomic compare-and-swap, so two nodes that read a free record at the same moment both write a claim. After writing its claim, a node waits 20 ms (`ClaimSettleDelay`), reads the record again, and keeps the lock only if its claim is still there. A node drops an update whose read is already 10 ms old when it is about to write, and tries again. This is safe only if every node's read of a lock record and its following write land within 20 ms. Time spent in I/O queues counts toward the 20 ms. A node that stalls right before its write lands can still win alongside another node. Readers that join or leave a record held for reading skip the wait, and losing that race can miscount readers. A count that is too low can let another node's writer in while a read is still running. A count that is too high makes writers wait up to 15 seconds. Two writers still cannot overlap.
 
 **Nodes keep released locks briefly.** After its last user releases a lock, a node keeps it for 250 ms (`CacheGrace`), so repeated work on the same node does not pay the 20 ms wait again. A node that has held a lock for longer than that releases it the next time it is idle and waits 50 ms (`YieldGap`) before taking it again, so another node gets a turn. Another node that wants the lock waits up to about 300 ms plus the 20 ms check. A clean unmount releases kept locks at once. A lock wait ends only when the caller's deadline passes or after 30 seconds (`DefaultTimeout`). A signal to the waiting process does not end it, because FUSE turns signals into request cancellations.
+
+**Writes to one region from two nodes interleave by sector.** A node writes whole 4 KB sectors of an existing, unshared block without taking that block's lock. If two nodes write overlapping ranges of a file at the same time, the result can mix both writes, one sector at a time. Applications that write the same region from several nodes must coordinate those writes themselves.
 
 **Read locks are not renewed.** A node whose overlapping lookups keep a directory read-locked for more than 15 seconds can lose that lock to another node's writer. Its readers may then see a half-written directory. Two writers still cannot overlap.
 
@@ -271,7 +273,7 @@ Common causes of a stall:
 |-------|-----|
 | Keep node clocks within 1 second (chrony or NTP) | Clock skew S shortens the stale threshold to 15s − S |
 | No node may stall for 10 seconds or more while mounted | Leaves margin below the 15s threshold |
-| A 4KB read followed by a 4KB write of a lock record must complete within 20 ms | Lock takeover check (see above); slower storage can let two nodes take one lock |
+| A 4KB read followed by a 4KB write of a lock record must complete within 20 ms, including queue time | Lock takeover check (see above). A node retries when its read is 10 ms old, so the write itself must land within 10 ms; slower storage can let two nodes take one lock |
 | Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
 | Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |
 
