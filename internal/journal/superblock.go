@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -62,6 +63,7 @@ const (
 // Errors
 var (
 	ErrInvalidJournalMagic     = errors.New("invalid journal magic")
+	ErrJournalUninitialized    = errors.New("journal was never initialized")
 	ErrJournalChecksumMismatch = errors.New("journal superblock checksum mismatch")
 	ErrJournalTooSmall         = errors.New("buffer too small for journal superblock")
 	ErrJournalCorrupt          = errors.New("journal is corrupt")
@@ -217,10 +219,14 @@ func (sb *JournalSuperblock) Serialize() []byte {
 }
 
 // DeserializeJournalSuperblock parses a journal superblock from raw bytes.
-// Returns an error if magic or checksum is invalid.
+// Returns ErrJournalUninitialized for an all-zero header (format zeroes every
+// slot's header), or an error if magic or checksum is invalid.
 func DeserializeJournalSuperblock(buf []byte) (*JournalSuperblock, error) {
 	if len(buf) < JournalSuperblockSize {
 		return nil, ErrJournalTooSmall
+	}
+	if !slices.ContainsFunc(buf[:JournalSuperblockSize], func(b byte) bool { return b != 0 }) {
+		return nil, ErrJournalUninitialized
 	}
 
 	sb := &JournalSuperblock{}

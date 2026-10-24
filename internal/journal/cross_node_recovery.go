@@ -67,8 +67,8 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 
 	// The region belongs to the slot and may hold a dirty journal from the slot's previous owner.
 	region, err := OpenRegionForRecovery(rctx.Dev, info.JournalOffset, info.JournalSize)
-	if errors.Is(err, ErrInvalidJournalMagic) {
-		log.Printf("[Recovery] No journal in region, nothing to replay")
+	if errors.Is(err, ErrJournalUninitialized) {
+		log.Printf("[Recovery] Journal was never initialized, nothing to replay")
 		result.Duration = time.Since(start)
 		return result, nil
 	}
