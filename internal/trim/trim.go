@@ -56,9 +56,8 @@ type Config struct {
 	Discard func(offset, length uint64) error
 }
 
-// FreeGuard calls discard with the blocks that are still free, and keeps them
-// from being allocated until discard returns. Freed blocks wait in the queue
-// for up to MaxAge, and any node may allocate and write one in that time.
+// FreeGuard calls discard with the queued blocks that are still free and keeps
+// them from being allocated until discard returns.
 type FreeGuard = func(ctx context.Context, blocks []uint64, discard func(free []uint64)) error
 
 // guardTimeout bounds how long a flush waits for the guard's allocation lock.
@@ -165,9 +164,8 @@ func (m *Manager) Queue(blockNum uint64) {
 	m.wakeIfFullLocked()
 }
 
-// wakeIfFullLocked asks the flush loop to flush once the batch is full. Queue
-// runs inside bitmap.Free, which holds the bitmap lock the guard needs, so it
-// must not flush itself.
+// wakeIfFullLocked wakes the flush loop. Queue runs inside bitmap.Free, which
+// holds the bitmap lock the guard needs, so it must not flush itself.
 func (m *Manager) wakeIfFullLocked() {
 	if len(m.pending) < m.config.BatchSize {
 		return
@@ -235,8 +233,8 @@ func (m *Manager) checkAndFlush() {
 	}
 }
 
-// flush discards the pending blocks. It runs the guard without holding m.mu,
-// because bitmap.Free holds the bitmap lock while it calls Queue.
+// flush discards the pending blocks. The guard runs without m.mu held, because
+// Free takes the bitmap lock before m.mu.
 func (m *Manager) flush(reason string) {
 	m.mu.Lock()
 	blocks := make([]uint64, len(m.pending))
@@ -288,7 +286,7 @@ func (m *Manager) discardBlocks(blocks []uint64) {
 }
 
 // coalesceBlocks sorts blocks, drops duplicates and groups adjacent blocks into
-// contiguous ranges. A block freed, reallocated and freed again is queued twice.
+// contiguous ranges.
 func coalesceBlocks(blocks []uint64) []blockRange {
 	if len(blocks) == 0 {
 		return nil

@@ -50,6 +50,8 @@ type TrimQueuer interface {
 	Queue(blockNum uint64)
 	// QueueRange adds multiple contiguous freed blocks to the TRIM queue.
 	QueueRange(startBlock, count uint64)
+	// SetFreeGuard makes the manager discard only blocks the guard confirms are free.
+	SetFreeGuard(guard func(ctx context.Context, blocks []uint64, discard func(free []uint64)) error)
 }
 
 // Region manages block allocation using a bitmap stored on disk.
@@ -270,25 +272,47 @@ func (r *Region) AllocatedCount() uint64 {
 
 // SetTrimManager sets the TRIM manager for batched block discards.
 // When set, freed blocks will be queued for TRIM rather than immediately discarded.
-// A manager that accepts a free guard gets one, so it skips blocks allocated again
-// before its discard runs.
 func (r *Region) SetTrimManager(tm TrimQueuer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.trimMgr = tm
-	if g, ok := tm.(interface {
-		SetFreeGuard(func(context.Context, []uint64, func([]uint64)) error)
-	}); ok {
-		g.SetFreeGuard(r.withFreeBlocks)
+	if tm != nil {
+		tm.SetFreeGuard(r.withFreeBlocks)
 	}
 }
 
-// withFreeBlocks calls discard with the blocks that are free on disk, holding
-// the allocation lock until discard returns so no node can allocate them.
+// withFreeBlocks marks the blocks that are still free as allocated, calls
+// discard without the bitmap lock, then frees them again. A discard can outlast
+// the lock's stale threshold, so no lock is held while it runs. A crash during
+// the discard leaves the blocks allocated and unreferenced, which fsck reports.
 func (r *Region) withFreeBlocks(ctx context.Context, blocks []uint64, discard func(free []uint64)) error {
+	reserved, err := r.flipBits(ctx, blocks, true)
+	if err != nil {
+		if len(reserved) > 0 {
+			if _, rerr := r.flipBits(ctx, reserved, false); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("blocks %v stay allocated: %w", reserved, rerr))
+			}
+		}
+		return err
+	}
+	if len(reserved) == 0 {
+		return nil
+	}
+
+	discard(reserved)
+
+	if _, err := r.flipBits(ctx, reserved, false); err != nil {
+		return fmt.Errorf("blocks %v stay allocated after discard: %w", reserved, err)
+	}
+	return nil
+}
+
+// flipBits marks each block allocated (or free) whose bit says otherwise, under
+// the bitmap lock, and returns the blocks it changed, even on error.
+func (r *Region) flipBits(ctx context.Context, blocks []uint64, allocated bool) ([]uint64, error) {
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
-			return fmt.Errorf("failed to acquire bitmap lock: %w", err)
+			return nil, fmt.Errorf("failed to acquire bitmap lock: %w", err)
 		}
 		defer r.unlock()
 	}
@@ -296,31 +320,38 @@ func (r *Region) withFreeBlocks(ctx context.Context, blocks []uint64, discard fu
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	sectors := make(map[uint64][]byte)
-	free := make([]uint64, 0, len(blocks))
+	bySector := make(map[uint64][]uint64)
 	for _, b := range blocks {
-		if b >= r.totalBlocks {
-			continue
-		}
-		sectorIdx := b / BitsPerSector
-		data, ok := sectors[sectorIdx]
-		if !ok {
-			var err error
-			if data, err = r.readSector(sectorIdx); err != nil {
-				return fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
-			}
-			sectors[sectorIdx] = data
-		}
-		bit := b % BitsPerSector
-		if data[bit/8]&(1<<(bit%8)) == 0 {
-			free = append(free, b)
+		if b < r.totalBlocks {
+			bySector[b/BitsPerSector] = append(bySector[b/BitsPerSector], b)
 		}
 	}
 
-	if len(free) > 0 {
-		discard(free)
+	var changed []uint64
+	for sectorIdx, sectorBlocks := range bySector {
+		data, err := r.readSector(sectorIdx)
+		if err != nil {
+			return changed, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+		}
+		var flipped []uint64
+		for _, b := range sectorBlocks {
+			bit := b % BitsPerSector
+			mask := byte(1) << (bit % 8)
+			if (data[bit/8]&mask != 0) == allocated {
+				continue
+			}
+			data[bit/8] ^= mask
+			flipped = append(flipped, b)
+		}
+		if len(flipped) == 0 {
+			continue
+		}
+		if err := r.writeSector(sectorIdx, data); err != nil {
+			return changed, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+		}
+		changed = append(changed, flipped...)
 	}
-	return nil
+	return changed, nil
 }
 
 // Scan reads the entire bitmap and returns free/allocated counts.
