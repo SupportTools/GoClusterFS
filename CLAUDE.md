@@ -40,7 +40,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/superblock` | Superblock format and the on-disk layout; `-format` writes it, mount reads it |
 | `internal/bitmap` | Block allocation bitmap, CRC32C per 4 KB sector |
 | `internal/inode` | Inode table, 256-byte inodes, CRC32C per sector |
-| `internal/extent` | File block mapping, up to 2 extents inline in the inode |
+| `internal/extent` | File block mapping: 2 extents inline in the inode, the rest in an on-disk overflow tree |
 | `internal/dir` | Directory entries |
 | `internal/lock` | Distributed CAS locks stored on the device |
 | `internal/node` | Node registry, heartbeats, failed-node detection |
@@ -89,7 +89,6 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
 - At most 64 nodes mount a volume at once, one per registry slot. Heartbeats compare wall clocks, so node clocks must agree within a few seconds.
 - `goclusterfs-fsck` reports errors on healthy volumes: the superblock free block and inode counters are never updated after format, and phases 5 and 7 expect refcount and snapshot sector checksums the runtime does not write.
-- Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
 - The inode count is fixed at 4096.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - No rename, symlinks, or hard links.
@@ -163,6 +162,6 @@ This avoids TOCTOU races in the distributed locking system.
 |---------|-------|
 | TaskForge Project ID | 88 |
 | Build command | `make build` |
-| Test command | `go test ./... -v` |
-| Lint command | `gofmt -l .` |
+| Test command | `make test-unit` |
+| Lint command | `make lint` |
 | Tech stack | Go (FUSE filesystem) |
