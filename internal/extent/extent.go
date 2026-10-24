@@ -48,6 +48,10 @@ const (
 	FlagSFB       = 1 << 3 // Stored in SFB container (not full block)
 )
 
+// Hole is what LookupPhysical returns for a logical block with no data on disk.
+// Physical block 0 is a valid data block.
+const Hole = math.MaxUint64
+
 // Errors
 var (
 	ErrExtentNotFound    = errors.New("extent not found")
@@ -125,12 +129,12 @@ func (m *Manager) Lookup(ino *inode.Inode, logicalBlock uint64) (*Extent, uint64
 	return &ext, logicalBlock - ext.LogicalBlock, nil
 }
 
-// LookupPhysical returns the physical block number for a logical block.
-// Returns 0 if the block is a hole (not allocated).
+// LookupPhysical returns the physical block number for a logical block, or Hole
+// if the block is not allocated.
 func (m *Manager) LookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
 	ext, offset, err := m.Lookup(ino, logicalBlock)
 	if err == ErrExtentNotFound {
-		return 0, nil // Hole - return 0
+		return Hole, nil
 	}
 	if err != nil {
 		return 0, err
@@ -139,7 +143,7 @@ func (m *Manager) LookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64,
 	// Unwritten extents return zeros like holes for read operations.
 	// The extent exists (space is allocated) but data hasn't been written yet.
 	if ext.Flags&FlagUnwritten != 0 {
-		return 0, nil // Lazy-zero: treat as hole for reads
+		return Hole, nil
 	}
 
 	return ext.PhysicalBlock + offset, nil
@@ -226,30 +230,34 @@ func contiguousRuns(logicalBlock uint64, blocks []uint64, flags uint32) []Extent
 	return runs
 }
 
-// ClearUnwritten clears the Unwritten flag for an extent and increments WrittenBlocks.
-// Called on first write to an unwritten block.
-// Returns true if the flag was cleared (first write), false if already written.
-func (m *Manager) ClearUnwritten(ino *inode.Inode, ext *Extent) (bool, error) {
-	if ext.Flags&FlagUnwritten == 0 {
-		return false, nil
-	}
-	e, err := m.edit(context.Background(), ino)
+// ClearUnwritten marks one block of an unwritten extent as written, splitting
+// the extent so its other blocks still read as zeros. Called on first write to
+// the block. Returns true if the block was unwritten, false if already written.
+func (m *Manager) ClearUnwritten(ctx context.Context, ino *inode.Inode, logicalBlock uint64) (bool, error) {
+	ext, _, err := m.Lookup(ino, logicalBlock)
 	if err != nil {
 		return false, err
 	}
-	var length uint64
-	found, err := e.update(ext.LogicalBlock, func(x *Extent) {
-		x.Flags &^= FlagUnwritten
-		length = x.Length
-	})
-	if err != nil || !found {
+	if ext.Flags&FlagUnwritten == 0 {
+		return false, nil
+	}
+	e, err := m.edit(ctx, ino)
+	if err != nil {
+		return false, err
+	}
+	removed, err := e.removeRange(logicalBlock, logicalBlock+1)
+	if err != nil {
+		return false, err
+	}
+	block := removed[0]
+	block.Flags &^= FlagUnwritten
+	if err := e.insert(block); err != nil {
 		return false, err
 	}
 	if err := e.commit(); err != nil {
 		return false, err
 	}
-	ext.Flags &^= FlagUnwritten
-	ino.WrittenBlocks += length
+	ino.WrittenBlocks++
 	return true, nil
 }
 

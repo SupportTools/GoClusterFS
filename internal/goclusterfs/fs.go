@@ -7,6 +7,7 @@
 package goclusterfs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -323,7 +324,7 @@ func (f *FS) cacheInode(ino *inode.Inode) {
 }
 
 // lookupPhysical finds the physical block for a logical block, using cache.
-// Returns 0 for holes (sparse file regions with no allocated blocks).
+// Returns extent.Hole for holes (sparse file regions with no data on disk).
 // This is the preferred method for read paths.
 func (f *FS) lookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
 	phys, err := f.lookupPhysicalIn(ino, logicalBlock)
@@ -953,10 +954,14 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 	childIno.Ctime = now
 
 	if childIno.LinkCount == 0 {
+		sfbBacked, sfbSlot := childIno.IsSFBBacked(), childIno.InlineExtents[0].PhysicalBlock
 		if err := f.extentMgr.Delete(ctx, childIno); err != nil {
 			log.Printf("[DEBUG] Unlink %q: freeing blocks failed: %v", name, err)
 		}
 		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		if sfbBacked {
+			f.freeSFBSlot(ctx, sfbSlot)
+		}
 	} else if _, err := f.updateInode(ctx, childIno.InodeNum, func(ino *inode.Inode) error {
 		ino.LinkCount--
 		ino.Ctime = now
@@ -1821,10 +1826,14 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 	// Decrement child link count and potentially free
 	childIno.LinkCount--
 	if childIno.LinkCount == 0 {
+		sfbBacked, sfbSlot := childIno.IsSFBBacked(), childIno.InlineExtents[0].PhysicalBlock
 		// Free all extents
 		d.fs.extentMgr.Delete(ctx, childIno)
 		// Free inode
 		d.fs.inodeTbl.Free(ctx, uint32(childInodeNum))
+		if sfbBacked {
+			d.fs.freeSFBSlot(ctx, sfbSlot)
+		}
 	} else if updated, err := d.fs.updateInode(ctx, uint32(childInodeNum), func(ino *inode.Inode) error { ino.LinkCount--; return nil }); err != nil {
 		log.Printf("[DEBUG] removeEntry %q: updating link count failed: %v", name, err)
 	} else {
@@ -1972,6 +1981,15 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 		readSize = int(ino.Size - offset)
 	}
 
+	if ino.IsSFBBacked() {
+		data, err := f.fs.readSFB(ino, offset, uint64(readSize))
+		if err != nil {
+			log.Printf("[ERROR] Read inode %d: SFB read failed: %v", f.inodeNum, err)
+			return nil, syscall.EIO
+		}
+		return fuse.ReadResultData(data), 0
+	}
+
 	// Read data block by block
 	data := make([]byte, readSize)
 	bytesRead := 0
@@ -1985,8 +2003,7 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 		if err != nil {
 			return nil, syscall.EIO
 		}
-		if physBlock == 0 {
-			// Hole - return zeros
+		if physBlock == extent.Hole {
 			toRead := int(BlockSize - blockOffset)
 			if toRead > readSize-bytesRead {
 				toRead = readSize - bytesRead
@@ -2070,6 +2087,14 @@ func retryOnTreeConflict(err error) error {
 	return err
 }
 
+func (f *FS) zeroBlock(physBlock uint64) error {
+	buf := storage.GetBuffer(BlockSize)
+	defer storage.PutBuffer(buf)
+	clear(buf.Bytes())
+	_, err := f.dev.WriteAt(buf.Bytes(), int64(f.dataOffset+physBlock*BlockSize))
+	return err
+}
+
 // writeInternal performs the actual write operation.
 // Returns errRetryWrite if a concurrent modification is detected and the caller should retry.
 func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (int, error) {
@@ -2113,96 +2138,27 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}()
 
-	// === SFB (Sub-File Block) handling for small files ===
-	// Check if this file uses SFB storage or could benefit from it.
-	newEndOffset := offset + uint64(len(data))
-
-	// Case 1: File is already SFB-backed
+	// SFB allocation is disabled: every file uses extents, and a file written by an
+	// older build moves out of its SFB slot before the write.
 	if ino.IsSFBBacked() {
-		if newEndOffset > SFBMaxFileSize {
-			// Write would exceed SFB limit - migrate to regular extent first
-			if err := f.migrateToExtent(ctx, ino); err != nil {
-				log.Printf("[DEBUG] Write inode %d: SFB migration failed: %v", f.inodeNum, err)
+		if err := f.migrateToExtent(ctx, ino); err != nil {
+			log.Printf("[DEBUG] Write inode %d: SFB migration failed: %v", f.inodeNum, err)
+			if err == errRetryWrite {
 				return 0, err
 			}
-			// Re-read inode after migration
-			ino, err = f.fs.inodeTbl.Read(f.inodeNum)
-			if err != nil {
-				return 0, syscall.EIO
-			}
-			// Fall through to regular extent write path below
-		} else {
-			// Write fits in SFB - use SFB write path
-			return f.writeSFB(ctx, ino, data, offset)
+			return 0, syscall.EIO
+		}
+		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
+		if err != nil {
+			return 0, syscall.EIO
 		}
 	}
 
-	// Case 2: New file (no extents) that fits in SFB
-	if ino.ExtentCount == 0 && newEndOffset <= SFBMaxFileSize && f.fs.sfbMgr != nil {
-		// Allocate SFB slot for this small file
-		containerBlock, slotIndex, err := f.fs.sfbMgr.AllocateSlot(ctx, newEndOffset)
-		if err == nil {
-			// === WAL: Log intent to allocate SFB slot ===
-			var sfbIntentSeq uint64
-			if f.fs.journal != nil {
-				txn := f.fs.journal.Begin()
-				tier, _ := sfb.TierForSize(newEndOffset)
-				if err := txn.LogSFBAlloc(&journal.SFBAllocPayload{
-					InodeNum:       uint64(f.inodeNum),
-					ContainerBlock: containerBlock,
-					SlotIndex:      slotIndex,
-					Tier:           journal.SFBTier(tier),
-				}); err != nil {
-					f.fs.journal.Abort(txn)
-					// Free the slot on journal failure
-					_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
-					return 0, err
-				}
-				// === COMMIT POINT ===
-				var commitErr error
-				sfbIntentSeq, commitErr = f.fs.journal.Commit(txn)
-				if commitErr != nil {
-					_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
-					return 0, commitErr
-				}
-			}
-
-			// Store the SFB reference in the inode's first extent
-			tier, _ := sfb.TierForSize(newEndOffset)
-			ino.InlineExtents[0] = inode.InlineExtent{
-				LogicalBlock:  0,
-				PhysicalBlock: sfb.PackPhysicalBlock(containerBlock, slotIndex),
-				Length:        1,
-				Flags:         extent.FlagAllocated | extent.FlagSFB | (uint32(tier) << 4),
-			}
-			ino.ExtentCount = 1
-			ino.AllocatedBlocks = 0 // SFB doesn't count as full blocks
-
-			if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-				_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
-				return 0, retryOnTreeConflict(err)
-			}
-
-			// Write data using SFB path
-			written, writeErr := f.writeSFB(ctx, ino, data, offset)
-
-			// === WAL: Mark SFB allocation intent complete ===
-			if f.fs.journal != nil && sfbIntentSeq > 0 {
-				if err := f.fs.journal.CompleteIntent(sfbIntentSeq); err != nil {
-					log.Printf("[DEBUG] Write inode %d SFB alloc: CompleteIntent failed: %v", f.inodeNum, err)
-				}
-			}
-
-			return written, writeErr
-		}
-		// SFB allocation failed (e.g., no space) - fall through to regular extent path
-		log.Printf("[DEBUG] Write inode %d: SFB allocation failed, using extent: %v", f.inodeNum, err)
-	}
-
-	// Regular extent-based write path for large files
+	// Regular extent-based write path
 	for bytesWritten < len(data) {
 		blockNum := offset / BlockSize
 		blockOffset := offset % BlockSize
+		zeroFirst := false
 
 		// Try to find existing extent first (without lock for read-only check)
 		ext, extOffset, err := f.fs.extentMgr.Lookup(ino, blockNum)
@@ -2410,7 +2366,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 
 			// Clear the Unwritten flag (if still set)
-			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ino, ext)
+			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ctx, ino, blockNum)
 			if clearErr != nil {
 				log.Printf("[DEBUG] Write inode %d: clearing Unwritten flag at block %d failed: %v",
 					f.inodeNum, blockNum, clearErr)
@@ -2420,6 +2376,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
 					f.inodeNum, blockNum)
 			}
+			zeroFirst = cleared
 		}
 
 		// Calculate physical location
@@ -2431,6 +2388,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if toWrite > len(data)-bytesWritten {
 			toWrite = len(data) - bytesWritten
 		}
+		zeroFirst = zeroFirst && toWrite < BlockSize
 
 		// Acquire extent lock on the physical block to prevent lost-update race.
 		// When multiple nodes write to different offsets within the same block,
@@ -2444,6 +2402,17 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return 0, syscall.EIO
 			}
 			extentLockHeld = true
+		}
+
+		// The rest of a block first written here would otherwise expose old disk contents.
+		if zeroFirst {
+			if err := f.fs.zeroBlock(physBlock); err != nil {
+				log.Printf("[DEBUG] Write inode %d: zeroing block %d failed: %v", f.inodeNum, physBlock, err)
+				if extentLockHeld {
+					f.fs.lockMgr.ReleaseExtent(physBlock)
+				}
+				return 0, syscall.EIO
+			}
 		}
 
 		// Handle unaligned writes by read-modify-write
@@ -2657,165 +2626,99 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	return bytesWritten, nil
 }
 
-// writeSFB handles writes to files stored in SFB containers.
-// SFB (Sub-File Block) stores small files (<64KB) efficiently in shared 1MB blocks.
-func (f *File) writeSFB(ctx context.Context, ino *inode.Inode, data []byte, offset uint64) (int, error) {
-	// Verify the file is SFB-backed
-	if !ino.IsSFBBacked() {
-		return 0, errors.New("file is not SFB-backed")
+// sfbSlotOffset returns the disk offset of an SFB-backed inode's data. SFB
+// allocation is disabled; this serves only inodes written by older builds.
+func (f *FS) sfbSlotOffset(ino *inode.Inode) (int64, error) {
+	ext := ino.InlineExtents[0]
+	container, slot := sfb.UnpackPhysicalBlock(ext.PhysicalBlock)
+	slotSize, _ := sfb.Tier((ext.Flags >> 4) & 0x3).Info()
+	if ino.Size > uint64(slotSize) {
+		return 0, fmt.Errorf("SFB inode %d: size %d exceeds its %d-byte slot", ino.InodeNum, ino.Size, slotSize)
 	}
-
-	// Get the SFB extent (should be the first inline extent)
-	if ino.ExtentCount == 0 {
-		return 0, errors.New("SFB file has no extent")
-	}
-
-	ext := &ino.InlineExtents[0]
-	containerBlock, slotIndex := sfb.UnpackPhysicalBlock(ext.PhysicalBlock)
-
-	// Determine slot size from tier
-	tier := sfb.Tier((ext.Flags >> 4) & 0x3) // Tier stored in bits 4-5 of flags
-	slotSize, _ := tier.Info()
-	if slotSize == 0 {
-		// Fallback: determine from container if tier not in flags
-		slotSize = 64 * 1024 // Assume max slot size
-	}
-
-	// Check if write would exceed slot size (needs migration to full extent)
-	newSize := offset + uint64(len(data))
-	if newSize > uint64(slotSize) {
-		log.Printf("[DEBUG] SFB write inode %d: size %d exceeds slot %d, needs migration",
-			f.inodeNum, newSize, slotSize)
-		return 0, errors.New("write exceeds SFB slot size - migration needed")
-	}
-
-	// Calculate the physical offset within the container block
-	// Container layout: [Header 64B][Slot 0][Slot 1]...[Slot N]
-	slotOffset := uint64(SFBHeaderSize) + uint64(slotIndex)*uint64(slotSize)
-	diskOffset := int64(f.fs.dataOffset + containerBlock*BlockSize + slotOffset + offset)
-
-	// Acquire SFB container lock (Level 7 in lock hierarchy)
-	if f.fs.lockMgr != nil {
-		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, containerBlock, lock.LockModeExclusive); err != nil {
-			log.Printf("[DEBUG] SFB write inode %d: failed to acquire container lock: %v", f.inodeNum, err)
-			return 0, syscall.EIO
-		}
-		defer f.fs.lockMgr.Release(lock.LockTypeSFBContainer, containerBlock)
-	}
-
-	// Write data to slot using aligned I/O
-	bytesWritten := 0
-	buf := storage.GetBuffer(storage.SectorSize)
-	defer storage.PutBuffer(buf)
-
-	alignedOffset := diskOffset &^ (storage.SectorSize - 1)
-	sectorOffset := diskOffset - alignedOffset
-
-	for bytesWritten < len(data) {
-		// Read existing sector
-		if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
-			// New sector - zero it
-			for i := range buf.Bytes() {
-				buf.Bytes()[i] = 0
-			}
-		}
-
-		// Modify
-		copyLen := storage.SectorSize - int(sectorOffset)
-		if copyLen > len(data)-bytesWritten {
-			copyLen = len(data) - bytesWritten
-		}
-		copy(buf.Bytes()[sectorOffset:], data[bytesWritten:bytesWritten+copyLen])
-
-		// Write back
-		if _, err := f.fs.dev.WriteAt(buf.Bytes(), alignedOffset); err != nil {
-			log.Printf("[DEBUG] SFB write inode %d: WriteAt failed: %v", f.inodeNum, err)
-			return bytesWritten, syscall.EIO
-		}
-
-		bytesWritten += copyLen
-		alignedOffset += storage.SectorSize
-		sectorOffset = 0
-	}
-
-	// Update inode size if extended
-	var intentSeq uint64
-	if newSize > ino.Size {
-		ino.Size = newSize
-		ino.Mtime = time.Now().UnixNano()
-
-		// === WAL: Log intent to update inode size ===
-		if f.fs.journal != nil {
-			txn := f.fs.journal.Begin()
-			if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
-				InodeNum:   uint64(f.inodeNum),
-				UpdateMask: journal.InodeUpdateSize | journal.InodeUpdateMtime,
-			}); err != nil {
-				f.fs.journal.Abort(txn)
-				return bytesWritten, err
-			}
-			// === COMMIT POINT ===
-			var commitErr error
-			intentSeq, commitErr = f.fs.journal.Commit(txn)
-			if commitErr != nil {
-				return bytesWritten, commitErr
-			}
-		}
-
-		// Write inode
-		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-			return bytesWritten, retryOnTreeConflict(err)
-		}
-	}
-
-	// === WAL: Mark intent complete ===
-	if f.fs.journal != nil && intentSeq > 0 {
-		if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
-			log.Printf("[DEBUG] writeSFB inode %d: CompleteIntent failed: %v", f.inodeNum, err)
-		}
-	}
-
-	return bytesWritten, nil
+	return int64(f.dataOffset + container*BlockSize + SFBHeaderSize + uint64(slot)*uint64(slotSize)), nil
 }
 
-// migrateToExtent migrates an SFB-backed file to regular extent allocation.
-// Called when a small file grows beyond the SFB slot size (64KB).
+// readSFB reads n bytes at off from an SFB-backed inode's slot. Slots are not
+// sector-aligned, so it reads the sectors that cover the range.
+func (f *FS) readSFB(ino *inode.Inode, off, n uint64) ([]byte, error) {
+	start, err := f.sfbSlotOffset(ino)
+	if err != nil || n == 0 {
+		return nil, err
+	}
+	from := start + int64(off)
+	aligned := from &^ (storage.SectorSize - 1)
+	length := (from + int64(n) - aligned + storage.SectorSize - 1) &^ (storage.SectorSize - 1)
+	buf := storage.GetBuffer(int(length))
+	defer storage.PutBuffer(buf)
+	if _, err := f.dev.ReadAt(buf.Bytes()[:length], aligned); err != nil {
+		return nil, err
+	}
+	return bytes.Clone(buf.Bytes()[from-aligned : from-aligned+int64(n)]), nil
+}
+
+// freeSFBSlot clears a slot's bit in its container header. A failure leaks the
+// slot, which is safe because nothing allocates SFB slots any more.
+func (f *FS) freeSFBSlot(ctx context.Context, packed uint64) {
+	container, slot := sfb.UnpackPhysicalBlock(packed)
+	if f.lockMgr != nil {
+		if err := f.lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, container, lock.LockModeExclusive); err != nil {
+			log.Printf("[WARN] Free SFB slot %d:%d: container lock failed: %v", container, slot, err)
+			return
+		}
+		defer f.lockMgr.Release(lock.LockTypeSFBContainer, container)
+	}
+
+	buf := storage.GetBuffer(storage.SectorSize)
+	defer storage.PutBuffer(buf)
+	sector := buf.Bytes()[:storage.SectorSize]
+	off := int64(f.dataOffset + container*BlockSize)
+	if _, err := f.dev.ReadAt(sector, off); err != nil {
+		log.Printf("[WARN] Free SFB slot %d:%d: reading container header failed: %v", container, slot, err)
+		return
+	}
+	h, err := sfb.DeserializeHeader(sector)
+	if err != nil || !bytes.Equal(h.Serialize(), sector[:sfb.HeaderSize]) || slot >= h.SlotCount {
+		log.Printf("[WARN] Free SFB slot %d:%d: no valid container header, leaking the slot", container, slot)
+		return
+	}
+	bit := byte(1) << (slot % 8)
+	if h.Bitmap[slot/8]&bit == 0 {
+		log.Printf("[WARN] Free SFB slot %d:%d: slot already free", container, slot)
+		return
+	}
+	h.Bitmap[slot/8] &^= bit
+	h.FreeSlots++
+	copy(sector, h.Serialize())
+	if _, err := f.dev.WriteAt(sector, off); err != nil {
+		log.Printf("[WARN] Free SFB slot %d:%d: writing container header failed: %v", container, slot, err)
+	}
+}
+
+// migrateToExtent moves an SFB-backed file's data into a full block and frees
+// its slot. It fails rather than map the file to a block missing its data.
 func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	if !ino.IsSFBBacked() {
 		return nil // Already using extents
 	}
 
-	ext := &ino.InlineExtents[0]
-	oldContainer, oldSlot := sfb.UnpackPhysicalBlock(ext.PhysicalBlock)
-
-	// Determine old slot size
-	tier := sfb.Tier((ext.Flags >> 4) & 0x3)
-	oldSlotSize, _ := tier.Info()
-	if oldSlotSize == 0 {
-		oldSlotSize = 64 * 1024
+	data, err := f.fs.readSFB(ino, 0, ino.Size)
+	if err != nil {
+		return fmt.Errorf("reading SFB slot: %w", err)
 	}
+	oldSlot := ino.InlineExtents[0].PhysicalBlock
+	oldContainer, oldSlotIndex := sfb.UnpackPhysicalBlock(oldSlot)
 
-	// Allocate a new full 1MB block
 	newBlocks, err := f.fs.bitmapMgr.Alloc(ctx, 1)
 	if err != nil {
 		return fmt.Errorf("failed to allocate block for migration: %w", err)
 	}
 	newBlock := newBlocks[0]
 
-	// Read data from old SFB slot
-	slotOffset := uint64(SFBHeaderSize) + uint64(oldSlot)*uint64(oldSlotSize)
-	oldDiskOffset := int64(f.fs.dataOffset + oldContainer*BlockSize + slotOffset)
-
-	slotData := make([]byte, ino.Size)
-	if _, err := f.fs.dev.ReadAt(slotData, oldDiskOffset); err != nil {
-		// Best effort - continue with partial data
-		log.Printf("[WARN] Migration read incomplete for inode %d: %v", f.inodeNum, err)
-	}
-
-	// Write data to new block
-	newDiskOffset := int64(f.fs.dataOffset + newBlock*BlockSize)
-	if _, err := f.fs.dev.WriteAt(slotData, newDiskOffset); err != nil {
-		// Release the allocated block on failure
+	buf := storage.GetBuffer(BlockSize)
+	copy(buf.Bytes(), data)
+	_, err = f.fs.dev.WriteAt(buf.Bytes()[:BlockSize], int64(f.fs.dataOffset+newBlock*BlockSize))
+	storage.PutBuffer(buf)
+	if err != nil {
 		_ = f.fs.bitmapMgr.Free(ctx, newBlock)
 		return fmt.Errorf("failed to write migrated data: %w", err)
 	}
@@ -2827,7 +2730,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 		if err := txn.LogSFBMigrate(&journal.SFBMigratePayload{
 			InodeNum:     uint64(f.inodeNum),
 			OldContainer: oldContainer,
-			OldSlot:      oldSlot,
+			OldSlot:      oldSlotIndex,
 			NewBlock:     newBlock,
 		}); err != nil {
 			f.fs.journal.Abort(txn)
@@ -2843,14 +2746,9 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 		}
 	}
 
-	// Update extent to point to new block (clear SFB flag)
-	ext.PhysicalBlock = newBlock
-	ext.LogicalBlock = 0
-	ext.Length = 1
-	ext.Flags = extent.FlagAllocated // Clear SFB flag
-
-	// Update inode
+	ino.InlineExtents[0] = inode.InlineExtent{PhysicalBlock: newBlock, Length: 1, Flags: extent.FlagAllocated}
 	ino.AllocatedBlocks = 1
+	ino.WrittenBlocks = 1
 	ino.Mtime = time.Now().UnixNano()
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
@@ -2861,12 +2759,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 		return retryOnTreeConflict(err)
 	}
 
-	// Free the old SFB slot (if sfbMgr is available)
-	if f.fs.sfbMgr != nil {
-		if err := f.fs.sfbMgr.FreeSlot(ctx, oldContainer, oldSlot); err != nil {
-			log.Printf("[WARN] Failed to free old SFB slot %d:%d: %v", oldContainer, oldSlot, err)
-		}
-	}
+	f.fs.freeSFBSlot(ctx, oldSlot)
 
 	// === WAL: Mark intent complete ===
 	if f.fs.journal != nil && intentSeq > 0 {
@@ -2876,7 +2769,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	}
 
 	log.Printf("[INFO] Migrated inode %d from SFB (%d:%d) to extent (block %d)",
-		f.inodeNum, oldContainer, oldSlot, newBlock)
+		f.inodeNum, oldContainer, oldSlotIndex, newBlock)
 
 	return nil
 }
@@ -2904,6 +2797,19 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
 		return syscall.EIO, nil
+	}
+
+	if _, resizing := in.GetSize(); resizing && ino.IsSFBBacked() {
+		if err := f.migrateToExtent(ctx, ino); err != nil {
+			log.Printf("[DEBUG] Setattr inode %d: SFB migration failed: %v", f.inodeNum, err)
+			if err == errRetryWrite {
+				return 0, err
+			}
+			return syscall.EIO, nil
+		}
+		if ino, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
+			return syscall.EIO, nil
+		}
 	}
 
 	now := time.Now().UnixNano()

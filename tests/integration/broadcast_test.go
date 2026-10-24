@@ -129,6 +129,21 @@ func TestBroadcastDirectoryInvalidation(t *testing.T) {
 	}
 }
 
+// waitForContent polls node until name reads as want.
+func waitForContent(t *testing.T, node *MountedFS, name, want string) {
+	t.Helper()
+	var data []byte
+	var err error
+	took, ok := waitFor(propagationTimeout, func() bool {
+		data, err = node.ReadFile(name)
+		return err == nil && string(data) == want
+	})
+	if !ok {
+		t.Fatalf("%s did not read %q within %v: got %q, err=%v", name, want, propagationTimeout, data, err)
+	}
+	t.Logf("%s propagated in %v", name, took)
+}
+
 // TestBroadcastMultipleUpdates verifies that rapid successive updates
 // are all broadcast correctly.
 func TestBroadcastMultipleUpdates(t *testing.T) {
@@ -169,19 +184,7 @@ func TestBroadcastMultipleUpdates(t *testing.T) {
 		time.Sleep(50 * time.Millisecond) // Small gap between updates
 	}
 
-	// Allow final broadcast to propagate
-	time.Sleep(300 * time.Millisecond)
-
-	// Node 1 should see the final version
-	readData, err := node1.ReadFile("rapid_updates.txt")
-	if err != nil {
-		t.Fatalf("Node1 ReadFile failed: %v", err)
-	}
-
-	expectedFinal := []byte("v" + string(rune('0'+updateCount)))
-	if !bytes.Equal(readData, expectedFinal) {
-		t.Errorf("Final content mismatch: got %q, want %q", readData, expectedFinal)
-	}
+	waitForContent(t, node1, "rapid_updates.txt", "v"+string(rune('0'+updateCount)))
 
 	t.Log("Multiple rapid updates correctly propagated via broadcast")
 }
@@ -218,26 +221,8 @@ func TestBroadcastBidirectional(t *testing.T) {
 		t.Fatalf("Node1 create file_b failed: %v", err)
 	}
 
-	// Allow broadcast propagation
-	time.Sleep(300 * time.Millisecond)
-
-	// Node 1 should see file A from Node 0
-	dataA, err := node1.ReadFile("file_a.txt")
-	if err != nil {
-		t.Fatalf("Node1 ReadFile(file_a) failed: %v", err)
-	}
-	if string(dataA) != "from node 0" {
-		t.Errorf("file_a content wrong: got %q", dataA)
-	}
-
-	// Node 0 should see file B from Node 1
-	dataB, err := node0.ReadFile("file_b.txt")
-	if err != nil {
-		t.Fatalf("Node0 ReadFile(file_b) failed: %v", err)
-	}
-	if string(dataB) != "from node 1" {
-		t.Errorf("file_b content wrong: got %q", dataB)
-	}
+	waitForContent(t, node1, "file_a.txt", "from node 0")
+	waitForContent(t, node0, "file_b.txt", "from node 1")
 
 	t.Log("Bidirectional broadcast invalidation working correctly")
 }

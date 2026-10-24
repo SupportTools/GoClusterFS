@@ -16,8 +16,7 @@ type ExtentCacheKey struct {
 
 // CachedExtent holds a cached extent lookup result.
 type CachedExtent struct {
-	// PhysicalBlock is the physical disk block number.
-	// A value of 0 means "hole" (sparse file - unallocated region).
+	// PhysicalBlock is the physical disk block number, or extent.Hole.
 	PhysicalBlock uint64
 
 	// InodeDataGen and InodeMetaGen are the inode's generations at cache time.
@@ -42,7 +41,7 @@ func (c *CachedExtent) IsStale(dataGen, metaGen uint64) bool {
 // extent.Manager.LookupPhysical() on cache miss.
 //
 // Returns:
-//   - physicalBlock: The physical block number (0 = hole)
+//   - physicalBlock: The physical block number or extent.Hole
 //   - found: true if cache hit and valid
 func (m *Manager) GetExtent(ino *inode.Inode, logicalBlock uint64) (physicalBlock uint64, found bool) {
 	key := ExtentCacheKey{
@@ -66,7 +65,7 @@ func (m *Manager) GetExtent(ino *inode.Inode, logicalBlock uint64) (physicalBloc
 // CacheExtent stores an extent mapping looked up with this version of ino.
 //
 // Call this after a successful extent.Manager.LookupPhysical() to cache
-// the result for future reads. physicalBlock is 0 for a hole.
+// the result for future reads. physicalBlock is extent.Hole for a hole.
 func (m *Manager) CacheExtent(ino *inode.Inode, logicalBlock uint64, physicalBlock uint64) {
 	if m.config.ExtentCacheSize == 0 {
 		return // Extent cache disabled
@@ -121,7 +120,7 @@ func (m *Manager) InvalidateExtentsForInode(inodeNum uint32) {
 //   - logicalBlock: The logical file block to look up
 //
 // Returns:
-//   - physicalBlock: The physical disk block (0 = hole)
+//   - physicalBlock: The physical disk block or extent.Hole
 //   - err: Any error from disk lookup
 func (m *Manager) LookupPhysicalCached(extMgr *extent.Manager, ino *inode.Inode, logicalBlock uint64) (uint64, error) {
 	if phys, found := m.GetExtent(ino, logicalBlock); found {
@@ -133,7 +132,7 @@ func (m *Manager) LookupPhysicalCached(extMgr *extent.Manager, ino *inode.Inode,
 		return 0, err
 	}
 
-	// Cache the result (including holes which have phys=0)
+	// Cache the result (including holes, which map to extent.Hole)
 	m.CacheExtent(ino, logicalBlock, phys)
 
 	return phys, nil
