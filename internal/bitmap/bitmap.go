@@ -89,9 +89,6 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 		return nil, nil
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
@@ -99,6 +96,9 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 		}
 		defer r.lockMgr.Release(lock.LockTypeBlockBitmap, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	allocated := make([]uint64, 0, count)
 
@@ -170,9 +170,6 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 		return ErrBlockOutOfRange
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
@@ -180,6 +177,9 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 		}
 		defer r.lockMgr.Release(lock.LockTypeBlockBitmap, 0)
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	sectorIdx := blockNum / BitsPerSector
 	bitOffset := blockNum % BitsPerSector

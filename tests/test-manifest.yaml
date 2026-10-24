@@ -304,6 +304,35 @@ scenarios:
       docker: run-tests.sh::test_mixed_size_writes
       vm: run-vm-tests.sh::test_mixed_size_writes
 
+  - id: multinode-concurrent-first-write-same-block
+    name: Concurrent first write to the same block
+    description: Two nodes write different ranges of a new file's first block at once; both writes survive
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentFirstWriteToSameBlock
+      docker: run-tests.sh::test_concurrent_first_write_same_block
+      vm: run-vm-tests.sh::test_concurrent_first_write_same_block
+
+  # Docker/VM TODO: single-node behavior that needs a remount and a full-volume
+  # write; the Go integration test runs the real mount binary already.
+  - id: tree-reservation-no-leak
+    name: Extent-tree reservations do not leak blocks
+    description: Appends that merge into a full inline extent return their unused tree-block reservation, so the whole volume is writable after the file is deleted and the FS remounted
+    priority: medium
+    environments:
+      go: tree_reservation_test.go::TestTreeReservationsDoNotLeakBlocks
+      docker: TODO
+      vm: TODO
+
+  - id: write-inside-fallocated-range
+    name: Write inside a fallocated range
+    description: A 4KB write into the middle of a fallocated range splits the unwritten extent under the live lock and zero-fills the rest of the block
+    priority: medium
+    environments:
+      go: tree_reservation_test.go::TestWriteInsideFallocatedRange
+      docker: TODO
+      vm: TODO
+
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
     description: Multiple nodes write to same block at different offsets
@@ -1425,3 +1454,126 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/journal_fuzz_test.go::FuzzJournalScan
+
+  # ===========================================================================
+  # DISTRIBUTED LOCK SAFETY (internal/lock)
+  # Two or three lock managers share one device to act as separate nodes.
+  # ===========================================================================
+
+  # Docker/VM TODO: a shell test would have to freeze a node (docker pause, or
+  # SIGSTOP on the QEMU process) inside a lock-held section that lasts
+  # milliseconds, then resume it after StaleThreshold. Shell tests cannot target
+  # that window, so the Go test simulates the pause by aging the on-disk record.
+  - id: lock-stale-reclaim-paused-holder
+    name: Stale lock reclaimed from paused holder
+    description: A holder stalled past StaleThreshold loses its lock to another node without being told
+    priority: high
+    environments:
+      go: ../../internal/lock/safety_test.go::TestStaleLockIsReclaimedFromPausedHolder
+      docker: TODO
+      vm: TODO
+
+  - id: lock-paused-holder-release
+    name: Paused holder release keeps new holder's lock
+    description: A late Release from a holder whose lock was reclaimed returns ErrNotLockOwner and leaves the new holder's record intact
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestPausedHolderReleaseKeepsReclaimedLock
+
+  - id: lock-colliding-resources-excluded
+    name: Colliding resources exclude other nodes
+    description: A held record blocks other nodes from every resource that hashes to it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCollidingResourceIsBlockedWhileOtherNodeHoldsRecord
+
+  - id: lock-same-node-colliding-resources
+    name: One node holds colliding resources
+    description: A node can hold two resources that share a record; the record stays held until the last one is released
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestNodeHoldsCollidingResourcesUntilLastRelease
+
+  - id: lock-same-node-concurrent-acquire
+    name: Concurrent same-node acquire keeps the lock
+    description: Goroutines on one node acquiring the same lock at once leave it held on disk
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestConcurrentAcquireOnOneNodeKeepsOtherNodesOut
+
+  - id: lock-shared-release-by-count
+    name: Shared lock survives another reader's release
+    description: Releasing one reader's shared hold does not free the lock for writers while other readers hold it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSharedLockHeldAfterAnotherReaderReleases
+
+  - id: lock-exclusive-waits-same-node-readers
+    name: Exclusive waits for same-node readers
+    description: An exclusive request does not join a shared hold from the same node; it waits until this node's readers release
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestExclusiveWaitsForSameNodeReaders
+
+  - id: lock-upgrade-same-goroutine
+    name: Shared to exclusive upgrade rejected
+    description: A goroutine holding a shared lock gets ErrDeadlockRisk when it asks for exclusive on the same record
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSameGoroutineCannotUpgradeSharedToExclusive
+
+  - id: lock-two-node-readers-cannot-write
+    name: Readers on two nodes cannot both write
+    description: When two nodes hold a record shared, neither node's exclusive request succeeds
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReadersOnTwoNodesCannotBothWrite
+
+  - id: lock-join-fails-after-takeover
+    name: Join fails after takeover
+    description: A key joining an exclusive hold that another node took over as stale gets ErrLockLost instead of joining
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestJoinFailsAfterRecordTakenOver
+
+  - id: lock-busy-record-renewed
+    name: Busy record renewed on join
+    description: A key joining an exclusive record this node has held past renewAfter rewrites its AcquireTime, so a busy node does not lose the record as stale
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestJoiningKeyRenewsBusyRecord
+
+  - id: inode-write-same-node-reader
+    name: Inode write does not hang behind same-node reader
+    description: Table.Write on a directory finishes while another goroutine on the node holds the directory's shared lock and reads the inode table
+    priority: go_only
+    environments:
+      go: internal/inode/lock_test.go::TestWriteDoesNotHangBehindSameNodeReader
+
+  - id: lock-stale-shared-reclaim
+    name: Stale shared lock reclaim drops dead readers
+    description: Reclaiming a stale shared record resets the reader count so it can be fully released
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestStaleSharedLockReclaimResetsReaderCount
+
+  - id: lock-leaked-shared-count-goes-stale
+    name: Leaked reader count goes stale
+    description: New readers do not refresh a shared record's age, so a reader count leaked by a lost update cannot block writers forever
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
+
+  - id: write-failure-keeps-committed-blocks
+    name: Failed write keeps blocks committed mid-write
+    description: When the final inode write fails after a mid-write persist committed a new block, the retry finds that block still allocated and mapped
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestFailedWriteKeepsBlocksCommittedMidWrite
+
+  - id: lock-region-bounded
+    name: Lock region stays bounded
+    description: Many acquire/release cycles across resources and two nodes reuse the fixed region, leave no record held, and write nothing outside it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles

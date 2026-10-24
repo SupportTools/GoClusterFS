@@ -202,9 +202,6 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 		return nil, ErrInodeOutOfRange
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if t.lockMgr != nil {
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inode.InodeNum), lock.LockModeExclusive); err != nil {
@@ -212,6 +209,9 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inode.InodeNum))
 	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	return t.writeWithTree(inode)
 }
@@ -311,11 +311,10 @@ func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
 		return nil, ErrInodeOutOfRange
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	// Re-read to verify slot is still free (another node may have claimed it)
+	t.mu.RLock()
 	existing, err := t.readInodeUnlocked(num)
+	t.mu.RUnlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read inode slot: %w", err)
 	}
@@ -330,6 +329,9 @@ func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
 	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	// Double-check after acquiring lock (another node could have won the race)
 	existing, err = t.readInodeUnlocked(num)
@@ -367,37 +369,16 @@ func (t *Table) newInodeInSlot(num uint32, free *Inode) *Inode {
 // Deprecated: Use FindFreeSlot() + ClaimSlot() for operations that need to allocate
 // blocks before claiming the inode (to respect lock ordering: BlockBitmap before Inode).
 func (t *Table) Alloc(ctx context.Context) (*Inode, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	// Scan for a free inode starting from InodeFirstUsable
-	for num := InodeFirstUsable; uint64(num) < t.totalInodes; num++ {
-		inode, err := t.readInodeUnlocked(num)
+	for {
+		num, err := t.FindFreeSlot()
 		if err != nil {
-			continue // Skip unreadable inodes
+			return nil, err
 		}
-
-		// Check if inode is free (Magic == 0)
-		if inode.Magic == 0 {
-			newInode := t.newInodeInSlot(num, inode)
-
-			// Acquire distributed lock if available
-			if t.lockMgr != nil {
-				if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
-					return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
-				}
-				defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
-			}
-
-			if err := t.writeInodeUnlocked(newInode); err != nil {
-				return nil, fmt.Errorf("failed to write new inode: %w", err)
-			}
-
-			return newInode, nil
+		ino, err := t.ClaimSlot(ctx, num)
+		if !errors.Is(err, ErrInodeInUse) {
+			return ino, err
 		}
 	}
-
-	return nil, ErrInodeFull
 }
 
 // Free marks an inode as free.
@@ -410,9 +391,6 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 		return fmt.Errorf("cannot free reserved inode %d", inodeNum)
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	// Acquire distributed lock if available
 	if t.lockMgr != nil {
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inodeNum), lock.LockModeExclusive); err != nil {
@@ -420,6 +398,9 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inodeNum))
 	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
 	// Read current inode
 	inode, err := t.readInodeUnlocked(inodeNum)
