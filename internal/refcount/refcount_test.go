@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
-	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // createTestDevice creates a test file for O_DIRECT testing.
@@ -956,33 +955,27 @@ func TestRegionOffset(t *testing.T) {
 	}
 }
 
-// A 200 GiB volume has 204537 blocks, but its 1 MB refcount region holds entries
-// for 130816. The sectors of the other blocks would fall in the snapshot registry.
-func TestBlocksPastRegionLeaveTheSnapshotRegistryAlone(t *testing.T) {
+// A region too small for its blocks, like layout v2's 1 MB table on a 200 GiB
+// volume, refuses blocks past its end and leaves the next region alone.
+func TestBlocksPastRegionLeaveTheNextRegionAlone(t *testing.T) {
 	ctx := context.Background()
-	dev, cleanup := createTestDevice(t, 200<<30)
+	const size, totalBlocks = 1 << 20, 204537
+	dev, cleanup := createTestDevice(t, 2*size)
 	defer cleanup()
-	sb, err := superblock.Format(dev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := BlocksForSize(sb.RefCountTableSize)
-	last := sb.TotalBlocks - 1
-	if last < first {
-		t.Fatalf("all %d blocks fit the %d-byte refcount region", sb.TotalBlocks, sb.RefCountTableSize)
-	}
+	first := BlocksForSize(size)
+	last := uint64(totalBlocks - 1)
 
-	// The registry's first sector holds a descriptor sector: data and a CRC32C, like a refcount sector.
-	registry := storage.NewAlignedBuffer(int(sb.SnapshotRegSize))
+	// The next region's first sector holds data and a CRC32C, like a refcount sector.
+	next := storage.NewAlignedBuffer(size)
 	for i := range SectorSize - ChecksumSize {
-		registry.Bytes()[i] = byte(i%251 + 1)
+		next.Bytes()[i] = byte(i%251 + 1)
 	}
-	binary.LittleEndian.PutUint32(registry.Bytes()[SectorSize-ChecksumSize:], storage.CRC32C(registry.Bytes()[:SectorSize-ChecksumSize]))
-	if _, err := dev.WriteAt(registry.Bytes(), int64(sb.SnapshotRegOffset)); err != nil {
+	binary.LittleEndian.PutUint32(next.Bytes()[SectorSize-ChecksumSize:], storage.CRC32C(next.Bytes()[:SectorSize-ChecksumSize]))
+	if _, err := dev.WriteAt(next.Bytes(), size); err != nil {
 		t.Fatal(err)
 	}
 
-	region := NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, nil)
+	region := NewRegion(dev, 0, size, totalBlocks, nil)
 
 	if _, err := region.Increment(ctx, first); !errors.Is(err, ErrBlockPastRegion) {
 		t.Errorf("Increment(%d) = %v, want ErrBlockPastRegion", first, err)
@@ -1005,16 +998,16 @@ func TestBlocksPastRegionLeaveTheSnapshotRegistryAlone(t *testing.T) {
 	if entry, _ := region.Get(ctx, first-1); entry.RefCount != 0 {
 		t.Errorf("failed Share left block %d with count %d", first-1, entry.RefCount)
 	}
-	if stats, err := region.Scan(ctx); err != nil || stats.FreeBlocks != sb.TotalBlocks {
-		t.Errorf("Scan = %+v, %v, want all %d blocks free", stats, err, sb.TotalBlocks)
+	if stats, err := region.Scan(ctx); err != nil || stats.FreeBlocks != totalBlocks {
+		t.Errorf("Scan = %+v, %v, want all %d blocks free", stats, err, totalBlocks)
 	}
 
-	after := storage.NewAlignedBuffer(int(sb.SnapshotRegSize))
-	if _, err := dev.ReadAt(after.Bytes(), int64(sb.SnapshotRegOffset)); err != nil {
+	after := storage.NewAlignedBuffer(size)
+	if _, err := dev.ReadAt(after.Bytes(), size); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(after.Bytes(), registry.Bytes()) {
-		t.Error("refcount updates for blocks past the region changed the snapshot registry")
+	if !bytes.Equal(after.Bytes(), next.Bytes()) {
+		t.Error("refcount updates for blocks past the region changed the next region")
 	}
 }
 

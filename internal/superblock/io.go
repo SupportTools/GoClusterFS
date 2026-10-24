@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/supporttools/GoClusterFS/internal/bitmap"
-	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -29,6 +27,10 @@ const (
 
 	regionSize = 1 << 20
 	inodeSize  = 256
+
+	// The bitmap and refcount sectors end in a 4-byte checksum.
+	bitmapBlocksPerSector   = (storage.SectorSize - 4) * 8
+	refcountBlocksPerSector = (storage.SectorSize - 4) / 8
 
 	// MinDeviceSize holds all metadata regions and one data block.
 	MinDeviceSize = 7*regionSize + MaxNodes*NodeJournalSize + storage.DefaultBlockSize
@@ -135,12 +137,12 @@ func (sb *Superblock) checkLayout(deviceSize int64) error {
 
 // BlockBitmapBytes is the bitmap size, in whole sectors, that tracks this many data blocks.
 func BlockBitmapBytes(blocks uint64) uint64 {
-	return (blocks + bitmap.BitsPerSector - 1) / bitmap.BitsPerSector * storage.SectorSize
+	return (blocks + bitmapBlocksPerSector - 1) / bitmapBlocksPerSector * storage.SectorSize
 }
 
 // RefCountTableBytes is the refcount table size, in whole sectors, that covers this many data blocks.
 func RefCountTableBytes(blocks uint64) uint64 {
-	return (blocks + refcount.EntriesPerSector - 1) / refcount.EntriesPerSector * storage.SectorSize
+	return (blocks + refcountBlocksPerSector - 1) / refcountBlocksPerSector * storage.SectorSize
 }
 
 func alignRegion(size uint64) uint64 {

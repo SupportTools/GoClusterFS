@@ -288,6 +288,13 @@ func TestNewSuperblock(t *testing.T) {
 	}
 }
 
+func TestSectorCapacitiesMatchRegions(t *testing.T) {
+	if bitmapBlocksPerSector != bitmap.BitsPerSector || refcountBlocksPerSector != refcount.EntriesPerSector {
+		t.Errorf("blocks per sector: bitmap %d, refcount %d; the packages use %d and %d",
+			bitmapBlocksPerSector, refcountBlocksPerSector, bitmap.BitsPerSector, refcount.EntriesPerSector)
+	}
+}
+
 func TestLayoutCoversEveryBlock(t *testing.T) {
 	for _, size := range []int64{MinDeviceSize, 10 << 30, 128 << 30, 200 << 30, 9 << 40, 100 << 40} {
 		sb := New(size, 0)
