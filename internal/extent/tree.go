@@ -22,7 +22,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
