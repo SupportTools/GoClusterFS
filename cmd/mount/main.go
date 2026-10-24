@@ -36,7 +36,9 @@ func main() {
 		devicePath = flag.String("device", "", "Path to block device or image file")
 		mountPoint = flag.String("mount", "", "Mount point directory")
 		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
-		debug      = flag.Bool("debug", false, "Enable FUSE debug output")
+		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
+			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes)", superblock.MinInodes, superblock.MaxInodes))
+		debug = flag.Bool("debug", false, "Enable FUSE debug output")
 
 		// Cache configuration
 		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
@@ -92,7 +94,7 @@ func main() {
 
 	var sb *superblock.Superblock
 	if *format {
-		sb, err = superblock.Format(dev)
+		sb, err = superblock.Format(dev, *inodeRatio)
 	} else {
 		sb, err = superblock.Read(dev)
 	}

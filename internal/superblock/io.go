@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -17,6 +19,13 @@ const (
 
 	// NodeJournalSize is the size of each node slot's journal region.
 	NodeJournalSize = 4 << 20
+
+	// DefaultBytesPerInode gives one inode per data block, since every non-empty file takes at least one block.
+	DefaultBytesPerInode = storage.DefaultBlockSize
+
+	// MinInodes and MaxInodes bound the inode table to 1 MB and 4 GB.
+	MinInodes = regionSize / inodeSize
+	MaxInodes = 1 << 24
 
 	regionSize = 1 << 20
 	inodeSize  = 256
@@ -77,30 +86,65 @@ func missingSuperblockError(dev *storage.Device) error {
 	return ErrNotFormatted
 }
 
-// checkLayout requires the exact layout this version formats; only the data size depends on the device.
+type region struct {
+	name         string
+	offset, size uint64
+	need         uint64
+	exact        bool
+}
+
+// layout lists the regions after the superblock in disk order, each with the size it needs.
+func (sb *Superblock) layout() []region {
+	return []region{
+		{"node registry", sb.NodeRegistryOffset, sb.NodeRegistrySize, regionSize, true},
+		{"lock records", sb.LockBitmapOffset, sb.LockBitmapSize, regionSize, true},
+		{"snapshot registry", sb.SnapshotRegOffset, sb.SnapshotRegSize, regionSize, true},
+		{"journals", sb.JournalRegionOffset, sb.JournalRegionSize, MaxNodes * NodeJournalSize, true},
+		{"block bitmap", sb.BlockBitmapOffset, sb.BlockBitmapSize, BlockBitmapBytes(sb.TotalBlocks), false},
+		{"refcount table", sb.RefCountTableOffset, sb.RefCountTableSize, RefCountTableBytes(sb.TotalBlocks), false},
+		{"inode table", sb.InodeTableOffset, sb.InodeTableSize, sb.InodeCount * inodeSize, true},
+	}
+}
+
+// checkLayout requires the v3 region order with every region big enough for the
+// volume's data blocks and inodes. The data blocks may end before the device does.
 func (sb *Superblock) checkLayout(deviceSize int64) error {
-	want := New(deviceSize)
-	switch {
-	case sb.BlockSize != want.BlockSize || sb.MetaBlockSize != want.MetaBlockSize ||
-		sb.InodeSize != want.InodeSize || sb.MaxNodes != want.MaxNodes || sb.InodeCount != want.InodeCount:
+	if sb.BlockSize != storage.DefaultBlockSize || sb.MetaBlockSize != storage.MetadataBlockSize ||
+		sb.InodeSize != inodeSize || sb.MaxNodes != MaxNodes || sb.InodeCount < MinInodes || sb.InodeCount > MaxInodes {
 		return fmt.Errorf("%w: block size %d, metadata block %d, inode size %d, %d node slots, %d inodes",
 			ErrUnsupportedLayout, sb.BlockSize, sb.MetaBlockSize, sb.InodeSize, sb.MaxNodes, sb.InodeCount)
-	case sb.regions() != want.regions():
-		return fmt.Errorf("%w: region offsets or sizes differ from layout v%d", ErrUnsupportedLayout, CurrentVersion)
-	case sb.TotalBlocks == 0 || sb.TotalBlocks > want.TotalBlocks:
+	}
+	offset := uint64(regionSize)
+	for _, r := range sb.layout() {
+		if r.offset != offset || r.size%regionSize != 0 || r.size < r.need || (r.exact && r.size != alignRegion(r.need)) {
+			return fmt.Errorf("%w: %s has %d bytes at offset %d, want %d bytes or more at offset %d",
+				ErrUnsupportedLayout, r.name, r.size, r.offset, alignRegion(r.need), offset)
+		}
+		offset += r.size
+	}
+	if sb.DataRegionOffset != offset {
+		return fmt.Errorf("%w: data blocks start at %d, want %d", ErrUnsupportedLayout, sb.DataRegionOffset, offset)
+	}
+	if sb.TotalBlocks == 0 || uint64(deviceSize) < offset ||
+		sb.TotalBlocks > (uint64(deviceSize)-offset)/uint64(sb.BlockSize) {
 		return fmt.Errorf("%w: %d data blocks at offset %d do not fit the %d-byte device",
-			ErrUnsupportedLayout, sb.TotalBlocks, sb.DataRegionOffset, deviceSize)
+			ErrUnsupportedLayout, sb.TotalBlocks, offset, deviceSize)
 	}
 	return nil
 }
 
-func (sb *Superblock) regions() [15]uint64 {
-	return [15]uint64{
-		sb.BlockBitmapOffset, sb.BlockBitmapSize, sb.InodeTableOffset, sb.InodeTableSize,
-		sb.NodeRegistryOffset, sb.NodeRegistrySize, sb.LockBitmapOffset, sb.LockBitmapSize,
-		sb.JournalRegionOffset, sb.JournalRegionSize, sb.RefCountTableOffset, sb.RefCountTableSize,
-		sb.SnapshotRegOffset, sb.SnapshotRegSize, sb.DataRegionOffset,
-	}
+// BlockBitmapBytes is the bitmap size, in whole sectors, that tracks this many data blocks.
+func BlockBitmapBytes(blocks uint64) uint64 {
+	return (blocks + bitmap.BitsPerSector - 1) / bitmap.BitsPerSector * storage.SectorSize
+}
+
+// RefCountTableBytes is the refcount table size, in whole sectors, that covers this many data blocks.
+func RefCountTableBytes(blocks uint64) uint64 {
+	return (blocks + refcount.EntriesPerSector - 1) / refcount.EntriesPerSector * storage.SectorSize
+}
+
+func alignRegion(size uint64) uint64 {
+	return max(size+regionSize-1, regionSize) / regionSize * regionSize
 }
 
 // JournalSlotSize returns the size of each node slot's journal region.
@@ -130,33 +174,42 @@ func Write(dev *storage.Device, sb *Superblock) error {
 
 // Format zeroes every metadata region and each node slot's journal header,
 // then writes a new superblock. The superblock goes last, so an interrupted
-// format leaves a device that mount refuses.
-func Format(dev *storage.Device) (*Superblock, error) {
+// format leaves a device that mount refuses. bytesPerInode sets the inode
+// count; 0 means DefaultBytesPerInode.
+func Format(dev *storage.Device, bytesPerInode uint64) (*Superblock, error) {
 	if dev.Size() < MinDeviceSize {
 		return nil, fmt.Errorf("%w: %d MB, need at least %d MB",
 			ErrDeviceTooSmall, dev.Size()>>20, MinDeviceSize>>20)
 	}
-	sb := New(dev.Size())
+	sb := New(dev.Size(), bytesPerInode)
 
 	zero := storage.NewAlignedBuffer(regionSize)
 	current := storage.NewAlignedBuffer(regionSize)
 	// Writing only non-zero ranges keeps holes in sparse images, which O_DIRECT reads fast.
-	zeroRange := func(offset uint64, size int) error {
-		if _, err := dev.ReadAt(current.Bytes()[:size], int64(offset)); err != nil {
-			return err
+	zeroRange := func(offset, size uint64) error {
+		for end := offset + size; offset < end; offset += regionSize {
+			chunk := min(end-offset, regionSize)
+			if _, err := dev.ReadAt(current.Bytes()[:chunk], int64(offset)); err != nil {
+				return err
+			}
+			if isZero(current.Bytes()[:chunk]) {
+				continue
+			}
+			if _, err := dev.WriteAt(zero.Bytes()[:chunk], int64(offset)); err != nil {
+				return err
+			}
 		}
-		if isZero(current.Bytes()[:size]) {
-			return nil
-		}
-		_, err := dev.WriteAt(zero.Bytes()[:size], int64(offset))
-		return err
+		return nil
 	}
-	for _, offset := range []uint64{
-		0, sb.BlockBitmapOffset, sb.InodeTableOffset, sb.NodeRegistryOffset,
-		sb.LockBitmapOffset, sb.RefCountTableOffset, sb.SnapshotRegOffset,
-	} {
-		if err := zeroRange(offset, regionSize); err != nil {
-			return nil, fmt.Errorf("zero metadata at %d: %w", offset, err)
+	if err := zeroRange(0, regionSize); err != nil {
+		return nil, fmt.Errorf("zero superblock region: %w", err)
+	}
+	for _, r := range sb.layout() {
+		if r.offset == sb.JournalRegionOffset {
+			continue
+		}
+		if err := zeroRange(r.offset, r.size); err != nil {
+			return nil, fmt.Errorf("zero %s at %d: %w", r.name, r.offset, err)
 		}
 	}
 	for slot := 0; slot < MaxNodes; slot++ {
@@ -176,8 +229,8 @@ func Format(dev *storage.Device) (*Superblock, error) {
 }
 
 // New creates a new superblock with default values for the given device size.
-// The caller should set additional fields as needed before writing.
-func New(deviceSize int64) *Superblock {
+// bytesPerInode sets the inode count; 0 means DefaultBytesPerInode.
+func New(deviceSize int64, bytesPerInode uint64) *Superblock {
 	sb := &Superblock{
 		Version:       CurrentVersion,
 		FeatureFlags:  FeatureSparseFiles | FeatureLargeFiles,
@@ -199,26 +252,36 @@ func New(deviceSize int64) *Superblock {
 	// Generate random UUID
 	rand.Read(sb.UUID[:])
 
-	calculateLayout(sb, deviceSize)
+	if bytesPerInode == 0 {
+		bytesPerInode = DefaultBytesPerInode
+	}
+	calculateLayout(sb, deviceSize, bytesPerInode)
 
 	return sb
 }
 
-func calculateLayout(sb *Superblock, deviceSize int64) {
+// calculateLayout puts the fixed-size regions first, so their offsets never
+// change, then the regions sized from the device: the bitmap and refcount
+// table cover every block the device could hold, and the inode table gets
+// one inode per bytesPerInode of device.
+func calculateLayout(sb *Superblock, deviceSize int64, bytesPerInode uint64) {
+	maxBlocks := uint64(deviceSize) / uint64(sb.BlockSize)
+	inodes := min(max(uint64(deviceSize)/bytesPerInode, MinInodes), MaxInodes)
+
 	offset := uint64(regionSize)
 	next := func(size uint64) (uint64, uint64) {
 		start := offset
-		offset += size
-		return start, size
+		offset += alignRegion(size)
+		return start, alignRegion(size)
 	}
 
-	sb.BlockBitmapOffset, sb.BlockBitmapSize = next(regionSize)
-	sb.InodeTableOffset, sb.InodeTableSize = next(regionSize)
 	sb.NodeRegistryOffset, sb.NodeRegistrySize = next(regionSize)
 	sb.LockBitmapOffset, sb.LockBitmapSize = next(regionSize)
-	sb.JournalRegionOffset, sb.JournalRegionSize = next(MaxNodes * NodeJournalSize)
-	sb.RefCountTableOffset, sb.RefCountTableSize = next(regionSize)
 	sb.SnapshotRegOffset, sb.SnapshotRegSize = next(regionSize)
+	sb.JournalRegionOffset, sb.JournalRegionSize = next(MaxNodes * NodeJournalSize)
+	sb.BlockBitmapOffset, sb.BlockBitmapSize = next(BlockBitmapBytes(maxBlocks))
+	sb.RefCountTableOffset, sb.RefCountTableSize = next(RefCountTableBytes(maxBlocks))
+	sb.InodeTableOffset, sb.InodeTableSize = next(inodes * inodeSize)
 	sb.DataRegionOffset = offset
 
 	sb.InodeCount = sb.InodeTableSize / inodeSize

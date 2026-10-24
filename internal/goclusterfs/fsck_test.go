@@ -42,7 +42,7 @@ func newFormattedImageOfSize(t *testing.T, size int64) string {
 		t.Fatal(err)
 	}
 	defer dev.Close()
-	if _, err := superblock.Format(dev); err != nil {
+	if _, err := superblock.Format(dev, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	fsys := openFormattedFS(t, path)

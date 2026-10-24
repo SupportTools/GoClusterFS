@@ -9,19 +9,19 @@ import (
 )
 
 func FuzzDeserialize(f *testing.F) {
-	valid := New(64 << 30).Serialize()
+	valid := New(64<<30, 0).Serialize()
 	f.Add(valid)
 	f.Add(valid[:SuperblockSize-1])
 	f.Add(valid[:len(Magic)])
 	f.Add([]byte{})
 	f.Add(make([]byte, SuperblockSize))
 
-	newer := New(1 << 30)
+	newer := New(1<<30, 0)
 	newer.Version = CurrentVersion + 1
 	newer.RequiredFlags = ^uint64(0)
 	f.Add(newer.Serialize())
 
-	maxed := New(1 << 30)
+	maxed := New(1<<30, 0)
 	maxed.BlockSize = ^uint32(0)
 	maxed.TotalBlocks = ^uint64(0)
 	maxed.InodeTableOffset = ^uint64(0)

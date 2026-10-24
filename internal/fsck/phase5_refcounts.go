@@ -75,8 +75,14 @@ func (c *Checker) checkRefcounts() error {
 		c.logf("  Refcount table not present (size=0)\n")
 		return nil
 	}
-	totalSectors := min(sb.RefCountTableSize/RefcountSectorSize,
-		(sb.TotalBlocks+RefcountEntriesPerSector-1)/RefcountEntriesPerSector)
+	needSectors := (sb.TotalBlocks + RefcountEntriesPerSector - 1) / RefcountEntriesPerSector
+	totalSectors := min(sb.RefCountTableSize/RefcountSectorSize, needSectors)
+	if totalSectors < needSectors {
+		c.addProblem(PhaseRefcounts, Error, "refcount table size",
+			fmt.Sprintf("refcount table too small: %d sectors, need %d for %d blocks",
+				totalSectors, needSectors, sb.TotalBlocks),
+			false)
+	}
 
 	c.logf("  Refcount table offset: 0x%X\n", sb.RefCountTableOffset)
 	c.logf("  Refcount table size: %d bytes (%d sectors)\n", sb.RefCountTableSize, totalSectors)
