@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -449,6 +450,136 @@ func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
 	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
 	setxattr(t, &File{fs: after, inodeNum: f.inodeNum}, "user.snapshot.clone", "race:/race-clone")
 	checkFile(t, lookupFile(t, after, "race-clone"), original)
+}
+
+// Node A decides to write a block in place, then node B snapshots the file
+// before A writes the data. The snapshot must keep the data from before the
+// write, whether the block was never shared or shared once by a snapshot that
+// is gone.
+func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
+	for _, onceShared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("onceShared=%v", onceShared), func(t *testing.T) {
+			path := newSnapshotFSImage(t)
+			nodeA := openSnapshotFS(t, path)
+			if err := nodeA.InitRoot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			original := pattern(1, BlockSize)
+			f := newRegularFile(t, nodeA)
+			writeAt(t, f, original, 0)
+			if onceShared {
+				setxattr(t, f, "user.snapshot", "gone")
+				if errno := f.Removexattr(context.Background(), "user.snapshot.gone"); errno != 0 {
+					t.Fatalf("delete snapshot: %v", errno)
+				}
+				waitSnapshotGone(t, nodeA, "gone")
+			}
+
+			nodeB := openSnapshotFS(t, path)
+			t.Cleanup(func() { beforeInPlaceWrite = nil })
+			beforeInPlaceWrite = func() {
+				beforeInPlaceWrite = nil
+				setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+			}
+			writeAt(t, f, pattern(2, 4096), 0)
+			if beforeInPlaceWrite != nil {
+				t.Fatal("node A's write never reached an in-place write")
+			}
+
+			checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, overwritten(original, 0, pattern(2, 4096)))
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			checkFile(t, lookupFile(t, nodeB, "mid-clone"), original)
+		})
+	}
+}
+
+// Node A changes the file after node B's snapshot counted its blocks and before
+// it marks the file shared. The snapshot shares the file as changed, and once
+// the snapshot is gone every block the file no longer maps is free again.
+func TestSnapshotRetriesWhenFileChangesWhileSharing(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		onceShared bool
+		change     func(t *testing.T, f *File)
+		want       func(original []byte) []byte
+	}{
+		{"in-place write", false,
+			func(t *testing.T, f *File) { writeAt(t, f, pattern(2, 4096), 0) },
+			func(o []byte) []byte { return overwritten(o, 0, pattern(2, 4096)) }},
+		{"copy on write", true,
+			func(t *testing.T, f *File) { writeAt(t, f, pattern(2, 4096), 0) },
+			func(o []byte) []byte { return overwritten(o, 0, pattern(2, 4096)) }},
+		{"truncate", false,
+			func(t *testing.T, f *File) { truncateFile(t, f, BlockSize) },
+			func(o []byte) []byte { return o[:BlockSize] }},
+		{"truncate once shared", true,
+			func(t *testing.T, f *File) { truncateFile(t, f, BlockSize) },
+			func(o []byte) []byte { return o[:BlockSize] }},
+		{"append", false,
+			func(t *testing.T, f *File) { writeAt(t, f, pattern(3, 4096), 2*BlockSize) },
+			func(o []byte) []byte { return append(bytes.Clone(o), pattern(3, 4096)...) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := newSnapshotFSImage(t)
+			nodeA := openSnapshotFS(t, path)
+			ctx := context.Background()
+			if err := nodeA.InitRoot(ctx); err != nil {
+				t.Fatal(err)
+			}
+			original := pattern(1, 2*BlockSize)
+			f := newRegularFile(t, nodeA)
+			writeAt(t, f, original, 0)
+			if tc.onceShared {
+				setxattr(t, f, "user.snapshot", "gone")
+				if errno := f.Removexattr(ctx, "user.snapshot.gone"); errno != 0 {
+					t.Fatalf("delete snapshot: %v", errno)
+				}
+				waitSnapshotGone(t, nodeA, "gone")
+			}
+			before := []uint64{physicalBlock(t, nodeA, f.inodeNum, 0), physicalBlock(t, nodeA, f.inodeNum, 1)}
+
+			nodeB := openSnapshotFS(t, path)
+			t.Cleanup(func() { beforeShareMark = nil })
+			beforeShareMark = func() {
+				beforeShareMark = nil
+				tc.change(t, f)
+			}
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+			if beforeShareMark != nil {
+				t.Fatal("the snapshot never reached the point between counting and marking")
+			}
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			clone := lookupFile(t, nodeB, "mid-clone")
+			checkFile(t, clone, tc.want(original))
+
+			if errno := f.Removexattr(ctx, "user.snapshot.mid"); errno != 0 {
+				t.Fatalf("delete snapshot: %v", errno)
+			}
+			waitSnapshotGone(t, nodeA, "mid")
+			nodeB.discardInode(ctx, clone.inodeNum)
+			ino, err := nodeA.inodeTbl.Read(f.inodeNum)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mapped, err := nodeA.extentMgr.DataBlocks(ino)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range mapped {
+				if got := refcountOf(t, nodeA, b); got > 1 {
+					t.Errorf("block %d of the file counts %d owners, want 1", b, got)
+				}
+			}
+			for _, b := range before {
+				if slices.Contains(mapped, b) {
+					continue
+				}
+				if free, err := nodeA.bitmapMgr.IsFree(b); err != nil || !free {
+					t.Errorf("block %d is unmapped but still allocated (refcount %d, err=%v)", b, refcountOf(t, nodeA, b), err)
+				}
+			}
+		})
+	}
 }
 
 // An image written by an older version, with an old snapshot and an old clone

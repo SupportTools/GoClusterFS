@@ -15,6 +15,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +46,14 @@ var errRetryWrite = errors.New("retry write operation")
 // beforeCoWCommit lets tests run another node's write after a copy-on-write,
 // before this write takes the inode lock and commits the copy.
 var beforeCoWCommit func()
+
+// beforeInPlaceWrite lets tests run another node's snapshot after a write
+// decided to write a block in place, before it writes the data.
+var beforeInPlaceWrite func()
+
+// beforeShareMark lets tests change a file after a snapshot or clone counted
+// its blocks, before it marks the file shared.
+var beforeShareMark func()
 
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected.
@@ -2183,6 +2192,38 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 	return 0, syscall.EAGAIN
 }
 
+// stillWritableInPlace checks, under the inode lock, that logical block
+// blockNum still maps to physBlock and that no other file shares it.
+func (f *File) stillWritableInPlace(blockNum, physBlock uint64) error {
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		log.Printf("[DEBUG] Write inode %d: re-read for in-place write failed: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
+	ext, off, err := f.fs.extentMgr.Lookup(ino, blockNum)
+	switch {
+	case errors.Is(err, extent.ErrExtentNotFound), errors.Is(err, extent.ErrStaleTree):
+		return errRetryWrite
+	case err != nil:
+		log.Printf("[DEBUG] Write inode %d: lookup for in-place write at block %d failed: %v", f.inodeNum, blockNum, err)
+		return syscall.EIO
+	case ext.PhysicalBlock+off != physBlock:
+		return errRetryWrite
+	}
+	if ext.Flags&extent.FlagShared == 0 || f.fs.refcountReg == nil {
+		return nil
+	}
+	entry, err := f.fs.refcountReg.GetUnlocked(physBlock)
+	if err != nil {
+		log.Printf("[DEBUG] Write inode %d: refcount read for block %d failed: %v", f.inodeNum, physBlock, err)
+		return syscall.EIO
+	}
+	if entry.NeedsCoW() {
+		return errRetryWrite
+	}
+	return nil
+}
+
 // retryOnTreeConflict turns a lost extent-tree race into a write retry.
 func retryOnTreeConflict(err error) error {
 	if errors.Is(err, extent.ErrTreeConflict) {
@@ -2561,6 +2602,35 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		zeroFirst = zeroFirst && toWrite < BlockSize
 
+		if beforeInPlaceWrite != nil {
+			beforeInPlaceWrite()
+		}
+		// Without the inode lock, ino may predate another node's snapshot, clone or
+		// copy of this block. A snapshot or clone counts the new owners and then
+		// marks the file shared under the exclusive inode lock, so checking again
+		// under the shared one orders this write before the mark, or sends it back
+		// to copy the block.
+		inPlaceLockHeld := false
+		releaseInPlaceLock := func() {
+			if inPlaceLockHeld {
+				if err := f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum)); err != nil {
+					log.Printf("[DEBUG] Write inode %d: releasing the shared inode lock failed: %v", f.inodeNum, err)
+				}
+				inPlaceLockHeld = false
+			}
+		}
+		if !lockHeld && f.fs.lockMgr != nil {
+			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeShared); err != nil {
+				log.Printf("[DEBUG] Write inode %d: failed to acquire shared inode lock: %v", f.inodeNum, err)
+				return 0, syscall.EIO
+			}
+			inPlaceLockHeld = true
+			if err := f.stillWritableInPlace(blockNum, physBlock); err != nil {
+				releaseInPlaceLock()
+				return 0, err
+			}
+		}
+
 		// Acquire extent lock on the physical block to prevent lost-update race.
 		// When multiple nodes write to different offsets within the same block,
 		// they must serialize their read-modify-write operations to avoid
@@ -2570,6 +2640,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
 				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
+				releaseInPlaceLock()
 				return 0, syscall.EIO
 			}
 			extentLockHeld = true
@@ -2582,6 +2653,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				if extentLockHeld {
 					f.fs.lockMgr.ReleaseExtent(physBlock)
 				}
+				releaseInPlaceLock()
 				return 0, syscall.EIO
 			}
 		}
@@ -2614,6 +2686,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				if extentLockHeld {
 					f.fs.lockMgr.ReleaseExtent(physBlock)
 				}
+				releaseInPlaceLock()
 				return 0, syscall.EIO
 			}
 
@@ -2627,6 +2700,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if extentLockHeld {
 			f.fs.lockMgr.ReleaseExtent(physBlock)
 		}
+		releaseInPlaceLock()
 
 		bytesWritten += toWrite
 		offset += uint64(toWrite)
@@ -3366,46 +3440,77 @@ func (f *FS) markShared(ino *inode.Inode) error {
 	return nil
 }
 
+// errSharingBusy means writes kept moving the file's blocks while a snapshot
+// or clone tried to share them.
+var errSharingBusy = errors.New("the file kept changing while it was being shared")
+
 // errUncountedSharing means the file shares blocks the way older versions did,
 // without refcounts, so its blocks cannot be shared again safely.
 var errUncountedSharing = errors.New("an older version shared this file's blocks without refcounts; run goclusterfs-fsck, and copy the file to snapshot or clone it")
 
+// shareSource counts a new owner of each block of src, then marks src shared
+// under the exclusive inode lock. A writer checks a block and writes it in
+// place under the shared inode lock, so the write lands before the mark, or
+// sees the count and copies the block. If a write copied a block between the
+// count and the mark, the counts are undone and the sharing tried again.
+func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []uint64, error) {
+	for attempt := 0; ; attempt++ {
+		src, err := f.inodeTbl.Read(srcNum)
+		if err != nil {
+			return nil, nil, err
+		}
+		uncounted, err := f.extentMgr.HasUncountedSharing(src)
+		if err != nil {
+			return nil, nil, err
+		}
+		if uncounted {
+			return nil, nil, errUncountedSharing
+		}
+		blocks, err := f.extentMgr.DataBlocks(src)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Refuse before marking src shared, so its writes stay off the copy-on-write path.
+		if err := f.refcountReg.CheckCovered(blocks); err != nil {
+			return nil, nil, err
+		}
+		if err := f.refcountReg.Share(ctx, blocks); err != nil {
+			return nil, nil, err
+		}
+		// A snapshot's data inode is marked shared when it is created and never written again.
+		if src.Flags&inode.FlagSnapshotData != 0 {
+			return src, blocks, nil
+		}
+		if beforeShareMark != nil {
+			beforeShareMark()
+		}
+		marked, err := f.updateInode(ctx, srcNum, f.markShared)
+		var now []uint64
+		if err == nil {
+			now, err = f.extentMgr.DataBlocks(marked)
+		}
+		if err == nil && slices.Equal(now, blocks) {
+			return marked, blocks, nil
+		}
+		f.extentMgr.ReleaseBlocks(ctx, blocks)
+		if err != nil {
+			return nil, nil, err
+		}
+		if attempt == maxConflictRetries-1 {
+			return nil, nil, fmt.Errorf("%w: inode %d", errSharingBusy, srcNum)
+		}
+		conflictBackoff(attempt)
+	}
+}
+
 // shareInto gives dst the extents of inode srcNum, sharing its data blocks.
-// src is marked shared first, then each block gains an owner, durably, before
-// dst maps it; a crash in between leaves src copying blocks it alone owns.
+// Each block gains an owner, durably, before dst maps it; a crash in between
+// leaves blocks counted with an owner too many, which fsck rebuilds.
 // stillValid, if set, runs after the blocks gain owners and before dst maps
 // them. On error the caller discards dst, which gives back any blocks it maps.
 func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, stillValid func() error) error {
-	src, err := f.inodeTbl.Read(srcNum)
+	src, blocks, err := f.shareSource(ctx, srcNum)
 	if err != nil {
-		return err
-	}
-	uncounted, err := f.extentMgr.HasUncountedSharing(src)
-	if err != nil {
-		return err
-	}
-	if uncounted {
-		return errUncountedSharing
-	}
-	// Refuse before marking src shared, so its writes stay off the copy-on-write path.
-	covered, err := f.extentMgr.DataBlocks(src)
-	if err != nil {
-		return err
-	}
-	if err := f.refcountReg.CheckCovered(covered); err != nil {
-		return err
-	}
-	// A snapshot's data inode is marked shared when it is created and never written again.
-	if src.Flags&inode.FlagSnapshotData == 0 {
-		if src, err = f.updateInode(ctx, srcNum, f.markShared); err != nil {
-			return err
-		}
-	}
-	blocks, err := f.extentMgr.DataBlocks(src)
-	if err != nil {
-		return err
-	}
-	if err := f.refcountReg.Share(ctx, blocks); err != nil {
 		return err
 	}
 	err = f.dev.Sync()
@@ -3434,8 +3539,11 @@ func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, sti
 
 // sharingErrno maps a failure to share a file's blocks to an errno.
 func sharingErrno(err error) syscall.Errno {
-	if errors.Is(err, errUncountedSharing) || errors.Is(err, refcount.ErrBlockPastRegion) {
+	switch {
+	case errors.Is(err, errUncountedSharing), errors.Is(err, refcount.ErrBlockPastRegion):
 		return syscall.ENOTSUP
+	case errors.Is(err, errSharingBusy):
+		return syscall.EAGAIN
 	}
 	return syscall.EIO
 }
