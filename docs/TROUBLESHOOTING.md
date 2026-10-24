@@ -87,9 +87,9 @@ sudo umount -l /mnt/goclusterfs
 ./goclusterfs-mount -device /dev/device -mount /mnt/goclusterfs
 ```
 
-### "no GoClusterFS superblock" or "invalid superblock magic"
+### "no GoClusterFS superblock" or "superblock checksum mismatch"
 
-**Symptom**: Mount exits with `Cannot use <device>: no GoClusterFS superblock; format the device with -format`, or a superblock error such as a checksum mismatch.
+**Symptom**: Mount exits with `Cannot use <device>: no GoClusterFS superblock; format the device with -format`, or `Cannot use <device>: superblock checksum mismatch - possible corruption`. (fsck reports a missing superblock as `invalid superblock magic`.)
 
 **Cause**: Device not formatted, wrong device, or a damaged superblock.
 
@@ -108,13 +108,18 @@ head -c 16 /dev/device | hexdump -C
 ./goclusterfs-fsck -repair /dev/device
 ```
 
-### "device has the pre-v2 layout"
+### "device has an inode table but no GoClusterFS superblock"
 
-**Symptom**: Mount exits with `Cannot use <device>: device has the pre-v2 layout, where all nodes share one journal`.
+**Symptom**: Mount exits with `Cannot use <device>: device has an inode table but no GoClusterFS superblock: it has the pre-v2 layout, where all nodes share one journal, or its superblock was destroyed. ...`
 
-**Cause**: An older GoClusterFS build formatted the device. In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
+**Cause**: One of two things, and you need to know which build formatted the device:
 
-**Solution**: Copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
+- **A build from before format version 2 formatted it.** In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
+- **A version 2 build formatted it, and its superblock was overwritten.** Both layouts keep the inode table at 2 MB, so the device looks old.
+
+**Solution**:
+- Pre-v2 device: copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
+- Version 2 device: do not run an old build on it; it would read the wrong layout. There is no tool to rebuild the superblock, so restore from backup.
 
 ---
 
@@ -144,19 +149,12 @@ A crashed node's locks free up on their own: other nodes take them over once the
 
 **Symptom**: Mount exits with `Journal recovery for slot N failed: ... (mount with -skip-recovery to discard this journal)`.
 
-**Cause**: The journal in this node's registry slot is damaged, so its transactions cannot be replayed. A normal crash does not cause this: the next mount on the same host replays the journal by itself.
+**Cause**: The mount could not replay the journal in the registry slot it took. A normal crash does not cause this: the next mount on the same host replays the journal by itself. Read the rest of the error:
 
-**Solution**:
-```bash
-# Discard this slot's journal and start a new one (may lose recent changes)
-./goclusterfs-mount -device /dev/device -mount /mnt/fs -skip-recovery
+- An I/O error, or `journal recovery failed: ...`: the storage failed or a transaction could not be applied. The journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
+- `journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`: the journal header is damaged and cannot be replayed.
 
-# Then unmount on every node and check
-fusermount3 -u /mnt/fs
-./goclusterfs-fsck /dev/device
-```
-
-See [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot).
+**Solution**: Only for a damaged header, discard the journal with `-skip-recovery`. That flag discards the journal of whichever slot the mount takes, which may belong to another crashed node, so follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot) exactly.
 
 ### Another Node's Change Shows Up Late
 

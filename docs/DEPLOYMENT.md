@@ -62,7 +62,7 @@ newgrp fuse
 | Requirement | Details |
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
-| Multicast | UDP multicast support (or unicast fallback) |
+| Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
 | Ports | UDP 31337 (configurable) |
 | Latency | < 10ms between nodes recommended |
 
@@ -468,7 +468,7 @@ stat -f /mnt/goclusterfs
 # On Node 1: Create file
 echo "from node1" > /mnt/cluster/node1.txt
 
-# On Node 2: Verify file appears (within -attr-timeout, 1s by default)
+# On Node 2: Verify file appears (within -attr-timeout, 1s by default, while broadcast works; up to -cache-ttl without it)
 cat /mnt/cluster/node1.txt
 
 # On Node 2: Create file

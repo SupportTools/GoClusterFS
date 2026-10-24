@@ -274,11 +274,21 @@ goclusterfs-mount -device /dev/device -mount /mnt/cluster
 
 ### Damaged Journal Slot
 
-If a mount exits with `Journal recovery for slot N failed`, that slot's journal header is damaged and its transactions cannot be replayed. Mount once with `-skip-recovery` on the same host, before it reboots: the mount discards the journal and starts a new one, and later mounts work normally. Then run fsck, because discarded transactions may have been only partly applied.
+A mount exits with `Journal recovery for slot N failed: ...` when it cannot replay the journal in the slot it took. Read the rest of the error first:
 
-`-skip-recovery` only affects the slot this mount takes. It does not stop the node from replaying crashed peers' journals. `-journal=false` also skips the replay of its own slot, and leaves that journal in place for the next mount, so don't use it on a device that may have a dirty journal.
+- **Storage or replay errors** (an I/O error, or `journal recovery failed: ...`): the journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
+- **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery`, which discards the journal.
 
-A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` once a minute and the slot stays taken. No tool frees it yet; the other 63 slots are unaffected.
+`-skip-recovery` discards the journal of whichever slot the mount takes, and that is not always the damaged one. About 20 seconds after the failed mount, a running node tries to replay the damaged slot and holds it for 60 seconds. A mount in that window takes a different slot, which may hold another crashed node's journal that has not been replayed yet. To discard the right journal:
+
+1. Either run step 2 right after the failed mount, within about 20 seconds, or first unmount on every other node and wait one minute.
+2. On the same host, before it reboots, mount once with `-skip-recovery`.
+3. Check the mount's `Registered as node N` log line. N must be the slot from the error. If it is not, unmount at once: the mount discarded another slot's journal. Check that node's recent changes, and restore them from backup if needed.
+4. Unmount on every node and run fsck, because discarded transactions may have been only partly applied.
+
+`-skip-recovery` does not stop the node from replaying crashed peers' journals. `-journal=false` also skips the replay of its own slot, and leaves that journal in place for the next mount, so don't use it on a device that may have a dirty journal.
+
+A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` and retry every minute. Between retries, a new mount on any host can take that slot and then fail with the same error. There is no safe tool to free the slot yet.
 
 ### Emergency: All Nodes Down
 
@@ -503,16 +513,15 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
-**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default) that tell peers to drop cached inodes and extents. Heartbeat messages add the sender as a unicast peer, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
+**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
 
-- With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add itself as a unicast peer.
+- With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.
+- The only replay protection is a sequence number check that forgets messages after 5 minutes, so a recorded message can be sent again later, even with a secret.
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-Limit UDP port 31337 to the cluster nodes with a firewall either way.
-
-**HTTP API.** This guide does not document the HTTP API yet.
+**Network listeners.** GoClusterFS has no HTTP API. Its only listener is UDP port 31337 on all interfaces, plus the multicast group. Limit that port to the cluster nodes with a firewall.
 
 ---
 
