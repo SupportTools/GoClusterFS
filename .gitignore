@@ -1,7 +1,9 @@
 # Build artifacts
-goclusterfs
-goclusterfs-mount
-GoClusterFS
+/goclusterfs
+/goclusterfs-mount
+/goclusterfs-fsck
+/GoClusterFS
+/coverage.out
 
 # Test artifacts
 *.img
@@ -20,9 +22,9 @@ Thumbs.db
 
 # Go
 vendor/
-mount
+/mount
 
 # VM test runtime artifacts
 tests/vm/runtime/
 tests/vm/results/
-fsck
+/fsck

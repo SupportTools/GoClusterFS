@@ -1,0 +1,38 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+        - -ST1003
+        - -ST1016
+        - -ST1020
+        - -ST1021
+        - -ST1022
+        - -QF1008
+  exclusions:
+    # Known findings as of 2026-10-24 in code other open PRs are changing; delete each rule once fixed.
+    rules:
+      - path: ^main\.go$
+        linters: [staticcheck]
+        text: "SA1019: os\\.SEEK_"
+      - path: ^internal/goclusterfs/fs\.go$
+        linters: [unused]
+        text: "errRetryCreate|field sb is unused"
+      - path: ^internal/extent/extent_test\.go$
+        linters: [staticcheck]
+        text: "SA4006: this value of found is never used"
+      - path: ^internal/fsck/phase7_snapshots\.go$
+        linters: [staticcheck]
+        text: "SA9003"
+      - path: ^internal/dir/dir_test\.go$
+        linters: [staticcheck]
+        text: "SA1019: .*inode\\.Table\\)\\.Alloc is deprecated"
