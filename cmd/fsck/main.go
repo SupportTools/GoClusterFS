@@ -14,6 +14,9 @@
 //	-repair -dry-run: Report what -repair would change, write nothing
 //	-force: Keep checking after a fatal error; with -repair, repair even if
 //	        a stopped node's journal still needs replay
+//	-list-slots: List node registry slots with their lease and journal
+//	-release-slot N: Free the slot of a node that will not return; with
+//	        -discard-journal, reset its journal and free it
 //
 // Exit codes, bits as with fsck(8):
 //
@@ -47,6 +50,10 @@ func main() {
 		summaryOnly  = flag.Bool("summary", false, "Only print final summary")
 		showProblems = flag.Bool("show-problems", true, "Show individual problems found")
 		showVersion  = flag.Bool("version", false, "Print version and exit")
+
+		listSlots      = flag.Bool("list-slots", false, "List node registry slots with their lease and journal, then exit")
+		releaseSlotN   = flag.Int("release-slot", -1, "Check that registry slot N can be released and print what releasing it discards")
+		discardJournal = flag.Bool("discard-journal", false, "With -release-slot, reset the slot's journal and free the slot")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <device>\n\n", os.Args[0])
@@ -58,7 +65,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -repair /path/to/disk.img    # Check and repair\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -verbose -repair /dev/sdc    # Verbose repair\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -repair -dry-run /dev/sdc     # Show what repair would change\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -list-slots /dev/sdb          # Show node registry slots\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -release-slot 3 /dev/sdb      # Show what releasing slot 3 discards\n", os.Args[0])
 		fmt.Fprint(os.Stderr, repairHelp)
+		fmt.Fprint(os.Stderr, slotsHelp)
 		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
 		fmt.Fprintf(os.Stderr, "  0: No errors (warnings may remain)\n")
 		fmt.Fprintf(os.Stderr, "  1: Errors were repaired\n")
@@ -88,6 +98,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: -dry-run needs -repair")
 		os.Exit(fsck.ExitUsage)
 	}
+	releasing := *releaseSlotN != -1
+	switch {
+	case *discardJournal && !releasing:
+		fmt.Fprintln(os.Stderr, "Error: -discard-journal needs -release-slot")
+		os.Exit(fsck.ExitUsage)
+	case releasing && *releaseSlotN < 0:
+		fmt.Fprintln(os.Stderr, "Error: -release-slot needs a slot number")
+		os.Exit(fsck.ExitUsage)
+	case *listSlots && releasing, (*listSlots || releasing) && *repair:
+		fmt.Fprintln(os.Stderr, "Error: -list-slots, -release-slot and -repair run separately")
+		os.Exit(fsck.ExitUsage)
+	}
 	devicePath := flag.Arg(0)
 
 	// Determine mode
@@ -110,6 +132,20 @@ func main() {
 		os.Exit(fsck.ExitOperational)
 	}
 	defer dev.Close()
+
+	if *listSlots || releasing {
+		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose})
+		if *listSlots {
+			err = printSlots(os.Stdout, checker)
+		} else {
+			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *discardJournal)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(fsck.ExitOperational)
+		}
+		os.Exit(fsck.ExitClean)
+	}
 
 	// Configure fsck options
 	opts := fsck.Options{

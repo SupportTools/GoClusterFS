@@ -53,6 +53,20 @@ const (
 	NodeStateDead    NodeState = 3 // Node failed (detected by others)
 )
 
+func (s NodeState) String() string {
+	switch s {
+	case NodeStateEmpty:
+		return "empty"
+	case NodeStateActive:
+		return "active"
+	case NodeStateLeaving:
+		return "leaving"
+	case NodeStateDead:
+		return "dead"
+	}
+	return fmt.Sprintf("unknown(%d)", uint32(s))
+}
+
 // Slot represents a node's on-disk registration entry.
 // Size: 4096 bytes (sector-aligned for O_DIRECT atomic writes)
 type Slot struct {
@@ -655,6 +669,11 @@ func serializeSlot(slot *Slot) []byte {
 }
 
 // deserializeSlot parses a Slot from bytes.
+// ParseSlot decodes one raw registry slot.
+func ParseSlot(buf []byte) (*Slot, error) {
+	return deserializeSlot(buf)
+}
+
 func deserializeSlot(buf []byte) (*Slot, error) {
 	if len(buf) < SlotSize {
 		return nil, ErrInvalidSlot
@@ -874,6 +893,18 @@ func (r *Registry) clearFailedSlot(slotIdx int, uuid [16]byte) error {
 	}
 	_, err = r.casSlot(slotIdx, serializeSlot(slot), serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
 	return err
+}
+
+// ReleaseSlot empties slot slotIdx if it still holds expected, the raw slot
+// bytes the caller checked, and reports whether it did. Only fsck calls it,
+// for a slot whose node will not return.
+func (r *Registry) ReleaseSlot(slotIdx int, expected []byte) (bool, error) {
+	if slotIdx < 0 || slotIdx >= MaxNodes {
+		return false, fmt.Errorf("slot index out of range: %d", slotIdx)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.casSlot(slotIdx, expected, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
 }
 
 // GetFailedNodes returns information about nodes that have failed (stale heartbeat).

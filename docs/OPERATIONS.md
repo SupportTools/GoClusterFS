@@ -288,7 +288,15 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 
 `-skip-recovery` does not stop the node from replaying crashed peers' journals. `-journal=false` also skips the replay of its own slot, and leaves that journal in place for the next mount, so don't use it on a device that may have a dirty journal.
 
-A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` and retry every minute. Between retries, a new mount on any host can take that slot and then fail with the same error. There is no safe tool to free the slot yet.
+A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` and retry every minute. Between retries, a new mount on any host can take that slot and then fail with the same error. Free the slot with fsck. Unmount the filesystem on every node first, then:
+
+```bash
+./goclusterfs-fsck -list-slots /dev/device                       # find the slot and its journal state
+./goclusterfs-fsck -release-slot N /dev/device                   # check the slot; prints what releasing discards
+./goclusterfs-fsck -release-slot N -discard-journal /dev/device  # reset its journal and free the slot
+```
+
+`-release-slot` refuses while any node has the filesystem mounted, and until a minute after the slot's lease ended: its last heartbeat plus 10 seconds, or for a slot another node was replaying, that node's last lease renewal plus 60 seconds. Without `-force` it also refuses a journal that a mount might still replay: one with committed transactions that fsck reads in full, or one fsck cannot read to the end. Mount a node to replay it instead, and add `-force` only if that replay fails. With `-discard-journal`, fsck holds the slot's recovery lease while it resets the journal, frees the slot, and exits 1. The next node to mount can then use the slot. Run fsck afterwards, because discarded transactions may have been only partly applied.
 
 ### Emergency: All Nodes Down
 

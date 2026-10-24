@@ -837,6 +837,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: fsck-release-dead-slot
+    name: fsck releases a dead node's slot
+    description: -release-slot exits 8 while the node is mounted; after the node dies with a damaged journal header, -list-slots shows the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
+    environments:
+      go: fsck_test.go::TestFsckReleasesDeadSlot
+      docker: TODO
+      vm: TODO
+
   - id: fsck-runtime-image-unit
     name: fsck accepts everything the runtime writes
     description: Snapshots, clones, snapshot clones, copies on write in inline and tree files, deletes and unlinks leave no fsck problem
@@ -871,6 +881,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
+
+  - id: fsck-release-slot
+    name: fsck slot release checks
+    description: Release refuses while any node runs or the slot's heartbeat or recovery lease is recent; an expired slot with a damaged journal is released, its journal reads as never initialized, and a new node registers in it
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: fsck-release-slot-registry-changes
+    name: fsck slot release stops when the registry changes
+    description: A node that registers between the release check and the write stops the release before the journal is reset
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotStopsWhenRegistryChanges
 
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust

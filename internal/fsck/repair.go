@@ -287,7 +287,7 @@ func (c *Checker) journalNeedsReplay(i int) string {
 	if sb.MaxNodes == 0 || uint32(i) >= sb.MaxNodes {
 		return "has no journal slot"
 	}
-	off := sb.JournalRegionOffset + uint64(i)*(sb.JournalRegionSize/uint64(sb.MaxNodes))
+	off, _ := c.journalArea(i)
 	buf := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
 	if err := c.readSector(buf, off); err != nil {
 		return "has an unreadable journal: " + err.Error()
