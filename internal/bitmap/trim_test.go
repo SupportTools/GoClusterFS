@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
@@ -55,28 +56,33 @@ func waitFor(t *testing.T, cond func() bool) {
 }
 
 func TestTrimSkipsBlockReallocatedBeforeFlush(t *testing.T) {
-	region, tm, rec, cleanup := newTrimmedRegion(t, 1000, 50*time.Millisecond)
+	region, _, rec, cleanup := newTrimmedRegion(t, 1000, 50*time.Millisecond)
 	defer cleanup()
 	ctx := context.Background()
 
-	blocks, err := region.Alloc(ctx, 1)
+	blocks, err := region.Alloc(ctx, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := region.Free(ctx, blocks[0]); err != nil {
-		t.Fatal(err)
+	reused, stillFree := blocks[0], blocks[2]
+	for _, b := range []uint64{reused, stillFree} {
+		if err := region.Free(ctx, b); err != nil {
+			t.Fatal(err)
+		}
 	}
 	again, err := region.Alloc(ctx, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again[0] != blocks[0] {
-		t.Fatalf("Alloc after Free got block %d, want the freed block %d", again[0], blocks[0])
+	if again[0] != reused {
+		t.Fatalf("Alloc after Free got block %d, want the freed block %d", again[0], reused)
 	}
 
-	waitFor(t, func() bool { return tm.Stats().PendingBlocks == 0 })
-	if rec.has(blocks[0]) {
-		t.Errorf("block %d was discarded after it was allocated again", blocks[0])
+	// Ranges are discarded in block order, so once stillFree is discarded the
+	// flush is past reused.
+	waitFor(t, func() bool { return rec.has(stillFree) })
+	if rec.has(reused) {
+		t.Errorf("block %d was discarded after it was allocated again", reused)
 	}
 }
 
@@ -158,4 +164,61 @@ func TestTrimBatchFlushFromFree(t *testing.T) {
 	}
 
 	waitFor(t, func() bool { return rec.has(blocks[0]) })
+}
+
+// TestTrimDiscardHoldsNoBitmapLock runs the guard with real lock managers on two
+// nodes. A discard can outlast the lock's 15s stale threshold, so the block must
+// stay reserved without the lock held, and other nodes must keep allocating.
+func TestTrimDiscardHoldsNoBitmapLock(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	lockA := lock.NewManager(dev, 1<<20, 1<<20, [16]byte{1}, 0)
+	lockB := lock.NewManager(dev, 1<<20, 1<<20, [16]byte{2}, 1)
+
+	started := make(chan struct{})
+	finish := make(chan struct{})
+	var once sync.Once
+	tm := trim.NewManager(dev, trim.Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+		once.Do(func() { close(started) })
+		<-finish
+		return nil
+	}})
+	a := NewRegion(dev, 0, 1000, lockA, [16]byte{1})
+	a.SetTrimManager(tm)
+	tm.Start()
+	b := NewRegion(dev, 0, 1000, lockB, [16]byte{2})
+	ctx := context.Background()
+
+	blocks, err := a.Alloc(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Free(ctx, blocks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- tm.Stop() }()
+	<-started
+
+	if free, err := b.IsFree(blocks[0]); err != nil || free {
+		t.Errorf("block %d being discarded: IsFree = %v, %v; want reserved", blocks[0], free, err)
+	}
+	allocCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	theirs, err := b.Alloc(allocCtx, 1)
+	cancel()
+	if err != nil {
+		t.Fatalf("node B could not allocate during node A's discard: %v", err)
+	}
+	if theirs[0] == blocks[0] {
+		t.Errorf("node B allocated block %d while node A was discarding it", blocks[0])
+	}
+
+	close(finish)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	if free, err := a.IsFree(blocks[0]); err != nil || !free {
+		t.Errorf("block %d after discard: IsFree = %v, %v; want free again", blocks[0], free, err)
+	}
 }
