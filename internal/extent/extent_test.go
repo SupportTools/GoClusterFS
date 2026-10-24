@@ -56,7 +56,7 @@ func createTestSetup(tb testing.TB) (*Manager, *inode.Inode, func()) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 1000, nil, uuid) // 1000 blocks
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 1<<20)
 
 	ino := &inode.Inode{
 		Magic:    inode.InodeMagic,
@@ -245,37 +245,33 @@ func TestInsertExtent(t *testing.T) {
 	}
 }
 
-func TestInsertTooManyExtents(t *testing.T) {
+func TestInsertBeyondInlineMovesToTree(t *testing.T) {
 	mgr, ino, cleanup := createTestSetup(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	// Fill both inline slots
-	for i := uint64(0); i < MaxInlineExtents; i++ {
-		ext := &Extent{
-			LogicalBlock:  i * 10,
-			PhysicalBlock: 100 + i*10,
-			Length:        5,
-			Flags:         FlagAllocated,
-		}
-		err := mgr.Insert(ctx, ino, ext)
-		if err != nil {
+	for i := uint64(0); i < 3; i++ {
+		ext := &Extent{LogicalBlock: i * 10, PhysicalBlock: 100 + i*10, Length: 5, Flags: FlagAllocated}
+		if err := mgr.Insert(ctx, ino, ext); err != nil {
 			t.Fatalf("Insert extent %d failed: %v", i, err)
 		}
 	}
 
-	// Third extent should fail (no extent tree yet)
-	ext3 := &Extent{
-		LogicalBlock:  100,
-		PhysicalBlock: 300,
-		Length:        5,
-		Flags:         FlagAllocated,
+	if !ino.HasExtentTree() {
+		t.Fatal("third extent should move the map into an extent tree")
 	}
-
-	err := mgr.Insert(ctx, ino, ext3)
-	if err != ErrNoSpaceForExtent {
-		t.Errorf("expected ErrNoSpaceForExtent, got %v", err)
+	if ino.ExtentCount != 3 || ino.ExtentDepth != 1 {
+		t.Errorf("ExtentCount=%d ExtentDepth=%d, want 3 and 1", ino.ExtentCount, ino.ExtentDepth)
+	}
+	if ino.InlineExtents != [inode.MaxInlineExtents]inode.InlineExtent{} {
+		t.Errorf("inline slots should be empty once the tree is used: %+v", ino.InlineExtents)
+	}
+	for i := uint64(0); i < 3; i++ {
+		phys, err := mgr.LookupPhysical(ino, i*10+2)
+		if err != nil || phys != 102+i*10 {
+			t.Errorf("LookupPhysical(%d) = %d, %v; want %d", i*10+2, phys, err, 102+i*10)
+		}
 	}
 }
 
@@ -523,7 +519,7 @@ func TestTruncate(t *testing.T) {
 	}
 
 	// Verify second extent removed
-	extents := mgr.ListExtents(ino)
+	extents := listExtents(t, mgr, ino)
 	if len(extents) != 1 {
 		t.Errorf("After truncate: %d extents, want 1", len(extents))
 	}
@@ -557,7 +553,7 @@ func TestTruncatePartial(t *testing.T) {
 	}
 
 	// Verify extent was shortened
-	extents := mgr.ListExtents(ino)
+	extents := listExtents(t, mgr, ino)
 	if len(extents) != 1 {
 		t.Fatalf("After truncate: %d extents, want 1", len(extents))
 	}
@@ -594,7 +590,7 @@ func TestTruncateToZero(t *testing.T) {
 		t.Fatalf("Truncate to 0 failed: %v", err)
 	}
 
-	extents := mgr.ListExtents(ino)
+	extents := listExtents(t, mgr, ino)
 	if len(extents) != 0 {
 		t.Errorf("After truncate to 0: %d extents, want 0", len(extents))
 	}
@@ -628,7 +624,7 @@ func TestListExtents(t *testing.T) {
 	mgr.Insert(ctx, ino, ext1)
 
 	// List should return sorted
-	extents := mgr.ListExtents(ino)
+	extents := listExtents(t, mgr, ino)
 	if len(extents) != 2 {
 		t.Fatalf("ListExtents returned %d, want 2", len(extents))
 	}
@@ -641,83 +637,20 @@ func TestListExtents(t *testing.T) {
 	}
 }
 
-func TestExtentsOverlap(t *testing.T) {
-	testCases := []struct {
-		name    string
-		a       *Extent
-		b       *Extent
-		overlap bool
-	}{
-		{
-			name:    "no overlap before",
-			a:       &Extent{LogicalBlock: 0, Length: 5},
-			b:       &Extent{LogicalBlock: 10, Length: 5},
-			overlap: false,
-		},
-		{
-			name:    "no overlap after",
-			a:       &Extent{LogicalBlock: 10, Length: 5},
-			b:       &Extent{LogicalBlock: 0, Length: 5},
-			overlap: false,
-		},
-		{
-			name:    "adjacent no overlap",
-			a:       &Extent{LogicalBlock: 0, Length: 5},
-			b:       &Extent{LogicalBlock: 5, Length: 5},
-			overlap: false,
-		},
-		{
-			name:    "partial overlap",
-			a:       &Extent{LogicalBlock: 0, Length: 10},
-			b:       &Extent{LogicalBlock: 5, Length: 10},
-			overlap: true,
-		},
-		{
-			name:    "contained",
-			a:       &Extent{LogicalBlock: 0, Length: 20},
-			b:       &Extent{LogicalBlock: 5, Length: 5},
-			overlap: true,
-		},
-		{
-			name:    "exact same",
-			a:       &Extent{LogicalBlock: 5, Length: 5},
-			b:       &Extent{LogicalBlock: 5, Length: 5},
-			overlap: true,
-		},
+func TestContiguousRuns(t *testing.T) {
+	runs := contiguousRuns(10, []uint64{5, 6, 7, 9, 12, 13}, FlagAllocated)
+	want := []Extent{
+		{LogicalBlock: 10, PhysicalBlock: 5, Length: 3, Flags: FlagAllocated},
+		{LogicalBlock: 13, PhysicalBlock: 9, Length: 1, Flags: FlagAllocated},
+		{LogicalBlock: 14, PhysicalBlock: 12, Length: 2, Flags: FlagAllocated},
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := extentsOverlap(tc.a, tc.b)
-			if result != tc.overlap {
-				t.Errorf("extentsOverlap = %v, want %v", result, tc.overlap)
-			}
-		})
+	if len(runs) != len(want) {
+		t.Fatalf("got %d runs, want %d: %+v", len(runs), len(want), runs)
 	}
-}
-
-func TestAreContiguous(t *testing.T) {
-	testCases := []struct {
-		name       string
-		blocks     []uint64
-		contiguous bool
-	}{
-		{"empty", []uint64{}, true},
-		{"single", []uint64{5}, true},
-		{"two contiguous", []uint64{5, 6}, true},
-		{"three contiguous", []uint64{5, 6, 7}, true},
-		{"gap", []uint64{5, 7}, false},
-		{"reverse", []uint64{7, 6}, false},
-		{"long contiguous", []uint64{100, 101, 102, 103, 104}, true},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			result := areContiguous(tc.blocks)
-			if result != tc.contiguous {
-				t.Errorf("areContiguous = %v, want %v", result, tc.contiguous)
-			}
-		})
+	for i := range want {
+		if runs[i] != want[i] {
+			t.Errorf("run %d = %+v, want %+v", i, runs[i], want[i])
+		}
 	}
 }
 
@@ -929,7 +862,7 @@ func TestAllocateUnwritten_CreatesUnwrittenExtent(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -968,7 +901,7 @@ func TestAllocateUnwritten_DoesNotIncrementWrittenBlocks(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1003,7 +936,7 @@ func TestClearUnwritten_ClearsFlagAndIncrementsWritten(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1025,7 +958,10 @@ func TestClearUnwritten_ClearsFlagAndIncrementsWritten(t *testing.T) {
 	}
 
 	// Clear unwritten flag
-	cleared := mgr.ClearUnwritten(ino, ext)
+	cleared, err := mgr.ClearUnwritten(ino, ext)
+	if err != nil {
+		t.Fatalf("ClearUnwritten failed: %v", err)
+	}
 	if !cleared {
 		t.Error("ClearUnwritten should return true for first clear")
 	}
@@ -1054,7 +990,7 @@ func TestClearUnwritten_NoOpIfAlreadyWritten(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1078,7 +1014,10 @@ func TestClearUnwritten_NoOpIfAlreadyWritten(t *testing.T) {
 	initialWrittenBlocks := ino.WrittenBlocks
 
 	// ClearUnwritten should be no-op
-	cleared := mgr.ClearUnwritten(ino, ext)
+	cleared, err := mgr.ClearUnwritten(ino, ext)
+	if err != nil {
+		t.Fatalf("ClearUnwritten failed: %v", err)
+	}
 	if cleared {
 		t.Error("ClearUnwritten should return false for already-written extent")
 	}
@@ -1098,7 +1037,7 @@ func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1131,7 +1070,10 @@ func TestLookupPhysical_ReturnsZeroForUnwritten(t *testing.T) {
 	}
 
 	// Now clear unwritten and LookupPhysical should return the real block
-	cleared := mgr.ClearUnwritten(ino, foundExt)
+	cleared, err := mgr.ClearUnwritten(ino, foundExt)
+	if err != nil {
+		t.Fatalf("ClearUnwritten failed: %v", err)
+	}
 	if !cleared {
 		t.Error("ClearUnwritten should return true for first clear")
 	}
@@ -1154,7 +1096,7 @@ func TestAllocateUnwritten_IdempotentForExisting(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1197,7 +1139,7 @@ func TestFreeExtent_HandlesUnwrittenCorrectly(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 0)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1252,7 +1194,7 @@ func createTestSetupWithRefcount(tb testing.TB) (*Manager, *refcount.Region, *in
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, 1000, nil, uuid) // 1000 blocks
 	refcountReg := refcount.NewRegion(dev, refcountOffset, refcountSize, nil)
-	mgr := NewManager(dev, bm, nil)
+	mgr := NewManager(dev, bm, nil, 2<<20)
 
 	ino := &inode.Inode{
 		Magic:    inode.InodeMagic,
@@ -1406,14 +1348,18 @@ func TestMarkAllShared(t *testing.T) {
 	}
 
 	// Mark all shared
-	mgr.MarkAllShared(ino)
-
-	// Verify both inline extents are now marked shared
-	if ino.InlineExtents[0].Flags&FlagShared == 0 {
-		t.Error("InlineExtents[0] should be shared after MarkAllShared")
+	if err := mgr.MarkAllShared(ino); err != nil {
+		t.Fatalf("MarkAllShared failed: %v", err)
 	}
-	if ino.InlineExtents[1].Flags&FlagShared == 0 {
-		t.Error("InlineExtents[1] should be shared after MarkAllShared")
+
+	extents := listExtents(t, mgr, ino)
+	if len(extents) == 0 {
+		t.Fatal("expected extents after allocation")
+	}
+	for _, ext := range extents {
+		if ext.Flags&FlagShared == 0 {
+			t.Errorf("extent %+v should be shared after MarkAllShared", *ext)
+		}
 	}
 }
 
@@ -1521,39 +1467,51 @@ func TestCopyOnWrite_AlreadyPrivate(t *testing.T) {
 	}
 }
 
-// TestCopyOnWrite_MultiBlockExtent verifies CoW fails for multi-block extents (not yet supported).
+// TestCopyOnWrite_MultiBlockExtent verifies CoW of one block splits a shared
+// multi-block extent and leaves the other blocks shared.
 func TestCopyOnWrite_MultiBlockExtent(t *testing.T) {
 	mgr, refcountReg, ino, cleanup := createTestSetupWithRefcount(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
-	// Insert a multi-block extent manually
-	ext := &Extent{
-		LogicalBlock:  0,
-		PhysicalBlock: 100,
-		Length:        5, // Multi-block
-		Flags:         FlagAllocated | FlagShared,
-	}
-	err := mgr.Insert(ctx, ino, ext)
-	if err != nil {
+	ext := &Extent{LogicalBlock: 0, PhysicalBlock: 50, Length: 5, Flags: FlagAllocated | FlagShared}
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
 		t.Fatalf("Insert failed: %v", err)
 	}
-
-	// Set refcount > 1 to trigger CoW
-	err = refcountReg.Set(ctx, 100, 2, 0)
-	if err != nil {
+	if err := refcountReg.Set(ctx, 52, 2, 0); err != nil {
 		t.Fatalf("refcount.Set failed: %v", err)
 	}
 
-	dataOffset := uint64(2 << 20)
-
-	// Convert inline extent to Extent for CopyOnWrite
-	extPtr := inlineExtentToExtent(&ino.InlineExtents[0])
-
-	// CoW should fail for multi-block extent
-	_, err = mgr.CopyOnWrite(ctx, ino, extPtr, 0, dataOffset, refcountReg)
-	if err != ErrCoWMultiBlock {
-		t.Errorf("CopyOnWrite should return ErrCoWMultiBlock, got %v", err)
+	result, err := mgr.CopyOnWrite(ctx, ino, ext, 2, 2<<20, refcountReg)
+	if err != nil {
+		t.Fatalf("CopyOnWrite failed: %v", err)
 	}
+	if !result.WasShared || result.OldPhysBlock != 52 || result.NewPhysBlock == 52 {
+		t.Fatalf("unexpected CoW result %+v", result)
+	}
+
+	want := []Extent{
+		{LogicalBlock: 0, PhysicalBlock: 50, Length: 2, Flags: FlagAllocated | FlagShared},
+		{LogicalBlock: 2, PhysicalBlock: result.NewPhysBlock, Length: 1, Flags: FlagAllocated},
+		{LogicalBlock: 3, PhysicalBlock: 53, Length: 2, Flags: FlagAllocated | FlagShared},
+	}
+	got := listExtents(t, mgr, ino)
+	if len(got) != len(want) {
+		t.Fatalf("got %d extents, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if *got[i] != want[i] {
+			t.Errorf("extent %d = %+v, want %+v", i, *got[i], want[i])
+		}
+	}
+}
+
+func listExtents(tb testing.TB, mgr *Manager, ino *inode.Inode) []*Extent {
+	tb.Helper()
+	extents, err := mgr.ListExtents(ino)
+	if err != nil {
+		tb.Fatalf("ListExtents failed: %v", err)
+	}
+	return extents
 }

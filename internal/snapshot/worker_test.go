@@ -83,7 +83,7 @@ func setupTestComponents(t *testing.T, dev *storage.Device) (*Registry, *refcoun
 	}
 
 	// Create extent manager (bitmap can be nil for tests not needing allocation)
-	extMgr := extent.NewManager(dev, nil, nil)
+	extMgr := extent.NewManager(dev, nil, nil, 0)
 
 	// Create inode table
 	var nodeUUID [16]byte
@@ -335,11 +335,14 @@ func TestCollectBlockNumbers(t *testing.T) {
 		Length:        2,
 	}
 
-	// Test worker's collectBlockNumbers
 	worker := &Worker{
 		inodeTable: inodeTbl,
+		extentMgr:  extent.NewManager(nil, nil, nil, 0),
 	}
-	blocks := worker.collectBlockNumbers(ino)
+	blocks, err := worker.extentMgr.DataBlocks(ino)
+	if err != nil {
+		t.Fatalf("DataBlocks failed: %v", err)
+	}
 
 	expected := []uint64{10, 11, 12, 20, 21}
 	if len(blocks) != len(expected) {

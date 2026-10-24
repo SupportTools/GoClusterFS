@@ -50,7 +50,8 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
 	rctx := &RecoveryContext{
@@ -508,6 +509,67 @@ func TestApplyExtentAdd(t *testing.T) {
 }
 
 // TestCreateRecoveryHandler tests the RecoveryHandler creation.
+// TestApplyExtentAddIntoTree replays an ExtentAdd whose inode write was lost in
+// a crash, for a file whose extents already live in an extent tree.
+func TestApplyExtentAddIntoTree(t *testing.T) {
+	rctx, cleanup := testRecoveryContext(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := applyInodeCreate(ctx, rctx, (&InodeCreatePayload{InodeNum: 51, Mode: 0644}).Serialize()); err != nil {
+		t.Fatalf("Setup: failed to create inode: %v", err)
+	}
+	ino, err := rctx.InodeTbl.Read(51)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lb := range []uint64{0, 2, 4} {
+		if _, err := rctx.ExtentMgr.AllocateBlocks(ctx, ino, lb, 1); err != nil {
+			t.Fatalf("Setup: allocate block %d: %v", lb, err)
+		}
+	}
+	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
+		t.Fatalf("Setup: write inode: %v", err)
+	}
+	if !ino.HasExtentTree() {
+		t.Fatal("Setup: inode should use an extent tree")
+	}
+
+	// The crashed write had allocated and journaled this block but never wrote the inode.
+	lost, err := rctx.ExtentMgr.AllocatePhysicalBlock(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := (&ExtentAddPayload{InodeNum: 51, FileBlock: 6, DiskBlock: lost, Length: 1}).Serialize()
+	for attempt, wantApplied := range []bool{true, false} {
+		applied, err := applyExtentAdd(ctx, rctx, payload)
+		if err != nil {
+			t.Fatalf("replay %d: %v", attempt, err)
+		}
+		if applied != wantApplied {
+			t.Fatalf("replay %d: applied=%v, want %v", attempt, applied, wantApplied)
+		}
+	}
+
+	// Read back through a fresh extent manager, as after a remount.
+	mgr := extent.NewManager(rctx.Dev, rctx.BitmapMgr, nil, 3<<20)
+	ino, err = rctx.InodeTbl.Read(51)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.ExtentCount != 4 || !ino.HasExtentTree() {
+		t.Fatalf("want 4 extents in a tree, got count=%d tree=%v", ino.ExtentCount, ino.HasExtentTree())
+	}
+	if phys, err := mgr.LookupPhysical(ino, 6); err != nil || phys != lost {
+		t.Fatalf("replayed block: got %d, %v; want %d", phys, err, lost)
+	}
+	for _, lb := range []uint64{0, 2, 4} {
+		if _, _, err := mgr.Lookup(ino, lb); err != nil {
+			t.Fatalf("block %d lost after replay: %v", lb, err)
+		}
+	}
+}
+
 func TestCreateRecoveryHandler(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()

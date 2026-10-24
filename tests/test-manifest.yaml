@@ -531,6 +531,75 @@ scenarios:
       vm: TODO      # Better suited for VM testing with actual crash simulation
 
   # ===========================================================================
+  # EXTENT TREES (files with more than 2 extents)
+  # ===========================================================================
+  # Inodes hold 2 extents inline; more move into an overflow tree of 1MB nodes.
+
+  - id: extent-tree-sparse-writes
+    name: Sparse writes beyond inline extents
+    description: Writes at scattered offsets create more than 2 extents; data reads back before and after remount
+    priority: critical
+    environments:
+      go: extent_tree_test.go::TestExtentTreeSparseWrites
+      docker: run-tests.sh::test_extent_tree_sparse_writes
+      vm: run-vm-tests.sh::test_extent_tree_sparse_writes
+
+  - id: extent-tree-interleaved-appends
+    name: Interleaved appends fragment files
+    description: Two files appended alternately 1MB at a time grow past 2MB; data reads back before and after remount
+    priority: critical
+    environments:
+      go: extent_tree_test.go::TestExtentTreeInterleavedAppends
+      docker: run-tests.sh::test_extent_tree_interleaved_appends
+      vm: run-vm-tests.sh::test_extent_tree_interleaved_appends
+
+  - id: extent-tree-truncate
+    name: Truncate fragmented file
+    description: Truncating a file with an extent tree keeps the head intact and returns freed blocks to statfs
+    priority: high
+    # Docker/VM TODO: truncation is node-local, the Go test checks data and statfs,
+    # and test_truncate_file already covers truncate across nodes.
+    environments:
+      go: extent_tree_test.go::TestExtentTreeTruncate
+      docker: TODO
+      vm: TODO
+
+  - id: extent-tree-unit
+    name: Extent tree operations
+    description: Spill, depth-2 growth, splits, folding back inline, and a randomized model check with reloads
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestTreeMatchesModel
+
+  - id: extent-tree-crash-safety
+    name: Extent tree crash safety
+    description: Tree nodes written without the inode write leave the committed tree readable
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestFlushWithoutInodeWriteKeepsCommittedTree
+
+  - id: extent-tree-journal-replay
+    name: Journal replay into extent tree
+    description: Replaying a committed ExtentAdd after a crash inserts into an existing extent tree
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestApplyExtentAddIntoTree
+
+  - id: extent-tree-write-path
+    name: Write path beyond two extents
+    description: File.Write handles sparse writes and interleaved appends without EAGAIN and survives a remount
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_tree_test.go::TestWriteBeyondTwoExtents
+
+  - id: extent-tree-fsck
+    name: fsck validates extent trees
+    description: fsck accepts a valid extent tree and reports a corrupted node
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckExtentTree
+
+  # ===========================================================================
   # VM-ONLY TESTS (Require QEMU/KVM features)
   # ===========================================================================
 
