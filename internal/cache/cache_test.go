@@ -381,16 +381,17 @@ func TestCachedExtent(t *testing.T) {
 		cached := &CachedExtent{
 			PhysicalBlock: 100,
 			InodeDataGen:  5,
+			InodeMetaGen:  7,
 		}
 
-		// Same generation - not stale
-		if cached.IsStale(5) {
-			t.Error("IsStale() should return false when generation matches")
+		if cached.IsStale(5, 7) {
+			t.Error("IsStale() should return false when generations match")
 		}
-
-		// Different generation - stale
-		if !cached.IsStale(6) {
-			t.Error("IsStale() should return true when generation differs")
+		if !cached.IsStale(6, 7) {
+			t.Error("IsStale() should return true when DataGeneration differs")
+		}
+		if !cached.IsStale(5, 8) {
+			t.Error("IsStale() should return true when MetaGeneration differs")
 		}
 	})
 }
@@ -491,14 +492,14 @@ func TestExtentCache(t *testing.T) {
 			t.Fatal("Get() should find cached extent")
 		}
 
-		// Same generation - not stale
-		if got.IsStale(10) {
-			t.Error("Extent should not be stale with matching generation")
+		if got.IsStale(10, 0) {
+			t.Error("Extent should not be stale with matching generations")
 		}
-
-		// Different generation - stale
-		if !got.IsStale(11) {
-			t.Error("Extent should be stale with different generation")
+		if !got.IsStale(11, 0) {
+			t.Error("Extent should be stale with different DataGeneration")
+		}
+		if !got.IsStale(10, 1) {
+			t.Error("Extent should be stale with different MetaGeneration")
 		}
 	})
 

@@ -2320,6 +2320,46 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
+# Test: Extent cache coherency across nodes
+# Node 1 reads files, node 0 changes their block mappings (truncate and rewrite,
+# hole fill), and node 1 must read the new data.
+test_extent_cache_coherency() {
+    log "Testing extent cache coherency across nodes..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]}"
+    local dir=/mnt/goclusterfs
+    local trunc="extent_trunc_$(date +%s).bin"
+    local holes="extent_holes_$(date +%s).bin"
+
+    exec_on_node "$writer" sh -c "head -c 307200 /dev/zero | tr '\\0' o > $dir/$trunc"
+    exec_on_node "$writer" sh -c "head -c 4096 /dev/zero | tr '\\0' a > $dir/$holes && head -c 4096 /dev/zero | tr '\\0' c | dd of=$dir/$holes bs=1M seek=2 conv=notrunc 2>/dev/null"
+    exec_on_node "$reader" sh -c "cat $dir/$trunc $dir/$holes > /dev/null"
+
+    # The padding file takes the freed block, so the rewrite lands in another one.
+    exec_on_node "$writer" sh -c "truncate -s 0 $dir/$trunc && head -c 307200 /dev/zero | tr '\\0' p > $dir/extent_pad.bin && head -c 307200 /dev/zero | tr '\\0' n > $dir/$trunc"
+    exec_on_node "$writer" sh -c "head -c 4096 /dev/zero | tr '\\0' b | dd of=$dir/$holes bs=1M seek=1 conv=notrunc 2>/dev/null"
+    # The healthcheck's ls can leave a mid-rewrite size in the reader's 1s kernel attribute cache.
+    sleep 1.5
+
+    local f want got failed=0
+    for f in "$trunc" "$holes"; do
+        want=$(exec_on_node "$writer" sh -c "md5sum < $dir/$f")
+        got=$(exec_on_node "$reader" sh -c "md5sum < $dir/$f")
+        if [[ "$got" != "$want" ]]; then
+            log "ERROR: $reader read stale data from $f: md5 '$got', want '$want'"
+            failed=1
+        fi
+    done
+    exec_on_node "$writer" sh -c "rm -f $dir/$trunc $dir/$holes $dir/extent_pad.bin"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log "Extent cache coherency test passed"
+    return 0
+}
+
 # Print the free 1MB blocks that statfs reports on node $1
 statfs_free_blocks() {
     exec_on_node "$1" stat -f -c %f /mnt/goclusterfs
@@ -3116,6 +3156,7 @@ run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidatio
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
+run_test "Extent Cache Coherency" test_extent_cache_coherency
 run_test "Statfs After Remount" test_statfs_after_remount
 run_test "Statfs Multi-Node" test_statfs_multinode
 run_test "Rolling Restart" test_rolling_restart
