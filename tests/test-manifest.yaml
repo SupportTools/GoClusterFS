@@ -2029,7 +2029,6 @@ scenarios:
     name: Snapshots on one node while another overwrites the file
     description: Every snapshot node B takes while node A overwrites the file chunk by chunk shows one moment of the file and never changes afterwards
     priority: high
-    # Skipped in all three suites until #29: two nodes can both hold the refcount lock and lose a count.
     environments:
       go: snapshot_test.go::TestSnapshotsDuringWritesAcrossNodes
       docker: run-tests.sh::test_snapshot_during_writes
