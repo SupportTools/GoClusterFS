@@ -3105,9 +3105,6 @@ test_snapshot_delete_after_overwrite() {
     return 0
 }
 
-# Two VMs each take 10 snapshots of their own file at the same time. Each file
-# must list all of its snapshots, and deleting one VM's snapshots must leave
-# the other VM's alone.
 # Node A overwrites a 2 MB file in 64 KB chunks with rounds of a, b, c while
 # node B snapshots it. Every snapshot must show one moment of the file (a
 # prefix of the next round, the rest of the round before) and never change.
@@ -3158,6 +3155,9 @@ test_snapshot_during_writes() {
     return 0
 }
 
+# Two VMs each take 10 snapshots of their own file at the same time. Each file
+# must list all of its snapshots, and deleting one VM's snapshots must leave
+# the other VM's alone.
 test_snapshot_concurrent_creates() {
     log_info "Testing concurrent snapshot creation on two VMs..."
     ensure_cluster_healthy 2

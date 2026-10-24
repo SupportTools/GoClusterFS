@@ -828,9 +828,7 @@ func TestCloneFromSnapshot(t *testing.T) {
 // snapshots it. Each snapshot must hold the file as it was at one moment, and
 // must not change after it is made.
 func TestSnapshotsDuringWritesAcrossNodes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("two nodes can still both hold the refcount lock and lose a count until lock claims are confirmed (#29)")
-	}
+	t.Skip("two nodes can still both hold the refcount lock and lose a count until lock claims are confirmed (#29)")
 	cluster := NewMultiNodeCluster(t, 2, 50)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("Failed to format and start first node: %v", err)

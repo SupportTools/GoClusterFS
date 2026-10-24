@@ -51,6 +51,10 @@ var beforeCoWCommit func()
 // decided to write a block in place, before it writes the data.
 var beforeInPlaceWrite func()
 
+// beforeShareMark lets tests change a file after a snapshot or clone counted
+// its blocks, before it marks the file shared.
+var beforeShareMark func()
+
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected.
 const MaxWriteRetries = 3
@@ -2117,7 +2121,13 @@ func (f *File) stillWritableInPlace(blockNum, physBlock uint64) error {
 		return syscall.EIO
 	}
 	ext, off, err := f.fs.extentMgr.Lookup(ino, blockNum)
-	if err != nil || ext.PhysicalBlock+off != physBlock {
+	switch {
+	case errors.Is(err, extent.ErrExtentNotFound), errors.Is(err, extent.ErrStaleTree):
+		return errRetryWrite
+	case err != nil:
+		log.Printf("[DEBUG] Write inode %d: lookup for in-place write at block %d failed: %v", f.inodeNum, blockNum, err)
+		return syscall.EIO
+	case ext.PhysicalBlock+off != physBlock:
 		return errRetryWrite
 	}
 	if ext.Flags&extent.FlagShared == 0 || f.fs.refcountReg == nil {
@@ -3348,15 +3358,14 @@ func (f *FS) markShared(ino *inode.Inode) error {
 	return nil
 }
 
+// errSharingBusy means writes kept moving the file's blocks while a snapshot
+// or clone tried to share them.
+var errSharingBusy = errors.New("the file kept changing while it was being shared")
+
 // errUncountedSharing means the file shares blocks the way older versions did,
 // without refcounts, so its blocks cannot be shared again safely.
 var errUncountedSharing = errors.New("an older version shared this file's blocks without refcounts; run goclusterfs-fsck, and copy the file to snapshot or clone it")
 
-// shareInto gives dst the extents of inode srcNum, sharing its data blocks.
-// src is marked shared first, then each block gains an owner, durably, before
-// dst maps it; a crash in between leaves src copying blocks it alone owns.
-// stillValid, if set, runs after the blocks gain owners and before dst maps
-// them. On error the caller discards dst, which gives back any blocks it maps.
 // shareSource counts a new owner of each block of src, then marks src shared
 // under the exclusive inode lock. A writer checks a block and writes it in
 // place under the shared inode lock, so the write lands before the mark, or
@@ -3386,6 +3395,9 @@ func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []ui
 		if src.Flags&inode.FlagSnapshotData != 0 {
 			return src, blocks, nil
 		}
+		if beforeShareMark != nil {
+			beforeShareMark()
+		}
 		marked, err := f.updateInode(ctx, srcNum, f.markShared)
 		var now []uint64
 		if err == nil {
@@ -3399,12 +3411,17 @@ func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []ui
 			return nil, nil, err
 		}
 		if attempt == maxConflictRetries-1 {
-			return nil, nil, fmt.Errorf("inode %d kept changing while it was being shared", srcNum)
+			return nil, nil, fmt.Errorf("%w: inode %d", errSharingBusy, srcNum)
 		}
 		conflictBackoff(attempt)
 	}
 }
 
+// shareInto gives dst the extents of inode srcNum, sharing its data blocks.
+// Each block gains an owner, durably, before dst maps it; a crash in between
+// leaves blocks counted with an owner too many, which fsck rebuilds.
+// stillValid, if set, runs after the blocks gain owners and before dst maps
+// them. On error the caller discards dst, which gives back any blocks it maps.
 func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, stillValid func() error) error {
 	src, blocks, err := f.shareSource(ctx, srcNum)
 	if err != nil {
@@ -3436,8 +3453,11 @@ func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, sti
 
 // sharingErrno maps a failure to share a file's blocks to an errno.
 func sharingErrno(err error) syscall.Errno {
-	if errors.Is(err, errUncountedSharing) {
+	switch {
+	case errors.Is(err, errUncountedSharing):
 		return syscall.ENOTSUP
+	case errors.Is(err, errSharingBusy):
+		return syscall.EAGAIN
 	}
 	return syscall.EIO
 }
