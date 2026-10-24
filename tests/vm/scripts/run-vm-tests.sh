@@ -54,6 +54,7 @@ run_test() {
     log_info "=========================================="
     log_info "Running test: $test_name"
     log_info "=========================================="
+    mark_vm_logs "Running test: $test_name"
 
     # Clean up test files from previous test to reclaim disk space
     cleanup_test_files 1
