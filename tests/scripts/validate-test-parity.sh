@@ -69,31 +69,26 @@ fi
 
 # Function to verify a Go test exists
 verify_go_test() {
-    local spec="$1"  # format: filename::FunctionName
-
-    if [[ "$spec" == "TODO" ]]; then
-        return 1
-    fi
+    local spec="$1"  # format: filename::FunctionName or pkg/path/file_test.go::FunctionName
 
     local file="${spec%%::*}"
     local func="${spec##*::}"
     local full_path="$GO_TESTS_DIR/$file"
+    if [[ ! -f "$full_path" ]]; then
+        full_path="$PROJECT_ROOT/$file"
+    fi
 
     if [[ ! -f "$full_path" ]]; then
         return 1
     fi
 
-    grep -q "func $func" "$full_path" 2>/dev/null
+    grep -qE "^func ${func}\(" "$full_path" 2>/dev/null
 }
 
 # Function to verify a shell test exists
 verify_shell_test() {
     local test_file="$1"
     local spec="$2"  # format: filename::function_name
-
-    if [[ "$spec" == "TODO" ]]; then
-        return 1
-    fi
 
     local func="${spec##*::}"
 
@@ -102,7 +97,13 @@ verify_shell_test() {
     fi
 
     # Match both "func_name() {" and "function func_name {" styles
-    grep -qE "^${func}\(\)|^function ${func}" "$test_file" 2>/dev/null
+    grep -qE "^${func}\(\)|^function ${func}( |\(|$)" "$test_file" 2>/dev/null
+}
+
+# Drop an inline "# comment" and trailing whitespace from a manifest value
+strip_comment() {
+    local value="${1%%#*}"
+    echo "${value%"${value##*[![:space:]]}"}"
 }
 
 # Function to extract scenarios from YAML-like format
@@ -123,13 +124,13 @@ extract_scenarios() {
         elif [[ "$line" =~ ^"    name: " ]]; then
             name="${line#*: }"
         elif [[ "$line" =~ ^"    priority: " ]]; then
-            priority="${line#*: }"
+            priority="$(strip_comment "${line#*: }")"
         elif [[ "$line" =~ ^"      go: " ]]; then
-            go="${line#*: }"
+            go="$(strip_comment "${line#*: }")"
         elif [[ "$line" =~ ^"      docker: " ]]; then
-            docker="${line#*: }"
+            docker="$(strip_comment "${line#*: }")"
         elif [[ "$line" =~ ^"      vm: " ]]; then
-            vm="${line#*: }"
+            vm="$(strip_comment "${line#*: }")"
         fi
     done < "$MANIFEST"
 
@@ -149,68 +150,66 @@ echo ""
 declare -a missing_critical=()
 declare -a missing_high=()
 declare -a missing_medium=()
+declare -a broken_refs=()
 
-while IFS='|' read -r id name priority go docker vm; do
-    ((total_scenarios++))
+# Sets env_status to implemented, todo, missing, skipped or empty
+check_env() {
+    local env="$1" spec="$2"
 
-    # Skip environment-specific tests
-    case "$priority" in
-        go_only|vm_only|docker_only)
-            continue
-            ;;
+    case "$spec" in
+        "") env_status=empty; return 0 ;;
+        TODO*) env_status=todo; return 0 ;;
+        SKIPPED*) env_status=skipped; return 0 ;;
     esac
 
+    env_status=missing
+    if [[ "$env" == go ]] && verify_go_test "$spec"; then
+        env_status=implemented
+    elif [[ "$env" == docker ]] && verify_shell_test "$DOCKER_TESTS" "$spec"; then
+        env_status=implemented
+    elif [[ "$env" == vm ]] && verify_shell_test "$VM_TESTS" "$spec"; then
+        env_status=implemented
+    fi
+}
+
+while IFS='|' read -r id name priority go docker vm; do
+    total_scenarios=$((total_scenarios+1))
     scenario_issues=""
 
-    # Check Go test
-    if [[ -n "$go" && "$go" != "TODO" ]]; then
-        if verify_go_test "$go"; then
-            ((go_implemented++))
-        else
-            scenario_issues+="go:MISSING "
-        fi
-    elif [[ "$go" == "TODO" ]]; then
-        ((go_todo++))
-        scenario_issues+="go:TODO "
-    fi
+    check_env go "$go"
+    case "$env_status" in
+        implemented) go_implemented=$((go_implemented+1)) ;;
+        todo) go_todo=$((go_todo+1)); scenario_issues+="go:TODO " ;;
+        missing) scenario_issues+="go:MISSING "; broken_refs+=("$id: go: $go") ;;
+    esac
 
-    # Check Docker test
-    if [[ -n "$docker" && "$docker" != "TODO" ]]; then
-        if verify_shell_test "$DOCKER_TESTS" "$docker"; then
-            ((docker_implemented++))
-        else
-            scenario_issues+="docker:MISSING "
-        fi
-    elif [[ "$docker" == "TODO" ]]; then
-        ((docker_todo++))
-        scenario_issues+="docker:TODO "
-    fi
+    check_env docker "$docker"
+    case "$env_status" in
+        implemented) docker_implemented=$((docker_implemented+1)) ;;
+        todo) docker_todo=$((docker_todo+1)); scenario_issues+="docker:TODO " ;;
+        missing) scenario_issues+="docker:MISSING "; broken_refs+=("$id: docker: $docker") ;;
+    esac
 
-    # Check VM test
-    if [[ -n "$vm" && "$vm" != "TODO" ]]; then
-        if verify_shell_test "$VM_TESTS" "$vm"; then
-            ((vm_implemented++))
-        else
-            scenario_issues+="vm:MISSING "
-        fi
-    elif [[ "$vm" == "TODO" ]]; then
-        ((vm_todo++))
-        scenario_issues+="vm:TODO "
-    fi
+    check_env vm "$vm"
+    case "$env_status" in
+        implemented) vm_implemented=$((vm_implemented+1)) ;;
+        todo) vm_todo=$((vm_todo+1)); scenario_issues+="vm:TODO " ;;
+        missing) scenario_issues+="vm:MISSING "; broken_refs+=("$id: vm: $vm") ;;
+    esac
 
     # Track issues by priority
     if [[ -n "$scenario_issues" ]]; then
         case "$priority" in
             critical)
-                ((critical_missing++))
+                critical_missing=$((critical_missing+1))
                 missing_critical+=("$id: $scenario_issues")
                 ;;
             high)
-                ((high_missing++))
+                high_missing=$((high_missing+1))
                 missing_high+=("$id: $scenario_issues")
                 ;;
             medium)
-                ((medium_missing++))
+                medium_missing=$((medium_missing+1))
                 missing_medium+=("$id: $scenario_issues")
                 ;;
         esac
@@ -236,6 +235,14 @@ echo "    TODO: $vm_todo"
 echo ""
 
 # Print missing tests
+if [[ ${#broken_refs[@]} -gt 0 ]]; then
+    echo -e "${RED}BROKEN REFERENCES (test named in manifest does not exist):${NC}"
+    for ref in "${broken_refs[@]}"; do
+        echo "  - $ref"
+    done
+    echo ""
+fi
+
 if [[ ${#missing_critical[@]} -gt 0 ]]; then
     echo -e "${RED}CRITICAL GAPS (must fix):${NC}"
     for issue in "${missing_critical[@]}"; do
@@ -263,15 +270,20 @@ fi
 # Determine exit code
 exit_code=0
 
+if [[ ${#broken_refs[@]} -gt 0 ]]; then
+    echo -e "${RED}FAIL: ${#broken_refs[@]} manifest reference(s) point to tests that do not exist${NC}"
+    exit_code=1
+fi
+
 if [[ $critical_missing -gt 0 ]]; then
     echo -e "${RED}FAIL: $critical_missing critical test(s) missing or have TODOs${NC}"
     exit_code=1
 elif [[ $high_missing -gt 0 ]]; then
     echo -e "${YELLOW}WARN: $high_missing high-priority test(s) missing or have TODOs${NC}"
-    if $STRICT_MODE; then
+    if $STRICT_MODE && [[ $exit_code -eq 0 ]]; then
         exit_code=2
     fi
-else
+elif [[ $exit_code -eq 0 ]]; then
     echo -e "${GREEN}PASS: All critical and high-priority tests are implemented${NC}"
 fi
 

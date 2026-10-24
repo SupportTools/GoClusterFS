@@ -820,14 +820,14 @@ scenarios:
     description: Message serialization/deserialization and HMAC authentication
     priority: go_only
     environments:
-      go: internal/cache/broadcast/protocol_test.go::TestMessageSerialization
+      go: internal/cache/broadcast/protocol_test.go::TestMessageMarshalUnmarshal
 
   - id: broadcast-hmac
     name: Broadcast HMAC authentication
     description: HMAC signing and verification for broadcast messages
     priority: go_only
     environments:
-      go: internal/cache/broadcast/protocol_test.go::TestMessageHMAC
+      go: internal/cache/broadcast/protocol_test.go::TestHMACValidation
 
   - id: broadcast-deduplication
     name: Broadcast message deduplication
