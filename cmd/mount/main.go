@@ -373,10 +373,6 @@ func main() {
 		log.Printf("Warning: Failed to stop broadcast on exit: %v", err)
 	}
 
-	if err := nodeReg.Unregister(ctx); err != nil {
-		log.Printf("Warning: Failed to release node slot: %v", err)
-	}
-
 	// Print final TRIM stats
 	if trimMgr != nil {
 		trimStats := trimMgr.Stats()
