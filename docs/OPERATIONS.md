@@ -277,14 +277,14 @@ Common causes of a stall:
 
 If a node did stall for more than 15 seconds while mounted (hung-task warnings in `dmesg`, a VM pause, a path failover), stop its mount process before it does more writes, then check the data from a healthy node.
 
-What is safe today: a node that crashes or is killed and stays down, and a clean unmount. Other nodes take over a crashed node's locks 15 seconds after it acquired them.
+What is safe today: a node that crashes or is killed and stays down, and a clean unmount. Other nodes take over a crashed node's locks 15 seconds after it acquired them, or once it is proven dead.
 
 ### Handling Node Failure
 
 When a node fails unexpectedly:
 
 1. **Other nodes continue operating** - Distributed locking handles failed node
-2. **Lock cleanup** - Other nodes take over the failed node's locks once they are 15 seconds old (lock age, not node heartbeat). A node that restarts into the failed node's registry slot takes its exclusive locks at once.
+2. **Lock cleanup** - Other nodes take over the failed node's locks once they are 15 seconds old (lock age, not node heartbeat). The node that replays a failed node's journal takes its exclusive locks sooner, once the failed node is proven dead (see "Crashed node's locks" above).
 3. **No immediate action required** - System is self-healing
 
 **When failed node recovers**:

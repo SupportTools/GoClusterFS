@@ -725,11 +725,6 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		// Leftover from a failed release or an earlier mount; this node holds no key on it.
 		reason = "leftover_from_this_node"
 
-	case record.Mode == LockModeExclusive && record.OwnerSlot == uint32(m.nodeSlot):
-		// Held by an earlier occupant of this node's registry slot, which the
-		// registry hands out only after that occupant has failed.
-		reason = "previous_slot_owner"
-
 	default:
 		log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - cannot acquire, held by node=%x mode=%d", lockType, resourceID, record.OwnerUUID[:8], record.Mode)
 		return false, nil

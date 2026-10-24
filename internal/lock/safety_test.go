@@ -539,22 +539,6 @@ func BenchmarkFreshAcquireRelease(b *testing.B) {
 	}
 }
 
-func TestRestartedNodeTakesLocksOfItsSlotsPreviousOwner(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	crashed := newTestNode(dev, 0, 1<<20, 3)
-	other := newTestNode(dev, 0, 1<<20, 4)
-	var uuid [16]byte
-	copy(uuid[:], "restarted-node-3")
-	restarted := NewManager(dev, 0, 1<<20, uuid, 3)
-
-	requireAcquired(t, crashed, LockTypeInode, 11, LockModeExclusive)
-	requireBlocked(t, other, LockTypeInode, 11, LockModeExclusive)
-	if err := acquireWithin(restarted, 100*time.Millisecond, LockTypeInode, 11, LockModeExclusive); err != nil {
-		t.Fatalf("node that took over slot 3 could not take its crashed predecessor's lock: %v", err)
-	}
-}
-
 // A node that keeps using a record must still let it go soon enough for another
 // node that wants it.
 func TestBusyNodeYieldsCachedRecord(t *testing.T) {
