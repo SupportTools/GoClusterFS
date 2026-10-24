@@ -107,10 +107,10 @@ func (c *Checker) PlanRelease(i int, force bool) (*ReleasePlan, error) {
 		return nil, fmt.Errorf("release refused: %s may still be alive; run again after %s",
 			s.Name(), after.Format(time.DateTime))
 	}
-	discards, replayable := journalContents(c.slotJournal(i))
-	if replayable && !force {
-		return nil, fmt.Errorf("release refused: slot %d's journal holds %s, which a mount can replay; "+
-			"mount a node to replay it, or add -force to discard it", i, discards)
+	discards, keep := journalContents(c.slotJournal(i))
+	if keep != "" && !force {
+		return nil, fmt.Errorf("release refused: slot %d's journal holds %s, and %s; "+
+			"mount a node to replay it, or add -force to discard it", i, discards, keep)
 	}
 	return &ReleasePlan{Slot: s, Discards: discards}, nil
 }
@@ -178,18 +178,18 @@ func journalState(region *journal.Region, err error) string {
 	return strings.ToLower(region.State().String())
 }
 
-// journalContents says what resetting a journal throws away, and whether a
-// mount could replay all of it instead.
-func journalContents(region *journal.Region, err error) (discards string, replayable bool) {
+// journalContents says what resetting a journal throws away and, when a mount
+// might replay it instead, why.
+func journalContents(region *journal.Region, err error) (discards, keep string) {
 	switch {
 	case errors.Is(err, journal.ErrJournalUninitialized):
-		return "nothing: the journal was never initialized", false
+		return "nothing: the journal was never initialized", ""
 	case err != nil:
-		return "the whole journal, unread: " + rootCause(err).Error(), false
+		return "the whole journal, unread: " + rootCause(err).Error(), ""
 	case region.State() == journal.JournalStateClean:
-		return "nothing: the journal is clean", false
+		return "nothing: the journal is clean", ""
 	case !region.NeedsRecovery():
-		return "the whole journal, unread: its state is " + strings.ToLower(region.State().String()), false
+		return "the whole journal, unread: its state is " + strings.ToLower(region.State().String()), ""
 	}
 	_, stats, err := journal.DryRunRecover(region)
 	pending := stats.TxnCommitted - stats.IntentsSkipped
@@ -197,10 +197,14 @@ func journalContents(region *journal.Region, err error) (discards string, replay
 	if pending == 1 {
 		discards = "1 committed transaction that was never replayed"
 	}
-	if err != nil {
-		return discards + fmt.Sprintf(", and whatever follows a record fsck cannot read (%v)", err), false
+	switch {
+	case err != nil:
+		return discards + ", and whatever follows a record fsck cannot read",
+			fmt.Sprintf("fsck could not read all of it (%v), so a mount may still replay it", err)
+	case pending > 0:
+		return discards, "a mount can replay it"
 	}
-	return discards, pending > 0
+	return discards, ""
 }
 
 func rootCause(err error) error {

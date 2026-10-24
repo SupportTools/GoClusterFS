@@ -895,6 +895,10 @@ func (r *Registry) clearFailedSlot(slotIdx int, uuid [16]byte) error {
 	return err
 }
 
+// releaseLeaseBudget is how long ReleaseSlot trusts its recovery lease before
+// it frees the slot, well inside recoveryLease so peers' clocks have room.
+var releaseLeaseBudget = recoveryLease / 2
+
 // ReleaseSlot frees slot slotIdx, whose node will not return, if the slot
 // still holds expected, the raw bytes the caller checked. Like a peer that
 // replays a crashed node's journal, it first takes the slot's recovery lease,
@@ -915,7 +919,8 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error)
 	slot.Magic = SlotMagic
 	slot.State = NodeStateDead
 	slot.RecoveryOwner = r.localUUID
-	slot.RecoveryStart = time.Now().Unix()
+	leaseStart := time.Now()
+	slot.RecoveryStart = leaseStart.Unix()
 	leased := serializeSlot(slot)
 	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
 		return false, err
@@ -927,6 +932,10 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error)
 
 	if err := reset(); err != nil {
 		return false, err
+	}
+	if age := time.Since(leaseStart); age > releaseLeaseBudget {
+		return false, fmt.Errorf("the journal reset took %s, too long to trust the slot's recovery lease; "+
+			"the slot stays dead until the lease lapses", age.Round(time.Millisecond))
 	}
 	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
 	if err == nil && !ok {

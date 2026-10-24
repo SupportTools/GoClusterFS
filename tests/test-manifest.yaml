@@ -889,12 +889,33 @@ scenarios:
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlot
 
-  - id: fsck-release-slot-registry-changes
-    name: fsck slot release stops when the registry changes
-    description: A node that registers between the release check and the write stops the release before the journal is reset
+  - id: fsck-release-slot-refusals
+    name: fsck slot release refusals
+    description: Release refuses a slot number the registry lacks (ErrNoSuchSlot), a journal a mount can replay unless forced, an unreadable slot, and a superblock mount would reject
     priority: go_only
     environments:
-      go: internal/fsck/slots_test.go::TestReleaseSlotStopsWhenRegistryChanges
+      go: internal/fsck/slots_test.go::TestReleaseSlotRefusals
+
+  - id: fsck-release-slot-lease
+    name: fsck slot release holds the recovery lease
+    description: A node that takes the slot before fsck's lease stops the release with the journal untouched; a node mounting during the lease takes another slot; a slot written during the lease is reported as reset but not free
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotLease
+
+  - id: fsck-release-slot-crash
+    name: fsck slot release survives a crash
+    description: After fsck crashes holding the lease, before or after the journal reset, mounts and peers skip the slot until the lease lapses; then a peer fails on the untouched damaged journal, or frees the slot after replaying the reset one
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotCrash
+
+  - id: release-slot-slow-reset
+    name: Slot release gives up on a slow journal reset
+    description: When the journal reset outlasts half the recovery lease, ReleaseSlot leaves the slot dead under its lease instead of freeing it
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotGivesUpOnSlowReset
 
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust

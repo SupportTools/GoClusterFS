@@ -192,6 +192,90 @@ func TestReleaseSlotLease(t *testing.T) {
 	}
 }
 
+// fsck can crash after it takes a slot's recovery lease, before or after it
+// resets the journal. The lease keeps mounts and peers away until it lapses;
+// then a peer replays the journal it finds: it fails on the untouched damaged
+// one, and frees the slot after the reset one.
+func TestReleaseSlotCrash(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		resetFirst bool
+	}{{"before reset", false}, {"after reset", true}} {
+		t.Run(tt.name, func(t *testing.T) {
+			var sb *superblock.Superblock
+			dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
+			ctx := context.Background()
+			gone := node.NewRegistry(dev, sb.NodeRegistryOffset)
+			gone.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
+			slot, err := gone.Register(ctx, "gone")
+			if err != nil {
+				t.Fatal(err)
+			}
+			setHeartbeat(t, dev, sb, slot, time.Now().Add(-time.Hour))
+			journalAt := damageJournal(t, dev, sb, slot)
+
+			crash := errors.New("fsck crashed")
+			raw := readSector(t, dev, int64(sb.NodeRegistryOffset)+int64(slot)*node.SlotSize)
+			released, err := node.NewRegistry(dev, sb.NodeRegistryOffset).ReleaseSlot(slot, raw, func() error {
+				if tt.resetFirst {
+					writeSector(t, dev, journalAt, nil)
+				}
+				return crash
+			})
+			if released || !errors.Is(err, crash) {
+				t.Fatalf("ReleaseSlot with a crashing reset = %v, %v", released, err)
+			}
+			journalLeft := readSector(t, dev, journalAt)
+
+			peer := node.NewRegistry(dev, sb.NodeRegistryOffset)
+			peer.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
+			if got, err := peer.Register(ctx, "peer"); err != nil || got == slot {
+				t.Fatalf("a node mounting during the lease took slot %d (%v)", got, err)
+			}
+			if replays := detectFailures(peer, dev); len(replays) != 0 {
+				t.Fatalf("a peer replayed slot %d during the lease", slot)
+			}
+
+			editSlot(t, dev, sb, slot, func(s []byte) {
+				binary.LittleEndian.PutUint64(s[172:180], uint64(time.Now().Add(-61*time.Second).Unix()))
+			})
+			replays := detectFailures(peer, dev)
+			if len(replays) != 1 || replays[0].slot != slot {
+				t.Fatalf("after the lease lapsed the peer replayed %+v, want slot %d once", replays, slot)
+			}
+			state, err := node.ParseSlot(readSector(t, dev, int64(sb.NodeRegistryOffset)+int64(slot)*node.SlotSize))
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tt.resetFirst && (replays[0].err != nil || state.State != node.NodeStateEmpty):
+				t.Errorf("replay of the reset journal: %v, slot %s; want success and an empty slot", replays[0].err, state.State)
+			case !tt.resetFirst && (replays[0].err == nil || !bytes.Equal(readSector(t, dev, journalAt), journalLeft)):
+				t.Errorf("replay of the damaged journal: %v; want an error and the journal untouched", replays[0].err)
+			}
+		})
+	}
+}
+
+type replay struct {
+	slot int
+	err  error
+}
+
+// detectFailures runs one failure detection pass on peer and lists the
+// journals it replayed.
+func detectFailures(peer *node.Registry, dev *storage.Device) []replay {
+	var replays []replay
+	peer.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
+		_, err := journal.ReplayJournal(context.Background(), &journal.RecoveryContext{Dev: dev}, info)
+		replays = append(replays, replay{info.SlotIndex, err})
+		return err
+	})
+	peer.StartFailureDetection()
+	peer.Stop()
+	return replays
+}
+
 func newChecker(dev *storage.Device) *fsck.Checker {
 	return fsck.New(dev, fsck.Options{Output: &bytes.Buffer{}})
 }
