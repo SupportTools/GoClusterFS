@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -848,5 +849,61 @@ func BenchmarkList(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		registry.List(ctx)
+	}
+}
+
+// Two mounted nodes each create a snapshot; the IDs must differ because a
+// delete by ID would otherwise remove the other node's snapshot.
+func TestRegistryIDsUniqueAcrossNodes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	nodeA := NewRegistry(dev, 0, 10*SectorSize, nil)
+	nodeB := NewRegistry(dev, 0, 10*SectorSize, nil)
+	for _, r := range []*Registry{nodeA, nodeB} {
+		if _, err := r.Scan(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, err := nodeA.Create(ctx, "from-a", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := nodeB.Create(ctx, "from-b", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.SnapshotID == b.SnapshotID {
+		t.Fatalf("both nodes created snapshot ID %d", a.SnapshotID)
+	}
+}
+
+func TestRegistryActivateRequiresCreating(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	registry := NewRegistry(dev, 0, 10*SectorSize, nil)
+	ctx := context.Background()
+
+	desc, err := registry.Create(ctx, "rolled-back", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Delete(ctx, desc.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Activate(ctx, desc.SnapshotID); !errors.Is(err, ErrSnapshotInvalidState) {
+		t.Fatalf("Activate of a deleting snapshot: got %v, want ErrSnapshotInvalidState", err)
+	}
+	if got, err := registry.Get(ctx, desc.SnapshotID); err != nil || got.State != StateDeleting {
+		t.Fatalf("snapshot after refused Activate: %+v, %v; want deleting", got, err)
+	}
+
+	fresh, err := registry.Create(ctx, "fresh", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Activate(ctx, fresh.SnapshotID); err != nil {
+		t.Fatalf("Activate of a creating snapshot: %v", err)
 	}
 }

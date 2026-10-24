@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -157,6 +158,27 @@ func TestSnapshotKeepsDataThroughWrites(t *testing.T) {
 		}
 	})
 
+	// Two blocks keep the copied block's split extents inline, so no tree node is allocated.
+	t.Run("DeleteAfterPartialOverwrite", func(t *testing.T) {
+		f := newRegularFile(t, fsys)
+		writeAt(t, f, original[:2*BlockSize], 0)
+		free := fsys.bitmapMgr.FreeCount()
+		setxattr(t, f, "user.snapshot", "partial")
+
+		writeAt(t, f, pattern(7, 4096), BlockSize+10)
+		if got := fsys.bitmapMgr.FreeCount(); got != free-1 {
+			t.Fatalf("free blocks after a write into 1 shared block = %d, want %d", got, free-1)
+		}
+		if errno := f.Removexattr(ctx, "user.snapshot.partial"); errno != 0 {
+			t.Fatalf("delete snapshot: %v", errno)
+		}
+		waitSnapshotGone(t, fsys, "partial")
+		if got := fsys.bitmapMgr.FreeCount(); got != free {
+			t.Fatalf("free blocks after deleting the snapshot = %d, want %d", got, free)
+		}
+		checkFile(t, f, overwritten(original[:2*BlockSize], BlockSize+10, pattern(7, 4096)))
+	})
+
 	t.Run("DeleteAfterOverwriteFreesSnapshotBlocks", func(t *testing.T) {
 		f := newRegularFile(t, fsys)
 		writeAt(t, f, original[:2*BlockSize], 0)
@@ -171,20 +193,161 @@ func TestSnapshotKeepsDataThroughWrites(t *testing.T) {
 		if errno := f.Removexattr(ctx, "user.snapshot.temp"); errno != 0 {
 			t.Fatalf("delete snapshot: %v", errno)
 		}
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			_, err := fsys.snapshotReg.GetByName(ctx, "temp")
-			if errors.Is(err, snapshot.ErrSnapshotNotFound) {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("snapshot still listed 10s after delete: %v", err)
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
+		waitSnapshotGone(t, fsys, "temp")
 		if got := fsys.bitmapMgr.FreeCount(); got != free {
 			t.Fatalf("free blocks after deleting the snapshot = %d, want %d", got, free)
 		}
 		checkFile(t, f, pattern(6, 2*BlockSize))
 	})
+}
+
+func waitSnapshotGone(t *testing.T, fsys *FS, name string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, err := fsys.snapshotReg.GetByName(context.Background(), name)
+		if errors.Is(err, snapshot.ErrSnapshotNotFound) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot %q still listed after 10s: %v", name, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func physicalBlock(t *testing.T, fsys *FS, num uint32, logical uint64) uint64 {
+	t.Helper()
+	ino, err := fsys.inodeTbl.Read(num)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext, off, err := fsys.extentMgr.Lookup(ino, logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ext.PhysicalBlock + off
+}
+
+func refcountOf(t *testing.T, fsys *FS, block uint64) uint32 {
+	t.Helper()
+	e, err := fsys.refcountReg.Get(context.Background(), block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.RefCount
+}
+
+// Older versions shared blocks without counting the owners, so this version
+// refuses to share them again.
+func TestSnapshotRefusesUncountedSharing(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, pattern(1, BlockSize), 0)
+	ino, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino.InlineExtents[0].Flags |= extent.FlagShared
+	if err := fsys.inodeTbl.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	usedInodes := func() int {
+		n := 0
+		for num := uint32(inode.InodeFirstUsable); num < 64; num++ {
+			if ino, err := fsys.inodeTbl.Read(num); err == nil && ino.Magic != 0 {
+				n++
+			}
+		}
+		return n
+	}
+	used := usedInodes()
+
+	if errno := f.Setxattr(ctx, "user.snapshot", []byte("legacy"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("snapshot of a file with uncounted sharing: errno %v, want ENOTSUP", errno)
+	}
+	if errno := f.Setxattr(ctx, "user.clone", []byte("/legacy-clone"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("clone of a file with uncounted sharing: errno %v, want ENOTSUP", errno)
+	}
+	waitSnapshotGone(t, fsys, "legacy")
+	// The delete job frees the data inode right after removing the descriptor.
+	deadline := time.Now().Add(10 * time.Second)
+	for usedInodes() != used {
+		if time.Now().After(deadline) {
+			t.Fatalf("refused snapshot and clone left %d inodes in use, want %d", usedInodes(), used)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	checkFile(t, f, pattern(1, BlockSize))
+}
+
+// A new mount cleans up a snapshot a crash left half created or half deleted,
+// and the file keeps its blocks.
+func TestSnapshotRecoveryAfterCrash(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	fsys := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	content := pattern(3, 2*BlockSize)
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, content, 0)
+	blocks := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
+
+	// Crash after the blocks were shared, before the snapshot became active.
+	data, err := fsys.claimInode(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data.Mode = inode.S_IFREG | 0o644
+	data.Flags |= inode.FlagSnapshotData
+	if err := fsys.inodeTbl.Write(ctx, data); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fsys.snapshotReg.Create(ctx, "half-created", f.inodeNum, 0, data.InodeNum, 2, uint64(len(content)), snapshot.FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.shareInto(ctx, f.inodeNum, data, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Crash after the data inode gave back its blocks, before the descriptor went away.
+	setxattr(t, f, "user.snapshot", "half-deleted")
+	deleting, err := fsys.snapshotReg.GetByName(ctx, "half-deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.snapshotReg.Delete(ctx, deleting.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.snapshotWkr.ReleaseData(ctx, deleting.DataInode); err != nil {
+		t.Fatal(err)
+	}
+
+	remounted := openSnapshotFS(t, path)
+	waitSnapshotGone(t, remounted, "half-created")
+	waitSnapshotGone(t, remounted, "half-deleted")
+	for _, num := range []uint32{data.InodeNum, deleting.DataInode} {
+		if ino, err := remounted.inodeTbl.Read(num); err != nil || ino.Magic != 0 {
+			t.Errorf("data inode %d still in use after recovery (err=%v)", num, err)
+		}
+	}
+	for _, b := range blocks {
+		if got := refcountOf(t, remounted, b); got > 1 {
+			t.Errorf("block %d refcount %d after recovery, want at most 1", b, got)
+		}
+	}
+
+	// With no other owner left, a write goes in place.
+	g := &File{fs: remounted, inodeNum: f.inodeNum}
+	writeAt(t, g, pattern(4, 100), 10)
+	if got := physicalBlock(t, remounted, f.inodeNum, 0); got != blocks[0] {
+		t.Errorf("write after recovery moved block 0 from %d to %d", blocks[0], got)
+	}
+	checkFile(t, g, overwritten(content, 10, pattern(4, 100)))
 }

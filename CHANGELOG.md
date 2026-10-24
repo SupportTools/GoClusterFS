@@ -14,8 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
+- Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. This version never frees such blocks, so deleting those files leaks their space. It also refuses to snapshot or clone them (`ENOTSUP`), and in-place writes to an old clone still change its source. To get files this version can snapshot and free, copy each affected file with `cp` and delete the original.
 - Snapshots made by older versions captured no data. They still list and delete, but cloning one fails with `ENOTSUP`.
-- Clones made by older versions share blocks without counting them. Newer binaries keep such a block allocated when a file lets go of it, so deleting an old clone or its source leaks its space instead of freeing blocks the other file still uses. Copy the clone with `cp` and delete the old one to avoid the leak.
 
 ### Added
 

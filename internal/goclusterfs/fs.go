@@ -3292,20 +3292,46 @@ func (f *FS) markShared(ino *inode.Inode) error {
 	return nil
 }
 
+// errUncountedSharing means the file shares blocks the way older versions did,
+// without refcounts, so its blocks cannot be shared again safely.
+var errUncountedSharing = errors.New("file shares blocks without refcounts")
+
 // shareInto gives dst the extents of inode srcNum, sharing its data blocks.
-// Each block gains an owner before dst maps it, and src is marked shared last,
-// so from then on writes to either inode copy blocks before changing them. On
-// error the caller discards dst, which gives back any blocks it maps.
-func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode) error {
+// src is marked shared first, then each block gains an owner, durably, before
+// dst maps it; a crash in between leaves src copying blocks it alone owns.
+// stillValid, if set, runs after the blocks gain owners and before dst maps
+// them. On error the caller discards dst, which gives back any blocks it maps.
+func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, stillValid func() error) error {
 	src, err := f.inodeTbl.Read(srcNum)
 	if err != nil {
 		return err
+	}
+	uncounted, err := f.extentMgr.HasUncountedSharing(src)
+	if err != nil {
+		return err
+	}
+	if uncounted {
+		return errUncountedSharing
+	}
+	// A snapshot's data inode is marked shared when it is created and never written again.
+	if src.Flags&inode.FlagSnapshotData == 0 {
+		if src, err = f.updateInode(ctx, srcNum, f.markShared); err != nil {
+			return err
+		}
 	}
 	blocks, err := f.extentMgr.DataBlocks(src)
 	if err != nil {
 		return err
 	}
 	if err := f.refcountReg.Share(ctx, blocks); err != nil {
+		return err
+	}
+	err = f.dev.Sync()
+	if err == nil && stillValid != nil {
+		err = stillValid()
+	}
+	if err != nil {
+		f.extentMgr.ReleaseBlocks(ctx, blocks)
 		return err
 	}
 	if err := f.extentMgr.CopyExtentsForClone(ctx, src, dst); err != nil {
@@ -3321,8 +3347,15 @@ func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode) err
 		}
 		return err
 	}
-	_, err = f.updateInode(ctx, srcNum, f.markShared)
-	return err
+	return nil
+}
+
+// sharingErrno maps a failure to share a file's blocks to an errno.
+func sharingErrno(err error) syscall.Errno {
+	if errors.Is(err, errUncountedSharing) {
+		return syscall.ENOTSUP
+	}
+	return syscall.EIO
 }
 
 // claimInode allocates an inode slot, retrying when another node takes the
@@ -3423,16 +3456,16 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	err = f.fs.shareInto(ctx, f.inodeNum, data)
+	err = f.fs.shareInto(ctx, f.inodeNum, data, nil)
 	if err == nil {
-		err = f.fs.snapshotReg.UpdateState(ctx, desc.SnapshotID, snapshot.StateActive)
+		err = f.fs.snapshotReg.Activate(ctx, desc.SnapshotID)
 	}
 	if err != nil {
 		log.Printf("[snapshot] Failed to create '%s' for inode %d: %v", name, f.inodeNum, err)
 		if dropErr := f.fs.dropSnapshot(ctx, desc.SnapshotID); dropErr != nil {
 			log.Printf("[snapshot] Failed to roll back snapshot %d: %v", desc.SnapshotID, dropErr)
 		}
-		return syscall.EIO
+		return sharingErrno(err)
 	}
 
 	log.Printf("[snapshot] Created '%s' (ID=%d) for inode %d", name, desc.SnapshotID, f.inodeNum)
@@ -3475,11 +3508,12 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 		log.Printf("[clone] Failed to read inode %d: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
-	return f.cloneInode(ctx, f.inodeNum, destPath)
+	return f.cloneInode(ctx, f.inodeNum, destPath, nil)
 }
 
 // cloneInode creates a file at destPath that shares the blocks of inode srcNum.
-func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string) syscall.Errno {
+// stillValid is passed to shareInto.
+func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, stillValid func() error) syscall.Errno {
 	if f.fs.refcountReg == nil {
 		return syscall.ENOTSUP
 	}
@@ -3551,11 +3585,11 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string) s
 	cloneIno.Mtime = now
 	cloneIno.Ctime = now
 
-	if err := f.fs.shareInto(ctx, srcNum, cloneIno); err != nil {
+	if err := f.fs.shareInto(ctx, srcNum, cloneIno, stillValid); err != nil {
 		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
 		f.fs.discardInode(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to share blocks of inode %d: %v", srcNum, err)
-		return syscall.EIO
+		return sharingErrno(err)
 	}
 
 	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, srcNum)
@@ -3598,7 +3632,15 @@ func (f *File) createCloneFromSnapshot(ctx context.Context, data string) syscall
 		return syscall.ENOTSUP
 	}
 
-	return f.cloneInode(ctx, desc.DataInode, destPath)
+	// A delete that starts before the blocks gain their new owner may free them.
+	stillActive := func() error {
+		d, err := f.fs.snapshotReg.Get(ctx, desc.SnapshotID)
+		if err == nil && d.State != snapshot.StateActive {
+			err = snapshot.ErrSnapshotInvalidState
+		}
+		return err
+	}
+	return f.cloneInode(ctx, desc.DataInode, destPath, stillActive)
 }
 
 // listSnapshots returns snapshot names for this file.

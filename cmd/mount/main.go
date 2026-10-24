@@ -266,12 +266,9 @@ func main() {
 		log.Println("SFB: disabled (all files use full 1MB blocks)")
 	}
 
-	// Create refcount region for snapshot CoW support
-	var refcountReg *refcount.Region
-	if *snapshotsEnabled {
-		refcountReg = refcount.NewRegion(dev, refcountOffset, totalBlocks, lockMgr)
-		log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
-	}
+	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write.
+	refcountReg := refcount.NewRegion(dev, refcountOffset, totalBlocks, lockMgr)
+	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)

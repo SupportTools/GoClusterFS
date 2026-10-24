@@ -285,15 +285,12 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Find a free slot
-	slot, err := r.findFreeSlot()
+	slot, maxID, err := r.freeSlotAndMaxID()
 	if err != nil {
 		return nil, err
 	}
-
-	// Allocate a new ID
-	snapshotID := r.nextID
-	r.nextID++
+	snapshotID := max(r.nextID, maxID+1)
+	r.nextID = snapshotID + 1
 
 	if dataInode != 0 {
 		flags |= FlagHasData
@@ -461,6 +458,19 @@ func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID u
 
 // UpdateState updates the state of a snapshot.
 func (r *Registry) UpdateState(ctx context.Context, snapshotID uint64, newState State) error {
+	return r.updateState(ctx, snapshotID, newState, StateInvalid)
+}
+
+// Activate marks a snapshot that is being created as active. It fails with
+// ErrSnapshotInvalidState if the snapshot left the creating state meanwhile,
+// for example because another node's mount rolled it back.
+func (r *Registry) Activate(ctx context.Context, snapshotID uint64) error {
+	return r.updateState(ctx, snapshotID, StateActive, StateCreating)
+}
+
+// updateState sets a snapshot's state, requiring it to be in from unless from
+// is StateInvalid.
+func (r *Registry) updateState(ctx context.Context, snapshotID uint64, newState, from State) error {
 	if snapshotID == InvalidSnapshotID {
 		return ErrInvalidID
 	}
@@ -483,6 +493,9 @@ func (r *Registry) UpdateState(ctx context.Context, snapshotID uint64, newState 
 			continue
 		}
 		if desc.IsValid() && desc.SnapshotID == snapshotID {
+			if from != StateInvalid && desc.State != from {
+				return ErrSnapshotInvalidState
+			}
 			desc.State = newState
 			if newState == StateDeleting {
 				desc.DeleteTime = time.Now().Unix()
@@ -661,19 +674,31 @@ type ScanStats struct {
 	TotalBlocks   uint64 // Total blocks referenced by all snapshots
 }
 
-// findFreeSlot finds the first free slot in the registry.
-func (r *Registry) findFreeSlot() (uint64, error) {
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			// Treat read errors as potentially free (might be uninitialized)
-			return slot, nil
-		}
-		if desc.IsFree() {
-			return slot, nil
+// freeSlotAndMaxID returns the first free slot and the highest snapshot ID on
+// disk, which includes snapshots other nodes created since this node's scan.
+// Unreadable slots count as free, as they did before.
+func (r *Registry) freeSlotAndMaxID() (uint64, uint64, error) {
+	free := r.maxDescriptors
+	var maxID uint64
+	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
+		data, readErr := r.readSector(sector)
+		for i := uint64(0); i < DescriptorsPerSector; i++ {
+			slot := sector*DescriptorsPerSector + i
+			if slot >= r.maxDescriptors {
+				break
+			}
+			desc, err := decodeDescriptor(data, i)
+			if readErr != nil || err != nil || desc.IsFree() {
+				free = min(free, slot)
+				continue
+			}
+			maxID = max(maxID, desc.SnapshotID)
 		}
 	}
-	return 0, ErrSnapshotFull
+	if free == r.maxDescriptors {
+		return 0, 0, ErrSnapshotFull
+	}
+	return free, maxID, nil
 }
 
 // readDescriptor reads a descriptor from a slot.
