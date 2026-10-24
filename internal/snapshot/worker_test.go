@@ -335,6 +335,42 @@ func TestWorkerEmptyBlockList(t *testing.T) {
 	}
 }
 
+// TestWorkerQueuesJobsWithCanceledContext checks that a canceled FUSE request
+// context cannot drop a job for a snapshot that already exists.
+func TestWorkerQueuesJobsWithCanceledContext(t *testing.T) {
+	dev, _, cleanup := setupTestDevice(t)
+	defer cleanup()
+
+	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
+
+	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, DefaultWorkerConfig())
+	worker.Start()
+	defer worker.Stop()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := 0; i < 20; i++ {
+		desc, err := snapReg.Create(context.Background(), fmt.Sprintf("snap-%d", i), 100, 0, 0, 0, 1024, FlagReadOnly)
+		if err != nil {
+			t.Fatalf("Failed to create snapshot %d: %v", i, err)
+		}
+
+		if _, err := worker.QueueCreateJob(canceled, desc.SnapshotID, 100, []uint64{}); err != nil {
+			t.Fatalf("QueueCreateJob %d with canceled context: %v", i, err)
+		}
+		waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
+
+		if err := snapReg.Delete(context.Background(), desc.SnapshotID); err != nil {
+			t.Fatalf("Failed to delete snapshot %d: %v", i, err)
+		}
+		if _, err := worker.QueueDeleteJob(canceled, desc.SnapshotID, []uint64{}); err != nil {
+			t.Fatalf("QueueDeleteJob %d with canceled context: %v", i, err)
+		}
+		waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
+	}
+}
+
 func TestWorkerPendingJobs(t *testing.T) {
 	dev, _, cleanup := setupTestDevice(t)
 	defer cleanup()
