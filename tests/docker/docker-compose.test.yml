@@ -177,6 +177,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - ORCHESTRATOR_MODE=true
+      # bookworm's docker.io client defaults to API 1.41; Docker Engine 29+ requires >= 1.44
+      - DOCKER_API_VERSION=1.44
       - NODES=goclusterfs-node1,goclusterfs-node2,goclusterfs-node3,goclusterfs-node4
       - RESULTS_DIR=/results
       # Skip concurrent tests in CI (they hang due to resource constraints)

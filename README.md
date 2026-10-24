@@ -204,6 +204,12 @@ make test-multinode-vm
 make test-parity
 ```
 
+VM tests need an x86_64 Linux host with `/dev/kvm`, `qemu-system-x86_64`, and `sshpass`. QEMU 10+ uses io_uring, which counts against the locked-memory limit. With the common 8 MB default, QEMU fails with `Failed to initialize io_uring: Cannot allocate memory`. Raise the limit for the test user, then log in again:
+
+```bash
+echo "$USER - memlock unlimited" | sudo tee /etc/security/limits.d/90-qemu-memlock.conf
+```
+
 ## License
 
 [License details to be added]

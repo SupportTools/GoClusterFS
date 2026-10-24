@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-build-image vm-clean clean fmt vet check-fuse check-qemu lint help
+.PHONY: build build-mount test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint help
 
 # Go parameters
 GOCMD=go
@@ -113,12 +113,6 @@ check-qemu:
 	@which qemu-system-x86_64 > /dev/null 2>&1 || (echo "Error: qemu-system-x86_64 not found. Install QEMU first." && exit 1)
 	@echo "QEMU is available"
 
-# Build VM image with Packer
-vm-build-image: check-qemu build-mount
-	@echo "Building VM image..."
-	$(VM_TEST_HARNESS) --build-image
-	@echo "VM image built successfully"
-
 # Run multi-node tests in QEMU VMs
 test-multinode-vm: check-qemu build-mount
 	@echo "Running multi-node VM tests..."
@@ -206,7 +200,6 @@ help:
 	@echo "  VM Multi-Node Tests (QEMU):"
 	@echo "    test-multinode-vm     - Run multi-node tests in QEMU VMs (2 nodes)"
 	@echo "    test-multinode-vm-3   - Run multi-node tests in QEMU VMs (3 nodes)"
-	@echo "    vm-build-image        - Build Alpine VM image with Packer"
 	@echo "    vm-clean              - Clean up VM runtime files"
 	@echo "    vm-clean-all          - Clean up all VM resources including images"
 	@echo "    check-qemu            - Verify QEMU is available"
