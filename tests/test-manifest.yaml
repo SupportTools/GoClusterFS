@@ -1378,6 +1378,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_test.go::TestFailedWriteReleasesCommittedCopiesOnce
 
+  - id: snapshot-stale-copy-after-cow
+    name: Stale inode copy after a copy-on-write
+    description: An inode copy read before a copy-on-write committed cannot write the old mapping back; a real chmod retries and keeps the copy
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestStaleCopyCannotUndoCopyOnWrite
+
+  - id: inode-stale-inline-copy
+    name: Stale inline inode copy
+    description: Writing an inode copy whose inline extents changed on disk since it was read fails with ErrTreeConflict
+    priority: go_only
+    environments:
+      go: internal/inode/inode_test.go::TestStaleCopyCannotUndoInlineExtentChange
+
   - id: snapshot-recovery-after-crash
     name: Snapshot cleanup on mount after a crash
     description: A mount removes a snapshot left half created or half deleted, frees its data inode, and the file's blocks drop back to one owner

@@ -624,3 +624,45 @@ func TestFailedWriteReleasesCommittedCopiesOnce(t *testing.T) {
 		})
 	}
 }
+
+// An inode copy read before a copy-on-write committed, as by a slow chmod on
+// another node, must not write the old mapping back: the old block already
+// lost this file's ownership, so the snapshot would hold it at an undercount.
+func TestStaleCopyCannotUndoCopyOnWrite(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, BlockSize)
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, original, 0)
+	setxattr(t, f, "user.snapshot", "before")
+	old := physicalBlock(t, fsys, f.inodeNum, 0)
+
+	stale, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAt(t, f, pattern(2, 100), 10)
+	stale.Mode = inode.S_IFREG | 0o600
+	if err := fsys.inodeTbl.Write(ctx, stale); !errors.Is(err, inode.ErrTreeConflict) {
+		t.Fatalf("stale copy written over a committed copy-on-write: got %v, want ErrTreeConflict", err)
+	}
+
+	in := &fuse.SetAttrIn{}
+	in.Valid = fuse.FATTR_MODE
+	in.Mode = 0o600
+	if errno := f.Setattr(ctx, nil, in, &fuse.AttrOut{}); errno != 0 {
+		t.Fatalf("chmod: %v", errno)
+	}
+	if got := physicalBlock(t, fsys, f.inodeNum, 0); got == old {
+		t.Fatal("the file maps the snapshot's block again")
+	}
+	if got := refcountOf(t, fsys, old); got != 1 {
+		t.Fatalf("old block refcount %d, want 1", got)
+	}
+	checkFile(t, f, overwritten(original, 10, pattern(2, 100)))
+	setxattr(t, f, "user.snapshot.clone", "before:/before-clone")
+	checkFile(t, lookupFile(t, fsys, "before-clone"), original)
+}
