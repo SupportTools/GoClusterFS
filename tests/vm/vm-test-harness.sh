@@ -361,9 +361,9 @@ setup_goclusterfs() {
         "${PROJECT_ROOT}/goclusterfs-mount" \
         "root@127.0.0.1:/usr/local/bin/goclusterfs-mount"
 
-    # Install fuse3 and gcompat (glibc compatibility for binary compiled on glibc systems)
-    log_info "Installing fuse3 and gcompat..."
-    ssh_run_password "$vm_id" "apk add --no-cache fuse3 gcompat"
+    # Install fuse3, gcompat (glibc compatibility for binary compiled on glibc systems) and attr (setfattr for snapshot tests)
+    log_info "Installing fuse3, gcompat and attr..."
+    ssh_run_password "$vm_id" "apk add --no-cache fuse3 gcompat attr"
 
     # Load FUSE kernel module (required before mounting any FUSE filesystem)
     log_info "Loading FUSE kernel module..."

@@ -220,12 +220,10 @@ func TestExtentTreeSnapshot(t *testing.T) {
 		}
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond) // background refcount job
 
 	if err := unix.Setxattr(path, "user.snapshot.clone", []byte("tree-snap:/clone.bin"), 0); err != nil {
 		t.Fatalf("clone from snapshot failed: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
 	cloneWant := append([]byte(nil), want...)
 	checkFile(t, mfs, "clone.bin", cloneWant)
 
@@ -248,7 +246,7 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	f.Close()
 	want = append(want, tail...)
 
-	// Blocks 4 and 5 are shared with the clone; only the new block 6 is freed.
+	// Blocks 4 and 5 are shared with the clone and the snapshot; only the new block 6 is freed.
 	before := freeBlocks()
 	if err := os.Truncate(path, 4*mb); err != nil {
 		t.Fatalf("Truncate failed: %v", err)
@@ -264,9 +262,16 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	if err := unix.Removexattr(path, "user.snapshot.tree-snap"); err != nil && err != syscall.ENODATA {
 		t.Fatalf("deleting snapshot failed: %v", err)
 	}
-	time.Sleep(500 * time.Millisecond)
-	if got := freeBlocks() - before; got != 0 {
-		t.Errorf("deleting the snapshot freed %d blocks, want 0", got)
+	listed := make([]byte, 4096)
+	if _, ok := waitFor(10*time.Second, func() bool {
+		n, err := unix.Getxattr(path, "user.snapshots", listed)
+		return err == nil && !bytes.Contains(listed[:n], []byte("tree-snap"))
+	}); !ok {
+		t.Fatal("snapshot still listed 10s after delete")
+	}
+	// The snapshot's own extent tree node is the only block nothing else maps.
+	if got := freeBlocks() - before; got != 1 {
+		t.Errorf("deleting the snapshot freed %d blocks, want 1", got)
 	}
 
 	remount(t, mfs)

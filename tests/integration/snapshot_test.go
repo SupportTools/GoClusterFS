@@ -823,3 +823,132 @@ func TestCloneFromSnapshot(t *testing.T) {
 	t.Logf("Clone content: %q", cloneContent)
 	t.Log("Clone from snapshot test passed")
 }
+
+func setxattr(t *testing.T, path, attr, value string) {
+	t.Helper()
+	if err := unix.Setxattr(path, attr, []byte(value), 0); err != nil {
+		t.Fatalf("setxattr %s=%q on %s: %v", attr, value, path, err)
+	}
+}
+
+func overwrite(base []byte, off int, data []byte) []byte {
+	out := bytes.Clone(base)
+	copy(out[off:], data)
+	return out
+}
+
+func freeBlocks(t *testing.T, mfs *MountedFS) uint64 {
+	t.Helper()
+	var st unix.Statfs_t
+	if err := unix.Statfs(mfs.Path(""), &st); err != nil {
+		t.Fatalf("statfs: %v", err)
+	}
+	return st.Bfree
+}
+
+// TestSnapshotPreservesData reads a snapshot, through a clone of it, after the
+// file was overwritten in place, appended to and truncated.
+func TestSnapshotPreservesData(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	original := chunk(1, 3*mb)
+	if err := writer.WriteFile("data.bin", original); err != nil {
+		t.Fatal(err)
+	}
+	checkFile(t, writer, "data.bin", original)
+	setxattr(t, writer.Path("data.bin"), "user.snapshot", "before")
+
+	if err := writer.WriteFileAt("data.bin", chunk(2, 4096), mb+100); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteFileAt("data.bin", chunk(3, 2*mb), 3*mb); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(writer.Path("data.bin"), mb+mb/2); err != nil {
+		t.Fatal(err)
+	}
+	setxattr(t, writer.Path("data.bin"), "user.snapshot.clone", "before:/before-clone")
+
+	live := overwrite(original[:mb+mb/2], mb+100, chunk(2, 4096))
+	for _, node := range []*MountedFS{writer, reader} {
+		checkFile(t, node, "before-clone", original)
+		checkFile(t, node, "data.bin", live)
+	}
+}
+
+// TestCloneInPlaceWrite writes into a clone and its source without truncating,
+// after both were read, so the reads that follow must not reuse cached blocks.
+func TestCloneInPlaceWrite(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	original := chunk(4, 2*mb)
+	if err := mfs.WriteFile("source.bin", original); err != nil {
+		t.Fatal(err)
+	}
+	setxattr(t, mfs.Path("source.bin"), "user.clone", "/clone.bin")
+	checkFile(t, mfs, "source.bin", original)
+	checkFile(t, mfs, "clone.bin", original)
+
+	if err := mfs.WriteFileAt("clone.bin", chunk(5, 100), 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := mfs.WriteFileAt("source.bin", chunk(6, 100), mb+10); err != nil {
+		t.Fatal(err)
+	}
+
+	wantSource := overwrite(original, mb+10, chunk(6, 100))
+	wantClone := overwrite(original, 10, chunk(5, 100))
+	checkFile(t, mfs, "source.bin", wantSource)
+	checkFile(t, mfs, "clone.bin", wantClone)
+	remount(t, mfs)
+	checkFile(t, mfs, "source.bin", wantSource)
+	checkFile(t, mfs, "clone.bin", wantClone)
+}
+
+// TestSnapshotDeleteAfterOverwrite deletes a snapshot whose blocks the file no
+// longer maps; the delete must finish and give back exactly those blocks.
+func TestSnapshotDeleteAfterOverwrite(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	if err := mfs.WriteFile("data.bin", chunk(7, 2*mb)); err != nil {
+		t.Fatal(err)
+	}
+	free := freeBlocks(t, mfs)
+	setxattr(t, mfs.Path("data.bin"), "user.snapshot", "temp")
+
+	updated := chunk(8, 2*mb)
+	if err := mfs.WriteFileAt("data.bin", updated, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := freeBlocks(t, mfs); got != free-2 {
+		t.Fatalf("free blocks after overwriting 2 snapshotted blocks = %d, want %d", got, free-2)
+	}
+
+	if err := unix.Removexattr(mfs.Path("data.bin"), "user.snapshot.temp"); err != nil {
+		t.Fatalf("delete snapshot: %v", err)
+	}
+	listed := make([]byte, 4096)
+	if _, ok := waitFor(10*time.Second, func() bool {
+		n, err := unix.Getxattr(mfs.Path("data.bin"), "user.snapshots", listed)
+		return err == nil && !bytes.Contains(listed[:n], []byte("temp"))
+	}); !ok {
+		t.Fatal("snapshot still listed 10s after delete")
+	}
+	if got := freeBlocks(t, mfs); got != free {
+		t.Fatalf("free blocks after deleting the snapshot = %d, want %d", got, free)
+	}
+	checkFile(t, mfs, "data.bin", updated)
+}

@@ -650,7 +650,7 @@ scenarios:
 
   - id: extent-tree-snapshot
     name: Snapshot and clone of a fragmented file
-    description: A clone of a file with more than 2 extents gets its own extent tree; blocks it shares survive truncating and deleting the source, and deleting the snapshot frees nothing in use
+    description: A clone of a file with more than 2 extents gets its own extent tree; blocks it shares survive truncating and deleting the source, and deleting the snapshot frees only its own extent tree node
     priority: high
     # Docker/VM TODO: snapshot and clone tests need xattr support in those harnesses, like the other snapshot scenarios.
     environments:
@@ -1287,19 +1287,47 @@ scenarios:
     environments:
       go: internal/snapshot/worker_test.go::TestWorkerStartStop
 
-  - id: snapshot-worker-create-job
-    name: Snapshot create job processing
-    description: Background worker processes refcount increment jobs
+  - id: snapshot-worker-recovery
+    name: Snapshot recovery after a crash
+    description: On mount, snapshots left creating or deleting give back their captured blocks and disappear, without touching blocks the live file still maps
     priority: go_only
     environments:
-      go: internal/snapshot/worker_test.go::TestWorkerQueueCreateJob
+      go: internal/snapshot/worker_test.go::TestRecoverIncompleteSnapshots
 
   - id: snapshot-worker-delete-job
     name: Snapshot delete job processing
-    description: Background worker processes refcount decrement jobs
+    description: Background worker frees the snapshot's own blocks, keeps blocks the live file still maps, and removes the descriptor
     priority: go_only
     environments:
       go: internal/snapshot/worker_test.go::TestWorkerQueueDeleteJob
+
+  - id: snapshot-queue-canceled-context
+    name: Snapshot delete queued from a canceled request
+    description: A delete job queued with an already canceled request context still runs
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestQueueDeleteJobIgnoresCanceledContext
+
+  - id: refcount-share-release
+    name: Block reference sharing
+    description: Sharing a block counts the existing owner, and releasing reports a block as free only when its last owner lets go
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestShareAndRelease
+
+  - id: extent-free-shared-blocks
+    name: Freeing shared blocks
+    description: Truncating one of two files that share a block keeps the block allocated until the other file lets go
+    priority: go_only
+    environments:
+      go: internal/extent/extent_test.go::TestFreeKeepsSharedBlocks
+
+  - id: snapshot-cow-in-process
+    name: Snapshot and clone copy-on-write
+    description: Snapshots keep their data through in-place writes, appends and truncates; clone writes never reach the source; deleting a snapshot after an overwrite frees exactly its blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotKeepsDataThroughWrites
 
   # Task #4712: Snapshot deletion (leaf + merge-up)
   - id: snapshot-leaf-deletion
@@ -1396,6 +1424,33 @@ scenarios:
       go: snapshot_test.go::TestCloneDataIntegrity
       docker: TODO
       vm: TODO
+
+  - id: snapshot-preserves-data
+    name: Snapshot keeps its data
+    description: After a snapshot, in-place overwrite, append and truncate of the file; a clone of the snapshot read on another node holds the original data
+    priority: critical
+    environments:
+      go: snapshot_test.go::TestSnapshotPreservesData
+      docker: run-tests.sh::test_snapshot_preserves_data
+      vm: run-vm-tests.sh::test_snapshot_preserves_data
+
+  - id: clone-in-place-write
+    name: In-place write to a clone
+    description: dd conv=notrunc into a clone, and into its source, changes only the file written
+    priority: critical
+    environments:
+      go: snapshot_test.go::TestCloneInPlaceWrite
+      docker: run-tests.sh::test_clone_in_place_write
+      vm: run-vm-tests.sh::test_clone_in_place_write
+
+  - id: snapshot-delete-after-overwrite
+    name: Snapshot delete after overwrite
+    description: Deleting a snapshot after the file was overwritten finishes, frees the snapshot's blocks, and leaves the file intact
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotDeleteAfterOverwrite
+      docker: run-tests.sh::test_snapshot_delete_after_overwrite
+      vm: run-vm-tests.sh::test_snapshot_delete_after_overwrite
 
   - id: clone-from-snapshot
     name: Clone from snapshot
