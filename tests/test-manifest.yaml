@@ -1385,6 +1385,13 @@ scenarios:
     environments:
       go: internal/cache/extent_cache_test.go::TestGetExtentCountsStaleEntryAsMiss
 
+  - id: inode-update-locked-two-nodes
+    name: Locked inode update waits for another node
+    description: Another node's link count update between this node's read and write of a directory inode is not lost
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/inode_update_test.go::TestUpdateInodeLockedWaitsForOtherNode
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself
