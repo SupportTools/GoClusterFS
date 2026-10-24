@@ -520,3 +520,21 @@ func TestCancelledContextStillWaitsForLock(t *testing.T) {
 		t.Fatalf("Acquire with a cancelled context: got %v, want the lock once node A let it go", err)
 	}
 }
+
+// BenchmarkFreshAcquireRelease measures an acquire that cannot reuse a cached
+// hold, so it pays the claim settle wait.
+func BenchmarkFreshAcquireRelease(b *testing.B) {
+	dev, cleanup := createTestDevice(b, 1<<20)
+	defer cleanup()
+	m := newTestNode(dev, 0, 1<<20, 1)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := m.Acquire(ctx, LockTypeInode, 100, LockModeExclusive); err != nil {
+			b.Fatal(err)
+		}
+		m.Release(LockTypeInode, 100)
+		m.ReleaseCached()
+	}
+}
