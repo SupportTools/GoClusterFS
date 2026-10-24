@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -27,9 +29,15 @@ const (
 	snapFSRefcountOffset = 3 << 20
 	snapFSRegistryOffset = 3<<20 + 64<<10
 	snapFSRegistrySize   = 64 << 10
+	snapFSLockOffset     = 3<<20 + 256<<10
+	snapFSLockSize       = 512 << 10
 	snapFSDataOffset     = 4 << 20
 	snapFSDataBlocks     = 60
 )
+
+// snapFSNodes hands each opened FS its own node slot, so instances on one
+// image lock against each other like separate nodes.
+var snapFSNodes atomic.Int32
 
 func newSnapshotFSImage(t *testing.T) string {
 	t.Helper()
@@ -43,7 +51,8 @@ func newSnapshotFSImage(t *testing.T) string {
 	return path
 }
 
-// openSnapshotFS mounts an image with snapshots enabled, as a fresh node would.
+// openSnapshotFS mounts an image with snapshots and the distributed locks
+// enabled, as a fresh node would.
 func openSnapshotFS(t *testing.T, path string) *FS {
 	t.Helper()
 	dev, err := storage.Open(path)
@@ -52,16 +61,19 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	}
 	t.Cleanup(func() { dev.Close() })
 
+	slot := int(snapFSNodes.Add(1)-1) % 64
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], "testnode12345678")
-	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, nil, nodeUUID)
-	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil, snapFSDataOffset)
+	nodeUUID[15] = byte(slot)
+	locks := lock.NewManager(dev, snapFSLockOffset, snapFSLockSize, nodeUUID, slot)
+	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, locks, nodeUUID)
+	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
+	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
-	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, nil)
-	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, snapFSDataOffset)
-	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, nodeUUID, snapFSDataOffset)
-	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, nil, 0); err != nil {
+	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, locks)
+	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, snapFSDataOffset)
+	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, snapFSDataOffset)
+	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, locks, slot); err != nil {
 		t.Fatalf("InitSnapshots: %v", err)
 	}
 	t.Cleanup(fsys.snapshotWkr.Stop)

@@ -42,8 +42,8 @@ import (
 // modification was detected and the Write operation should be retried.
 var errRetryWrite = errors.New("retry write operation")
 
-// beforeCoWCommit lets tests run another node's write between a copy-on-write
-// and the inode write that commits it.
+// beforeCoWCommit lets tests run another node's write after a copy-on-write,
+// before this write takes the inode lock and commits the copy.
 var beforeCoWCommit func()
 
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
@@ -2367,76 +2367,55 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 
 	handleExtent:
-		// === Copy-on-Write for Shared Blocks (Snapshot Support) ===
-		// If this extent is shared with a snapshot (FlagShared + RefCount > 1),
-		// we must allocate a new block before writing to preserve snapshot data.
+		// A shared block is copied before the write, so its other owners keep their data.
 		if ext.Flags&extent.FlagShared != 0 && f.fs.refcountReg != nil {
-			// Check if CoW is actually needed (refcount > 1)
+			// Refcounts and the bitmap come before the inode in lock order.
+			if err := persistAndUnlock(); err != nil {
+				return 0, err
+			}
 			needsCoW, cowErr := f.fs.extentMgr.NeedsCoW(ctx, blockExtent(ext, extOffset), f.fs.refcountReg)
 			if cowErr != nil {
 				log.Printf("[DEBUG] Write inode %d: CoW check failed for block %d: %v",
 					f.inodeNum, ext.PhysicalBlock, cowErr)
 				return 0, syscall.EIO
 			}
-
 			if needsCoW {
-				// Need exclusive inode lock for CoW (modifies extent tree)
-				if !lockHeld && f.fs.lockMgr != nil {
-					if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-						log.Printf("[DEBUG] Write inode %d: failed to acquire lock for CoW: %v", f.inodeNum, err)
-						return 0, syscall.EIO
-					}
-					lockHeld = true
-
-					// Re-read inode after acquiring lock
-					freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
-					if err != nil {
-						log.Printf("[DEBUG] Write inode %d: re-read for CoW failed: %v", f.inodeNum, err)
-						return 0, syscall.EIO
-					}
-					if freshIno.MetaGeneration != ino.MetaGeneration {
-						log.Printf("[DEBUG] Write inode %d: MetaGeneration changed during CoW", f.inodeNum)
-						return 0, errRetryWrite
-					}
-					ino = freshIno
-
-					// Re-lookup extent - another node may have already done CoW
-					ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum)
-					if err != nil {
-						log.Printf("[DEBUG] Write inode %d: extent lookup for CoW failed: %v", f.inodeNum, err)
-						return 0, syscall.EIO
-					}
-
-					// Re-check if CoW is still needed (another node may have done it)
-					needsCoW, cowErr = f.fs.extentMgr.NeedsCoW(ctx, blockExtent(ext, extOffset), f.fs.refcountReg)
-					if cowErr != nil {
-						log.Printf("[DEBUG] Write inode %d: CoW re-check failed: %v", f.inodeNum, cowErr)
-						return 0, syscall.EIO
-					}
+				cowResult, cowErr := f.fs.extentMgr.CopyOnWrite(ctx, ino, ext, blockNum, f.fs.dataOffset, f.fs.refcountReg)
+				if cowErr != nil {
+					log.Printf("[DEBUG] Write inode %d: CoW failed for block %d: %v",
+						f.inodeNum, ext.PhysicalBlock, cowErr)
+					f.fs.extentMgr.DiscardPending(ctx, ino)
+					return 0, syscall.EIO
 				}
-
-				// Perform CoW if still needed
-				if needsCoW {
-					cowResult, cowErr := f.fs.extentMgr.CopyOnWrite(ctx, ino, ext, blockNum, f.fs.dataOffset, f.fs.refcountReg)
-					if cowErr != nil {
-						log.Printf("[DEBUG] Write inode %d: CoW failed for block %d: %v",
-							f.inodeNum, ext.PhysicalBlock, cowErr)
-						return 0, syscall.EIO
+				if cowResult.WasShared {
+					if beforeCoWCommit != nil {
+						beforeCoWCommit()
 					}
-
-					if cowResult.WasShared {
-						inoDirty = true
-						log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
-							f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
-
-						cowDone = append(cowDone, cowResult)
-
-						// Re-lookup extent to get updated physical block
-						ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum)
-						if cowErr != nil {
-							log.Printf("[DEBUG] Write inode %d: extent lookup after CoW failed: %v", f.inodeNum, cowErr)
+					// Copied on an unlocked copy: keep it only if no node wrote the inode meanwhile.
+					if f.fs.lockMgr != nil {
+						if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+							log.Printf("[DEBUG] Write inode %d: failed to acquire lock for CoW: %v", f.inodeNum, err)
+							f.fs.extentMgr.DiscardPending(ctx, ino)
+							f.fs.extentMgr.FreePhysicalBlock(ctx, cowResult.NewPhysBlock)
 							return 0, syscall.EIO
 						}
+						lockHeld = true
+						freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+						if err != nil || freshIno.MetaGeneration != ino.MetaGeneration {
+							log.Printf("[DEBUG] Write inode %d: inode changed during CoW (err=%v)", f.inodeNum, err)
+							releaseInodeLock()
+							f.fs.extentMgr.DiscardPending(ctx, ino)
+							f.fs.extentMgr.FreePhysicalBlock(ctx, cowResult.NewPhysBlock)
+							return 0, errRetryWrite
+						}
+					}
+					inoDirty = true
+					cowDone = append(cowDone, cowResult)
+					log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
+						f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
+					if ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum); cowErr != nil {
+						log.Printf("[DEBUG] Write inode %d: extent lookup after CoW failed: %v", f.inodeNum, cowErr)
+						return 0, syscall.EIO
 					}
 				}
 			}
@@ -2652,6 +2631,20 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	ino.Size = newSize
 	ino.Mtime = newMtime
 
+	// releaseCopied drops this file's ownership of blocks it copied away from.
+	// Blocks an older version shared without counting stay allocated.
+	releaseCopied := func(cows []*extent.CoWResult) {
+		var old []uint64
+		for _, cow := range cows {
+			if !cow.Uncounted {
+				old = append(old, cow.OldPhysBlock)
+			}
+		}
+		if len(old) > 0 {
+			f.fs.extentMgr.ReleaseBlocks(ctx, old)
+		}
+	}
+
 	// On a tree conflict the blocks allocated since the last mid-write persist are
 	// unreferenced. Close the intent first so journal replay cannot map them again,
 	// then free them. Blocks the persist committed stay mapped on disk.
@@ -2683,12 +2676,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 		// The retry finds these blocks already copied, so release the old ones now.
-		for _, cow := range cowDone[:committedCoW] {
-			if _, err := f.fs.refcountReg.Decrement(ctx, cow.OldPhysBlock); err != nil {
-				log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
-					f.inodeNum, cow.OldPhysBlock, err)
-			}
-		}
+		releaseCopied(cowDone[:committedCoW])
 		return errRetryWrite
 	}
 
@@ -2697,10 +2685,6 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			return 0, writeFailed(err)
 		}
 	}
-	if len(cowDone) > 0 && beforeCoWCommit != nil {
-		beforeCoWCommit()
-	}
-
 	// Write inode - use WriteWithLockHeld if we hold the lock
 	if lockHeld {
 		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
@@ -2718,15 +2702,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 	releaseInodeLock()
 
-	var copied []uint64
-	for _, cow := range cowDone {
-		if !cow.Uncounted {
-			copied = append(copied, cow.OldPhysBlock)
-		}
-	}
-	if len(copied) > 0 {
-		f.fs.extentMgr.ReleaseBlocks(ctx, copied)
-	}
+	releaseCopied(cowDone)
 
 	// Cache the freshly-written inode for subsequent reads
 	f.fs.cacheInode(ino)
