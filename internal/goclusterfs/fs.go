@@ -493,7 +493,6 @@ func (f *FS) OnAdd(ctx context.Context) {
 
 // Statfs returns filesystem statistics.
 func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
-	ctx = detach(ctx)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -514,7 +513,6 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 
 // Getattr returns the root directory attributes.
 func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	ctx = detach(ctx)
 	ino, err := f.getInode(inode.InodeRoot)
 	if err != nil {
 		return syscall.EIO
@@ -1156,7 +1154,6 @@ var (
 
 // Getattr returns directory attributes.
 func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	ctx = detach(ctx)
 	ino, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return syscall.EIO
@@ -2021,7 +2018,6 @@ var (
 // Open opens the file for reading/writing.
 // Returns nil FileHandle to indicate the File node itself should be used as the handle.
 func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	ctx = detach(ctx)
 	log.Printf("[DEBUG] File.Open: inode=%d flags=%d", f.inodeNum, flags)
 	// Verify the inode exists and is a regular file
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
@@ -2044,7 +2040,6 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 
 // Getattr returns file attributes.
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	ctx = detach(ctx)
 	log.Printf("[DEBUG] File.Getattr: inode=%d", f.inodeNum)
 	// Read directly from disk to get fresh inode state.
 	// In multi-node scenarios, another node may have updated the inode.
@@ -2079,7 +2074,6 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 
 // Read reads file data.
 func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	ctx = detach(ctx)
 	// Use cached inode with validation for better performance.
 	// The cache manager handles TTL-based staleness checks and generation
 	// counter validation, automatically refreshing stale entries from disk.
@@ -3168,7 +3162,6 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 // Fsync flushes file data to disk.
 func (f *File) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
-	ctx = detach(ctx)
 	if err := f.fs.dev.Sync(); err != nil {
 		return syscall.EIO
 	}
