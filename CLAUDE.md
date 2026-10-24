@@ -88,7 +88,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
 - At most 64 nodes mount a volume at once, one per registry slot.
-- The superblock free block and free inode counters are written at format time and never updated, so `goclusterfs-fsck` reports counter mismatches once files exist.
+- `goclusterfs-fsck` reports errors on healthy volumes: the superblock free block and inode counters are never updated after format, and phases 5 and 7 expect refcount and snapshot sector checksums the runtime does not write.
 - Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
 - The inode count is fixed at 4096.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.

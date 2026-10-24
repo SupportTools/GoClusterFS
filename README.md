@@ -158,7 +158,7 @@ Run fsck on an unmounted device. The device is a positional argument, and flags 
 
 Exit codes: `0` clean, `1` errors found, `2` usage error or fatal failure.
 
-**Known issue:** fsck does not work yet on volumes made with `goclusterfs-mount -format`. The mount tool does not write a superblock, so fsck stops at phase 1 with `invalid superblock magic` and exits with `2`.
+**Known issue:** fsck reports errors on healthy volumes, so its exit code is not reliable yet. The superblock free block and inode counters are never updated after `-format`, and phases 5 and 7 expect refcount and snapshot sector checksums that the runtime does not write.
 
 ## Architecture
 
