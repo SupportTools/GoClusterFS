@@ -566,6 +566,61 @@ func TestDecrementBatchUnderflow(t *testing.T) {
 	}
 }
 
+func TestShareAndRelease(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	region := NewRegion(dev, 0, 1000, nil)
+	ctx := context.Background()
+	blocks := []uint64{3, 700}
+	count := func(block uint64) uint32 {
+		t.Helper()
+		e, err := region.Get(ctx, block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e.RefCount
+	}
+
+	if err := region.Share(ctx, blocks); err != nil {
+		t.Fatal(err)
+	}
+	if got := count(3); got != 2 {
+		t.Fatalf("first share of a new block: count %d, want 2", got)
+	}
+	if err := region.Share(ctx, blocks[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if got := count(3); got != 3 {
+		t.Fatalf("second share: count %d, want 3", got)
+	}
+
+	for want := uint32(2); want >= 1; want-- {
+		free, err := region.Release(ctx, blocks[:1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(free) != 0 || count(3) != want {
+			t.Fatalf("release down to %d: free=%v count=%d", want, free, count(3))
+		}
+	}
+	free, err := region.Release(ctx, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(free) != 1 || free[0] != 3 || count(3) != 0 || count(700) != 1 {
+		t.Fatalf("last owner of 3 and one of two owners of 700: free=%v counts=%d,%d", free, count(3), count(700))
+	}
+
+	free, err = region.Release(ctx, []uint64{700, 900})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(free) != 2 || count(700) != 0 || count(900) != 0 {
+		t.Fatalf("release of single-owner blocks: free=%v", free)
+	}
+}
+
 func TestScan(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
