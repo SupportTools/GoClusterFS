@@ -55,6 +55,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `chmod` cleared a file's type bits, so the file could no longer be opened ("Is a directory") and fsck reported an invalid file type. `chmod`, `chown` and `touch` now also work on directories and the mount root, which returned "Operation not supported".
+- The cache summary logged at unmount showed hit rates 100 times too high.
 - All nodes wrote the same journal region. A restarting node replayed and then reset the journal of nodes still writing, and no node could replay a crashed node's journal. Each node registry slot now owns a 4 MB journal, and a crashed node's journal is replayed through its slot.
 - Nodes never sent registry heartbeats, so a node mounting more than 10 seconds after another took the live node's registry slot.
 - After a partial write into a fallocated range, reads of the other fallocated blocks, and of the rest of the written block, returned old disk contents. They now return zeros.

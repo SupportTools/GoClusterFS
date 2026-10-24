@@ -408,9 +408,7 @@ func main() {
 
 	// Print final cache stats
 	stats := cacheMgr.Stats()
-	log.Printf("Cache stats: inodes=%d (hit=%.1f%%), extents=%d (hit=%.1f%%)",
-		stats.InodeCacheSize, stats.InodeHitRate*100,
-		stats.ExtentCacheSize, stats.ExtentHitRate*100)
+	log.Printf("Cache stats: %s", stats)
 	if stats.BroadcastEnabled {
 		log.Printf("Broadcast stats: sent=%d, received=%d, duplicates=%d",
 			stats.InvalidationsSent, stats.InvalidationsReceived, stats.BroadcastDuplicates)
