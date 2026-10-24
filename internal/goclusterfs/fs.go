@@ -53,6 +53,14 @@ var errRetryCreate = errors.New("retry create: inode slot collision")
 // operations when inode slot collisions occur across cluster nodes.
 const MaxCreateRetries = 5
 
+// maxConflictRetries bounds how often an inode update is redone after another
+// node changed the same inode's extent tree first.
+const maxConflictRetries = 5
+
+func conflictBackoff(attempt int) {
+	time.Sleep(time.Duration(1+rand.Intn(5<<attempt)) * time.Millisecond)
+}
+
 // BlockSize is the size of data blocks (1MB).
 const BlockSize = 1 << 20
 
@@ -151,7 +159,8 @@ func New(cfg *Config) (*FS, error) {
 	inodeTbl := inode.NewTable(dev, cfg.InodeOffset, cfg.InodeCount*inode.InodeSize, lockMgr, cfg.NodeUUID)
 
 	// Create extent manager
-	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr)
+	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr, cfg.DataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
 
 	// Create directory manager
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, cfg.DataOffset)
@@ -274,6 +283,29 @@ func (f *FS) getInode(inodeNum uint32) (*inode.Inode, error) {
 	return f.inodeTbl.Read(inodeNum)
 }
 
+// updateInode re-reads an inode, applies update, and writes it back, starting
+// over when another node changed the inode's extent tree in between.
+func (f *FS) updateInode(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
+	for attempt := 0; ; attempt++ {
+		ino, err := f.inodeTbl.Read(num)
+		if err != nil {
+			return nil, err
+		}
+		if err := update(ino); err != nil {
+			f.extentMgr.DiscardPending(ctx, ino)
+			return nil, err
+		}
+		if err = f.inodeTbl.Write(ctx, ino); err == nil {
+			return ino, nil
+		}
+		f.extentMgr.DiscardPending(ctx, ino)
+		if !errors.Is(err, extent.ErrTreeConflict) || attempt == maxConflictRetries-1 {
+			return nil, err
+		}
+		conflictBackoff(attempt)
+	}
+}
+
 // invalidateInode removes an inode from the cache before modification.
 // Safe to call even if cache is nil.
 func (f *FS) invalidateInode(inodeNum uint32) {
@@ -294,6 +326,20 @@ func (f *FS) cacheInode(ino *inode.Inode) {
 // Returns 0 for holes (sparse file regions with no allocated blocks).
 // This is the preferred method for read paths.
 func (f *FS) lookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
+	phys, err := f.lookupPhysicalIn(ino, logicalBlock)
+	if errors.Is(err, extent.ErrStaleTree) || errors.Is(err, extent.ErrCorruptTree) {
+		// The cached inode may point at tree nodes another node has since rewritten.
+		f.invalidateInode(ino.InodeNum)
+		fresh, readErr := f.inodeTbl.Read(ino.InodeNum)
+		if readErr != nil {
+			return 0, err
+		}
+		return f.lookupPhysicalIn(fresh, logicalBlock)
+	}
+	return phys, err
+}
+
+func (f *FS) lookupPhysicalIn(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
 	if f.cacheMgr != nil {
 		return f.cacheMgr.LookupPhysicalCached(f.extentMgr, ino, logicalBlock)
 	}
@@ -647,13 +693,11 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 	// dirMgr.Add() may have allocated a new block and updated extent fields.
 	// Only Size is copied back to dirIno; extent fields are stale.
 	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = f.inodeTbl.Read(inode.InodeRoot)
+	dirIno, err = f.updateInode(ctx, inode.InodeRoot, func(ino *inode.Inode) error { ino.Mtime = now; return nil })
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: Re-read root inode failed: %v", name, err)
+		log.Printf("[DEBUG] Create %q: updating root inode failed: %v", name, err)
 		// The file was created successfully, just log the error
 	} else {
-		dirIno.Mtime = now
-		f.inodeTbl.Write(ctx, dirIno)
 		// Update cache with parent directory inode
 		f.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
@@ -806,14 +850,15 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 	// dirMgr.Add() may have allocated a new block and updated extent fields.
 	// Only Size is copied back to dirIno; extent fields are stale.
 	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = f.inodeTbl.Read(inode.InodeRoot)
+	dirIno, err = f.updateInode(ctx, inode.InodeRoot, func(ino *inode.Inode) error {
+		ino.LinkCount++
+		ino.Mtime = now
+		return nil
+	})
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: Re-read root inode failed: %v", name, err)
+		log.Printf("[DEBUG] Mkdir %q: updating root inode failed: %v", name, err)
 		// The child directory was created successfully, just log the error
 	} else {
-		dirIno.LinkCount++
-		dirIno.Mtime = now
-		f.inodeTbl.Write(ctx, dirIno)
 		// Update cache with parent directory inode
 		f.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
@@ -908,16 +953,21 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 	childIno.Ctime = now
 
 	if childIno.LinkCount == 0 {
-		if err := f.extentMgr.Truncate(ctx, childIno, 0); err != nil {
-			log.Printf("[DEBUG] Unlink %q: Truncate failed: %v", name, err)
+		if err := f.extentMgr.Delete(ctx, childIno); err != nil {
+			log.Printf("[DEBUG] Unlink %q: freeing blocks failed: %v", name, err)
 		}
 		f.inodeTbl.Free(ctx, childIno.InodeNum)
-	} else {
-		f.inodeTbl.Write(ctx, childIno)
+	} else if _, err := f.updateInode(ctx, childIno.InodeNum, func(ino *inode.Inode) error {
+		ino.LinkCount--
+		ino.Ctime = now
+		return nil
+	}); err != nil {
+		log.Printf("[DEBUG] Unlink %q: updating link count failed: %v", name, err)
 	}
 
-	dirIno.Mtime = now
-	f.inodeTbl.Write(ctx, dirIno)
+	if _, err := f.updateInode(ctx, dirIno.InodeNum, func(ino *inode.Inode) error { ino.Mtime = now; return nil }); err != nil {
+		log.Printf("[DEBUG] Unlink %q: updating directory failed: %v", name, err)
+	}
 
 	// === WAL: Mark intent complete ===
 	if f.journal != nil && intentSeq > 0 {
@@ -986,15 +1036,19 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	if err := f.extentMgr.Truncate(ctx, childIno, 0); err != nil {
-		log.Printf("[DEBUG] Rmdir %q: Truncate failed: %v", name, err)
+	if err := f.extentMgr.Delete(ctx, childIno); err != nil {
+		log.Printf("[DEBUG] Rmdir %q: freeing blocks failed: %v", name, err)
 	}
 	f.inodeTbl.Free(ctx, childIno.InodeNum)
 
 	now := time.Now().UnixNano()
-	dirIno.LinkCount--
-	dirIno.Mtime = now
-	f.inodeTbl.Write(ctx, dirIno)
+	if _, err := f.updateInode(ctx, dirIno.InodeNum, func(ino *inode.Inode) error {
+		ino.LinkCount--
+		ino.Mtime = now
+		return nil
+	}); err != nil {
+		log.Printf("[DEBUG] Rmdir %q: updating directory failed: %v", name, err)
+	}
 
 	// === WAL: Mark intent complete ===
 	if f.journal != nil && intentSeq > 0 {
@@ -1341,13 +1395,11 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 	// dirMgr.Add() may have allocated a new block and updated extent fields.
 	// Only Size is copied back to dirIno; extent fields are stale.
 	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = d.fs.inodeTbl.Read(d.inodeNum)
+	dirIno, err = d.fs.updateInode(ctx, d.inodeNum, func(ino *inode.Inode) error { ino.Mtime = now; return nil })
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: Re-read parent inode %d failed: %v", name, d.inodeNum, err)
+		log.Printf("[DEBUG] Create %q: updating parent inode %d failed: %v", name, d.inodeNum, err)
 		// The file was created successfully, just log the error
 	} else {
-		dirIno.Mtime = now
-		d.fs.inodeTbl.Write(ctx, dirIno)
 		// Update cache with parent directory inode
 		d.fs.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
@@ -1560,16 +1612,17 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 	// dirMgr.Add() may have allocated a new block and updated extent fields.
 	// Only Size is copied back to dirIno; extent fields are stale.
 	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = d.fs.inodeTbl.Read(d.inodeNum)
+	dirIno, err = d.fs.updateInode(ctx, d.inodeNum, func(ino *inode.Inode) error {
+		// Increment parent link count (for ..)
+		ino.LinkCount++
+		ino.Mtime = now
+		return nil
+	})
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: Re-read parent inode %d failed: %v", name, d.inodeNum, err)
+		log.Printf("[DEBUG] Mkdir %q: updating parent inode %d failed: %v", name, d.inodeNum, err)
 		// The child directory was created successfully, just log the error
 		// and skip updating parent LinkCount/Mtime
 	} else {
-		// Increment parent link count (for ..)
-		dirIno.LinkCount++
-		dirIno.Mtime = now
-		d.fs.inodeTbl.Write(ctx, dirIno)
 		// Update cache with parent directory inode
 		d.fs.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
@@ -1760,11 +1813,6 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 	// Now execute the actual metadata operations (safe - recoverable if crash)
 
-	// Update parent link count for directory removal
-	if isDir {
-		dirIno.LinkCount--
-	}
-
 	// Remove directory entry
 	if err := d.fs.dirMgr.Remove(ctx, dirIno, name); err != nil {
 		return syscall.EIO
@@ -1774,22 +1822,30 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 	childIno.LinkCount--
 	if childIno.LinkCount == 0 {
 		// Free all extents
-		d.fs.extentMgr.Truncate(ctx, childIno, 0)
+		d.fs.extentMgr.Delete(ctx, childIno)
 		// Free inode
 		d.fs.inodeTbl.Free(ctx, uint32(childInodeNum))
+	} else if updated, err := d.fs.updateInode(ctx, uint32(childInodeNum), func(ino *inode.Inode) error { ino.LinkCount--; return nil }); err != nil {
+		log.Printf("[DEBUG] removeEntry %q: updating link count failed: %v", name, err)
 	} else {
-		d.fs.inodeTbl.Write(ctx, childIno)
 		// Cache the updated child inode
-		d.fs.cacheInode(childIno)
+		d.fs.cacheInode(updated)
 	}
 
-	// Update directory mtime
+	// Update directory mtime, and its link count for directory removal
 	now := time.Now().UnixNano()
-	dirIno.Mtime = now
-	d.fs.inodeTbl.Write(ctx, dirIno)
-
-	// Cache the updated parent directory inode
-	d.fs.cacheInode(dirIno)
+	if updated, err := d.fs.updateInode(ctx, d.inodeNum, func(ino *inode.Inode) error {
+		if isDir {
+			ino.LinkCount--
+		}
+		ino.Mtime = now
+		return nil
+	}); err != nil {
+		log.Printf("[DEBUG] removeEntry %q: updating directory failed: %v", name, err)
+	} else {
+		// Cache the updated parent directory inode
+		d.fs.cacheInode(updated)
+	}
 
 	// === WAL: Mark intent complete ===
 	if d.fs.journal != nil && intentSeq > 0 {
@@ -1992,6 +2048,7 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 		if err == errRetryWrite {
 			log.Printf("[DEBUG] Write inode %d: retry attempt %d due to concurrent modification",
 				f.inodeNum, attempt+1)
+			conflictBackoff(attempt)
 			continue
 		}
 		if err != nil {
@@ -2003,6 +2060,14 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 	log.Printf("[ERROR] Write inode %d: concurrent modification detected after %d retries",
 		f.inodeNum, MaxWriteRetries)
 	return 0, syscall.EAGAIN
+}
+
+// retryOnTreeConflict turns a lost extent-tree race into a write retry.
+func retryOnTreeConflict(err error) error {
+	if errors.Is(err, extent.ErrTreeConflict) {
+		return errRetryWrite
+	}
+	return err
 }
 
 // writeInternal performs the actual write operation.
@@ -2025,6 +2090,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		physicalBlock uint64
 		count         uint32
 	}, 0)
+	// Snapshot refcounts drop only after the inode write commits the copies.
+	var cowDone []*extent.CoWResult
 	// Abort transaction on error path
 	defer func() {
 		if txn != nil && f.fs.journal != nil {
@@ -2039,6 +2106,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		log.Printf("[DEBUG] Write inode %d: Read failed: %v", f.inodeNum, err)
 		return 0, syscall.EIO
 	}
+	inodeWritten := false
+	defer func() {
+		if !inodeWritten {
+			f.fs.extentMgr.DiscardPending(ctx, ino)
+		}
+	}()
 
 	// === SFB (Sub-File Block) handling for small files ===
 	// Check if this file uses SFB storage or could benefit from it.
@@ -2107,7 +2180,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 			if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 				_ = f.fs.sfbMgr.FreeSlot(ctx, containerBlock, slotIndex)
-				return 0, err
+				return 0, retryOnTreeConflict(err)
 			}
 
 			// Write data using SFB path
@@ -2133,6 +2206,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Try to find existing extent first (without lock for read-only check)
 		ext, extOffset, err := f.fs.extentMgr.Lookup(ino, blockNum)
+		if err != nil && err != extent.ErrExtentNotFound {
+			log.Printf("[DEBUG] Write inode %d: extent lookup at block %d failed: %v", f.inodeNum, blockNum, err)
+			if errors.Is(err, extent.ErrStaleTree) {
+				return 0, errRetryWrite
+			}
+			return 0, syscall.EIO
+		}
 		if err != nil {
 			// Need to allocate - must acquire lock first
 			if !lockHeld && f.fs.lockMgr != nil {
@@ -2176,14 +2256,18 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			// Allocate block (acquires bitmap lock internally, then releases it)
 			ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
 			if err != nil {
-				// Check for extent conflicts indicating concurrent allocation
-				if err == extent.ErrExtentOverlap || err == extent.ErrNoSpaceForExtent {
-					log.Printf("[DEBUG] Write inode %d: extent conflict at block %d, retrying",
-						f.inodeNum, blockNum)
+				log.Printf("[DEBUG] Write inode %d: AllocateBlocks at block %d failed: %v", f.inodeNum, blockNum, err)
+				switch {
+				case errors.Is(err, extent.ErrExtentOverlap), errors.Is(err, extent.ErrStaleTree):
+					// Concurrent allocation by another node
 					return 0, errRetryWrite
+				case errors.Is(err, extent.ErrExtentTreeFull):
+					return 0, syscall.EFBIG
+				case errors.Is(err, extent.ErrCorruptTree):
+					return 0, syscall.EIO
+				default:
+					return 0, syscall.ENOSPC
 				}
-				log.Printf("[DEBUG] Write inode %d: AllocateBlocks failed: %v", f.inodeNum, err)
-				return 0, syscall.ENOSPC
 			}
 
 			// Re-acquire inode lock after allocation
@@ -2222,7 +2306,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// we must allocate a new block before writing to preserve snapshot data.
 		if ext.Flags&extent.FlagShared != 0 && f.fs.refcountReg != nil {
 			// Check if CoW is actually needed (refcount > 1)
-			needsCoW, cowErr := f.fs.extentMgr.NeedsCoW(ctx, ext, f.fs.refcountReg)
+			needsCoW, cowErr := f.fs.extentMgr.NeedsCoW(ctx, blockExtent(ext, extOffset), f.fs.refcountReg)
 			if cowErr != nil {
 				log.Printf("[DEBUG] Write inode %d: CoW check failed for block %d: %v",
 					f.inodeNum, ext.PhysicalBlock, cowErr)
@@ -2258,7 +2342,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					}
 
 					// Re-check if CoW is still needed (another node may have done it)
-					needsCoW, cowErr = f.fs.extentMgr.NeedsCoW(ctx, ext, f.fs.refcountReg)
+					needsCoW, cowErr = f.fs.extentMgr.NeedsCoW(ctx, blockExtent(ext, extOffset), f.fs.refcountReg)
 					if cowErr != nil {
 						log.Printf("[DEBUG] Write inode %d: CoW re-check failed: %v", f.inodeNum, cowErr)
 						return 0, syscall.EIO
@@ -2278,17 +2362,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 						log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
 							f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
 
-						// Decrement refcount on old block (async, will be freed if reaches 0)
-						newCount, decErr := f.fs.refcountReg.Decrement(ctx, cowResult.OldPhysBlock)
-						if decErr != nil {
-							// Log but don't fail - the write succeeded, refcount is secondary
-							log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
-								f.inodeNum, cowResult.OldPhysBlock, decErr)
-						} else if newCount == 0 {
-							// Block is no longer referenced - queue for TRIM if enabled
-							log.Printf("[DEBUG] Write inode %d: old block %d refcount reached 0 (can be freed)",
-								f.inodeNum, cowResult.OldPhysBlock)
-						}
+						cowDone = append(cowDone, cowResult)
 
 						// Re-lookup extent to get updated physical block
 						ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum)
@@ -2336,7 +2410,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 
 			// Clear the Unwritten flag (if still set)
-			if f.fs.extentMgr.ClearUnwritten(ino, ext) {
+			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ino, ext)
+			if clearErr != nil {
+				log.Printf("[DEBUG] Write inode %d: clearing Unwritten flag at block %d failed: %v",
+					f.inodeNum, blockNum, clearErr)
+				return 0, syscall.EIO
+			}
+			if cleared {
 				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
 					f.inodeNum, blockNum)
 			}
@@ -2491,6 +2571,36 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	ino.Size = newSize
 	ino.Mtime = newMtime
 
+	// On a tree conflict the blocks allocated here are unreferenced. Close the
+	// intent first so journal replay cannot map them again, then free them.
+	writeFailed := func(err error) error {
+		f.fs.extentMgr.DiscardPending(ctx, ino)
+		if !errors.Is(err, extent.ErrTreeConflict) {
+			return syscall.EIO
+		}
+		if f.fs.journal != nil && intentSeq > 0 {
+			if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+				log.Printf("[DEBUG] Write inode %d: CompleteIntent after tree conflict failed: %v", f.inodeNum, err)
+				return errRetryWrite
+			}
+		}
+		var unused []uint64
+		for _, alloc := range allocatedExtents {
+			for i := uint64(0); i < uint64(alloc.count); i++ {
+				unused = append(unused, alloc.physicalBlock+i)
+			}
+		}
+		for _, cow := range cowDone {
+			unused = append(unused, cow.NewPhysBlock)
+		}
+		for _, b := range unused {
+			if err := f.fs.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
+				log.Printf("[DEBUG] Write inode %d: freeing block %d after tree conflict failed: %v", f.inodeNum, b, err)
+			}
+		}
+		return errRetryWrite
+	}
+
 	// Write inode - use WriteWithLockHeld if we hold the lock
 	if lockHeld {
 		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
@@ -2498,18 +2608,32 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if acquiredLockForSize {
 				f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
 			}
-			return 0, syscall.EIO
+			return 0, writeFailed(err)
 		}
 	} else {
 		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 			log.Printf("[DEBUG] Write inode %d: final inodeTbl.Write failed: %v", f.inodeNum, err)
-			return 0, syscall.EIO
+			return 0, writeFailed(err)
 		}
 	}
+
+	inodeWritten = true
 
 	// Release the lock we acquired for size update
 	if acquiredLockForSize {
 		f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+	}
+
+	for _, cow := range cowDone {
+		newCount, decErr := f.fs.refcountReg.Decrement(ctx, cow.OldPhysBlock)
+		if decErr != nil {
+			// Log but don't fail - the write succeeded, refcount is secondary
+			log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
+				f.inodeNum, cow.OldPhysBlock, decErr)
+		} else if newCount == 0 {
+			log.Printf("[DEBUG] Write inode %d: old block %d refcount reached 0 (can be freed)",
+				f.inodeNum, cow.OldPhysBlock)
+		}
 	}
 
 	// Cache the freshly-written inode for subsequent reads
@@ -2640,7 +2764,7 @@ func (f *File) writeSFB(ctx context.Context, ino *inode.Inode, data []byte, offs
 
 		// Write inode
 		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-			return bytesWritten, err
+			return bytesWritten, retryOnTreeConflict(err)
 		}
 	}
 
@@ -2730,7 +2854,11 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	ino.Mtime = time.Now().UnixNano()
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-		return err
+		// Only a conflict proves the inode on disk does not map newBlock.
+		if errors.Is(err, extent.ErrTreeConflict) {
+			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+		}
+		return retryOnTreeConflict(err)
 	}
 
 	// Free the old SFB slot (if sfbMgr is available)
@@ -2755,12 +2883,27 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	for attempt := 0; ; attempt++ {
+		errno, err := f.setattr(ctx, fh, in, out)
+		if err == nil {
+			return errno
+		}
+		if attempt == maxConflictRetries-1 {
+			return syscall.EAGAIN
+		}
+		conflictBackoff(attempt)
+	}
+}
+
+// setattr applies one Setattr attempt. A non-nil error means another node
+// changed the inode's extent tree first and the attempt should be redone.
+func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) (syscall.Errno, error) {
 	// Invalidate cache before modifying - ensures we read fresh data
 	f.fs.invalidateInode(f.inodeNum)
 
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
-		return syscall.EIO
+		return syscall.EIO, nil
 	}
 
 	now := time.Now().UnixNano()
@@ -2821,7 +2964,7 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 				Count:      blocksToFree,
 			}); err != nil {
 				f.fs.journal.Abort(txn)
-				return syscall.EIO
+				return syscall.EIO, nil
 			}
 		}
 
@@ -2831,14 +2974,14 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 			UpdateMask: mask,
 		}); err != nil {
 			f.fs.journal.Abort(txn)
-			return syscall.EIO
+			return syscall.EIO, nil
 		}
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
 		var commitErr error
 		intentSeq, commitErr = f.fs.journal.Commit(txn)
 		if commitErr != nil {
-			return syscall.EIO
+			return syscall.EIO, nil
 		}
 	}
 	// === End WAL transaction ===
@@ -2848,7 +2991,7 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		if sz < ino.Size {
 			// Truncate
 			if err := f.fs.extentMgr.Truncate(ctx, ino, sz); err != nil {
-				return syscall.EIO
+				return syscall.EIO, nil
 			}
 		}
 		ino.Size = sz
@@ -2879,7 +3022,15 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-		return syscall.EIO
+		f.fs.extentMgr.DiscardPending(ctx, ino)
+		if errors.Is(err, extent.ErrTreeConflict) {
+			// Nothing was applied, so close the intent before the retry logs a new one.
+			if f.fs.journal != nil && intentSeq > 0 {
+				f.fs.journal.CompleteIntent(intentSeq)
+			}
+			return 0, err
+		}
+		return syscall.EIO, nil
 	}
 
 	// Cache the freshly-written inode for subsequent reads
@@ -2892,7 +3043,7 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		}
 	}
 
-	return f.Getattr(ctx, fh, out)
+	return f.Getattr(ctx, fh, out), nil
 }
 
 // Fsync flushes file data to disk.
@@ -2915,12 +3066,39 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		return syscall.EOPNOTSUPP
 	}
 
+	for attempt := 0; ; attempt++ {
+		errno, err := f.allocate(ctx, off, size, mode)
+		if err == nil {
+			return errno
+		}
+		if attempt == maxConflictRetries-1 {
+			return syscall.EAGAIN
+		}
+		conflictBackoff(attempt)
+	}
+}
+
+// allocate makes one fallocate attempt. A non-nil error means another node
+// changed the inode's extent tree first; the blocks allocated here are freed.
+func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint32) (syscall.Errno, error) {
 	// Read current inode
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
 		log.Printf("[DEBUG] Allocate inode %d: read failed: %v", f.inodeNum, err)
-		return syscall.EIO
+		return syscall.EIO, nil
 	}
+
+	// Until the inode write commits them, blocks allocated here belong to nobody.
+	var newBlocks []uint64
+	committed := false
+	defer func() {
+		if !committed {
+			f.fs.extentMgr.DiscardPending(ctx, ino)
+			for _, b := range newBlocks {
+				f.fs.extentMgr.FreePhysicalBlock(ctx, b)
+			}
+		}
+	}()
 
 	// Note: We don't hold the inode lock during block allocation to respect lock ordering.
 	// Lock order: bitmap (6) must be acquired before inode (8).
@@ -2947,14 +3125,18 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 			blockNum++
 			continue
 		}
+		if lookupErr != extent.ErrExtentNotFound {
+			log.Printf("[DEBUG] Allocate inode %d: extent lookup at block %d failed: %v", f.inodeNum, blockNum, lookupErr)
+			return syscall.EIO, nil
+		}
 
 		// Find how many contiguous blocks starting from blockNum are unallocated
 		rangeStart := blockNum
 		rangeEnd := blockNum + 1
 		for rangeEnd < endBlock {
 			_, _, lookupErr := f.fs.extentMgr.Lookup(ino, rangeEnd)
-			if lookupErr == nil {
-				break // This block is allocated, stop the range
+			if lookupErr != extent.ErrExtentNotFound {
+				break // Allocated (or unreadable), stop the range
 			}
 			rangeEnd++
 		}
@@ -2968,7 +3150,15 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		if allocErr != nil {
 			log.Printf("[DEBUG] Allocate inode %d: AllocateUnwritten blocks %d-%d failed: %v",
 				f.inodeNum, rangeStart, rangeEnd-1, allocErr)
-			return syscall.ENOSPC
+			if errors.Is(allocErr, extent.ErrExtentTreeFull) {
+				return syscall.EFBIG, nil
+			}
+			return syscall.ENOSPC, nil
+		}
+		for b := rangeStart; b < rangeEnd; b++ {
+			if ext, inExt, err := f.fs.extentMgr.Lookup(ino, b); err == nil {
+				newBlocks = append(newBlocks, ext.PhysicalBlock+inExt)
+			}
 		}
 
 		blockNum = rangeEnd
@@ -2978,7 +3168,7 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 	if f.fs.lockMgr != nil {
 		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
 			log.Printf("[DEBUG] Allocate inode %d: lock failed: %v", f.inodeNum, err)
-			return syscall.EIO
+			return syscall.EIO, nil
 		}
 		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
 
@@ -2986,7 +3176,7 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
 		if err != nil {
 			log.Printf("[DEBUG] Allocate inode %d: re-read failed: %v", f.inodeNum, err)
-			return syscall.EIO
+			return syscall.EIO, nil
 		}
 	}
 
@@ -3007,13 +3197,18 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 	// Write updated inode
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 		log.Printf("[DEBUG] Allocate inode %d: write inode failed: %v", f.inodeNum, err)
-		return syscall.EIO
+		if errors.Is(err, extent.ErrTreeConflict) {
+			return 0, err
+		}
+		committed = true // the inode on disk may already map newBlocks
+		return syscall.EIO, nil
 	}
+	committed = true
 
 	log.Printf("[DEBUG] Allocate inode %d: success, AllocatedBlocks=%d WrittenBlocks=%d Size=%d",
 		f.inodeNum, ino.AllocatedBlocks, ino.WrittenBlocks, ino.Size)
 
-	return 0
+	return 0, nil
 }
 
 // Setxattr sets an extended attribute on the file.
@@ -3063,6 +3258,16 @@ func (f *File) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	return syscall.ENODATA
 }
 
+// markShared marks every extent shared so writes to either copy use CoW.
+func (f *File) markShared(ino *inode.Inode) error {
+	if err := f.fs.extentMgr.MarkAllShared(ino); err != nil {
+		return err
+	}
+	ino.Flags |= inode.FlagHasSnapshot
+	ino.MetaGeneration++
+	return nil
+}
+
 // createSnapshot creates a new snapshot of this file.
 func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	if f.fs.snapshotReg == nil || f.fs.snapshotWkr == nil {
@@ -3070,21 +3275,18 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOTSUP
 	}
 
-	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if err != nil {
-		return syscall.EIO
-	}
-
 	// Mark all extents as shared BEFORE creating snapshot (CoW active immediately)
-	f.fs.extentMgr.MarkAllShared(ino)
-	ino.Flags |= inode.FlagHasSnapshot
-	ino.MetaGeneration++
-
-	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+	ino, err := f.fs.updateInode(ctx, f.inodeNum, f.markShared)
+	if err != nil {
+		log.Printf("[snapshot] Failed to mark extents shared for inode %d: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
 
-	blockNums := collectBlockNumbers(ino)
+	blockNums, err := f.fs.extentMgr.DataBlocks(ino)
+	if err != nil {
+		log.Printf("[snapshot] Failed to list blocks for inode %d: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
 
 	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
 		ino.ExtentTreeRoot, uint64(len(blockNums)), ino.Size, snapshot.FlagReadOnly)
@@ -3129,8 +3331,12 @@ func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	ino, _ := f.fs.inodeTbl.Read(f.inodeNum)
-	blockNums := collectBlockNumbers(ino)
+	var blockNums []uint64
+	if ino, err := f.fs.inodeTbl.Read(f.inodeNum); err == nil {
+		if blockNums, err = f.fs.extentMgr.DataBlocks(ino); err != nil {
+			log.Printf("[snapshot] Failed to list blocks for inode %d: %v", f.inodeNum, err)
+		}
+	}
 
 	if _, err := f.fs.snapshotWkr.QueueDeleteJob(ctx, desc.SnapshotID, blockNums); err != nil {
 		log.Printf("[snapshot] Warning: queue delete job failed: %v", err)
@@ -3159,13 +3365,6 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 		return syscall.ENOTSUP
 	}
 
-	// Read source inode
-	srcIno, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if err != nil {
-		log.Printf("[clone] Failed to read source inode: %v", err)
-		return syscall.EIO
-	}
-
 	// Get root directory inode
 	rootIno, err := f.fs.inodeTbl.Read(inode.InodeRoot)
 	if err != nil {
@@ -3180,10 +3379,8 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	}
 
 	// Mark source extents as shared (enables CoW on source)
-	f.fs.extentMgr.MarkAllShared(srcIno)
-	srcIno.Flags |= inode.FlagHasSnapshot
-	srcIno.MetaGeneration++
-	if err := f.fs.inodeTbl.Write(ctx, srcIno); err != nil {
+	srcIno, err := f.fs.updateInode(ctx, f.inodeNum, f.markShared)
+	if err != nil {
 		log.Printf("[clone] Failed to update source inode: %v", err)
 		return syscall.EIO
 	}
@@ -3214,7 +3411,12 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	}
 
 	// Copy extents with FlagShared set
-	f.fs.extentMgr.CopyExtentsForClone(srcIno, cloneIno)
+	if err := f.fs.extentMgr.CopyExtentsForClone(ctx, srcIno, cloneIno); err != nil {
+		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
+		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
+		log.Printf("[clone] Failed to copy extents: %v", err)
+		return syscall.EIO
+	}
 
 	// Copy attributes from source
 	now := time.Now().UnixNano()
@@ -3223,13 +3425,14 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	cloneIno.GID = srcIno.GID
 	cloneIno.Size = srcIno.Size
 	cloneIno.LinkCount = 1
-	cloneIno.Flags = inode.FlagHasSnapshot
+	cloneIno.Flags |= inode.FlagHasSnapshot
 	cloneIno.Atime = now
 	cloneIno.Mtime = now
 	cloneIno.Ctime = now
 
 	// Write clone inode
 	if err := f.fs.inodeTbl.Write(ctx, cloneIno); err != nil {
+		f.fs.extentMgr.DiscardPending(ctx, cloneIno)
 		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
 		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to write clone inode: %v", err)
@@ -3237,7 +3440,10 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	}
 
 	// Queue background refcount increment for shared blocks
-	blockNums := collectBlockNumbers(srcIno)
+	blockNums, err := f.fs.extentMgr.DataBlocks(srcIno)
+	if err != nil {
+		log.Printf("[clone] Failed to list source blocks: %v", err)
+	}
 	if len(blockNums) > 0 && f.fs.snapshotWkr != nil {
 		if _, err := f.fs.snapshotWkr.QueueCreateJob(ctx, 0, f.inodeNum, blockNums); err != nil {
 			log.Printf("[clone] Warning: queue refcount job failed: %v", err)
@@ -3307,21 +3513,15 @@ func (f *File) listSnapshots(ctx context.Context, dest []byte) (uint32, syscall.
 	return uint32(n), 0
 }
 
-// collectBlockNumbers extracts physical block numbers from an inode.
-func collectBlockNumbers(ino *inode.Inode) []uint64 {
-	if ino == nil {
-		return nil
+// blockExtent returns the single block of ext at offset, so per-block checks
+// such as refcounts look at the right physical block.
+func blockExtent(ext *extent.Extent, offset uint64) *extent.Extent {
+	return &extent.Extent{
+		LogicalBlock:  ext.LogicalBlock + offset,
+		PhysicalBlock: ext.PhysicalBlock + offset,
+		Length:        1,
+		Flags:         ext.Flags,
 	}
-	var blocks []uint64
-	for i := 0; i < inode.MaxInlineExtents; i++ {
-		ext := &ino.InlineExtents[i]
-		if ext.Length > 0 {
-			for j := uint64(0); j < ext.Length; j++ {
-				blocks = append(blocks, ext.PhysicalBlock+j)
-			}
-		}
-	}
-	return blocks
 }
 
 // parseClonePath splits an absolute path into parent directory path and filename.

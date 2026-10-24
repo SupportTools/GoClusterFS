@@ -2,8 +2,11 @@ package inode
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -890,5 +893,95 @@ func TestFindFreeSlotWhenFull(t *testing.T) {
 	_, err := table.FindFreeSlot()
 	if err != ErrInodeFull {
 		t.Errorf("FindFreeSlot on full table error = %v, want ErrInodeFull", err)
+	}
+}
+
+type recordingFlusher struct{ events *[]string }
+
+func (f recordingFlusher) FlushTree(ino, onDisk *Inode) (func(), error) {
+	*f.events = append(*f.events, "flush")
+	return func() { *f.events = append(*f.events, "release") }, nil
+}
+
+// A tree commit must reach the disk before released blocks are freed or a
+// later commit overwrites the half the previous inode used.
+func TestTreeCommitIsSyncedBeforeRelease(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	var uuid [16]byte
+	tbl := NewTable(dev, 0, 16*InodeSize, nil, uuid)
+	var events []string
+	tbl.SetTreeFlusher(recordingFlusher{&events})
+	syncErr := error(nil)
+	tbl.syncDevice = func() error {
+		onDisk, err := tbl.readInodeUnlocked(5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, fmt.Sprintf("sync size=%d", onDisk.Size))
+		return syncErr
+	}
+
+	ctx := context.Background()
+	ino := &Inode{Magic: InodeMagic, InodeNum: 5, Size: 77, PendingTree: struct{}{}}
+	if err := tbl.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"flush", "sync size=77", "release"}; !slices.Equal(events, want) {
+		t.Fatalf("events %v, want %v", events, want)
+	}
+
+	events, syncErr = nil, errors.New("sync failed")
+	ino.Size, ino.PendingTree = 78, struct{}{}
+	if err := tbl.Write(ctx, ino); err == nil {
+		t.Fatal("Write should fail when the commit cannot be synced")
+	}
+	if want := []string{"flush", "sync size=78"}; !slices.Equal(events, want) {
+		t.Fatalf("a failed sync must not release blocks: events %v, want %v", events, want)
+	}
+
+	events = nil
+	ino.Size = 79
+	if err := tbl.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("a write without tree changes should not flush or sync: %v", events)
+	}
+}
+
+// A copy with no extent edits must not wipe or roll back the tree on disk.
+func TestStaleCopyCannotReplaceExtentTree(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	var uuid [16]byte
+	tbl := NewTable(dev, 0, 16*InodeSize, nil, uuid)
+	ctx := context.Background()
+
+	inline := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1}
+	inline.InlineExtents[0] = InlineExtent{LogicalBlock: 0, PhysicalBlock: 9, Length: 1, Flags: 1}
+	if err := tbl.Write(ctx, inline); err != nil {
+		t.Fatal(err)
+	}
+	oldTree := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1, Flags: FlagHasExtentTree,
+		ExtentTreeRoot: 40, ExtentTreeGen: 7, ExtentDepth: 1, ExtentCount: 3}
+	newTree := *oldTree
+	newTree.ExtentTreeGen = 8
+	if err := tbl.writeInodeUnlocked(&newTree); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, stale := range map[string]*Inode{"inline copy": inline, "older tree": oldTree} {
+		stale.Size = 4096
+		if err := tbl.Write(ctx, stale); !errors.Is(err, ErrTreeConflict) {
+			t.Fatalf("%s: got %v, want ErrTreeConflict", name, err)
+		}
+	}
+	got, err := tbl.Read(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ExtentTreeGen != 8 || got.Size != 0 {
+		t.Fatalf("a rejected write changed the inode: %+v", got)
 	}
 }

@@ -2662,6 +2662,125 @@ test_concurrent_writes_power_failure() {
 # Main Test Execution
 # =============================================================================
 
+# =============================================================================
+# Extent tree tests (files with more than 2 extents)
+# =============================================================================
+# These tests read back only on a node that has just restarted: the extent
+# cache keeps mappings of deleted files, and cleanup_test_files makes new files
+# reuse those inode numbers.
+
+# Print the md5 of 64KB at 1MB block $3 of file $2 on VM $1
+extent_chunk_md5_on_vm() {
+    ssh_run "$1" "dd if=/mnt/goclusterfs/$2 bs=65536 skip=$(($3 * 16)) count=1 2>/dev/null | md5sum | cut -d' ' -f1"
+}
+
+# Restarts a VM and mounts GoClusterFS on it again.
+restart_goclusterfs_vm() {
+    local vm_id=$1
+    stop_vm "$vm_id"
+    start_vm "$vm_id" false
+    wait_vm_healthy "$vm_id" || return 1
+    setup_goclusterfs "$vm_id" false
+}
+
+# Writes 64KB at seven scattered 1MB blocks (more than the 2 inline extents)
+# on VM 1, then checks every chunk and a hole on VM 2 and on VM 1, each after
+# a restart.
+test_extent_tree_sparse_writes() {
+    log_info "Testing sparse writes beyond inline extents..."
+    ensure_cluster_healthy 2
+
+    local file="extent_sparse.bin"
+    local blocks="12 3 7 0 20 15 30"
+    declare -A want
+
+    for blk in $blocks; do
+        ssh_run 1 "head -c 65536 /dev/urandom > /tmp/extent_chunk"
+        want[$blk]=$(ssh_run 1 "md5sum /tmp/extent_chunk | cut -d' ' -f1")
+        ssh_run 1 "dd if=/tmp/extent_chunk of=/mnt/goclusterfs/$file bs=65536 seek=$((blk * 16)) conv=notrunc 2>/dev/null" || {
+            log_error "write at block $blk failed"
+            return 1
+        }
+    done
+
+    local size
+    size=$(ssh_run 1 "stat -c%s /mnt/goclusterfs/$file")
+    if [ "$size" -ne $((30 * 1048576 + 65536)) ]; then
+        log_error "size $size, want $((30 * 1048576 + 65536))"
+        return 1
+    fi
+
+    check_sparse_on_vm() {
+        local vm_id=$1
+        for blk in $blocks; do
+            local got
+            got=$(extent_chunk_md5_on_vm "$vm_id" "$file" "$blk")
+            if [ "$got" != "${want[$blk]}" ]; then
+                log_error "VM $vm_id block $blk md5 $got, want ${want[$blk]}"
+                return 1
+            fi
+        done
+        local nonzero
+        nonzero=$(ssh_run "$vm_id" "dd if=/mnt/goclusterfs/$file bs=65536 skip=80 count=1 2>/dev/null | tr -d '\\000' | wc -c")
+        if [ "$nonzero" -ne 0 ]; then
+            log_error "VM $vm_id hole at block 5 has $nonzero non-zero bytes"
+            return 1
+        fi
+    }
+
+    for vm_id in 2 1; do
+        restart_goclusterfs_vm "$vm_id" || return 1
+        check_sparse_on_vm "$vm_id" || return 1
+    done
+
+    log_info "Sparse writes beyond inline extents test passed"
+    return 0
+}
+
+# Two VMs append 1MB alternately to their own file, so both files get
+# non-contiguous blocks and grow past the old 2MB limit. Checks both files on
+# each VM after restarting it.
+test_extent_tree_interleaved_appends() {
+    log_info "Testing interleaved appends across VMs..."
+    ensure_cluster_healthy 2
+
+    ssh_run 1 "rm -f /tmp/extent_left.expected"
+    ssh_run 2 "rm -f /tmp/extent_right.expected"
+    for i in 0 1 2 3 4 5; do
+        ssh_run 1 "head -c 1048576 /dev/urandom | tee -a /tmp/extent_left.expected >> /mnt/goclusterfs/extent_left.bin" || {
+            log_error "VM 1 append $i failed"
+            return 1
+        }
+        ssh_run 2 "head -c 1048576 /dev/urandom | tee -a /tmp/extent_right.expected >> /mnt/goclusterfs/extent_right.bin" || {
+            log_error "VM 2 append $i failed"
+            return 1
+        }
+    done
+
+    local want_left want_right
+    want_left=$(ssh_run 1 "md5sum /tmp/extent_left.expected | cut -d' ' -f1")
+    want_right=$(ssh_run 2 "md5sum /tmp/extent_right.expected | cut -d' ' -f1")
+
+    check_appends_on_vm() {
+        local vm_id=$1
+        local left right
+        left=$(ssh_run "$vm_id" "md5sum /mnt/goclusterfs/extent_left.bin | cut -d' ' -f1")
+        right=$(ssh_run "$vm_id" "md5sum /mnt/goclusterfs/extent_right.bin | cut -d' ' -f1")
+        if [ "$left" != "$want_left" ] || [ "$right" != "$want_right" ]; then
+            log_error "VM $vm_id md5 left=$left right=$right, want left=$want_left right=$want_right"
+            return 1
+        fi
+    }
+
+    for vm_id in 2 1; do
+        restart_goclusterfs_vm "$vm_id" || return 1
+        check_appends_on_vm "$vm_id" || return 1
+    done
+
+    log_info "Interleaved appends test passed"
+    return 0
+}
+
 main() {
     log_info "Starting VM test suite with $NODE_COUNT VMs..."
 
@@ -2717,6 +2836,8 @@ main() {
     run_test "Delete File" test_delete_file
     run_test "Overwrite File" test_overwrite_file
     run_test "Sequential Access" test_sequential_access
+    run_test "Extent Tree Sparse Writes" test_extent_tree_sparse_writes
+    run_test "Extent Tree Interleaved Appends" test_extent_tree_interleaved_appends
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation

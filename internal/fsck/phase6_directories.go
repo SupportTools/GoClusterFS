@@ -3,6 +3,8 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 const (
@@ -71,7 +73,7 @@ func (c *Checker) checkDirectories() error {
 	inodeTableOffset := sb.InodeTableOffset
 	inodeTableSize := sb.InodeTableSize
 	totalSectors := inodeTableSize / InodeSectorSize
-	sectorBuf := make([]byte, InodeSectorSize)
+	sectorBuf := storage.NewAlignedBuffer(InodeSectorSize).Bytes()
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
@@ -181,8 +183,7 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 	var errors []string
 
 	// Read directory data from extents
-	for extIdx := 0; extIdx < 2; extIdx++ {
-		ext := inode.InlineExtents[extIdx]
+	for _, ext := range c.inodeExtents(inodeNum, inode) {
 		if ext.Length == 0 || (ext.Flags&ExtentFlagAllocated) == 0 {
 			continue
 		}
@@ -199,7 +200,7 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 
 			// Read the block in chunks
 			for chunkOffset := uint64(0); chunkOffset < DirBlockSize; chunkOffset += DirChunkSize {
-				chunkBuf := make([]byte, DirChunkSize)
+				chunkBuf := storage.NewAlignedBuffer(DirChunkSize).Bytes()
 				diskOffset := int64(blockOffset + chunkOffset)
 
 				n, err := c.dev.ReadAt(chunkBuf, diskOffset)

@@ -2573,6 +2573,122 @@ log "All nodes healthy, starting tests..."
 
 # Run test suite
 # Basic sanity checks first
+# =============================================================================
+# Extent tree tests (files with more than 2 extents)
+# =============================================================================
+# These tests read back only on a node that has just restarted: the extent
+# cache keeps mappings of deleted files whose inode numbers new files reuse.
+
+# Print the md5 of 64KB at 1MB block $3 of file $2 on node $1
+extent_chunk_md5() {
+    exec_on_node "$1" sh -c "dd if=/mnt/goclusterfs/$2 bs=65536 skip=$(($3 * 16)) count=1 2>/dev/null | md5sum | cut -d' ' -f1"
+}
+
+# Writes 64KB at seven scattered 1MB blocks (more than the 2 inline extents),
+# then checks every chunk and a hole on a second node and on the writer, each
+# after a restart.
+test_extent_tree_sparse_writes() {
+    log "Testing sparse writes beyond inline extents..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]:-${NODE_ARRAY[0]}}"
+    local file="extent_sparse.bin"
+    local blocks="12 3 7 0 20 15 30"
+    declare -A want
+
+    exec_on_node "$writer" rm -f "/mnt/goclusterfs/$file"
+    for blk in $blocks; do
+        exec_on_node "$writer" sh -c "head -c 65536 /dev/urandom > /tmp/extent_chunk"
+        want[$blk]=$(exec_on_node "$writer" sh -c "md5sum /tmp/extent_chunk | cut -d' ' -f1")
+        exec_on_node "$writer" sh -c "dd if=/tmp/extent_chunk of=/mnt/goclusterfs/$file bs=65536 seek=$((blk * 16)) conv=notrunc 2>/dev/null" || {
+            log "ERROR: write at block $blk failed"
+            return 1
+        }
+    done
+
+    local size
+    size=$(exec_on_node "$writer" stat -c%s "/mnt/goclusterfs/$file")
+    if [ "$size" -ne $((30 * 1048576 + 65536)) ]; then
+        log "ERROR: size $size, want $((30 * 1048576 + 65536))"
+        return 1
+    fi
+
+    check_sparse() {
+        local node=$1
+        for blk in $blocks; do
+            local got
+            got=$(extent_chunk_md5 "$node" "$file" "$blk")
+            if [ "$got" != "${want[$blk]}" ]; then
+                log "ERROR: $node block $blk md5 $got, want ${want[$blk]}"
+                return 1
+            fi
+        done
+        local nonzero
+        nonzero=$(exec_on_node "$node" sh -c "dd if=/mnt/goclusterfs/$file bs=65536 skip=80 count=1 2>/dev/null | tr -d '\\000' | wc -c")
+        if [ "$nonzero" -ne 0 ]; then
+            log "ERROR: $node hole at block 5 has $nonzero non-zero bytes"
+            return 1
+        fi
+    }
+
+    for node in $(printf '%s\n' "$reader" "$writer" | uniq); do
+        restart_node "$node"
+        wait_node_healthy "$node" 30 || return 1
+        check_sparse "$node" || return 1
+    done
+
+    log "Sparse writes beyond inline extents test passed"
+    return 0
+}
+
+# Two nodes append 1MB alternately to their own file, so both files get
+# non-contiguous blocks and grow past the old 2MB limit. Checks both files on
+# each node after restarting it.
+test_extent_tree_interleaved_appends() {
+    log "Testing interleaved appends across nodes..."
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]:-${NODE_ARRAY[0]}}"
+
+    exec_on_node "$node_a" rm -f /mnt/goclusterfs/extent_left.bin /mnt/goclusterfs/extent_right.bin
+    exec_on_node "$node_a" rm -f /tmp/extent_left.expected
+    exec_on_node "$node_b" rm -f /tmp/extent_right.expected
+    for i in 0 1 2 3 4 5; do
+        exec_on_node "$node_a" sh -c "head -c 1048576 /dev/urandom | tee -a /tmp/extent_left.expected >> /mnt/goclusterfs/extent_left.bin" || {
+            log "ERROR: $node_a append $i failed"
+            return 1
+        }
+        exec_on_node "$node_b" sh -c "head -c 1048576 /dev/urandom | tee -a /tmp/extent_right.expected >> /mnt/goclusterfs/extent_right.bin" || {
+            log "ERROR: $node_b append $i failed"
+            return 1
+        }
+    done
+
+    local want_left want_right
+    want_left=$(exec_on_node "$node_a" sh -c "md5sum /tmp/extent_left.expected | cut -d' ' -f1")
+    want_right=$(exec_on_node "$node_b" sh -c "md5sum /tmp/extent_right.expected | cut -d' ' -f1")
+
+    check_appends() {
+        local node=$1
+        local left right
+        left=$(exec_on_node "$node" sh -c "md5sum /mnt/goclusterfs/extent_left.bin | cut -d' ' -f1")
+        right=$(exec_on_node "$node" sh -c "md5sum /mnt/goclusterfs/extent_right.bin | cut -d' ' -f1")
+        if [ "$left" != "$want_left" ] || [ "$right" != "$want_right" ]; then
+            log "ERROR: $node md5 left=$left right=$right, want left=$want_left right=$want_right"
+            return 1
+        fi
+    }
+
+    for node in $(printf '%s\n' "$node_b" "$node_a" | uniq); do
+        restart_node "$node"
+        wait_node_healthy "$node" 30 || return 1
+        check_appends "$node" || return 1
+    done
+
+    log "Interleaved appends test passed"
+    return 0
+}
+
 run_test "Create and Read File" test_create_read_file
 run_test "Create Directory" test_create_directory
 run_test "File in Directory" test_file_in_directory
@@ -2588,6 +2704,8 @@ run_test "Rename File" test_rename_file
 run_test "Stress Single Node" test_stress_single_node
 run_test "Overwrite File" test_overwrite_file
 run_test "Sequential Access" test_sequential_access
+run_test "Extent Tree Sparse Writes" test_extent_tree_sparse_writes
+run_test "Extent Tree Interleaved Appends" test_extent_tree_interleaved_appends
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"

@@ -7,6 +7,7 @@ package journal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -428,46 +429,35 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, payload []byte) 
 		return false, err
 	}
 
-	// Read the inode
-	ino, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
-	if err != nil {
-		return false, fmt.Errorf("inode %d not found", p.InodeNum)
-	}
-
-	// Check if extent already exists at this file block
-	_, _, err = rctx.ExtentMgr.Lookup(ino, p.FileBlock)
-	if err == nil {
-		// Extent already exists at this position - idempotent skip
-		log.Printf("[Recovery] ExtentAdd: extent at file block %d already exists for inode %d, skipping",
-			p.FileBlock, p.InodeNum)
-		return false, nil
-	}
-
-	// Add the extent using the extent manager's recovery-friendly method
-	// Note: Journal payload uses FileBlock/DiskBlock, extent uses LogicalBlock/PhysicalBlock
-	ext := &extent.Extent{
-		LogicalBlock:  p.FileBlock,
-		PhysicalBlock: p.DiskBlock,
-		Length:        uint64(p.Length),
-	}
-
-	if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, ext); err != nil {
-		// Check for overlap (concurrent recovery may have added it)
-		if err == extent.ErrExtentOverlap {
-			log.Printf("[Recovery] ExtentAdd: extent overlaps, likely concurrent recovery, skipping")
+	return updateExtents(ctx, rctx, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+		// Check if extent already exists at this file block
+		if _, _, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock); err == nil {
+			// Extent already exists at this position - idempotent skip
+			log.Printf("[Recovery] ExtentAdd: extent at file block %d already exists for inode %d, skipping",
+				p.FileBlock, p.InodeNum)
 			return false, nil
 		}
-		return false, fmt.Errorf("failed to add extent: %w", err)
-	}
 
-	// Write the modified inode back to disk (extent was added in-memory)
-	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
-		return false, fmt.Errorf("failed to write inode after extent add: %w", err)
-	}
-
-	log.Printf("[Recovery] ExtentAdd: added extent file=%d disk=%d len=%d to inode %d",
-		p.FileBlock, p.DiskBlock, p.Length, p.InodeNum)
-	return true, nil
+		// Add the extent using the extent manager's recovery-friendly method
+		// Note: Journal payload uses FileBlock/DiskBlock, extent uses LogicalBlock/PhysicalBlock
+		ext := &extent.Extent{
+			LogicalBlock:  p.FileBlock,
+			PhysicalBlock: p.DiskBlock,
+			Length:        uint64(p.Length),
+			Flags:         extent.FlagAllocated,
+		}
+		if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, ext); err != nil {
+			// Check for overlap (concurrent recovery may have added it)
+			if err == extent.ErrExtentOverlap {
+				log.Printf("[Recovery] ExtentAdd: extent overlaps, likely concurrent recovery, skipping")
+				return false, nil
+			}
+			return false, fmt.Errorf("failed to add extent: %w", err)
+		}
+		log.Printf("[Recovery] ExtentAdd: added extent file=%d disk=%d len=%d to inode %d",
+			p.FileBlock, p.DiskBlock, p.Length, p.InodeNum)
+		return true, nil
+	})
 }
 
 // applyExtentRemove removes an extent from an inode if present.
@@ -477,36 +467,52 @@ func applyExtentRemove(ctx context.Context, rctx *RecoveryContext, payload []byt
 		return false, err
 	}
 
-	// Read the inode
-	ino, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
-	if err != nil {
-		return false, fmt.Errorf("inode %d not found", p.InodeNum)
-	}
+	return updateExtents(ctx, rctx, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+		// Check if extent exists
+		if _, _, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock); err != nil {
+			// Extent doesn't exist - already removed, idempotent skip
+			log.Printf("[Recovery] ExtentRemove: extent at file block %d already removed from inode %d, skipping",
+				p.FileBlock, p.InodeNum)
+			return false, nil
+		}
 
-	// Check if extent exists
-	_, _, err = rctx.ExtentMgr.Lookup(ino, p.FileBlock)
-	if err != nil {
-		// Extent doesn't exist - already removed, idempotent skip
-		log.Printf("[Recovery] ExtentRemove: extent at file block %d already removed from inode %d, skipping",
-			p.FileBlock, p.InodeNum)
-		return false, nil
-	}
+		// Remove the extent using truncate to the file block position
+		// This removes extents from FileBlock onwards for Length blocks
+		// Note: Journal uses uint64 for FileBlock, but extent manager uses uint32
+		if err := rctx.ExtentMgr.RemoveExtentForRecovery(ctx, ino, uint32(p.FileBlock), p.Length); err != nil {
+			return false, fmt.Errorf("failed to remove extent: %w", err)
+		}
+		log.Printf("[Recovery] ExtentRemove: removed extent file=%d len=%d from inode %d",
+			p.FileBlock, p.Length, p.InodeNum)
+		return true, nil
+	})
+}
 
-	// Remove the extent using truncate to the file block position
-	// This removes extents from FileBlock onwards for Length blocks
-	// Note: Journal uses uint64 for FileBlock, but extent manager uses uint32
-	if err := rctx.ExtentMgr.RemoveExtentForRecovery(ctx, ino, uint32(p.FileBlock), p.Length); err != nil {
-		return false, fmt.Errorf("failed to remove extent: %w", err)
+// updateExtents reads an inode, applies change, and writes it back when change
+// reports an update, starting over if another node changed the inode's extent
+// tree in between.
+func updateExtents(ctx context.Context, rctx *RecoveryContext, inodeNum uint32, change func(*inode.Inode) (bool, error)) (bool, error) {
+	const attempts = 5
+	for attempt := 1; ; attempt++ {
+		ino, err := rctx.InodeTbl.Read(inodeNum)
+		if err != nil {
+			return false, fmt.Errorf("inode %d not found", inodeNum)
+		}
+		changed, err := change(ino)
+		if err != nil || !changed {
+			rctx.ExtentMgr.DiscardPending(ctx, ino)
+			return false, err
+		}
+		err = rctx.InodeTbl.Write(ctx, ino)
+		if err == nil {
+			return true, nil
+		}
+		rctx.ExtentMgr.DiscardPending(ctx, ino)
+		if !errors.Is(err, extent.ErrTreeConflict) || attempt == attempts {
+			return false, fmt.Errorf("failed to write inode %d after extent change: %w", inodeNum, err)
+		}
+		time.Sleep(time.Duration(attempt) * time.Millisecond)
 	}
-
-	// Write the modified inode back to disk (extent was removed in-memory)
-	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
-		return false, fmt.Errorf("failed to write inode after extent remove: %w", err)
-	}
-
-	log.Printf("[Recovery] ExtentRemove: removed extent file=%d len=%d from inode %d",
-		p.FileBlock, p.Length, p.InodeNum)
-	return true, nil
 }
 
 // CreateRecoveryHandler creates a node.RecoveryHandler that uses the given context.

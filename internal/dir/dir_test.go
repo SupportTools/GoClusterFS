@@ -2,6 +2,7 @@ package dir
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -49,11 +51,12 @@ func testSetup(t *testing.T) (context.Context, *Manager, *inode.Table, func()) {
 	// Pass nil for lockMgr for unit tests
 	inodeTbl := inode.NewTable(dev, 3*1024*1024, 100*inode.InodeSize, nil, nodeUUID)
 
-	// Create extent manager (nil lockMgr for unit tests)
-	extentMgr := extent.NewManager(dev, bm, nil)
-
 	// Data blocks start at 10MB (past all metadata regions)
 	dataOffset := uint64(10 * 1024 * 1024)
+
+	// Create extent manager (nil lockMgr for unit tests)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
 
 	// Create directory manager (nil lockMgr for unit tests)
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
@@ -641,8 +644,9 @@ func BenchmarkLookup(b *testing.B) {
 
 	bm := bitmap.NewRegion(dev, 2*1024*1024, 100, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, 3*1024*1024, 100*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil)
 	dataOffset := uint64(10 * 1024 * 1024)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
 	ctx := context.Background()
@@ -687,8 +691,9 @@ func BenchmarkAdd(b *testing.B) {
 
 	bm := bitmap.NewRegion(dev, 2*1024*1024, 1000, nil, nodeUUID) // More blocks for benchmark
 	inodeTbl := inode.NewTable(dev, 3*1024*1024, 100*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil)
 	dataOffset := uint64(10 * 1024 * 1024)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
 	ctx := context.Background()
@@ -703,5 +708,92 @@ func BenchmarkAdd(b *testing.B) {
 		b.StartTimer()
 
 		dirMgr.Add(ctx, dirIno, "testfile", uint64(100+i), DT_REG)
+	}
+}
+
+// TestDirectoryGrowsPastInlineExtentsUnderLocks adds directory blocks while the
+// directory's inode lock is held, so the extent tree block must come from the
+// reservation taken before the lock rather than from the bitmap.
+func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
+	tmpFile := filepath.Join(t.TempDir(), "locked.img")
+	if err := os.WriteFile(tmpFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(tmpFile, 200<<20); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := storage.Open(tmpFile)
+	if err != nil {
+		t.Fatalf("open device: %v", err)
+	}
+	defer dev.Close()
+
+	var nodeUUID [16]byte
+	copy(nodeUUID[:], "test-node-uuid00")
+	lockMgr := lock.NewManager(dev, 0, 1<<20, nodeUUID, 0)
+	bm := bitmap.NewRegion(dev, 2<<20, 100, lockMgr, nodeUUID)
+	inodeTbl := inode.NewTable(dev, 3<<20, 100*inode.InodeSize, lockMgr, nodeUUID)
+	dataOffset := uint64(10 << 20)
+	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
+	dirMgr := NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
+
+	ctx := context.Background()
+	num, err := inodeTbl.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno, err := inodeTbl.ClaimSlot(ctx, num)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno.Mode = inode.S_IFDIR | 0o755
+	if err := dirMgr.InitDirectory(ctx, dirIno, uint64(inode.InodeRoot)); err != nil {
+		t.Fatalf("InitDirectory: %v", err)
+	}
+
+	const blocks = 6
+	var stale *inode.Inode
+	for i := 0; i < blocks; i++ {
+		if i == 3 {
+			if stale, err = inodeTbl.Read(dirIno.InodeNum); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Take the next free block so directory blocks are never contiguous.
+		if _, err := extentMgr.AllocatePhysicalBlock(ctx); err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := inodeTbl.Read(dirIno.InodeNum)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := fmt.Sprintf("entry-%d", i)
+		entry := &DirEntry{InodeNum: uint64(50 + i), NameLen: uint8(len(name)), FileType: DT_REG, Name: name}
+		entry.RecLen = entrySize(entry)
+		if err := dirMgr.addToNewBlock(ctx, fresh, entry); err != nil {
+			t.Fatalf("addToNewBlock %d: %v", i, err)
+		}
+	}
+
+	fresh, err := inodeTbl.Read(dirIno.InodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A copy read before the last commits points at rewritten tree nodes; a
+	// manager with an empty cache has to fall back to the current inode.
+	remounted := NewManager(dev, inodeTbl, extent.NewManager(dev, bm, lockMgr, dataOffset), lockMgr, dataOffset)
+	if num, _, err := remounted.Lookup(ctx, stale, "entry-5"); err != nil || num != 55 {
+		t.Fatalf("lookup through a stale directory inode: inode %d, %v", num, err)
+	}
+	if !fresh.HasExtentTree() || fresh.ExtentCount != blocks+1 {
+		t.Fatalf("directory should use an extent tree with %d extents, got tree=%v count=%d",
+			blocks+1, fresh.HasExtentTree(), fresh.ExtentCount)
+	}
+	for i := 0; i < blocks; i++ {
+		num, _, err := dirMgr.Lookup(ctx, fresh, fmt.Sprintf("entry-%d", i))
+		if err != nil || num != uint64(50+i) {
+			t.Fatalf("lookup entry-%d: inode %d, %v", i, num, err)
+		}
 	}
 }

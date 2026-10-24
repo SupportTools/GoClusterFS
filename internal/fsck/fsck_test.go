@@ -2,13 +2,18 @@ package fsck_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -497,5 +502,107 @@ func TestFsckResultIsClean(t *testing.T) {
 
 	if result.IsClean() {
 		t.Error("result with problems should not be clean")
+	}
+}
+
+// extentProblems runs fsck and returns extent-phase problems of Error severity or worse.
+func extentProblems(dev *storage.Device) []fsck.Problem {
+	result := fsck.New(dev, fsck.DefaultOptions()).Check()
+	var out []fsck.Problem
+	for _, p := range result.Problems {
+		if p.Phase == fsck.PhaseExtents && p.Severity >= fsck.Error {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func TestFsckExtentTree(t *testing.T) {
+	const (
+		totalBlocks = 29
+		dataOffset  = 11 * 1024 * 1024
+	)
+	dev, cleanup := testDevice(t, 40)
+	defer cleanup()
+	writeSuperblock(t, dev, totalBlocks)
+	initRootInode(t, dev)
+
+	var uuid [16]byte
+	ctx := context.Background()
+	bm := bitmap.NewRegion(dev, 1*1024*1024, totalBlocks, nil, uuid)
+	tbl := inode.NewTable(dev, 2*1024*1024, 4096*inode.InodeSize, nil, uuid)
+	mgr := extent.NewManager(dev, bm, nil, dataOffset)
+	tbl.SetTreeFlusher(mgr)
+
+	newFile := func() *inode.Inode {
+		num, err := tbl.FindFreeSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino, err := tbl.ClaimSlot(ctx, num)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino.Mode = inode.S_IFREG | 0o644
+		return ino
+	}
+
+	// Two files appended alternately end up with one extent per block.
+	a, b := newFile(), newFile()
+	for blk := uint64(0); blk < 6; blk++ {
+		for _, ino := range []*inode.Inode{a, b} {
+			if _, err := mgr.AllocateBlocks(ctx, ino, blk, 1); err != nil {
+				t.Fatalf("allocate: %v", err)
+			}
+		}
+	}
+	for _, ino := range []*inode.Inode{a, b} {
+		ino.Size = 6 * extent.BlockSize
+		if err := tbl.Write(ctx, ino); err != nil {
+			t.Fatalf("write inode: %v", err)
+		}
+		if !ino.HasExtentTree() {
+			t.Fatalf("inode %d should use an extent tree", ino.InodeNum)
+		}
+	}
+
+	if problems := extentProblems(dev); len(problems) != 0 {
+		t.Fatalf("valid extent trees reported as broken: %v", problems)
+	}
+
+	off := extent.TreeNodeOffset(dataOffset, a.ExtentTreeRoot, a.ExtentTreeGen)
+	buf := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := dev.ReadAt(buf.Bytes(), off); err != nil {
+		t.Fatal(err)
+	}
+	buf.Bytes()[64+8] ^= 0xFF // first extent's physical block
+	if _, err := dev.WriteAt(buf.Bytes(), off); err != nil {
+		t.Fatal(err)
+	}
+
+	problems := extentProblems(dev)
+	found := false
+	for _, p := range problems {
+		found = found || strings.Contains(p.Message, "extent tree")
+	}
+	if !found {
+		t.Fatalf("corrupted tree node not reported; extent problems: %v", problems)
+	}
+
+	// A shared data extent may point at another inode's data, never at its tree node.
+	thief := newFile()
+	thief.InlineExtents[0] = inode.InlineExtent{
+		PhysicalBlock: b.ExtentTreeRoot, Length: 1, Flags: uint32(extent.FlagAllocated | extent.FlagShared),
+	}
+	thief.ExtentCount = 1
+	if err := tbl.Write(ctx, thief); err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, p := range extentProblems(dev) {
+		found = found || p.Severity == fsck.Critical && strings.Contains(p.Message, "is an extent tree node of inode")
+	}
+	if !found {
+		t.Fatal("data extent pointing at another inode's tree node not reported")
 	}
 }

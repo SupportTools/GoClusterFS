@@ -468,7 +468,10 @@ func (w *Worker) recoverCreateJob(ctx context.Context, snap *Descriptor) error {
 	}
 
 	// Collect all block numbers from the inode
-	blockNums := w.collectBlockNumbers(ino)
+	blockNums, err := w.extentMgr.DataBlocks(ino)
+	if err != nil {
+		return fmt.Errorf("failed to list blocks of inode %d: %w", snap.TargetInode, err)
+	}
 
 	// Re-queue the create job
 	// Note: This may result in some blocks being incremented twice if crash
@@ -488,31 +491,6 @@ func (w *Worker) recoverDeleteJob(ctx context.Context, snap *Descriptor) error {
 	// already decremented or will be off by 1 (leak) which is acceptable
 	// for crash recovery.
 	return w.registry.Remove(ctx, snap.SnapshotID)
-}
-
-// collectBlockNumbers extracts all physical block numbers from an inode.
-func (w *Worker) collectBlockNumbers(ino *inode.Inode) []uint64 {
-	var blocks []uint64
-
-	// Collect from inline extents
-	for i := 0; i < inode.MaxInlineExtents; i++ {
-		ext := &ino.InlineExtents[i]
-		if ext.Length > 0 {
-			// Add all blocks in this extent
-			for j := uint64(0); j < ext.Length; j++ {
-				blocks = append(blocks, ext.PhysicalBlock+j)
-			}
-		}
-	}
-
-	// TODO: If ExtentTreeRoot is set, traverse the overflow tree
-	// For now, inline extents only (most files)
-	if ino.Flags&inode.FlagHasExtentTree != 0 {
-		log.Printf("[snapshot/worker] Warning: inode %d has extent tree, not fully processed",
-			ino.InodeNum)
-	}
-
-	return blocks
 }
 
 // PendingJobs returns the number of jobs waiting in the queue.

@@ -83,7 +83,7 @@ func setupTestComponents(t *testing.T, dev *storage.Device) (*Registry, *refcoun
 	}
 
 	// Create extent manager (bitmap can be nil for tests not needing allocation)
-	extMgr := extent.NewManager(dev, nil, nil)
+	extMgr := extent.NewManager(dev, nil, nil, 0)
 
 	// Create inode table
 	var nodeUUID [16]byte
@@ -307,49 +307,6 @@ func TestWorkerEmptyBlockList(t *testing.T) {
 	}
 	if updatedDesc.State != StateActive {
 		t.Errorf("Snapshot state = %v, want StateActive", updatedDesc.State)
-	}
-}
-
-func TestCollectBlockNumbers(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	_, _, _, inodeTbl := setupTestComponents(t, dev)
-
-	// Create an inode with some extents
-	ino := &inode.Inode{
-		Magic:    inode.InodeMagic,
-		InodeNum: 100,
-		Mode:     inode.S_IFREG | 0644,
-	}
-
-	// Set up inline extents
-	ino.InlineExtents[0] = inode.InlineExtent{
-		LogicalBlock:  0,
-		PhysicalBlock: 10,
-		Length:        3,
-	}
-	ino.InlineExtents[1] = inode.InlineExtent{
-		LogicalBlock:  3,
-		PhysicalBlock: 20,
-		Length:        2,
-	}
-
-	// Test worker's collectBlockNumbers
-	worker := &Worker{
-		inodeTable: inodeTbl,
-	}
-	blocks := worker.collectBlockNumbers(ino)
-
-	expected := []uint64{10, 11, 12, 20, 21}
-	if len(blocks) != len(expected) {
-		t.Fatalf("Got %d blocks, want %d", len(blocks), len(expected))
-	}
-
-	for i, block := range blocks {
-		if block != expected[i] {
-			t.Errorf("Block[%d] = %d, want %d", i, block, expected[i])
-		}
 	}
 }
 
