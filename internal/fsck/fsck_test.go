@@ -588,4 +588,21 @@ func TestFsckExtentTree(t *testing.T) {
 	if !found {
 		t.Fatalf("corrupted tree node not reported; extent problems: %v", problems)
 	}
+
+	// A shared data extent may point at another inode's data, never at its tree node.
+	thief := newFile()
+	thief.InlineExtents[0] = inode.InlineExtent{
+		PhysicalBlock: b.ExtentTreeRoot, Length: 1, Flags: uint32(extent.FlagAllocated | extent.FlagShared),
+	}
+	thief.ExtentCount = 1
+	if err := tbl.Write(ctx, thief); err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, p := range extentProblems(dev) {
+		found = found || p.Severity == fsck.Critical && strings.Contains(p.Message, "is an extent tree node of inode")
+	}
+	if !found {
+		t.Fatal("data extent pointing at another inode's tree node not reported")
+	}
 }

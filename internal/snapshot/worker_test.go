@@ -310,52 +310,6 @@ func TestWorkerEmptyBlockList(t *testing.T) {
 	}
 }
 
-func TestCollectBlockNumbers(t *testing.T) {
-	dev, _, cleanup := setupTestDevice(t)
-	defer cleanup()
-
-	_, _, _, inodeTbl := setupTestComponents(t, dev)
-
-	// Create an inode with some extents
-	ino := &inode.Inode{
-		Magic:    inode.InodeMagic,
-		InodeNum: 100,
-		Mode:     inode.S_IFREG | 0644,
-	}
-
-	// Set up inline extents
-	ino.InlineExtents[0] = inode.InlineExtent{
-		LogicalBlock:  0,
-		PhysicalBlock: 10,
-		Length:        3,
-	}
-	ino.InlineExtents[1] = inode.InlineExtent{
-		LogicalBlock:  3,
-		PhysicalBlock: 20,
-		Length:        2,
-	}
-
-	worker := &Worker{
-		inodeTable: inodeTbl,
-		extentMgr:  extent.NewManager(nil, nil, nil, 0),
-	}
-	blocks, err := worker.extentMgr.DataBlocks(ino)
-	if err != nil {
-		t.Fatalf("DataBlocks failed: %v", err)
-	}
-
-	expected := []uint64{10, 11, 12, 20, 21}
-	if len(blocks) != len(expected) {
-		t.Fatalf("Got %d blocks, want %d", len(blocks), len(expected))
-	}
-
-	for i, block := range blocks {
-		if block != expected[i] {
-			t.Errorf("Block[%d] = %d, want %d", i, block, expected[i])
-		}
-	}
-}
-
 func TestWorkerPendingJobs(t *testing.T) {
 	dev, _, cleanup := setupTestDevice(t)
 	defer cleanup()

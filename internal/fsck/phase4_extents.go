@@ -34,6 +34,20 @@ func (c *Checker) checkExtents() error {
 	orphanedBlocks := uint64(0)
 	overlappingBlocks := 0
 
+	// Tree nodes are never shared, not even with FlagShared data extents.
+	treeNodeOwner := make(map[uint64]uint32)
+	for inodeNum, tree := range c.extentTrees {
+		for _, block := range tree.nodes {
+			if other, taken := treeNodeOwner[block]; taken && other != inodeNum {
+				c.addProblem(PhaseExtents, Critical, fmt.Sprintf("tree node %d", block),
+					fmt.Sprintf("extent tree node used by inodes %d and %d", other, inodeNum),
+					false)
+				overlappingBlocks++
+			}
+			treeNodeOwner[block] = inodeNum
+		}
+	}
+
 	// Re-scan inodes to check their extents in detail
 	// (inodeBlocks already collected block references in Phase 3)
 	inodeTableOffset := sb.InodeTableOffset
@@ -99,6 +113,14 @@ func (c *Checker) checkExtents() error {
 						orphanedBlocks++
 					}
 
+					if nodeOwner, isNode := treeNodeOwner[physBlock]; isNode {
+						c.addProblem(PhaseExtents, Critical, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
+							fmt.Sprintf("physical block %d is an extent tree node of inode %d", physBlock, nodeOwner),
+							false)
+						overlappingBlocks++
+						continue
+					}
+
 					// Check for overlapping ownership
 					if owner, exists := blockOwner[physBlock]; exists {
 						// Block is shared - check if both have FlagShared
@@ -143,14 +165,6 @@ func (c *Checker) checkExtents() error {
 							"extent tree node block not marked allocated in bitmap",
 							true)
 						extentErrors++
-					}
-					if owner, exists := blockOwner[block]; exists {
-						c.addProblem(PhaseExtents, Critical, location,
-							fmt.Sprintf("extent tree node block also claimed by inode %d", owner),
-							false)
-						overlappingBlocks++
-					} else {
-						blockOwner[block] = inodeNum
 					}
 				}
 			}

@@ -150,3 +150,38 @@ func TestWriteBeyondTwoExtents(t *testing.T) {
 	verify(fsys)
 	verify(openTreeFS(t, path))
 }
+
+// updateInode redoes an update whose write lost to another node's tree change,
+// so neither change is lost.
+func TestUpdateInodeRetriesTreeConflict(t *testing.T) {
+	fsys := openTreeFS(t, newTreeFSImage(t))
+	if err := fsys.InitRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f := newRegularFile(t, fsys)
+	for blk := int64(0); blk < 3; blk++ {
+		writeAt(t, f, pattern(byte(blk+1), 4096), blk*2*BlockSize)
+	}
+
+	ctx := context.Background()
+	attempts := 0
+	updated, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error {
+		attempts++
+		if attempts == 1 {
+			// Another node commits a tree change between this read and this write.
+			writeAt(t, f, pattern(9, 4096), 20*BlockSize)
+		}
+		ino.Mtime = 12345
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("updateInode: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("update ran %d times, want 2", attempts)
+	}
+	if updated.Mtime != 12345 {
+		t.Fatalf("Mtime = %d, want 12345", updated.Mtime)
+	}
+	checkAt(t, f, pattern(9, 4096), 20*BlockSize)
+}

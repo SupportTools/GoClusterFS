@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -52,7 +53,7 @@ var (
 	ErrExtentTreeFull = errors.New("extent tree full")
 	ErrCorruptTree    = errors.New("corrupt extent tree node")
 	ErrStaleTree      = errors.New("extent tree changed since the inode was read")
-	ErrTreeConflict   = errors.New("extent tree changed concurrently")
+	ErrTreeConflict   = inode.ErrTreeConflict
 )
 
 // TreeNode is one decoded generation of an extent tree node.

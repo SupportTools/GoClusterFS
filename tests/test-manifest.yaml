@@ -557,8 +557,8 @@ scenarios:
     name: Truncate fragmented file
     description: Truncating a file with an extent tree keeps the head intact and returns freed blocks to statfs
     priority: high
-    # Docker/VM TODO: truncation is node-local, the Go test checks data and statfs,
-    # and test_truncate_file already covers truncate across nodes.
+    # Docker/VM TODO: truncation is node-local and the Go test checks the data, the
+    # freed tree block, and statfs; a multi-node version would add no new code path.
     environments:
       go: extent_tree_test.go::TestExtentTreeTruncate
       docker: TODO
@@ -601,6 +601,14 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/extent_tree_test.go::TestWriteBeyondTwoExtents
+
+  - id: extent-tree-directory
+    name: Directory grows past inline extents
+    description: A directory gaining a fourth non-contiguous block moves to an extent tree while its inode lock is held, using tree blocks reserved before the lock
+    priority: go_only
+    # Docker/VM: a directory needs over 3MB of entries to reach 3 blocks, too slow for those suites.
+    environments:
+      go: internal/dir/dir_test.go::TestDirectoryGrowsPastInlineExtentsUnderLocks
 
   - id: extent-tree-fsck
     name: fsck validates extent trees

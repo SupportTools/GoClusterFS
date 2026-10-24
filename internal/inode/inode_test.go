@@ -951,37 +951,37 @@ func TestTreeCommitIsSyncedBeforeRelease(t *testing.T) {
 }
 
 // A copy with no extent edits must not wipe or roll back the tree on disk.
-func TestStaleCopyKeepsOnDiskExtentTree(t *testing.T) {
+func TestStaleCopyCannotReplaceExtentTree(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	var uuid [16]byte
 	tbl := NewTable(dev, 0, 16*InodeSize, nil, uuid)
 	ctx := context.Background()
 
-	stale := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1}
-	stale.InlineExtents[0] = InlineExtent{LogicalBlock: 0, PhysicalBlock: 9, Length: 1, Flags: 1}
-	if err := tbl.Write(ctx, stale); err != nil {
+	inline := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1}
+	inline.InlineExtents[0] = InlineExtent{LogicalBlock: 0, PhysicalBlock: 9, Length: 1, Flags: 1}
+	if err := tbl.Write(ctx, inline); err != nil {
 		t.Fatal(err)
 	}
-
-	tree := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1, Flags: FlagHasExtentTree,
+	oldTree := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1, Flags: FlagHasExtentTree,
 		ExtentTreeRoot: 40, ExtentTreeGen: 7, ExtentDepth: 1, ExtentCount: 3}
-	if err := tbl.writeInodeUnlocked(tree); err != nil {
+	newTree := *oldTree
+	newTree.ExtentTreeGen = 8
+	if err := tbl.writeInodeUnlocked(&newTree); err != nil {
 		t.Fatal(err)
 	}
 
-	stale.Size = 4096
-	if err := tbl.Write(ctx, stale); err != nil {
-		t.Fatal(err)
+	for name, stale := range map[string]*Inode{"inline copy": inline, "older tree": oldTree} {
+		stale.Size = 4096
+		if err := tbl.Write(ctx, stale); !errors.Is(err, ErrTreeConflict) {
+			t.Fatalf("%s: got %v, want ErrTreeConflict", name, err)
+		}
 	}
 	got, err := tbl.Read(6)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.HasExtentTree() || got.ExtentTreeRoot != 40 || got.ExtentTreeGen != 7 || got.InlineExtents != [MaxInlineExtents]InlineExtent{} {
-		t.Fatalf("stale inline copy replaced the on-disk tree: %+v", got)
-	}
-	if got.Size != 4096 {
-		t.Fatalf("Size = %d, want the stale writer's 4096", got.Size)
+	if got.ExtentTreeGen != 8 || got.Size != 0 {
+		t.Fatalf("a rejected write changed the inode: %+v", got)
 	}
 }

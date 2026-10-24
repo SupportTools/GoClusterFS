@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
@@ -764,8 +765,8 @@ func TestDiscardPendingFreesNewTreeBlocks(t *testing.T) {
 	}
 }
 
-// Writing a stale copy that has no extent edits must keep the tree on disk.
-func TestStaleInodeWriteKeepsOnDiskTree(t *testing.T) {
+// Writing a stale copy that has no extent edits must not roll back the tree.
+func TestStaleInodeWriteIsRejected(t *testing.T) {
 	env := newTreeEnv(t, 0)
 	ino := env.newInode()
 	env.insertScattered(ino, 3)
@@ -777,14 +778,34 @@ func TestStaleInodeWriteKeepsOnDiskTree(t *testing.T) {
 		env.write(ino)
 	}
 	stale.Size = 12345
-	env.write(stale)
+	if err := env.tbl.Write(env.ctx, stale); !errors.Is(err, ErrTreeConflict) {
+		t.Fatalf("stale write: got %v, want ErrTreeConflict", err)
+	}
 
 	env.remount(0)
 	got := env.reread(ino)
-	if got.Size != 12345 {
-		t.Fatalf("Size = %d, want the stale writer's 12345", got.Size)
+	if got.Size == 12345 {
+		t.Fatal("the rejected stale write must not change the inode")
 	}
 	env.checkScatteredWith(got, 3, 5)
+}
+
+func TestDataBlocks(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	env.insert(ino, Extent{0, 10, 3, FlagAllocated})
+	sfb := Extent{LogicalBlock: 3, Length: 1}
+	sfb.SetSFBLocation(2, 5)
+	env.insert(ino, sfb)
+	env.insert(ino, Extent{8, 20, 2, FlagAllocated})
+
+	got, err := env.mgr.DataBlocks(ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint64{10, 11, 12, 20, 21}; !slices.Equal(got, want) {
+		t.Fatalf("DataBlocks = %v, want %v (SFB extents skipped)", got, want)
+	}
 }
 
 // A spill that started from inline extents conflicts when another node changed

@@ -274,6 +274,9 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 				if lockHeld {
 					m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
 				}
+				if errors.Is(err, extent.ErrTreeConflict) {
+					return errRetryAdd
+				}
 				return fmt.Errorf("failed to write directory inode: %w", err)
 			}
 			if lockHeld {
@@ -752,6 +755,9 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 			// Increment MetaGeneration and write inode.
 			freshIno.MetaGeneration++
 			if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
+				if errors.Is(err, extent.ErrTreeConflict) {
+					return errRetryAdd
+				}
 				return fmt.Errorf("failed to write directory inode: %w", err)
 			}
 			// The defer will free the block we allocated since blockUsed is false.

@@ -14,7 +14,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"syscall"
 
@@ -76,6 +75,7 @@ var (
 	ErrInodeNotInUse    = errors.New("inode not in use")
 	ErrChecksumMismatch = errors.New("inode checksum mismatch")
 	ErrNoTreeFlusher    = errors.New("inode has pending extent tree changes but no tree flusher is set")
+	ErrTreeConflict     = errors.New("extent tree changed concurrently")
 )
 
 // TreeFlusher writes an inode's pending extent-tree changes before the inode
@@ -276,14 +276,6 @@ func (t *Table) writeWithTree(inode *Inode) (func(), error) {
 func sameExtentTree(a, b *Inode) bool {
 	return a.HasExtentTree() == b.HasExtentTree() && a.ExtentTreeRoot == b.ExtentTreeRoot &&
 		a.ExtentTreeGen == b.ExtentTreeGen && a.ExtentDepth == b.ExtentDepth
-}
-
-func copyExtentMap(dst, src *Inode) {
-	dst.Flags = dst.Flags&^FlagHasExtentTree | src.Flags&FlagHasExtentTree
-	dst.InlineExtents = src.InlineExtents
-	dst.ExtentTreeRoot, dst.ExtentTreeGen, dst.ExtentDepth = src.ExtentTreeRoot, src.ExtentTreeGen, src.ExtentDepth
-	dst.ExtentCount = src.ExtentCount
-	dst.AllocatedBlocks, dst.WrittenBlocks = src.AllocatedBlocks, src.WrittenBlocks
 }
 
 // FindFreeSlot scans for a free inode slot without acquiring any distributed locks.
@@ -504,11 +496,11 @@ func (t *Table) writeInodeUnlocked(inode *Inode) error {
 	return t.writeInodeSector(inode, false)
 }
 
-// writeInodeSector writes an inode into its sector. With keepTree, a copy that
-// disagrees with the stored inode about the extent tree takes the stored extent
-// map instead of rolling the tree back or wiping it; that copy has no extent
-// edits, and the tree it read may already be rewritten or freed.
-func (t *Table) writeInodeSector(inode *Inode, keepTree bool) error {
+// writeInodeSector writes an inode into its sector. With checkTree, a copy
+// whose extent tree differs from the stored one fails with ErrTreeConflict:
+// it has no extent edits, so writing it would roll back or wipe a tree that
+// another node committed, and the tree it read may already be freed.
+func (t *Table) writeInodeSector(inode *Inode, checkTree bool) error {
 	// Calculate sector containing this inode
 	sectorIdx := uint64(inode.InodeNum) / InodesPerSector
 	inodeOffset := uint64(inode.InodeNum) % InodesPerSector
@@ -531,11 +523,10 @@ func (t *Table) writeInodeSector(inode *Inode, keepTree bool) error {
 	}
 
 	start := inodeOffset * InodeSize
-	if keepTree {
+	if checkTree {
 		onDisk, err := deserializeInode(buf.Bytes()[start : start+InodeSize])
 		if err == nil && (inode.HasExtentTree() || onDisk.HasExtentTree()) && !sameExtentTree(inode, onDisk) {
-			log.Printf("[inode] inode %d: extent tree changed since read; keeping the on-disk extent map", inode.InodeNum)
-			copyExtentMap(inode, onDisk)
+			return fmt.Errorf("%w: inode %d", ErrTreeConflict, inode.InodeNum)
 		}
 	}
 
