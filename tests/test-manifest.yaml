@@ -1533,7 +1533,7 @@ scenarios:
 
   - id: snapshot-registry-concurrent-creates
     name: Registry creates from two nodes at once
-    description: Two registries with their own lock managers create snapshots concurrently; none share a slot or ID
+    description: Two registries create snapshots concurrently with no lock between them; node slots keep every slot and ID apart
     priority: go_only
     environments:
       go: internal/snapshot/snapshot_test.go::TestRegistryConcurrentCreatesAcrossNodes

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -230,8 +231,19 @@ type Registry struct {
 	size            uint64        // Region size in bytes
 	maxDescriptors  uint64        // Maximum number of descriptors
 	lockMgr         *lock.Manager // For distributed locking (optional)
+	nodeSlot        int           // This node's slot in the node registry
 	nextID          uint64        // Next available snapshot ID (cached)
 	descriptorCount uint64        // Active descriptor count (cached)
+}
+
+// SetNodeSlot tells the registry which node slot this mount holds. New IDs
+// end in the slot and each node fills its own sectors first, so two nodes
+// never create the same ID or write the same sector at once, even if the
+// registry lock fails to exclude them.
+func (r *Registry) SetNodeSlot(slot int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nodeSlot = slot % node.MaxNodes
 }
 
 // NewRegistry creates a new snapshot registry manager.
@@ -289,7 +301,8 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 	if err != nil {
 		return nil, err
 	}
-	snapshotID := max(r.nextID, maxID+1)
+	base := max(maxID, r.nextID-1)
+	snapshotID := (base/node.MaxNodes+1)*node.MaxNodes + uint64(r.nodeSlot)
 	r.nextID = snapshotID + 1
 
 	if dataInode != 0 {
@@ -680,11 +693,12 @@ type ScanStats struct {
 	TotalBlocks   uint64 // Total blocks referenced by all snapshots
 }
 
-// freeSlotAndMaxID returns the first free slot and the highest snapshot ID on
-// disk, which includes snapshots other nodes created since this node's scan.
-// Unreadable slots count as free, as they did before.
+// freeSlotAndMaxID returns a free slot, preferring sectors this node owns, and
+// the highest snapshot ID on disk, which includes snapshots other nodes
+// created since this node's scan. Unreadable slots count as free, as they did
+// before.
 func (r *Registry) freeSlotAndMaxID() (uint64, uint64, error) {
-	free := r.maxDescriptors
+	free, owned := r.maxDescriptors, r.maxDescriptors
 	var maxID uint64
 	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
 		data, readErr := r.readSector(sector)
@@ -696,10 +710,16 @@ func (r *Registry) freeSlotAndMaxID() (uint64, uint64, error) {
 			desc, err := decodeDescriptor(data, i)
 			if readErr != nil || err != nil || desc.IsFree() {
 				free = min(free, slot)
+				if sector%node.MaxNodes == uint64(r.nodeSlot) {
+					owned = min(owned, slot)
+				}
 				continue
 			}
 			maxID = max(maxID, desc.SnapshotID)
 		}
+	}
+	if owned < r.maxDescriptors {
+		return owned, maxID, nil
 	}
 	if free == r.maxDescriptors {
 		return 0, 0, ErrSnapshotFull

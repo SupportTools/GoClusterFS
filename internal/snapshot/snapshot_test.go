@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -863,7 +862,8 @@ func TestRegistryIDsUniqueAcrossNodes(t *testing.T) {
 
 	nodeA := NewRegistry(dev, 0, 10*SectorSize, nil)
 	nodeB := NewRegistry(dev, 0, 10*SectorSize, nil)
-	for _, r := range []*Registry{nodeA, nodeB} {
+	for slot, r := range []*Registry{nodeA, nodeB} {
+		r.SetNodeSlot(slot)
 		if _, err := r.Scan(ctx); err != nil {
 			t.Fatal(err)
 		}
@@ -917,8 +917,9 @@ func TestRegistryActivateRequiresCreating(t *testing.T) {
 	}
 }
 
-// Two nodes, each with its own lock manager on the shared lock region, create
-// snapshots at the same time. Every snapshot must keep its own slot and ID.
+// Two nodes create snapshots at the same time with no lock between them, as
+// when the distributed lock fails to exclude them. Node slots alone must keep
+// every snapshot in its own slot with its own ID.
 func TestRegistryConcurrentCreatesAcrossNodes(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 4<<20)
 	defer cleanup()
@@ -927,10 +928,8 @@ func TestRegistryConcurrentCreatesAcrossNodes(t *testing.T) {
 
 	var nodes []*Registry
 	for slot := range 2 {
-		var nodeUUID [16]byte
-		nodeUUID[0] = byte(slot + 1)
-		locks := lock.NewManager(dev, 1<<20, 1<<20, nodeUUID, slot)
-		r := NewRegistry(dev, 0, 10*SectorSize, locks)
+		r := NewRegistry(dev, 0, 10*SectorSize, nil)
+		r.SetNodeSlot(slot)
 		if _, err := r.Scan(ctx); err != nil {
 			t.Fatal(err)
 		}

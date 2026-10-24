@@ -61,7 +61,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, nil)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, snapFSDataOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, nodeUUID, snapFSDataOffset)
-	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, nil); err != nil {
+	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, nil, 0); err != nil {
 		t.Fatalf("InitSnapshots: %v", err)
 	}
 	t.Cleanup(fsys.snapshotWkr.Stop)

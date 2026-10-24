@@ -233,17 +233,19 @@ func NewWithComponents(
 // Parameters:
 //   - snapshotOffset: byte offset where snapshot region starts on device
 //   - snapshotSize: size of snapshot region in bytes
-//   - lockMgr: serializes registry changes across nodes, so two nodes never
-//     take the same descriptor slot or snapshot ID (nil for single-node use)
+//   - lockMgr: serializes registry changes across nodes (nil for single-node use)
+//   - nodeSlot: this mount's node registry slot, which keeps snapshot IDs and
+//     descriptor sectors apart from other nodes' even without the lock
 //
 // This must be called before any snapshot operations can succeed.
-func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uint64, lockMgr *lock.Manager) error {
+func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uint64, lockMgr *lock.Manager, nodeSlot int) error {
 	if f.refcountReg == nil {
 		return fmt.Errorf("refcount region must be initialized before snapshots")
 	}
 
 	// Create snapshot registry
 	f.snapshotReg = snapshot.NewRegistry(f.dev, snapshotOffset, snapshotSize, lockMgr)
+	f.snapshotReg.SetNodeSlot(nodeSlot)
 
 	// Scan registry to rebuild state
 	stats, err := f.snapshotReg.Scan(ctx)
