@@ -1126,6 +1126,13 @@ scenarios:
     environments:
       go: internal/bitmap/trim_test.go::TestTrimDiscardHoldsNoBitmapLock
 
+  - id: trim-release-after-slow-discard
+    name: TRIM frees reserved blocks after a slow discard
+    description: Reserved blocks are freed even when the flush context ran out during the discard and another node holds the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimReleasesReservationAfterSlowDiscard
+
   - id: trim-duplicate-block
     name: TRIM duplicate block
     description: A block queued twice is discarded once

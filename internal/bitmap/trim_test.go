@@ -222,3 +222,44 @@ func TestTrimDiscardHoldsNoBitmapLock(t *testing.T) {
 		t.Errorf("block %d after discard: IsFree = %v, %v; want free again", blocks[0], free, err)
 	}
 }
+
+// TestTrimReleasesReservationAfterSlowDiscard checks that the reserved blocks are
+// freed even when the flush's context ran out during the discard and another
+// node holds the bitmap lock at that moment.
+func TestTrimReleasesReservationAfterSlowDiscard(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	lockA := lock.NewManager(dev, 1<<20, 1<<20, [16]byte{1}, 0)
+	lockB := lock.NewManager(dev, 1<<20, 1<<20, [16]byte{2}, 1)
+	a := NewRegion(dev, 0, 1000, lockA, [16]byte{1})
+	bg := context.Background()
+
+	blocks, err := a.Alloc(bg, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Free(bg, blocks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(bg, 100*time.Millisecond)
+	defer cancel()
+	err = a.withFreeBlocks(ctx, blocks, func([]uint64) {
+		if err := lockB.Acquire(bg, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+			t.Errorf("node B lock: %v", err)
+			return
+		}
+		<-ctx.Done()
+		go func() {
+			time.Sleep(time.Second)
+			_ = lockB.Release(lock.LockTypeBlockBitmap, 0)
+		}()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if free, err := a.IsFree(blocks[0]); err != nil || !free {
+		t.Errorf("block %d after a discard that outlasted the context: IsFree = %v, %v; want free", blocks[0], free, err)
+	}
+}

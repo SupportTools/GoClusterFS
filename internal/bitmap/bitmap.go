@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"log"
 	"math/bits"
+	"slices"
 	"sync"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -288,23 +290,35 @@ func (r *Region) SetTrimManager(tm TrimQueuer) {
 func (r *Region) withFreeBlocks(ctx context.Context, blocks []uint64, discard func(free []uint64)) error {
 	reserved, err := r.flipBits(ctx, blocks, true)
 	if err != nil {
-		if len(reserved) > 0 {
-			if _, rerr := r.flipBits(ctx, reserved, false); rerr != nil {
-				err = errors.Join(err, fmt.Errorf("blocks %v stay allocated: %w", reserved, rerr))
-			}
-		}
+		r.releaseReserved(ctx, reserved)
 		return err
 	}
-	if len(reserved) == 0 {
-		return nil
-	}
-
-	discard(reserved)
-
-	if _, err := r.flipBits(ctx, reserved, false); err != nil {
-		return fmt.Errorf("blocks %v stay allocated after discard: %w", reserved, err)
+	if len(reserved) > 0 {
+		discard(reserved)
+		r.releaseReserved(ctx, reserved)
 	}
 	return nil
+}
+
+// releaseTimeout bounds each attempt to take the bitmap lock when freeing reserved blocks.
+const releaseTimeout = 30 * time.Second
+
+// releaseReserved frees blocks reserved for a discard. ctx may have run out
+// during a slow discard, and fsck cannot repair a leaked reservation, so it
+// retries until every block is free. Nothing else references these blocks.
+func (r *Region) releaseReserved(ctx context.Context, blocks []uint64) {
+	ctx = context.WithoutCancel(ctx)
+	for attempt := 1; len(blocks) > 0; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, releaseTimeout)
+		freed, err := r.flipBits(attemptCtx, blocks, false)
+		cancel()
+		blocks = slices.DeleteFunc(blocks, func(b uint64) bool { return slices.Contains(freed, b) })
+		if err == nil {
+			return
+		}
+		log.Printf("[WARN] bitmap: freeing %d blocks reserved for TRIM failed (attempt %d), retrying: %v", len(blocks), attempt, err)
+		time.Sleep(time.Second)
+	}
 }
 
 // flipBits marks each block allocated (or free) whose bit says otherwise, under
