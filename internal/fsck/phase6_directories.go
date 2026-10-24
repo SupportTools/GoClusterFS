@@ -148,8 +148,8 @@ func (c *Checker) checkDirectories() error {
 
 	// Check for orphaned inodes (in use but not referenced by any directory)
 	for inodeNum := range c.inodeUsed {
-		if inodeNum == InodeRoot {
-			continue // Root directory is special
+		if inodeNum == InodeRoot || c.snapshotData[inodeNum] {
+			continue
 		}
 		if c.dirEntryRefs[inodeNum] == 0 {
 			orphanedInodes++

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/bits"
 	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -57,7 +58,6 @@ type Region struct {
 	dev         *storage.Device
 	offset      uint64        // Bitmap region start offset on device
 	totalBlocks uint64        // Total number of data blocks tracked
-	freeBlocks  uint64        // Cached count of free blocks
 	lockMgr     *lock.Manager // For distributed locking (optional)
 	nodeUUID    [16]byte      // This node's UUID for locking
 	trimMgr     TrimQueuer    // Optional TRIM manager for batched discards
@@ -76,7 +76,6 @@ func NewRegion(dev *storage.Device, offset, totalBlocks uint64, lockMgr *lock.Ma
 		dev:         dev,
 		offset:      offset,
 		totalBlocks: totalBlocks,
-		freeBlocks:  totalBlocks, // Assume all free initially; will be corrected by scan
 		lockMgr:     lockMgr,
 		nodeUUID:    nodeUUID,
 	}
@@ -159,8 +158,7 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 		return nil, ErrNoFreeBlocks
 	}
 
-	r.freeBlocks -= uint64(len(allocated))
-	log.Printf("[DEBUG] bitmap.Alloc: allocated blocks %v, freeBlocks=%d", allocated, r.freeBlocks)
+	log.Printf("[DEBUG] bitmap.Alloc: allocated blocks %v", allocated)
 	return allocated, nil
 }
 
@@ -204,8 +202,7 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 		return fmt.Errorf("failed to write bitmap sector: %w", err)
 	}
 
-	r.freeBlocks++
-	log.Printf("[DEBUG] bitmap.Free: freed block %d, freeBlocks=%d", blockNum, r.freeBlocks)
+	log.Printf("[DEBUG] bitmap.Free: freed block %d", blockNum)
 
 	// Queue block for TRIM if manager is configured
 	if r.trimMgr != nil {
@@ -244,12 +241,14 @@ func (r *Region) IsAllocated(blockNum uint64) (bool, error) {
 	return !free, err
 }
 
-// FreeCount returns the current count of free blocks.
-// Note: This returns the cached value; use Scan() to get an accurate count.
+// FreeCount returns the number of free blocks. It counts the on-disk bitmap on
+// every call, so the result includes blocks other nodes allocated or freed.
+// Sectors that cannot be read count as fully allocated.
 func (r *Region) FreeCount() uint64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.freeBlocks
+	allocated, _ := r.countAllocated()
+	return r.totalBlocks - allocated
 }
 
 // TotalBlocks returns the total number of blocks tracked by this bitmap.
@@ -259,9 +258,7 @@ func (r *Region) TotalBlocks() uint64 {
 
 // AllocatedCount returns the number of allocated blocks.
 func (r *Region) AllocatedCount() uint64 {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.totalBlocks - r.freeBlocks
+	return r.totalBlocks - r.FreeCount()
 }
 
 // SetTrimManager sets the TRIM manager for batched block discards.
@@ -272,41 +269,44 @@ func (r *Region) SetTrimManager(tm TrimQueuer) {
 	r.trimMgr = tm
 }
 
-// Scan reads the entire bitmap and returns accurate free/allocated counts.
-// This also updates the cached freeBlocks count.
+// Scan reads the entire bitmap and returns free/allocated counts.
+// Unlike FreeCount, it fails if any bitmap sector cannot be read.
 func (r *Region) Scan(ctx context.Context) (free, allocated uint64, err error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	numSectors := (r.totalBlocks + BitsPerSector - 1) / BitsPerSector
-	var totalFree, totalAllocated uint64
+	allocated, err = r.countAllocated()
+	if err != nil {
+		return 0, 0, err
+	}
+	return r.totalBlocks - allocated, allocated, nil
+}
 
-	for sectorIdx := uint64(0); sectorIdx < numSectors; sectorIdx++ {
-		sectorData, err := r.readSector(sectorIdx)
+// countAllocated counts allocated blocks in the on-disk bitmap. A sector it
+// cannot read counts as fully allocated, and the first such error is returned.
+func (r *Region) countAllocated() (uint64, error) {
+	var allocated uint64
+	var firstErr error
+	for base := uint64(0); base < r.totalBlocks; base += BitsPerSector {
+		blocks := min(BitsPerSector, r.totalBlocks-base)
+		sectorData, err := r.readSector(base / BitsPerSector)
 		if err != nil {
-			return 0, 0, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+			allocated += blocks
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to read bitmap sector %d: %w", base/BitsPerSector, err)
+			}
+			continue
 		}
 
-		baseBlock := sectorIdx * BitsPerSector
-
-		for byteIdx := 0; byteIdx < BytesPerSector; byteIdx++ {
-			for bitIdx := 0; bitIdx < 8; bitIdx++ {
-				blockNum := baseBlock + uint64(byteIdx*8+bitIdx)
-				if blockNum >= r.totalBlocks {
-					break
-				}
-
-				if (sectorData[byteIdx] & (1 << bitIdx)) == 0 {
-					totalFree++
-				} else {
-					totalAllocated++
-				}
-			}
+		full := blocks / 8
+		for _, b := range sectorData[:full] {
+			allocated += uint64(bits.OnesCount8(b))
+		}
+		if rem := blocks % 8; rem != 0 {
+			allocated += uint64(bits.OnesCount8(sectorData[full] & (1<<rem - 1)))
 		}
 	}
-
-	r.freeBlocks = totalFree
-	return totalFree, totalAllocated, nil
+	return allocated, firstErr
 }
 
 // MarkAllocated marks a specific block as allocated.
@@ -341,7 +341,6 @@ func (r *Region) MarkAllocated(ctx context.Context, blockNum uint64) error {
 		return fmt.Errorf("failed to write bitmap sector: %w", err)
 	}
 
-	r.freeBlocks--
 	return nil
 }
 

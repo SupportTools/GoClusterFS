@@ -985,3 +985,49 @@ func TestStaleCopyCannotReplaceExtentTree(t *testing.T) {
 		t.Fatalf("a rejected write changed the inode: %+v", got)
 	}
 }
+
+// A copy read before another write changed its inline extents, for example a
+// copy-on-write that already released the old block, must not write the old
+// mapping back.
+func TestStaleCopyCannotUndoInlineExtentChange(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	var uuid [16]byte
+	tbl := NewTable(dev, 0, 16*InodeSize, nil, uuid)
+	ctx := context.Background()
+
+	ino := &Inode{Magic: InodeMagic, InodeNum: 6, LinkCount: 1}
+	ino.InlineExtents[0] = InlineExtent{LogicalBlock: 0, PhysicalBlock: 9, Length: 1, Flags: 1}
+	if err := tbl.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := tbl.Read(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, err := tbl.Read(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied.InlineExtents[0].PhysicalBlock = 12
+	if err := tbl.Write(ctx, copied); err != nil {
+		t.Fatal(err)
+	}
+
+	stale.Mode = S_IFREG | 0o600
+	if err := tbl.Write(ctx, stale); !errors.Is(err, ErrTreeConflict) {
+		t.Fatalf("stale inline copy: got %v, want ErrTreeConflict", err)
+	}
+	got, err := tbl.Read(6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InlineExtents[0].PhysicalBlock != 12 {
+		t.Fatalf("stale copy restored block %d", got.InlineExtents[0].PhysicalBlock)
+	}
+	// A copy that saw the change may write.
+	got.Mode = S_IFREG | 0o600
+	if err := tbl.Write(ctx, got); err != nil {
+		t.Fatalf("fresh copy: %v", err)
+	}
+}
