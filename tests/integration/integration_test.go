@@ -987,6 +987,41 @@ func TestStatfsAvailableBlocks(t *testing.T) {
 	t.Log("Statfs available blocks test passed")
 }
 
+func statfs(t *testing.T, mfs *MountedFS) syscall.Statfs_t {
+	t.Helper()
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mfs.MountPoint, &st); err != nil {
+		t.Fatalf("Statfs failed: %v", err)
+	}
+	return st
+}
+
+// TestStatfsFreeBlocksAfterRemount checks that a remounted node reports the
+// free blocks on disk instead of the whole volume.
+func TestStatfsFreeBlocksAfterRemount(t *testing.T) {
+	mfs := NewMountedFS(t, 20)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	const fileBlocks = 5
+	formatted := statfs(t, mfs)
+	if err := mfs.WriteFile("five-blocks.bin", make([]byte, fileBlocks*1024*1024)); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	written := statfs(t, mfs)
+	if used := formatted.Bfree - written.Bfree; used != fileBlocks {
+		t.Fatalf("writing %d blocks lowered Bfree by %d", fileBlocks, used)
+	}
+
+	remount(t, mfs)
+	remounted := statfs(t, mfs)
+	if remounted.Bfree != written.Bfree || remounted.Bavail != written.Bavail {
+		t.Errorf("after remount Bfree=%d Bavail=%d, want %d of %d blocks",
+			remounted.Bfree, remounted.Bavail, written.Bfree, remounted.Blocks)
+	}
+}
+
 // TestSparseFileBlocks verifies sparse files have Size > Blocks × 512.
 // Task #4703: Accurate space reporting (stat/statfs)
 func TestSparseFileBlocks(t *testing.T) {
