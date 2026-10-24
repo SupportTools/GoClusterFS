@@ -951,9 +951,6 @@ func TestSnapshotDeleteAfterOverwrite(t *testing.T) {
 // files at the same time. Each file keeps all its snapshots, and deleting one
 // node's snapshots leaves the other node's alone.
 func TestSnapshotConcurrentCreatesAcrossNodes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("two nodes can still both claim a free inode until lock claims are confirmed (#29)")
-	}
 	cluster := NewMultiNodeCluster(t, 2, 50)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("Failed to format and start first node: %v", err)

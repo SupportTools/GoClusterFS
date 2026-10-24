@@ -1693,7 +1693,6 @@ scenarios:
     name: Concurrent snapshots on two nodes
     description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's
     priority: high
-    # Skipped in all three suites (Go in -short mode) until #29: two nodes can both claim one free inode.
     environments:
       go: snapshot_test.go::TestSnapshotConcurrentCreatesAcrossNodes
       docker: run-tests.sh::test_snapshot_concurrent_creates

@@ -3122,9 +3122,7 @@ run_test "Extent Tree Interleaved Appends" test_extent_tree_interleaved_appends
 run_test "Snapshot Preserves Data" test_snapshot_preserves_data
 run_test "Clone In-Place Write" test_clone_in_place_write
 run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
-# Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
-log "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
-echo "SKIP: Snapshot Concurrent Creates" >> "$RESULTS_DIR/results.txt"
+run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"
