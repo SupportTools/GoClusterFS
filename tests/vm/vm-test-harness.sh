@@ -13,7 +13,8 @@
 #   ./vm-test-harness.sh --stop-vm 1       # Stop specific VM
 #
 # VM N listens for SSH on 127.0.0.1:$((VM_SSH_BASE_PORT + N - 1)), default base 2222.
-# Each run gets its own SSH key and copy of goclusterfs-mount. VM console, QEMU and
+# A lock allows one run per checkout; runs from different checkouts on one host
+# need different VM_SSH_BASE_PORT values. Each run gets its own SSH key and copy of goclusterfs-mount. VM console, QEMU and
 # mount logs go to tests/vm/results/.
 
 set -euo pipefail
@@ -32,6 +33,7 @@ ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 ISO_NAME="alpine-virt-${ALPINE_VERSION}.0-x86_64.iso"
 ISO_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/x86_64/${ISO_NAME}"
 ISO_PATH="${VM_DIR}/${ISO_NAME}"
+ISO_SHA256="95ed37b1e54b04aad1c6ff54a5fd60d904363a2a8810c3e3dfe4c2a29e94056b"
 
 # Shared storage (configurable via VM_CLUSTER_SIZE_MB environment variable)
 SHARED_DISK_PATH="${VM_DIR}/cluster.img"
@@ -115,9 +117,14 @@ init_vm_run() {
     fi
 
     mkdir -p "${VM_DIR}" "${RESULTS_DIR}"
+    exec {VM_RUN_LOCK_FD}> "${VM_DIR}/harness.lock"
+    if ! flock -n "$VM_RUN_LOCK_FD"; then
+        log_error "Another VM run is using ${VM_DIR}. Wait for it, stop it with --cleanup, or run from another checkout with a different VM_SSH_BASE_PORT"
+        return 1
+    fi
     VM_RUN_DIR=$(mktemp -d "${VM_DIR}/run.XXXXXX")
     VM_RUN_OWNER=$$
-    export VM_RUN_DIR VM_RUN_OWNER
+    export VM_RUN_DIR VM_RUN_OWNER VM_RUN_LOCK_FD
 
     cp "${PROJECT_ROOT}/goclusterfs-mount" "${VM_RUN_DIR}/goclusterfs-mount"
     ssh-keygen -t ed25519 -f "$(get_ssh_key)" -N "" -q -C "goclusterfs-vm-run"
@@ -131,6 +138,23 @@ start_vm_run() {
     trap on_vm_run_exit EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if [[ "${VM_RUN_OWNER}" == "$$" && -n "$(vm_ids_with_pid_files)" ]]; then
+        log_warn "Stopping VMs left in ${VM_DIR} by an earlier run"
+        kill_all_vms
+    fi
+}
+
+# Removes run directories unless a run in this checkout still holds the lock
+remove_idle_run_dirs() {
+    local lock_fd
+    [[ -d "${VM_DIR}" ]] || return 0
+    exec {lock_fd}> "${VM_DIR}/harness.lock"
+    if flock -n "$lock_fd"; then
+        rm -rf "${VM_DIR}"/run.*
+    else
+        log_warn "A VM run is active in ${VM_DIR}, keeping its run directory"
+    fi
+    exec {lock_fd}>&-
 }
 
 on_vm_run_exit() {
@@ -210,13 +234,18 @@ EOF
 download_iso() {
     if [[ -f "${ISO_PATH}" ]]; then
         log_info "Alpine ISO already downloaded"
-        return 0
+    else
+        log_info "Downloading Alpine Linux ISO..."
+        mkdir -p "${VM_DIR}"
+        wget -q --show-progress -O "${ISO_PATH}" "${ISO_URL}"
+        log_success "Downloaded: ${ISO_PATH}"
     fi
 
-    log_info "Downloading Alpine Linux ISO..."
-    mkdir -p "${VM_DIR}"
-    wget -q --show-progress -O "${ISO_PATH}" "${ISO_URL}"
-    log_success "Downloaded: ${ISO_PATH}"
+    if ! echo "${ISO_SHA256}  ${ISO_PATH}" | sha256sum -c --status; then
+        log_error "${ISO_PATH} does not match the pinned SHA-256; removed it, rerun to download again"
+        rm -f "${ISO_PATH}"
+        return 1
+    fi
 }
 
 # =============================================================================
@@ -376,7 +405,7 @@ boot_vm() {
         -serial chardev:serial0 \
         -monitor "unix:${monitor_socket},server,nowait" \
         -display none \
-        >> "${RESULTS_DIR}/vm${vm_id}.qemu.log" 2>&1 &
+        {VM_RUN_LOCK_FD}>&- >> "${RESULTS_DIR}/vm${vm_id}.qemu.log" 2>&1 &
     local pid=$!
     disown "$pid"
     echo "$pid" > "$pid_file"
@@ -808,7 +837,7 @@ main() {
             ;;
         --cleanup)
             cleanup
-            rm -rf "${VM_DIR}"/run.*
+            remove_idle_run_dirs
             ;;
         --cleanup-all)
             cleanup_all
@@ -826,7 +855,8 @@ main() {
             echo "  $0 --help                  Show this help"
             echo ""
             echo "Environment:"
-            echo "  VM_SSH_BASE_PORT  Host SSH port of VM 1 (default: 2222)"
+            echo "  VM_SSH_BASE_PORT  Host SSH port of VM 1 (default: 2222); use a different"
+            echo "                    value for each checkout that runs VMs at the same time"
             ;;
         *)
             log_error "Unknown command: $command"
