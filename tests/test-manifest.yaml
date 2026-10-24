@@ -835,6 +835,31 @@ scenarios:
       docker: TODO - needs old data in the blocks fallocate hands out; reusing a deleted file's blocks races TRIM (on by default, 5s flush), so a shell test would be flaky
       vm: TODO - same reason as docker
 
+  # The kernel serializes write, truncate and fallocate on one file per mount, so
+  # only in-process callers reach these two races and FUSE tests cannot trigger them.
+  - id: concurrent-first-writes-fallocated-block
+    name: Concurrent first writes into one fallocated block
+    description: Goroutines on one node writing different ranges of the same fallocated block keep all their data instead of zero-filling over each other
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/inode_race_test.go::TestConcurrentFirstWritesToFallocatedBlock
+
+  - id: truncate-racing-write
+    name: Truncate racing a write on one node
+    description: A write does not store a stale inode over a truncate that committed meanwhile, so the file never maps freed blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/inode_race_test.go::TestTruncateRacingWrite
+
+  - id: concurrent-pwrites-fallocated-block-mount
+    name: Parallel pwrites into one fallocated block through a mount
+    description: Parallel pwrites from one mount into different ranges of a fallocated block keep every writer's data
+    priority: medium
+    environments:
+      go: concurrency_test.go::TestConcurrentPwritesToFallocatedBlock
+      docker: TODO - the kernel serializes writes to one file per mount, so a shell version checks nothing the Go mount test does not
+      vm: TODO - same reason as docker
+
   # Block 0 belongs to the root directory on a formatted volume, so FUSE cannot reach this case.
   - id: read-physical-block-zero
     name: Data in physical block 0 is readable

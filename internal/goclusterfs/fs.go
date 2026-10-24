@@ -65,6 +65,8 @@ func conflictBackoff(attempt int) {
 // BlockSize is the size of data blocks (1MB).
 const BlockSize = 1 << 20
 
+const inodeMuStripes = 256
+
 // SFB (Sub-File Block) constants for small file storage.
 const (
 	// SFBMaxFileSize is the maximum file size that can use SFB storage.
@@ -107,6 +109,8 @@ type FS struct {
 	// Runtime state
 	uid uint32
 	gid uint32
+
+	inodeMu [inodeMuStripes]sync.Mutex
 }
 
 // Verify interface compliance at compile time
@@ -282,6 +286,14 @@ func (f *FS) getInode(inodeNum uint32) (*inode.Inode, error) {
 		return f.cacheMgr.GetInode(inodeNum)
 	}
 	return f.inodeTbl.Read(inodeNum)
+}
+
+// lockInode serializes this node's read-modify-write of one inode. Call it
+// before taking any cluster lock and hold one at a time: inodes share stripes.
+func (f *FS) lockInode(num uint32) func() {
+	mu := &f.inodeMu[num%inodeMuStripes]
+	mu.Lock()
+	return mu.Unlock
 }
 
 // updateInode re-reads an inode, applies update, and writes it back, starting
@@ -2061,7 +2073,9 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
 	// we retry the operation.
 	for attempt := 0; attempt < MaxWriteRetries; attempt++ {
+		unlock := f.fs.lockInode(f.inodeNum)
 		bytesWritten, err := f.writeInternal(ctx, data, uint64(off))
+		unlock()
 		if err == errRetryWrite {
 			log.Printf("[DEBUG] Write inode %d: retry attempt %d due to concurrent modification",
 				f.inodeNum, attempt+1)
@@ -2777,7 +2791,9 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	for attempt := 0; ; attempt++ {
+		unlock := f.fs.lockInode(f.inodeNum)
 		errno, err := f.setattr(ctx, fh, in, out)
+		unlock()
 		if err == nil {
 			return errno
 		}
@@ -2973,7 +2989,9 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 	}
 
 	for attempt := 0; ; attempt++ {
+		unlock := f.fs.lockInode(f.inodeNum)
 		errno, err := f.allocate(ctx, off, size, mode)
+		unlock()
 		if err == nil {
 			return errno
 		}
@@ -3120,6 +3138,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 // Setxattr sets an extended attribute on the file.
 // Used for snapshot creation via user.snapshot attribute and clone creation via user.clone.
 func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	defer f.fs.lockInode(f.inodeNum)()
 	switch attr {
 	case "user.snapshot":
 		return f.createSnapshot(ctx, string(data))
