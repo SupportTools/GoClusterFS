@@ -133,9 +133,8 @@ func (r *Region) unlock() {
 	}
 }
 
-// GetUnlocked returns a block's entry without the distributed refcount lock.
-// It is for callers that hold another lock every Share of this block also
-// holds, so the count cannot rise while they use it.
+// GetUnlocked returns a block's entry without the distributed refcount lock,
+// for callers whose own lock orders them with every Share that matters to them.
 func (r *Region) GetUnlocked(blockNum uint64) (Entry, error) {
 	if blockNum >= r.totalBlocks {
 		return Entry{}, ErrBlockOutOfRange

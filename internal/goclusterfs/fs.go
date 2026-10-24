@@ -15,6 +15,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -2515,9 +2516,10 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			beforeInPlaceWrite()
 		}
 		// Without the inode lock, ino may predate another node's snapshot, clone or
-		// copy of this block. Snapshots and clones share blocks under the
-		// exclusive inode lock, so checking again under the shared one orders this
-		// write before them, or sends it back to copy the block.
+		// copy of this block. A snapshot or clone counts the new owners and then
+		// marks the file shared under the exclusive inode lock, so checking again
+		// under the shared one orders this write before the mark, or sends it back
+		// to copy the block.
 		inPlaceLockHeld := false
 		releaseInPlaceLock := func() {
 			if inPlaceLockHeld {
@@ -3355,18 +3357,12 @@ var errUncountedSharing = errors.New("an older version shared this file's blocks
 // dst maps it; a crash in between leaves src copying blocks it alone owns.
 // stillValid, if set, runs after the blocks gain owners and before dst maps
 // them. On error the caller discards dst, which gives back any blocks it maps.
-// shareSource marks src shared and counts the new owner of each of its blocks
-// under src's exclusive inode lock. A writer checks a block and writes it in
-// place under the shared inode lock, so the write lands wholly before this
-// or finds the block shared and copies it. The refcount lock comes before the
-// inode lock, so it is taken first and held for Share.
+// shareSource counts a new owner of each block of src, then marks src shared
+// under the exclusive inode lock. A writer checks a block and writes it in
+// place under the shared inode lock, so the write lands before the mark, or
+// sees the count and copies the block. If a write copied a block between the
+// count and the mark, the counts are undone and the sharing tried again.
 func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []uint64, error) {
-	if f.lockMgr != nil {
-		if err := f.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
-			return nil, nil, err
-		}
-		defer f.lockMgr.Release(lock.LockTypeRefCount, 0)
-	}
 	for attempt := 0; ; attempt++ {
 		src, err := f.inodeTbl.Read(srcNum)
 		if err != nil {
@@ -3379,40 +3375,32 @@ func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []ui
 		if uncounted {
 			return nil, nil, errUncountedSharing
 		}
+		blocks, err := f.extentMgr.DataBlocks(src)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := f.refcountReg.Share(ctx, blocks); err != nil {
+			return nil, nil, err
+		}
 		// A snapshot's data inode is marked shared when it is created and never written again.
-		mark := src.Flags&inode.FlagSnapshotData == 0
-		// Marking may rewrite tree nodes, which takes the bitmap lock, so it comes before the inode lock.
-		if mark {
-			if err := f.markShared(src); err != nil {
-				f.extentMgr.DiscardPending(ctx, src)
-				return nil, nil, err
-			}
+		if src.Flags&inode.FlagSnapshotData != 0 {
+			return src, blocks, nil
 		}
-		if f.lockMgr != nil {
-			if err := f.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(srcNum), lock.LockModeExclusive); err != nil {
-				f.extentMgr.DiscardPending(ctx, src)
-				return nil, nil, err
-			}
-		}
-		if mark {
-			err = f.inodeTbl.Write(ctx, src)
-		}
-		var blocks []uint64
+		marked, err := f.updateInode(ctx, srcNum, f.markShared)
+		var now []uint64
 		if err == nil {
-			if blocks, err = f.extentMgr.DataBlocks(src); err == nil {
-				err = f.refcountReg.Share(ctx, blocks)
-			}
+			now, err = f.extentMgr.DataBlocks(marked)
 		}
-		if f.lockMgr != nil {
-			f.lockMgr.Release(lock.LockTypeInode, uint64(srcNum))
+		if err == nil && slices.Equal(now, blocks) {
+			return marked, blocks, nil
 		}
-		if !errors.Is(err, extent.ErrTreeConflict) || attempt == maxConflictRetries-1 {
-			if err != nil {
-				f.extentMgr.DiscardPending(ctx, src)
-			}
-			return src, blocks, err
+		f.extentMgr.ReleaseBlocks(ctx, blocks)
+		if err != nil {
+			return nil, nil, err
 		}
-		f.extentMgr.DiscardPending(ctx, src)
+		if attempt == maxConflictRetries-1 {
+			return nil, nil, fmt.Errorf("inode %d kept changing while it was being shared", srcNum)
+		}
 		conflictBackoff(attempt)
 	}
 }
