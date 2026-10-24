@@ -439,12 +439,6 @@ func (m *Manager) FreeSlot(ctx context.Context, containerBlock uint64, slotIndex
 		m.addToFreeList(container.Header.Tier, containerBlock)
 	}
 
-	// If container is now completely empty, consider recycling the block
-	if container.Header.FreeSlots == container.Header.SlotCount {
-		// For now, keep empty containers in the pool for reuse.
-		// A background garbage collector could reclaim them later.
-	}
-
 	return nil
 }
 

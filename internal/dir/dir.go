@@ -290,7 +290,6 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 	// (bitmap lock level 6 < inode lock level 8)
 	if lockHeld {
 		m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
-		lockHeld = false
 	}
 
 	// Allocate block without holding inode lock
@@ -355,7 +354,6 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 		// Scan for the entry
 		offset := uint32(0)
 		prevOffset := uint32(0)
-		found := false
 
 		for offset < uint32(len(data)) {
 			entry, err := parseEntry(data[offset:])
@@ -369,8 +367,6 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 
 			if entry.InodeNum != 0 && entry.Name == name {
 				// Found it - mark as deleted
-				found = true
-
 				// Option 1: Zero the inode number (simple deletion)
 				binary.LittleEndian.PutUint64(data[offset:], 0)
 
@@ -391,10 +387,6 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 
 			prevOffset = offset
 			offset += uint32(entry.RecLen)
-		}
-
-		if found {
-			break
 		}
 	}
 

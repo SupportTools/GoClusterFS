@@ -92,12 +92,7 @@ func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
 // Records are identified by IntentCompletionMagic (0x43544E49 "INTC").
 func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, completed map[uint64]bool, stats *RecoveryStats) error {
 	pos := head
-	for {
-		// Check if we've reached the tail
-		if pos == tail {
-			break
-		}
-
+	for pos != tail {
 		// Handle wrap-around
 		if pos >= dataAreaSize {
 			pos = 0
@@ -181,12 +176,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 
 	// Phase 2: Replay transactions that are not completed
 	pos := head
-	for {
-		// Check if we've reached the tail
-		if pos == tail {
-			break
-		}
-
+	for pos != tail {
 		// Handle wrap-around
 		if pos >= dataAreaSize {
 			pos = 0

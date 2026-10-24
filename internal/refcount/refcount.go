@@ -414,10 +414,10 @@ func (r *Region) Scan(ctx context.Context) (stats ScanStats, err error) {
 			}
 
 			entry := decodeEntry(sectorData, entryIdx)
-			switch {
-			case entry.RefCount == 0:
+			switch entry.RefCount {
+			case 0:
 				stats.FreeBlocks++
-			case entry.RefCount == 1:
+			case 1:
 				stats.ExclusiveBlocks++
 			default:
 				stats.SharedBlocks++

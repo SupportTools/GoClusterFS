@@ -710,20 +710,6 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 	return deserializeRecord(buf.Bytes())
 }
 
-// writeRecord writes a lock record to disk.
-func (m *Manager) writeRecord(recordID uint64, record *Record) error {
-	offset := int64(m.offset) + int64(recordID)*RecordSize
-
-	data := serializeRecord(record)
-
-	buf := storage.GetBuffer(RecordSize)
-	defer storage.PutBuffer(buf)
-	copy(buf.Bytes(), data)
-
-	_, err := m.dev.WriteAt(buf.Bytes(), offset)
-	return err
-}
-
 // casRecordOptimistic performs an optimistic CAS using only the expected sequence.
 // It writes the new record directly, then reads back to verify the sequence.
 // Returns true if the write succeeded (sequence matched), false if stale.

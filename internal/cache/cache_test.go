@@ -3,8 +3,6 @@ package cache
 import (
 	"testing"
 	"time"
-
-	"github.com/supporttools/GoClusterFS/internal/inode"
 )
 
 // TestLRU tests the generic LRU cache implementation.
@@ -271,34 +269,6 @@ func TestConfig(t *testing.T) {
 			t.Error("Negative InodeTTL should fail validation")
 		}
 	})
-}
-
-// mockInodeTable implements a simple mock for testing cache operations.
-type mockInodeTable struct {
-	inodes map[uint32]*inode.Inode
-}
-
-func newMockInodeTable() *mockInodeTable {
-	return &mockInodeTable{
-		inodes: make(map[uint32]*inode.Inode),
-	}
-}
-
-func (m *mockInodeTable) Read(inodeNum uint32) (*inode.Inode, error) {
-	ino, ok := m.inodes[inodeNum]
-	if !ok {
-		return &inode.Inode{}, nil // Return empty inode (Magic == 0)
-	}
-	return ino, nil
-}
-
-func (m *mockInodeTable) Write(ino *inode.Inode) error {
-	m.inodes[ino.InodeNum] = ino
-	return nil
-}
-
-func (m *mockInodeTable) setInode(ino *inode.Inode) {
-	m.inodes[ino.InodeNum] = ino
 }
 
 // Note: Full integration tests for Manager.GetInode require a real inode.Table
