@@ -578,13 +578,11 @@ test_many_files() {
     # Create test directory
     exec_on_node "$node" mkdir -p "/mnt/goclusterfs/$test_dir"
 
-    # Create 100 files with unique content
+    # One docker exec per loop: an exec per file costs more than the file operation
     log "Creating $num_files files..."
-    for i in $(seq 0 $((num_files - 1))); do
-        local filename=$(printf "file_%03d.txt" "$i")
-        local content="Content of file $i"
-        exec_on_node "$node" sh -c "echo '$content' > /mnt/goclusterfs/$test_dir/$filename"
-    done
+    exec_on_node "$node" sh -c 'for i in $(seq 0 $(($2 - 1))); do
+            echo "Content of file $i" > "$(printf "%s/file_%03d.txt" "$1" "$i")"
+        done' sh "/mnt/goclusterfs/$test_dir" "$num_files"
 
     # Count files in directory
     local count
@@ -595,21 +593,15 @@ test_many_files() {
     fi
     log "File count verified: $count files"
 
-    # Verify each file has correct content
-    local verify_errors=0
-    for i in $(seq 0 $((num_files - 1))); do
-        local filename=$(printf "file_%03d.txt" "$i")
-        local expected="Content of file $i"
-        local actual
-        actual=$(exec_on_node "$node" cat "/mnt/goclusterfs/$test_dir/$filename")
-        if [[ "$actual" != "$expected" ]]; then
-            log "ERROR: Content mismatch for $filename: expected '$expected', got '$actual'"
-            ((verify_errors++))
-        fi
-    done
-
-    if [[ "$verify_errors" -gt 0 ]]; then
-        log "ERROR: $verify_errors files had content mismatches"
+    local mismatches
+    mismatches=$(exec_on_node "$node" sh -c 'for i in $(seq 0 $(($2 - 1))); do
+            f=$(printf "%s/file_%03d.txt" "$1" "$i")
+            got=$(cat "$f")
+            [ "$got" = "Content of file $i" ] || echo "Content mismatch for $f: got '\''$got'\''"
+        done' sh "/mnt/goclusterfs/$test_dir" "$num_files")
+    if [[ -n "$mismatches" ]]; then
+        log "ERROR: content mismatches:"
+        log "$mismatches"
         return 1
     fi
 
@@ -921,38 +913,24 @@ test_stress_single_node() {
 
     log "Running $iterations create/read/delete iterations..."
 
-    for i in $(seq 1 $iterations); do
-        local filename=$(printf "stress_%04d.txt" $i)
-        local content="Stress test iteration $i"
-
-        # Create file
-        if ! exec_on_node "$node" sh -c "echo -n '$content' > /mnt/goclusterfs/$filename" 2>/dev/null; then
-            log "ERROR: Iteration $i: Failed to create file"
-            ((errors++))
-            continue
-        fi
-
-        # Read and verify
-        local readback
-        readback=$(exec_on_node "$node" cat "/mnt/goclusterfs/$filename" 2>/dev/null)
-        if [[ "$readback" != "$content" ]]; then
-            log "ERROR: Iteration $i: Content mismatch. Expected: '$content', Got: '$readback'"
-            ((errors++))
-            continue
-        fi
-
-        # Delete
-        if ! exec_on_node "$node" rm "/mnt/goclusterfs/$filename" 2>/dev/null; then
-            log "ERROR: Iteration $i: Failed to delete file"
-            ((errors++))
-            continue
-        fi
-
-        # Progress logging every 25 iterations
-        if [[ $((i % 25)) -eq 0 ]]; then
-            log "Progress: $i/$iterations iterations completed"
-        fi
-    done
+    # One docker exec for the whole loop: an exec per step costs more than the file operation
+    local failures
+    failures=$(exec_on_node "$node" sh -c 'for i in $(seq 1 $1); do
+            f=$(printf "/mnt/goclusterfs/stress_%04d.txt" "$i")
+            want="Stress test iteration $i"
+            if ! printf "%s" "$want" > "$f" 2>/dev/null; then
+                echo "Iteration $i: Failed to create file"; continue
+            fi
+            got=$(cat "$f" 2>/dev/null)
+            if [ "$got" != "$want" ]; then
+                echo "Iteration $i: Content mismatch. Expected: '\''$want'\'', Got: '\''$got'\''"; continue
+            fi
+            rm "$f" 2>/dev/null || echo "Iteration $i: Failed to delete file"
+        done' sh "$iterations")
+    if [[ -n "$failures" ]]; then
+        log "ERROR: $failures"
+        errors=$(echo "$failures" | wc -l)
+    fi
 
     # Verify no stress test files remain
     local remaining
