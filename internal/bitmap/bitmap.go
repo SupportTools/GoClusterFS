@@ -300,15 +300,25 @@ func (r *Region) withFreeBlocks(ctx context.Context, blocks []uint64, discard fu
 	return nil
 }
 
-// releaseTimeout bounds each attempt to take the bitmap lock when freeing reserved blocks.
-const releaseTimeout = 30 * time.Second
+const (
+	// releaseTimeout bounds each attempt to take the bitmap lock when freeing reserved blocks.
+	releaseTimeout = 30 * time.Second
+	// releaseDeadline bounds all attempts, so a failing device cannot hang unmount.
+	releaseDeadline = 5 * time.Minute
+)
 
 // releaseReserved frees blocks reserved for a discard. ctx may have run out
 // during a slow discard, and fsck cannot repair a leaked reservation, so it
-// retries until every block is free. Nothing else references these blocks.
+// retries until every block is free or releaseDeadline passes. Nothing else
+// references these blocks.
 func (r *Region) releaseReserved(ctx context.Context, blocks []uint64) {
 	ctx = context.WithoutCancel(ctx)
+	deadline := time.Now().Add(releaseDeadline)
 	for attempt := 1; len(blocks) > 0; attempt++ {
+		if time.Now().After(deadline) {
+			log.Printf("[ERROR] bitmap: gave up freeing blocks %v reserved for TRIM after %v; fsck will report them as leaked", blocks, releaseDeadline)
+			return
+		}
 		attemptCtx, cancel := context.WithTimeout(ctx, releaseTimeout)
 		freed, err := r.flipBits(attemptCtx, blocks, false)
 		cancel()
