@@ -495,10 +495,10 @@ setup_goclusterfs() {
         mount_args="$mount_args -format"
     fi
 
-    # The log device streams to the host, so the log survives VM kills and restarts
+    # /var/log/goclusterfs.log is lost when the VM dies; the log device keeps a copy on the host
     log_info "Mounting GoClusterFS..."
     ssh_run "$vm_id" \
-        "nohup /usr/local/bin/goclusterfs-mount $mount_args < /dev/null > /dev/goclusterfs-log 2>&1 &"
+        "nohup /usr/local/bin/goclusterfs-mount $mount_args < /dev/null 2>&1 | tee /var/log/goclusterfs.log > /dev/goclusterfs-log 2>/dev/null &"
 
     # Wait for mount to be ready
     wait_for_goclusterfs_mount "$vm_id"
