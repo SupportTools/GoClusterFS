@@ -15,7 +15,7 @@ The project uses PostgreSQL-backed TaskForge for persistent task management:
 ### Development Environment
 
 **Requirements:**
-- Go 1.21+ (check with `go version`)
+- Go 1.26+ (check with `go version`)
 - FUSE 3 libraries (`libfuse3-dev` on Debian/Ubuntu)
 - Linux kernel with FUSE support
 
@@ -34,12 +34,11 @@ GoClusterFS is a **single repository** project:
 
 ```
 GoClusterFS/
-├── main.go              # FUSE mount entry point
-├── internal/
-│   ├── block/           # Block device I/O, O_DIRECT
-│   ├── journal/         # Write-ahead logging
-│   ├── node/            # Cluster node registry
-│   └── fs/              # FUSE filesystem handlers
+├── cmd/
+│   ├── mount/           # goclusterfs-mount
+│   └── fsck/            # goclusterfs-fsck
+├── internal/            # See CLAUDE.md for the package map
+├── tests/               # Integration, Docker and VM tests
 ├── docs/                # Documentation
 └── CLAUDE.md            # Project coding standards
 ```
@@ -86,7 +85,7 @@ Clear summary aligned with project architecture
 #### Design Approach
 Technical strategy following established patterns:
 - Block-level operations (1MB blocks)
-- Metadata handling (gob encoding in block 0)
+- On-disk layout as defined in `cmd/mount/main.go`
 - FUSE handler patterns
 - Thread-safe concurrent access
 
@@ -145,7 +144,7 @@ Implement the approved design with strict adherence to:
 #### Step 5.1: Build Verification (BLOCKER)
 
 ```bash
-go build -o GoClusterFS .
+make build
 ```
 
 - **MUST PASS**: Zero compilation errors
@@ -174,20 +173,20 @@ go test ./... -v
 
 ```bash
 # Create test environment
-dd if=/dev/zero of=/tmp/test.img bs=1M count=100
-mkdir -p /tmp/testmount
+truncate -s 100M test.img
+mkdir -p testmount
 
-# Mount and test
-./GoClusterFS /tmp/testmount /tmp/test.img &
+# Mount and test (the image must not be on tmpfs)
+./goclusterfs-mount -device ./test.img -mount ./testmount -format > mount.log 2>&1 &
 sleep 2
 
 # Verify basic operations
-ls -la /tmp/testmount
-echo "test" > /tmp/testmount/testfile
-cat /tmp/testmount/testfile
+ls -la testmount
+echo "test" > testmount/testfile
+cat testmount/testfile
 
 # Unmount
-fusermount -u /tmp/testmount
+fusermount3 -u testmount
 ```
 
 ### 6. Task Completion
@@ -295,7 +294,7 @@ Before marking task complete, verify:
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 5.1 Build Verification (BLOCKER)                            │
-│     go build -o GoClusterFS .                               │
+│     make build                                              │
 │     ❌ Failed → Fix → Retry                                  │
 └────────────────────────┬────────────────────────────────────┘
                          │ (passed)
