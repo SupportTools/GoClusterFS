@@ -601,27 +601,104 @@ func TestSharedClaimSurvivesJoinDuringSettle(t *testing.T) {
 	}
 }
 
-// A claim whose write would land long after the read it was based on can
-// overwrite a claim another node has confirmed in the meantime, so it is dropped.
-func TestSlowClaimWriteIsAborted(t *testing.T) {
+// stallOnce returns a hook that, the first time it runs, signals started and
+// then stalls for 1.5 settle delays.
+func stallOnce(started chan<- struct{}) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(started)
+			time.Sleep(3 * ClaimSettleDelay / 2)
+		})
+	}
+}
+
+// A node whose claim write cannot start within half the settle delay of its
+// read, after a stall or a wait for the device's I/O shard, writes nothing: it
+// neither takes the lock beside another node nor gets stuck behind its own claim.
+func TestSlowClaimWriteIsSkipped(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	var once sync.Once
-	bRead := make(chan struct{})
-	b.beforeCASWrite = func() {
-		once.Do(func() {
-			close(bRead)
-			time.Sleep(3 * ClaimSettleDelay / 2)
-		})
-	}
+	bWriting := make(chan struct{})
+	b.beforeCASWrite = stallOnce(bWriting)
 
 	errb := make(chan error, 1)
-	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 21, LockModeExclusive) }()
-	<-bRead
+	go func() { errb <- acquireWithin(b, 2*time.Second, LockTypeInode, 21, LockModeExclusive) }()
+	<-bWriting
 	requireAcquired(t, a, LockTypeInode, 21, LockModeExclusive)
-	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("node B with a slow write: got %v, want ErrLockTimeout while node A holds the lock", err)
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-errb:
+		t.Fatalf("node B finished (%v) while node A held the lock", err)
+	default:
+	}
+	if err := a.Release(LockTypeInode, 21); err != nil {
+		t.Fatalf("node A Release: %v", err)
+	}
+	a.ReleaseCached()
+	if err := <-errb; err != nil {
+		t.Fatalf("node B after node A released: %v", err)
+	}
+}
+
+// A claim write that finished long after its read may have replaced a claim
+// another node confirmed in the meantime, so the node does not take the lock.
+func TestLateClaimWriteIsNotHeld(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	b := newTestNode(dev, 0, 1<<20, 2)
+	b.afterCASWrite = stallOnce(make(chan struct{}))
+
+	if err := acquireWithin(b, 300*time.Millisecond, LockTypeInode, 22, LockModeExclusive); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("Acquire with a late claim write: got %v, want ErrLockTimeout", err)
+	}
+}
+
+// returnsWithin fails the test if fn has not returned after 3s.
+func returnsWithin(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		fn()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("%s still retrying after 3s", what)
+	}
+}
+
+// On storage too slow for any write to start within its deadline, a release
+// gives up after a few tries and leaves the record to go stale.
+func TestReleaseWithSlowWritesGivesUp(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	requireAcquired(t, a, LockTypeInode, 23, LockModeExclusive)
+	a.beforeCASWrite = func() { time.Sleep(ClaimSettleDelay) }
+
+	returnsWithin(t, "release", func() {
+		a.Release(LockTypeInode, 23)
+		a.ReleaseCached()
+	})
+}
+
+// On storage that slow, a renewal gives up too, and the acquire that needed it fails.
+func TestRenewalWithSlowWritesGivesUp(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, RecordSize, 1)
+	defer func(d time.Duration) { renewAfter = d }(renewAfter)
+	renewAfter = 0
+	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
+	a.beforeCASWrite = func() { time.Sleep(ClaimSettleDelay) }
+
+	var err error
+	returnsWithin(t, "renewal", func() { err = acquireWithin(a, time.Minute, LockTypeInode, 2, LockModeExclusive) })
+	if !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("Acquire joining a record whose renewal cannot write: got %v, want ErrLockTimeout", err)
 	}
 }

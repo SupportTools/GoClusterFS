@@ -1874,12 +1874,54 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestSharedClaimSurvivesJoinDuringSettle
 
-  - id: lock-slow-claim-write-aborted
-    name: Slow claim write is aborted
-    description: A claim whose write would land more than half the settle delay after its read is dropped, so two nodes cannot both hold the lock
+  - id: lock-concurrent-dir-reads-create
+    name: Concurrent directory reads do not delay create or unlink
+    description: Two nodes taking a shared claim on one directory at once leave no reader count behind, so a create or unlink there finishes within 2s
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestSlowClaimWriteIsAborted
+      go: internal/goclusterfs/lock_commit_test.go::TestConcurrentDirReadsDoNotDelayCreateOrUnlink
+
+  - id: lock-concurrent-refcount-reads-snapshots
+    name: Concurrent refcount reads do not delay snapshots
+    description: Two nodes reading refcounts at once leave no reader count behind, so snapshot create, copy-on-write and snapshot delete each finish within 2s
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestConcurrentRefcountReadsDoNotDelaySnapshots
+
+  - id: lock-slow-claim-write-skipped
+    name: Slow claim write is skipped
+    description: A claim write that cannot start within half the settle delay of its read writes nothing, and the node gets the lock once the holder releases
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlowClaimWriteIsSkipped
+
+  - id: lock-late-claim-write-not-held
+    name: Late claim write is not held
+    description: A claim write that finishes more than half the settle delay after its read is not held, so two nodes cannot both hold the lock
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLateClaimWriteIsNotHeld
+
+  - id: lock-slow-release-gives-up
+    name: Release with slow writes gives up
+    description: A release whose writes keep missing their deadline stops after a bounded number of tries and leaves the record to go stale
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseWithSlowWritesGivesUp
+
+  - id: lock-slow-renewal-gives-up
+    name: Renewal with slow writes gives up
+    description: A renewal whose writes keep missing their deadline stops after a bounded number of tries and fails the joining acquire
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestRenewalWithSlowWritesGivesUp
+
+  - id: storage-write-deadline-after-shard-wait
+    name: Deadline write skipped after shard wait
+    description: A write that waits for its I/O shard past its deadline writes nothing
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestWriteAtBeforeSkipsWriteAfterShardWait
 
   - id: lock-cancelled-context-waits
     name: Cancelled context keeps waiting

@@ -228,8 +228,8 @@ type Manager struct {
 	gates map[uint64]*sync.Mutex
 	// yieldUntil holds records this node gave up and will not claim again before then.
 	yieldUntil map[uint64]time.Time
-	// beforeCASWrite, when set by a test, runs between a record CAS's read and its write.
-	beforeCASWrite func()
+	// Test hooks: beforeCASWrite runs just before a record CAS writes, afterCASWrite just after.
+	beforeCASWrite, afterCASWrite func()
 
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
@@ -282,10 +282,21 @@ var (
 	yieldGap         = YieldGap
 )
 
-// holdAge is the time since a hold was last written to disk. It takes the larger
-// of the monotonic and wall-clock ages, so a pause that stops one clock still counts.
-func holdAge(renewed time.Time) time.Duration {
-	return max(time.Since(renewed), time.Now().Round(0).Sub(renewed.Round(0)))
+// maxRecordUpdates bounds the tries of a release, renewal or takeover whose record
+// keeps changing under it or whose writes keep missing their deadline.
+const maxRecordUpdates = 10
+
+// updateBackoff sleeps before retry n of a record update, with jitter so nodes
+// retrying the same record spread out.
+func updateBackoff(n int) {
+	d := min(RetryBaseDelay<<min(n, 4), RetryMaxDelay)
+	time.Sleep(d/2 + time.Duration(rand.Int63n(int64(d/2))))
+}
+
+// age is the time since t. It takes the larger of the monotonic and wall-clock
+// ages, so a pause that stops one clock still counts.
+func age(t time.Time) time.Duration {
+	return max(time.Since(t), time.Now().Round(0).Sub(t.Round(0)))
 }
 
 // Errors
@@ -296,6 +307,10 @@ var (
 	ErrDeadlockRisk  = errors.New("lock order violation would cause deadlock")
 	ErrInvalidRecord = errors.New("invalid lock record")
 	ErrLockLost      = errors.New("lock record was taken over by another node")
+
+	// errLateWrite means a record write finished so long after its read that it
+	// may have overwritten a claim another node had already confirmed.
+	errLateWrite = errors.New("lock record write finished late")
 )
 
 // NewManager creates a new lock manager.
@@ -446,7 +461,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	defer gate.Unlock()
 
 	m.mu.Lock()
-	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (rec.lost || !covers(rec.mode, mode) || holdAge(rec.renewed) > renewAfter) {
+	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (rec.lost || !covers(rec.mode, mode) || age(rec.renewed) > renewAfter) {
 		// A cached hold that is lost, too weak, or old enough that another node may
 		// have taken it over (after a pause, say) is released, then acquired afresh.
 		delete(m.records, recordID)
@@ -469,7 +484,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			}
 			return false, false, nil
 		}
-		renew := rec.mode == LockModeExclusive && holdAge(rec.renewed) > renewAfter
+		renew := rec.mode == LockModeExclusive && age(rec.renewed) > renewAfter
 		m.mu.Unlock()
 		if renew {
 			if err := m.renewRecord(recordID, rec); err != nil {
@@ -516,7 +531,7 @@ func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) boo
 		return false
 	}
 	rec := m.records[held.RecordID]
-	if rec.lost || !covers(rec.mode, mode) || (rec.mode == LockModeExclusive && holdAge(rec.renewed) > renewAfter) {
+	if rec.lost || !covers(rec.mode, mode) || (rec.mode == LockModeExclusive && age(rec.renewed) > renewAfter) {
 		return false
 	}
 	held.refCount++
@@ -607,7 +622,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if holdAge(rec.since) > cacheGrace {
+	if age(rec.since) > cacheGrace {
 		// Held long enough: give other nodes a turn instead of keeping it.
 		delete(m.records, recordID)
 		m.yieldUntil[recordID] = time.Now().Add(yieldGap)
@@ -674,6 +689,10 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		// For held locks, we need to read current state to check conditions
 		if hint.Mode == LockModeNone {
 			acquired, newSeq, err := m.tryAcquireOptimistic(recordID, lockType, resourceID, mode, hint.Sequence)
+			if errors.Is(err, errLateWrite) {
+				m.giveUpLateClaim(recordID)
+				return false, nil
+			}
 			if err != nil {
 				return false, err
 			}
@@ -751,6 +770,10 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 
 	// CAS the record
 	acquired, err := m.casRecord(recordID, record, newRecord)
+	if errors.Is(err, errLateWrite) {
+		m.giveUpLateClaim(recordID)
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -771,6 +794,15 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	}
 
 	return acquired, nil
+}
+
+// giveUpLateClaim leaves alone, until it is stale, a record whose claim write
+// finished late. The write may have replaced a claim another node confirmed, and
+// that node may still hold the lock while the record names this node.
+func (m *Manager) giveUpLateClaim(recordID uint64) {
+	m.mu.Lock()
+	m.yieldUntil[recordID] = time.Now().Add(StaleThreshold)
+	m.mu.Unlock()
 }
 
 // confirmClaim waits out the window in which a node that read the record before
@@ -826,7 +858,7 @@ func (m *Manager) tryAcquireOptimistic(recordID uint64, lockType LockType, resou
 // runs under the record gate. If another node took the record over as stale,
 // the hold is marked lost and no new key may join it.
 func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
-	for {
+	for attempt := 0; ; attempt++ {
 		record, err := m.readRecord(recordID)
 		if err != nil {
 			return err
@@ -842,7 +874,7 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 		renewed.AcquireTime = time.Now().Unix()
 		renewed.Sequence++
 		ok, err := m.casRecord(recordID, record, &renewed)
-		if err != nil {
+		if err != nil && !errors.Is(err, errLateWrite) {
 			return err
 		}
 		if ok {
@@ -856,6 +888,10 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 			m.mu.Unlock()
 			return nil
 		}
+		if attempt == maxRecordUpdates-1 {
+			return fmt.Errorf("%w: could not renew record %d in %d tries", ErrLockTimeout, recordID, maxRecordUpdates)
+		}
+		updateBackoff(attempt)
 	}
 }
 
@@ -863,7 +899,7 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 // After successful release, caches the new sequence number to enable
 // optimistic acquisition on the next lock attempt.
 func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
-	for {
+	for attempt := 0; ; attempt++ {
 		record, err := m.readRecord(recordID)
 		if err != nil {
 			return err
@@ -886,7 +922,7 @@ func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
 		}
 
 		success, err := m.casRecord(recordID, record, newRecord)
-		if err != nil {
+		if err != nil && !errors.Is(err, errLateWrite) {
 			return err
 		}
 		if success {
@@ -897,6 +933,11 @@ func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
 			})
 			return nil
 		}
+		if attempt == maxRecordUpdates-1 {
+			log.Printf("[WARN] lock: could not release record %d in %d tries; it frees itself once stale", recordID, maxRecordUpdates)
+			return nil
+		}
+		updateBackoff(attempt)
 	}
 }
 
@@ -905,8 +946,7 @@ func (m *Manager) isLockStale(record *Record) bool {
 	if record.Mode == LockModeNone {
 		return false
 	}
-	age := time.Since(time.Unix(record.AcquireTime, 0))
-	return age > StaleThreshold
+	return time.Since(time.Unix(record.AcquireTime, 0)) > StaleThreshold
 }
 
 // checkLockOrder ensures we're acquiring locks in hierarchy order.
@@ -959,54 +999,26 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 	}
 }
 
-// casRecordOptimistic performs an optimistic CAS using only the expected sequence.
-// It writes the new record directly, then reads back to verify the sequence.
-// Returns true if the write succeeded (sequence matched), false if stale.
+// casRecordOptimistic writes new over a record that is free and at expectedSeq.
 // This saves one disk read compared to casRecord when the hint is correct.
 func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *Record) (bool, error) {
-	offset := int64(m.offset) + int64(recordID)*RecordSize
-
-	buf := storage.GetBuffer(RecordSize)
-	defer storage.PutBuffer(buf)
-
-	start := time.Now()
-	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
-		return false, err
-	}
-
-	// Check if sequence matches our expectation
-	currentSeq := binary.LittleEndian.Uint64(buf.Bytes()[48:56])
-	if currentSeq != expectedSeq {
-		// Sequence doesn't match - hint was stale
-		return false, nil
-	}
-
-	// Also verify the lock is actually free (Mode == None)
-	// This prevents acquiring a lock that another node just took
-	currentMode := LockMode(buf.Bytes()[5])
-	if currentMode != LockModeNone {
-		// Lock is held - can't acquire optimistically
-		return false, nil
-	}
-
-	if m.casWriteTooLate(recordID, start) {
-		return false, nil
-	}
-	newData := serializeRecord(new)
-	copy(buf.Bytes(), newData)
-	if _, err := m.dev.WriteAt(buf.Bytes(), offset); err != nil {
-		return false, err
-	}
-
-	return true, nil
+	return m.casRecordIf(recordID, new, func(seq uint64, mode LockMode) bool {
+		return seq == expectedSeq && mode == LockModeNone
+	})
 }
 
-// casRecord performs compare-and-swap on a lock record.
+// casRecord writes new over a record that is still at expected's sequence.
 func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error) {
-	offset := int64(m.offset) + int64(recordID)*RecordSize
+	return m.casRecordIf(recordID, new, func(seq uint64, _ LockMode) bool {
+		return seq == expected.Sequence
+	})
+}
 
-	expectedData := serializeRecord(expected)
-	newData := serializeRecord(new)
+// casRecordIf reads a record and writes new over it if match accepts what it read.
+// It skips the write if the write would start more than ClaimSettleDelay/2 after
+// the read, and returns errLateWrite, with the write done, if it finished later than that.
+func (m *Manager) casRecordIf(recordID uint64, new *Record, match func(seq uint64, mode LockMode) bool) (bool, error) {
+	offset := int64(m.offset) + int64(recordID)*RecordSize
 
 	buf := storage.GetBuffer(RecordSize)
 	defer storage.PutBuffer(buf)
@@ -1015,36 +1027,29 @@ func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error
 	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
 		return false, err
 	}
-
-	// Compare (check sequence number is sufficient for CAS)
-	currentSeq := binary.LittleEndian.Uint64(buf.Bytes()[48:56])
-	expectedSeq := binary.LittleEndian.Uint64(expectedData[48:56])
-	if currentSeq != expectedSeq {
+	if !match(binary.LittleEndian.Uint64(buf.Bytes()[48:56]), LockMode(buf.Bytes()[5])) {
 		return false, nil
 	}
 
-	if m.casWriteTooLate(recordID, start) {
-		return false, nil
-	}
-	copy(buf.Bytes(), newData)
-	if _, err := m.dev.WriteAt(buf.Bytes(), offset); err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
-// casWriteTooLate reports whether a CAS write would land so long after its read
-// that another node's claim could have passed its settle wait in between.
-func (m *Manager) casWriteTooLate(recordID uint64, readStart time.Time) bool {
 	if m.beforeCASWrite != nil {
 		m.beforeCASWrite()
 	}
-	if elapsed := time.Since(readStart); elapsed > ClaimSettleDelay/2 {
-		log.Printf("[WARN] lock: record %d read was %v old at write time; retrying the update", recordID, elapsed)
-		return true
+	copy(buf.Bytes(), serializeRecord(new))
+	if _, err := m.dev.WriteAtBefore(buf.Bytes(), offset, start.Add(ClaimSettleDelay/2)); err != nil {
+		if errors.Is(err, storage.ErrWriteDeadline) {
+			log.Printf("[WARN] lock: record %d read was %v old when its write could start; retrying the update", recordID, age(start))
+			return false, nil
+		}
+		return false, err
 	}
-	return false
+	if m.afterCASWrite != nil {
+		m.afterCASWrite()
+	}
+	if took := age(start); took > ClaimSettleDelay/2 {
+		log.Printf("[WARN] lock: record %d write finished %v after its read", recordID, took)
+		return true, errLateWrite
+	}
+	return true, nil
 }
 
 // serializeRecord converts a Record to bytes.

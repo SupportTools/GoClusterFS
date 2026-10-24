@@ -7,13 +7,18 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
+
+// ErrWriteDeadline means WriteAtBefore reached its deadline before it started the write, so nothing was written.
+var ErrWriteDeadline = errors.New("write deadline passed before the write started")
 
 const (
 	// SectorSize is the minimum alignment for O_DIRECT I/O.
@@ -193,6 +198,13 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 // Both offset and len(buf) MUST be aligned to SectorSize.
 // Concurrent writes to different 1MB regions proceed in parallel.
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
+	return d.WriteAtBefore(buf, offset, time.Time{})
+}
+
+// WriteAtBefore is WriteAt, except that it writes nothing and returns
+// ErrWriteDeadline if deadline has passed once it holds the I/O shard and is
+// about to start the write. A zero deadline never passes.
+func (d *Device) WriteAtBefore(buf []byte, offset int64, deadline time.Time) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, err
 	}
@@ -208,6 +220,9 @@ func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
 	startShard, endShard := d.lockIORange(offset, len(buf))
 	defer d.unlockIORange(startShard, endShard)
 
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return 0, ErrWriteDeadline
+	}
 	return d.file.WriteAt(buf, offset)
 }
 

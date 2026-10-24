@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/dir"
@@ -177,4 +178,110 @@ func TestReaderNeverSeesUncommittedBlocks(t *testing.T) {
 	if len(sizes) < 3 {
 		t.Fatalf("node B saw the file at only %d non-empty sizes while node A wrote it", len(sizes))
 	}
+}
+
+// readTogether ends both nodes' kept locks, then runs read on node A and, 5ms
+// later, on node B, so B joins A's shared claim while A waits to confirm it.
+func readTogether(t *testing.T, a, b *FS, read func(*FS) error) {
+	t.Helper()
+	a.lockMgr.ReleaseCached()
+	b.lockMgr.ReleaseCached()
+	errc := make(chan error, 1)
+	go func() { errc <- read(a) }()
+	time.Sleep(5 * time.Millisecond)
+	if err := read(b); err != nil {
+		t.Fatalf("node B read: %v", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("node A read: %v", err)
+	}
+}
+
+// promptly fails the test if op takes over 2s. A reader count leaked by the
+// reads before it would hold op off for the 15s it takes a lock to go stale.
+func promptly(t *testing.T, what string, op func(ctx context.Context) error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := op(ctx)
+	if took := time.Since(start); err != nil || took > 2*time.Second {
+		t.Fatalf("%s: err=%v after %v", what, err, took.Round(time.Millisecond))
+	}
+}
+
+func TestConcurrentDirReadsDoNotDelayCreateOrUnlink(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	fsA := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := fsA.InitRoot(ctx); err != nil {
+		t.Fatalf("InitRoot: %v", err)
+	}
+	fsB := openSnapshotFS(t, path)
+	addEntry := func(ctx context.Context, fsys *FS, name string) error {
+		root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+		if err != nil {
+			return err
+		}
+		return fsys.dirMgr.Add(ctx, root, name, uint64(newRegularFile(t, fsys).inodeNum), dir.DT_REG)
+	}
+	if err := addEntry(ctx, fsA, "keep"); err != nil {
+		t.Fatalf("add keep: %v", err)
+	}
+	lookup := func(fsys *FS) error {
+		root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+		if err != nil {
+			return err
+		}
+		_, _, err = fsys.dirMgr.Lookup(ctx, root, "keep")
+		return err
+	}
+
+	for i := range 3 {
+		name := fmt.Sprintf("file-%d", i)
+		readTogether(t, fsA, fsB, lookup)
+		promptly(t, "create "+name, func(ctx context.Context) error { return addEntry(ctx, fsA, name) })
+		readTogether(t, fsA, fsB, lookup)
+		promptly(t, "unlink "+name, func(ctx context.Context) error {
+			if errno := (&Dir{fs: fsB, inodeNum: inode.InodeRoot}).Unlink(ctx, name); errno != 0 {
+				return errno
+			}
+			return nil
+		})
+	}
+}
+
+func TestConcurrentRefcountReadsDoNotDelaySnapshots(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	fsA := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := fsA.InitRoot(ctx); err != nil {
+		t.Fatalf("InitRoot: %v", err)
+	}
+	fsB := openSnapshotFS(t, path)
+	f := newRegularFile(t, fsA)
+	writeAt(t, f, pattern(1, 2*BlockSize), 0)
+	readRefs := func(fsys *FS) error {
+		_, err := fsys.refcountReg.Get(ctx, 0)
+		return err
+	}
+
+	readTogether(t, fsA, fsB, readRefs)
+	promptly(t, "snapshot create", func(context.Context) error {
+		setxattr(t, f, "user.snapshot", "snap")
+		return nil
+	})
+	readTogether(t, fsA, fsB, readRefs)
+	promptly(t, "copy-on-write", func(context.Context) error {
+		writeAt(t, f, pattern(2, 4096), 0)
+		return nil
+	})
+	readTogether(t, fsA, fsB, readRefs)
+	promptly(t, "snapshot delete", func(ctx context.Context) error {
+		if errno := f.Removexattr(ctx, "user.snapshot.snap"); errno != 0 {
+			return errno
+		}
+		waitSnapshotGone(t, fsA, "snap")
+		return nil
+	})
 }
