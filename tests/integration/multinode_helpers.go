@@ -173,6 +173,20 @@ func (c *MultiNodeCluster) WaitAllMounted(timeout time.Duration) error {
 	return fmt.Errorf("timeout waiting for all nodes to mount after %v", timeout)
 }
 
+// waitFor polls cond until it is true or timeout passes, and reports how long that took.
+func waitFor(timeout time.Duration, cond func() bool) (time.Duration, bool) {
+	start := time.Now()
+	for {
+		if cond() {
+			return time.Since(start), true
+		}
+		if time.Since(start) > timeout {
+			return time.Since(start), false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // StartAllNodes starts all nodes (except first which should use FormatAndStartFirst).
 func (c *MultiNodeCluster) StartAllNodes(debug bool) error {
 	for i := 1; i < len(c.Nodes); i++ {

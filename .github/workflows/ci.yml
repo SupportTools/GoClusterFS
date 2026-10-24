@@ -37,6 +37,9 @@ jobs:
       - name: Run go vet
         run: make vet
 
+      - name: Check test parity manifest
+        run: make test-parity
+
       - name: Check formatting
         run: |
           if [ -n "$(gofmt -l .)" ]; then
