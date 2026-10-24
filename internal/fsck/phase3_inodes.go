@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 const (
@@ -63,6 +65,7 @@ type InodeData struct {
 	ExtentTreeRoot uint64
 	ExtentCount    uint64
 	ExtentDepth    uint32
+	ExtentTreeGen  uint64
 
 	// Checksum
 	Checksum uint32
@@ -110,7 +113,7 @@ func (c *Checker) checkInodes() error {
 	c.logf("  Total inode slots: %d\n", totalInodes)
 
 	// Read inodes sector by sector
-	sectorBuf := make([]byte, InodeSectorSize)
+	sectorBuf := storage.NewAlignedBuffer(InodeSectorSize).Bytes()
 	totalSectors := inodeTableSize / InodeSectorSize
 
 	usedInodes := uint64(0)
@@ -281,10 +284,11 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 		}
 	}
 
-	// Extent tree fields (offset 168-191)
+	// Extent tree fields (offset 168-195)
 	inode.ExtentTreeRoot = binary.LittleEndian.Uint64(buf[168:176])
 	inode.ExtentCount = binary.LittleEndian.Uint64(buf[176:184])
 	inode.ExtentDepth = binary.LittleEndian.Uint32(buf[184:188])
+	inode.ExtentTreeGen = binary.LittleEndian.Uint64(buf[188:196])
 
 	// Checksum (last 4 bytes)
 	inode.Checksum = binary.LittleEndian.Uint32(buf[252:256])
@@ -293,10 +297,17 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 }
 
 // recordInodeExtents records block references from inode extents.
+// For an inode with an extent tree, the tree nodes count as references too.
 func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
-	// Record inline extents
-	for i := 0; i < 2; i++ {
-		ext := inode.InlineExtents[i]
+	if inode.Flags&FlagHasExtentTree != 0 {
+		tree := c.walkExtentTree(inodeNum, inode)
+		c.extentTrees[inodeNum] = tree
+		for _, block := range tree.nodes {
+			c.inodeBlocks[block]++
+		}
+	}
+
+	for _, ext := range c.inodeExtents(inodeNum, inode) {
 		if ext.Length == 0 || (ext.Flags&ExtentFlagAllocated) == 0 {
 			continue
 		}
@@ -312,9 +323,6 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 			c.inodeBlocks[blockNum]++
 		}
 	}
-
-	// Note: Overflow extent tree would need to be traversed here
-	// when FlagHasExtentTree is set
 }
 
 // checkReservedInodes validates the reserved inode entries.

@@ -5,7 +5,7 @@
 //
 // Storage modes:
 //   - Inline: Up to 2 extents stored directly in the inode (64 bytes)
-//   - Tree: Overflow extents stored in a B-tree (future implementation)
+//   - Tree: More extents stored in an overflow tree of 1MB nodes (see tree.go)
 //
 // Extent flags support:
 //   - Allocated: Physical blocks are allocated
@@ -19,7 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
+	"math"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -50,12 +50,10 @@ const (
 // Errors
 var (
 	ErrExtentNotFound    = errors.New("extent not found")
-	ErrNoSpaceForExtent  = errors.New("no space for new extent (tree required)")
 	ErrExtentOverlap     = errors.New("extent overlap detected")
 	ErrInvalidExtent     = errors.New("invalid extent")
 	ErrBlockNotAllocated = errors.New("block not allocated")
 	ErrCoWRequired       = errors.New("copy-on-write required for shared block")
-	ErrCoWMultiBlock     = errors.New("CoW on multi-block extents not yet supported")
 )
 
 // CoWResult contains the result of a copy-on-write operation.
@@ -75,48 +73,52 @@ type Extent struct {
 
 // Manager manages extent operations for the filesystem.
 type Manager struct {
-	dev     *storage.Device
-	bitmap  *bitmap.Region
-	lockMgr *lock.Manager
+	dev        *storage.Device
+	bitmap     *bitmap.Region
+	lockMgr    *lock.Manager
+	dataOffset uint64
+	nodes      *nodeCache
+	leafCap    int // extents per leaf before it splits
+	indexCap   int // leaves per tree
 }
 
-// NewManager creates a new extent manager.
-func NewManager(dev *storage.Device, bm *bitmap.Region, lockMgr *lock.Manager) *Manager {
+// NewManager creates a new extent manager. dataOffset is the device offset of
+// data block 0; extent tree nodes are stored in data blocks.
+func NewManager(dev *storage.Device, bm *bitmap.Region, lockMgr *lock.Manager, dataOffset uint64) *Manager {
 	return &Manager{
-		dev:     dev,
-		bitmap:  bm,
-		lockMgr: lockMgr,
+		dev:        dev,
+		bitmap:     bm,
+		lockMgr:    lockMgr,
+		dataOffset: dataOffset,
+		nodes:      newNodeCache(nodeCacheEntries),
+		leafCap:    defaultLeafCap,
+		indexCap:   MaxNodeEntries,
 	}
 }
 
 // Lookup finds the extent containing the given logical block.
 // Returns the extent and the offset within that extent, or ErrExtentNotFound.
 func (m *Manager) Lookup(ino *inode.Inode, logicalBlock uint64) (*Extent, uint64, error) {
-	// Check inline extents first
-	for _, inline := range ino.InlineExtents {
-		if inline.Length == 0 {
-			continue // Empty slot
+	exts, err := m.lookupLeaf(ino, logicalBlock)
+	if err != nil {
+		return nil, 0, err
+	}
+	if exts == nil {
+		for _, inline := range ino.InlineExtents {
+			if inline.Length > 0 && logicalBlock >= inline.LogicalBlock && logicalBlock < inline.LogicalBlock+inline.Length {
+				ext := &Extent{inline.LogicalBlock, inline.PhysicalBlock, inline.Length, inline.Flags}
+				return ext, logicalBlock - ext.LogicalBlock, nil
+			}
 		}
-
-		ext := &Extent{
-			LogicalBlock:  inline.LogicalBlock,
-			PhysicalBlock: inline.PhysicalBlock,
-			Length:        inline.Length,
-			Flags:         inline.Flags,
-		}
-
-		if logicalBlock >= ext.LogicalBlock && logicalBlock < ext.LogicalBlock+ext.Length {
-			offset := logicalBlock - ext.LogicalBlock
-			return ext, offset, nil
-		}
+		return nil, 0, ErrExtentNotFound
 	}
 
-	// TODO: Check extent tree if FlagHasExtentTree is set
-	if ino.HasExtentTree() {
-		return nil, 0, fmt.Errorf("extent tree not yet implemented")
+	i, ok := find(exts, logicalBlock)
+	if !ok {
+		return nil, 0, ErrExtentNotFound
 	}
-
-	return nil, 0, ErrExtentNotFound
+	ext := exts[i]
+	return &ext, logicalBlock - ext.LogicalBlock, nil
 }
 
 // LookupPhysical returns the physical block number for a logical block.
@@ -139,129 +141,27 @@ func (m *Manager) LookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64,
 	return ext.PhysicalBlock + offset, nil
 }
 
-// Insert adds a new extent to the inode.
-// For Phase 2, only supports inline extents (max 2).
+// Insert adds a new extent to the inode, merging it with adjacent extents.
+// The extent map moves into an overflow tree when it outgrows the inode.
+// Changes reach disk when the inode is written.
 func (m *Manager) Insert(ctx context.Context, ino *inode.Inode, ext *Extent) error {
-	// Validate extent
 	if ext.Length == 0 {
 		return ErrInvalidExtent
 	}
-
-	// Check for overlaps with existing extents
-	for i, inline := range ino.InlineExtents {
-		if inline.Length == 0 {
-			continue
-		}
-
-		// Check if ranges overlap
-		if extentsOverlap(ext, &Extent{
-			LogicalBlock: inline.LogicalBlock,
-			Length:       inline.Length,
-		}) {
-			// Allow merge if adjacent and same physical region
-			if canMerge(ext, &Extent{
-				LogicalBlock:  inline.LogicalBlock,
-				PhysicalBlock: inline.PhysicalBlock,
-				Length:        inline.Length,
-				Flags:         inline.Flags,
-			}) {
-				// Merge the extents
-				merged := mergeExtents(ext, &Extent{
-					LogicalBlock:  inline.LogicalBlock,
-					PhysicalBlock: inline.PhysicalBlock,
-					Length:        inline.Length,
-					Flags:         inline.Flags,
-				})
-				ino.InlineExtents[i] = inode.InlineExtent{
-					LogicalBlock:  merged.LogicalBlock,
-					PhysicalBlock: merged.PhysicalBlock,
-					Length:        merged.Length,
-					Flags:         merged.Flags,
-				}
-				return nil
-			}
-			return ErrExtentOverlap
-		}
+	e, err := m.edit(ctx, ino)
+	if err != nil {
+		return err
 	}
-
-	// Find empty slot for new extent
-	for i, inline := range ino.InlineExtents {
-		if inline.Length == 0 {
-			ino.InlineExtents[i] = inode.InlineExtent{
-				LogicalBlock:  ext.LogicalBlock,
-				PhysicalBlock: ext.PhysicalBlock,
-				Length:        ext.Length,
-				Flags:         ext.Flags,
-			}
-			ino.ExtentCount++
-			return nil
-		}
+	if err := e.insert(*ext); err != nil {
+		return err
 	}
-
-	// TODO: Create extent tree if no inline slots available
-	if !ino.HasExtentTree() {
-		return ErrNoSpaceForExtent
-	}
-
-	return fmt.Errorf("extent tree insertion not yet implemented")
+	return e.commit()
 }
 
 // AllocateBlocks allocates physical blocks for a logical range.
-// Returns the extent representing the allocated blocks.
+// Returns the extent representing the first contiguous run of allocated blocks.
 func (m *Manager) AllocateBlocks(ctx context.Context, ino *inode.Inode, logicalBlock, count uint64) (*Extent, error) {
-	// Check if already allocated
-	existing, _, err := m.Lookup(ino, logicalBlock)
-	if err == nil && existing != nil {
-		// Already has an extent - check if it covers the full range
-		if logicalBlock >= existing.LogicalBlock &&
-			logicalBlock+count <= existing.LogicalBlock+existing.Length {
-			return existing, nil
-		}
-		// Partial coverage - need to extend or add new extent
-		// For now, return what we have
-		return existing, nil
-	}
-
-	// Allocate physical blocks
-	blocks, err := m.bitmap.Alloc(ctx, int(count))
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate blocks: %w", err)
-	}
-
-	// Check if blocks are contiguous
-	if !areContiguous(blocks) {
-		// For simplicity in Phase 2, require contiguous allocation
-		// Free the non-contiguous blocks and try again with smaller count
-		for _, b := range blocks {
-			m.bitmap.Free(ctx, b)
-		}
-		return nil, fmt.Errorf("non-contiguous allocation not yet supported")
-	}
-
-	// Create extent
-	ext := &Extent{
-		LogicalBlock:  logicalBlock,
-		PhysicalBlock: blocks[0],
-		Length:        uint64(len(blocks)),
-		Flags:         FlagAllocated,
-	}
-
-	// Insert into inode
-	if err := m.Insert(ctx, ino, ext); err != nil {
-		// Rollback allocation
-		for _, b := range blocks {
-			m.bitmap.Free(ctx, b)
-		}
-		return nil, err
-	}
-
-	// Update inode stats
-	ino.AllocatedBlocks += uint64(len(blocks))
-	// Blocks allocated via AllocateBlocks are for immediate write, so also count as written.
-	// Unwritten extents (from fallocate) would use FlagUnwritten and not increment WrittenBlocks.
-	ino.WrittenBlocks += uint64(len(blocks))
-
-	return ext, nil
+	return m.allocate(ctx, ino, logicalBlock, count, FlagAllocated)
 }
 
 // AllocateUnwritten allocates physical blocks marked as unwritten (lazy-zero).
@@ -269,110 +169,102 @@ func (m *Manager) AllocateBlocks(ctx context.Context, ino *inode.Inode, logicalB
 // Reads from unwritten blocks return zeros without disk I/O.
 // The first write to an unwritten block clears the Unwritten flag.
 func (m *Manager) AllocateUnwritten(ctx context.Context, ino *inode.Inode, logicalBlock, count uint64) (*Extent, error) {
-	// Check if already allocated
+	return m.allocate(ctx, ino, logicalBlock, count, FlagAllocated|FlagUnwritten)
+}
+
+func (m *Manager) allocate(ctx context.Context, ino *inode.Inode, logicalBlock, count uint64, flags uint32) (*Extent, error) {
 	existing, _, err := m.Lookup(ino, logicalBlock)
-	if err == nil && existing != nil {
-		// Already has extent - return it (no-op for already allocated blocks)
+	if err == nil {
 		return existing, nil
 	}
+	if err != ErrExtentNotFound {
+		return nil, err
+	}
 
-	// Allocate physical blocks
 	blocks, err := m.bitmap.Alloc(ctx, int(count))
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate blocks: %w", err)
 	}
 
-	// Check if blocks are contiguous
-	if !areContiguous(blocks) {
-		for _, b := range blocks {
-			m.bitmap.Free(ctx, b)
-		}
-		return nil, fmt.Errorf("non-contiguous allocation not yet supported")
+	runs := contiguousRuns(logicalBlock, blocks, flags)
+	e, err := m.edit(ctx, ino)
+	for i := 0; err == nil && i < len(runs); i++ {
+		err = e.insert(runs[i])
 	}
-
-	// Create extent with BOTH FlagAllocated and FlagUnwritten
-	ext := &Extent{
-		LogicalBlock:  logicalBlock,
-		PhysicalBlock: blocks[0],
-		Length:        uint64(len(blocks)),
-		Flags:         FlagAllocated | FlagUnwritten,
+	if err == nil {
+		err = e.commit()
 	}
-
-	// Insert into inode
-	if err := m.Insert(ctx, ino, ext); err != nil {
+	if err != nil {
 		for _, b := range blocks {
 			m.bitmap.Free(ctx, b)
 		}
 		return nil, err
 	}
 
-	// Update inode stats - only AllocatedBlocks, NOT WrittenBlocks
-	// Unwritten extents don't count toward written blocks until first write
-	ino.AllocatedBlocks += uint64(len(blocks))
+	ino.AllocatedBlocks += count
+	if flags&FlagUnwritten == 0 {
+		ino.WrittenBlocks += count
+	}
+	return &runs[0], nil
+}
 
-	return ext, nil
+// contiguousRuns maps blocks onto consecutive logical blocks starting at
+// logicalBlock, one extent per physically contiguous run.
+func contiguousRuns(logicalBlock uint64, blocks []uint64, flags uint32) []Extent {
+	var runs []Extent
+	for i, b := range blocks {
+		if n := len(runs); n > 0 && runs[n-1].PhysicalBlock+runs[n-1].Length == b {
+			runs[n-1].Length++
+			continue
+		}
+		runs = append(runs, Extent{logicalBlock + uint64(i), b, 1, flags})
+	}
+	return runs
 }
 
 // ClearUnwritten clears the Unwritten flag for an extent and increments WrittenBlocks.
 // Called on first write to an unwritten block.
 // Returns true if the flag was cleared (first write), false if already written.
-func (m *Manager) ClearUnwritten(ino *inode.Inode, ext *Extent) bool {
+func (m *Manager) ClearUnwritten(ino *inode.Inode, ext *Extent) (bool, error) {
 	if ext.Flags&FlagUnwritten == 0 {
-		return false // Already written, nothing to do
+		return false, nil
 	}
-
-	// Clear the flag
+	e, err := m.edit(context.Background(), ino)
+	if err != nil {
+		return false, err
+	}
+	var length uint64
+	found, err := e.update(ext.LogicalBlock, func(x *Extent) {
+		x.Flags &^= FlagUnwritten
+		length = x.Length
+	})
+	if err != nil || !found {
+		return false, err
+	}
+	if err := e.commit(); err != nil {
+		return false, err
+	}
 	ext.Flags &^= FlagUnwritten
-
-	// Update the inline extent in inode
-	for i, inline := range ino.InlineExtents {
-		if inline.LogicalBlock == ext.LogicalBlock && inline.Length == ext.Length {
-			ino.InlineExtents[i].Flags = ext.Flags
-			break
-		}
-	}
-
-	// Increment WrittenBlocks
-	ino.WrittenBlocks += ext.Length
-
-	return true
+	ino.WrittenBlocks += length
+	return true, nil
 }
 
-// FreeExtent frees the physical blocks for an extent.
+// FreeExtent frees the physical blocks for the extent containing logicalBlock.
 func (m *Manager) FreeExtent(ctx context.Context, ino *inode.Inode, logicalBlock uint64) error {
-	// Find the extent
 	ext, _, err := m.Lookup(ino, logicalBlock)
 	if err != nil {
 		return err
 	}
+	return m.unmap(ctx, ino, ext.LogicalBlock, ext.LogicalBlock+ext.Length)
+}
 
-	// Free all blocks in the extent
-	for i := uint64(0); i < ext.Length; i++ {
-		if err := m.bitmap.Free(ctx, ext.PhysicalBlock+i); err != nil {
-			// Continue freeing other blocks even if one fails
-			continue
-		}
+// AllocatePhysicalBlock allocates one block without mapping it into any inode.
+func (m *Manager) AllocatePhysicalBlock(ctx context.Context) (uint64, error) {
+	blocks, err := m.bitmap.Alloc(ctx, 1)
+	if err != nil {
+		return 0, err
 	}
-
-	// Remove extent from inode
-	for i, inline := range ino.InlineExtents {
-		if inline.LogicalBlock == ext.LogicalBlock && inline.Length == ext.Length {
-			ino.InlineExtents[i] = inode.InlineExtent{} // Clear
-			ino.ExtentCount--
-			break
-		}
-	}
-
-	// Update inode stats
-	if ino.AllocatedBlocks >= ext.Length {
-		ino.AllocatedBlocks -= ext.Length
-	}
-	// Decrement WrittenBlocks for actually written extents (not unwritten)
-	if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
-		ino.WrittenBlocks -= ext.Length
-	}
-
-	return nil
+	return blocks[0], nil
 }
 
 // FreePhysicalBlock frees a single physical block back to the bitmap.
@@ -385,191 +277,95 @@ func (m *Manager) FreePhysicalBlock(ctx context.Context, physBlock uint64) error
 // Truncate removes all extents beyond the given size.
 func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64) error {
 	log.Printf("[DEBUG] extent.Truncate: inode %d, newSize=%d, extentCount=%d", ino.InodeNum, newSize, ino.ExtentCount)
-	// Special case: truncate to 0 frees everything
-	if newSize == 0 {
-		for i := range ino.InlineExtents {
-			ext := &ino.InlineExtents[i]
-			if ext.Length == 0 {
-				continue
-			}
-
-			log.Printf("[DEBUG] extent.Truncate: freeing extent[%d] physBlock=%d len=%d flags=%d", i, ext.PhysicalBlock, ext.Length, ext.Flags)
-
-			// For shared extents (from clones/snapshots), don't free the block.
-			// The refcount system ensures the block is kept until all references are gone.
-			if ext.Flags&FlagShared != 0 {
-				log.Printf("[DEBUG] extent.Truncate: skipping shared extent (refcount will manage)")
-				// Just update accounting and clear the extent
-				ino.AllocatedBlocks -= ext.Length
-				if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
-					ino.WrittenBlocks -= ext.Length
-				}
-				*ext = inode.InlineExtent{} // Clear
-				ino.ExtentCount--
-				continue
-			}
-
-			// Free all blocks (not shared)
-			for j := uint64(0); j < ext.Length; j++ {
-				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+j); err != nil {
-					log.Printf("[DEBUG] extent.Truncate: bitmap.Free(%d) failed: %v", ext.PhysicalBlock+j, err)
-				}
-			}
-			ino.AllocatedBlocks -= ext.Length
-			// Decrement WrittenBlocks for actually written extents (not unwritten)
-			if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
-				ino.WrittenBlocks -= ext.Length
-			}
-			*ext = inode.InlineExtent{} // Clear
-			ino.ExtentCount--
-		}
-		ino.Size = 0
-		return nil
+	if err := m.unmap(ctx, ino, BlocksForSize(newSize), math.MaxUint64); err != nil {
+		return err
 	}
-
-	// Calculate the last block to keep
-	lastBlock := (newSize - 1) / BlockSize
-
-	// Process inline extents
-	for i := range ino.InlineExtents {
-		ext := &ino.InlineExtents[i]
-		if ext.Length == 0 {
-			continue
-		}
-
-		extEnd := ext.LogicalBlock + ext.Length - 1
-
-		if ext.LogicalBlock > lastBlock {
-			// Entire extent is beyond truncation point - free all blocks
-			for j := uint64(0); j < ext.Length; j++ {
-				m.bitmap.Free(ctx, ext.PhysicalBlock+j)
-			}
-			ino.AllocatedBlocks -= ext.Length
-			// Decrement WrittenBlocks for actually written extents (not unwritten)
-			if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= ext.Length {
-				ino.WrittenBlocks -= ext.Length
-			}
-			*ext = inode.InlineExtent{} // Clear
-			ino.ExtentCount--
-		} else if extEnd > lastBlock {
-			// Partial truncation - free blocks beyond lastBlock
-			keepBlocks := lastBlock - ext.LogicalBlock + 1
-			freeBlocks := ext.Length - keepBlocks
-
-			for j := uint64(0); j < freeBlocks; j++ {
-				m.bitmap.Free(ctx, ext.PhysicalBlock+keepBlocks+j)
-			}
-			ino.AllocatedBlocks -= freeBlocks
-			// Decrement WrittenBlocks for freed portion if extent was written
-			if ext.Flags&FlagUnwritten == 0 && ino.WrittenBlocks >= freeBlocks {
-				ino.WrittenBlocks -= freeBlocks
-			}
-			ext.Length = keepBlocks
-		}
-	}
-
-	// Update inode size
 	ino.Size = newSize
-
 	return nil
 }
 
-// MaxAllocatedOffset returns the highest byte offset covered by allocated extents.
-// This is used to derive file size from extents, which eliminates race conditions
-// when multiple nodes write to the same file at different offsets - each node's
-// write creates/extends different extents, and the true size is always the max.
-func (m *Manager) MaxAllocatedOffset(ino *inode.Inode) uint64 {
-	max := uint64(0)
-	for _, ext := range ino.InlineExtents {
-		if ext.Length == 0 {
-			continue
-		}
-		// Calculate the end byte offset of this extent
-		end := (ext.LogicalBlock + ext.Length) * BlockSize
-		if end > max {
-			max = end
-		}
+// unmap removes logical blocks [from, to) from the inode and releases them.
+func (m *Manager) unmap(ctx context.Context, ino *inode.Inode, from, to uint64) error {
+	e, err := m.edit(ctx, ino)
+	if err != nil {
+		return err
 	}
-	return max
+	removed, err := e.removeRange(from, to)
+	if err != nil {
+		return err
+	}
+	if err := e.commit(); err != nil {
+		return err
+	}
+	m.release(ctx, ino, removed)
+	return nil
 }
 
-// ListExtents returns all extents for an inode.
-func (m *Manager) ListExtents(ino *inode.Inode) []*Extent {
+// release updates block accounting for removed extents and frees their blocks.
+// Shared blocks stay allocated for the refcount system, and SFB extents point
+// into containers rather than at bitmap blocks.
+func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Extent) {
+	for _, x := range removed {
+		ino.AllocatedBlocks -= min(ino.AllocatedBlocks, x.Length)
+		if x.Flags&FlagUnwritten == 0 {
+			ino.WrittenBlocks -= min(ino.WrittenBlocks, x.Length)
+		}
+		if x.Flags&(FlagShared|FlagSFB) != 0 {
+			continue
+		}
+		for j := uint64(0); j < x.Length; j++ {
+			if err := m.bitmap.Free(ctx, x.PhysicalBlock+j); err != nil {
+				log.Printf("[extent] inode %d: free block %d: %v", ino.InodeNum, x.PhysicalBlock+j, err)
+			}
+		}
+	}
+}
+
+// ListExtents returns all extents for an inode, sorted by logical block.
+func (m *Manager) ListExtents(ino *inode.Inode) ([]*Extent, error) {
 	var extents []*Extent
-
-	for _, inline := range ino.InlineExtents {
-		if inline.Length == 0 {
-			continue
-		}
-		extents = append(extents, &Extent{
-			LogicalBlock:  inline.LogicalBlock,
-			PhysicalBlock: inline.PhysicalBlock,
-			Length:        inline.Length,
-			Flags:         inline.Flags,
-		})
-	}
-
-	// Sort by logical block
-	sort.Slice(extents, func(i, j int) bool {
-		return extents[i].LogicalBlock < extents[j].LogicalBlock
+	err := m.forEach(ino, func(x Extent) {
+		extents = append(extents, &x)
 	})
-
-	return extents
+	return extents, err
 }
 
-// extentsOverlap checks if two extents overlap.
-func extentsOverlap(a, b *Extent) bool {
-	aEnd := a.LogicalBlock + a.Length
-	bEnd := b.LogicalBlock + b.Length
-	return a.LogicalBlock < bEnd && aEnd > b.LogicalBlock
+// DataBlocks returns every physical data block mapped by the inode, in logical
+// order. SFB extents are skipped because they point into shared containers.
+func (m *Manager) DataBlocks(ino *inode.Inode) ([]uint64, error) {
+	var blocks []uint64
+	err := m.forEach(ino, func(x Extent) {
+		if x.Flags&FlagSFB != 0 {
+			return
+		}
+		for j := uint64(0); j < x.Length; j++ {
+			blocks = append(blocks, x.PhysicalBlock+j)
+		}
+	})
+	return blocks, err
 }
 
-// canMerge checks if two extents can be merged.
-func canMerge(a, b *Extent) bool {
-	// Must be adjacent (logically)
-	if a.LogicalBlock+a.Length != b.LogicalBlock &&
-		b.LogicalBlock+b.Length != a.LogicalBlock {
-		return false
+func (m *Manager) forEach(ino *inode.Inode, fn func(Extent)) error {
+	leaves, err := m.layout(ino)
+	if err != nil {
+		return err
 	}
-
-	// Must be adjacent (physically)
-	if a.LogicalBlock < b.LogicalBlock {
-		// a comes first
-		return a.PhysicalBlock+a.Length == b.PhysicalBlock
+	if len(leaves) == 0 {
+		for _, x := range inlineExtents(ino) {
+			fn(x)
+		}
+		return nil
 	}
-	// b comes first
-	return b.PhysicalBlock+b.Length == a.PhysicalBlock
-}
-
-// mergeExtents merges two adjacent extents.
-func mergeExtents(a, b *Extent) *Extent {
-	if a.LogicalBlock < b.LogicalBlock {
-		return &Extent{
-			LogicalBlock:  a.LogicalBlock,
-			PhysicalBlock: a.PhysicalBlock,
-			Length:        a.Length + b.Length,
-			Flags:         a.Flags, // Keep first extent's flags
+	for _, l := range leaves {
+		exts, err := m.leafExtents(ino.InodeNum, l)
+		if err != nil {
+			return err
+		}
+		for _, x := range exts {
+			fn(x)
 		}
 	}
-	return &Extent{
-		LogicalBlock:  b.LogicalBlock,
-		PhysicalBlock: b.PhysicalBlock,
-		Length:        a.Length + b.Length,
-		Flags:         b.Flags,
-	}
-}
-
-// areContiguous checks if block numbers are contiguous.
-func areContiguous(blocks []uint64) bool {
-	if len(blocks) <= 1 {
-		return true
-	}
-	for i := 1; i < len(blocks); i++ {
-		if blocks[i] != blocks[i-1]+1 {
-			return false
-		}
-	}
-	return true
+	return nil
 }
 
 // SerializeExtent converts an Extent to bytes.
@@ -657,60 +453,15 @@ func BlockToOffset(block uint64) uint64 {
 }
 
 // AddExtentForRecovery adds an extent during recovery.
-// This is similar to Insert but designed for idempotent recovery.
-// It uses Insert internally but handles the case where the extent
-// may already exist due to concurrent recovery.
+// Callers check with Lookup first; an overlap means another recovery won.
 func (m *Manager) AddExtentForRecovery(ctx context.Context, ino *inode.Inode, ext *Extent) error {
 	return m.Insert(ctx, ino, ext)
 }
 
-// RemoveExtentForRecovery removes extents during recovery.
-// This removes extents starting at fileBlock for the given length.
+// RemoveExtentForRecovery unmaps logical blocks [fileBlock, fileBlock+length)
+// during recovery and frees them.
 func (m *Manager) RemoveExtentForRecovery(ctx context.Context, ino *inode.Inode, fileBlock, length uint32) error {
-	// Find and remove extents that overlap with the specified range
-	for i := range ino.InlineExtents {
-		ext := &ino.InlineExtents[i]
-		if ext.Length == 0 {
-			continue
-		}
-
-		// Check if this extent overlaps with the range to remove
-		rangeEnd := uint64(fileBlock) + uint64(length)
-		extEnd := ext.LogicalBlock + ext.Length
-
-		if ext.LogicalBlock >= uint64(fileBlock) && ext.LogicalBlock < rangeEnd {
-			// This extent starts within the removal range
-			// Free all blocks in this extent
-			for j := uint64(0); j < ext.Length; j++ {
-				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+j); err != nil {
-					log.Printf("[Recovery] Failed to free block %d: %v", ext.PhysicalBlock+j, err)
-				}
-			}
-			if ino.AllocatedBlocks >= ext.Length {
-				ino.AllocatedBlocks -= ext.Length
-			}
-			*ext = inode.InlineExtent{} // Clear
-			if ino.ExtentCount > 0 {
-				ino.ExtentCount--
-			}
-		} else if uint64(fileBlock) > ext.LogicalBlock && uint64(fileBlock) < extEnd {
-			// Removal starts in the middle of this extent - partial removal
-			keepBlocks := uint64(fileBlock) - ext.LogicalBlock
-			freeBlocks := ext.Length - keepBlocks
-
-			for j := uint64(0); j < freeBlocks; j++ {
-				if err := m.bitmap.Free(ctx, ext.PhysicalBlock+keepBlocks+j); err != nil {
-					log.Printf("[Recovery] Failed to free block %d: %v", ext.PhysicalBlock+keepBlocks+j, err)
-				}
-			}
-			if ino.AllocatedBlocks >= freeBlocks {
-				ino.AllocatedBlocks -= freeBlocks
-			}
-			ext.Length = keepBlocks
-		}
-	}
-
-	return nil
+	return m.unmap(ctx, ino, uint64(fileBlock), uint64(fileBlock)+uint64(length))
 }
 
 // NeedsCoW checks if a write to the given extent requires copy-on-write.
@@ -729,19 +480,22 @@ func (m *Manager) NeedsCoW(ctx context.Context, ext *Extent, refcountReg *refcou
 	return entry.NeedsCoW(), nil
 }
 
-// CopyOnWrite performs copy-on-write for a shared block.
-// Allocates a new block, copies data, and updates the extent.
+// CopyOnWrite performs copy-on-write for the shared block at logicalBlock.
+// It allocates a new block, copies the data, and maps just that block to the
+// copy, splitting a multi-block extent if needed. On a copy, ext is updated to
+// the new single-block mapping.
 // The caller must decrement the old block's refcount after this returns.
 func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent,
 	logicalBlock uint64, dataOffset uint64, refcountReg *refcount.Region) (*CoWResult, error) {
 
-	offsetInExtent := logicalBlock - ext.LogicalBlock
-	result := &CoWResult{
-		OldPhysBlock: ext.PhysicalBlock + offsetInExtent,
-		WasShared:    false,
+	cur, offset, err := m.Lookup(ino, logicalBlock)
+	if err != nil {
+		return nil, err
 	}
+	result := &CoWResult{OldPhysBlock: cur.PhysicalBlock + offset}
+	block := Extent{logicalBlock, result.OldPhysBlock, 1, cur.Flags}
 
-	needsCoW, err := m.NeedsCoW(ctx, ext, refcountReg)
+	needsCoW, err := m.NeedsCoW(ctx, &block, refcountReg)
 	if err != nil {
 		return nil, err
 	}
@@ -750,21 +504,14 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 		return result, nil
 	}
 
-	// Only support single-block extents for now
-	if ext.Length != 1 {
-		return nil, ErrCoWMultiBlock
-	}
-
 	log.Printf("[CoW] Block %d is shared, performing copy-on-write", result.OldPhysBlock)
 
-	// Allocate new block
 	newBlocks, err := m.bitmap.Alloc(ctx, 1)
 	if err != nil {
 		return nil, fmt.Errorf("CoW alloc failed: %w", err)
 	}
 	newPhysBlock := newBlocks[0]
 
-	// Copy data from old to new block
 	buf := storage.GetBuffer(BlockSize)
 	defer storage.PutBuffer(buf)
 
@@ -780,19 +527,12 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 		return nil, fmt.Errorf("CoW write failed: %w", err)
 	}
 
-	// Update extent to point to new block
-	ext.PhysicalBlock = newPhysBlock
-	ext.Flags &^= FlagShared
-
-	// Update inline extent in inode
-	for i := range ino.InlineExtents {
-		inline := &ino.InlineExtents[i]
-		if inline.LogicalBlock == ext.LogicalBlock {
-			inline.PhysicalBlock = newPhysBlock
-			inline.Flags &^= FlagShared
-			break
-		}
+	private := Extent{logicalBlock, newPhysBlock, 1, cur.Flags &^ FlagShared}
+	if err := m.remap(ctx, ino, private); err != nil {
+		m.bitmap.Free(ctx, newPhysBlock)
+		return nil, err
 	}
+	*ext = private
 
 	result.NewPhysBlock = newPhysBlock
 	result.WasShared = true
@@ -800,26 +540,58 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 	return result, nil
 }
 
-// MarkAllShared sets FlagShared on all extents of an inode.
-func (m *Manager) MarkAllShared(ino *inode.Inode) {
-	for i := range ino.InlineExtents {
-		if ino.InlineExtents[i].Length > 0 {
-			ino.InlineExtents[i].Flags |= FlagShared
-		}
+// remap points the logical blocks covered by x at x's physical blocks without
+// freeing the blocks they mapped before.
+func (m *Manager) remap(ctx context.Context, ino *inode.Inode, x Extent) error {
+	e, err := m.edit(ctx, ino)
+	if err != nil {
+		return err
 	}
+	if _, err := e.removeRange(x.LogicalBlock, x.LogicalBlock+x.Length); err != nil {
+		return err
+	}
+	if err := e.insert(x); err != nil {
+		return err
+	}
+	return e.commit()
+}
+
+// MarkAllShared sets FlagShared on all extents of an inode.
+func (m *Manager) MarkAllShared(ino *inode.Inode) error {
+	e, err := m.edit(context.Background(), ino)
+	if err != nil {
+		return err
+	}
+	if err := e.updateAll(func(x *Extent) { x.Flags |= FlagShared }); err != nil {
+		return err
+	}
+	return e.commit()
 }
 
 // CopyExtentsForClone copies all extents from src to dst with FlagShared set.
 // Used when creating writable clones - the clone shares blocks with the source
 // until either is modified, at which point CoW allocates new blocks.
-func (m *Manager) CopyExtentsForClone(src *inode.Inode, dst *inode.Inode) {
-	for i := range src.InlineExtents {
-		if src.InlineExtents[i].Length > 0 {
-			dst.InlineExtents[i] = src.InlineExtents[i]
-			dst.InlineExtents[i].Flags |= FlagShared
-		}
+// dst must have no extents; it gets its own extent tree when src has one.
+func (m *Manager) CopyExtentsForClone(ctx context.Context, src *inode.Inode, dst *inode.Inode) error {
+	if dst.ExtentCount != 0 || dst.HasExtentTree() || dst.PendingTree != nil {
+		return fmt.Errorf("clone target inode %d already has extents", dst.InodeNum)
 	}
-	dst.ExtentCount = src.ExtentCount
+	all := []Extent{}
+	if err := m.forEach(src, func(x Extent) {
+		x.Flags |= FlagShared
+		all = append(all, x)
+	}); err != nil {
+		return err
+	}
+	e, err := m.edit(ctx, dst)
+	if err != nil {
+		return err
+	}
+	e.set(0, all)
+	if err := e.commit(); err != nil {
+		return err
+	}
 	dst.AllocatedBlocks = src.AllocatedBlocks
 	dst.WrittenBlocks = src.WrittenBlocks
+	return nil
 }

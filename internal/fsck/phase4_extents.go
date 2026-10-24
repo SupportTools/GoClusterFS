@@ -2,6 +2,8 @@ package fsck
 
 import (
 	"fmt"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 // checkExtents validates extent consistency (Phase 4).
@@ -37,7 +39,7 @@ func (c *Checker) checkExtents() error {
 	inodeTableOffset := sb.InodeTableOffset
 	inodeTableSize := sb.InodeTableSize
 	totalSectors := inodeTableSize / InodeSectorSize
-	sectorBuf := make([]byte, InodeSectorSize)
+	sectorBuf := storage.NewAlignedBuffer(InodeSectorSize).Bytes()
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
@@ -56,9 +58,8 @@ func (c *Checker) checkExtents() error {
 			inodeBuf := sectorBuf[inodeIdx*InodeSize : (inodeIdx+1)*InodeSize]
 			inode := c.parseInode(inodeBuf)
 
-			// Check each inline extent
-			for extIdx := 0; extIdx < 2; extIdx++ {
-				ext := inode.InlineExtents[extIdx]
+			// Check each extent, inline or from the extent tree
+			for extIdx, ext := range c.inodeExtents(inodeNum, inode) {
 				if ext.Length == 0 {
 					continue
 				}
@@ -121,16 +122,36 @@ func (c *Checker) checkExtents() error {
 				}
 			}
 
-			// Check extent tree if present
-			if (inode.Flags & FlagHasExtentTree) != 0 {
-				if inode.ExtentTreeRoot == 0 {
+			// Check extent tree structure and the blocks its nodes occupy
+			if tree := c.extentTrees[inodeNum]; tree != nil {
+				if inode.InlineExtents != [2]ExtentData{} {
 					c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d", inodeNum),
-						"FlagHasExtentTree set but ExtentTreeRoot is 0",
+						"inline extents set on an inode that uses an extent tree",
 						false)
-				} else {
-					// TODO: Traverse and validate extent tree
-					c.logf("  Inode %d has extent tree (root=%d, count=%d, depth=%d) - tree validation not yet implemented\n",
-						inodeNum, inode.ExtentTreeRoot, inode.ExtentCount, inode.ExtentDepth)
+					extentErrors++
+				}
+				if tree.err != nil {
+					c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d", inodeNum),
+						fmt.Sprintf("extent tree: %v", tree.err),
+						false)
+					extentErrors++
+				}
+				for _, block := range tree.nodes {
+					location := fmt.Sprintf("inode %d tree node %d", inodeNum, block)
+					if !c.bitmapAllocated[block] {
+						c.addProblem(PhaseExtents, Error, location,
+							"extent tree node block not marked allocated in bitmap",
+							true)
+						extentErrors++
+					}
+					if owner, exists := blockOwner[block]; exists {
+						c.addProblem(PhaseExtents, Critical, location,
+							fmt.Sprintf("extent tree node block also claimed by inode %d", owner),
+							false)
+						overlappingBlocks++
+					} else {
+						blockOwner[block] = inodeNum
+					}
 				}
 			}
 		}

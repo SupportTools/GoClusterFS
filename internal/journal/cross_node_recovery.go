@@ -449,6 +449,7 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, payload []byte) 
 		LogicalBlock:  p.FileBlock,
 		PhysicalBlock: p.DiskBlock,
 		Length:        uint64(p.Length),
+		Flags:         extent.FlagAllocated,
 	}
 
 	if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, ext); err != nil {

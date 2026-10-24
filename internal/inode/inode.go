@@ -74,7 +74,15 @@ var (
 	ErrInodeInUse       = errors.New("inode already in use")
 	ErrInodeNotInUse    = errors.New("inode not in use")
 	ErrChecksumMismatch = errors.New("inode checksum mismatch")
+	ErrNoTreeFlusher    = errors.New("inode has pending extent tree changes but no tree flusher is set")
 )
+
+// TreeFlusher writes an inode's pending extent-tree changes before the inode
+// itself is written. It runs under the inode lock; onDisk is the inode as it is
+// currently stored. The returned func, if any, runs once the inode write succeeds.
+type TreeFlusher interface {
+	FlushTree(ino, onDisk *Inode) (committed func(), err error)
+}
 
 // InlineExtent represents an extent stored directly in the inode.
 // Size: 32 bytes.
@@ -108,8 +116,13 @@ type Inode struct {
 	ExtentTreeRoot   uint64          // Block number for overflow tree
 	ExtentCount      uint64          // Total extent count
 	ExtentDepth      uint32          // Extent tree depth (0 = inline only)
-	Reserved         [52]byte        // Padding to 252 bytes
+	ExtentTreeGen    uint64          // Commit generation of the tree root; its low bit picks the root's active half
+	Reserved         [56]byte        // Padding to 252 bytes
 	Checksum         uint32          // CRC32C checksum
+
+	// PendingTree holds extent-tree changes owned by package extent that are
+	// not on disk yet. It is never serialized; Table writes it via its TreeFlusher.
+	PendingTree any
 }
 
 // Table manages the inode table on disk.
@@ -121,6 +134,13 @@ type Table struct {
 	totalInodes uint64        // Total inode count
 	lockMgr     *lock.Manager // For distributed locking (optional)
 	nodeUUID    [16]byte      // This node's UUID
+	treeFlusher TreeFlusher
+}
+
+// SetTreeFlusher sets the writer for pending extent-tree changes.
+// It must be set before any inode with an extent tree is modified.
+func (t *Table) SetTreeFlusher(f TreeFlusher) {
+	t.treeFlusher = f
 }
 
 // NewTable creates a new inode table manager.
@@ -173,11 +193,7 @@ func (t *Table) Write(ctx context.Context, inode *Inode) error {
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inode.InodeNum))
 	}
 
-	// Update modification tracking
-	inode.LastModifierUUID = t.nodeUUID
-	inode.MetaGeneration++
-
-	return t.writeInodeUnlocked(inode)
+	return t.writeWithTree(inode)
 }
 
 // WriteWithLockHeld writes an inode to disk without acquiring the distributed lock.
@@ -191,11 +207,38 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Update modification tracking
+	return t.writeWithTree(inode)
+}
+
+// writeWithTree flushes pending extent-tree changes, then writes the inode.
+// The inode sector write is the commit point for the tree.
+// Caller must hold t.mu and the inode lock.
+func (t *Table) writeWithTree(inode *Inode) error {
+	var committed func()
+	if inode.PendingTree != nil {
+		if t.treeFlusher == nil {
+			return ErrNoTreeFlusher
+		}
+		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
+		if err != nil {
+			return err
+		}
+		if committed, err = t.treeFlusher.FlushTree(inode, onDisk); err != nil {
+			return err
+		}
+	}
+
 	inode.LastModifierUUID = t.nodeUUID
 	inode.MetaGeneration++
 
-	return t.writeInodeUnlocked(inode)
+	if err := t.writeInodeUnlocked(inode); err != nil {
+		return err
+	}
+	inode.PendingTree = nil
+	if committed != nil {
+		committed()
+	}
+	return nil
 }
 
 // FindFreeSlot scans for a free inode slot without acquiring any distributed locks.
@@ -553,8 +596,9 @@ func serializeInode(inode *Inode) []byte {
 	binary.LittleEndian.PutUint64(buf[168:176], inode.ExtentTreeRoot)
 	binary.LittleEndian.PutUint64(buf[176:184], inode.ExtentCount)
 	binary.LittleEndian.PutUint32(buf[184:188], inode.ExtentDepth)
+	binary.LittleEndian.PutUint64(buf[188:196], inode.ExtentTreeGen)
 
-	// Reserved bytes 188-251 (64 bytes) - already zero
+	// Reserved bytes 196-251 (56 bytes) - already zero
 
 	// Compute checksum (bytes 0-251)
 	checksum := storage.CRC32C(buf[:InodeSize-4])
@@ -603,6 +647,7 @@ func deserializeInode(buf []byte) (*Inode, error) {
 		ExtentTreeRoot:  binary.LittleEndian.Uint64(buf[168:176]),
 		ExtentCount:     binary.LittleEndian.Uint64(buf[176:184]),
 		ExtentDepth:     binary.LittleEndian.Uint32(buf[184:188]),
+		ExtentTreeGen:   binary.LittleEndian.Uint64(buf[188:196]),
 		Checksum:        stored,
 	}
 

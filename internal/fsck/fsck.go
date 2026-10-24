@@ -334,6 +334,7 @@ type Checker struct {
 	dirEntryRefs    map[uint32]int    // inode -> reference count from dir entries
 	refcountEntries map[uint64]uint32 // block -> refcount from table
 	snapshotInodes  map[uint32]bool   // inodes referenced by snapshots
+	extentTrees     map[uint32]*extentTree
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
@@ -400,6 +401,7 @@ func New(dev *storage.Device, opts Options) *Checker {
 		dirEntryRefs:    make(map[uint32]int),
 		refcountEntries: make(map[uint64]uint32),
 		snapshotInodes:  make(map[uint32]bool),
+		extentTrees:     make(map[uint32]*extentTree),
 	}
 }
 

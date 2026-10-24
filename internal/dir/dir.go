@@ -339,9 +339,12 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 	for block := uint64(0); block < numBlocks; block++ {
 		// Look up the extent for this logical block
 		ext, extOffset, err := m.extentMgr.Lookup(dirIno, block)
-		if err != nil {
+		if err == extent.ErrExtentNotFound {
 			// No extent for this block - it's a hole (shouldn't happen for directories)
 			continue
+		}
+		if err != nil {
+			return err
 		}
 		physBlock := ext.PhysicalBlock + extOffset
 
@@ -524,9 +527,12 @@ func (m *Manager) readEntries(ctx context.Context, dirIno *inode.Inode) ([]DirEn
 	for block := uint64(0); block < numBlocks; block++ {
 		// Look up the extent for this logical block
 		ext, offset, err := m.extentMgr.Lookup(dirIno, block)
-		if err != nil {
+		if err == extent.ErrExtentNotFound {
 			// No extent for this block - it's a hole (shouldn't happen for directories)
 			continue
+		}
+		if err != nil {
+			return nil, err
 		}
 		physBlock := ext.PhysicalBlock + offset
 
@@ -581,9 +587,12 @@ func (m *Manager) addToExistingBlock(ctx context.Context, dirIno *inode.Inode, n
 	for block := uint64(0); block < numBlocks; block++ {
 		// Look up the extent for this logical block
 		ext, extOffset, err := m.extentMgr.Lookup(dirIno, block)
-		if err != nil {
+		if err == extent.ErrExtentNotFound {
 			// No extent for this block - it's a hole
 			continue
+		}
+		if err != nil {
+			return false, err
 		}
 		physBlock := ext.PhysicalBlock + extOffset
 
@@ -646,7 +655,7 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	nextBlock := extent.BlocksForSize(dirIno.Size)
 
 	// Allocate a new block (this acquires bitmap lock - level 6)
-	ext, err := m.extentMgr.AllocateBlocks(ctx, dirIno, nextBlock, 1)
+	physBlock, err := m.extentMgr.AllocatePhysicalBlock(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to allocate directory block: %w", err)
 	}
@@ -658,10 +667,17 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 			// Free the allocated block since we didn't use it.
 			// Ignore errors - best effort cleanup.
 			log.Printf("[DEBUG] dir.addToNewBlock: freeing unused block %d for inode %d",
-				ext.PhysicalBlock, dirIno.InodeNum)
-			m.extentMgr.FreePhysicalBlock(ctx, ext.PhysicalBlock)
+				physBlock, dirIno.InodeNum)
+			m.extentMgr.FreePhysicalBlock(ctx, physBlock)
 		}
 	}()
+
+	// Extent tree blocks also come from the bitmap, so reserve them before the inode lock.
+	ctx, releaseTreeBlocks, err := m.extentMgr.ReserveTreeBlocks(ctx, dirIno)
+	if err != nil {
+		return fmt.Errorf("failed to reserve extent tree blocks: %w", err)
+	}
+	defer releaseTreeBlocks()
 
 	// Now acquire inode lock for writing (level 8 - after bitmap lock)
 	if m.lockMgr != nil {
@@ -738,22 +754,21 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	data := make([]byte, BlockSize)
 	serializeEntry(entry, data)
 
-	if err := m.writeBlock(ext.PhysicalBlock, data); err != nil {
+	if err := m.writeBlock(physBlock, data); err != nil {
 		return err
 	}
 
-	// Insert the extent into the fresh inode.
-	// AllocateBlocks inserted into the stale inode, so we need to add it to freshIno.
-	// Create a new extent for the correct logical block.
+	// Map the block into the fresh inode at the correct logical block.
 	newExt := &extent.Extent{
 		LogicalBlock:  nextBlock,
-		PhysicalBlock: ext.PhysicalBlock,
+		PhysicalBlock: physBlock,
 		Length:        1,
 		Flags:         extent.FlagAllocated,
 	}
 	if err := m.extentMgr.Insert(ctx, freshIno, newExt); err != nil {
-		// If insert fails due to overlap, another node beat us - signal retry
-		if err == extent.ErrExtentOverlap || err == extent.ErrNoSpaceForExtent {
+		// Overlap: another node beat us. Deadlock risk: the reservation was too
+		// small for the fresh inode, so retry outside the lock.
+		if errors.Is(err, extent.ErrExtentOverlap) || errors.Is(err, extent.ErrStaleTree) || errors.Is(err, lock.ErrDeadlockRisk) {
 			log.Printf("[DEBUG] dir.addToNewBlock: extent insert conflict in inode %d: %v, retrying",
 				dirIno.InodeNum, err)
 			return errRetryAdd
@@ -769,6 +784,9 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	// Write the updated inode to disk.
 	// Use WriteWithLockHeld since we already hold the inode lock.
 	if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
+		if errors.Is(err, extent.ErrTreeConflict) {
+			return errRetryAdd
+		}
 		return fmt.Errorf("failed to write directory inode: %w", err)
 	}
 

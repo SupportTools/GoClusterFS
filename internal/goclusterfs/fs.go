@@ -151,7 +151,8 @@ func New(cfg *Config) (*FS, error) {
 	inodeTbl := inode.NewTable(dev, cfg.InodeOffset, cfg.InodeCount*inode.InodeSize, lockMgr, cfg.NodeUUID)
 
 	// Create extent manager
-	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr)
+	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr, cfg.DataOffset)
+	inodeTbl.SetTreeFlusher(extentMgr)
 
 	// Create directory manager
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, cfg.DataOffset)
@@ -294,6 +295,20 @@ func (f *FS) cacheInode(ino *inode.Inode) {
 // Returns 0 for holes (sparse file regions with no allocated blocks).
 // This is the preferred method for read paths.
 func (f *FS) lookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
+	phys, err := f.lookupPhysicalIn(ino, logicalBlock)
+	if errors.Is(err, extent.ErrStaleTree) || errors.Is(err, extent.ErrCorruptTree) {
+		// The cached inode may point at tree nodes another node has since rewritten.
+		f.invalidateInode(ino.InodeNum)
+		fresh, readErr := f.inodeTbl.Read(ino.InodeNum)
+		if readErr != nil {
+			return 0, err
+		}
+		return f.lookupPhysicalIn(fresh, logicalBlock)
+	}
+	return phys, err
+}
+
+func (f *FS) lookupPhysicalIn(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
 	if f.cacheMgr != nil {
 		return f.cacheMgr.LookupPhysicalCached(f.extentMgr, ino, logicalBlock)
 	}
@@ -2133,6 +2148,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Try to find existing extent first (without lock for read-only check)
 		ext, extOffset, err := f.fs.extentMgr.Lookup(ino, blockNum)
+		if err != nil && err != extent.ErrExtentNotFound {
+			log.Printf("[DEBUG] Write inode %d: extent lookup at block %d failed: %v", f.inodeNum, blockNum, err)
+			if errors.Is(err, extent.ErrStaleTree) {
+				return 0, errRetryWrite
+			}
+			return 0, syscall.EIO
+		}
 		if err != nil {
 			// Need to allocate - must acquire lock first
 			if !lockHeld && f.fs.lockMgr != nil {
@@ -2176,14 +2198,18 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			// Allocate block (acquires bitmap lock internally, then releases it)
 			ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
 			if err != nil {
-				// Check for extent conflicts indicating concurrent allocation
-				if err == extent.ErrExtentOverlap || err == extent.ErrNoSpaceForExtent {
-					log.Printf("[DEBUG] Write inode %d: extent conflict at block %d, retrying",
-						f.inodeNum, blockNum)
+				log.Printf("[DEBUG] Write inode %d: AllocateBlocks at block %d failed: %v", f.inodeNum, blockNum, err)
+				switch {
+				case errors.Is(err, extent.ErrExtentOverlap), errors.Is(err, extent.ErrStaleTree):
+					// Concurrent allocation by another node
 					return 0, errRetryWrite
+				case errors.Is(err, extent.ErrExtentTreeFull):
+					return 0, syscall.EFBIG
+				case errors.Is(err, extent.ErrCorruptTree):
+					return 0, syscall.EIO
+				default:
+					return 0, syscall.ENOSPC
 				}
-				log.Printf("[DEBUG] Write inode %d: AllocateBlocks failed: %v", f.inodeNum, err)
-				return 0, syscall.ENOSPC
 			}
 
 			// Re-acquire inode lock after allocation
@@ -2222,7 +2248,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// we must allocate a new block before writing to preserve snapshot data.
 		if ext.Flags&extent.FlagShared != 0 && f.fs.refcountReg != nil {
 			// Check if CoW is actually needed (refcount > 1)
-			needsCoW, cowErr := f.fs.extentMgr.NeedsCoW(ctx, ext, f.fs.refcountReg)
+			needsCoW, cowErr := f.fs.extentMgr.NeedsCoW(ctx, blockExtent(ext, extOffset), f.fs.refcountReg)
 			if cowErr != nil {
 				log.Printf("[DEBUG] Write inode %d: CoW check failed for block %d: %v",
 					f.inodeNum, ext.PhysicalBlock, cowErr)
@@ -2258,7 +2284,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					}
 
 					// Re-check if CoW is still needed (another node may have done it)
-					needsCoW, cowErr = f.fs.extentMgr.NeedsCoW(ctx, ext, f.fs.refcountReg)
+					needsCoW, cowErr = f.fs.extentMgr.NeedsCoW(ctx, blockExtent(ext, extOffset), f.fs.refcountReg)
 					if cowErr != nil {
 						log.Printf("[DEBUG] Write inode %d: CoW re-check failed: %v", f.inodeNum, cowErr)
 						return 0, syscall.EIO
@@ -2336,7 +2362,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 
 			// Clear the Unwritten flag (if still set)
-			if f.fs.extentMgr.ClearUnwritten(ino, ext) {
+			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ino, ext)
+			if clearErr != nil {
+				log.Printf("[DEBUG] Write inode %d: clearing Unwritten flag at block %d failed: %v",
+					f.inodeNum, blockNum, clearErr)
+				return 0, syscall.EIO
+			}
+			if cleared {
 				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
 					f.inodeNum, blockNum)
 			}
@@ -2491,6 +2523,29 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	ino.Size = newSize
 	ino.Mtime = newMtime
 
+	// On a tree conflict the blocks allocated here are unreferenced. Close the
+	// intent first so journal replay cannot map them again, then free them.
+	writeFailed := func(err error) error {
+		if !errors.Is(err, extent.ErrTreeConflict) {
+			return syscall.EIO
+		}
+		if f.fs.journal != nil && intentSeq > 0 {
+			if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+				log.Printf("[DEBUG] Write inode %d: CompleteIntent after tree conflict failed: %v", f.inodeNum, err)
+				return errRetryWrite
+			}
+		}
+		for _, alloc := range allocatedExtents {
+			for i := uint64(0); i < uint64(alloc.count); i++ {
+				if err := f.fs.extentMgr.FreePhysicalBlock(ctx, alloc.physicalBlock+i); err != nil {
+					log.Printf("[DEBUG] Write inode %d: freeing block %d after tree conflict failed: %v",
+						f.inodeNum, alloc.physicalBlock+i, err)
+				}
+			}
+		}
+		return errRetryWrite
+	}
+
 	// Write inode - use WriteWithLockHeld if we hold the lock
 	if lockHeld {
 		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
@@ -2498,12 +2553,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if acquiredLockForSize {
 				f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
 			}
-			return 0, syscall.EIO
+			return 0, writeFailed(err)
 		}
 	} else {
 		if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 			log.Printf("[DEBUG] Write inode %d: final inodeTbl.Write failed: %v", f.inodeNum, err)
-			return 0, syscall.EIO
+			return 0, writeFailed(err)
 		}
 	}
 
@@ -2947,14 +3002,18 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 			blockNum++
 			continue
 		}
+		if lookupErr != extent.ErrExtentNotFound {
+			log.Printf("[DEBUG] Allocate inode %d: extent lookup at block %d failed: %v", f.inodeNum, blockNum, lookupErr)
+			return syscall.EIO
+		}
 
 		// Find how many contiguous blocks starting from blockNum are unallocated
 		rangeStart := blockNum
 		rangeEnd := blockNum + 1
 		for rangeEnd < endBlock {
 			_, _, lookupErr := f.fs.extentMgr.Lookup(ino, rangeEnd)
-			if lookupErr == nil {
-				break // This block is allocated, stop the range
+			if lookupErr != extent.ErrExtentNotFound {
+				break // Allocated (or unreadable), stop the range
 			}
 			rangeEnd++
 		}
@@ -2968,6 +3027,9 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		if allocErr != nil {
 			log.Printf("[DEBUG] Allocate inode %d: AllocateUnwritten blocks %d-%d failed: %v",
 				f.inodeNum, rangeStart, rangeEnd-1, allocErr)
+			if errors.Is(allocErr, extent.ErrExtentTreeFull) {
+				return syscall.EFBIG
+			}
 			return syscall.ENOSPC
 		}
 
@@ -3076,7 +3138,10 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	}
 
 	// Mark all extents as shared BEFORE creating snapshot (CoW active immediately)
-	f.fs.extentMgr.MarkAllShared(ino)
+	if err := f.fs.extentMgr.MarkAllShared(ino); err != nil {
+		log.Printf("[snapshot] Failed to mark extents shared for inode %d: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
 	ino.Flags |= inode.FlagHasSnapshot
 	ino.MetaGeneration++
 
@@ -3084,7 +3149,11 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	blockNums := collectBlockNumbers(ino)
+	blockNums, err := f.fs.extentMgr.DataBlocks(ino)
+	if err != nil {
+		log.Printf("[snapshot] Failed to list blocks for inode %d: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
 
 	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
 		ino.ExtentTreeRoot, uint64(len(blockNums)), ino.Size, snapshot.FlagReadOnly)
@@ -3129,8 +3198,12 @@ func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	ino, _ := f.fs.inodeTbl.Read(f.inodeNum)
-	blockNums := collectBlockNumbers(ino)
+	var blockNums []uint64
+	if ino, err := f.fs.inodeTbl.Read(f.inodeNum); err == nil {
+		if blockNums, err = f.fs.extentMgr.DataBlocks(ino); err != nil {
+			log.Printf("[snapshot] Failed to list blocks for inode %d: %v", f.inodeNum, err)
+		}
+	}
 
 	if _, err := f.fs.snapshotWkr.QueueDeleteJob(ctx, desc.SnapshotID, blockNums); err != nil {
 		log.Printf("[snapshot] Warning: queue delete job failed: %v", err)
@@ -3180,7 +3253,10 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	}
 
 	// Mark source extents as shared (enables CoW on source)
-	f.fs.extentMgr.MarkAllShared(srcIno)
+	if err := f.fs.extentMgr.MarkAllShared(srcIno); err != nil {
+		log.Printf("[clone] Failed to mark source extents shared: %v", err)
+		return syscall.EIO
+	}
 	srcIno.Flags |= inode.FlagHasSnapshot
 	srcIno.MetaGeneration++
 	if err := f.fs.inodeTbl.Write(ctx, srcIno); err != nil {
@@ -3214,7 +3290,12 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	}
 
 	// Copy extents with FlagShared set
-	f.fs.extentMgr.CopyExtentsForClone(srcIno, cloneIno)
+	if err := f.fs.extentMgr.CopyExtentsForClone(ctx, srcIno, cloneIno); err != nil {
+		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
+		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
+		log.Printf("[clone] Failed to copy extents: %v", err)
+		return syscall.EIO
+	}
 
 	// Copy attributes from source
 	now := time.Now().UnixNano()
@@ -3223,13 +3304,15 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	cloneIno.GID = srcIno.GID
 	cloneIno.Size = srcIno.Size
 	cloneIno.LinkCount = 1
-	cloneIno.Flags = inode.FlagHasSnapshot
+	cloneIno.Flags |= inode.FlagHasSnapshot
 	cloneIno.Atime = now
 	cloneIno.Mtime = now
 	cloneIno.Ctime = now
 
 	// Write clone inode
 	if err := f.fs.inodeTbl.Write(ctx, cloneIno); err != nil {
+		// Every clone extent is shared, so this only frees the clone's tree blocks.
+		f.fs.extentMgr.Truncate(ctx, cloneIno, 0)
 		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
 		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to write clone inode: %v", err)
@@ -3237,7 +3320,10 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	}
 
 	// Queue background refcount increment for shared blocks
-	blockNums := collectBlockNumbers(srcIno)
+	blockNums, err := f.fs.extentMgr.DataBlocks(srcIno)
+	if err != nil {
+		log.Printf("[clone] Failed to list source blocks: %v", err)
+	}
 	if len(blockNums) > 0 && f.fs.snapshotWkr != nil {
 		if _, err := f.fs.snapshotWkr.QueueCreateJob(ctx, 0, f.inodeNum, blockNums); err != nil {
 			log.Printf("[clone] Warning: queue refcount job failed: %v", err)
@@ -3307,21 +3393,15 @@ func (f *File) listSnapshots(ctx context.Context, dest []byte) (uint32, syscall.
 	return uint32(n), 0
 }
 
-// collectBlockNumbers extracts physical block numbers from an inode.
-func collectBlockNumbers(ino *inode.Inode) []uint64 {
-	if ino == nil {
-		return nil
+// blockExtent returns the single block of ext at offset, so per-block checks
+// such as refcounts look at the right physical block.
+func blockExtent(ext *extent.Extent, offset uint64) *extent.Extent {
+	return &extent.Extent{
+		LogicalBlock:  ext.LogicalBlock + offset,
+		PhysicalBlock: ext.PhysicalBlock + offset,
+		Length:        1,
+		Flags:         ext.Flags,
 	}
-	var blocks []uint64
-	for i := 0; i < inode.MaxInlineExtents; i++ {
-		ext := &ino.InlineExtents[i]
-		if ext.Length > 0 {
-			for j := uint64(0); j < ext.Length; j++ {
-				blocks = append(blocks, ext.PhysicalBlock+j)
-			}
-		}
-	}
-	return blocks
 }
 
 // parseClonePath splits an absolute path into parent directory path and filename.
