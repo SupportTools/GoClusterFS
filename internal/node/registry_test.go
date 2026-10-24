@@ -1012,3 +1012,27 @@ func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
 		t.Errorf("CheckLease after another node took over: err = %v, want ErrLeaseLost", err)
 	}
 }
+
+func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	previous := writeOtherNamespaceSlot(t, reg, 2, time.Now())
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		previous.HeartbeatTime = time.Now().Add(-2 * HeartbeatTimeout).Unix()
+		reg.writeSlot(2, previous)
+	}()
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 2 {
+		t.Errorf("Register took slot %d, want slot 2, which went stale after the first scan", slot)
+	}
+}
