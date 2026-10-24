@@ -786,3 +786,69 @@ func TestStaleInodeWriteKeepsOnDiskTree(t *testing.T) {
 	}
 	env.checkScatteredWith(got, 3, 5)
 }
+
+// A spill that started from inline extents conflicts when another node changed
+// them; the extents it carries over may map blocks that node freed.
+func TestStaleInlineSpillIsDetected(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	for _, lb := range []uint64{0, 2} {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, ino, lb, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.write(ino)
+
+	loser, winner := env.reread(ino), env.reread(ino)
+	if err := env.mgr.Truncate(env.ctx, winner, BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	env.write(winner)
+
+	if _, err := env.mgr.AllocateBlocks(env.ctx, loser, 4, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !loser.HasExtentTree() {
+		t.Fatal("third extent should spill into a tree")
+	}
+	if err := env.tbl.Write(env.ctx, loser); !errors.Is(err, ErrTreeConflict) {
+		t.Fatalf("stale inline spill: got %v, want ErrTreeConflict", err)
+	}
+}
+
+// Blocks released while a never-committed tree existed stay pending when the
+// map folds back inline, and are freed once the inode is written.
+func TestFoldOfUncommittedTreeKeepsReleases(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	free := env.bm.FreeCount()
+	ino := env.newInode()
+	for _, lb := range []uint64{0, 2} {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, ino, lb, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.write(ino)
+
+	for _, lb := range []uint64{4, 6} {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, ino, lb, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first shrink keeps a tree, so block 6 waits for the commit.
+	if err := env.mgr.Truncate(env.ctx, ino, 5*BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if !ino.HasExtentTree() {
+		t.Fatal("3 extents should still use a tree")
+	}
+	if err := env.mgr.Truncate(env.ctx, ino, BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if ino.HasExtentTree() || ino.PendingTree == nil {
+		t.Fatalf("want an inline map with releases still pending, tree=%v pending=%v", ino.HasExtentTree(), ino.PendingTree != nil)
+	}
+	env.write(ino)
+	if got := env.bm.FreeCount(); got != free-1 {
+		t.Fatalf("free blocks = %d after commit, want %d (only block 0 still mapped)", got, free-1)
+	}
+}

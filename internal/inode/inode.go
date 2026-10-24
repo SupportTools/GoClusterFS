@@ -125,6 +125,14 @@ type Inode struct {
 	// PendingTree holds extent-tree changes owned by package extent that are
 	// not on disk yet. It is never serialized; Table writes it via its TreeFlusher.
 	PendingTree any
+
+	committedInline [MaxInlineExtents]InlineExtent // inline extents as last read or written
+}
+
+// CommittedInlineExtents returns the inline extents as this copy last read or
+// wrote them, before any uncommitted edits.
+func (inode *Inode) CommittedInlineExtents() [MaxInlineExtents]InlineExtent {
+	return inode.committedInline
 }
 
 // Table manages the inode table on disk.
@@ -137,6 +145,7 @@ type Table struct {
 	lockMgr     *lock.Manager // For distributed locking (optional)
 	nodeUUID    [16]byte      // This node's UUID
 	treeFlusher TreeFlusher
+	syncDevice  func() error
 }
 
 // SetTreeFlusher sets the writer for pending extent-tree changes.
@@ -162,6 +171,7 @@ func NewTable(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager, n
 		totalInodes: totalInodes,
 		lockMgr:     lockMgr,
 		nodeUUID:    nodeUUID,
+		syncDevice:  dev.Sync,
 	}
 }
 
@@ -225,13 +235,14 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 
 // writeWithTree flushes pending extent-tree changes, then writes the inode.
 // The inode sector write is the commit point for the tree. The returned func
-// finishes the commit (it frees released blocks) and must run once the inode
-// lock is no longer needed, because freeing takes the bitmap lock.
+// finishes the commit by freeing released blocks; Write runs it after dropping
+// the inode lock. Under WriteWithLockHeld the caller still holds that lock, so
+// frees that would break the lock order are deferred by the flusher.
 // Caller must hold t.mu and the inode lock.
 func (t *Table) writeWithTree(inode *Inode) (func(), error) {
 	var committed func()
-	switch {
-	case inode.PendingTree != nil:
+	flushed := inode.PendingTree != nil
+	if flushed {
 		if t.treeFlusher == nil {
 			return nil, ErrNoTreeFlusher
 		}
@@ -242,26 +253,23 @@ func (t *Table) writeWithTree(inode *Inode) (func(), error) {
 		if committed, err = t.treeFlusher.FlushTree(inode, onDisk); err != nil {
 			return nil, err
 		}
-	case inode.HasExtentTree():
-		// A copy with no extent edits must not roll the tree back to the one
-		// it read; that tree's nodes may already be rewritten or freed.
-		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
-		if err != nil {
-			return nil, err
-		}
-		if !sameExtentTree(inode, onDisk) {
-			log.Printf("[inode] inode %d: extent tree changed since read; keeping the on-disk extent map", inode.InodeNum)
-			copyExtentMap(inode, onDisk)
-		}
 	}
 
 	inode.LastModifierUUID = t.nodeUUID
 	inode.MetaGeneration++
 
-	if err := t.writeInodeUnlocked(inode); err != nil {
+	if err := t.writeInodeSector(inode, !flushed); err != nil {
 		return nil, err
 	}
 	inode.PendingTree = nil
+	inode.committedInline = inode.InlineExtents
+	if flushed {
+		// The next commit overwrites the half the previous inode used, and
+		// released blocks may be reused, so this inode must be durable first.
+		if err := t.syncDevice(); err != nil {
+			return nil, err
+		}
+	}
 	return committed, nil
 }
 
@@ -493,6 +501,14 @@ func (t *Table) readInodeUnlocked(inodeNum uint32) (*Inode, error) {
 // writeInodeUnlocked writes an inode without acquiring the mutex.
 // Caller must hold t.mu.Lock().
 func (t *Table) writeInodeUnlocked(inode *Inode) error {
+	return t.writeInodeSector(inode, false)
+}
+
+// writeInodeSector writes an inode into its sector. With keepTree, a copy that
+// disagrees with the stored inode about the extent tree takes the stored extent
+// map instead of rolling the tree back or wiping it; that copy has no extent
+// edits, and the tree it read may already be rewritten or freed.
+func (t *Table) writeInodeSector(inode *Inode, keepTree bool) error {
 	// Calculate sector containing this inode
 	sectorIdx := uint64(inode.InodeNum) / InodesPerSector
 	inodeOffset := uint64(inode.InodeNum) % InodesPerSector
@@ -514,11 +530,19 @@ func (t *Table) writeInodeUnlocked(inode *Inode) error {
 		}
 	}
 
+	start := inodeOffset * InodeSize
+	if keepTree {
+		onDisk, err := deserializeInode(buf.Bytes()[start : start+InodeSize])
+		if err == nil && (inode.HasExtentTree() || onDisk.HasExtentTree()) && !sameExtentTree(inode, onDisk) {
+			log.Printf("[inode] inode %d: extent tree changed since read; keeping the on-disk extent map", inode.InodeNum)
+			copyExtentMap(inode, onDisk)
+		}
+	}
+
 	// Serialize the inode
 	inodeData := serializeInode(inode)
 
 	// Copy into the sector at the correct offset
-	start := inodeOffset * InodeSize
 	copy(buf.Bytes()[start:start+InodeSize], inodeData)
 
 	// Write the sector back
@@ -702,6 +726,7 @@ func deserializeInode(buf []byte) (*Inode, error) {
 			Reserved:      binary.LittleEndian.Uint32(buf[offset+28 : offset+32]),
 		}
 	}
+	inode.committedInline = inode.InlineExtents
 
 	return inode, nil
 }

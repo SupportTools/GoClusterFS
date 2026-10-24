@@ -463,6 +463,7 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, payload []byte) 
 
 	// Write the modified inode back to disk (extent was added in-memory)
 	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
+		rctx.ExtentMgr.DiscardPending(ctx, ino)
 		return false, fmt.Errorf("failed to write inode after extent add: %w", err)
 	}
 
@@ -502,6 +503,7 @@ func applyExtentRemove(ctx context.Context, rctx *RecoveryContext, payload []byt
 
 	// Write the modified inode back to disk (extent was removed in-memory)
 	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
+		rctx.ExtentMgr.DiscardPending(ctx, ino)
 		return false, fmt.Errorf("failed to write inode after extent remove: %w", err)
 	}
 

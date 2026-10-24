@@ -2007,6 +2007,8 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 		if err == errRetryWrite {
 			log.Printf("[DEBUG] Write inode %d: retry attempt %d due to concurrent modification",
 				f.inodeNum, attempt+1)
+			// Jitter keeps writers on different nodes from colliding again in lockstep.
+			time.Sleep(time.Duration(1+rand.Intn(5<<attempt)) * time.Millisecond)
 			continue
 		}
 		if err != nil {

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -80,6 +81,9 @@ type Manager struct {
 	nodes      *nodeCache
 	leafCap    int // extents per leaf before it splits
 	indexCap   int // leaves per tree
+
+	deferredMu sync.Mutex
+	deferred   []uint64 // frees postponed by lock order
 }
 
 // NewManager creates a new extent manager. dataOffset is the device offset of

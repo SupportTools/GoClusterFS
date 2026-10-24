@@ -2,12 +2,14 @@ package extent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
 	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 )
 
 // treeRef identifies a committed tree as recorded in an inode.
@@ -539,7 +541,7 @@ func (e *editor) fold(leaves []*leafRef, dropped []uint64) error {
 	ino.ExtentTreeRoot, ino.ExtentDepth = 0, 0
 	ino.ExtentCount = uint64(len(all))
 	e.drop(dropped)
-	if e.base.present {
+	if e.base.present || len(e.release) > 0 {
 		ino.PendingTree = &pendingTree{base: e.base, release: e.release}
 	} else {
 		ino.PendingTree = nil
@@ -556,7 +558,9 @@ func (m *Manager) FlushTree(ino, onDisk *inode.Inode) (func(), error) {
 	if p == nil {
 		return nil, fmt.Errorf("extent: unexpected pending tree type %T", ino.PendingTree)
 	}
-	if committedTree(onDisk) != p.base {
+	// A change that started from inline extents also conflicts if another node
+	// rewrote them; the blocks they mapped may already be freed.
+	if committedTree(onDisk) != p.base || !p.base.present && onDisk.InlineExtents != ino.CommittedInlineExtents() {
 		return nil, fmt.Errorf("%w: inode %d", ErrTreeConflict, ino.InodeNum)
 	}
 	release := func() { m.freeBlocks(context.Background(), p.release) }
@@ -734,9 +738,23 @@ func (m *Manager) allocTreeBlocks(ctx context.Context, n int) ([]uint64, error) 
 	return out, nil
 }
 
+// freeBlocks returns blocks to the bitmap. A caller holding an inode lock
+// cannot take the bitmap lock, so those frees wait for the next freeBlocks
+// call made without it.
 func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
+	m.deferredMu.Lock()
+	blocks = append(blocks, m.deferred...)
+	m.deferred = nil
+	m.deferredMu.Unlock()
+
 	for _, b := range blocks {
-		if err := m.bitmap.Free(ctx, b); err != nil {
+		err := m.bitmap.Free(ctx, b)
+		switch {
+		case errors.Is(err, lock.ErrDeadlockRisk):
+			m.deferredMu.Lock()
+			m.deferred = append(m.deferred, b)
+			m.deferredMu.Unlock()
+		case err != nil:
 			log.Printf("[extent] free block %d: %v", b, err)
 		}
 	}
