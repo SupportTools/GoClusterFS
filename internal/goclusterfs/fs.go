@@ -302,6 +302,14 @@ func (f *FS) getInode(inodeNum uint32) (*inode.Inode, error) {
 	return f.inodeTbl.Read(inodeNum)
 }
 
+// detach keeps an operation running when its FUSE request is interrupted. The
+// kernel interrupts a request whenever the calling process gets a signal, and Go
+// programs signal themselves for preemption all the time, so ending lock waits
+// there turned ordinary creates and writes into EIO.
+func detach(ctx context.Context) context.Context {
+	return context.WithoutCancel(ctx)
+}
+
 // lockInode serializes this node's read-modify-write of one inode. Call it
 // before taking any cluster lock and hold one at a time: inodes share stripes.
 func (f *FS) lockInode(num uint32) func() {
@@ -485,6 +493,7 @@ func (f *FS) OnAdd(ctx context.Context) {
 
 // Statfs returns filesystem statistics.
 func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	ctx = detach(ctx)
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -505,6 +514,7 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 
 // Getattr returns the root directory attributes.
 func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	ctx = detach(ctx)
 	ino, err := f.getInode(inode.InodeRoot)
 	if err != nil {
 		return syscall.EIO
@@ -533,6 +543,7 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 
 // Lookup finds a child of the root directory by name.
 func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] FS.Lookup: name=%q", name)
 
 	dirIno, err := f.getInode(inode.InodeRoot)
@@ -607,6 +618,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 
 // Readdir returns a DirStream for the root directory listing.
 func (f *FS) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] FS.Readdir: root directory")
 	dirIno, err := f.getInode(inode.InodeRoot)
 	if err != nil {
@@ -640,6 +652,7 @@ func (f *FS) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Create creates a new file in the root directory.
 func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	ctx = detach(ctx)
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
 		node, fh, fuseFlags, errno = f.createFileInternal(ctx, name, flags, mode, out)
 		if errno == syscall.EAGAIN {
@@ -792,6 +805,7 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 
 // Mkdir creates a new directory in the root directory.
 func (f *FS) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = detach(ctx)
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
 		node, errno := f.mkdirInternal(ctx, name, mode, out)
 		if errno == syscall.EAGAIN {
@@ -953,6 +967,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 
 // Unlink removes a file from the root directory.
 func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
+	ctx = detach(ctx)
 	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
 	if err != nil {
 		return syscall.EIO
@@ -1037,6 +1052,7 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 
 // Rmdir removes an empty directory from the root directory.
 func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
+	ctx = detach(ctx)
 	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
 	if err != nil {
 		return syscall.EIO
@@ -1140,6 +1156,7 @@ var (
 
 // Getattr returns directory attributes.
 func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	ctx = detach(ctx)
 	ino, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
 		return syscall.EIO
@@ -1168,6 +1185,7 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 
 // Setattr applies chmod, chown and utimes to the directory.
 func (d *Dir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	ctx = detach(ctx)
 	if errno := d.fs.setattrDir(ctx, d.inodeNum, in); errno != 0 {
 		return errno
 	}
@@ -1176,6 +1194,7 @@ func (d *Dir) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn,
 
 // Setattr applies chmod, chown and utimes to the root directory.
 func (f *FS) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	ctx = detach(ctx)
 	if errno := f.setattrDir(ctx, inode.InodeRoot, in); errno != 0 {
 		return errno
 	}
@@ -1221,6 +1240,7 @@ func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) sys
 
 // Lookup finds a child by name.
 func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] Lookup: dir=%d name=%q", d.inodeNum, name)
 
 	dirIno, err := d.fs.getInode(d.inodeNum)
@@ -1319,6 +1339,7 @@ func (ds *dirStream) Close() {}
 
 // Readdir returns a DirStream for directory listing.
 func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] Readdir: dir=%d", d.inodeNum)
 	dirIno, err := d.fs.getInode(d.inodeNum)
 	if err != nil {
@@ -1358,6 +1379,7 @@ func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 // When another node claims the same inode slot, we rollback and retry with a
 // different slot.
 func (d *Dir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	ctx = detach(ctx)
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
 		node, fh, fuseFlags, errno = d.createInternal(ctx, name, flags, mode, out)
 		if errno == syscall.EAGAIN {
@@ -1561,6 +1583,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 // When another node claims the same inode slot, we rollback and retry with a
 // different slot.
 func (d *Dir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ctx = detach(ctx)
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
 		node, errno := d.mkdirInternal(ctx, name, mode, out)
 		if errno == syscall.EAGAIN {
@@ -1779,11 +1802,13 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 
 // Unlink removes a file.
 func (d *Dir) Unlink(ctx context.Context, name string) syscall.Errno {
+	ctx = detach(ctx)
 	return d.removeEntry(ctx, name, false)
 }
 
 // Rmdir removes an empty directory.
 func (d *Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
+	ctx = detach(ctx)
 	return d.removeEntry(ctx, name, true)
 }
 
@@ -1996,6 +2021,7 @@ var (
 // Open opens the file for reading/writing.
 // Returns nil FileHandle to indicate the File node itself should be used as the handle.
 func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] File.Open: inode=%d flags=%d", f.inodeNum, flags)
 	// Verify the inode exists and is a regular file
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
@@ -2018,6 +2044,7 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 
 // Getattr returns file attributes.
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] File.Getattr: inode=%d", f.inodeNum)
 	// Read directly from disk to get fresh inode state.
 	// In multi-node scenarios, another node may have updated the inode.
@@ -2052,6 +2079,7 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 
 // Read reads file data.
 func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	ctx = detach(ctx)
 	// Use cached inode with validation for better performance.
 	// The cache manager handles TTL-based staleness checks and generation
 	// counter validation, automatically refreshing stale entries from disk.
@@ -2158,6 +2186,7 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 // Write writes file data.
 // Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
+	ctx = detach(ctx)
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to extend the same file simultaneously, they may race
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
@@ -2956,6 +2985,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	ctx = detach(ctx)
 	for attempt := 0; ; attempt++ {
 		unlock := f.fs.lockInode(f.inodeNum)
 		errno, err := f.setattr(ctx, fh, in, out)
@@ -3138,6 +3168,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 // Fsync flushes file data to disk.
 func (f *File) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
+	ctx = detach(ctx)
 	if err := f.fs.dev.Sync(); err != nil {
 		return syscall.EIO
 	}
@@ -3148,6 +3179,7 @@ func (f *File) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscal
 // Supports mode==0 (allocate and extend size) and FALLOC_FL_KEEP_SIZE (allocate only).
 // PUNCH_HOLE and ZERO_RANGE are not yet implemented.
 func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+	ctx = detach(ctx)
 	// Only support mode 0 (allocate) and KEEP_SIZE for now
 	const FALLOC_FL_KEEP_SIZE = 0x01
 	if mode != 0 && mode != FALLOC_FL_KEEP_SIZE {
@@ -3309,6 +3341,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 // Setxattr sets an extended attribute on the file.
 // Used for snapshot creation via user.snapshot attribute and clone creation via user.clone.
 func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	ctx = detach(ctx)
 	defer f.fs.lockInode(f.inodeNum)()
 	// A snapshot or clone spans several writes; an interrupted caller must not stop it halfway.
 	ctx = context.WithoutCancel(ctx)
@@ -3328,6 +3361,7 @@ func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uin
 
 // Getxattr gets an extended attribute from the file.
 func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] File.Getxattr: inode=%d attr=%s", f.inodeNum, attr)
 
 	switch attr {
@@ -3341,6 +3375,7 @@ func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 // Removexattr removes an extended attribute from the file.
 // Used for snapshot deletion via user.snapshot.<name> pattern.
 func (f *File) Removexattr(ctx context.Context, attr string) syscall.Errno {
+	ctx = detach(ctx)
 	log.Printf("[DEBUG] File.Removexattr: inode=%d attr=%s", f.inodeNum, attr)
 
 	// Handle user.snapshot.<name> for snapshot deletion
