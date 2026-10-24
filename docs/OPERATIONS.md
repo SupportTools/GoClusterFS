@@ -283,7 +283,7 @@ What is safe today: a node that crashes or is killed and stays down, and a clean
 When a node fails unexpectedly:
 
 1. **Other nodes continue operating** - Distributed locking handles failed node
-2. **Lock cleanup** - Other nodes take over the failed node's locks once they are 15 seconds old (lock age, not node heartbeat)
+2. **Lock cleanup** - Other nodes take over the failed node's locks once they are 15 seconds old (lock age, not node heartbeat). A node that restarts into the failed node's registry slot takes its exclusive locks at once.
 3. **No immediate action required** - System is self-healing
 
 **When failed node recovers**:
