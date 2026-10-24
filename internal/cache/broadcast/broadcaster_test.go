@@ -98,6 +98,7 @@ func TestBroadcasterDisabled(t *testing.T) {
 }
 
 func TestBroadcasterDuplication(t *testing.T) {
+	peer := [16]byte{9}
 	handler := newMockHandler()
 	uuid := [16]byte{1, 2, 3, 4}
 	cfg := DefaultConfig()
@@ -113,27 +114,28 @@ func TestBroadcasterDuplication(t *testing.T) {
 	seq2 := uint64(2000)
 
 	// First time should not be duplicate
-	if b.isDuplicate(seq1) {
+	if b.isDuplicate(peer, seq1) {
 		t.Error("First check of seq1 should not be duplicate")
 	}
 
 	// Second time should be duplicate
-	if !b.isDuplicate(seq1) {
+	if !b.isDuplicate(peer, seq1) {
 		t.Error("Second check of seq1 should be duplicate")
 	}
 
 	// Different sequence should not be duplicate
-	if b.isDuplicate(seq2) {
+	if b.isDuplicate(peer, seq2) {
 		t.Error("First check of seq2 should not be duplicate")
 	}
 
 	// Original sequence still duplicate
-	if !b.isDuplicate(seq1) {
+	if !b.isDuplicate(peer, seq1) {
 		t.Error("Third check of seq1 should still be duplicate")
 	}
 }
 
 func TestBroadcasterCleanupSeen(t *testing.T) {
+	peer := [16]byte{9}
 	handler := newMockHandler()
 	uuid := [16]byte{1, 2, 3, 4}
 	cfg := DefaultConfig()
@@ -146,7 +148,7 @@ func TestBroadcasterCleanupSeen(t *testing.T) {
 
 	// Add some entries
 	for i := uint64(1); i <= 10; i++ {
-		b.isDuplicate(i)
+		b.isDuplicate(peer, i)
 	}
 
 	b.seenMu.Lock()
@@ -424,6 +426,7 @@ func TestConfigDisabled(t *testing.T) {
 
 // TestConcurrentDeduplication tests thread-safety of deduplication.
 func TestConcurrentDeduplication(t *testing.T) {
+	peer := [16]byte{9}
 	handler := newMockHandler()
 	uuid := [16]byte{1, 2, 3, 4}
 	cfg := DefaultConfig()
@@ -443,7 +446,7 @@ func TestConcurrentDeduplication(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				if b.isDuplicate(12345) {
+				if b.isDuplicate(peer, 12345) {
 					atomic.AddInt64(&duplicates, 1)
 				}
 			}
@@ -456,5 +459,30 @@ func TestConcurrentDeduplication(t *testing.T) {
 	// but at least 990 should be duplicates)
 	if duplicates < 990 {
 		t.Errorf("Expected at least 990 duplicates, got %d", duplicates)
+	}
+}
+
+// TestSameSequenceFromTwoSenders checks that dedup is per sender. Each node's
+// sequence starts at its boot time in nanoseconds, so ranges can overlap.
+func TestSameSequenceFromTwoSenders(t *testing.T) {
+	handler := newMockHandler()
+	cfg := DefaultConfig()
+	cfg.Enabled = false
+
+	b, err := NewBroadcaster(cfg, [16]byte{1}, 0, handler)
+	if err != nil {
+		t.Fatalf("NewBroadcaster failed: %v", err)
+	}
+
+	for i, sender := range [][16]byte{{2}, {3}} {
+		msg := NewMessageBuilder(sender).InvalidateInode(uint32(10+i), 1, 1)
+		msg.Sequence = 777
+		b.handleMessage(msg, nil)
+	}
+
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if len(handler.inodeInvalidated) != 2 {
+		t.Errorf("invalidated inodes = %v, want both senders' inodes [10 11]", handler.inodeInvalidated)
 	}
 }

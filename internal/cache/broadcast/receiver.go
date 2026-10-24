@@ -33,7 +33,7 @@ type Broadcaster struct {
 
 	// Deduplication
 	seenMu sync.RWMutex
-	seen   map[uint64]time.Time // sequence -> first seen time
+	seen   map[seenKey]time.Time // first seen time
 
 	// Stats
 	invalidationsReceived uint64
@@ -46,6 +46,13 @@ type Broadcaster struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	running atomic.Bool
+}
+
+// seenKey identifies a message. Each node's sequence starts at its boot time in
+// nanoseconds, so two nodes' sequence ranges can overlap.
+type seenKey struct {
+	sender [16]byte
+	seq    uint64
 }
 
 // NewBroadcaster creates a new cache invalidation broadcaster.
@@ -62,7 +69,7 @@ func NewBroadcaster(cfg Config, localUUID [16]byte, nodeSlot uint32, handler Inv
 		localUUID: localUUID,
 		nodeSlot:  nodeSlot,
 		localPort: uint16(cfg.UnicastPort),
-		seen:      make(map[uint64]time.Time),
+		seen:      make(map[seenKey]time.Time),
 	}
 
 	return b, nil
@@ -132,7 +139,7 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
 	}
 
 	// Deduplicate
-	if b.isDuplicate(msg.Sequence) {
+	if b.isDuplicate(msg.SenderUUID, msg.Sequence) {
 		atomic.AddUint64(&b.duplicatesDropped, 1)
 		return
 	}
@@ -226,16 +233,17 @@ func (b *Broadcaster) handlePeerAnnounce(msg *Message, addr *net.UDPAddr) {
 		payload.NodeSlot, uuidStr[:16], peerAddr)
 }
 
-// isDuplicate checks if we've seen this sequence number recently.
-func (b *Broadcaster) isDuplicate(seq uint64) bool {
+// isDuplicate checks if we've seen this message from this sender recently.
+func (b *Broadcaster) isDuplicate(sender [16]byte, seq uint64) bool {
 	b.seenMu.Lock()
 	defer b.seenMu.Unlock()
 
-	if _, exists := b.seen[seq]; exists {
+	key := seenKey{sender: sender, seq: seq}
+	if _, exists := b.seen[key]; exists {
 		return true
 	}
 
-	b.seen[seq] = time.Now()
+	b.seen[key] = time.Now()
 	return false
 }
 
@@ -281,9 +289,9 @@ func (b *Broadcaster) cleanupSeen() {
 	defer b.seenMu.Unlock()
 
 	cutoff := time.Now().Add(-5 * time.Minute)
-	for seq, seen := range b.seen {
+	for key, seen := range b.seen {
 		if seen.Before(cutoff) {
-			delete(b.seen, seq)
+			delete(b.seen, key)
 		}
 	}
 }
