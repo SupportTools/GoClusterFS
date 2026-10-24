@@ -345,7 +345,7 @@ func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf("has entries for blocks 0-%d of %d", covered-1, sb.TotalBlocks),
 		fmt.Sprintf("block %d: mapped by 2 inodes but past the refcount table", counted),
-		fmt.Sprintf("inode %d: shares blocks the way older versions did, some past the refcount table", oldA.inodeNum),
+		fmt.Sprintf("inode %d: shares blocks past the refcount table the way older versions did", oldA.inodeNum),
 	} {
 		if !strings.Contains(problems, want) {
 			t.Errorf("fsck did not report %q:%s", want, problems)
@@ -356,6 +356,11 @@ func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
 	}
 	if check.ExitCode() != fsck.ExitUncorrected {
 		t.Errorf("check exit %d, want %d", check.ExitCode(), fsck.ExitUncorrected)
+	}
+	for _, p := range check.Problems {
+		if p.Location == fmt.Sprintf("inode %d", oldA.inodeNum) && p.Severity != fsck.Error {
+			t.Errorf("inode %d reported as %v, want an error: writes to it change older-b too", oldA.inodeNum, p.Severity)
+		}
 	}
 
 	repair := fsck.DefaultOptions()

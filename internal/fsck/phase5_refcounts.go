@@ -156,10 +156,8 @@ func (c *Checker) refcountCoverage() uint64 {
 	return c.sbData.RefCountTableSize / RefcountSectorSize * RefcountEntriesPerSector
 }
 
-// checkSharingPastTable reports blocks past the refcount table that several
-// inodes map. The runtime counts one owner for them, so the first delete frees
-// them. Blocks mapped only by sharing an older version did without counting
-// are never freed, so they are left out.
+// checkSharingPastTable reports blocks past the refcount table that inodes share
+// with counts, which the first delete frees. Only-uncounted sharing is never freed.
 func (c *Checker) checkSharingPastTable(covered uint64) {
 	var blocks []uint64
 	for block, refs := range c.inodeBlocks {
