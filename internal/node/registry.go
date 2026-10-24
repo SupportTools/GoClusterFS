@@ -215,7 +215,8 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	if i, err := r.claimFirst(allSlots(), ownFailed); i >= 0 || err != nil {
 		return i, err
 	}
-	if i, err := r.claimFirst(r.awaitOtherNamespaceSlots(), ownFailed); i >= 0 || err != nil {
+	// A slot can go stale between scans, so recheck every slot after the wait.
+	if i, err := r.claimFirst(append(r.awaitOtherNamespaceSlots(), allSlots()...), ownFailed); i >= 0 || err != nil {
 		return i, err
 	}
 	i, err := r.claimFirst(allSlots(), func(slot *Slot) bool {
