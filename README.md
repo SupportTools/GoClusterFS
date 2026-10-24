@@ -212,7 +212,7 @@ echo "$USER - memlock unlimited" | sudo tee /etc/security/limits.d/90-qemu-memlo
 
 ## License
 
-[License details to be added]
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Contributing
 
