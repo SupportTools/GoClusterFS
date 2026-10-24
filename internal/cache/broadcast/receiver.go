@@ -252,9 +252,8 @@ func (b *Broadcaster) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			msg := b.builder.Heartbeat()
-			if err := b.transport.Send(msg); err != nil {
-				// Heartbeat failures are expected during network issues
-			}
+			// Heartbeat failures are expected during network issues
+			_ = b.transport.Send(msg)
 		}
 	}
 }

@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint help
+.PHONY: build build-mount build-fsck test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
 
 # Go parameters
 GOCMD=go
@@ -13,24 +13,34 @@ GOMOD=$(GOCMD) mod
 
 # Binary names
 MOUNT_BINARY=goclusterfs-mount
+FSCK_BINARY=goclusterfs-fsck
+
+GOLANGCI_LINT_VERSION=v2.15.0
+GOVULNCHECK_VERSION=v1.9.0
+COVER_PROFILE=coverage.out
 
 # Default target
 .DEFAULT_GOAL := help
 
 # Build all binaries
-build: build-mount
+build: build-mount build-fsck
 
 build-mount:
 	@echo "Building $(MOUNT_BINARY)..."
 	$(GOBUILD) -o $(MOUNT_BINARY) ./cmd/mount
 	@echo "Built $(MOUNT_BINARY) successfully"
 
+build-fsck:
+	@echo "Building $(FSCK_BINARY)..."
+	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/fsck
+	@echo "Built $(FSCK_BINARY) successfully"
+
 # Unit tests (fast, no FUSE needed)
 test: test-unit
 
 test-unit:
-	@echo "Running unit tests..."
-	$(GOTEST) -v ./internal/...
+	@echo "Running unit tests with race detector..."
+	$(GOTEST) -v -race -covermode=atomic -coverprofile=$(COVER_PROFILE) ./internal/...
 
 # Integration tests (requires FUSE and built binary)
 test-integration: check-fuse build-mount
@@ -148,14 +158,16 @@ check-fuse:
 	@which fusermount > /dev/null 2>&1 || (echo "Error: fusermount not found. Install FUSE first." && exit 1)
 	@echo "FUSE is available"
 
-# Run linter (if golangci-lint is installed)
 lint:
-	@which golangci-lint > /dev/null 2>&1 && golangci-lint run ./... || echo "golangci-lint not installed, skipping"
+	$(GOCMD) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION) run ./...
+
+vuln:
+	$(GOCMD) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 # Utilities
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(MOUNT_BINARY) GoClusterFS
+	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(COVER_PROFILE)
 	rm -f *.img
 	@echo "Clean complete"
 
@@ -181,10 +193,11 @@ help:
 	@echo "  Build:"
 	@echo "    build          - Build all binaries"
 	@echo "    build-mount    - Build goclusterfs-mount binary"
+	@echo "    build-fsck     - Build goclusterfs-fsck binary"
 	@echo ""
 	@echo "  Test:"
 	@echo "    test           - Run unit tests (alias for test-unit)"
-	@echo "    test-unit      - Run unit tests only (fast, no FUSE needed)"
+	@echo "    test-unit      - Run unit tests with race detector and coverage (no FUSE needed)"
 	@echo "    test-integration - Run integration tests (requires FUSE)"
 	@echo "    test-all       - Run all tests (unit + integration)"
 	@echo "    test-parity    - Validate test coverage across environments"
@@ -207,7 +220,8 @@ help:
 	@echo "  Code Quality:"
 	@echo "    fmt            - Format code with go fmt"
 	@echo "    vet            - Run go vet"
-	@echo "    lint           - Run golangci-lint (if installed)"
+	@echo "    lint           - Run golangci-lint $(GOLANGCI_LINT_VERSION) with .golangci.yml"
+	@echo "    vuln           - Run govulncheck $(GOVULNCHECK_VERSION)"
 	@echo ""
 	@echo "  Utilities:"
 	@echo "    clean          - Remove build artifacts"

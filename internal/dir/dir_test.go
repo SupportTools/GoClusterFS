@@ -338,7 +338,7 @@ func TestLookup(t *testing.T) {
 	}
 
 	// Lookup ".."
-	ino, ftype, err = dirMgr.Lookup(ctx, dirIno, "..")
+	ino, _, err = dirMgr.Lookup(ctx, dirIno, "..")
 	if err != nil {
 		t.Fatalf("Lookup(..) failed: %v", err)
 	}

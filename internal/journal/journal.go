@@ -113,7 +113,6 @@ type Journal struct {
 	batchFirstCommit  time.Time       // Time of first commit in current batch
 	batchSyncCond     *sync.Cond      // Signals waiting goroutines when batch syncs
 	batchSyncTimer    *time.Timer     // Timer for MaxBatchAge
-	batchSyncInFlight bool            // True if a batch sync is in progress
 	batchSyncWaiters  []chan struct{} // Channels waiting for current batch sync
 
 	// Metrics
