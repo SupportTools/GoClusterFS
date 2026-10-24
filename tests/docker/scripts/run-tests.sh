@@ -2294,7 +2294,7 @@ test_inode_reuse_stale_read() {
     old_ino=$(exec_on_node "$writer" stat -c %i "$dir/$old")
     exec_on_node "$reader" sh -c "cat $dir/$old > /dev/null"
 
-    # New files take the lowest free inode, so create files until one gets the old number.
+    # New files take the first free inode from this node's start, so create files until one gets the old number.
     local new
     new=$(exec_on_node "$writer" sh -c "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; done")
     if [[ -z "$new" ]]; then

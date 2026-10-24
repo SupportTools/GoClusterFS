@@ -1670,7 +1670,7 @@ test_inode_reuse_stale_read() {
     old_ino=$(ssh_run "$writer" "stat -c %i $dir/$old")
     ssh_run "$reader" "cat $dir/$old > /dev/null"
 
-    # New files take the lowest free inode, so create files until one gets the old number.
+    # New files take the first free inode from this node's start, so create files until one gets the old number.
     local new
     new=$(ssh_run "$writer" "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; done")
     if [[ -z "$new" ]]; then

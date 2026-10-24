@@ -4,12 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
 
-var claimCollisionRe = regexp.MustCompile(`inode slot collision, retry`)
+var (
+	claimCollisionRe = regexp.MustCompile(`inode slot collision, retry`)
+	mountProblemRe   = regexp.MustCompile(`WARN|ERROR|failed|TIMEOUT|concurrently`)
+)
 
 // TestMultiNodeConcurrentCreatesDoNotCollide has two nodes create files in one
 // directory at the same time. Each node starts its inode search in its own part
@@ -31,6 +36,7 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 		t.Fatalf("start node 1: %v", err)
 	}
 
+	var eioRetries atomic.Int64
 	start := time.Now()
 	errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
 		eagain, failed := 0, 0
@@ -38,6 +44,11 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 		for i := 0; i < perNode; i++ {
 			name := fmt.Sprintf("node%d-%03d", idx, i)
 			err := node.WriteFile(name, []byte(name))
+			// A signal to this process interrupts the FUSE request, and a create waiting for the directory lock then fails with EIO.
+			for retry := 0; errors.Is(err, syscall.EIO) && retry < 5; retry++ {
+				eioRetries.Add(1)
+				err = node.WriteFile(name, []byte(name))
+			}
 			switch {
 			case errors.Is(err, syscall.EAGAIN):
 				eagain++
@@ -56,7 +67,8 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 	elapsed := time.Since(start)
 	collisions := len(claimCollisionRe.FindAllString(logs[0].String(), -1)) +
 		len(claimCollisionRe.FindAllString(logs[1].String(), -1))
-	t.Logf("%d concurrent creates on 2 nodes took %v with %d inode claim collisions", 2*perNode, elapsed, collisions)
+	t.Logf("%d concurrent creates on 2 nodes took %v with %d inode claim collisions and %d EIO retries",
+		2*perNode, elapsed, collisions, eioRetries.Load())
 
 	for idx, err := range errs {
 		if err != nil {
@@ -65,5 +77,14 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 	}
 	if collisions > 0 {
 		t.Errorf("%d inode claims collided between the nodes, want 0", collisions)
+	}
+	if t.Failed() {
+		for idx, buf := range logs {
+			for _, line := range strings.Split(buf.String(), "\n") {
+				if mountProblemRe.MatchString(line) {
+					t.Logf("node %d: %s", idx, line)
+				}
+			}
+		}
 	}
 }
