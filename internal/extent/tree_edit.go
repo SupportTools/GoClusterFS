@@ -714,6 +714,18 @@ func (m *Manager) allocTreeBlocks(ctx context.Context, n int) ([]uint64, error) 
 	return out, nil
 }
 
+// ensurePending returns ino's pending change, creating an empty one if needed.
+// Any pending change makes the inode write check that the extents on disk are
+// still the ones this change started from.
+func ensurePending(ino *inode.Inode) *pendingTree {
+	p := pendingOf(ino)
+	if p == nil {
+		p = &pendingTree{base: committedTree(ino)}
+		ino.PendingTree = p
+	}
+	return p
+}
+
 // ReleaseBlocks drops one owner from each block and frees the blocks that no
 // owner holds any more, such as a block a write just copied away from.
 func (m *Manager) ReleaseBlocks(ctx context.Context, blocks []uint64) {

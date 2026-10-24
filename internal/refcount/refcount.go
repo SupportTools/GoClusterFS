@@ -343,19 +343,6 @@ func (r *Region) Release(ctx context.Context, blockNums []uint64) ([]uint64, err
 	return free, nil
 }
 
-// Counts returns the reference count of each block.
-func (r *Region) Counts(ctx context.Context, blockNums []uint64) ([]uint32, error) {
-	counts := make([]uint32, len(blockNums))
-	err := r.updateBatch(ctx, blockNums, func(i int, e *Entry) (bool, error) {
-		counts[i] = e.RefCount
-		return false, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return counts, nil
-}
-
 // updateBatch applies fn to the entry of each block under the region lock and
 // writes back the sectors fn changed. Nothing is written if fn fails.
 func (r *Region) updateBatch(ctx context.Context, blockNums []uint64, fn func(i int, e *Entry) (bool, error)) error {

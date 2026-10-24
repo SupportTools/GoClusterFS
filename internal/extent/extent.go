@@ -46,6 +46,9 @@ const (
 	FlagUnwritten = 1 << 1 // Allocated but lazy-zero (not yet written)
 	FlagShared    = 1 << 2 // Shared with snapshot (requires CoW)
 	FlagSFB       = 1 << 3 // Stored in SFB container (not full block)
+	// FlagCounted marks sharing that refcounts track. Older versions set
+	// FlagShared alone and never counted the owners.
+	FlagCounted = 1 << 6
 )
 
 // Hole is what LookupPhysical returns for a logical block with no data on disk.
@@ -333,49 +336,39 @@ func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Exten
 			ino.WrittenBlocks -= min(ino.WrittenBlocks, x.Length)
 		}
 		if x.Flags&FlagSFB == 0 {
-			blocks = append(blocks, m.ownedBlocks(ctx, x)...)
+			blocks = append(blocks, m.ownedBlocks(x)...)
 		}
 	}
 	if len(blocks) == 0 {
 		return
 	}
-	p := pendingOf(ino)
-	if p == nil {
-		p = &pendingTree{base: committedTree(ino)}
-		ino.PendingTree = p
-	}
+	p := ensurePending(ino)
 	p.release = append(p.release, blocks...)
 }
 
-// ownedBlocks returns the blocks of x that refcounts can account for. A
-// shared block with a count of 0 comes from a clone made by an older version,
-// which shared blocks without counting the owners, so it stays allocated. So
-// do all shared blocks when refcounts are disabled.
-func (m *Manager) ownedBlocks(ctx context.Context, x Extent) []uint64 {
+// ownedBlocks returns the blocks of x that frees may give back. Nobody knows
+// how many inodes share an uncounted block, so it stays allocated.
+func (m *Manager) ownedBlocks(x Extent) []uint64 {
+	if x.Flags&FlagShared != 0 && (x.Flags&FlagCounted == 0 || m.refs == nil) {
+		return nil
+	}
 	blocks := make([]uint64, x.Length)
 	for j := range blocks {
 		blocks[j] = x.PhysicalBlock + uint64(j)
 	}
-	if x.Flags&FlagShared == 0 {
-		return blocks
-	}
-	if m.refs == nil {
-		return nil
-	}
-	counts, err := m.refs.Counts(ctx, blocks)
-	if err != nil {
-		log.Printf("[extent] read refcounts of blocks %d-%d: %v; leaving them allocated", x.PhysicalBlock, x.PhysicalBlock+x.Length-1, err)
-		return nil
-	}
-	owned := blocks[:0]
-	for j, b := range blocks {
-		if counts[j] == 0 {
-			log.Printf("[extent] block %d is shared but uncounted; leaving it allocated", b)
-			continue
+	return blocks
+}
+
+// HasUncountedSharing reports whether ino shares blocks the way older versions
+// did, without refcounts. Such blocks cannot be shared again safely.
+func (m *Manager) HasUncountedSharing(ino *inode.Inode) (bool, error) {
+	uncounted := false
+	err := m.forEach(ino, func(x Extent) {
+		if x.Flags&FlagShared != 0 && x.Flags&FlagCounted == 0 {
+			uncounted = true
 		}
-		owned = append(owned, b)
-	}
-	return owned
+	})
+	return uncounted, err
 }
 
 // Delete unmaps every block of an inode that is being freed and frees the
@@ -599,11 +592,14 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 		return nil, fmt.Errorf("CoW write failed: %w", err)
 	}
 
-	private := Extent{logicalBlock, newPhysBlock, 1, cur.Flags &^ FlagShared}
+	private := Extent{logicalBlock, newPhysBlock, 1, cur.Flags &^ (FlagShared | FlagCounted)}
 	if err := m.remap(ctx, ino, private); err != nil {
 		m.bitmap.Free(ctx, newPhysBlock)
 		return nil, err
 	}
+	// The caller releases the old block after the inode write, so that write
+	// must fail if another node copied the block first.
+	ensurePending(ino)
 	*ext = private
 	// Readers keep cached block mappings until DataGeneration changes.
 	ino.DataGeneration++
@@ -636,7 +632,7 @@ func (m *Manager) MarkAllShared(ino *inode.Inode) error {
 	if err != nil {
 		return err
 	}
-	if err := e.updateAll(func(x *Extent) { x.Flags |= FlagShared }); err != nil {
+	if err := e.updateAll(func(x *Extent) { x.Flags |= FlagShared | FlagCounted }); err != nil {
 		return err
 	}
 	return e.commit()
@@ -652,7 +648,7 @@ func (m *Manager) CopyExtentsForClone(ctx context.Context, src *inode.Inode, dst
 	}
 	all := []Extent{}
 	if err := m.forEach(src, func(x Extent) {
-		x.Flags |= FlagShared
+		x.Flags |= FlagShared | FlagCounted
 		all = append(all, x)
 	}); err != nil {
 		return err

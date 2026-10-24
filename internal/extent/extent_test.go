@@ -2,6 +2,7 @@ package extent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -1551,17 +1552,123 @@ func TestFreeKeepsSharedBlocks(t *testing.T) {
 		t.Fatalf("free blocks after truncating both = %d, want %d", got, initial)
 	}
 
-	// Older versions shared blocks with clones without counting them.
-	legacy := env.newInode()
-	if _, err := env.mgr.AllocateBlocks(env.ctx, legacy, 0, 1); err != nil {
+}
+
+// legacyShared maps a new block into each inode the way older versions shared
+// blocks: FlagShared without FlagCounted, and a refcount of count.
+func legacyShared(t *testing.T, env *treeEnv, refs *refcount.Region, count uint32, inodes ...*inode.Inode) uint64 {
+	t.Helper()
+	blocks, err := env.bm.Alloc(env.ctx, 1)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := env.mgr.MarkAllShared(legacy); err != nil {
+	if err := refs.Set(env.ctx, blocks[0], count, refcount.FlagNone); err != nil {
 		t.Fatal(err)
 	}
-	env.write(legacy)
-	truncate(legacy)
-	if got := env.bm.FreeCount(); got != initial-1 {
-		t.Fatalf("free blocks after truncating an uncounted shared block = %d, want %d", got, initial-1)
+	for _, ino := range inodes {
+		env.insert(ino, Extent{LogicalBlock: 0, PhysicalBlock: blocks[0], Length: 1, Flags: FlagAllocated | FlagShared})
+		env.write(ino)
+	}
+	return blocks[0]
+}
+
+func TestUncountedSharingIsNeverFreed(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, treeTestBlocks, nil)
+	env.mgr.SetRefcounts(refs)
+	truncate := func(ino *inode.Inode) {
+		t.Helper()
+		if err := env.mgr.Truncate(env.ctx, ino, 0); err != nil {
+			t.Fatal(err)
+		}
+		env.write(ino)
+	}
+
+	// An old clone left a count of 0; an old snapshot and then an old clone left 1.
+	for _, count := range []uint32{0, 1} {
+		src, clone := env.newInode(), env.newInode()
+		block := legacyShared(t, env, refs, count, src, clone)
+		for _, ino := range []*inode.Inode{src, clone} {
+			uncounted, err := env.mgr.HasUncountedSharing(ino)
+			if err != nil || !uncounted {
+				t.Fatalf("count %d: HasUncountedSharing = %v, %v; want true", count, uncounted, err)
+			}
+		}
+		truncate(clone)
+		if ok, _ := env.bm.IsAllocated(block); !ok {
+			t.Fatalf("count %d: truncating the old clone freed block %d that its source maps", count, block)
+		}
+	}
+
+	fresh := env.newInode()
+	if _, err := env.mgr.AllocateBlocks(env.ctx, fresh, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.mgr.MarkAllShared(fresh); err != nil {
+		t.Fatal(err)
+	}
+	if uncounted, err := env.mgr.HasUncountedSharing(fresh); err != nil || uncounted {
+		t.Fatalf("sharing marked by this version reported as uncounted: %v, %v", uncounted, err)
+	}
+}
+
+// Two nodes copy the same shared block of an inline file: only the first
+// inode write may land, so the old block is released once.
+func TestConcurrentInlineCopyOnWrite(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, treeTestBlocks, nil)
+	env.mgr.SetRefcounts(refs)
+
+	src := env.newInode()
+	ext, err := env.mgr.AllocateBlocks(env.ctx, src, 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := ext.PhysicalBlock
+	if err := env.mgr.MarkAllShared(src); err != nil {
+		t.Fatal(err)
+	}
+	env.write(src)
+	if err := refs.Share(env.ctx, []uint64{old}); err != nil {
+		t.Fatal(err)
+	}
+	snap := env.newInode()
+	if err := env.mgr.CopyExtentsForClone(env.ctx, src, snap); err != nil {
+		t.Fatal(err)
+	}
+	env.write(snap)
+
+	nodeA, nodeB := env.reread(src), env.reread(src)
+	var copies []uint64
+	for _, ino := range []*inode.Inode{nodeA, nodeB} {
+		x, _, err := env.mgr.Lookup(ino, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := env.mgr.CopyOnWrite(env.ctx, ino, x, 0, treeTestDataOffset, refs)
+		if err != nil || !res.WasShared {
+			t.Fatalf("copy-on-write: %+v, %v", res, err)
+		}
+		copies = append(copies, res.NewPhysBlock)
+	}
+
+	env.write(nodeA)
+	env.mgr.ReleaseBlocks(env.ctx, []uint64{old})
+	if err := env.tbl.Write(env.ctx, nodeB); !errors.Is(err, ErrTreeConflict) {
+		t.Fatalf("second copy's inode write: got %v, want ErrTreeConflict", err)
+	}
+	env.mgr.DiscardPending(env.ctx, nodeB)
+	if err := env.bm.Free(env.ctx, copies[1]); err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, _ := env.bm.IsAllocated(old); !ok {
+		t.Fatalf("block %d freed while the snapshot still maps it", old)
+	}
+	if e, err := refs.Get(env.ctx, old); err != nil || e.RefCount != 1 {
+		t.Fatalf("old block refcount = %+v, %v; want 1 (the snapshot)", e, err)
+	}
+	if got, _, err := env.mgr.Lookup(env.reread(src), 0); err != nil || got.PhysicalBlock != copies[0] {
+		t.Fatalf("file maps %+v, %v; want the first copy %d", got, err, copies[0])
 	}
 }
