@@ -526,6 +526,13 @@ scenarios:
     environments:
       go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheSnapshotRegistryAlone
 
+  - id: snapshot-refuses-blocks-past-refcount-region
+    name: Snapshot and clone refuse blocks the refcount region cannot count
+    description: Snapshot and clone of a file with blocks past the refcount region fail with ENOTSUP and leave the file unmarked, so later writes do not copy blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotRefusesBlocksPastRefcountRegion
+
   - id: registry-slot-journal-region
     name: Registry records each slot's journal region
     description: Register stores a distinct journal region in each slot

@@ -3305,6 +3305,14 @@ func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, sti
 	if uncounted {
 		return errUncountedSharing
 	}
+	// Refuse before marking src shared, so its writes stay off the copy-on-write path.
+	covered, err := f.extentMgr.DataBlocks(src)
+	if err != nil {
+		return err
+	}
+	if err := f.refcountReg.CheckCovered(covered); err != nil {
+		return err
+	}
 	// A snapshot's data inode is marked shared when it is created and never written again.
 	if src.Flags&inode.FlagSnapshotData == 0 {
 		if src, err = f.updateInode(ctx, srcNum, f.markShared); err != nil {
@@ -3344,7 +3352,7 @@ func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, sti
 
 // sharingErrno maps a failure to share a file's blocks to an errno.
 func sharingErrno(err error) syscall.Errno {
-	if errors.Is(err, errUncountedSharing) {
+	if errors.Is(err, errUncountedSharing) || errors.Is(err, refcount.ErrBlockPastRegion) {
 		return syscall.ENOTSUP
 	}
 	return syscall.EIO

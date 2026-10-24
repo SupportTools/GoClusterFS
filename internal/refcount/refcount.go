@@ -480,6 +480,17 @@ func (r *Region) TotalBlocks() uint64 {
 	return r.totalBlocks
 }
 
+// CheckCovered returns an ErrBlockPastRegion error for the first block the
+// region has no entry for.
+func (r *Region) CheckCovered(blockNums []uint64) error {
+	for _, blockNum := range blockNums {
+		if blockNum >= r.capacity {
+			return r.pastRegion(blockNum)
+		}
+	}
+	return nil
+}
+
 func (r *Region) coveredBlocks() uint64 {
 	return min(r.totalBlocks, r.capacity)
 }
