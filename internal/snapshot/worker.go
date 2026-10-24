@@ -222,13 +222,21 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 		return fmt.Errorf("failed to remove snapshot: %w", err)
 	}
 
+	// Freed only once no descriptor names it, so a reused slot is never released again.
+	if snap.HasData() {
+		if err := w.inodeTable.Free(ctx, snap.DataInode); err != nil {
+			log.Printf("[snapshot/worker] Failed to free data inode %d of snapshot %d: %v",
+				snap.DataInode, job.SnapshotID, err)
+		}
+	}
+
 	log.Printf("[snapshot/worker] Snapshot %d deleted", job.SnapshotID)
 	return nil
 }
 
-// ReleaseData gives back the blocks held by a snapshot's data inode and frees
-// the inode. The empty extent map is committed before any block is released,
-// so a crash leaks blocks at worst and calling it again is safe.
+// ReleaseData gives back the blocks held by a snapshot's data inode. The empty
+// extent map is committed before any block is released, so a crash leaks
+// blocks at worst and calling it again is safe.
 func (w *Worker) ReleaseData(ctx context.Context, num uint32) error {
 	const attempts = 5
 	for attempt := 1; ; attempt++ {
@@ -237,7 +245,6 @@ func (w *Worker) ReleaseData(ctx context.Context, num uint32) error {
 			return err
 		}
 		if ino.Magic == 0 || ino.Flags&inode.FlagSnapshotData == 0 {
-			// Already freed, and possibly reused by a regular file since.
 			return nil
 		}
 		if err := w.extentMgr.Truncate(ctx, ino, 0); err != nil {
@@ -246,14 +253,13 @@ func (w *Worker) ReleaseData(ctx context.Context, num uint32) error {
 		}
 		err = w.inodeTable.Write(ctx, ino)
 		if err == nil {
-			break
+			return nil
 		}
 		w.extentMgr.DiscardPending(ctx, ino)
 		if !errors.Is(err, inode.ErrTreeConflict) || attempt == attempts {
 			return err
 		}
 	}
-	return w.inodeTable.Free(ctx, num)
 }
 
 // resultHandler processes completed job results.
