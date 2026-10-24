@@ -1897,10 +1897,24 @@ scenarios:
 
   - id: lock-late-claim-write-not-held
     name: Late claim write is not held
-    description: A claim write that finishes more than half the settle delay after its read is not held, so two nodes cannot both hold the lock
+    description: A claim write that lands more than half the settle delay after its read, over another node's confirmed claim, is not held, so two nodes cannot both hold the lock
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestLateClaimWriteIsNotHeld
+
+  - id: lock-late-read-claim-admits-no-readers
+    name: Late read claim admits no readers
+    description: A read claim that lands late on another node's write claim is turned into a write claim, so no further reader joins beside the writer
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLateReadClaimAdmitsNoReaders
+
+  - id: lock-release-cached-parallel
+    name: Unmount frees kept locks in parallel
+    description: On slow storage ReleaseCached frees kept records in parallel, so 16 records take about as long as one
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseCachedWithSlowWritesRunsInParallel
 
   - id: lock-slow-release-gives-up
     name: Release with slow writes gives up

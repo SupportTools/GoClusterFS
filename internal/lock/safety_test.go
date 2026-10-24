@@ -601,15 +601,33 @@ func TestSharedClaimSurvivesJoinDuringSettle(t *testing.T) {
 	}
 }
 
-// stallOnce returns a hook that, the first time it runs, signals started and
-// then stalls for 1.5 settle delays.
-func stallOnce(started chan<- struct{}) func() {
+// slowWrite is a record write on slow storage. It waits stall before its
+// deadline check, as a stopped process would, and queued between the check and
+// the write landing, as a busy device would.
+func slowWrite(m *Manager, stall, queued time.Duration) func([]byte, int64, time.Time) (int, error) {
+	return func(buf []byte, offset int64, deadline time.Time) (int, error) {
+		time.Sleep(stall)
+		if !time.Now().Before(deadline) {
+			return 0, storage.ErrWriteDeadline
+		}
+		time.Sleep(queued)
+		return m.dev.WriteAt(buf, offset)
+	}
+}
+
+// slowFirstWrite makes only m's first record write slow and closes started as it begins.
+func slowFirstWrite(m *Manager, slow func([]byte, int64, time.Time) (int, error), started chan<- struct{}) {
 	var once sync.Once
-	return func() {
+	m.casWrite = func(buf []byte, offset int64, deadline time.Time) (int, error) {
+		first := false
 		once.Do(func() {
+			first = true
 			close(started)
-			time.Sleep(3 * ClaimSettleDelay / 2)
 		})
+		if first {
+			return slow(buf, offset, deadline)
+		}
+		return m.dev.WriteAtBefore(buf, offset, deadline)
 	}
 }
 
@@ -622,7 +640,7 @@ func TestSlowClaimWriteIsSkipped(t *testing.T) {
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
 	bWriting := make(chan struct{})
-	b.beforeCASWrite = stallOnce(bWriting)
+	slowFirstWrite(b, slowWrite(b, 3*ClaimSettleDelay/2, 0), bWriting)
 
 	errb := make(chan error, 1)
 	go func() { errb <- acquireWithin(b, 2*time.Second, LockTypeInode, 21, LockModeExclusive) }()
@@ -643,17 +661,44 @@ func TestSlowClaimWriteIsSkipped(t *testing.T) {
 	}
 }
 
-// A claim write that finished long after its read may have replaced a claim
-// another node confirmed in the meantime, so the node does not take the lock.
+// A claim write that lands long after its read can replace a claim another node
+// confirmed in the meantime, so the late node does not take the lock.
 func TestLateClaimWriteIsNotHeld(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	b.afterCASWrite = stallOnce(make(chan struct{}))
+	bWriting := make(chan struct{})
+	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay), bWriting)
 
-	if err := acquireWithin(b, 300*time.Millisecond, LockTypeInode, 22, LockModeExclusive); !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("Acquire with a late claim write: got %v, want ErrLockTimeout", err)
+	errb := make(chan error, 1)
+	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 22, LockModeExclusive) }()
+	<-bWriting
+	requireAcquired(t, a, LockTypeInode, 22, LockModeExclusive)
+	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("node B with a late write: got %v, want ErrLockTimeout while node A holds the lock", err)
 	}
+}
+
+// A late read claim that lands on another node's write claim must not let
+// further readers in beside that writer.
+func TestLateReadClaimAdmitsNoReaders(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	c := newTestNode(dev, 0, 1<<20, 3)
+	bWriting := make(chan struct{})
+	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay), bWriting)
+
+	errb := make(chan error, 1)
+	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 26, LockModeShared) }()
+	<-bWriting
+	requireAcquired(t, a, LockTypeInode, 26, LockModeExclusive)
+	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("node B with a late read claim: got %v, want ErrLockTimeout", err)
+	}
+	requireBlocked(t, c, LockTypeInode, 26, LockModeShared)
 }
 
 // returnsWithin fails the test if fn has not returned after 3s.
@@ -678,7 +723,7 @@ func TestReleaseWithSlowWritesGivesUp(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	requireAcquired(t, a, LockTypeInode, 23, LockModeExclusive)
-	a.beforeCASWrite = func() { time.Sleep(ClaimSettleDelay) }
+	a.casWrite = slowWrite(a, ClaimSettleDelay, 0)
 
 	returnsWithin(t, "release", func() {
 		a.Release(LockTypeInode, 23)
@@ -694,11 +739,40 @@ func TestRenewalWithSlowWritesGivesUp(t *testing.T) {
 	defer func(d time.Duration) { renewAfter = d }(renewAfter)
 	renewAfter = 0
 	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
-	a.beforeCASWrite = func() { time.Sleep(ClaimSettleDelay) }
+	a.casWrite = slowWrite(a, ClaimSettleDelay, 0)
 
 	var err error
 	returnsWithin(t, "renewal", func() { err = acquireWithin(a, time.Minute, LockTypeInode, 2, LockModeExclusive) })
 	if !errors.Is(err, ErrLockTimeout) {
 		t.Fatalf("Acquire joining a record whose renewal cannot write: got %v, want ErrLockTimeout", err)
+	}
+}
+
+// On slow storage an unmount frees its kept records in parallel, so it takes
+// about as long as one record's retries, not the sum of them.
+func TestReleaseCachedWithSlowWritesRunsInParallel(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
+	cacheGrace = time.Minute
+
+	records := map[uint64]bool{}
+	for id := uint64(100); len(records) < 16; id++ {
+		if records[a.hashToRecord(LockTypeInode, id)] {
+			continue
+		}
+		records[a.hashToRecord(LockTypeInode, id)] = true
+		requireAcquired(t, a, LockTypeInode, id, LockModeExclusive)
+		if err := a.Release(LockTypeInode, id); err != nil {
+			t.Fatalf("Release: %v", err)
+		}
+	}
+	a.casWrite = slowWrite(a, ClaimSettleDelay, 0)
+
+	start := time.Now()
+	a.ReleaseCached()
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("ReleaseCached of %d kept records took %v", len(records), took.Round(time.Millisecond))
 	}
 }

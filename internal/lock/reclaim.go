@@ -64,7 +64,7 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
 		adopted.Sequence++
 		ok, err := m.casRecord(recordID, record, &adopted)
 		if errors.Is(err, errLateWrite) {
-			m.giveUpLateClaim(recordID)
+			m.giveUpLateClaim(recordID, &adopted)
 			return false, nil
 		}
 		if err != nil {
