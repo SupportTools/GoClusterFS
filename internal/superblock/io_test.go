@@ -5,12 +5,18 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 func testDevice(t *testing.T, size int64) *storage.Device {
+	dev, _ := testDeviceAt(t, size)
+	return dev
+}
+
+func testDeviceAt(t *testing.T, size int64) (*storage.Device, string) {
 	t.Helper()
 	dir := os.Getenv("GOCLUSTERFS_TEST_DIR")
 	if dir == "" {
@@ -32,7 +38,7 @@ func testDevice(t *testing.T, size int64) *storage.Device {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
 	t.Cleanup(func() { dev.Close() })
-	return dev
+	return dev, path
 }
 
 func writeAt(t *testing.T, dev *storage.Device, offset int64, data []byte) {
@@ -71,6 +77,20 @@ func TestFormatThenRead(t *testing.T) {
 		if !isZero(buf.Bytes()) {
 			t.Errorf("Format left data at offset %d", offset)
 		}
+	}
+}
+
+func TestFormatKeepsSparseImageSparse(t *testing.T) {
+	dev, path := testDeviceAt(t, MinDeviceSize)
+	if _, err := Format(dev); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		t.Fatal(err)
+	}
+	if allocated := st.Blocks * 512; allocated > 64<<10 {
+		t.Errorf("Format allocated %d bytes of a blank sparse image, want only the superblock", allocated)
 	}
 }
 

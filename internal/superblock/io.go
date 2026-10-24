@@ -126,17 +126,29 @@ func Format(dev *storage.Device) (*Superblock, error) {
 	sb := New(dev.Size())
 
 	zero := storage.NewAlignedBuffer(regionSize)
+	current := storage.NewAlignedBuffer(regionSize)
+	// Writing only non-zero ranges keeps holes in sparse images, which O_DIRECT reads fast.
+	zeroRange := func(offset uint64, size int) error {
+		if _, err := dev.ReadAt(current.Bytes()[:size], int64(offset)); err != nil {
+			return err
+		}
+		if isZero(current.Bytes()[:size]) {
+			return nil
+		}
+		_, err := dev.WriteAt(zero.Bytes()[:size], int64(offset))
+		return err
+	}
 	for _, offset := range []uint64{
 		0, sb.BlockBitmapOffset, sb.InodeTableOffset, sb.NodeRegistryOffset,
 		sb.LockBitmapOffset, sb.RefCountTableOffset, sb.SnapshotRegOffset,
 	} {
-		if _, err := dev.WriteAt(zero.Bytes(), int64(offset)); err != nil {
+		if err := zeroRange(offset, regionSize); err != nil {
 			return nil, fmt.Errorf("zero metadata at %d: %w", offset, err)
 		}
 	}
 	for slot := 0; slot < MaxNodes; slot++ {
 		offset := sb.JournalRegionOffset + uint64(slot)*sb.JournalSlotSize()
-		if _, err := dev.WriteAt(zero.Bytes()[:storage.SectorSize], int64(offset)); err != nil {
+		if err := zeroRange(offset, storage.SectorSize); err != nil {
 			return nil, fmt.Errorf("zero journal header of slot %d: %w", slot, err)
 		}
 	}
