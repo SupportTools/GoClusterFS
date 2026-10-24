@@ -2353,7 +2353,12 @@ test_concurrent_first_write_same_block() {
     done
     sleep 2
 
-    # Each writer caches its own extent, so a lost update shows on either reader.
+    # Restart the reader so cached extents from earlier files with the same inode numbers cannot hide the result.
+    stop_vm 1
+    start_vm 1 false
+    wait_vm_healthy 1 || return 1
+    setup_goclusterfs 1 false
+
     local lost=0
     for i in $(seq 1 $files); do
         verify_pattern_at_on_vm 1 "first_write_$i.bin" "A" "$offset0" 4096 || lost=$((lost + 1))
