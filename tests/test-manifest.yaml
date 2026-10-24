@@ -1091,6 +1091,41 @@ scenarios:
     environments:
       go: internal/trim/trim_test.go::TestStatsAreThreadSafe
 
+  - id: trim-skip-reallocated
+    name: TRIM skips a reallocated block
+    description: A block freed and allocated again before the flush is not discarded
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimSkipsBlockReallocatedBeforeFlush
+
+  - id: trim-skip-remote-allocated
+    name: TRIM skips a block another node allocated
+    description: A freed block another node allocated before the flush is not discarded
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimSkipsBlockAnotherNodeAllocated
+
+  - id: trim-discard-free
+    name: TRIM discards free blocks
+    description: Blocks still free at flush time are discarded
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimDiscardsFreedBlocks
+
+  - id: trim-batch-flush-from-free
+    name: TRIM batch flush from Free
+    description: A full batch flushes in the background without deadlocking Free on the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimBatchFlushFromFree
+
+  - id: trim-duplicate-block
+    name: TRIM duplicate block
+    description: A block queued twice is discarded once
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestDuplicateBlockDiscardedOnce
+
   # ===========================================================================
   # SPACE REPORTING TESTS (Phase 5: Thin Provisioning)
   # ===========================================================================
@@ -1457,6 +1492,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestConfigDefaults
+
+  - id: broadcast-dedup-per-sender
+    name: Broadcast dedup per sender
+    description: The same sequence number from two senders is processed twice
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestSameSequenceFromTwoSenders
+
+  - id: broadcast-hmac-every-byte
+    name: Broadcast HMAC covers every byte
+    description: Flipping any bit, appending a byte or stripping the HMAC is rejected
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::TestHMACCoversEveryByte
+
+  - id: broadcast-truncation
+    name: Broadcast truncated messages
+    description: Every truncation of a message is rejected
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::TestTruncatedMessageRejected
+
+  - id: broadcast-single-datagram
+    name: Broadcast message fits one datagram
+    description: The largest message fits a 1500-byte MTU without fragmentation
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::TestLargestMessageFitsOneDatagram
+
+  - id: broadcast-fuzz-unmarshal
+    name: Broadcast Unmarshal fuzz
+    description: Accepted signed datagrams are exactly what Marshal produces
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::FuzzUnmarshal
 
   # ---------------------------------------------------------------------------
   # Broadcast Integration Tests (end-to-end cross-node invalidation)
