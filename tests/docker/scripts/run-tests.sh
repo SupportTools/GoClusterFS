@@ -1874,7 +1874,10 @@ test_concurrent_first_write_same_block() {
         write_pattern_at "$writer1" "first_write_$i.bin" B "$size" "$offset1" &
         wait
     done
-    sleep 2
+
+    # Restart the reader so cached extents from earlier files with the same inode numbers cannot hide the result.
+    restart_node "$reader"
+    wait_node_healthy "$reader" 30 || return 1
 
     local lost=0
     for i in $(seq 1 $files); do
