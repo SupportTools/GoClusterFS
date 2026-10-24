@@ -824,6 +824,104 @@ func TestCloneFromSnapshot(t *testing.T) {
 	t.Log("Clone from snapshot test passed")
 }
 
+// Node A overwrites a file chunk by chunk, round after round, while node B
+// snapshots it. Each snapshot must hold the file as it was at one moment, and
+// must not change after it is made.
+func TestSnapshotsDuringWritesAcrossNodes(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, snapshotter := cluster.Node(0), cluster.Node(1)
+	const size, chunkSize, snapshots = 2 * mb, 64 << 10, 20
+	fill := func(round int) []byte { return bytes.Repeat([]byte{byte(round%250 + 1)}, chunkSize) }
+	if err := writer.WriteFile("busy.bin", bytes.Repeat(fill(0), size/chunkSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	writerDone := make(chan error, 1)
+	go func() {
+		f, err := os.OpenFile(writer.Path("busy.bin"), os.O_WRONLY, 0)
+		if err != nil {
+			writerDone <- err
+			return
+		}
+		defer f.Close()
+		for round := 1; ; round++ {
+			for off := 0; off < size; off += chunkSize {
+				select {
+				case <-stop:
+					writerDone <- nil
+					return
+				default:
+				}
+				if _, err := f.WriteAt(fill(round), int64(off)); err != nil {
+					writerDone <- err
+					return
+				}
+			}
+		}
+	}()
+
+	var clones []string
+	first := map[string][]byte{}
+	for i := range snapshots {
+		name := fmt.Sprintf("busy-%d", i)
+		setxattr(t, snapshotter.Path("busy.bin"), "user.snapshot", name)
+		clone := name + ".bin"
+		setxattr(t, snapshotter.Path("busy.bin"), "user.snapshot.clone", name+":/"+clone)
+		data, err := snapshotter.ReadFile(clone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clones = append(clones, clone)
+		first[clone] = data
+	}
+	close(stop)
+	if err := <-writerDone; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+
+	for _, clone := range clones {
+		data, err := snapshotter.ReadFile(clone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, first[clone]) {
+			t.Errorf("%s changed after its snapshot was made", clone)
+		}
+		if len(data) != size {
+			t.Fatalf("%s: size %d, want %d", clone, len(data), size)
+		}
+		// Chunks before the writer's position hold the newer round, the rest the round before.
+		newer := data[0]
+		before := newer - 1
+		if newer == 1 {
+			before = 250
+		}
+		older := false
+	chunks:
+		for off := 0; off < size; off += chunkSize {
+			c := data[off : off+chunkSize]
+			switch {
+			case !bytes.Equal(c, bytes.Repeat(c[:1], chunkSize)):
+				t.Errorf("%s: chunk at %d mixes two rounds", clone, off)
+				break chunks
+			case c[0] == newer && !older:
+			case c[0] == before:
+				older = true
+			default:
+				t.Errorf("%s: chunk at %d holds round value %d after %d; the file never looked like this", clone, off, c[0], newer)
+				break chunks
+			}
+		}
+	}
+}
+
 func setxattr(t *testing.T, path, attr, value string) {
 	t.Helper()
 	if err := unix.Setxattr(path, attr, []byte(value), 0); err != nil {

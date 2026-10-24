@@ -3108,6 +3108,56 @@ test_snapshot_delete_after_overwrite() {
 # Two VMs each take 10 snapshots of their own file at the same time. Each file
 # must list all of its snapshots, and deleting one VM's snapshots must leave
 # the other VM's alone.
+# Node A overwrites a 2 MB file in 64 KB chunks with rounds of a, b, c while
+# node B snapshots it. Every snapshot must show one moment of the file (a
+# prefix of the next round, the rest of the round before) and never change.
+test_snapshot_during_writes() {
+    log_info "Testing snapshots on one VM while another VM overwrites the file..."
+    ensure_cluster_healthy 2
+
+    local run=$$
+    local file=/mnt/goclusterfs/busy.bin
+
+    ssh_run 1 "head -c 2097152 /dev/zero | tr '\\000' c > $file" || return 1
+    ssh_run 1 "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/dev/null || exit 1; done; done; done" &
+    local writer=$!
+
+    local i clone sum
+    local clones=() sums=()
+    for i in $(seq 1 10); do
+        clone=/mnt/goclusterfs/busy_${run}_$i.bin
+        if ! ssh_run 2 "setfattr -n user.snapshot -v busy_${run}_$i $file && setfattr -n user.snapshot.clone -v busy_${run}_$i:/busy_${run}_$i.bin $file"; then
+            log_error "snapshot $i on VM 2 failed"
+            ssh_run 1 "touch /tmp/busy.stop"
+            wait "$writer"
+            return 1
+        fi
+        clones+=("$clone")
+        sums+=("$(ssh_run 2 "md5sum < $clone | cut -d' ' -f1")")
+    done
+    ssh_run 1 "touch /tmp/busy.stop"
+    wait "$writer" || { log_error "writer on VM 1 failed"; return 1; }
+
+    for i in "${!clones[@]}"; do
+        clone=${clones[$i]}
+        sum=$(ssh_run 2 "md5sum < $clone | cut -d' ' -f1")
+        if [ "$sum" != "${sums[$i]}" ]; then
+            log_error "$clone changed after its snapshot was made"
+            return 1
+        fi
+        local shape
+        shape=$(ssh_run 2 "for k in \$(seq 0 31); do dd if=$clone bs=65536 skip=\$k count=1 2>/dev/null | tr -s abc | head -c 2; done")
+        if [ ${#shape} -ne 32 ] || ! [[ $shape =~ ^(b*a*|c*b*|a*c*)$ ]]; then
+            log_error "$clone chunks read $shape; the file never looked like this"
+            return 1
+        fi
+    done
+
+    ssh_run 2 "for i in \$(seq 1 10); do setfattr -x user.snapshot.busy_${run}_\$i $file; rm -f /mnt/goclusterfs/busy_${run}_\$i.bin; done"
+    log_info "Snapshots during writes test passed"
+    return 0
+}
+
 test_snapshot_concurrent_creates() {
     log_info "Testing concurrent snapshot creation on two VMs..."
     ensure_cluster_healthy 2
@@ -3264,6 +3314,7 @@ main() {
     run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
     # Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
     log_info "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
+    run_test "Snapshot During Writes" test_snapshot_during_writes
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation

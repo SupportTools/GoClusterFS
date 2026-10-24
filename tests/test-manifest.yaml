@@ -1809,6 +1809,22 @@ scenarios:
       docker: run-tests.sh::test_snapshot_delete_after_overwrite
       vm: run-vm-tests.sh::test_snapshot_delete_after_overwrite
 
+  - id: snapshot-during-inplace-write
+    name: Snapshot between an in-place write's decision and its data
+    description: Node A decides to write a never-shared or once-shared block in place, node B snapshots the file before A writes; A finds the block shared under the inode lock, copies it, and the snapshot keeps the old data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotDuringInPlaceWriteAcrossNodes
+
+  - id: snapshot-during-writes-across-nodes
+    name: Snapshots on one node while another overwrites the file
+    description: Every snapshot node B takes while node A overwrites the file chunk by chunk shows one moment of the file and never changes afterwards
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotsDuringWritesAcrossNodes
+      docker: run-tests.sh::test_snapshot_during_writes
+      vm: run-vm-tests.sh::test_snapshot_during_writes
+
   - id: snapshot-concurrent-creates-across-nodes
     name: Concurrent snapshots on two nodes
     description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's

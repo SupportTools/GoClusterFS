@@ -417,6 +417,47 @@ func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
 // An image written by an older version, with an old snapshot and an old clone
 // of one file. Writes, then deleting the clone and the source, never free a
 // block another inode still maps; the blocks leak instead.
+// Node A decides to write a block in place, then node B snapshots the file
+// before A writes the data. The snapshot must keep the data from before the
+// write, whether the block was never shared or shared once by a snapshot that
+// is gone.
+func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
+	for _, onceShared := range []bool{false, true} {
+		t.Run(fmt.Sprintf("onceShared=%v", onceShared), func(t *testing.T) {
+			path := newSnapshotFSImage(t)
+			nodeA := openSnapshotFS(t, path)
+			if err := nodeA.InitRoot(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			original := pattern(1, BlockSize)
+			f := newRegularFile(t, nodeA)
+			writeAt(t, f, original, 0)
+			if onceShared {
+				setxattr(t, f, "user.snapshot", "gone")
+				if errno := f.Removexattr(context.Background(), "user.snapshot.gone"); errno != 0 {
+					t.Fatalf("delete snapshot: %v", errno)
+				}
+				waitSnapshotGone(t, nodeA, "gone")
+			}
+
+			nodeB := openSnapshotFS(t, path)
+			t.Cleanup(func() { beforeInPlaceWrite = nil })
+			beforeInPlaceWrite = func() {
+				beforeInPlaceWrite = nil
+				setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+			}
+			writeAt(t, f, pattern(2, 4096), 0)
+			if beforeInPlaceWrite != nil {
+				t.Fatal("node A's write never reached an in-place write")
+			}
+
+			checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, overwritten(original, 0, pattern(2, 4096)))
+			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			checkFile(t, lookupFile(t, nodeB, "mid-clone"), original)
+		})
+	}
+}
+
 func TestOldSnapshotAndCloneNeverFreeSharedBlocks(t *testing.T) {
 	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
 	ctx := context.Background()
