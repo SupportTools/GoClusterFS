@@ -357,11 +357,9 @@ scenarios:
   - id: multinode-reader-sees-no-uncommitted-blocks
     name: Reader never sees uncommitted blocks
     description: While node A writes a new file of fresh blocks without extent locks, node B's reads show only holes, the old size or each block's own data
-    priority: high
+    priority: go_only
     environments:
-      go: multinode_test.go::TestMultiNodeReaderNeverSeesUncommittedBlocks
-      docker: TODO
-      vm: TODO
+      go: internal/goclusterfs/lock_commit_test.go::TestReaderNeverSeesUncommittedBlocks
 
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
