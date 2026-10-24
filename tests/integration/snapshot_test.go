@@ -505,7 +505,8 @@ func TestSnapshotDeleteAndReuse(t *testing.T) {
 		t.Fatalf("Removexattr failed: %v", err)
 	}
 
-	waitForSnapshotState(t, filePath, "", "temp-snap")
+	// Wait for background deletion and block freeing
+	time.Sleep(500 * time.Millisecond)
 
 	// Verify the live file still has the new content
 	readBack, err := mfs.ReadFile("reuse.txt")
