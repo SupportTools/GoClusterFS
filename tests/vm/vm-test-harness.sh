@@ -130,6 +130,7 @@ download_iso() {
 # =============================================================================
 create_shared_disk() {
     local expected_bytes=$((SHARED_DISK_SIZE_MB * 1024 * 1024))
+    mkdir -p "${VM_DIR}"
 
     if [[ -f "${SHARED_DISK_PATH}" ]]; then
         local actual_bytes=$(stat -c%s "${SHARED_DISK_PATH}" 2>/dev/null || echo 0)
