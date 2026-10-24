@@ -1613,6 +1613,51 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
+# Test: Extent cache coherency across VMs
+# VM 2 reads files, VM 1 changes their block mappings (truncate and rewrite,
+# hole fill), and VM 2 must read the new data.
+test_extent_cache_coherency() {
+    log_info "Testing extent cache coherency across VMs..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping extent cache coherency test (requires 2+ VMs)"
+        return 0
+    fi
+
+    ensure_cluster_healthy 2
+
+    local writer=1
+    local reader=2
+    local dir=/mnt/goclusterfs
+    local trunc="extent_trunc_$(date +%s).bin"
+    local holes="extent_holes_$(date +%s).bin"
+
+    ssh_run "$writer" "head -c 307200 /dev/zero | tr '\\0' o > $dir/$trunc"
+    ssh_run "$writer" "head -c 4096 /dev/zero | tr '\\0' a > $dir/$holes && head -c 4096 /dev/zero | tr '\\0' c | dd of=$dir/$holes bs=1M seek=2 conv=notrunc 2>/dev/null"
+    ssh_run "$reader" "cat $dir/$trunc $dir/$holes > /dev/null"
+
+    # The padding file takes the freed block, so the rewrite lands in another one.
+    ssh_run "$writer" "truncate -s 0 $dir/$trunc && head -c 307200 /dev/zero | tr '\\0' p > $dir/extent_pad.bin && head -c 307200 /dev/zero | tr '\\0' n > $dir/$trunc"
+    ssh_run "$writer" "head -c 4096 /dev/zero | tr '\\0' b | dd of=$dir/$holes bs=1M seek=1 conv=notrunc 2>/dev/null"
+
+    local f want got failed=0
+    for f in "$trunc" "$holes"; do
+        want=$(ssh_run "$writer" "md5sum < $dir/$f")
+        got=$(ssh_run "$reader" "md5sum < $dir/$f")
+        if [[ "$got" != "$want" ]]; then
+            log_error "VM $reader read stale data from $f: md5 '$got', want '$want'"
+            failed=1
+        fi
+    done
+    ssh_run "$writer" "rm -f $dir/$trunc $dir/$holes $dir/extent_pad.bin"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log_info "Extent cache coherency test passed"
+    return 0
+}
+
 # Test 4: Rolling restart
 test_rolling_restart() {
     log_info "Testing rolling restart..."
@@ -2856,6 +2901,7 @@ main() {
     run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
     run_test "Broadcast Bidirectional" test_broadcast_bidirectional
     run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
+    run_test "Extent Cache Coherency" test_extent_cache_coherency
     run_test "Rolling Restart" test_rolling_restart
     run_test "Stress Random Failures" test_stress_random_failures
 

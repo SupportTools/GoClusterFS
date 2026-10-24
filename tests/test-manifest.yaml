@@ -340,6 +340,15 @@ scenarios:
       docker: run-tests.sh::test_inode_reuse_stale_read
       vm: run-vm-tests.sh::test_inode_reuse_stale_read
 
+  - id: multinode-extent-cache-coherency
+    name: Extent cache coherency across nodes
+    description: One node changes the block mappings of files another node has read (truncate and rewrite, hole fill); the other node reads the new data
+    priority: critical
+    environments:
+      go: multinode_test.go::TestMultiNodeExtentCacheCoherency
+      docker: run-tests.sh::test_extent_cache_coherency
+      vm: run-vm-tests.sh::test_extent_cache_coherency
+
   # ===========================================================================
   # NETWORK AND RESILIENCE TESTS
   # ===========================================================================
@@ -964,6 +973,27 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cache/inode_cache_test.go::TestCacheInodeClearsNegativeEntry
+
+  - id: inode-cache-keeps-newer
+    name: Inode cache keeps the newer copy
+    description: Caching an older copy of an inode does not replace a newer cached copy
+    priority: go_only
+    environments:
+      go: internal/cache/inode_cache_test.go::TestCacheInodeKeepsNewerCopy
+
+  - id: extent-cache-inode-version
+    name: Extent cache misses after an inode write
+    description: A cached block mapping is not used with a later version of its inode
+    priority: go_only
+    environments:
+      go: internal/cache/extent_cache_test.go::TestGetExtentMissesAfterInodeWrite
+
+  - id: extent-cache-invalidate
+    name: Extent invalidation drops the cached inode
+    description: InvalidateExtentsForInode forces the next lookup to read the current inode version
+    priority: go_only
+    environments:
+      go: internal/cache/extent_cache_test.go::TestInvalidateExtentsForInodeDropsCachedInode
 
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
