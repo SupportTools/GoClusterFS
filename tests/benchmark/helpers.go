@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // BenchmarkFS manages a temporary mounted GoClusterFS instance for benchmarking.
@@ -52,14 +54,14 @@ func findBinary() (string, error) {
 	return "", fmt.Errorf("goclusterfs-mount binary not found; run 'go build -o goclusterfs-mount ./cmd/mount' first")
 }
 
-// allocateImage creates a sparse image file of the given size.
+// allocateImage creates a sparse image file with sizeMB of data space after the metadata regions.
 func allocateImage(path string, sizeMB int) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	return f.Truncate(int64(sizeMB) * 1024 * 1024)
+	return f.Truncate(superblock.MinDeviceSize + int64(sizeMB)*1024*1024)
 }
 
 // setupBenchmarkFS creates and mounts a new test filesystem for benchmarking.

@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- The on-disk format is now version 2. Mount refuses devices formatted by earlier builds, because they kept one journal for all nodes and data blocks at a different offset. Copy the data off with the old build, reformat with `-format`, and copy it back.
+- Devices must be at least 264 MB: version 2 reserves 256 MB for 64 node journals of 4 MB.
+- Node clocks must agree within a few seconds. See the node requirements in `docs/OPERATIONS.md`.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
@@ -24,7 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Batched TRIM of freed blocks (`-trim`).
 - SFB containers for files under 64 KB, disabled: every file uses normal extents and `-sfb` has no effect. A file that an older build stored in an SFB slot stays readable, moves to a full block on its next write or truncate, and frees its slot when deleted.
 - Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Copy-on-write does not trigger yet, so a snapshot does not preserve data, and an in-place write to a clone changes the source file.
-- Experimental: `goclusterfs-fsck` consistency checker with a repair mode. It fails on newly formatted volumes because `-format` does not write a superblock.
+- Experimental: `goclusterfs-fsck` consistency checker with a repair mode. It reports errors on healthy volumes: the superblock free counters are not updated after format, and it expects refcount and snapshot sector checksums the runtime does not write.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
 - Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records) and the journal recovery scan.
@@ -34,6 +37,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `-format` now writes a superblock with the volume layout and zeroes all metadata regions, even on a device that already holds a filesystem. Mount reads every region offset from the superblock.
+- At most 64 nodes mount a volume at once, one per node registry slot.
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.
 - `go.mod` now requires Go 1.26.
 - `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
@@ -45,6 +50,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- All nodes wrote the same journal region. A restarting node replayed and then reset the journal of nodes still writing, and no node could replay a crashed node's journal. Each node registry slot now owns a 4 MB journal, and a crashed node's journal is replayed through its slot.
+- Nodes never sent registry heartbeats, so a node mounting more than 10 seconds after another took the live node's registry slot.
 - After a partial write into a fallocated range, reads of the other fallocated blocks, and of the rest of the written block, returned old disk contents. They now return zeros.
 - Writes failed with `EAGAIN` once a file needed a third extent, so most files over 2 MB could not be written. Extents past the first two now go in an on-disk extent tree, and adjacent extents merge.
 - `goclusterfs-fsck` phase 4 never checked file extents, because it read inodes into unaligned buffers that `O_DIRECT` rejects.
