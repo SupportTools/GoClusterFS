@@ -42,8 +42,11 @@ These flags are passed when starting `goclusterfs`:
 |------|------|---------|-------------|
 | `-cache-strict` | bool | `false` | Enable strict cache mode (always validate against disk) |
 | `-cache-ttl` | duration | `5s` | Cache entry TTL before revalidation required |
+| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries |
 
-The kernel caches file attributes and directory entries for 1s (the FUSE attribute and entry timeouts). For up to 1s after another node changes a file, `stat` and path lookups on this node can return the old size, and a read can stop at the old size even right after `open`. After that, opening a file reads its inode from disk, so the reader sees the other node's completed writes. Reads through a file that is already open use the inode cache and can use the old size and block mappings for up to `-cache-ttl`, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
+The kernel caches file attributes and directory entries for `-attr-timeout`. For that long after another node changes a file, `stat` and path lookups on this node can return the old size, and a read can stop at the old size even right after `open`. After that, opening a file reads its inode from disk, so the reader sees the other node's completed writes. Reads through a file that is already open use the inode cache and can use the old size and block mappings for up to `-cache-ttl`, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
+
+`-attr-timeout=0` makes `stat` and path lookups always current, but each `stat` and path step then reads the directory from disk under a cluster lock. In one test on a single mount, 2000 `stat` calls on one file took 13.9s at 0 and 0.01s at 1s, and `ls -l` of 300 files took 11.8s and 3.7s.
 
 ### Journal Flags
 

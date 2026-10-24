@@ -484,7 +484,7 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 		return syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
@@ -533,7 +533,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return nil, syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.EntryValid = 0
 	out.AttrValid = 0
 
@@ -1118,8 +1118,7 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 		return syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
-	// Other nodes may modify attributes at any time.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
@@ -1168,8 +1167,7 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return nil, syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
-	// Other nodes may modify the filesystem at any time.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.EntryValid = 0
 	out.AttrValid = 0
 
@@ -1951,8 +1949,7 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 
 	log.Printf("[DEBUG] File.Getattr: inode=%d Size=%d AllocatedBlocks=%d", f.inodeNum, ino.Size, ino.AllocatedBlocks)
 
-	// Disable FUSE kernel caching for cluster operation.
-	// Other nodes may modify attributes at any time.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
