@@ -117,7 +117,7 @@ init_vm_run() {
     mkdir -p "${VM_DIR}" "${RESULTS_DIR}"
     VM_RUN_DIR=$(mktemp -d "${VM_DIR}/run.XXXXXX")
     VM_RUN_OWNER=$$
-    export VM_RUN_DIR
+    export VM_RUN_DIR VM_RUN_OWNER
 
     cp "${PROJECT_ROOT}/goclusterfs-mount" "${VM_RUN_DIR}/goclusterfs-mount"
     ssh-keygen -t ed25519 -f "$(get_ssh_key)" -N "" -q -C "goclusterfs-vm-run"
@@ -140,7 +140,7 @@ on_vm_run_exit() {
     set +e
     stop_child_processes
     kill_all_vms
-    if [[ "${VM_RUN_OWNER:-}" == "$$" ]]; then
+    if [[ "${VM_RUN_OWNER:-}" == "$$" ]] || ! kill -0 "${VM_RUN_OWNER:-$$}" 2>/dev/null; then
         rm -rf "${VM_RUN_DIR}"
     fi
     exit "$status"
@@ -284,9 +284,11 @@ is_vm_running() {
     local vm_id="$1"
     local pid_file=$(get_vm_pid_file "$vm_id")
 
+    # A stale pid file may name a reused PID, so check that it is still this VM's QEMU
     if [[ -f "$pid_file" ]]; then
         local pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
+        local cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+        if [[ "$cmdline" == *"-name goclusterfs-vm${vm_id} "* ]]; then
             return 0
         fi
     fi
@@ -531,6 +533,7 @@ stop_vm() {
 
     if ! is_vm_running "$vm_id"; then
         log_info "VM $vm_id is not running"
+        rm -f "$pid_file" "$(get_vm_monitor_socket "$vm_id")" "$(get_vm_serial_socket "$vm_id")"
         return 0
     fi
 
@@ -565,12 +568,11 @@ kill_vm() {
     local vm_id="$1"
     local pid_file=$(get_vm_pid_file "$vm_id")
 
-    if [[ -f "$pid_file" ]]; then
-        local pid=$(cat "$pid_file")
-        kill -9 "$pid" 2>/dev/null || true
-        rm -f "$pid_file"
+    if is_vm_running "$vm_id"; then
+        kill -9 "$(cat "$pid_file")" 2>/dev/null || true
         mark_vm_log "$vm_id" "VM $vm_id killed"
     fi
+    rm -f "$pid_file"
     # Clean up sockets
     rm -f "$(get_vm_monitor_socket "$vm_id")" "$(get_vm_serial_socket "$vm_id")"
 
