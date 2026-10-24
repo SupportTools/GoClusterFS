@@ -26,9 +26,13 @@ log() {
 if [ "$ORCHESTRATOR_MODE" = "true" ]; then
     log "Starting in orchestrator mode"
 
-    # Wait for all nodes to be healthy
     log "Waiting for nodes to be ready..."
-    sleep 5  # Initial delay for nodes to start
+    for node in ${NODES//,/ }; do
+        for _ in $(seq 1 240); do
+            docker exec "$node" /scripts/healthcheck.sh > /dev/null 2>&1 && break
+            sleep 0.5
+        done
+    done
 
     # Run the test script if provided
     if [ -n "$TEST_SCRIPT" ] && [ -f "$TEST_SCRIPT" ]; then
