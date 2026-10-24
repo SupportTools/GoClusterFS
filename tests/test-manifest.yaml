@@ -557,8 +557,8 @@ scenarios:
     name: Truncate fragmented file
     description: Truncating a file with an extent tree keeps the head intact and returns freed blocks to statfs
     priority: high
-    # Docker/VM TODO: truncation is node-local and the Go test checks the data, the
-    # freed tree block, and statfs; a multi-node version would add no new code path.
+    # Docker/VM TODO: a shell test cannot make two nodes race one truncate on cue.
+    # extent-tree-truncate-conflict covers that race with two inode copies.
     environments:
       go: extent_tree_test.go::TestExtentTreeTruncate
       docker: TODO
@@ -587,6 +587,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/extent/tree_test.go::TestFlushWithoutInodeWriteKeepsCommittedTree
+
+  - id: extent-tree-truncate-conflict
+    name: Truncate that loses a conflict
+    description: A truncate whose inode write loses to another node's extent change frees nothing, and its retry frees each block once
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestConflictingInlineTruncateRetryFreesOnce
 
   - id: extent-tree-journal-replay
     name: Journal replay into extent tree

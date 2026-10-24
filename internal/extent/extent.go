@@ -305,11 +305,11 @@ func (m *Manager) unmap(ctx context.Context, ino *inode.Inode, from, to uint64) 
 	return nil
 }
 
-// release updates block accounting for removed extents and frees their blocks.
-// Shared blocks stay allocated for the refcount system, and SFB extents point
-// into containers rather than at bitmap blocks. While a tree change is pending
-// the frees wait for its commit: if it loses a conflict, the inode on disk
-// still maps these blocks.
+// release updates block accounting for removed extents and queues their
+// blocks to be freed when the inode write commits: if that write loses a
+// conflict, the inode on disk still maps them. Shared blocks stay allocated for
+// the refcount system, and SFB extents point into containers rather than at
+// bitmap blocks.
 func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Extent) {
 	var blocks []uint64
 	for _, x := range removed {
@@ -324,11 +324,15 @@ func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Exten
 			blocks = append(blocks, x.PhysicalBlock+j)
 		}
 	}
-	if p := pendingOf(ino); p != nil {
-		p.release = append(p.release, blocks...)
+	if len(blocks) == 0 {
 		return
 	}
-	m.freeBlocks(ctx, blocks)
+	p := pendingOf(ino)
+	if p == nil {
+		p = &pendingTree{base: committedTree(ino)}
+		ino.PendingTree = p
+	}
+	p.release = append(p.release, blocks...)
 }
 
 // Delete unmaps every block of an inode that is being freed and frees the

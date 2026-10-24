@@ -729,6 +729,72 @@ func TestConflictingTruncateFreesNothing(t *testing.T) {
 	}
 }
 
+func TestConflictingInlineTruncateRetryFreesOnce(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	initial := env.bm.FreeCount()
+	ino := env.newInode()
+	if _, err := env.mgr.AllocateBlocks(env.ctx, ino, 0, 6); err != nil {
+		t.Fatal(err)
+	}
+	env.write(ino)
+	ext, _, err := env.mgr.Lookup(ino, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := ext.PhysicalBlock + 5 - ext.LogicalBlock
+
+	loser, winner := env.reread(ino), env.reread(ino)
+	if err := env.mgr.Truncate(env.ctx, loser, 5*BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := env.bm.IsAllocated(tail); err != nil || !ok {
+		t.Fatalf("truncate freed block %d before its inode write (allocated=%v, err=%v)", tail, ok, err)
+	}
+	for _, blk := range []uint64{10, 20} {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, winner, blk, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.write(winner)
+	if !winner.HasExtentTree() {
+		t.Fatal("winner should have spilled to a tree")
+	}
+	free := env.bm.FreeCount()
+
+	if err := env.tbl.Write(env.ctx, loser); !errors.Is(err, ErrTreeConflict) {
+		t.Fatalf("losing truncate: got %v, want ErrTreeConflict", err)
+	}
+	env.mgr.DiscardPending(env.ctx, loser)
+	if got := env.bm.FreeCount(); got != free {
+		t.Fatalf("losing truncate changed free blocks from %d to %d", free, got)
+	}
+
+	other := env.newInode()
+	if _, err := env.mgr.AllocateBlocks(env.ctx, other, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	env.write(other)
+	otherExt, _, err := env.mgr.Lookup(other, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherExt.PhysicalBlock == tail {
+		t.Fatalf("block %d was handed out while the winner still maps it", tail)
+	}
+
+	retry := env.reread(ino)
+	if err := env.mgr.Truncate(env.ctx, retry, 5*BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	env.write(retry)
+	if ok, err := env.bm.IsAllocated(otherExt.PhysicalBlock); err != nil || !ok {
+		t.Fatalf("other file's block %d freed by the retry (allocated=%v, err=%v)", otherExt.PhysicalBlock, ok, err)
+	}
+	if got, want := env.bm.FreeCount(), initial-6; got != want {
+		t.Fatalf("free blocks after retry = %d, want %d", got, want)
+	}
+}
+
 func TestDeleteFreesWithoutInodeWrite(t *testing.T) {
 	env := newTreeEnv(t, 4)
 	free := env.bm.FreeCount()
