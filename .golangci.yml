@@ -21,9 +21,6 @@ linters:
   exclusions:
     # Known findings as of 2026-10-24 in code other open PRs are changing; delete each rule once fixed.
     rules:
-      - path: ^main\.go$
-        linters: [staticcheck]
-        text: "SA1019: os\\.SEEK_"
       - path: ^internal/goclusterfs/fs\.go$
         linters: [unused]
         text: "errRetryCreate|field sb is unused"
