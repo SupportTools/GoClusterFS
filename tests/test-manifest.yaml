@@ -1370,19 +1370,26 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestSharedLockHeldAfterAnotherReaderReleases
 
-  - id: lock-exclusive-waits-same-node-readers
-    name: Exclusive waits for same-node readers
-    description: An exclusive request does not piggyback on a shared hold from the same node
+  - id: lock-exclusive-joins-same-node-readers
+    name: Exclusive joins same-node readers
+    description: An exclusive request on a node that already reads the record joins that hold instead of waiting for its own readers
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestExclusiveWaitsForSameNodeReaders
+      go: internal/lock/safety_test.go::TestExclusiveJoinsSameNodeSharedHold
 
-  - id: lock-upgrade-same-goroutine
-    name: Shared to exclusive upgrade rejected
-    description: A goroutine holding a shared lock gets ErrDeadlockRisk when it asks for exclusive on the same record
+  - id: lock-busy-record-renewed
+    name: Busy record renewed on join
+    description: A key joining a record this node has held past renewAfter rewrites its AcquireTime, so a busy node does not lose the record as stale
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestSameGoroutineCannotUpgradeSharedToExclusive
+      go: internal/lock/safety_test.go::TestJoiningKeyRenewsBusyRecord
+
+  - id: inode-write-same-node-reader
+    name: Inode write does not hang behind same-node reader
+    description: Table.Write on a directory finishes while another goroutine on the node holds the directory's shared lock and reads the inode table
+    priority: go_only
+    environments:
+      go: internal/inode/lock_test.go::TestWriteDoesNotHangBehindSameNodeReader
 
   - id: lock-stale-shared-reclaim
     name: Stale shared lock reclaim drops dead readers
