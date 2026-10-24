@@ -109,7 +109,7 @@ hexdump -C /dev/device | head -20
 ./goclusterfs -format -device /dev/device
 
 # If corrupted, try fsck
-./goclusterfs-fsck -device /dev/device -repair
+./goclusterfs-fsck -repair /dev/device
 ```
 
 ### "device has the pre-v2 layout"
@@ -167,7 +167,7 @@ ps aux | grep goclusterfs
 
 # Then run fsck
 fusermount -u /mnt/fs
-./goclusterfs-fsck -device /dev/device -repair
+./goclusterfs-fsck -repair /dev/device
 ```
 
 ### "stale file handle"
@@ -236,7 +236,7 @@ iscsiadm -m session -P 3  # Check session state
 
 # Run fsck
 fusermount -u /mnt/fs
-./goclusterfs-fsck -device /dev/device -repair
+./goclusterfs-fsck -repair /dev/device
 ```
 
 ### "invalid extent" / "block out of range"
@@ -251,7 +251,7 @@ fusermount -u /mnt/fs
 fusermount -u /mnt/fs
 
 # Run fsck with repair
-./goclusterfs-fsck -device /dev/device -repair -force
+./goclusterfs-fsck -repair /dev/device
 
 # If fsck fails, restore from backup
 ```
@@ -396,7 +396,7 @@ ip maddr show
 fusermount -u /mnt/cluster
 
 # Step 2: Run fsck
-./goclusterfs-fsck -device /dev/device -repair
+./goclusterfs-fsck -repair /dev/device
 
 # Step 3: Identify correct data
 # Compare file versions, timestamps
@@ -453,7 +453,7 @@ Signs of corruption:
 fusermount -u /mnt/cluster
 
 # Step 2: Run fsck on one node
-./goclusterfs-fsck -device /dev/device -repair -force
+./goclusterfs-fsck -repair /dev/device
 
 # Step 3: Review fsck output
 # Note which files were affected
@@ -519,62 +519,80 @@ For low-level FUSE debugging:
 
 ## fsck Guide
 
-**Before `-repair`:** unmount the device on every node, then mount and cleanly unmount it once from one node. fsck does not check for mounted nodes or replay journals: repairing while a node is mounted, or while a crashed node's journal is still dirty, can undo or corrupt that node's changes.
+`goclusterfs-fsck` reads every on-disk structure and reports what is wrong. It writes nothing unless you pass `-repair`.
 
-### fsck Phases Explained
+```bash
+# Check only
+./goclusterfs-fsck /dev/device
 
-GoClusterFS fsck runs 8 verification phases:
+# List what -repair would change
+./goclusterfs-fsck -repair -dry-run /dev/device
+
+# Repair
+./goclusterfs-fsck -repair /dev/device
+```
+
+### Before `-repair`
+
+1. Unmount the device on every node.
+2. Back up the device, for example with `dd`.
+3. Run `-repair -dry-run` and read the problems marked `[WOULD FIX]`.
+
+`-repair` refuses to run, with exit code 4, in two cases:
+
+- **A node has the device mounted.** fsck watches the heartbeat counter in each node slot. The mount binary leaves its slot behind when it stops, so right after an unmount fsck can wait up to 11 seconds before it knows the node is gone.
+- **A node stopped without replaying its journal.** Mount the device on one node, which replays its own journal and recovers the journals of crashed nodes, then unmount it and run fsck again. `-force` repairs anyway, but changes still in that journal can then be lost or undone.
+
+### What `-repair` Changes
+
+- It rebuilds block refcounts from the extents of every inode, snapshot and clone, including extent trees. It skips this when it could not read an inode or extent tree, because counts that miss an owner let the runtime free a block another file still uses.
+- It marks the blocks that older versions shared without counting as counted, so this version can snapshot, clone and free those files.
+- It rewrites refcount sectors that fail their checksum from the same references.
+- It fixes the superblock checksum, but only when every other superblock field passed its checks.
+
+It never frees blocks, deletes inodes, or edits directories. Problems not marked `[FIXABLE]` stay as they are.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | No errors. Warnings may remain. |
+| 1 | Errors remain on disk. A dry run that would fix them also exits 1. |
+| 2 | Every error found was repaired. |
+| 4 | Usage error, I/O failure, fsck could not finish, or `-repair` was refused. |
+
+### fsck Phases
 
 | Phase | Name | Checks |
 |-------|------|--------|
-| 1 | Superblock | Magic number, version, checksum |
-| 2 | Bitmap | Sector checksums, allocation consistency |
-| 3 | Inodes | Per-inode checksums, extent validity |
-| 4 | Extents | Logical/physical block sanity |
-| 5 | Refcounts | Block reference count consistency |
-| 6 | Directories | Entry validity, parent linkage |
-| 7 | Snapshots | Snapshot descriptor validity |
-| 8 | Cross-Validation | Counter consistency across all structures |
+| 1 | Superblock | Magic, version, block and inode size, checksum, and the format v2 layout (below). fsck stops here when a region lies outside the device or overlaps another. |
+| 2 | Bitmap | Sector checksums; counts allocated blocks |
+| 3 | Inodes | Inode checksums, file type, link count, block counts; reads extent trees |
+| 4 | Extents | Extents stay inside the device and are allocated; two inodes share a block only if both mark it shared; extent tree structure |
+| 5 | Refcounts | Sector checksums; each block's refcount covers the inodes that map it |
+| 6 | Directories | Entry lengths and names; entries point at inodes in use |
+| 7 | Snapshots | Registry sector and descriptor checksums, duplicate IDs and names, snapshot data inodes |
+| 8 | Cross-Validation | Allocated blocks that no inode maps, mapped blocks the bitmap calls free, inodes no directory names |
 
-### fsck Modes
+The format v2 layout checks in phase 1:
 
-```bash
-# Check only (read-only, default)
-./goclusterfs-fsck -device /dev/device
+- Every region starts on a 4 KB boundary, lies inside the device, and does not overlap another region.
+- The journal region splits evenly into one journal per node, and each journal is a multiple of 4 KB and at least 8 KB.
+- The node registry has a slot for every node journal.
 
-# Check and repair
-./goclusterfs-fsck -device /dev/device -repair
+fsck does not compare the superblock free block, free inode, and snapshot counters, because the runtime never updates them.
 
-# Force check (ignore clean flag)
-./goclusterfs-fsck -device /dev/device -force
+### Reading fsck Output
 
-# Force check and repair
-./goclusterfs-fsck -device /dev/device -repair -force
+Each problem is one line: severity, phase, location, message, and repair status.
+
+```
+[ERROR] Phase 5 (Refcounts): block 17: mapped by 2 inodes but refcount is 0: freeing one of them frees a block another still maps [FIXABLE]
 ```
 
-### Interpreting fsck Output
-
-**Clean filesystem**:
-```
-Phase 1: Superblock... OK
-Phase 2: Bitmap... OK
-Phase 3: Inodes... OK
-Phase 4: Extents... OK
-Phase 5: Refcounts... OK
-Phase 6: Directories... OK
-Phase 7: Snapshots... OK
-Phase 8: Cross-Validation... OK
-Filesystem is clean.
-```
-
-**Issues found**:
-```
-Phase 3: Inodes...
-  ERROR: Inode 1234 has invalid checksum
-  ERROR: Inode 1234 extent 0 points to unallocated block
-  FIXED: Inode 1234 marked as damaged
-Phase 3: 2 errors found, 1 fixed
-```
+- `[FIXABLE]`: `-repair` fixes it.
+- `[WOULD FIX]`: a dry run found that `-repair` would fix it.
+- `[FIXED]`: `-repair` fixed it.
 
 ### When fsck Cannot Repair
 
@@ -610,7 +628,7 @@ If this guide doesn't resolve your issue:
    ./goclusterfs -debug ... 2>&1 | head -1000 > debug.log
 
    # fsck output
-   ./goclusterfs-fsck -device /dev/device > fsck.log 2>&1
+   ./goclusterfs-fsck /dev/device > fsck.log 2>&1
    ```
 
 2. **Report issue**: https://github.com/supporttools/GoClusterFS/issues

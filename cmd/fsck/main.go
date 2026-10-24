@@ -13,7 +13,7 @@
 //	-repair: Fix the problems marked [FIXABLE]
 //	-repair -dry-run: Report what -repair would change, write nothing
 //	-force: Keep checking after a fatal error; with -repair, repair even if
-//	        a node did not unmount cleanly
+//	        a stopped node's journal still needs replay
 //
 // Exit codes:
 //
@@ -37,7 +37,7 @@ func main() {
 	var (
 		repair       = flag.Bool("repair", false, "Repair problems automatically where possible (see Repair below)")
 		dryRun       = flag.Bool("dry-run", false, "With -repair, report what would change without writing")
-		force        = flag.Bool("force", false, "Keep checking after a fatal error; with -repair, repair even if a node did not unmount cleanly")
+		force        = flag.Bool("force", false, "Keep checking after a fatal error; with -repair, repair even if a stopped node's journal still needs replay")
 		verbose      = flag.Bool("verbose", false, "Enable verbose progress output")
 		quiet        = flag.Bool("quiet", false, "Only print errors and summary")
 		stopOnFatal  = flag.Bool("stop-on-fatal", true, "Stop checking when a fatal error is found")
@@ -184,8 +184,9 @@ func main() {
 const repairHelp = `
 Repair:
   Unmount the filesystem on every node first. -repair refuses to run while a
-  node has it mounted, or while a node that did not unmount cleanly may still
-  have changes in its journal (-force overrides only the second check).
+  node's heartbeat still moves, which it can take up to 11 seconds to rule out
+  right after an unmount, or while a stopped node's journal still needs replay
+  (-force overrides only the second check).
 
   -repair rewrites block refcounts from the extents of every inode, snapshot
   and clone, marks blocks that older versions shared as counted, and fixes the
@@ -207,14 +208,14 @@ func printPhases() {
 		name string
 		desc string
 	}{
-		{1, "Superblock", "Validates magic, version, region bounds, checksum"},
+		{1, "Superblock", "Validates magic, version, sizes, the format v2 region layout, checksum"},
 		{2, "Bitmap", "Checks sector checksums, counts allocated blocks"},
-		{3, "Inodes", "Validates per-inode checksums, mode, link count"},
+		{3, "Inodes", "Validates per-inode checksums, mode, link count, extent trees"},
 		{4, "Extents", "Verifies block bounds, allocation, overlap detection"},
-		{5, "Refcounts", "Checks reference counts match extent usage"},
+		{5, "Refcounts", "Checks each block's refcount covers the inodes that map it"},
 		{6, "Directories", "Validates entries, detects orphaned inodes"},
-		{7, "Snapshots", "Verifies snapshot registry and descriptors"},
-		{8, "Cross-Validation", "Compares counters across all structures"},
+		{7, "Snapshots", "Verifies snapshot registry, descriptors and data inodes"},
+		{8, "Cross-Validation", "Finds leaked blocks, blocks mapped but free, unlinked inodes"},
 	}
 	for _, p := range phases {
 		fmt.Printf("  Phase %d (%s):\n", p.num, p.name)

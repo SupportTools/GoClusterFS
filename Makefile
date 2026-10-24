@@ -43,7 +43,7 @@ test-unit:
 	$(GOTEST) -v -race -covermode=atomic -coverprofile=$(COVER_PROFILE) ./internal/...
 
 # Integration tests (requires FUSE and built binary)
-test-integration: check-fuse build-mount
+test-integration: check-fuse build
 	@echo "Running integration tests..."
 	$(GOTEST) -v -timeout 5m ./tests/integration/...
 

@@ -126,25 +126,18 @@ fusermount -u /mnt/fs
 - When mount fails with corruption errors
 - Periodically for preventive maintenance
 
-#### Check-Only Mode
-```bash
-# Unmount first
-fusermount -u /mnt/fs
+Unmount the device on every node first. The device is a positional argument, and flags go before it.
 
-# Run check
-./goclusterfs-fsck -device /dev/device
+```bash
+# Check only (writes nothing)
+./goclusterfs-fsck /dev/device
+
+# List what -repair would change, then repair
+./goclusterfs-fsck -repair -dry-run /dev/device
+./goclusterfs-fsck -repair /dev/device
 ```
 
-#### Repair Mode
-```bash
-./goclusterfs-fsck -device /dev/device -repair
-```
-
-#### Force Check
-```bash
-# Check even if filesystem appears clean
-./goclusterfs-fsck -device /dev/device -force
-```
+`-repair` refuses to run while a node has the device mounted or a stopped node's journal still needs replay. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
 
 ### Managing Snapshots
 
@@ -287,7 +280,7 @@ When a node fails unexpectedly:
 **When failed node recovers**:
 ```bash
 # fsck may be required if node crashed during write
-./goclusterfs-fsck -device /dev/device
+./goclusterfs-fsck /dev/device
 
 # Then remount normally
 ./goclusterfs -device /dev/device -mount /mnt/cluster -journal -broadcast
@@ -297,14 +290,11 @@ When a node fails unexpectedly:
 
 If all nodes go down simultaneously:
 
-1. **Start one node first**:
+1. **Start one node first**. It replays its own journal on mount and recovers the journals of the crashed nodes:
    ```bash
-   # Run fsck
-   ./goclusterfs-fsck -device /dev/device -repair
-
-   # Mount
    ./goclusterfs -device /dev/device -mount /mnt/cluster -journal
    ```
+   If the data looks wrong, unmount it and run `./goclusterfs-fsck /dev/device`.
 
 2. **Start remaining nodes** one at a time
 
@@ -360,7 +350,7 @@ fusermount -u /mnt/cluster  # On all nodes
 dd if=/backup/goclusterfs_20240101.img of=/dev/mapper/shared_lun bs=4M status=progress
 
 # Run fsck
-./goclusterfs-fsck -device /dev/mapper/shared_lun -repair
+./goclusterfs-fsck -repair /dev/mapper/shared_lun
 
 # Remount
 ./goclusterfs -device /dev/mapper/shared_lun -mount /mnt/cluster -journal
@@ -373,7 +363,7 @@ dd if=/backup/goclusterfs_20240101.img of=/dev/mapper/shared_lun bs=4M status=pr
 fusermount -u /mnt/cluster
 
 # Step 2: Run fsck with repair
-./goclusterfs-fsck -device /dev/device -repair -force
+./goclusterfs-fsck -repair /dev/device
 
 # Step 3: Review fsck output for:
 # - Orphaned inodes

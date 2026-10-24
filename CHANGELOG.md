@@ -14,8 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
-- Run `goclusterfs-fsck` before the first mount after upgrading an image that has snapshots or clones. Phase 5 reports blocks shared by more files than their refcount allows.
-- Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. This version never frees such blocks, so deleting those files leaks their space. It also refuses to snapshot or clone them (`ENOTSUP`), and in-place writes to an old clone still change its source. To get files this version can snapshot and free, copy each affected file with `cp` and delete the original.
+- Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
+- Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
 - Snapshots made by older versions captured no data. They still list and delete, but cloning one fails with `ENOTSUP`.
 
 ### Added
@@ -30,7 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Batched TRIM of freed blocks (`-trim`).
 - SFB containers for files under 64 KB, disabled: every file uses normal extents and `-sfb` has no effect. A file that an older build stored in an SFB slot stays readable, moves to a full block on its next write or truncate, and frees its slot when deleted.
 - Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Read a snapshot by cloning it with `user.snapshot.clone`.
-- Experimental: `goclusterfs-fsck` consistency checker with a repair mode. It reports errors on healthy volumes: the superblock free counters are not updated after format, and it expects refcount and snapshot sector checksums the runtime does not write.
+- `goclusterfs-fsck` consistency checker. `-repair` rebuilds block refcounts from every file, snapshot and clone. It refuses to run while the device is in use, and `-repair -dry-run` shows what it would change. Exit codes: `0` no errors, `1` errors remain, `2` repaired, `4` failed or refused.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
 - Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records) and the journal recovery scan.

@@ -31,7 +31,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **On-disk format version 2** since [#15](https://github.com/SupportTools/GoClusterFS/pull/15). Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
-- **fsck is experimental.** It reports errors on healthy volumes. See [Filesystem Check](#filesystem-check).
+- **fsck repairs little.** `-repair` rebuilds refcounts and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
 - **Cluster safety limits.** Node clocks, node stalls, and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
 
 ## Quick Start
@@ -160,19 +160,19 @@ Format the device once, from one node, with `-format`. Then mount it on every no
 Run fsck on an unmounted device. The device is a positional argument, and flags go before it:
 
 ```bash
-# Check only (read-only)
+# Check only (writes nothing)
 ./goclusterfs-fsck ./disk.img
 
-# Check and repair
-./goclusterfs-fsck -repair ./disk.img
+# Show what -repair would change
+./goclusterfs-fsck -repair -dry-run ./disk.img
 
-# Keep going past fatal errors (data recovery)
-./goclusterfs-fsck -force ./disk.img
+# Repair
+./goclusterfs-fsck -repair ./disk.img
 ```
 
-Exit codes: `0` clean, `1` errors found, `2` usage error or fatal failure.
+Exit codes: `0` no errors, `1` errors remain, `2` every error found was repaired, `4` usage error, I/O failure, or a check that could not finish or was refused.
 
-**Known issue:** fsck reports errors on healthy volumes, so its exit code is not reliable yet. The superblock free block and inode counters are never updated after `-format`, and phases 5 and 7 expect refcount and snapshot sector checksums that the runtime does not write.
+`-repair` refuses to run while a node has the device mounted, or while a stopped node's journal still needs replay. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
 
 ## Architecture
 

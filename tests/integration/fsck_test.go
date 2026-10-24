@@ -52,7 +52,7 @@ func runFsck(t *testing.T, args ...string) (int, string) {
 func problemLines(out string) []string {
 	var lines []string
 	for _, line := range strings.Split(out, "\n") {
-		for _, sev := range []string{"[INFO]", "[WARNING]", "[ERROR]", "[CRITICAL]", "[FATAL]"} {
+		for _, sev := range []string{"[INFO]", "[WARN]", "[ERROR]", "[CRIT]", "[FATAL]"} {
 			if strings.HasPrefix(strings.TrimSpace(line), sev) {
 				lines = append(lines, line)
 			}
