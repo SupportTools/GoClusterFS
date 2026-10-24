@@ -158,7 +158,7 @@ func TestReadAfterDeviceGrows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer grown.Close()
+	t.Cleanup(func() { _ = grown.Close() })
 
 	got, err := Read(grown)
 	if err != nil {
