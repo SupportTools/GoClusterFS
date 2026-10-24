@@ -2385,6 +2385,10 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					log.Printf("[DEBUG] Write inode %d: CoW failed for block %d: %v",
 						f.inodeNum, ext.PhysicalBlock, cowErr)
 					f.fs.extentMgr.DiscardPending(ctx, ino)
+					// The unlocked copy may point at tree nodes another node has since rewritten.
+					if errors.Is(cowErr, extent.ErrStaleTree) {
+						return 0, errRetryWrite
+					}
 					return 0, syscall.EIO
 				}
 				if cowResult.WasShared {
@@ -3227,6 +3231,8 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 // Used for snapshot creation via user.snapshot attribute and clone creation via user.clone.
 func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	defer f.fs.lockInode(f.inodeNum)()
+	// A snapshot or clone spans several writes; an interrupted caller must not stop it halfway.
+	ctx = context.WithoutCancel(ctx)
 	switch attr {
 	case "user.snapshot":
 		return f.createSnapshot(ctx, string(data))
@@ -3265,7 +3271,7 @@ func (f *File) Removexattr(ctx context.Context, attr string) syscall.Errno {
 		if snapName == "" {
 			return syscall.EINVAL
 		}
-		return f.deleteSnapshot(ctx, snapName)
+		return f.deleteSnapshot(context.WithoutCancel(ctx), snapName)
 	}
 
 	return syscall.ENODATA
