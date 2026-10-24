@@ -270,10 +270,57 @@ func (r *Region) AllocatedCount() uint64 {
 
 // SetTrimManager sets the TRIM manager for batched block discards.
 // When set, freed blocks will be queued for TRIM rather than immediately discarded.
+// A manager that accepts a free guard gets one, so it skips blocks allocated again
+// before its discard runs.
 func (r *Region) SetTrimManager(tm TrimQueuer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.trimMgr = tm
+	if g, ok := tm.(interface {
+		SetFreeGuard(func(context.Context, []uint64, func([]uint64)) error)
+	}); ok {
+		g.SetFreeGuard(r.withFreeBlocks)
+	}
+}
+
+// withFreeBlocks calls discard with the blocks that are free on disk, holding
+// the allocation lock until discard returns so no node can allocate them.
+func (r *Region) withFreeBlocks(ctx context.Context, blocks []uint64, discard func(free []uint64)) error {
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+			return fmt.Errorf("failed to acquire bitmap lock: %w", err)
+		}
+		defer r.unlock()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	sectors := make(map[uint64][]byte)
+	free := make([]uint64, 0, len(blocks))
+	for _, b := range blocks {
+		if b >= r.totalBlocks {
+			continue
+		}
+		sectorIdx := b / BitsPerSector
+		data, ok := sectors[sectorIdx]
+		if !ok {
+			var err error
+			if data, err = r.readSector(sectorIdx); err != nil {
+				return fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+			}
+			sectors[sectorIdx] = data
+		}
+		bit := b % BitsPerSector
+		if data[bit/8]&(1<<(bit%8)) == 0 {
+			free = append(free, b)
+		}
+	}
+
+	if len(free) > 0 {
+		discard(free)
+	}
+	return nil
 }
 
 // Scan reads the entire bitmap and returns free/allocated counts.

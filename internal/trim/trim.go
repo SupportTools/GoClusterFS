@@ -11,6 +11,7 @@
 package trim
 
 import (
+	"context"
 	"log"
 	"sort"
 	"sync"
@@ -50,7 +51,18 @@ type Config struct {
 	// Enabled controls whether TRIM operations are actually issued.
 	// When false, blocks are still tracked but no ioctl is issued.
 	Enabled bool
+
+	// Discard replaces the BLKDISCARD ioctl when set. Offsets and lengths are in bytes.
+	Discard func(offset, length uint64) error
 }
+
+// FreeGuard calls discard with the blocks that are still free, and keeps them
+// from being allocated until discard returns. Freed blocks wait in the queue
+// for up to MaxAge, and any node may allocate and write one in that time.
+type FreeGuard = func(ctx context.Context, blocks []uint64, discard func(free []uint64)) error
+
+// guardTimeout bounds how long a flush waits for the guard's allocation lock.
+const guardTimeout = 30 * time.Second
 
 // DefaultConfig returns the default TRIM configuration.
 func DefaultConfig() Config {
@@ -82,9 +94,11 @@ type Manager struct {
 
 	// Pending blocks for TRIM
 	pending []pendingBlock
+	guard   FreeGuard
 
 	// Background loop control
 	stopCh   chan struct{}
+	flushCh  chan struct{}
 	flushWg  sync.WaitGroup
 	stopOnce sync.Once // Ensures Stop() is idempotent
 
@@ -102,7 +116,15 @@ func NewManager(dev *storage.Device, cfg Config) *Manager {
 		config:  cfg,
 		pending: make([]pendingBlock, 0, cfg.BatchSize),
 		stopCh:  make(chan struct{}),
+		flushCh: make(chan struct{}, 1),
 	}
+}
+
+// SetFreeGuard makes every flush discard only the blocks the guard reports as free.
+func (m *Manager) SetFreeGuard(guard FreeGuard) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.guard = guard
 }
 
 // Start begins the background flush loop.
@@ -120,17 +142,11 @@ func (m *Manager) Stop() error {
 		close(m.stopCh)
 		m.flushWg.Wait()
 
-		// Final flush of any remaining blocks
-		m.mu.Lock()
-		defer m.mu.Unlock()
+		m.flush("final")
 
-		if len(m.pending) > 0 {
-			log.Printf("[trim] final flush of %d pending blocks", len(m.pending))
-			m.flushLocked()
-		}
-
+		stats := m.Stats()
 		log.Printf("[trim] stopped (queued=%d, discarded=%d, calls=%d)",
-			m.blocksQueued, m.blocksDiscarded, m.discardCalls)
+			stats.BlocksQueued, stats.BlocksDiscarded, stats.DiscardCalls)
 	})
 	return nil
 }
@@ -146,11 +162,19 @@ func (m *Manager) Queue(blockNum uint64) {
 		queuedAt: time.Now(),
 	})
 	m.blocksQueued++
+	m.wakeIfFullLocked()
+}
 
-	// Check if batch size threshold reached
-	if len(m.pending) >= m.config.BatchSize {
-		log.Printf("[trim] batch threshold reached (%d blocks)", len(m.pending))
-		m.flushLocked()
+// wakeIfFullLocked asks the flush loop to flush once the batch is full. Queue
+// runs inside bitmap.Free, which holds the bitmap lock the guard needs, so it
+// must not flush itself.
+func (m *Manager) wakeIfFullLocked() {
+	if len(m.pending) < m.config.BatchSize {
+		return
+	}
+	select {
+	case m.flushCh <- struct{}{}:
+	default:
 	}
 }
 
@@ -168,11 +192,7 @@ func (m *Manager) QueueRange(startBlock, count uint64) {
 		})
 		m.blocksQueued++
 	}
-
-	if len(m.pending) >= m.config.BatchSize {
-		log.Printf("[trim] batch threshold reached (%d blocks)", len(m.pending))
-		m.flushLocked()
-	}
+	m.wakeIfFullLocked()
 }
 
 // flushLoop runs periodically to check age-based flush conditions.
@@ -187,6 +207,8 @@ func (m *Manager) flushLoop() {
 		select {
 		case <-m.stopCh:
 			return
+		case <-m.flushCh:
+			m.flush("batch threshold")
 		case <-ticker.C:
 			m.checkAndFlush()
 		}
@@ -196,41 +218,56 @@ func (m *Manager) flushLoop() {
 // checkAndFlush flushes if the oldest pending block exceeds MaxAge.
 func (m *Manager) checkAndFlush() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if len(m.pending) == 0 {
-		return
-	}
-
-	// Find oldest entry
-	oldest := m.pending[0].queuedAt
-	for _, p := range m.pending {
-		if p.queuedAt.Before(oldest) {
-			oldest = p.queuedAt
+	due := false
+	if len(m.pending) > 0 {
+		oldest := m.pending[0].queuedAt
+		for _, p := range m.pending {
+			if p.queuedAt.Before(oldest) {
+				oldest = p.queuedAt
+			}
 		}
+		due = time.Since(oldest) >= m.config.MaxAge
 	}
+	m.mu.Unlock()
 
-	if time.Since(oldest) >= m.config.MaxAge {
-		log.Printf("[trim] age threshold reached (%d blocks, oldest=%v)",
-			len(m.pending), time.Since(oldest))
-		m.flushLocked()
+	if due {
+		m.flush("age threshold")
 	}
 }
 
-// flushLocked issues BLKDISCARD for all pending blocks.
-// Must be called with m.mu held.
-func (m *Manager) flushLocked() {
-	if len(m.pending) == 0 {
+// flush discards the pending blocks. It runs the guard without holding m.mu,
+// because bitmap.Free holds the bitmap lock while it calls Queue.
+func (m *Manager) flush(reason string) {
+	m.mu.Lock()
+	blocks := make([]uint64, len(m.pending))
+	for i, p := range m.pending {
+		blocks[i] = p.blockNum
+	}
+	m.pending = m.pending[:0]
+	guard := m.guard
+	m.mu.Unlock()
+
+	if len(blocks) == 0 {
 		return
 	}
+	log.Printf("[trim] %s: flushing %d blocks", reason, len(blocks))
 
-	// Coalesce adjacent blocks into ranges
-	ranges := m.coalesceBlocks()
+	if guard == nil {
+		m.discardBlocks(blocks)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), guardTimeout)
+	defer cancel()
+	if err := guard(ctx, blocks, m.discardBlocks); err != nil {
+		log.Printf("[trim] skipping discard of %d blocks: %v", len(blocks), err)
+	}
+}
 
-	log.Printf("[trim] flushing %d blocks in %d ranges", len(m.pending), len(ranges))
+// discardBlocks issues one discard per contiguous range of blocks.
+func (m *Manager) discardBlocks(blocks []uint64) {
+	ranges := coalesceBlocks(blocks)
 
-	// Issue BLKDISCARD for each range
-	discarded := uint64(0)
+	var discarded, calls uint64
 	for _, r := range ranges {
 		if err := m.issueDiscard(r); err != nil {
 			log.Printf("[trim] discard failed for range [%d, %d): %v",
@@ -238,40 +275,39 @@ func (m *Manager) flushLocked() {
 			continue
 		}
 		discarded += r.count
-		m.discardCalls++
+		calls++
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.blocksDiscarded += discarded
+	m.discardCalls += calls
 	if len(ranges) > 0 {
 		m.coalesceRatio = float64(discarded) / float64(len(ranges))
 	}
-
-	// Clear pending list
-	m.pending = m.pending[:0]
 }
 
-// coalesceBlocks groups adjacent blocks into contiguous ranges.
-// Returns sorted ranges for efficient BLKDISCARD.
-func (m *Manager) coalesceBlocks() []blockRange {
-	if len(m.pending) == 0 {
+// coalesceBlocks sorts blocks, drops duplicates and groups adjacent blocks into
+// contiguous ranges. A block freed, reallocated and freed again is queued twice.
+func coalesceBlocks(blocks []uint64) []blockRange {
+	if len(blocks) == 0 {
 		return nil
 	}
 
-	// Sort blocks by block number
-	sort.Slice(m.pending, func(i, j int) bool {
-		return m.pending[i].blockNum < m.pending[j].blockNum
-	})
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
 
 	var ranges []blockRange
 	current := blockRange{
-		startBlock: m.pending[0].blockNum,
+		startBlock: blocks[0],
 		count:      1,
 	}
 
-	for i := 1; i < len(m.pending); i++ {
-		blockNum := m.pending[i].blockNum
+	for i := 1; i < len(blocks); i++ {
+		blockNum := blocks[i]
 
-		// Check if adjacent to current range
+		if blockNum < current.startBlock+current.count {
+			continue
+		}
 		if blockNum == current.startBlock+current.count {
 			current.count++
 		} else {
@@ -303,6 +339,9 @@ func (m *Manager) issueDiscard(r blockRange) error {
 	// startBlock is relative to data region, add DataOffset
 	byteOffset := m.config.DataOffset + r.startBlock*BlockSize
 	byteLength := r.count * BlockSize
+	if m.config.Discard != nil {
+		return m.config.Discard(byteOffset, byteLength)
+	}
 
 	// BLKDISCARD takes [2]uint64{offset, length}
 	args := [2]uint64{byteOffset, byteLength}
