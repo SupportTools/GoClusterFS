@@ -1119,6 +1119,13 @@ scenarios:
     environments:
       go: internal/bitmap/trim_test.go::TestTrimBatchFlushFromFree
 
+  - id: trim-discard-without-lock
+    name: TRIM discard without the bitmap lock
+    description: With real locks on two nodes, a block being discarded stays reserved and the other node keeps allocating
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimDiscardHoldsNoBitmapLock
+
   - id: trim-duplicate-block
     name: TRIM duplicate block
     description: A block queued twice is discarded once
