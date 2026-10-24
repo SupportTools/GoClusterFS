@@ -147,14 +147,14 @@ A crashed node's locks free up on their own: other nodes take them over once the
 
 ### "Journal recovery for slot N failed"
 
-**Symptom**: Mount exits with `Journal recovery for slot N failed: ... (mount with -skip-recovery to discard this journal)`.
+**Symptom**: Mount exits with `Journal recovery for slot N failed: ... (to discard this journal, mount with -skip-recovery=N)`.
 
 **Cause**: The mount could not replay the journal in the registry slot it took. A normal crash does not cause this: the next mount on the same host replays the journal by itself. Read the rest of the error:
 
 - An I/O error, or `journal recovery failed: ...`: the storage failed or a transaction could not be applied. The journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - `journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`: the journal header is damaged and cannot be replayed.
 
-**Solution**: Only for a damaged header, discard the journal with `-skip-recovery`. That flag discards the journal of whichever slot the mount takes, which may belong to another crashed node, so follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot) exactly.
+**Solution**: Only for a damaged header, discard the journal with `-skip-recovery=N`. The mount discards it only if it takes slot N again; follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot).
 
 ### Another Node's Change Shows Up Late
 

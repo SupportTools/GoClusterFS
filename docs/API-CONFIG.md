@@ -53,7 +53,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-journal` | bool | `true` | Enable write-ahead journal for crash consistency |
-| `-skip-recovery` | bool | `false` | Skip journal recovery on mount (dangerous, may lose data) |
+| `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data) |
 
 ### Network Broadcast Flags
 
