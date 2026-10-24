@@ -1770,12 +1770,8 @@ test_journal_crash_recovery_multiple_ops() {
     log "Restarting container..."
     docker start "$node_a" >/dev/null 2>&1
 
-    # Wait for container and remount
-    sleep 2
-    if ! docker exec "$node_a" mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        # May need to explicitly remount after restart
-        start_goclusterfs "$node_a" false
-        sleep 2
+    if ! wait_node_healthy "$node_a" 60; then
+        return 1
     fi
 
     # Verify all operations were recovered
@@ -1868,11 +1864,8 @@ test_journal_crash_during_write() {
     log "Restarting container after crash..."
     docker start "$node_a" >/dev/null 2>&1
 
-    # Wait for container and remount
-    sleep 2
-    if ! docker exec "$node_a" mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        start_goclusterfs "$node_a" false
-        sleep 2
+    if ! wait_node_healthy "$node_a" 60; then
+        return 1
     fi
 
     # Baseline file MUST be recovered
