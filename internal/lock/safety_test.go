@@ -43,6 +43,16 @@ func requireAcquired(t *testing.T, m *Manager, lt LockType, id uint64, mode Lock
 	}
 }
 
+func writeTestRecord(t *testing.T, m *Manager, recordID uint64, rec *Record) {
+	t.Helper()
+	buf := storage.GetBuffer(RecordSize)
+	defer storage.PutBuffer(buf)
+	copy(buf.Bytes(), serializeRecord(rec))
+	if _, err := m.dev.WriteAt(buf.Bytes(), int64(m.offset)+int64(recordID)*RecordSize); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+}
+
 // ageRecord rewrites the lock's record as if it was taken age ago and never renewed.
 func ageRecord(t *testing.T, m *Manager, lt LockType, id uint64, age time.Duration) {
 	t.Helper()
@@ -52,12 +62,7 @@ func ageRecord(t *testing.T, m *Manager, lt LockType, id uint64, age time.Durati
 		t.Fatalf("readRecord: %v", err)
 	}
 	rec.AcquireTime = time.Now().Add(-age).Unix()
-	buf := storage.GetBuffer(RecordSize)
-	defer storage.PutBuffer(buf)
-	copy(buf.Bytes(), serializeRecord(rec))
-	if _, err := m.dev.WriteAt(buf.Bytes(), int64(m.offset)+int64(recordID)*RecordSize); err != nil {
-		t.Fatalf("write record: %v", err)
-	}
+	writeTestRecord(t, m, recordID, rec)
 }
 
 const pastStale = StaleThreshold + 2*time.Second
@@ -265,9 +270,8 @@ func TestPausedHolderReleaseKeepsReclaimedLock(t *testing.T) {
 	ageRecord(t, a, LockTypeInode, 3, pastStale)
 	requireAcquired(t, b, LockTypeInode, 3, LockModeExclusive)
 
-	if err := a.Release(LockTypeInode, 3); !errors.Is(err, ErrNotLockOwner) {
-		t.Fatalf("paused holder Release: got %v, want ErrNotLockOwner", err)
-	}
+	a.Release(LockTypeInode, 3)
+	time.Sleep(cacheGrace + 50*time.Millisecond)
 	requireBlocked(t, c, LockTypeInode, 3, LockModeExclusive)
 }
 
@@ -296,6 +300,8 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 	)
 	dev, cleanup := createTestDevice(t, guard+regionSize+guard)
 	defer cleanup()
+	defer func(d, g time.Duration) { claimSettleDelay, cacheGrace = d, g }(claimSettleDelay, cacheGrace)
+	claimSettleDelay, cacheGrace = time.Millisecond, time.Millisecond
 
 	sentinel := storage.NewAlignedBuffer(guard)
 	for i := range sentinel.Bytes() {
@@ -391,5 +397,126 @@ func TestJoinFailsAfterRecordTakenOver(t *testing.T) {
 
 	if err := acquireWithin(a, time.Second, LockTypeInode, 3, LockModeExclusive); !errors.Is(err, ErrLockLost) {
 		t.Fatalf("joining a record another node took over: got %v, want ErrLockLost", err)
+	}
+}
+
+func TestClaimOverwrittenDuringSettleIsNotHeld(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
+	claimSettleDelay = 100 * time.Millisecond
+
+	errc := make(chan error, 1)
+	go func() { errc <- acquireWithin(a, 50*time.Millisecond, LockTypeInode, 5, LockModeExclusive) }()
+	time.Sleep(20 * time.Millisecond)
+
+	// B read the record as free before A's claim landed, so B's claim lands on top of it.
+	recordID := a.hashToRecord(LockTypeInode, 5)
+	rec, err := a.readRecord(recordID)
+	if err != nil {
+		t.Fatalf("readRecord: %v", err)
+	}
+	rec.OwnerUUID, rec.OwnerSlot, rec.AcquireTime = b.nodeUUID, uint32(b.nodeSlot), time.Now().Unix()
+	writeTestRecord(t, a, recordID, rec)
+
+	if err := <-errc; err == nil {
+		t.Fatal("node A kept a claim that node B overwrote during the settle wait")
+	}
+}
+
+func TestReleasedHoldIsCachedForGrace(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+
+	requireAcquired(t, a, LockTypeInode, 6, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 6); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	requireBlocked(t, b, LockTypeInode, 6, LockModeExclusive)
+
+	start := time.Now()
+	requireAcquired(t, b, LockTypeInode, 6, LockModeExclusive)
+	if waited := time.Since(start); waited > cacheGrace+claimSettleDelay+2*RetryMaxDelay {
+		t.Fatalf("other node waited %v for a cached hold, want at most about grace+settle", waited)
+	}
+}
+
+func TestCachedHoldRejoinSkipsSettleWait(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
+	claimSettleDelay = 200 * time.Millisecond
+
+	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 7); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	start := time.Now()
+	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
+	if took := time.Since(start); took >= claimSettleDelay/2 {
+		t.Fatalf("re-acquiring a cached hold took %v, want well under the %v settle wait", took, claimSettleDelay)
+	}
+}
+
+func TestPausedNodeDropsCachedHoldTakenOver(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	defer func(d time.Duration) { renewAfter = d }(renewAfter)
+
+	requireAcquired(t, a, LockTypeInode, 8, LockModeShared)
+	if err := a.Release(LockTypeInode, 8); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	// A pauses past StaleThreshold with the read hold cached, and B takes the record over.
+	ageRecord(t, a, LockTypeInode, 8, pastStale)
+	requireAcquired(t, b, LockTypeInode, 8, LockModeExclusive)
+	renewAfter = 0
+
+	requireBlocked(t, a, LockTypeInode, 8, LockModeShared)
+}
+
+func TestReleaseCachedFreesHoldsAtOnce(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+
+	requireAcquired(t, a, LockTypeInode, 9, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 9); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	a.ReleaseCached()
+	if err := acquireWithin(b, cacheGrace/4, LockTypeInode, 9, LockModeExclusive); err != nil {
+		t.Fatalf("Acquire right after ReleaseCached: %v", err)
+	}
+}
+
+// FUSE cancels a request's context whenever the calling process gets a signal,
+// which happens all the time, so cancellation alone must not end the wait.
+func TestCancelledContextStillWaitsForLock(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+
+	requireAcquired(t, a, LockTypeInode, 10, LockModeExclusive)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- b.Acquire(ctx, LockTypeInode, 10, LockModeExclusive) }()
+
+	time.Sleep(300 * time.Millisecond)
+	if err := a.Release(LockTypeInode, 10); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := <-errc; err != nil {
+		t.Fatalf("Acquire with a cancelled context: got %v, want the lock once node A let it go", err)
 	}
 }

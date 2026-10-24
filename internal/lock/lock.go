@@ -64,8 +64,19 @@ const (
 	// RetryBaseDelay is the initial retry delay.
 	RetryBaseDelay = 10 * time.Millisecond
 
-	// RetryMaxDelay is the maximum retry delay.
-	RetryMaxDelay = 1 * time.Second
+	// RetryMaxDelay is the maximum retry delay. It is short so a waiter notices
+	// soon after another node lets a cached hold go.
+	RetryMaxDelay = 100 * time.Millisecond
+
+	// ClaimSettleDelay is how long a node waits after writing a claim before it
+	// re-reads the record to check the claim survived. Taking a lock is a read
+	// then a write, so it must exceed the longest time between another node's
+	// read of the record and its write landing on disk.
+	ClaimSettleDelay = 20 * time.Millisecond
+
+	// CacheGrace is how long a node keeps a record after its last local holder
+	// releases it, so the next local acquire needs no disk I/O and no settle wait.
+	CacheGrace = 250 * time.Millisecond
 
 	// StaleThreshold is how old a lock must be to consider it stale.
 	StaleThreshold = 15 * time.Second
@@ -243,6 +254,8 @@ type heldRecord struct {
 	keys    int
 	renewed time.Time
 	lost    bool
+	// cacheGen identifies the current cached period; keys == 0 means cached.
+	cacheGen uint64
 }
 
 func covers(held, want LockMode) bool {
@@ -252,6 +265,17 @@ func covers(held, want LockMode) bool {
 // renewAfter is the age of an exclusive hold after which a key joining the record
 // rewrites AcquireTime, so a record kept busy by overlapping keys never looks stale.
 var renewAfter = StaleThreshold / 3
+
+var (
+	claimSettleDelay = ClaimSettleDelay
+	cacheGrace       = CacheGrace
+)
+
+// holdAge is the time since a hold was last written to disk. It takes the larger
+// of the monotonic and wall-clock ages, so a pause that stops one clock still counts.
+func holdAge(renewed time.Time) time.Duration {
+	return max(time.Since(renewed), time.Now().Round(0).Sub(renewed.Round(0)))
+}
 
 // Errors
 var (
@@ -378,14 +402,11 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 
 		retryCount++
 
-		// Check context cancellation, but allow at least 3 retries
-		if retryCount >= 3 {
-			select {
-			case <-ctx.Done():
-				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - TIMEOUT after %d retries (%v)", lockType, resourceID, retryCount, time.Since(startTime))
-				return ErrLockTimeout
-			default:
-			}
+		// Only a deadline, or DefaultTimeout, ends the wait: FUSE cancels a request's
+		// context whenever the caller gets a signal, and the caller expects the op to finish.
+		if retryCount >= 3 && (errors.Is(ctx.Err(), context.DeadlineExceeded) || time.Since(startTime) > DefaultTimeout) {
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - TIMEOUT after %d retries (%v)", lockType, resourceID, retryCount, time.Since(startTime))
+			return ErrLockTimeout
 		}
 
 		// Add jitter to prevent thundering herd
@@ -412,6 +433,16 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	defer gate.Unlock()
 
 	m.mu.Lock()
+	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (rec.lost || !covers(rec.mode, mode) || holdAge(rec.renewed) > renewAfter) {
+		// A cached hold that is lost, too weak, or old enough that another node may
+		// have taken it over (after a pause, say) is released, then acquired afresh.
+		delete(m.records, recordID)
+		m.mu.Unlock()
+		if err := m.releaseRecord(recordID, rec.mode); err != nil && !errors.Is(err, ErrNotLockOwner) {
+			return false, false, err
+		}
+		m.mu.Lock()
+	}
 	if rec, ok := m.records[recordID]; ok {
 		switch {
 		case rec.lost:
@@ -425,7 +456,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			}
 			return false, false, nil
 		}
-		renew := rec.mode == LockModeExclusive && time.Since(rec.renewed) > renewAfter
+		renew := rec.mode == LockModeExclusive && holdAge(rec.renewed) > renewAfter
 		m.mu.Unlock()
 		if renew {
 			if err := m.renewRecord(recordID, rec); err != nil {
@@ -464,7 +495,7 @@ func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) boo
 		return false
 	}
 	rec := m.records[held.RecordID]
-	if rec.lost || !covers(rec.mode, mode) || (rec.mode == LockModeExclusive && time.Since(rec.renewed) > renewAfter) {
+	if rec.lost || !covers(rec.mode, mode) || (rec.mode == LockModeExclusive && holdAge(rec.renewed) > renewAfter) {
 		return false
 	}
 	held.refCount++
@@ -555,10 +586,54 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 		m.mu.Unlock()
 		return nil
 	}
+	rec.cacheGen++
+	gen := rec.cacheGen
+	m.mu.Unlock()
+
+	time.AfterFunc(cacheGrace, func() { m.expireCached(recordID, gen) })
+	return nil
+}
+
+// expireCached releases a cached hold on disk unless a key joined it again.
+func (m *Manager) expireCached(recordID uint64, gen uint64) {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	m.mu.Lock()
+	rec, ok := m.records[recordID]
+	if !ok || rec.keys > 0 || rec.cacheGen != gen {
+		m.mu.Unlock()
+		return
+	}
 	delete(m.records, recordID)
 	m.mu.Unlock()
 
-	return m.releaseRecord(recordID, rec.mode)
+	if err := m.releaseRecord(recordID, rec.mode); err != nil {
+		log.Printf("[DEBUG] lock: releasing cached record %d: %v", recordID, err)
+	}
+}
+
+// ReleaseCached releases every hold no local key is using. Call it on unmount.
+func (m *Manager) ReleaseCached() {
+	m.mu.Lock()
+	var cached []uint64
+	for recordID, rec := range m.records {
+		if rec.keys == 0 {
+			cached = append(cached, recordID)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, recordID := range cached {
+		m.mu.Lock()
+		gen := uint64(0)
+		if rec, ok := m.records[recordID]; ok {
+			gen = rec.cacheGen
+		}
+		m.mu.Unlock()
+		m.expireCached(recordID, gen)
+	}
 }
 
 // tryAcquire attempts a single lock acquisition.
@@ -575,6 +650,9 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 				return false, err
 			}
 			if acquired {
+				if ok, err := m.confirmClaim(recordID, mode, newSeq); err != nil || !ok {
+					return false, err
+				}
 				// Update hint with new sequence
 				m.hintCache.Put(recordID, &lockHint{
 					Sequence: newSeq,
@@ -648,6 +726,13 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	if err != nil {
 		return false, err
 	}
+	// A shared add only raises the count of a record that is already shared; a lost
+	// race there can over-count readers, which delays writers but never admits two.
+	if acquired && reason != "shared_add" {
+		if acquired, err = m.confirmClaim(recordID, mode, newRecord.Sequence); err != nil {
+			return false, err
+		}
+	}
 
 	if acquired {
 		// Update hint cache with new sequence
@@ -659,6 +744,17 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	}
 
 	return acquired, nil
+}
+
+// confirmClaim waits out the window in which a node that read the record before
+// this node's claim landed can still overwrite it, then checks the claim survived.
+func (m *Manager) confirmClaim(recordID uint64, mode LockMode, sequence uint64) (bool, error) {
+	time.Sleep(claimSettleDelay)
+	record, err := m.readRecord(recordID)
+	if err != nil {
+		return false, err
+	}
+	return record.Mode == mode && record.OwnerUUID == m.nodeUUID && record.Sequence == sequence, nil
 }
 
 // tryAcquireOptimistic attempts to acquire a lock using a cached sequence hint.
@@ -714,6 +810,11 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 		ok, err := m.casRecord(recordID, record, &renewed)
 		if err != nil {
 			return err
+		}
+		if ok {
+			if ok, err = m.confirmClaim(recordID, LockModeExclusive, renewed.Sequence); err != nil {
+				return err
+			}
 		}
 		if ok {
 			m.mu.Lock()
@@ -811,11 +912,17 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 	buf := storage.GetBuffer(RecordSize)
 	defer storage.PutBuffer(buf)
 
-	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
-		return nil, err
+	// A read racing another node's write of the record can come back torn; read again.
+	for attempt := 0; ; attempt++ {
+		if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
+			return nil, err
+		}
+		record, err := deserializeRecord(buf.Bytes())
+		if !errors.Is(err, ErrInvalidRecord) || attempt == 4 {
+			return record, err
+		}
+		time.Sleep(time.Millisecond)
 	}
-
-	return deserializeRecord(buf.Bytes())
 }
 
 // casRecordOptimistic performs an optimistic CAS using only the expected sequence.

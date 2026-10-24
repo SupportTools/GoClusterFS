@@ -529,6 +529,7 @@ func TestHintCacheOptimisticAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Release failed: %v", err)
 	}
+	mgr.ReleaseCached()
 
 	// Second acquire should use the hint cache (optimistic path)
 	err = mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
