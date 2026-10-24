@@ -183,6 +183,7 @@ services:
       - RESULTS_DIR=/results
       # Skip concurrent tests in CI (they hang due to resource constraints)
       - SKIP_CONCURRENT_TESTS=${SKIP_CONCURRENT_TESTS:-false}
+      - TEST_GROUP=${TEST_GROUP:-}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.100

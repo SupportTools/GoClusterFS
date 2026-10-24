@@ -260,9 +260,22 @@ md5_portion() {
 test_passed=0
 test_failed=0
 
+# CI runs the suite as two parallel jobs. TEST_GROUP=1 or 2 runs one half; empty runs everything.
+in_test_group() {
+    [[ -z "$TEST_GROUP" ]] && return 0
+    local group=1
+    case "$1" in
+        "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|"Inode Reuse Stale Read"|"Rolling Restart")
+            group=2 ;;
+    esac
+    [[ "$group" == "$TEST_GROUP" ]]
+}
+
 run_test() {
     local test_name=$1
     local test_func=$2
+
+    in_test_group "$test_name" || return 0
 
     log "=========================================="
     log "Running test: $test_name"
