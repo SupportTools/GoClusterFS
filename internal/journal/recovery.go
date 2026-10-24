@@ -320,7 +320,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats) 
 func parseTxnEntries(header *TxnHeader, buf []byte) (*RecoveredTxn, error) {
 	txn := &RecoveredTxn{
 		Header:  header,
-		Entries: make([]*RecoveredEntry, 0, header.EntryCount),
+		Entries: make([]*RecoveredEntry, 0, min(header.EntryCount, uint32(len(buf)/TxnEntryHeaderSize))),
 		RawData: buf,
 	}
 
@@ -335,7 +335,7 @@ func parseTxnEntries(header *TxnHeader, buf []byte) (*RecoveredTxn, error) {
 			return nil, err
 		}
 
-		if offset+int(entry.Length) > len(buf) {
+		if entry.Length < TxnEntryHeaderSize || offset+int(entry.Length) > len(buf) {
 			return nil, ErrCorruptTxn
 		}
 

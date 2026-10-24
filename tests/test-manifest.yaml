@@ -1164,3 +1164,52 @@ scenarios:
       go: snapshot_test.go::TestCloneFromSnapshot
       docker: TODO
       vm: TODO
+
+  # ===========================================================================
+  # ON-DISK PARSER FUZZ TESTS (go_only)
+  # ===========================================================================
+  # Corrupt or hostile shared-disk bytes must produce an error, never a panic,
+  # a hang, or a huge allocation. `go test` runs the seed corpus and the
+  # crashers under testdata/fuzz; `go test -fuzz=FuzzX` explores further.
+
+  - id: fuzz-superblock-decode
+    name: Fuzz superblock decode
+    description: Arbitrary bytes, with and without a valid CRC, decode to an error or a superblock that round-trips
+    priority: go_only
+    environments:
+      go: internal/superblock/superblock_fuzz_test.go::FuzzDeserialize
+
+  - id: fuzz-inode-decode
+    name: Fuzz inode decode
+    description: Arbitrary 256-byte inode slots, with and without a valid CRC, decode to an error or an inode that round-trips
+    priority: go_only
+    environments:
+      go: internal/inode/inode_fuzz_test.go::FuzzDeserializeInode
+
+  - id: fuzz-snapshot-descriptor-decode
+    name: Fuzz snapshot descriptor decode
+    description: Arbitrary registry sectors and slot indexes decode to an error or a descriptor that round-trips
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_fuzz_test.go::FuzzDecodeDescriptor
+
+  - id: fuzz-journal-superblock-decode
+    name: Fuzz journal superblock decode
+    description: Arbitrary journal superblock bytes decode to an error or a superblock that round-trips
+    priority: go_only
+    environments:
+      go: internal/journal/journal_fuzz_test.go::FuzzJournalSuperblock
+
+  - id: fuzz-journal-txn-record
+    name: Fuzz journal transaction record decode
+    description: Transaction headers, entries, payloads and intent completions decode without panics or large allocations
+    priority: go_only
+    environments:
+      go: internal/journal/journal_fuzz_test.go::FuzzTxnRecord
+
+  - id: fuzz-journal-recovery-scan
+    name: Fuzz journal recovery scan
+    description: Recovery scan of a hostile journal region (head, tail, geometry, records) terminates without panics or large allocations
+    priority: go_only
+    environments:
+      go: internal/journal/journal_fuzz_test.go::FuzzJournalScan

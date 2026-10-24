@@ -10,7 +10,7 @@ import (
 
 // createTestDevice creates a temporary file for testing.
 // The file is sparse and suitable for O_DIRECT operations.
-func createTestDevice(t *testing.T, size int64) (*storage.Device, func()) {
+func createTestDevice(t testing.TB, size int64) (*storage.Device, func()) {
 	t.Helper()
 
 	// Create temp file
