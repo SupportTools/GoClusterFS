@@ -87,7 +87,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 ## Current Limitations
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
-- At most 64 nodes mount a volume at once, one per registry slot.
+- At most 64 nodes mount a volume at once, one per registry slot. Heartbeats compare wall clocks, so node clocks must agree within a few seconds.
 - `goclusterfs-fsck` reports errors on healthy volumes: the superblock free block and inode counters are never updated after format, and phases 5 and 7 expect refcount and snapshot sector checksums the runtime does not write.
 - Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
 - The inode count is fixed at 4096.

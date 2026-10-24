@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The on-disk format is now version 2. Mount refuses devices formatted by earlier builds, because they kept one journal for all nodes and data blocks at a different offset. Copy the data off with the old build, reformat with `-format`, and copy it back.
 - Devices must be at least 264 MB: version 2 reserves 256 MB for 64 node journals of 4 MB.
+- Node clocks must agree within a few seconds, and nodes that share a host (containers) need distinct hostnames. See the node requirements in `docs/OPERATIONS.md`.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
