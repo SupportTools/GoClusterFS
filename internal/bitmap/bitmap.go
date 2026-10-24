@@ -245,8 +245,6 @@ func (r *Region) IsAllocated(blockNum uint64) (bool, error) {
 // every call, so the result includes blocks other nodes allocated or freed.
 // Sectors that cannot be read count as fully allocated.
 func (r *Region) FreeCount() uint64 {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
 	allocated, _ := r.countAllocated()
 	return r.totalBlocks - allocated
 }
@@ -272,9 +270,6 @@ func (r *Region) SetTrimManager(tm TrimQueuer) {
 // Scan reads the entire bitmap and returns free/allocated counts.
 // Unlike FreeCount, it fails if any bitmap sector cannot be read.
 func (r *Region) Scan(ctx context.Context) (free, allocated uint64, err error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	allocated, err = r.countAllocated()
 	if err != nil {
 		return 0, 0, err
@@ -284,6 +279,7 @@ func (r *Region) Scan(ctx context.Context) (free, allocated uint64, err error) {
 
 // countAllocated counts allocated blocks in the on-disk bitmap. A sector it
 // cannot read counts as fully allocated, and the first such error is returned.
+// It runs without r.mu so a slow scan does not stall this node's Alloc and Free.
 func (r *Region) countAllocated() (uint64, error) {
 	var allocated uint64
 	var firstErr error
