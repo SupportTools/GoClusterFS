@@ -1903,11 +1903,11 @@ scenarios:
       go: internal/lock/safety_test.go::TestLateClaimWriteIsNotHeld
 
   - id: lock-late-read-claim-admits-no-readers
-    name: Late read claim admits no readers
-    description: A read claim that lands late on another node's write claim is turned into a write claim, so no further reader joins beside the writer
+    name: Late read claim admits no more readers
+    description: A read claim that lands late on another node's write claim is turned into a write claim, with no write deadline, so no reader joins beside the writer after that
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestLateReadClaimAdmitsNoReaders
+      go: internal/lock/safety_test.go::TestLateReadClaimAdmitsNoMoreReaders
 
   - id: lock-release-cached-parallel
     name: Unmount frees kept locks in parallel
