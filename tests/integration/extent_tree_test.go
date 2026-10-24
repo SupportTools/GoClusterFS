@@ -5,6 +5,9 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const mb = 1024 * 1024
@@ -174,4 +177,104 @@ func TestExtentTreeTruncate(t *testing.T) {
 	checkFile(t, mfs, "frag.bin", want[:keep])
 	remount(t, mfs)
 	checkFile(t, mfs, "frag.bin", want[:keep])
+}
+
+// TestExtentTreeSnapshot covers snapshots and clones of a file with more than
+// 2 extents. Snapshots have no read interface yet, clone-from-snapshot clones
+// the live file, and copy-on-write of full blocks does not trigger for any file
+// (refcounts only reach 1). So the test checks what does hold: the clone gets
+// its own extent tree, blocks shared with it survive truncating and deleting
+// the source, and deleting the snapshot frees nothing in use.
+func TestExtentTreeSnapshot(t *testing.T) {
+	mfs := NewMountedFS(t, 96)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+
+	frag, err := os.OpenFile(mfs.Path("frag.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filler, err := os.OpenFile(mfs.Path("filler.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []byte
+	for blk := 0; blk < 6; blk++ {
+		data := chunk(byte(blk+1), mb)
+		if _, err := frag.Write(data); err != nil {
+			t.Fatalf("append block %d failed: %v", blk, err)
+		}
+		want = append(want, data...)
+		if _, err := filler.Write(chunk(0xAA, mb)); err != nil {
+			t.Fatalf("filler append %d failed: %v", blk, err)
+		}
+	}
+	frag.Close()
+	filler.Close()
+
+	path := mfs.Path("frag.bin")
+	if err := unix.Setxattr(path, "user.snapshot", []byte("tree-snap"), 0); err != nil {
+		if err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP {
+			t.Skip("Snapshot xattr not supported")
+		}
+		t.Fatalf("Failed to create snapshot: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond) // background refcount job
+
+	if err := unix.Setxattr(path, "user.snapshot.clone", []byte("tree-snap:/clone.bin"), 0); err != nil {
+		t.Fatalf("clone from snapshot failed: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	cloneWant := append([]byte(nil), want...)
+	checkFile(t, mfs, "clone.bin", cloneWant)
+
+	freeBlocks := func() int64 {
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(mfs.MountPoint, &st); err != nil {
+			t.Fatal(err)
+		}
+		return int64(st.Bfree)
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := chunk(0x77, mb)
+	if _, err := f.Write(tail); err != nil {
+		t.Fatalf("append after snapshot failed: %v", err)
+	}
+	f.Close()
+	want = append(want, tail...)
+
+	// Blocks 4 and 5 are shared with the clone; only the new block 6 is freed.
+	before := freeBlocks()
+	if err := os.Truncate(path, 4*mb); err != nil {
+		t.Fatalf("Truncate failed: %v", err)
+	}
+	want = want[:4*mb]
+	if got := freeBlocks() - before; got != 1 {
+		t.Errorf("truncating shared and private blocks freed %d blocks, want 1", got)
+	}
+	checkFile(t, mfs, "frag.bin", want)
+	checkFile(t, mfs, "clone.bin", cloneWant)
+
+	before = freeBlocks()
+	if err := unix.Removexattr(path, "user.snapshot.tree-snap"); err != nil && err != syscall.ENODATA {
+		t.Fatalf("deleting snapshot failed: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if got := freeBlocks() - before; got != 0 {
+		t.Errorf("deleting the snapshot freed %d blocks, want 0", got)
+	}
+
+	remount(t, mfs)
+	checkFile(t, mfs, "frag.bin", want)
+	checkFile(t, mfs, "clone.bin", cloneWant)
+
+	if err := mfs.Remove("frag.bin"); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+	checkFile(t, mfs, "clone.bin", cloneWant)
 }

@@ -564,6 +564,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: extent-tree-snapshot
+    name: Snapshot and clone of a fragmented file
+    description: A clone of a file with more than 2 extents gets its own extent tree; blocks it shares survive truncating and deleting the source, and deleting the snapshot frees nothing in use
+    priority: high
+    # Docker/VM TODO: snapshot and clone tests need xattr support in those harnesses, like the other snapshot scenarios.
+    environments:
+      go: extent_tree_test.go::TestExtentTreeSnapshot
+      docker: TODO
+      vm: TODO
+
   - id: extent-tree-unit
     name: Extent tree operations
     description: Spill, depth-2 growth, splits, folding back inline, and a randomized model check with reloads
