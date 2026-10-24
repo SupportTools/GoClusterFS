@@ -1385,6 +1385,13 @@ scenarios:
     environments:
       go: internal/snapshot/snapshot_test.go::TestRegistryIDsUniqueAcrossNodes
 
+  - id: snapshot-ids-after-older-images
+    name: Snapshot IDs on an older image and after slot reuse
+    description: New IDs land above the sequential IDs an older version assigned, and a node that takes over a departed node's slot never reuses its IDs
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestRegistryIDsAfterOlderImagesAndSlotReuse
+
   - id: snapshot-activate-requires-creating
     name: Snapshot activation after a rollback
     description: A snapshot another node rolled back cannot be marked active

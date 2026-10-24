@@ -970,3 +970,62 @@ func TestRegistryConcurrentCreatesAcrossNodes(t *testing.T) {
 		names[d.SnapshotID] = d.GetName()
 	}
 }
+
+// Older versions numbered snapshots 1, 2, 3... New IDs must land above every
+// one of them, and a node that takes over a departed node's slot must never
+// reuse that node's IDs.
+func TestRegistryIDsAfterOlderImagesAndSlotReuse(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	old := NewRegistry(dev, 0, 10*SectorSize, nil)
+	for i := range 70 {
+		if _, err := old.Create(ctx, fmt.Sprintf("old-%d", i), 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Rewrite them with the sequential IDs an older version would have assigned.
+	all, err := old.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := uint64(0); slot < old.maxDescriptors; slot++ {
+		d, err := old.readDescriptor(slot)
+		if err != nil || d.IsFree() {
+			continue
+		}
+		var n int
+		fmt.Sscanf(d.GetName(), "old-%d", &n)
+		d.SnapshotID = uint64(n + 1)
+		if err := old.writeDescriptor(slot, d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(all) != 70 {
+		t.Fatalf("%d old snapshots, want 70", len(all))
+	}
+
+	create := func(slot int, name string) uint64 {
+		t.Helper()
+		r := NewRegistry(dev, 0, 10*SectorSize, nil)
+		r.SetNodeSlot(slot)
+		if _, err := r.Scan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		d, err := r.Create(ctx, name, 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.SnapshotID
+	}
+	first := create(5, "from-slot-5")
+	if first <= 70 || first%64 != 5 {
+		t.Fatalf("ID %d after IDs 1-70 from an older image, want above 70 and ending in slot 5", first)
+	}
+	// A new node takes over slot 5 after the first owner left.
+	second := create(5, "slot-5-new-owner")
+	if second <= first || second%64 != 5 {
+		t.Fatalf("new owner of slot 5 got ID %d after %d, want a higher ID ending in slot 5", second, first)
+	}
+}
