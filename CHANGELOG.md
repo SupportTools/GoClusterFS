@@ -27,6 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Experimental: `goclusterfs-fsck` consistency checker with a repair mode. It fails on newly formatted volumes because `-format` does not write a superblock.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
+- Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records) and the journal recovery scan.
+- CI gates: unit tests with the race detector and coverage, golangci-lint (`make lint`), govulncheck (`make vuln`), and a `go mod tidy` check.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
 - Apache License 2.0.
 
@@ -34,11 +36,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.
 - `go.mod` now requires Go 1.26.
+- `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
 - Reads use the inode cache, lock acquisition reuses cached lock sequence numbers, and the inode and extent caches are split into 16 shards.
+
+### Removed
+
+- The legacy single-block prototype in the repository root (`main.go`).
 
 ### Fixed
 
+- A node could serve a stale cached inode after another node freed and reused its inode number. Inode generations now survive free and reuse, and opening a file reloads its inode from disk.
+- Journal recovery no longer panics, loops forever, or allocates gigabytes on a corrupt journal. It now rejects short entries and bad ring geometry as corrupt.
 - Lock-order violations when several nodes create files and directories at the same time.
 - Inode allocation races between nodes; allocation now retries with jittered backoff.
 - Directory operations now update caches and send broadcast invalidations.
 - Docker and VM test suites now run on fresh hosts.
+- The README quick start now uses the real binary names and flags.
