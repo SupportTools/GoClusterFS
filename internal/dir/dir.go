@@ -330,6 +330,12 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
 	}
 
+	// The caller's copy may predate another node's changes to the extent tree.
+	dirIno, err := m.inodeTbl.Read(dirIno.InodeNum)
+	if err != nil {
+		return fmt.Errorf("failed to re-read directory inode: %w", err)
+	}
+
 	// Read all blocks and find the entry
 	numBlocks := extent.BlocksForSize(dirIno.Size)
 	if numBlocks == 0 {
@@ -517,6 +523,19 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 
 // readEntries reads all entries from a directory.
 func (m *Manager) readEntries(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, error) {
+	entries, err := m.readEntriesOf(ctx, dirIno)
+	if errors.Is(err, extent.ErrStaleTree) {
+		// A cached inode can point at tree nodes another node has rewritten.
+		fresh, readErr := m.inodeTbl.Read(dirIno.InodeNum)
+		if readErr != nil {
+			return nil, err
+		}
+		return m.readEntriesOf(ctx, fresh)
+	}
+	return entries, err
+}
+
+func (m *Manager) readEntriesOf(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, error) {
 	if dirIno.Size == 0 {
 		return nil, nil
 	}
@@ -674,10 +693,22 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 
 	// Extent tree blocks also come from the bitmap, so reserve them before the inode lock.
 	ctx, releaseTreeBlocks, err := m.extentMgr.ReserveTreeBlocks(ctx, dirIno)
+	if errors.Is(err, extent.ErrStaleTree) {
+		return errRetryAdd
+	}
 	if err != nil {
 		return fmt.Errorf("failed to reserve extent tree blocks: %w", err)
 	}
 	defer releaseTreeBlocks()
+
+	// Set once the extent is inserted; an uncommitted tree change is dropped
+	// after the inode lock is released, since freeing takes the bitmap lock.
+	var pending *inode.Inode
+	defer func() {
+		if pending != nil && !blockUsed {
+			m.extentMgr.DiscardPending(ctx, pending)
+		}
+	}()
 
 	// Now acquire inode lock for writing (level 8 - after bitmap lock)
 	if m.lockMgr != nil {
@@ -775,6 +806,7 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		}
 		return fmt.Errorf("failed to insert extent: %w", err)
 	}
+	pending = freshIno
 
 	// Update directory size and allocated blocks
 	freshIno.Size = uint64(nextBlock+1) * BlockSize

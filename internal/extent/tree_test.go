@@ -252,6 +252,7 @@ func TestAllocateUsesFragmentedFreeSpace(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	env.write(filler)
 
 	ino := env.newInode()
 	if _, err := env.mgr.AllocateUnwritten(env.ctx, ino, 0, 6); err != nil {
@@ -688,4 +689,100 @@ func TestTruncateSFBDoesNotFreeBitmapBlocks(t *testing.T) {
 	if got := env.bm.FreeCount(); got != free {
 		t.Fatalf("truncating an SFB file changed free blocks from %d to %d", free, got)
 	}
+}
+
+// A truncate that loses a conflict must not free blocks the winning commit still maps.
+func TestConflictingTruncateFreesNothing(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	for blk := uint64(0); blk < 6; blk++ {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, ino, blk*2, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.write(ino)
+
+	loser, winner := env.reread(ino), env.reread(ino)
+	if err := env.mgr.Truncate(env.ctx, loser, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.mgr.AllocateBlocks(env.ctx, winner, 100, 1); err != nil {
+		t.Fatal(err)
+	}
+	env.write(winner)
+	free := env.bm.FreeCount()
+
+	if err := env.tbl.Write(env.ctx, loser); !errors.Is(err, ErrTreeConflict) {
+		t.Fatalf("losing truncate: got %v, want ErrTreeConflict", err)
+	}
+	env.mgr.DiscardPending(env.ctx, loser)
+	if got := env.bm.FreeCount(); got != free {
+		t.Fatalf("losing truncate changed free blocks from %d to %d", free, got)
+	}
+	env.remount(0)
+	ino = env.reread(ino)
+	for blk := uint64(0); blk < 6; blk++ {
+		if _, _, err := env.mgr.Lookup(ino, blk*2); err != nil {
+			t.Fatalf("block %d lost: %v", blk*2, err)
+		}
+	}
+}
+
+func TestDeleteFreesWithoutInodeWrite(t *testing.T) {
+	env := newTreeEnv(t, 4)
+	free := env.bm.FreeCount()
+	ino := env.newInode()
+	for blk := uint64(0); blk < 12; blk++ {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, ino, blk*2, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.write(ino)
+
+	if err := env.mgr.Delete(env.ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	if ino.PendingTree != nil || ino.HasExtentTree() {
+		t.Fatal("Delete should leave no tree and no pending change")
+	}
+	if got := env.bm.FreeCount(); got != free {
+		t.Fatalf("free blocks after Delete = %d, want %d", got, free)
+	}
+}
+
+func TestDiscardPendingFreesNewTreeBlocks(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	free := env.bm.FreeCount()
+	ino := env.newInode()
+	env.insertScattered(ino, 3)
+	if env.bm.FreeCount() != free-1 {
+		t.Fatal("spilling to a tree should allocate one block")
+	}
+	env.mgr.DiscardPending(env.ctx, ino)
+	if got := env.bm.FreeCount(); got != free {
+		t.Fatalf("free blocks after discard = %d, want %d", got, free)
+	}
+}
+
+// Writing a stale copy that has no extent edits must keep the tree on disk.
+func TestStaleInodeWriteKeepsOnDiskTree(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	env.insertScattered(ino, 3)
+	env.write(ino)
+
+	stale := env.reread(ino)
+	for i := 0; i < 2; i++ {
+		env.insert(ino, Extent{uint64(100 + i), fakePhys + uint64(100+i*7), 1, FlagAllocated | FlagShared})
+		env.write(ino)
+	}
+	stale.Size = 12345
+	env.write(stale)
+
+	env.remount(0)
+	got := env.reread(ino)
+	if got.Size != 12345 {
+		t.Fatalf("Size = %d, want the stale writer's 12345", got.Size)
+	}
+	env.checkScatteredWith(got, 3, 5)
 }

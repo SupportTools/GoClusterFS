@@ -303,8 +303,11 @@ func (m *Manager) unmap(ctx context.Context, ino *inode.Inode, from, to uint64) 
 
 // release updates block accounting for removed extents and frees their blocks.
 // Shared blocks stay allocated for the refcount system, and SFB extents point
-// into containers rather than at bitmap blocks.
+// into containers rather than at bitmap blocks. While a tree change is pending
+// the frees wait for its commit: if it loses a conflict, the inode on disk
+// still maps these blocks.
 func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Extent) {
+	var blocks []uint64
 	for _, x := range removed {
 		ino.AllocatedBlocks -= min(ino.AllocatedBlocks, x.Length)
 		if x.Flags&FlagUnwritten == 0 {
@@ -314,11 +317,29 @@ func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Exten
 			continue
 		}
 		for j := uint64(0); j < x.Length; j++ {
-			if err := m.bitmap.Free(ctx, x.PhysicalBlock+j); err != nil {
-				log.Printf("[extent] inode %d: free block %d: %v", ino.InodeNum, x.PhysicalBlock+j, err)
-			}
+			blocks = append(blocks, x.PhysicalBlock+j)
 		}
 	}
+	if p := pendingOf(ino); p != nil {
+		p.release = append(p.release, blocks...)
+		return
+	}
+	m.freeBlocks(ctx, blocks)
+}
+
+// Delete unmaps every block of an inode that is being freed and frees the
+// blocks now, since no inode write will follow to commit the change.
+func (m *Manager) Delete(ctx context.Context, ino *inode.Inode) error {
+	if err := m.unmap(ctx, ino, 0, math.MaxUint64); err != nil {
+		return err
+	}
+	if p := pendingOf(ino); p != nil {
+		m.freeBlocks(ctx, p.release)
+		m.freeBlocks(ctx, p.fresh)
+		ino.PendingTree = nil
+	}
+	ino.Size = 0
+	return nil
 }
 
 // ListExtents returns all extents for an inode, sorted by logical block.

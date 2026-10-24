@@ -923,8 +923,8 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 	childIno.Ctime = now
 
 	if childIno.LinkCount == 0 {
-		if err := f.extentMgr.Truncate(ctx, childIno, 0); err != nil {
-			log.Printf("[DEBUG] Unlink %q: Truncate failed: %v", name, err)
+		if err := f.extentMgr.Delete(ctx, childIno); err != nil {
+			log.Printf("[DEBUG] Unlink %q: freeing blocks failed: %v", name, err)
 		}
 		f.inodeTbl.Free(ctx, childIno.InodeNum)
 	} else {
@@ -1001,8 +1001,8 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	if err := f.extentMgr.Truncate(ctx, childIno, 0); err != nil {
-		log.Printf("[DEBUG] Rmdir %q: Truncate failed: %v", name, err)
+	if err := f.extentMgr.Delete(ctx, childIno); err != nil {
+		log.Printf("[DEBUG] Rmdir %q: freeing blocks failed: %v", name, err)
 	}
 	f.inodeTbl.Free(ctx, childIno.InodeNum)
 
@@ -1789,7 +1789,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 	childIno.LinkCount--
 	if childIno.LinkCount == 0 {
 		// Free all extents
-		d.fs.extentMgr.Truncate(ctx, childIno, 0)
+		d.fs.extentMgr.Delete(ctx, childIno)
 		// Free inode
 		d.fs.inodeTbl.Free(ctx, uint32(childInodeNum))
 	} else {
@@ -2040,6 +2040,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		physicalBlock uint64
 		count         uint32
 	}, 0)
+	// Snapshot refcounts drop only after the inode write commits the copies.
+	var cowDone []*extent.CoWResult
 	// Abort transaction on error path
 	defer func() {
 		if txn != nil && f.fs.journal != nil {
@@ -2304,17 +2306,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 						log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
 							f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
 
-						// Decrement refcount on old block (async, will be freed if reaches 0)
-						newCount, decErr := f.fs.refcountReg.Decrement(ctx, cowResult.OldPhysBlock)
-						if decErr != nil {
-							// Log but don't fail - the write succeeded, refcount is secondary
-							log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
-								f.inodeNum, cowResult.OldPhysBlock, decErr)
-						} else if newCount == 0 {
-							// Block is no longer referenced - queue for TRIM if enabled
-							log.Printf("[DEBUG] Write inode %d: old block %d refcount reached 0 (can be freed)",
-								f.inodeNum, cowResult.OldPhysBlock)
-						}
+						cowDone = append(cowDone, cowResult)
 
 						// Re-lookup extent to get updated physical block
 						ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum)
@@ -2526,6 +2518,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	// On a tree conflict the blocks allocated here are unreferenced. Close the
 	// intent first so journal replay cannot map them again, then free them.
 	writeFailed := func(err error) error {
+		f.fs.extentMgr.DiscardPending(ctx, ino)
 		if !errors.Is(err, extent.ErrTreeConflict) {
 			return syscall.EIO
 		}
@@ -2535,12 +2528,18 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return errRetryWrite
 			}
 		}
+		var unused []uint64
 		for _, alloc := range allocatedExtents {
 			for i := uint64(0); i < uint64(alloc.count); i++ {
-				if err := f.fs.extentMgr.FreePhysicalBlock(ctx, alloc.physicalBlock+i); err != nil {
-					log.Printf("[DEBUG] Write inode %d: freeing block %d after tree conflict failed: %v",
-						f.inodeNum, alloc.physicalBlock+i, err)
-				}
+				unused = append(unused, alloc.physicalBlock+i)
+			}
+		}
+		for _, cow := range cowDone {
+			unused = append(unused, cow.NewPhysBlock)
+		}
+		for _, b := range unused {
+			if err := f.fs.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
+				log.Printf("[DEBUG] Write inode %d: freeing block %d after tree conflict failed: %v", f.inodeNum, b, err)
 			}
 		}
 		return errRetryWrite
@@ -2565,6 +2564,18 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	// Release the lock we acquired for size update
 	if acquiredLockForSize {
 		f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+	}
+
+	for _, cow := range cowDone {
+		newCount, decErr := f.fs.refcountReg.Decrement(ctx, cow.OldPhysBlock)
+		if decErr != nil {
+			// Log but don't fail - the write succeeded, refcount is secondary
+			log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
+				f.inodeNum, cow.OldPhysBlock, decErr)
+		} else if newCount == 0 {
+			log.Printf("[DEBUG] Write inode %d: old block %d refcount reached 0 (can be freed)",
+				f.inodeNum, cow.OldPhysBlock)
+		}
 	}
 
 	// Cache the freshly-written inode for subsequent reads
@@ -2934,6 +2945,7 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+		f.fs.extentMgr.DiscardPending(ctx, ino)
 		return syscall.EIO
 	}
 
@@ -3069,6 +3081,7 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 	// Write updated inode
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 		log.Printf("[DEBUG] Allocate inode %d: write inode failed: %v", f.inodeNum, err)
+		f.fs.extentMgr.DiscardPending(ctx, ino)
 		return syscall.EIO
 	}
 
@@ -3311,8 +3324,7 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 
 	// Write clone inode
 	if err := f.fs.inodeTbl.Write(ctx, cloneIno); err != nil {
-		// Every clone extent is shared, so this only frees the clone's tree blocks.
-		f.fs.extentMgr.Truncate(ctx, cloneIno, 0)
+		f.fs.extentMgr.DiscardPending(ctx, cloneIno)
 		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
 		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to write clone inode: %v", err)

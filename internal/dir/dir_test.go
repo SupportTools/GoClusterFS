@@ -753,7 +753,13 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 	}
 
 	const blocks = 6
+	var stale *inode.Inode
 	for i := 0; i < blocks; i++ {
+		if i == 3 {
+			if stale, err = inodeTbl.Read(dirIno.InodeNum); err != nil {
+				t.Fatal(err)
+			}
+		}
 		// Take the next free block so directory blocks are never contiguous.
 		if _, err := extentMgr.AllocatePhysicalBlock(ctx); err != nil {
 			t.Fatal(err)
@@ -773,6 +779,12 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 	fresh, err := inodeTbl.Read(dirIno.InodeNum)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// A copy read before the last commits points at rewritten tree nodes; a
+	// manager with an empty cache has to fall back to the current inode.
+	remounted := NewManager(dev, inodeTbl, extent.NewManager(dev, bm, lockMgr, dataOffset), lockMgr, dataOffset)
+	if num, _, err := remounted.Lookup(ctx, stale, "entry-5"); err != nil || num != 55 {
+		t.Fatalf("lookup through a stale directory inode: inode %d, %v", num, err)
 	}
 	if !fresh.HasExtentTree() || fresh.ExtentCount != blocks+1 {
 		t.Fatalf("directory should use an extent tree with %d extents, got tree=%v count=%d",

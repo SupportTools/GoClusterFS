@@ -44,12 +44,16 @@ func (l *leafRef) size() int {
 }
 
 // pendingTree is the uncommitted layout stored in inode.PendingTree.
-// No leaves means the extents folded back into the inode.
+// No leaves means the extents folded back into the inode. Blocks the
+// committed tree or committed extents still use are only freed once the
+// change commits; blocks allocated for the change are freed if it is discarded.
 type pendingTree struct {
 	base     treeRef
 	index    uint64
 	hasIndex bool
 	leaves   []*leafRef
+	fresh    []uint64 // tree blocks allocated since base
+	release  []uint64 // blocks to free after the commit
 }
 
 func pendingOf(ino *inode.Inode) *pendingTree {
@@ -227,6 +231,8 @@ type editor struct {
 	index    uint64
 	hasIndex bool
 	leaves   []*leafRef
+	fresh    []uint64
+	release  []uint64
 	changed  bool
 }
 
@@ -235,6 +241,8 @@ func (m *Manager) edit(ctx context.Context, ino *inode.Inode) (*editor, error) {
 	var leaves []*leafRef
 	if p := pendingOf(ino); p != nil {
 		e.base, e.index, e.hasIndex = p.base, p.index, p.hasIndex
+		e.fresh = append([]uint64(nil), p.fresh...)
+		e.release = append([]uint64(nil), p.release...)
 		leaves = p.leaves
 	} else {
 		e.base = committedTree(ino)
@@ -413,6 +421,7 @@ func (e *editor) commit() error {
 	if err != nil {
 		return err
 	}
+	e.fresh = append(e.fresh, blocks...)
 	for i, l := range unplaced {
 		l.block, l.placed, l.gen = blocks[i], true, 0
 	}
@@ -433,9 +442,35 @@ func (e *editor) commit() error {
 		ino.ExtentDepth, ino.ExtentTreeRoot = 1, leaves[0].block
 	}
 	ino.ExtentCount = uint64(total)
-	ino.PendingTree = &pendingTree{base: e.base, index: e.index, hasIndex: e.hasIndex, leaves: leaves}
-	e.m.freeTreeBlocks(e.ctx, dropped)
+	e.drop(dropped)
+	ino.PendingTree = &pendingTree{
+		base: e.base, index: e.index, hasIndex: e.hasIndex, leaves: leaves,
+		fresh: e.fresh, release: e.release,
+	}
 	return nil
+}
+
+// drop gives up tree blocks. Blocks allocated for this change are freed now;
+// blocks of the committed tree wait for the commit, since the inode on disk
+// still points at them.
+func (e *editor) drop(blocks []uint64) {
+	for _, b := range blocks {
+		if i := indexOf(e.fresh, b); i >= 0 {
+			e.fresh = append(e.fresh[:i], e.fresh[i+1:]...)
+			e.m.freeBlocks(e.ctx, []uint64{b})
+			continue
+		}
+		e.release = append(e.release, b)
+	}
+}
+
+func indexOf(s []uint64, v uint64) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return -1
 }
 
 // normalize drops empty leaves and splits leaves that exceed the node capacity.
@@ -503,12 +538,12 @@ func (e *editor) fold(leaves []*leafRef, dropped []uint64) error {
 	ino.Flags &^= inode.FlagHasExtentTree
 	ino.ExtentTreeRoot, ino.ExtentDepth = 0, 0
 	ino.ExtentCount = uint64(len(all))
+	e.drop(dropped)
 	if e.base.present {
-		ino.PendingTree = &pendingTree{base: e.base}
+		ino.PendingTree = &pendingTree{base: e.base, release: e.release}
 	} else {
 		ino.PendingTree = nil
 	}
-	e.m.freeTreeBlocks(e.ctx, dropped)
 	return nil
 }
 
@@ -524,9 +559,10 @@ func (m *Manager) FlushTree(ino, onDisk *inode.Inode) (func(), error) {
 	if committedTree(onDisk) != p.base {
 		return nil, fmt.Errorf("%w: inode %d", ErrTreeConflict, ino.InodeNum)
 	}
+	release := func() { m.freeBlocks(context.Background(), p.release) }
 	if len(p.leaves) == 0 {
 		ino.ExtentTreeGen = 0
-		return nil, nil
+		return release, nil
 	}
 
 	committed, err := m.committedGens(ino.InodeNum, p.base)
@@ -576,6 +612,13 @@ func (m *Manager) FlushTree(ino, onDisk *inode.Inode) (func(), error) {
 		root, rootGen, depth = p.index, n.Gen, 2
 	}
 
+	// The inode write commits these nodes, so they must reach the disk first.
+	if len(out) > 0 {
+		if err := m.dev.Sync(); err != nil {
+			return nil, err
+		}
+	}
+
 	ino.Flags |= inode.FlagHasExtentTree
 	ino.ExtentTreeRoot, ino.ExtentTreeGen, ino.ExtentDepth = root, rootGen, depth
 	ino.ExtentCount = uint64(total)
@@ -583,6 +626,7 @@ func (m *Manager) FlushTree(ino, onDisk *inode.Inode) (func(), error) {
 		for _, w := range out {
 			m.nodes.put(nodeKey{ino.InodeNum, w.block, w.node.Gen}, w.node)
 		}
+		release()
 	}, nil
 }
 
@@ -633,7 +677,7 @@ func (m *Manager) ReserveTreeBlocks(ctx context.Context, ino *inode.Inode) (cont
 		left := r.blocks
 		r.blocks = nil
 		r.mu.Unlock()
-		m.freeTreeBlocks(context.Background(), left)
+		m.freeBlocks(context.Background(), left)
 	}
 	return context.WithValue(ctx, reservationKey{}, r), release, nil
 }
@@ -690,10 +734,20 @@ func (m *Manager) allocTreeBlocks(ctx context.Context, n int) ([]uint64, error) 
 	return out, nil
 }
 
-func (m *Manager) freeTreeBlocks(ctx context.Context, blocks []uint64) {
+func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 	for _, b := range blocks {
 		if err := m.bitmap.Free(ctx, b); err != nil {
-			log.Printf("[extent] free tree block %d: %v", b, err)
+			log.Printf("[extent] free block %d: %v", b, err)
 		}
+	}
+}
+
+// DiscardPending drops ino's uncommitted extent-tree change after a failed
+// inode write, freeing the tree blocks allocated for it. Blocks the change
+// would have released stay allocated because the inode on disk may use them.
+func (m *Manager) DiscardPending(ctx context.Context, ino *inode.Inode) {
+	if p := pendingOf(ino); p != nil {
+		m.freeBlocks(ctx, p.fresh)
+		ino.PendingTree = nil
 	}
 }

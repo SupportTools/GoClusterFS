@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"syscall"
 
@@ -79,7 +80,8 @@ var (
 
 // TreeFlusher writes an inode's pending extent-tree changes before the inode
 // itself is written. It runs under the inode lock; onDisk is the inode as it is
-// currently stored. The returned func, if any, runs once the inode write succeeds.
+// currently stored. The returned func, if any, runs after the inode write
+// succeeds; Write runs it after releasing the inode lock.
 type TreeFlusher interface {
 	FlushTree(ino, onDisk *Inode) (committed func(), err error)
 }
@@ -178,8 +180,16 @@ func (t *Table) Read(inodeNum uint32) (*Inode, error) {
 // Write writes an inode to disk.
 // The inode must have a valid InodeNum set.
 func (t *Table) Write(ctx context.Context, inode *Inode) error {
+	committed, err := t.lockedWrite(ctx, inode)
+	if committed != nil {
+		committed()
+	}
+	return err
+}
+
+func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 	if uint64(inode.InodeNum) >= t.totalInodes {
-		return ErrInodeOutOfRange
+		return nil, ErrInodeOutOfRange
 	}
 
 	t.mu.Lock()
@@ -188,7 +198,7 @@ func (t *Table) Write(ctx context.Context, inode *Inode) error {
 	// Acquire distributed lock if available
 	if t.lockMgr != nil {
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inode.InodeNum), lock.LockModeExclusive); err != nil {
-			return fmt.Errorf("failed to acquire inode lock: %w", err)
+			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inode.InodeNum))
 	}
@@ -205,26 +215,43 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	return t.writeWithTree(inode)
+	committed, err := t.writeWithTree(inode)
+	t.mu.Unlock()
+	if committed != nil {
+		committed()
+	}
+	return err
 }
 
 // writeWithTree flushes pending extent-tree changes, then writes the inode.
-// The inode sector write is the commit point for the tree.
+// The inode sector write is the commit point for the tree. The returned func
+// finishes the commit (it frees released blocks) and must run once the inode
+// lock is no longer needed, because freeing takes the bitmap lock.
 // Caller must hold t.mu and the inode lock.
-func (t *Table) writeWithTree(inode *Inode) error {
+func (t *Table) writeWithTree(inode *Inode) (func(), error) {
 	var committed func()
-	if inode.PendingTree != nil {
+	switch {
+	case inode.PendingTree != nil:
 		if t.treeFlusher == nil {
-			return ErrNoTreeFlusher
+			return nil, ErrNoTreeFlusher
 		}
 		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if committed, err = t.treeFlusher.FlushTree(inode, onDisk); err != nil {
-			return err
+			return nil, err
+		}
+	case inode.HasExtentTree():
+		// A copy with no extent edits must not roll the tree back to the one
+		// it read; that tree's nodes may already be rewritten or freed.
+		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
+		if err != nil {
+			return nil, err
+		}
+		if !sameExtentTree(inode, onDisk) {
+			log.Printf("[inode] inode %d: extent tree changed since read; keeping the on-disk extent map", inode.InodeNum)
+			copyExtentMap(inode, onDisk)
 		}
 	}
 
@@ -232,13 +259,23 @@ func (t *Table) writeWithTree(inode *Inode) error {
 	inode.MetaGeneration++
 
 	if err := t.writeInodeUnlocked(inode); err != nil {
-		return err
+		return nil, err
 	}
 	inode.PendingTree = nil
-	if committed != nil {
-		committed()
-	}
-	return nil
+	return committed, nil
+}
+
+func sameExtentTree(a, b *Inode) bool {
+	return a.HasExtentTree() == b.HasExtentTree() && a.ExtentTreeRoot == b.ExtentTreeRoot &&
+		a.ExtentTreeGen == b.ExtentTreeGen && a.ExtentDepth == b.ExtentDepth
+}
+
+func copyExtentMap(dst, src *Inode) {
+	dst.Flags = dst.Flags&^FlagHasExtentTree | src.Flags&FlagHasExtentTree
+	dst.InlineExtents = src.InlineExtents
+	dst.ExtentTreeRoot, dst.ExtentTreeGen, dst.ExtentDepth = src.ExtentTreeRoot, src.ExtentTreeGen, src.ExtentDepth
+	dst.ExtentCount = src.ExtentCount
+	dst.AllocatedBlocks, dst.WrittenBlocks = src.AllocatedBlocks, src.WrittenBlocks
 }
 
 // FindFreeSlot scans for a free inode slot without acquiring any distributed locks.
