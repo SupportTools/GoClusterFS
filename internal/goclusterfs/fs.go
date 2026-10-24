@@ -907,7 +907,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 		return nil
 	})
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: updating root inode failed: %v", name, err)
+		log.Printf("[WARN] Mkdir %q: link count of directory inode %d not updated: %v", name, inode.InodeRoot, err)
 		// The child directory was created successfully, just log the error
 	} else {
 		// Broadcast invalidation so other nodes refresh their directory cache
@@ -1017,7 +1017,7 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 		ino.Ctime = now
 		return nil
 	}); err != nil {
-		log.Printf("[DEBUG] Unlink %q: updating link count failed: %v", name, err)
+		log.Printf("[WARN] Unlink %q: link count of inode %d not updated: %v", name, childIno.InodeNum, err)
 	}
 
 	if _, err := f.updateInodeLocked(ctx, dirIno.InodeNum, func(ino *inode.Inode) error { ino.Mtime = now; return nil }); err != nil {
@@ -1102,7 +1102,7 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 		ino.Mtime = now
 		return nil
 	}); err != nil {
-		log.Printf("[DEBUG] Rmdir %q: updating directory failed: %v", name, err)
+		log.Printf("[WARN] Rmdir %q: link count of directory inode %d not updated: %v", name, dirIno.InodeNum, err)
 	}
 
 	// === WAL: Mark intent complete ===
@@ -1672,7 +1672,7 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 		return nil
 	})
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: updating parent inode %d failed: %v", name, d.inodeNum, err)
+		log.Printf("[WARN] Mkdir %q: link count of directory inode %d not updated: %v", name, d.inodeNum, err)
 		// The child directory was created successfully, just log the error
 		// and skip updating parent LinkCount/Mtime
 	} else {
@@ -1883,7 +1883,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 			d.fs.freeSFBSlot(ctx, sfbSlot)
 		}
 	} else if updated, err := d.fs.updateInodeLocked(ctx, uint32(childInodeNum), func(ino *inode.Inode) error { ino.LinkCount--; return nil }); err != nil {
-		log.Printf("[DEBUG] removeEntry %q: updating link count failed: %v", name, err)
+		log.Printf("[WARN] removeEntry %q: link count of inode %d not updated: %v", name, childInodeNum, err)
 	} else {
 		// Cache the updated child inode
 		d.fs.cacheInode(updated)
@@ -1898,7 +1898,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		ino.Mtime = now
 		return nil
 	}); err != nil {
-		log.Printf("[DEBUG] removeEntry %q: updating directory failed: %v", name, err)
+		log.Printf("[WARN] removeEntry %q: directory inode %d not updated: %v", name, d.inodeNum, err)
 	} else {
 		// Cache the updated parent directory inode
 		d.fs.cacheInode(updated)
