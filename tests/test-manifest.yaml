@@ -241,6 +241,22 @@ scenarios:
       docker: run-tests.sh::test_concurrent_file_creation
       vm: run-vm-tests.sh::test_concurrent_file_creation
 
+  - id: multinode-concurrent-creates-no-inode-collisions
+    name: Concurrent creates on two nodes pick different inodes
+    description: Two nodes create files in one directory at once; each starts its inode search in its own part of the table, so no create fails with EAGAIN and no inode claim collides
+    priority: high
+    environments:
+      go: inode_alloc_test.go::TestMultiNodeConcurrentCreatesDoNotCollide
+      docker: TODO  # counts inode claim collisions from mount debug logs; the Go test covers it
+      vm: TODO  # same as docker
+
+  - id: inode-allocation-start
+    name: Inode search starts at the node's part of the table
+    description: FindFreeSlot starts at a bit-reversed fraction of the table per node slot, wraps around, and still finds every free inode
+    priority: go_only
+    environments:
+      go: internal/inode/alloc_test.go::TestFindFreeSlotFindsEveryFreeInode
+
   - id: multinode-concurrent-writes
     name: Concurrent writes to different files
     description: Multiple nodes write to different files simultaneously
