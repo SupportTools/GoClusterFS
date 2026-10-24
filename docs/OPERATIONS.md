@@ -42,7 +42,7 @@ The cache hit percentages are wrong today and can read far above 100%, so don't 
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Warning: Failed to start cache broadcast` | The mount runs without broadcast. Other nodes' changes show up after `-cache-ttl` instead of right away. |
 | `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
-| `lock.Acquire: ... TIMEOUT after N retries` | A background task's lock wait ended because the task was stopped, for example at unmount. File operations keep waiting when the calling program gets a signal. Lock waits have no time limit otherwise. |
+| `lock.Acquire: ... TIMEOUT after N retries` | A lock wait gave up after 30 seconds (`DefaultTimeout`), or a background task was stopped at unmount. A file operation that was waiting fails with EIO. See [Interrupted File Operations](#interrupted-file-operations). |
 
 ### Journal
 
@@ -223,6 +223,10 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
    ```bash
    iscsiadm -m node -T <iqn> -p <ip> --logout
    ```
+
+### Interrupted File Operations
+
+GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait that cannot finish fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock.
 
 ### Distributed Lock Limits
 
