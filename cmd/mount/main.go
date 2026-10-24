@@ -304,7 +304,7 @@ func main() {
 
 	// Initialize snapshot subsystem after verifying filesystem is valid
 	if *snapshotsEnabled {
-		if err := gfs.InitSnapshots(ctx, snapshotOffset, snapshotSize); err != nil {
+		if err := gfs.InitSnapshots(ctx, snapshotOffset, snapshotSize, lockMgr); err != nil {
 			log.Fatalf("Failed to initialize snapshots: %v", err)
 		}
 		log.Printf("Snapshots: enabled (registry at %dMB, %dMB capacity)",

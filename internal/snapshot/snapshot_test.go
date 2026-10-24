@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -905,5 +907,60 @@ func TestRegistryActivateRequiresCreating(t *testing.T) {
 	}
 	if err := registry.Activate(ctx, fresh.SnapshotID); err != nil {
 		t.Fatalf("Activate of a creating snapshot: %v", err)
+	}
+}
+
+// Two nodes, each with its own lock manager on the shared lock region, create
+// snapshots at the same time. Every snapshot must keep its own slot and ID.
+func TestRegistryConcurrentCreatesAcrossNodes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 4<<20)
+	defer cleanup()
+	ctx := context.Background()
+	const perNode = 20
+
+	var nodes []*Registry
+	for slot := range 2 {
+		var nodeUUID [16]byte
+		nodeUUID[0] = byte(slot + 1)
+		locks := lock.NewManager(dev, 1<<20, 1<<20, nodeUUID, slot)
+		r := NewRegistry(dev, 0, 10*SectorSize, locks)
+		if _, err := r.Scan(ctx); err != nil {
+			t.Fatal(err)
+		}
+		nodes = append(nodes, r)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*perNode)
+	for n, r := range nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perNode {
+				if _, err := r.Create(ctx, fmt.Sprintf("node%d-%d", n, i), 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	all, err := nodes[0].List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2*perNode {
+		t.Fatalf("%d snapshots on disk, want %d", len(all), 2*perNode)
+	}
+	names := make(map[uint64]string)
+	for _, d := range all {
+		if other, dup := names[d.SnapshotID]; dup {
+			t.Fatalf("snapshots %q and %q share ID %d", other, d.GetName(), d.SnapshotID)
+		}
+		names[d.SnapshotID] = d.GetName()
 	}
 }

@@ -2991,6 +2991,59 @@ test_snapshot_delete_after_overwrite() {
     return 0
 }
 
+# Two VMs each take 10 snapshots of their own file at the same time. Each file
+# must list all of its snapshots, and deleting one VM's snapshots must leave
+# the other VM's alone.
+test_snapshot_concurrent_creates() {
+    log_info "Testing concurrent snapshot creation on two VMs..."
+    ensure_cluster_healthy 2
+
+    local run=$$
+    local file_a=/mnt/goclusterfs/conc_a.bin
+    local file_b=/mnt/goclusterfs/conc_b.bin
+
+    ssh_run 1 "rm -f $file_a && head -c 1048576 /dev/urandom > $file_a" || return 1
+    ssh_run 2 "rm -f $file_b && head -c 1048576 /dev/urandom > $file_b" || return 1
+
+    ssh_run 1 "for i in \$(seq 1 10); do setfattr -n user.snapshot -v conc_a_${run}_\$i $file_a || exit 1; done" &
+    local pid_a=$!
+    ssh_run 2 "for i in \$(seq 1 10); do setfattr -n user.snapshot -v conc_b_${run}_\$i $file_b || exit 1; done" &
+    local pid_b=$!
+    wait "$pid_a" || { log_error "snapshots on VM 1 failed"; return 1; }
+    wait "$pid_b" || { log_error "snapshots on VM 2 failed"; return 1; }
+
+    local count_a count_b
+    count_a=$(ssh_run 1 "getfattr --only-values -n user.snapshots $file_a 2>/dev/null | grep -c ':active'")
+    count_b=$(ssh_run 2 "getfattr --only-values -n user.snapshots $file_b 2>/dev/null | grep -c ':active'")
+    if [ "$count_a" -ne 10 ] || [ "$count_b" -ne 10 ]; then
+        log_error "$count_a and $count_b active snapshots, want 10 each"
+        return 1
+    fi
+
+    ssh_run 1 "for i in \$(seq 1 10); do setfattr -x user.snapshot.conc_a_${run}_\$i $file_a || exit 1; done" || {
+        log_error "deleting snapshots on VM 1 failed"
+        return 1
+    }
+    local tries=0
+    while ssh_run 1 "getfattr --only-values -n user.snapshots $file_a 2>/dev/null | grep -q conc_a_"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            log_error "VM 1 snapshots still listed 10s after delete"
+            return 1
+        fi
+        sleep 0.1
+    done
+    count_b=$(ssh_run 2 "getfattr --only-values -n user.snapshots $file_b 2>/dev/null | grep -c ':active'")
+    if [ "$count_b" -ne 10 ]; then
+        log_error "VM 2 lists $count_b snapshots after VM 1 deleted its own, want 10"
+        return 1
+    fi
+
+    ssh_run 2 "for i in \$(seq 1 10); do setfattr -x user.snapshot.conc_b_${run}_\$i $file_b; done"
+    log_info "Concurrent snapshot creation test passed"
+    return 0
+}
+
 # Two VMs append 1MB alternately to their own file, so both files get
 # non-contiguous blocks and grow past the old 2MB limit. Checks both files on
 # each VM after restarting it.
@@ -3095,6 +3148,7 @@ main() {
     run_test "Snapshot Preserves Data" test_snapshot_preserves_data
     run_test "Clone In-Place Write" test_clone_in_place_write
     run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
+    run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation

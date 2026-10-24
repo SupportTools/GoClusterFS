@@ -2931,6 +2931,64 @@ test_snapshot_delete_after_overwrite() {
     return 0
 }
 
+# Two nodes each take 10 snapshots of their own file at the same time. Each
+# file must list all of its snapshots, and deleting one node's snapshots must
+# leave the other node's alone.
+test_snapshot_concurrent_creates() {
+    log "Testing concurrent snapshot creation on two nodes..."
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]:-}"
+    if [ -z "$node_b" ]; then
+        log "SKIP: needs two nodes"
+        return 0
+    fi
+    local run=$$
+    local file_a=/mnt/goclusterfs/conc_a.bin
+    local file_b=/mnt/goclusterfs/conc_b.bin
+
+    exec_on_node "$node_a" sh -c "rm -f $file_a && head -c 1048576 /dev/urandom > $file_a" || return 1
+    exec_on_node "$node_b" sh -c "rm -f $file_b && head -c 1048576 /dev/urandom > $file_b" || return 1
+
+    exec_on_node "$node_a" sh -c "for i in \$(seq 1 10); do setfattr -n user.snapshot -v conc_a_${run}_\$i $file_a || exit 1; done" &
+    local pid_a=$!
+    exec_on_node "$node_b" sh -c "for i in \$(seq 1 10); do setfattr -n user.snapshot -v conc_b_${run}_\$i $file_b || exit 1; done" &
+    local pid_b=$!
+    wait "$pid_a" || { log "ERROR: snapshots on $node_a failed"; return 1; }
+    wait "$pid_b" || { log "ERROR: snapshots on $node_b failed"; return 1; }
+
+    local count_a count_b
+    count_a=$(exec_on_node "$node_a" sh -c "getfattr --only-values -n user.snapshots $file_a 2>/dev/null | grep -c ':active'")
+    count_b=$(exec_on_node "$node_b" sh -c "getfattr --only-values -n user.snapshots $file_b 2>/dev/null | grep -c ':active'")
+    if [ "$count_a" -ne 10 ] || [ "$count_b" -ne 10 ]; then
+        log "ERROR: $count_a and $count_b active snapshots, want 10 each"
+        return 1
+    fi
+
+    exec_on_node "$node_a" sh -c "for i in \$(seq 1 10); do setfattr -x user.snapshot.conc_a_${run}_\$i $file_a || exit 1; done" || {
+        log "ERROR: deleting snapshots on $node_a failed"
+        return 1
+    }
+    local tries=0
+    while exec_on_node "$node_a" sh -c "getfattr --only-values -n user.snapshots $file_a 2>/dev/null | grep -q conc_a_"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            log "ERROR: $node_a snapshots still listed 10s after delete"
+            return 1
+        fi
+        sleep 0.1
+    done
+    count_b=$(exec_on_node "$node_b" sh -c "getfattr --only-values -n user.snapshots $file_b 2>/dev/null | grep -c ':active'")
+    if [ "$count_b" -ne 10 ]; then
+        log "ERROR: $node_b lists $count_b snapshots after $node_a deleted its own, want 10"
+        return 1
+    fi
+
+    exec_on_node "$node_b" sh -c "for i in \$(seq 1 10); do setfattr -x user.snapshot.conc_b_${run}_\$i $file_b; done"
+    log "Concurrent snapshot creation test passed"
+    return 0
+}
+
 run_test "Create and Read File" test_create_read_file
 run_test "Create Directory" test_create_directory
 run_test "File in Directory" test_file_in_directory
@@ -2951,6 +3009,7 @@ run_test "Extent Tree Interleaved Appends" test_extent_tree_interleaved_appends
 run_test "Snapshot Preserves Data" test_snapshot_preserves_data
 run_test "Clone In-Place Write" test_clone_in_place_write
 run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
+run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"

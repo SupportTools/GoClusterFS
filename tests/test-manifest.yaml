@@ -1343,6 +1343,20 @@ scenarios:
     environments:
       go: internal/extent/extent_test.go::TestConcurrentInlineCopyOnWrite
 
+  - id: snapshot-concurrent-cow-across-nodes
+    name: Two nodes copy one shared block through the write path
+    description: Node A commits its copy of a shared block first; node B's commit fails, B frees only its own copy and retries in place, and the old block loses exactly one owner
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestConcurrentCopyOnWriteAcrossNodes
+
+  - id: snapshot-old-image-safe
+    name: Old snapshot and old clone after upgrading
+    description: On an image with an older version's snapshot and clone of one file, writes and deleting the snapshot, clone and source never free a block another inode maps
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestOldSnapshotAndCloneNeverFreeSharedBlocks
+
   - id: snapshot-recovery-after-crash
     name: Snapshot cleanup on mount after a crash
     description: A mount removes a snapshot left half created or half deleted, frees its data inode, and the file's blocks drop back to one owner
@@ -1493,6 +1507,22 @@ scenarios:
       go: snapshot_test.go::TestSnapshotDeleteAfterOverwrite
       docker: run-tests.sh::test_snapshot_delete_after_overwrite
       vm: run-vm-tests.sh::test_snapshot_delete_after_overwrite
+
+  - id: snapshot-concurrent-creates-across-nodes
+    name: Concurrent snapshots on two nodes
+    description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's
+    priority: high
+    environments:
+      go: snapshot_test.go::TestSnapshotConcurrentCreatesAcrossNodes
+      docker: run-tests.sh::test_snapshot_concurrent_creates
+      vm: run-vm-tests.sh::test_snapshot_concurrent_creates
+
+  - id: snapshot-registry-concurrent-creates
+    name: Registry creates from two nodes at once
+    description: Two registries with their own lock managers create snapshots concurrently; none share a slot or ID
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestRegistryConcurrentCreatesAcrossNodes
 
   - id: clone-from-snapshot
     name: Clone from snapshot

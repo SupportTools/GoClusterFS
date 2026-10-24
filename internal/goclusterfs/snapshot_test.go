@@ -61,7 +61,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	refs := refcount.NewRegion(dev, snapFSRefcountOffset, snapFSDataBlocks, nil)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, snapFSDataOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, nodeUUID, snapFSDataOffset)
-	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize); err != nil {
+	if err := fsys.InitSnapshots(context.Background(), snapFSRegistryOffset, snapFSRegistrySize, nil); err != nil {
 		t.Fatalf("InitSnapshots: %v", err)
 	}
 	t.Cleanup(fsys.snapshotWkr.Stop)
@@ -350,4 +350,143 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 		t.Errorf("write after recovery moved block 0 from %d to %d", blocks[0], got)
 	}
 	checkFile(t, g, overwritten(content, 10, pattern(4, 100)))
+}
+
+// Two nodes write into the same shared block at once. Node A commits its copy
+// first; node B's commit then fails, B frees only its own copy and retries,
+// and the old block loses exactly one owner.
+func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	nodeA := openSnapshotFS(t, path)
+	if err := nodeA.InitRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, BlockSize)
+	f := newRegularFile(t, nodeA)
+	writeAt(t, f, original, 0)
+	setxattr(t, f, "user.snapshot", "race")
+	old := physicalBlock(t, nodeA, f.inodeNum, 0)
+
+	nodeB := openSnapshotFS(t, path)
+	t.Cleanup(func() { beforeCoWCommit = nil })
+	beforeCoWCommit = func() {
+		beforeCoWCommit = nil
+		writeAt(t, f, pattern(2, 100), 0)
+	}
+	writeAt(t, &File{fs: nodeB, inodeNum: f.inodeNum}, pattern(3, 100), 200)
+	if beforeCoWCommit != nil {
+		t.Fatal("node B's write never reached a copy-on-write commit")
+	}
+
+	after := openSnapshotFS(t, path)
+	if got := refcountOf(t, after, old); got != 1 {
+		t.Fatalf("old block refcount %d, want 1: the snapshot is its only owner", got)
+	}
+	current := physicalBlock(t, after, f.inodeNum, 0)
+	allocated := 0
+	for b := uint64(0); b < snapFSDataBlocks; b++ {
+		if ok, err := after.bitmapMgr.IsAllocated(b); err != nil {
+			t.Fatal(err)
+		} else if ok {
+			allocated++
+		}
+	}
+	// The root directory, the snapshot's old block and the file's copy; node B's copy is gone.
+	if allocated != 3 || current == old {
+		t.Fatalf("%d blocks allocated with the file on block %d (old %d); want 3 and a copy", allocated, current, old)
+	}
+	want := overwritten(overwritten(original, 0, pattern(2, 100)), 200, pattern(3, 100))
+	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
+	setxattr(t, &File{fs: after, inodeNum: f.inodeNum}, "user.snapshot.clone", "race:/race-clone")
+	checkFile(t, lookupFile(t, after, "race-clone"), original)
+}
+
+// An image written by an older version, with an old snapshot and an old clone
+// of one file. Writes, then deleting the clone and the source, never free a
+// block another inode still maps; the blocks leak instead.
+func TestOldSnapshotAndCloneNeverFreeSharedBlocks(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	src := newRegularFile(t, fsys)
+	writeAt(t, src, pattern(5, 2*BlockSize), 0)
+
+	// What older versions left: blocks marked shared without FlagCounted, a
+	// refcount of 1 from the snapshot job, a clone of the same blocks whose
+	// refcount job never ran, and a snapshot descriptor without data.
+	srcIno, err := fsys.inodeTbl.Read(src.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range srcIno.InlineExtents {
+		if srcIno.InlineExtents[i].Length > 0 {
+			srcIno.InlineExtents[i].Flags |= extent.FlagShared
+		}
+	}
+	if err := fsys.inodeTbl.Write(ctx, srcIno); err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := fsys.extentMgr.DataBlocks(srcIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fsys.refcountReg.IncrementBatch(ctx, blocks); err != nil {
+		t.Fatal(err)
+	}
+	clone := newRegularFile(t, fsys)
+	cloneIno, err := fsys.inodeTbl.Read(clone.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloneIno.InlineExtents = srcIno.InlineExtents
+	cloneIno.ExtentCount = srcIno.ExtentCount
+	cloneIno.Size, cloneIno.AllocatedBlocks, cloneIno.WrittenBlocks = srcIno.Size, srcIno.AllocatedBlocks, srcIno.WrittenBlocks
+	if err := fsys.inodeTbl.Write(ctx, cloneIno); err != nil {
+		t.Fatal(err)
+	}
+	old, err := fsys.snapshotReg.Create(ctx, "old-snap", src.inodeNum, 0, 0, 2, srcIno.Size, snapshot.FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.snapshotReg.Activate(ctx, old.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, num := range map[string]uint32{"src.bin": src.inodeNum, "clone.bin": clone.inodeNum} {
+		if err := fsys.dirMgr.Add(ctx, root, name, uint64(num), dir.DT_REG); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stillAllocated := func(step string) {
+		t.Helper()
+		for _, b := range blocks {
+			if ok, err := fsys.bitmapMgr.IsAllocated(b); err != nil || !ok {
+				t.Fatalf("after %s, shared block %d is free (err=%v)", step, b, err)
+			}
+		}
+	}
+
+	writeAt(t, clone, pattern(6, 100), 10)
+	stillAllocated("writing the old clone")
+	if errno := src.Setxattr(ctx, "user.snapshot.clone", []byte("old-snap:/x"), 0); errno != syscall.ENOTSUP {
+		t.Fatalf("clone of a snapshot without data: errno %v, want ENOTSUP", errno)
+	}
+	if errno := src.Removexattr(ctx, "user.snapshot.old-snap"); errno != 0 {
+		t.Fatalf("delete old snapshot: %v", errno)
+	}
+	waitSnapshotGone(t, fsys, "old-snap")
+	stillAllocated("deleting the old snapshot")
+	if errno := fsys.Unlink(ctx, "clone.bin"); errno != 0 {
+		t.Fatalf("unlink old clone: %v", errno)
+	}
+	stillAllocated("deleting the old clone")
+	if errno := fsys.Unlink(ctx, "src.bin"); errno != 0 {
+		t.Fatalf("unlink source: %v", errno)
+	}
+	stillAllocated("deleting the source")
 }

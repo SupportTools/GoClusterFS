@@ -42,6 +42,10 @@ import (
 // modification was detected and the Write operation should be retried.
 var errRetryWrite = errors.New("retry write operation")
 
+// beforeCoWCommit lets tests run another node's write between a copy-on-write
+// and the inode write that commits it.
+var beforeCoWCommit func()
+
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected.
 const MaxWriteRetries = 3
@@ -229,15 +233,17 @@ func NewWithComponents(
 // Parameters:
 //   - snapshotOffset: byte offset where snapshot region starts on device
 //   - snapshotSize: size of snapshot region in bytes
+//   - lockMgr: serializes registry changes across nodes, so two nodes never
+//     take the same descriptor slot or snapshot ID (nil for single-node use)
 //
 // This must be called before any snapshot operations can succeed.
-func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uint64) error {
+func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uint64, lockMgr *lock.Manager) error {
 	if f.refcountReg == nil {
 		return fmt.Errorf("refcount region must be initialized before snapshots")
 	}
 
 	// Create snapshot registry
-	f.snapshotReg = snapshot.NewRegistry(f.dev, snapshotOffset, snapshotSize, f.lockMgr)
+	f.snapshotReg = snapshot.NewRegistry(f.dev, snapshotOffset, snapshotSize, lockMgr)
 
 	// Scan registry to rebuild state
 	stats, err := f.snapshotReg.Scan(ctx)
@@ -2689,6 +2695,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			return 0, writeFailed(err)
 		}
 	}
+	if len(cowDone) > 0 && beforeCoWCommit != nil {
+		beforeCoWCommit()
+	}
 
 	// Write inode - use WriteWithLockHeld if we hold the lock
 	if lockHeld {
@@ -3294,7 +3303,7 @@ func (f *FS) markShared(ino *inode.Inode) error {
 
 // errUncountedSharing means the file shares blocks the way older versions did,
 // without refcounts, so its blocks cannot be shared again safely.
-var errUncountedSharing = errors.New("file shares blocks without refcounts")
+var errUncountedSharing = errors.New("an older version shared this file's blocks without refcounts; run goclusterfs-fsck, and copy the file to snapshot or clone it")
 
 // shareInto gives dst the extents of inode srcNum, sharing its data blocks.
 // src is marked shared first, then each block gains an owner, durably, before

@@ -3,8 +3,10 @@ package integration
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -943,4 +945,68 @@ func TestSnapshotDeleteAfterOverwrite(t *testing.T) {
 		t.Fatalf("free blocks after deleting the snapshot = %d, want %d", got, free)
 	}
 	checkFile(t, mfs, "data.bin", updated)
+}
+
+// TestSnapshotConcurrentCreatesAcrossNodes has two nodes snapshot their own
+// files at the same time. Each file keeps all its snapshots, and deleting one
+// node's snapshots leaves the other node's alone.
+func TestSnapshotConcurrentCreatesAcrossNodes(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	nodes := []*MountedFS{cluster.Node(0), cluster.Node(1)}
+	const perNode = 10
+	file := func(n int) string { return fmt.Sprintf("conc%d.bin", n) }
+	snapName := func(n, i int) string { return fmt.Sprintf("conc%d-%d", n, i) }
+	for n, node := range nodes {
+		if err := node.WriteFile(file(n), chunk(byte(n+1), mb)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*perNode)
+	for n, node := range nodes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perNode {
+				if err := unix.Setxattr(node.Path(file(n)), "user.snapshot", []byte(snapName(n, i)), 0); err != nil {
+					errs <- fmt.Errorf("node %d snapshot %d: %w", n, i, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	names := func(n int) []string {
+		var out []string
+		for i := range perNode {
+			out = append(out, snapName(n, i))
+		}
+		return out
+	}
+	for n, node := range nodes {
+		waitForSnapshotState(t, node.Path(file(n)), "active", names(n)...)
+	}
+
+	for _, name := range names(0) {
+		if err := unix.Removexattr(nodes[0].Path(file(0)), "user.snapshot."+name); err != nil {
+			t.Fatalf("delete %s: %v", name, err)
+		}
+	}
+	waitForSnapshotState(t, nodes[0].Path(file(0)), "", names(0)...)
+	if states := snapshotStates(t, nodes[1].Path(file(1))); len(states) != perNode {
+		t.Fatalf("node 1's file lists %d snapshots after node 0 deleted its own, want %d: %v", len(states), perNode, states)
+	}
+	setxattr(t, nodes[1].Path(file(1)), "user.snapshot.clone", snapName(1, 0)+":/conc1-clone.bin")
+	checkFile(t, nodes[1], "conc1-clone.bin", chunk(2, mb))
 }
