@@ -41,6 +41,7 @@ func main() {
 		// Cache configuration
 		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
 		cacheTTL    = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
+		attrTimeout = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries")
 
 		// Journal configuration
 		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
@@ -321,9 +322,6 @@ func main() {
 
 	// Configure go-fuse mount options
 	// AttrTimeout and EntryTimeout control kernel-side caching
-	attrTimeout := 1 * time.Second
-	entryTimeout := 1 * time.Second
-
 	mountOpts := &fs.Options{
 		MountOptions: fuse.MountOptions{
 			FsName:        "goclusterfs",
@@ -333,8 +331,8 @@ func main() {
 			DisableXAttrs: false,
 			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
 		},
-		AttrTimeout:  &attrTimeout,
-		EntryTimeout: &entryTimeout,
+		AttrTimeout:  attrTimeout,
+		EntryTimeout: attrTimeout,
 	}
 
 	// Mount filesystem using go-fuse v2 API

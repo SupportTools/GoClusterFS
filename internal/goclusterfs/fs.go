@@ -488,7 +488,7 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 		return syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
@@ -537,7 +537,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return nil, syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.EntryValid = 0
 	out.AttrValid = 0
 
@@ -728,12 +728,12 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 		log.Printf("[DEBUG] Create %q: updating root inode failed: %v", name, err)
 		// The file was created successfully, just log the error
 	} else {
-		// Update cache with parent directory inode
-		f.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
 		if f.cacheMgr != nil {
 			f.cacheMgr.BroadcastInvalidateInode(uint32(inode.InodeRoot), dirIno.DataGeneration, dirIno.MetaGeneration)
 		}
+		// Update cache with parent directory inode
+		f.cacheInode(dirIno)
 	}
 
 	file := &File{fs: f, inodeNum: childIno.InodeNum}
@@ -889,12 +889,12 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 		log.Printf("[DEBUG] Mkdir %q: updating root inode failed: %v", name, err)
 		// The child directory was created successfully, just log the error
 	} else {
-		// Update cache with parent directory inode
-		f.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
 		if f.cacheMgr != nil {
 			f.cacheMgr.BroadcastInvalidateInode(uint32(inode.InodeRoot), dirIno.DataGeneration, dirIno.MetaGeneration)
 		}
+		// Update cache with parent directory inode
+		f.cacheInode(dirIno)
 	}
 
 	childDir := &Dir{fs: f, inodeNum: childIno.InodeNum}
@@ -1122,8 +1122,7 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 		return syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
-	// Other nodes may modify attributes at any time.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
@@ -1172,8 +1171,7 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return nil, syscall.EIO
 	}
 
-	// Disable FUSE kernel caching for cluster operation.
-	// Other nodes may modify the filesystem at any time.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.EntryValid = 0
 	out.AttrValid = 0
 
@@ -1434,12 +1432,12 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 		log.Printf("[DEBUG] Create %q: updating parent inode %d failed: %v", name, d.inodeNum, err)
 		// The file was created successfully, just log the error
 	} else {
-		// Update cache with parent directory inode
-		d.fs.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
 		if d.fs.cacheMgr != nil {
 			d.fs.cacheMgr.BroadcastInvalidateInode(uint32(d.inodeNum), dirIno.DataGeneration, dirIno.MetaGeneration)
 		}
+		// Update cache with parent directory inode
+		d.fs.cacheInode(dirIno)
 	}
 
 	// Create the file node
@@ -1657,12 +1655,12 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 		// The child directory was created successfully, just log the error
 		// and skip updating parent LinkCount/Mtime
 	} else {
-		// Update cache with parent directory inode
-		d.fs.cacheInode(dirIno)
 		// Broadcast invalidation so other nodes refresh their directory cache
 		if d.fs.cacheMgr != nil {
 			d.fs.cacheMgr.BroadcastInvalidateInode(uint32(d.inodeNum), dirIno.DataGeneration, dirIno.MetaGeneration)
 		}
+		// Update cache with parent directory inode
+		d.fs.cacheInode(dirIno)
 	}
 
 	// Create the directory node
@@ -1955,8 +1953,7 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 
 	log.Printf("[DEBUG] File.Getattr: inode=%d Size=%d AllocatedBlocks=%d", f.inodeNum, ino.Size, ino.AllocatedBlocks)
 
-	// Disable FUSE kernel caching for cluster operation.
-	// Other nodes may modify attributes at any time.
+	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
@@ -2724,14 +2721,14 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 	releaseCopied(cowDone)
 
-	// Cache the freshly-written inode for subsequent reads
-	f.fs.cacheInode(ino)
-
 	// Broadcast inode invalidation to other nodes for immediate visibility.
 	// This is fire-and-forget - doesn't block the write operation.
 	if f.fs.cacheMgr != nil {
 		f.fs.cacheMgr.BroadcastInvalidateInode(uint32(f.inodeNum), ino.DataGeneration, ino.MetaGeneration)
 	}
+
+	// Cache the freshly-written inode for subsequent reads
+	f.fs.cacheInode(ino)
 
 	// === WAL: Mark intent complete ===
 	// Now that all metadata and data have been persisted, mark the intent as complete.

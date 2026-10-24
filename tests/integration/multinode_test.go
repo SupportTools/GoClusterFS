@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -1132,6 +1133,106 @@ func inodeNumber(t *testing.T, m *MountedFS, name string) uint64 {
 		t.Fatalf("stat %s: %v", name, err)
 	}
 	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+// TestMultiNodeExtentCacheCoherency checks that a node which cached a file's block
+// mappings reads the new data after another node changes those mappings.
+func TestMultiNodeExtentCacheCoherency(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false"}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	t.Run("TruncateRewrite", func(t *testing.T) {
+		const name = "trunc.bin"
+		writeOrFail(t, writer, name, bytes.Repeat([]byte("o"), 300<<10), 0)
+		expectContent(t, reader, name, bytes.Repeat([]byte("o"), 300<<10))
+
+		if err := os.Truncate(writer.Path(name), 0); err != nil {
+			t.Fatalf("Writer: truncate %s: %v", name, err)
+		}
+		// The padding file takes the freed block, so the rewrite lands in another one.
+		writeOrFail(t, writer, "trunc_pad.bin", bytes.Repeat([]byte("p"), 300<<10), 0)
+		writeOrFail(t, writer, name, bytes.Repeat([]byte("n"), 300<<10), 0)
+
+		expectContent(t, reader, name, bytes.Repeat([]byte("n"), 300<<10))
+	})
+
+	t.Run("HoleFill", func(t *testing.T) {
+		const name = "holes.bin"
+		const blockSize = 1 << 20
+		chunk := func(c byte) []byte { return bytes.Repeat([]byte{c}, 4096) }
+		writeOrFail(t, writer, name, chunk('a'), 0)
+		writeOrFail(t, writer, name, chunk('c'), 2*blockSize)
+
+		want := make([]byte, 2*blockSize+4096)
+		copy(want, chunk('a'))
+		copy(want[2*blockSize:], chunk('c'))
+		expectContent(t, reader, name, want)
+
+		writeOrFail(t, writer, name, chunk('b'), blockSize)
+		copy(want[blockSize:], chunk('b'))
+		expectContent(t, reader, name, want)
+	})
+}
+
+// TestMultiNodeAttrTimeoutZero checks that with -attr-timeout=0 a node's next stat
+// shows another node's size change, with no kernel attribute cache delay.
+func TestMultiNodeAttrTimeoutZero(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false", "-attr-timeout=0"}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	const name = "grow.txt"
+	writeOrFail(t, writer, name, []byte("0123456789"), 0)
+	expectSize(t, reader, name, 10)
+	writeOrFail(t, writer, name, []byte("abcdefghij"), 10)
+	expectSize(t, reader, name, 20)
+}
+
+func expectSize(t *testing.T, m *MountedFS, name string, want int64) {
+	t.Helper()
+	fi, err := m.Stat(name)
+	if err != nil {
+		t.Fatalf("stat %s: %v", name, err)
+	}
+	if fi.Size() != want {
+		t.Errorf("stat %s: size %d, want %d", name, fi.Size(), want)
+	}
+}
+
+func writeOrFail(t *testing.T, m *MountedFS, name string, data []byte, offset int64) {
+	t.Helper()
+	if err := m.WriteFileAt(name, data, offset); err != nil {
+		t.Fatalf("write %s at %d: %v", name, offset, err)
+	}
+}
+
+func expectContent(t *testing.T, m *MountedFS, name string, want []byte) {
+	t.Helper()
+	got, err := m.ReadFile(name)
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	if bytes.Equal(got, want) {
+		return
+	}
+	i := 0
+	for i < len(got) && i < len(want) && got[i] == want[i] {
+		i++
+	}
+	t.Errorf("%s: %d bytes, want %d; first difference at offset %d", name, len(got), len(want), i)
 }
 
 // TestNetworkPartition simulates network partition handling by testing node isolation

@@ -108,3 +108,36 @@ func TestCacheInodeClearsNegativeEntry(t *testing.T) {
 		t.Errorf("GetInode returned Size %d, want 5", got.Size)
 	}
 }
+
+func TestCacheInodeKeepsNewerCopy(t *testing.T) {
+	tbl := newTestInodeTable(t)
+	mgr, err := NewManager(DefaultConfig(), tbl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimWithSize(t, tbl, inode.InodeFirstUsable, 3)
+	older, err := tbl.Read(inode.InodeFirstUsable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer, err := tbl.Read(inode.InodeFirstUsable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer.Size = 10
+	if err := tbl.Write(context.Background(), newer); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.CacheInode(newer)
+	mgr.CacheInode(older)
+
+	got, err := mgr.GetInode(inode.InodeFirstUsable)
+	if err != nil {
+		t.Fatalf("GetInode: %v", err)
+	}
+	if got.Size != 10 {
+		t.Errorf("GetInode returned Size %d from the older copy, want 10", got.Size)
+	}
+}

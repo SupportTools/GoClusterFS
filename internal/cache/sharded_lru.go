@@ -56,6 +56,11 @@ func (s *ShardedLRU[K, V]) Get(key K) (V, bool) {
 	return s.shards[s.shard(key)].Get(key)
 }
 
+// GetIf retrieves a value if valid accepts it; otherwise the entry is removed.
+func (s *ShardedLRU[K, V]) GetIf(key K, valid func(V) bool) (V, bool) {
+	return s.shards[s.shard(key)].GetIf(key, valid)
+}
+
 // Peek retrieves a value without affecting LRU ordering.
 func (s *ShardedLRU[K, V]) Peek(key K) (V, bool) {
 	return s.shards[s.shard(key)].Peek(key)
@@ -65,6 +70,11 @@ func (s *ShardedLRU[K, V]) Peek(key K) (V, bool) {
 // If the shard is at capacity, the least recently used entry is evicted.
 func (s *ShardedLRU[K, V]) Put(key K, value V) (evictedKey K, evictedValue V, evicted bool) {
 	return s.shards[s.shard(key)].Put(key, value)
+}
+
+// PutIf stores value unless key is already present and replace(old) returns false.
+func (s *ShardedLRU[K, V]) PutIf(key K, value V, replace func(old V) bool) bool {
+	return s.shards[s.shard(key)].PutIf(key, value, replace)
 }
 
 // Delete removes an entry from the cache.

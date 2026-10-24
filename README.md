@@ -28,6 +28,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Linux only.** GoClusterFS needs FUSE and O_DIRECT.
 - **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **Name lookups are slow.** Each lookup reads the whole directory from disk and scans it entry by entry. In one test on a single node, a lookup took about 25 ms, and `ls -l` on a 1,000-file directory took about 47 seconds.
+- **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime, and a read can stop at the old size. A file that stays open can use the old size and block mappings for up to `-cache-ttl` (default 5s). Opening the file after `-attr-timeout` has passed reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
 - **On-disk format version 2** since [#15](https://github.com/SupportTools/GoClusterFS/pull/15). Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
@@ -219,7 +220,7 @@ make test-multinode-vm
 make test-parity
 ```
 
-VM tests need an x86_64 Linux host with `/dev/kvm`, `qemu-system-x86_64`, and `sshpass`. QEMU 10+ uses io_uring, which counts against the locked-memory limit. With the common 8 MB default, QEMU fails with `Failed to initialize io_uring: Cannot allocate memory`. Raise the limit for the test user, then log in again:
+VM tests need an x86_64 Linux host with `/dev/kvm`, `qemu-system-x86_64`, OpenBSD `nc` (Debian's `netcat-openbsd`) and `setpriv` from util-linux. VM N listens for SSH on `127.0.0.1:2222+N-1`; set `VM_SSH_BASE_PORT` to run two suites on one host. Each VM's console, QEMU and mount logs are written to `tests/vm/results/`, including logs from before a VM was killed. QEMU 10+ uses io_uring, which counts against the locked-memory limit. With the common 8 MB default, QEMU fails with `Failed to initialize io_uring: Cannot allocate memory`. Raise the limit for the test user, then log in again:
 
 ```bash
 echo "$USER - memlock unlimited" | sudo tee /etc/security/limits.d/90-qemu-memlock.conf
