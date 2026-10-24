@@ -58,8 +58,7 @@ func (c *Checker) checkExtents() error {
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
 
-		n, err := c.dev.ReadAt(sectorBuf, int64(sectorOffset))
-		if err != nil || n != InodeSectorSize {
+		if c.readSector(sectorBuf, sectorOffset) != nil {
 			continue // Already reported in Phase 3
 		}
 
@@ -87,28 +86,32 @@ func (c *Checker) checkExtents() error {
 							fmt.Sprintf("SFB container block %d out of range (max %d)", containerBlock, totalBlocks-1),
 							false)
 						extentErrors++
+					} else if !c.bitmapAllocated[containerBlock] {
+						c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
+							fmt.Sprintf("SFB container block %d not marked allocated in bitmap", containerBlock),
+							false)
+						extentErrors++
 					}
 					continue
 				}
 
-				// Validate physical block range
+				if ext.PhysicalBlock >= totalBlocks || ext.Length > totalBlocks-ext.PhysicalBlock {
+					c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
+						fmt.Sprintf("%d blocks at physical block %d run past the last block %d",
+							ext.Length, ext.PhysicalBlock, totalBlocks-1),
+						false)
+					extentErrors++
+					continue
+				}
+
 				for j := uint64(0); j < ext.Length; j++ {
 					physBlock := ext.PhysicalBlock + j
-
-					// Check bounds
-					if physBlock >= totalBlocks {
-						c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
-							fmt.Sprintf("physical block %d out of range (max %d)", physBlock, totalBlocks-1),
-							false)
-						extentErrors++
-						continue
-					}
 
 					// Check if block is allocated in bitmap
 					if !c.bitmapAllocated[physBlock] {
 						c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
 							fmt.Sprintf("physical block %d not marked allocated in bitmap", physBlock),
-							true)
+							false)
 						extentErrors++
 						orphanedBlocks++
 					}
@@ -140,7 +143,7 @@ func (c *Checker) checkExtents() error {
 				if (ext.Flags & ExtentFlagAllocated) == 0 {
 					c.addProblem(PhaseExtents, Warning, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
 						"extent has data but FlagAllocated not set",
-						true)
+						false)
 				}
 			}
 
@@ -163,7 +166,7 @@ func (c *Checker) checkExtents() error {
 					if !c.bitmapAllocated[block] {
 						c.addProblem(PhaseExtents, Error, location,
 							"extent tree node block not marked allocated in bitmap",
-							true)
+							false)
 						extentErrors++
 					}
 				}
@@ -171,30 +174,10 @@ func (c *Checker) checkExtents() error {
 		}
 	}
 
-	// Check for allocated blocks not referenced by any inode
-	unreferencedAllocated := 0
-	for blockNum := range c.bitmapAllocated {
-		if c.inodeBlocks[blockNum] == 0 {
-			unreferencedAllocated++
-			// Only report if significant (avoid spam for metadata blocks)
-			if unreferencedAllocated <= 10 {
-				c.addProblem(PhaseExtents, Warning, fmt.Sprintf("block %d", blockNum),
-					"allocated in bitmap but not referenced by any inode",
-					true)
-			}
-		}
-	}
-	if unreferencedAllocated > 10 {
-		c.addProblem(PhaseExtents, Warning, "bitmap",
-			fmt.Sprintf("%d additional blocks allocated but unreferenced", unreferencedAllocated-10),
-			true)
-	}
-
 	c.result.OrphanedBlocks = orphanedBlocks
 
 	c.logf("  Extent errors: %d\n", extentErrors)
 	c.logf("  Overlapping blocks: %d\n", overlappingBlocks)
-	c.logf("  Unreferenced allocated blocks: %d\n", unreferencedAllocated)
 
 	return nil
 }

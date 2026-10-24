@@ -3,7 +3,9 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
+	"strings"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 const (
@@ -36,131 +38,179 @@ const (
 	RefcountFlagPinned     uint16 = 1 << 3
 )
 
+// refcountFix is a change repair makes to one refcount sector: a new count for
+// one block, or, when entry is false, a sector rebuilt from the references.
+type refcountFix struct {
+	sector  uint64
+	entry   bool
+	block   uint64
+	count   uint32
+	problem int // index of the problem the fix repairs
+}
+
 // checkRefcounts validates the refcount table (Phase 5).
 //
-// Checks performed:
-//   - Each sector has valid CRC32C checksum
-//   - RefCount == 0 for free blocks (0 or 1 means one owner, so an
-//     allocated block may have either)
-//   - RefCount > 1 implies FlagShared should be set in extent
+// A block's refcount counts the inodes that map it, where 0 and 1 both mean
+// one owner. Checks performed:
+//   - Each sector has a valid CRC32C checksum (or is all zero, never written)
+//   - Free blocks have a count of 0
+//   - Blocks mapped by several inodes count at least that many owners;
+//     fewer would free a block another inode still maps
+//   - Blocks count no more owners than inodes map them; more would leak them
 //   - No refcount overflow (0xFFFFFFFF)
-//   - Cross-validate with extent references from Phase 4
+//
+// In repair mode, and only when every inode's extents were read, the counts
+// are rebuilt from those references, and extents an older version shared
+// without counting are marked counted.
 func (c *Checker) checkRefcounts() error {
 	if c.sbData == nil {
 		return fmt.Errorf("superblock not validated")
 	}
 
 	sb := c.sbData
-	refcountOffset := sb.RefCountTableOffset
-	refcountSize := sb.RefCountTableSize
-	totalBlocks := sb.TotalBlocks
-
-	// Check if refcount table exists
-	if refcountSize == 0 {
+	if sb.RefCountTableSize == 0 {
 		c.logf("  Refcount table not present (size=0)\n")
 		return nil
 	}
+	totalSectors := min(sb.RefCountTableSize/RefcountSectorSize,
+		(sb.TotalBlocks+RefcountEntriesPerSector-1)/RefcountEntriesPerSector)
 
-	totalSectors := refcountSize / RefcountSectorSize
+	c.logf("  Refcount table offset: 0x%X\n", sb.RefCountTableOffset)
+	c.logf("  Refcount table size: %d bytes (%d sectors)\n", sb.RefCountTableSize, totalSectors)
 
-	c.logf("  Refcount table offset: 0x%X\n", refcountOffset)
-	c.logf("  Refcount table size: %d bytes (%d sectors)\n", refcountSize, totalSectors)
-	c.logf("  Entries per sector: %d\n", RefcountEntriesPerSector)
-
-	sectorBuf := make([]byte, RefcountSectorSize)
-	checksumErrors := 0
-	inconsistentEntries := 0
+	sectorBuf := storage.NewAlignedBuffer(RefcountSectorSize).Bytes()
 	sharedBlocks := uint64(0)
+	var fixes []refcountFix
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
-		sectorOffset := refcountOffset + sectorIdx*RefcountSectorSize
-
-		n, err := c.dev.ReadAt(sectorBuf, int64(sectorOffset))
-		if err != nil {
-			c.addProblem(PhaseRefcounts, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("read error: %v", err),
-				false)
+		if err := c.readSector(sectorBuf, sb.RefCountTableOffset+sectorIdx*RefcountSectorSize); err != nil {
+			c.addProblem(PhaseRefcounts, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
+			c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("refcount sector %d is unreadable", sectorIdx))
 			continue
 		}
-		if n != RefcountSectorSize {
-			c.addProblem(PhaseRefcounts, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("short read: %d bytes", n),
-				false)
-			continue
-		}
-
-		// Validate checksum
-		dataLen := RefcountEntriesPerSector * RefcountEntrySize
-		storedChecksum := binary.LittleEndian.Uint32(sectorBuf[dataLen:])
-		computedChecksum := crc32.Checksum(sectorBuf[:dataLen], crc32.MakeTable(crc32.Castagnoli))
-
-		if storedChecksum != computedChecksum {
-			checksumErrors++
+		// None of the counts in such a sector can be trusted, so repair
+		// rebuilds all of them.
+		if !sectorChecksumValid(sectorBuf) {
 			c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
-					storedChecksum, computedChecksum),
-				true)
-
-			if c.opts.Mode == Repair {
-				binary.LittleEndian.PutUint32(sectorBuf[dataLen:], computedChecksum)
-				if _, err := c.dev.WriteAt(sectorBuf, int64(sectorOffset)); err != nil {
-					c.logf("  Failed to repair sector %d: %v\n", sectorIdx, err)
-				} else {
-					c.result.Problems[len(c.result.Problems)-1].Repaired = true
-					c.result.RepairedCount++
-				}
-			}
+				"checksum mismatch: the runtime cannot read refcounts in this sector", true)
+			fixes = append(fixes, refcountFix{sector: sectorIdx, problem: c.lastProblem()})
+			continue
 		}
 
-		// Process each entry
 		for entryIdx := 0; entryIdx < RefcountEntriesPerSector; entryIdx++ {
 			blockNum := sectorIdx*RefcountEntriesPerSector + uint64(entryIdx)
-			if blockNum >= totalBlocks {
+			if blockNum >= sb.TotalBlocks {
 				break
 			}
-
-			entryOffset := entryIdx * RefcountEntrySize
-			entry := parseRefcountEntry(sectorBuf[entryOffset:])
-
-			// Store for cross-validation
-			c.refcountEntries[blockNum] = entry.RefCount
-
+			entry := parseRefcountEntry(sectorBuf[entryIdx*RefcountEntrySize:])
 			if entry.RefCount > 1 {
 				sharedBlocks++
 			}
-
-			// Validate consistency with bitmap
-			isAllocatedInBitmap := c.bitmapAllocated[blockNum]
-			refsFromInodes := c.inodeBlocks[blockNum]
-
-			if !isAllocatedInBitmap && entry.RefCount != 0 {
-				c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("block %d", blockNum),
-					fmt.Sprintf("block free in bitmap but refcount is %d", entry.RefCount),
-					true)
-				inconsistentEntries++
-			}
-
-			// An undercounted block is freed while another inode still maps it.
-			if refsFromInodes > 1 && entry.RefCount < uint32(refsFromInodes) {
-				c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("block %d", blockNum),
-					fmt.Sprintf("referenced by %d inodes but refcount is only %d", refsFromInodes, entry.RefCount),
-					true)
-			}
-
-			// Check for overflow (should never happen)
-			if entry.RefCount == 0xFFFFFFFF {
-				c.addProblem(PhaseRefcounts, Critical, fmt.Sprintf("block %d", blockNum),
-					"refcount overflow (0xFFFFFFFF)",
-					false)
+			if want, ok := c.checkRefcount(blockNum, entry.RefCount); ok {
+				fixes = append(fixes, refcountFix{sector: sectorIdx, entry: true, block: blockNum, count: want, problem: c.lastProblem()})
 			}
 		}
 	}
+	c.reportUncounted()
 
-	c.logf("  Checksum errors: %d\n", checksumErrors)
-	c.logf("  Inconsistent entries: %d\n", inconsistentEntries)
 	c.logf("  Shared blocks (refcount > 1): %d\n", sharedBlocks)
 
+	if c.opts.Mode != Repair || len(fixes) == 0 && len(c.uncounted) == 0 {
+		return nil
+	}
+	if len(c.refsIncomplete) > 0 {
+		c.addProblem(PhaseRefcounts, Error, "refcount table",
+			"not rebuilt, because some references could not be read: "+strings.Join(c.refsIncomplete, "; "), false)
+		return nil
+	}
+	if !c.opts.DryRun {
+		if beforeRepairWrites != nil {
+			beforeRepairWrites()
+		}
+		if err := c.registryUnchanged(); err != nil {
+			return err
+		}
+	}
+	if err := c.writeRefcounts(fixes); err != nil {
+		return err
+	}
+	// The runtime trusts counted sharing, so the counts must be on disk first.
+	if !c.opts.DryRun {
+		if err := c.dev.Sync(); err != nil {
+			return fmt.Errorf("sync refcounts: %w", err)
+		}
+	}
+	return c.markSharingCounted()
+}
+
+// checkRefcount compares one block's count with the inodes that map it. It
+// reports a problem and returns the count repair should set, if any.
+func (c *Checker) checkRefcount(block uint64, count uint32) (uint32, bool) {
+	refs := uint32(c.inodeBlocks[block])
+	loc := fmt.Sprintf("block %d", block)
+	switch {
+	case count == 0xFFFFFFFF:
+		c.addProblem(PhaseRefcounts, Critical, loc, "refcount overflow (0xFFFFFFFF)", false)
+		return 0, false
+	case refs > 1 && count < refs:
+		c.addProblem(PhaseRefcounts, Error, loc,
+			fmt.Sprintf("mapped by %d inodes but refcount is %d: freeing one of them frees a block another still maps", refs, count), true)
+		return refs, true
+	case refs > 0 && count > max(refs, 1):
+		c.addProblem(PhaseRefcounts, Warning, loc,
+			fmt.Sprintf("mapped by %d inode(s) but refcount is %d: the block will never be freed", refs, count), true)
+		return refs, true
+	case refs == 0 && count != 0 && !c.bitmapAllocated[block]:
+		c.addProblem(PhaseRefcounts, Error, loc,
+			fmt.Sprintf("free in the bitmap but refcount is %d", count), true)
+		return 0, true
+	}
+	return 0, false
+}
+
+// writeRefcounts applies fixes one sector at a time, rewriting its checksum.
+func (c *Checker) writeRefcounts(fixes []refcountFix) error {
+	sectorBuf := storage.NewAlignedBuffer(RefcountSectorSize).Bytes()
+	for len(fixes) > 0 {
+		n := 1
+		for n < len(fixes) && fixes[n].sector == fixes[0].sector {
+			n++
+		}
+		sector := fixes[0].sector
+		offset := c.sbData.RefCountTableOffset + sector*RefcountSectorSize
+		if err := c.readSector(sectorBuf, offset); err != nil {
+			return fmt.Errorf("refcount sector %d: %w", sector, err)
+		}
+		problems := make([]int, 0, n)
+		for _, f := range fixes[:n] {
+			if f.entry {
+				binary.LittleEndian.PutUint32(sectorBuf[(f.block%RefcountEntriesPerSector)*RefcountEntrySize:], f.count)
+			} else {
+				c.rebuildRefcountSector(sectorBuf, sector)
+			}
+			problems = append(problems, f.problem)
+		}
+		setSectorChecksum(sectorBuf)
+		if err := c.write(sectorBuf, offset, problems...); err != nil {
+			return fmt.Errorf("refcount sector %d: %w", fixes[0].sector, err)
+		}
+		fixes = fixes[n:]
+	}
 	return nil
+}
+
+// rebuildRefcountSector sets every count in the sector from the references.
+func (c *Checker) rebuildRefcountSector(buf []byte, sector uint64) {
+	clear(buf)
+	for i := uint64(0); i < RefcountEntriesPerSector; i++ {
+		block := sector*RefcountEntriesPerSector + i
+		if block >= c.sbData.TotalBlocks {
+			break
+		}
+		if refs := c.inodeBlocks[block]; refs > 1 {
+			binary.LittleEndian.PutUint32(buf[i*RefcountEntrySize:], uint32(refs))
+		}
+	}
 }
 
 // parseRefcountEntry extracts a refcount entry from raw bytes.

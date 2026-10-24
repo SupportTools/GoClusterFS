@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/node"
@@ -24,7 +23,7 @@ var expectedMagic = [12]byte{'G', 'O', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'F', '
 //   - Magic number is "GOCLUSTERFS\0"
 //   - Version is supported
 //   - RequiredFlags are all understood
-//   - BlockSize is 1MB
+//   - BlockSize is 1MB and InodeSize is 256 bytes
 //   - All region offsets are 4KB-aligned
 //   - All region sizes are multiples of 4KB
 //   - No region overlaps
@@ -32,14 +31,9 @@ var expectedMagic = [12]byte{'G', 'O', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'F', '
 //   - All regions fit within device
 //   - Checksum (CRC32C) is valid
 func (c *Checker) checkSuperblock() error {
-	// Read superblock from device
-	buf := make([]byte, SuperblockSize)
-	n, err := c.dev.ReadAt(buf, 0)
-	if err != nil {
+	buf := storage.NewAlignedBuffer(SuperblockSize).Bytes()
+	if err := c.readSector(buf, 0); err != nil {
 		return fmt.Errorf("failed to read superblock: %w", err)
-	}
-	if n != SuperblockSize {
-		return fmt.Errorf("short read: got %d bytes, expected %d", n, SuperblockSize)
 	}
 
 	// Parse raw fields
@@ -84,6 +78,13 @@ func (c *Checker) checkSuperblock() error {
 	}
 	c.logf("  Block Size: %d (OK)\n", sb.BlockSize)
 
+	if sb.InodeSize != InodeSize {
+		c.addProblem(PhaseSuperblock, Fatal, "offset 68",
+			fmt.Sprintf("invalid inode size: %d (expected %d)", sb.InodeSize, InodeSize),
+			false)
+		return fmt.Errorf("invalid inode size")
+	}
+
 	// Get device size
 	devSize := uint64(c.dev.Size())
 	c.logf("  Device Size: %d bytes\n", devSize)
@@ -94,37 +95,29 @@ func (c *Checker) checkSuperblock() error {
 	}
 	c.checkJournalSlots(sb)
 
-	// Validate checksum
 	checksumOffset := SuperblockSize - 4
 	storedChecksum := binary.LittleEndian.Uint32(buf[checksumOffset:])
-	computedChecksum := crc32.Checksum(buf[:checksumOffset], crc32.MakeTable(crc32.Castagnoli))
+	computedChecksum := storage.CRC32C(buf[:checksumOffset])
 
 	if storedChecksum != computedChecksum {
+		// A new checksum would make the runtime trust every field, so only
+		// offer it when the fields passed the checks above.
+		repairable := !c.result.HasErrors()
 		c.addProblem(PhaseSuperblock, Critical, "offset 4092",
 			fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
 				storedChecksum, computedChecksum),
-			true) // Repairable by recalculating
-
-		if c.opts.Mode == Repair {
-			// Write correct checksum
+			repairable)
+		if repairable && c.opts.Mode == Repair {
 			binary.LittleEndian.PutUint32(buf[checksumOffset:], computedChecksum)
-			if _, err := c.dev.WriteAt(buf, 0); err != nil {
-				return fmt.Errorf("failed to repair checksum: %w", err)
-			}
-			c.result.Problems[len(c.result.Problems)-1].Repaired = true
-			c.result.RepairedCount++
-			c.logf("  Checksum: REPAIRED\n")
+			problem := c.lastProblem()
+			c.superblockFix = func() error { return c.write(buf, 0, problem) }
 		}
 	} else {
 		c.logf("  Checksum: 0x%08X (OK)\n", storedChecksum)
 	}
 
-	// Store statistics for result
 	c.result.TotalBlocks = sb.TotalBlocks
-	c.result.TotalInodes = sb.InodeTableSize / uint64(sb.InodeSize)
-	c.result.FreeBlocks = sb.FreeBlocks
-	c.result.FreeInodes = sb.FreeInodes
-	c.result.SnapshotCount = sb.SnapshotCount
+	c.result.TotalInodes = sb.InodeTableSize / InodeSize
 
 	c.logf("  Total Blocks: %d\n", sb.TotalBlocks)
 	c.logf("  Total Inodes: %d\n", c.result.TotalInodes)
@@ -187,9 +180,18 @@ func (c *Checker) parseSuperblock(buf []byte) *SuperblockData {
 	return sb
 }
 
-// validateRegions checks that all region offsets and sizes are valid.
+// validateRegions checks that all region offsets and sizes are valid. It fails
+// when a region lies outside the device or overlaps another, since later
+// phases would read the wrong data.
 func (c *Checker) validateRegions(sb *SuperblockData, devSize uint64) error {
 	const align = 4096 // 4KB alignment
+
+	if sb.TotalBlocks == 0 || sb.TotalBlocks > devSize/uint64(sb.BlockSize) {
+		c.addProblem(PhaseSuperblock, Critical, "data_region",
+			fmt.Sprintf("%d blocks of %d bytes do not fit the %d-byte device", sb.TotalBlocks, sb.BlockSize, devSize),
+			false)
+		return fmt.Errorf("data region does not fit the device")
+	}
 
 	type region struct {
 		name   string
@@ -223,16 +225,17 @@ func (c *Checker) validateRegions(sb *SuperblockData, devSize uint64) error {
 		}
 	}
 
-	// Check bounds
 	for _, r := range regions {
-		end := r.offset + r.size
-		if end > devSize {
+		if r.size > devSize || r.offset > devSize-r.size {
 			c.addProblem(PhaseSuperblock, Critical, r.name,
-				fmt.Sprintf("extends beyond device: 0x%X+0x%X = 0x%X > 0x%X",
-					r.offset, r.size, end, devSize),
+				fmt.Sprintf("extends beyond device: offset 0x%X + size 0x%X > 0x%X",
+					r.offset, r.size, devSize),
 				false)
+			return fmt.Errorf("%s extends beyond the device", r.name)
 		}
 	}
+
+	overlaps := 0
 
 	// Check for overlaps
 	for i, r1 := range regions {
@@ -253,8 +256,12 @@ func (c *Checker) validateRegions(sb *SuperblockData, devSize uint64) error {
 						r1.name, r1.offset, r1End,
 						r2.name, r2.offset, r2End),
 					false)
+				overlaps++
 			}
 		}
+	}
+	if overlaps > 0 {
+		return fmt.Errorf("%d region overlaps", overlaps)
 	}
 
 	c.logf("  Region validation: complete\n")
@@ -309,7 +316,7 @@ func ValidateSuperblockQuick(data []byte) error {
 	// Check checksum
 	checksumOffset := SuperblockSize - 4
 	storedChecksum := binary.LittleEndian.Uint32(data[checksumOffset:])
-	computedChecksum := crc32.Checksum(data[:checksumOffset], crc32.MakeTable(crc32.Castagnoli))
+	computedChecksum := storage.CRC32C(data[:checksumOffset])
 	if storedChecksum != computedChecksum {
 		return fmt.Errorf("checksum mismatch: stored=0x%08X, computed=0x%08X",
 			storedChecksum, computedChecksum)

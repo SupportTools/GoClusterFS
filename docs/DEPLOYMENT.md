@@ -169,7 +169,7 @@ The default block size is 1 MB. This is fixed in the current version.
 
 ```bash
 # Check superblock
-./goclusterfs-fsck -device /path/to/device
+./goclusterfs-fsck /path/to/device
 ```
 
 ---
@@ -492,7 +492,7 @@ cat /mnt/cluster/node2.txt
 fusermount -u /mnt/goclusterfs
 
 # Run fsck
-./goclusterfs-fsck -device /path/to/device
+./goclusterfs-fsck /path/to/device
 
 # Expected output: All 8 phases pass
 ```

@@ -1,10 +1,9 @@
 package fsck
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
-	"hash/crc32"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 const (
@@ -21,14 +20,15 @@ const (
 	BitmapBitsPerSector = BitmapBytesPerSector * 8 // 32736
 )
 
-var zeroSector [BitmapSectorSize]byte
-
 // checkBitmap validates the block allocation bitmap (Phase 2).
 //
 // Checks performed:
 //   - Sectors covering TotalBlocks have valid CRC32C checksums or are all zero (never written)
 //   - Bitmap size matches TotalBlocks from superblock
 //   - Track which blocks are allocated (for cross-validation)
+//
+// The superblock's free block counter is set at format and never updated by
+// the runtime, so it is not compared.
 func (c *Checker) checkBitmap() error {
 	if c.sbData == nil {
 		return fmt.Errorf("superblock not validated")
@@ -55,48 +55,22 @@ func (c *Checker) checkBitmap() error {
 	c.logf("  Total blocks tracked: %d\n", totalBlocks)
 
 	// Read and validate each sector
-	sectorBuf := make([]byte, BitmapSectorSize)
+	sectorBuf := storage.NewAlignedBuffer(BitmapSectorSize).Bytes()
 	allocatedCount := uint64(0)
 	checksumErrors := 0
 
 	for sectorIdx := uint64(0); sectorIdx < min(actualSectors, expectedSectors); sectorIdx++ {
-		sectorOffset := bitmapOffset + sectorIdx*BitmapSectorSize
-
-		n, err := c.dev.ReadAt(sectorBuf, int64(sectorOffset))
-		if err != nil {
-			c.addProblem(PhaseBitmap, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("read error: %v", err),
-				false)
-			continue
-		}
-		if n != BitmapSectorSize {
-			c.addProblem(PhaseBitmap, Critical, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("short read: %d bytes", n),
-				false)
+		if err := c.readSector(sectorBuf, bitmapOffset+sectorIdx*BitmapSectorSize); err != nil {
+			c.addProblem(PhaseBitmap, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
 			continue
 		}
 
-		// Validate checksum
-		storedChecksum := binary.LittleEndian.Uint32(sectorBuf[BitmapBytesPerSector:])
-		computedChecksum := crc32.Checksum(sectorBuf[:BitmapBytesPerSector], crc32.MakeTable(crc32.Castagnoli))
-
-		if storedChecksum != computedChecksum && !bytes.Equal(sectorBuf, zeroSector[:]) {
+		// The runtime refuses to read a sector with a bad checksum. Rewriting
+		// the checksum would make it trust bits that may be wrong.
+		if !sectorChecksumValid(sectorBuf) {
 			checksumErrors++
 			c.addProblem(PhaseBitmap, Error, fmt.Sprintf("sector %d", sectorIdx),
-				fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
-					storedChecksum, computedChecksum),
-				true)
-
-			if c.opts.Mode == Repair {
-				// Repair by recalculating checksum
-				binary.LittleEndian.PutUint32(sectorBuf[BitmapBytesPerSector:], computedChecksum)
-				if _, err := c.dev.WriteAt(sectorBuf, int64(sectorOffset)); err != nil {
-					c.logf("  Failed to repair sector %d: %v\n", sectorIdx, err)
-				} else {
-					c.result.Problems[len(c.result.Problems)-1].Repaired = true
-					c.result.RepairedCount++
-				}
-			}
+				"checksum mismatch: the runtime cannot allocate or free blocks in this sector", false)
 		}
 
 		// Count allocated blocks and record for cross-validation
@@ -119,21 +93,11 @@ func (c *Checker) checkBitmap() error {
 
 	// Update result statistics
 	c.result.AllocatedBlocks = allocatedCount
-	freeBlocks := totalBlocks - allocatedCount
-	c.result.FreeBlocks = freeBlocks
+	c.result.FreeBlocks = totalBlocks - allocatedCount
 
 	c.logf("  Allocated blocks: %d\n", allocatedCount)
-	c.logf("  Free blocks: %d\n", freeBlocks)
+	c.logf("  Free blocks: %d\n", c.result.FreeBlocks)
 	c.logf("  Checksum errors: %d\n", checksumErrors)
-
-	// Compare with superblock's FreeBlocks counter
-	if freeBlocks != sb.FreeBlocks {
-		c.addProblem(PhaseBitmap, Error, "free count",
-			fmt.Sprintf("superblock says %d free blocks, bitmap shows %d",
-				sb.FreeBlocks, freeBlocks),
-			true)
-		// This is fixable by updating superblock counter
-	}
 
 	return nil
 }

@@ -759,6 +759,110 @@ scenarios:
     environments:
       go: internal/fsck/fsck_test.go::TestFsckExtentTree
 
+  - id: fsck-runtime-image
+    name: fsck passes a runtime image
+    description: An image the mount binary wrote, with snapshots, clones, copies on write and extent trees, passes goclusterfs-fsck with no problems; -repair exits 8 while mounted and 0 after a clean unmount
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
+    environments:
+      go: fsck_test.go::TestFsckCleanAfterWorkload
+      docker: TODO
+      vm: TODO
+
+  - id: fsck-repair-older-sharing
+    name: fsck -repair counts sharing from older versions
+    description: Snapshots of a file an older version shared fail with ENOTSUP; -repair -dry-run changes nothing, -repair exits 1, and snapshots, clones and copies on write work afterwards
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
+    environments:
+      go: fsck_test.go::TestFsckRepairsOlderSharing
+      docker: TODO
+      vm: TODO
+
+  - id: fsck-runtime-image-unit
+    name: fsck accepts everything the runtime writes
+    description: Snapshots, clones, snapshot clones, copies on write in inline and tree files, deletes and unlinks leave no fsck problem
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckAcceptsRuntimeImage
+
+  - id: fsck-repair-older-tree-sharing
+    name: fsck -repair counts older sharing in extent trees
+    description: Older sharing in inline and extent tree files, including a block shared between a tree file and an inline clone, is rebuilt and marked counted
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckRepairsOlderSharing
+
+  - id: fsck-rebuild-refcount-sector
+    name: fsck -repair rebuilds a corrupt refcount sector
+    description: A refcount sector with a bad checksum is rebuilt from the extents that map its blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckRebuildsCorruptRefcountSector
+
+  - id: fsck-repair-in-use
+    name: fsck -repair refuses an in-use filesystem
+    description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
+    priority: go_only
+    environments:
+      go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
+
+  - id: fsck-bad-layout
+    name: fsck stops on a layout it cannot trust
+    description: A zero inode size, no or too many data blocks, a wrapping offset or overlapping regions abort fsck in phase 1 with exit code 8
+    priority: go_only
+    environments:
+      go: internal/fsck/layout_test.go::TestFsckStopsOnBadLayout
+
+  - id: fsck-exit-codes
+    name: fsck exit codes
+    description: fsck(8) bits - 0 no errors, 1 repaired, 4 errors remain, 8 aborted, and their sums
+    priority: go_only
+    environments:
+      go: internal/fsck/layout_test.go::TestFsckExitCodes
+
+  - id: fsck-fuzz-check
+    name: Fuzz fsck over corrupted metadata
+    description: A corrupted superblock, bitmap, inode, registry, refcount, snapshot, extent tree or directory sector never panics a check or a repair dry run
+    priority: go_only
+    environments:
+      go: internal/fsck/check_fuzz_test.go::FuzzCheck
+
+  - id: fsck-fuzz-parsers
+    name: Fuzz fsck record and directory parsers
+    description: Arbitrary bytes never panic the fsck directory block and record parsers
+    priority: go_only
+    environments:
+      go: internal/fsck/parse_fuzz_test.go::FuzzParseDirBlock
+
+  - id: fsck-repair-node-mounting
+    name: fsck -repair stops when a node mounts
+    description: A node that mounts while repair watches the registry, or after the watch but before repair writes, stops the repair with exit code 8 and nothing written
+    priority: go_only
+    environments:
+      go: internal/fsck/layout_test.go::TestFsckRepairNoticesNodeMounting
+
+  - id: fsck-directory-chunk
+    name: fsck checks directory entries fill one chunk
+    description: Directory entries whose record lengths stop short of or run past the 4KB chunk are reported
+    priority: go_only
+    environments:
+      go: internal/fsck/parse_fuzz_test.go::TestParseDirBlockChunkBoundary
+
+  - id: fsck-fuzz-records
+    name: Fuzz fsck fixed-size record parsers
+    description: Arbitrary bytes never panic the superblock, inode, refcount and snapshot descriptor parsers
+    priority: go_only
+    environments:
+      go: internal/fsck/parse_fuzz_test.go::FuzzParseRecords
+
+  - id: extent-tree-node-fuzz
+    name: Fuzz the extent tree node decoder
+    description: Arbitrary bytes never panic the tree node decoder, and decoded nodes survive an encode/decode round trip
+    priority: go_only
+    environments:
+      go: internal/extent/tree_fuzz_test.go::FuzzParseTreeNode
+
   # ===========================================================================
   # VM-ONLY TESTS (Require QEMU/KVM features)
   # ===========================================================================
