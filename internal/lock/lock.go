@@ -206,6 +206,11 @@ type Manager struct {
 	nodeSlot  int      // This node's slot
 	heldLocks map[lockKey]*heldLock
 
+	// Several keys can hash to one record; the record stays held until the last key is released.
+	records map[uint64]*heldRecord
+	// gates serialize this node's on-disk operations per record.
+	gates map[uint64]*sync.Mutex
+
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
 
@@ -233,6 +238,15 @@ type heldLock struct {
 	goroutines map[uint64]int // Goroutine ID -> reference count for that goroutine
 }
 
+type heldRecord struct {
+	mode LockMode
+	keys int
+}
+
+func covers(held, want LockMode) bool {
+	return held == LockModeExclusive || held == want
+}
+
 // Errors
 var (
 	ErrLockTimeout   = errors.New("lock acquisition timed out")
@@ -251,6 +265,8 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		nodeUUID:  nodeUUID,
 		nodeSlot:  nodeSlot,
 		heldLocks: make(map[lockKey]*heldLock),
+		records:   make(map[uint64]*heldRecord),
+		gates:     make(map[uint64]*sync.Mutex),
 		hintCache: newHintLRU(HintCacheSize),
 	}
 }
@@ -265,6 +281,8 @@ func NewManagerWithHintCacheSize(dev *storage.Device, offset, size uint64, nodeU
 		nodeUUID:  nodeUUID,
 		nodeSlot:  nodeSlot,
 		heldLocks: make(map[lockKey]*heldLock),
+		records:   make(map[uint64]*heldRecord),
+		gates:     make(map[uint64]*sync.Mutex),
 		hintCache: newHintLRU(hintCacheSize),
 	}
 }
@@ -303,33 +321,25 @@ func (m *Manager) HintStats() (hits, misses uint64, hitRate float64) {
 // subsequent goroutines increment a local reference count. This allows
 // concurrent FUSE operations from the same node to share locks efficiently
 // while still providing cross-node serialization.
+//
+// Resources that hash to the same record share it: a node holding the record
+// for one resource excludes other nodes from every resource in that record.
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
-
+	recordID := m.hashToRecord(lockType, resourceID)
 	gid := getGoroutineID()
 
 	m.mu.Lock()
-	// Check if we already hold this lock (same node) - just increment refCount
-	if held, ok := m.heldLocks[key]; ok {
-		held.refCount++
-		if held.goroutines == nil {
-			held.goroutines = make(map[uint64]int)
-		}
-		held.goroutines[gid]++
-		log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - reusing existing lock (refCount=%d, gid=%d)", lockType, resourceID, held.refCount, gid)
+	if m.reuseHeldKeyLocked(key, mode, gid) {
 		m.mu.Unlock()
 		return nil
 	}
-
-	// Check lock ordering to prevent deadlocks
 	if err := m.checkLockOrder(lockType); err != nil {
 		m.mu.Unlock()
 		return err
 	}
 	m.mu.Unlock()
 
-	// Calculate record position (hash-based)
-	recordID := m.hashToRecord(lockType, resourceID)
 	retryCount := 0
 	startTime := time.Now()
 
@@ -338,63 +348,30 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 	for {
 		// Always attempt acquire first, then check context after failure
 		// This ensures we try at least once even if context is nearly expired
-		acquired, err := m.tryAcquire(recordID, lockType, resourceID, mode)
+		held, added, err := m.attemptAcquire(key, recordID, mode, gid)
 		if err != nil {
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - tryAcquire error: %v", lockType, resourceID, err)
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - attempt error: %v", lockType, resourceID, err)
 			return err
 		}
-		if acquired {
-			m.mu.Lock()
-			// Double-check in case another goroutine acquired while we were trying
-			if held, ok := m.heldLocks[key]; ok {
-				// Another goroutine beat us - just increment refCount
-				held.refCount++
-				if held.goroutines == nil {
-					held.goroutines = make(map[uint64]int)
-				}
-				held.goroutines[gid]++
-				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - late arrival, reusing (refCount=%d, gid=%d)", lockType, resourceID, held.refCount, gid)
-				m.mu.Unlock()
-				// Release the on-disk lock we just acquired since we'll share the existing one
-				m.releaseRecord(recordID)
-				return nil
-			}
-			m.heldLocks[key] = &heldLock{
-				Mode:       mode,
-				RecordID:   recordID,
-				refCount:   1,
-				goroutines: map[uint64]int{gid: 1},
-			}
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired distributed lock (retries=%d, dur=%v, gid=%d)", lockType, resourceID, retryCount, time.Since(startTime), gid)
+		if held {
+			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired (retries=%d, dur=%v, gid=%d)", lockType, resourceID, retryCount, time.Since(startTime), gid)
 
 			// Trigger cache invalidation callback for exclusive locks.
 			// We do this before returning so the caller reads fresh data.
 			// Only exclusive locks trigger invalidation since shared locks
 			// are for reading and can safely use cached values.
+			m.mu.Lock()
 			onAcquire := m.onAcquire
 			m.mu.Unlock()
-
-			if onAcquire != nil && mode == LockModeExclusive {
+			if added && onAcquire != nil && mode == LockModeExclusive {
 				onAcquire(lockType, resourceID, mode)
 			}
 			return nil
 		}
 
-		// Check again if another goroutine acquired while we were waiting
-		m.mu.Lock()
-		if held, ok := m.heldLocks[key]; ok {
-			held.refCount++
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - piggyback on existing (refCount=%d)", lockType, resourceID, held.refCount)
-			m.mu.Unlock()
-			return nil
-		}
-		m.mu.Unlock()
-
 		retryCount++
-		log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - loop iteration, retryCount now %d", lockType, resourceID, retryCount)
 
-		// Check context cancellation, but allow at least 3 retries for same-node
-		// CAS races where the other goroutine is still adding to heldLocks
+		// Check context cancellation, but allow at least 3 retries
 		if retryCount >= 3 {
 			select {
 			case <-ctx.Done():
@@ -416,6 +393,85 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 	}
 }
 
+// attemptAcquire makes one acquisition attempt. added reports whether this
+// call registered the key rather than joining another goroutine's hold.
+func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gid uint64) (held, added bool, err error) {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	m.mu.Lock()
+	if m.reuseHeldKeyLocked(key, mode, gid) {
+		m.mu.Unlock()
+		return true, false, nil
+	}
+	if rec, ok := m.records[recordID]; ok {
+		if !covers(rec.mode, mode) {
+			selfDeadlock := m.goroutineHoldsRecordLocked(recordID, gid)
+			m.mu.Unlock()
+			if selfDeadlock {
+				return false, false, fmt.Errorf("%w: cannot upgrade a shared lock to exclusive", ErrDeadlockRisk)
+			}
+			return false, false, nil
+		}
+		rec.keys++
+		m.addHeldKeyLocked(key, recordID, mode, gid)
+		m.mu.Unlock()
+		return true, true, nil
+	}
+	m.mu.Unlock()
+
+	acquired, err := m.tryAcquire(recordID, key.Type, key.ResourceID, mode)
+	if err != nil || !acquired {
+		return false, false, err
+	}
+
+	m.mu.Lock()
+	m.records[recordID] = &heldRecord{mode: mode, keys: 1}
+	m.addHeldKeyLocked(key, recordID, mode, gid)
+	m.mu.Unlock()
+	return true, true, nil
+}
+
+func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) bool {
+	held, ok := m.heldLocks[key]
+	if !ok || !covers(m.records[held.RecordID].mode, mode) {
+		return false
+	}
+	held.refCount++
+	held.goroutines[gid]++
+	return true
+}
+
+func (m *Manager) addHeldKeyLocked(key lockKey, recordID uint64, mode LockMode, gid uint64) {
+	m.heldLocks[key] = &heldLock{
+		Mode:       mode,
+		RecordID:   recordID,
+		refCount:   1,
+		goroutines: map[uint64]int{gid: 1},
+	}
+}
+
+func (m *Manager) goroutineHoldsRecordLocked(recordID uint64, gid uint64) bool {
+	for _, held := range m.heldLocks {
+		if held.RecordID == recordID && held.goroutines[gid] > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) recordGate(recordID uint64) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	gate, ok := m.gates[recordID]
+	if !ok {
+		gate = &sync.Mutex{}
+		m.gates[recordID] = gate
+	}
+	return gate
+}
+
 // Release releases a held lock.
 // With reference counting, this decrements the local count and only releases
 // the distributed lock when the last goroutine releases.
@@ -431,34 +487,49 @@ func (m *Manager) Release(lockType LockType, resourceID uint64) error {
 		return ErrNotLockOwner
 	}
 
-	// Decrement goroutine-specific count
-	if held.goroutines != nil {
-		held.goroutines[gid]--
-		if held.goroutines[gid] <= 0 {
-			delete(held.goroutines, gid)
-		}
+	held.goroutines[gid]--
+	if held.goroutines[gid] <= 0 {
+		delete(held.goroutines, gid)
 	}
 
 	// Decrement overall reference count
 	held.refCount--
 	if held.refCount > 0 {
-		// Other goroutines still using the lock
-		log.Printf("[DEBUG] lock.Release: type=%d res=%d gid=%d - decremented refCount to %d", lockType, resourceID, gid, held.refCount)
 		m.mu.Unlock()
 		return nil
 	}
 
-	// Last reference - release the distributed lock
-	log.Printf("[DEBUG] lock.Release: type=%d res=%d gid=%d - last ref, releasing distributed lock", lockType, resourceID, gid)
 	delete(m.heldLocks, key)
 	recordID := held.RecordID
 	m.mu.Unlock()
 
-	err := m.releaseRecord(recordID)
+	err := m.dropRecordKey(recordID)
 	if err != nil {
-		log.Printf("[DEBUG] lock.Release: type=%d res=%d - releaseRecord error: %v", lockType, resourceID, err)
+		log.Printf("[DEBUG] lock.Release: type=%d res=%d - release error: %v", lockType, resourceID, err)
 	}
 	return err
+}
+
+func (m *Manager) dropRecordKey(recordID uint64) error {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	m.mu.Lock()
+	rec, ok := m.records[recordID]
+	if !ok {
+		m.mu.Unlock()
+		return ErrNotLockOwner
+	}
+	rec.keys--
+	if rec.keys > 0 {
+		m.mu.Unlock()
+		return nil
+	}
+	delete(m.records, recordID)
+	m.mu.Unlock()
+
+	return m.releaseRecord(recordID, rec.mode)
 }
 
 // tryAcquire attempts a single lock acquisition.
@@ -499,40 +570,26 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 
 	now := time.Now()
 
-	// Check if lock is free or can be acquired
-	canAcquire := false
-	reason := "unknown"
+	// A record held for a colliding resource is still held; taking it over lets two nodes hold it.
+	var sharedCount uint32
+	reason := ""
 	switch {
 	case record.Mode == LockModeNone:
-		// Lock is free
-		canAcquire = true
 		reason = "free"
 
-	case record.Type != lockType || record.ResourceID != resourceID:
-		// Hash collision - different resource, treat as free
-		// In production, we'd use a more sophisticated collision resolution
-		canAcquire = true
-		reason = "hash_collision"
-
 	case m.isLockStale(record):
-		// Lock is stale (owner died)
-		canAcquire = true
+		// Owner presumed dead; its shared holders are gone too.
 		reason = "stale"
 
 	case mode == LockModeShared && record.Mode == LockModeShared:
-		// Adding another shared holder
-		canAcquire = true
 		reason = "shared_add"
+		sharedCount = record.SharedCount
 
-	case record.OwnerUUID == m.nodeUUID:
-		// Same node owns the lock - this can happen due to a race between
-		// Release clearing heldLocks and releaseRecord clearing on-disk.
-		// Safe to re-acquire since the previous holder from this node is gone.
-		canAcquire = true
-		reason = "same_node_reacquire"
-	}
+	case record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID:
+		// Leftover from a failed release or an earlier mount; this node holds no key on it.
+		reason = "leftover_from_this_node"
 
-	if !canAcquire {
+	default:
 		log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - cannot acquire, held by node=%x mode=%d", lockType, resourceID, record.OwnerUUID[:8], record.Mode)
 		return false, nil
 	}
@@ -551,7 +608,7 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		Sequence:    record.Sequence + 1,
 	}
 	if mode == LockModeShared {
-		newRecord.SharedCount = record.SharedCount + 1
+		newRecord.SharedCount = sharedCount + 1
 	}
 
 	// CAS the record
@@ -603,58 +660,45 @@ func (m *Manager) tryAcquireOptimistic(recordID uint64, lockType LockType, resou
 	return acquired, newSeq, nil
 }
 
-// releaseRecord releases a lock record.
+// releaseRecord releases this node's hold on a lock record.
 // After successful release, caches the new sequence number to enable
 // optimistic acquisition on the next lock attempt.
-func (m *Manager) releaseRecord(recordID uint64) error {
-	record, err := m.readRecord(recordID)
-	if err != nil {
-		return err
-	}
+func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
+	for {
+		record, err := m.readRecord(recordID)
+		if err != nil {
+			return err
+		}
 
-	// Verify we own it
-	if record.OwnerUUID != m.nodeUUID {
-		// For shared locks, just decrement count
-		if record.Mode == LockModeShared && record.SharedCount > 1 {
-			newRecord := *record
-			newRecord.SharedCount--
-			newRecord.Sequence++
-			success, err := m.casRecord(recordID, record, &newRecord)
-			if err != nil {
-				return err
-			}
-			if success {
-				// Cache the new sequence for optimistic re-acquisition
-				m.hintCache.Put(recordID, &lockHint{
-					Sequence: newRecord.Sequence,
-					Mode:     LockModeShared, // Still shared (decremented)
-					UpdateAt: time.Now(),
-				})
-			}
+		var newRecord *Record
+		switch {
+		case mode == LockModeExclusive && record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID,
+			mode == LockModeShared && record.Mode == LockModeShared && record.SharedCount <= 1:
+			newRecord = &Record{Sequence: record.Sequence + 1}
+		case mode == LockModeShared && record.Mode == LockModeShared:
+			// OwnerUUID names only the latest reader, so readers release by count.
+			next := *record
+			next.SharedCount--
+			next.Sequence++
+			newRecord = &next
+		default:
+			// Another node reclaimed the record after it went stale.
+			return ErrNotLockOwner
+		}
+
+		success, err := m.casRecord(recordID, record, newRecord)
+		if err != nil {
+			return err
+		}
+		if success {
+			m.hintCache.Put(recordID, &lockHint{
+				Sequence: newRecord.Sequence,
+				Mode:     newRecord.Mode,
+				UpdateAt: time.Now(),
+			})
 			return nil
 		}
-		return ErrNotLockOwner
 	}
-
-	// Clear the record
-	newRecord := &Record{
-		Sequence: record.Sequence + 1,
-	}
-
-	success, err := m.casRecord(recordID, record, newRecord)
-	if err != nil {
-		return err
-	}
-	if success {
-		// Cache the new sequence for optimistic re-acquisition
-		// Mode is None since lock is now free
-		m.hintCache.Put(recordID, &lockHint{
-			Sequence: newRecord.Sequence,
-			Mode:     LockModeNone,
-			UpdateAt: time.Now(),
-		})
-	}
-	return nil
 }
 
 // isLockStale checks if a lock's owner is dead.
