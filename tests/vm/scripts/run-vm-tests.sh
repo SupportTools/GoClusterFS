@@ -2329,7 +2329,6 @@ test_stability() {
 # Concurrent Same-File Write Tests (using pre-extension pattern)
 # =============================================================================
 
-# Test 10: Two VMs write to same file at different offsets
 # Two VMs write different ranges of each new file's first block at once.
 # Without the inode lock the later inode write drops the other VM's extent.
 test_concurrent_first_write_same_block() {
@@ -2372,6 +2371,7 @@ test_concurrent_first_write_same_block() {
     return 0
 }
 
+# Test 10: Two VMs write to same file at different offsets
 test_concurrent_same_file_writes() {
     log_info "Testing concurrent same-file writes (2 VMs)..."
     ensure_cluster_healthy 2

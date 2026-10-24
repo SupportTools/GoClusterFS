@@ -313,6 +313,17 @@ scenarios:
       docker: run-tests.sh::test_concurrent_first_write_same_block
       vm: run-vm-tests.sh::test_concurrent_first_write_same_block
 
+  # Docker/VM TODO: single-node behavior that needs a remount and a full-volume
+  # write; the Go integration test runs the real mount binary already.
+  - id: tree-reservation-no-leak
+    name: Extent-tree reservations do not leak blocks
+    description: Appends that merge into a full inline extent return their unused tree-block reservation, so the whole volume is writable after the file is deleted and the FS remounted
+    priority: medium
+    environments:
+      go: tree_reservation_test.go::TestTreeReservationsDoNotLeakBlocks
+      docker: TODO
+      vm: TODO
+
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
     description: Multiple nodes write to same block at different offsets
