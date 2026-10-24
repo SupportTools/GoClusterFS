@@ -3435,6 +3435,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
 		data.InodeNum, src.AllocatedBlocks, src.Size, snapshot.FlagReadOnly)
 	if err != nil {
+		log.Printf("[snapshot] Failed to add '%s' to the registry: %v", name, err)
 		f.fs.inodeTbl.Free(ctx, data.InodeNum)
 		if errors.Is(err, snapshot.ErrSnapshotExists) {
 			return syscall.EEXIST
