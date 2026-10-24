@@ -64,6 +64,17 @@ For tests where several nodes write to one file at the same time, create the fil
 - Keep each pull request to one concern. Send a refactor, a fix, and a feature as separate pull requests.
 - Fill in the pull request template: what changed, why, and which test suites you ran.
 
+## Releasing
+
+Maintainers cut a release like this:
+
+1. In `CHANGELOG.md`, move the `[Unreleased]` entries into a new `## [X.Y.Z] - YYYY-MM-DD` section, and merge that change.
+2. Tag the merge commit `vX.Y.Z` and push the tag.
+
+The [Release workflow](.github/workflows/release.yml) builds `linux/amd64` and `linux/arm64` archives with both binaries, `LICENSE`, and the licenses of Go and every linked module. It publishes them with `checksums.txt` as a GitHub Release, using the matching `CHANGELOG.md` section as the notes. It fails if that section is missing. A tag with a hyphen, such as `v0.1.0-rc.1`, makes a pre-release.
+
+To build the same archives locally, run `scripts/dist.sh`. It writes them to `dist/`.
+
 ## License
 
 By sending a contribution, you agree that it is licensed under the [Apache License 2.0](LICENSE).
