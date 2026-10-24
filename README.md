@@ -19,7 +19,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 
 - Go 1.26 or later
 - Linux with FUSE support (`fusermount3`)
-- O_DIRECT-capable storage (not tmpfs)
+- O_DIRECT-capable storage (tmpfs supports O_DIRECT only on Linux 6.6 and later)
 - Root or `fuse` group membership
 - For multi-node: Shared block device (SAN, iSCSI, NVMe-oF, etc.)
 
@@ -37,7 +37,7 @@ This builds `goclusterfs-mount` and `goclusterfs-fsck` in the repo root.
 
 ### Format and Mount
 
-Use a file as the block device. Keep it on a filesystem that supports O_DIRECT, not tmpfs.
+Use a file as the block device. Keep it on a filesystem that supports O_DIRECT.
 
 ```bash
 truncate -s 1G disk.img

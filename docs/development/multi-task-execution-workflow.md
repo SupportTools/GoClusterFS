@@ -261,7 +261,7 @@ When task affects filesystem operations:
 truncate -s 100M test.img
 mkdir -p testmount
 
-# Mount and test (the image must not be on tmpfs)
+# Mount and test
 ./goclusterfs-mount -device ./test.img -mount ./testmount -format > mount.log 2>&1 &
 sleep 2
 

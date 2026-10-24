@@ -15,7 +15,7 @@ make build                 # ./goclusterfs-mount and ./goclusterfs-fsck
 go build ./... && go vet ./...
 ```
 
-Run against a file-backed image. The image must sit on a filesystem that supports O_DIRECT (not tmpfs).
+Run against a file-backed image. The image must sit on a filesystem that supports O_DIRECT (tmpfs only on Linux 6.6+).
 
 ```bash
 truncate -s 1G disk.img
@@ -91,6 +91,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - Every node uses the same 4 MB journal region at 5 MB. `cmd/mount` does not give each node its own journal slot.
 - Each file holds at most 2 extents (inline in the inode). The overflow extent tree is being built.
 - The inode count is fixed at 4096.
+- SFB containers fail on real devices: `internal/sfb` writes buffers that are not 4 KB aligned, so `storage.WriteAt` rejects them and small files fall back to full 1 MB blocks.
 - No rename, symlinks, or hard links.
 
 ## Testing
