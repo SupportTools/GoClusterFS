@@ -714,26 +714,50 @@ func (m *Manager) allocTreeBlocks(ctx context.Context, n int) ([]uint64, error) 
 	return out, nil
 }
 
-// freeBlocks returns blocks to the bitmap. A caller holding an inode lock
-// cannot take the bitmap lock, so those frees wait for the next freeBlocks
-// call made without it.
+// ReleaseBlocks drops one owner from each block and frees the blocks that no
+// owner holds any more, such as a block a write just copied away from.
+func (m *Manager) ReleaseBlocks(ctx context.Context, blocks []uint64) {
+	m.freeBlocks(ctx, blocks)
+}
+
+// freeBlocks drops one owner from each block and returns the blocks no owner
+// holds to the bitmap. A caller holding an inode lock cannot take the refcount
+// or bitmap lock, so those frees wait for the next freeBlocks call made
+// without it.
 func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 	m.deferredMu.Lock()
 	blocks = append(blocks, m.deferred...)
 	m.deferred = nil
 	m.deferredMu.Unlock()
 
+	if m.refs != nil && len(blocks) > 0 {
+		free, err := m.refs.Release(ctx, blocks)
+		switch {
+		case errors.Is(err, lock.ErrDeadlockRisk):
+			m.deferFree(blocks...)
+			return
+		case err != nil:
+			log.Printf("[extent] release %d blocks: %v; leaving them allocated", len(blocks), err)
+			return
+		}
+		blocks = free
+	}
+
 	for _, b := range blocks {
 		err := m.bitmap.Free(ctx, b)
 		switch {
 		case errors.Is(err, lock.ErrDeadlockRisk):
-			m.deferredMu.Lock()
-			m.deferred = append(m.deferred, b)
-			m.deferredMu.Unlock()
+			m.deferFree(b)
 		case err != nil:
 			log.Printf("[extent] free block %d: %v", b, err)
 		}
 	}
+}
+
+func (m *Manager) deferFree(blocks ...uint64) {
+	m.deferredMu.Lock()
+	m.deferred = append(m.deferred, blocks...)
+	m.deferredMu.Unlock()
 }
 
 // DiscardPending drops ino's uncommitted extent-tree change after a failed

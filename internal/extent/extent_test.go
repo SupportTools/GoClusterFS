@@ -1507,3 +1507,61 @@ func listExtents(tb testing.TB, mgr *Manager, ino *inode.Inode) []*Extent {
 	}
 	return extents
 }
+
+func TestFreeKeepsSharedBlocks(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	refs := refcount.NewRegion(env.dev, treeTestInodeOffset+512<<10, treeTestBlocks, nil)
+	env.mgr.SetRefcounts(refs)
+	initial := env.bm.FreeCount()
+
+	src := env.newInode()
+	if _, err := env.mgr.AllocateBlocks(env.ctx, src, 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.mgr.MarkAllShared(src); err != nil {
+		t.Fatal(err)
+	}
+	env.write(src)
+	clone := env.newInode()
+	if err := env.mgr.CopyExtentsForClone(env.ctx, src, clone); err != nil {
+		t.Fatal(err)
+	}
+	env.write(clone)
+	blocks, err := env.mgr.DataBlocks(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := refs.Share(env.ctx, blocks); err != nil {
+		t.Fatal(err)
+	}
+
+	truncate := func(ino *inode.Inode) {
+		t.Helper()
+		if err := env.mgr.Truncate(env.ctx, ino, 0); err != nil {
+			t.Fatal(err)
+		}
+		env.write(ino)
+	}
+	truncate(src)
+	if got := env.bm.FreeCount(); got != initial-2 {
+		t.Fatalf("free blocks after truncating the source = %d, want %d: the clone still maps them", got, initial-2)
+	}
+	truncate(clone)
+	if got := env.bm.FreeCount(); got != initial {
+		t.Fatalf("free blocks after truncating both = %d, want %d", got, initial)
+	}
+
+	// Older versions shared blocks with clones without counting them.
+	legacy := env.newInode()
+	if _, err := env.mgr.AllocateBlocks(env.ctx, legacy, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.mgr.MarkAllShared(legacy); err != nil {
+		t.Fatal(err)
+	}
+	env.write(legacy)
+	truncate(legacy)
+	if got := env.bm.FreeCount(); got != initial-1 {
+		t.Fatalf("free blocks after truncating an uncounted shared block = %d, want %d", got, initial-1)
+	}
+}

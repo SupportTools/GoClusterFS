@@ -86,8 +86,16 @@ type Manager struct {
 	leafCap    int // extents per leaf before it splits
 	indexCap   int // leaves per tree
 
+	refs *refcount.Region // nil when snapshots are disabled
+
 	deferredMu sync.Mutex
 	deferred   []uint64 // frees postponed by lock order
+}
+
+// SetRefcounts makes frees respect block sharing: a block shared by a
+// snapshot or clone goes back to the bitmap only after its last owner frees it.
+func (m *Manager) SetRefcounts(refs *refcount.Region) {
+	m.refs = refs
 }
 
 // NewManager creates a new extent manager. dataOffset is the device offset of
@@ -315,9 +323,8 @@ func (m *Manager) unmap(ctx context.Context, ino *inode.Inode, from, to uint64) 
 
 // release updates block accounting for removed extents and queues their
 // blocks to be freed when the inode write commits: if that write loses a
-// conflict, the inode on disk still maps them. Shared blocks stay allocated for
-// the refcount system, and SFB extents point into containers rather than at
-// bitmap blocks.
+// conflict, the inode on disk still maps them. SFB extents point into
+// containers rather than at bitmap blocks.
 func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Extent) {
 	var blocks []uint64
 	for _, x := range removed {
@@ -325,11 +332,8 @@ func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Exten
 		if x.Flags&FlagUnwritten == 0 {
 			ino.WrittenBlocks -= min(ino.WrittenBlocks, x.Length)
 		}
-		if x.Flags&(FlagShared|FlagSFB) != 0 {
-			continue
-		}
-		for j := uint64(0); j < x.Length; j++ {
-			blocks = append(blocks, x.PhysicalBlock+j)
+		if x.Flags&FlagSFB == 0 {
+			blocks = append(blocks, m.ownedBlocks(ctx, x)...)
 		}
 	}
 	if len(blocks) == 0 {
@@ -341,6 +345,37 @@ func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Exten
 		ino.PendingTree = p
 	}
 	p.release = append(p.release, blocks...)
+}
+
+// ownedBlocks returns the blocks of x that refcounts can account for. A
+// shared block with a count of 0 comes from a clone made by an older version,
+// which shared blocks without counting the owners, so it stays allocated. So
+// do all shared blocks when refcounts are disabled.
+func (m *Manager) ownedBlocks(ctx context.Context, x Extent) []uint64 {
+	blocks := make([]uint64, x.Length)
+	for j := range blocks {
+		blocks[j] = x.PhysicalBlock + uint64(j)
+	}
+	if x.Flags&FlagShared == 0 {
+		return blocks
+	}
+	if m.refs == nil {
+		return nil
+	}
+	counts, err := m.refs.Counts(ctx, blocks)
+	if err != nil {
+		log.Printf("[extent] read refcounts of blocks %d-%d: %v; leaving them allocated", x.PhysicalBlock, x.PhysicalBlock+x.Length-1, err)
+		return nil
+	}
+	owned := blocks[:0]
+	for j, b := range blocks {
+		if counts[j] == 0 {
+			log.Printf("[extent] block %d is shared but uncounted; leaving it allocated", b)
+			continue
+		}
+		owned = append(owned, b)
+	}
+	return owned
 }
 
 // Delete unmaps every block of an inode that is being freed and frees the
@@ -570,6 +605,8 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 		return nil, err
 	}
 	*ext = private
+	// Readers keep cached block mappings until DataGeneration changes.
+	ino.DataGeneration++
 
 	result.NewPhysBlock = newPhysBlock
 	result.WasShared = true
