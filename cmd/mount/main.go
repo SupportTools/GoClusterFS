@@ -123,7 +123,7 @@ func main() {
 		log.Fatalf("Failed to register node: %v", err)
 	}
 	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
-		log.Fatalf("Node registry slot %d now belongs to node %x; stopping so two nodes never share a journal", slot, owner[:8])
+		log.Fatalf("Node registry slot %d is no longer this node's (owner %x); stopping so two nodes never share a journal", slot, owner[:8])
 	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		log.Fatalf("Failed to start node heartbeat: %v", err)
@@ -134,6 +134,11 @@ func main() {
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
+	nodeReg.SetOwnerDeadHandler(func(owner [16]byte) func() { return adoptLocks(lockMgr, owner) })
+	releasePrevious := func() {}
+	if owner, ok := nodeReg.DeadPreviousOwner(); ok {
+		releasePrevious = adoptLocks(lockMgr, owner)
+	}
 
 	// Create managers with distributed locking enabled
 	// NOTE: Managers must be created BEFORE journal recovery so we can replay transactions
@@ -169,6 +174,7 @@ func main() {
 	} else if *skipRecovery {
 		log.Println("Journal: WARNING - skipping recovery (emergency mode)")
 	}
+	releasePrevious()
 
 	// Create journal for write-ahead logging (crash consistency)
 	var j *journal.Journal
@@ -408,4 +414,18 @@ func main() {
 	}
 
 	log.Println("Filesystem unmounted.")
+}
+
+// adoptLocks takes over a dead node's exclusive locks before its journal is
+// replayed and returns the function that frees them after the replay.
+func adoptLocks(locks *lock.Manager, owner [16]byte) func() {
+	adopted, err := locks.AdoptOwner(owner)
+	if err != nil {
+		log.Printf("Warning: Failed to take over the locks of dead node %x: %v", owner[:8], err)
+	}
+	return func() {
+		if err := locks.ReleaseAdopted(adopted); err != nil {
+			log.Printf("Warning: Failed to release the locks taken over from dead node %x: %v", owner[:8], err)
+		}
+	}
 }
