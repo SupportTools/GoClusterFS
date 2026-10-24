@@ -156,3 +156,13 @@ For tests involving concurrent writes from multiple nodes, use the **pre-extensi
 4. Verify data at each offset after writes complete
 
 This avoids TOCTOU races in the distributed locking system.
+
+## Commands Config
+
+| Setting | Value |
+|---------|-------|
+| TaskForge Project ID | 88 |
+| Build command | `make build` |
+| Test command | `go test ./... -v` |
+| Lint command | `gofmt -l .` |
+| Tech stack | Go (FUSE filesystem) |
