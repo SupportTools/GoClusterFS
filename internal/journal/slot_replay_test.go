@@ -159,3 +159,28 @@ func TestRecoverCheckedStopsWhenLeaseIsLost(t *testing.T) {
 		t.Errorf("journal is %v after losing the lease before reset, want Recovering", region.State())
 	}
 }
+
+func TestRecoverCheckedLeavesHeaderAloneAfterLosingLease(t *testing.T) {
+	region, cleanup := journalWithTxns(t, 2)
+	defer cleanup()
+	head := region.HeadOffset()
+
+	checks := 0
+	_, err := RecoverChecked(region, func(*RecoveredTxn) error { return nil }, func() error {
+		checks++
+		if checks == 2 {
+			return errors.New("lease lost")
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("want an error after losing the lease")
+	}
+	onDisk, err := OpenRegionForRecovery(region.dev, region.regionOffset, region.regionSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := onDisk.HeadOffset(); got != head {
+		t.Errorf("head moved to %d after the lease was lost, want it left at %d", got, head)
+	}
+}

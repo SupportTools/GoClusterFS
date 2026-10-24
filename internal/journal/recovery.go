@@ -78,7 +78,12 @@ func RecoverChecked(region *Region, handler RecoveryHandler, check func() error)
 	stats := &RecoveryStats{}
 
 	// Scan and recover
-	advance := func(seq uint64, next uint32) error { return region.Checkpoint(seq, next) }
+	advance := func(seq uint64, next uint32) error {
+		if err := region.Sync(); err != nil {
+			return err
+		}
+		return region.Checkpoint(seq, next)
+	}
 	if err := scanJournal(region, handler, stats, check, advance); err != nil {
 		// Leave the journal Recovering so the next attempt resumes it
 		return stats, fmt.Errorf("recovery failed: %w", err)
@@ -168,7 +173,8 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 // Phase 1: Scan for IntentCompletion records to find completed intents
 // Phase 2: Replay only transactions without matching completion records
 // scanJournal replays committed, uncompleted transactions. check runs before
-// each one; advance, when set, records progress after each one is applied.
+// each one and before recording it; advance, when set, records progress after
+// each one is applied, once its writes are flushed.
 func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 	check func() error, advance func(seq uint64, next uint32) error) error {
 	sb := region.Superblock()
@@ -320,6 +326,11 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 
 			stats.EntriesReplayed += len(recoveredTxn.Entries)
 
+			if check != nil {
+				if err := check(); err != nil {
+					return fmt.Errorf("replay stopped after txn %d: %w", txnHeader.Seq, err)
+				}
+			}
 			if advance != nil {
 				next := pos + ((txnHeader.TotalLength+storage.SectorSize-1)/storage.SectorSize)*storage.SectorSize
 				if next >= dataAreaSize {
