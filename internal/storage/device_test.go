@@ -382,12 +382,12 @@ func TestWriteAtBeforeSkipsWriteAfterShardWait(t *testing.T) {
 	if err := os.WriteFile(testFile, make([]byte, IOShardSize), 0o600); err != nil {
 		t.Skipf("Cannot create test file: %v", err)
 	}
-	defer os.Remove(testFile)
+	defer func() { _ = os.Remove(testFile) }()
 	dev, err := Open(testFile)
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	buf := NewAlignedBuffer(SectorSize)
 	buf.Bytes()[0] = 0xAB
