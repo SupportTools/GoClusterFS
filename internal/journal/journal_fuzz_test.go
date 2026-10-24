@@ -130,6 +130,12 @@ func FuzzJournalScan(f *testing.F) {
 	copy(wrapped[sector(0):], seedTransaction(f, 4, 1))
 	f.Add(sector(6), sector(1), uint32(scanDataArea), uint32(JournalDataOffset), wrapped)
 
+	f.Add(uint32(0), sector(1), uint32(0), uint32(JournalDataOffset), linear)
+	f.Add(uint32(0), uint32(100), sector(1), uint32(JournalDataOffset), linear[sector(1):])
+	hugeTxn := bytes.Clone(linear)
+	binary.LittleEndian.PutUint32(hugeTxn[16:20], 1<<30)
+	f.Add(uint32(0), ^uint32(0)-storage.SectorSize+1, ^uint32(0)-storage.SectorSize+1, uint32(JournalDataOffset), hugeTxn)
+
 	f.Fuzz(func(t *testing.T, head, tail, size, dataOffset uint32, area []byte) {
 		sb := NewJournalSuperblock(fuzzNode, 1, size)
 		sb.State = JournalStateDirty

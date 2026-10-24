@@ -123,6 +123,13 @@ func (r *Region) readSuperblock() error {
 		return err
 	}
 
+	if sb.DataAreaSize == 0 || uint64(sb.DataAreaOffset)+uint64(sb.DataAreaSize) > r.regionSize ||
+		sb.HeadOffset > sb.DataAreaSize || sb.TailOffset > sb.DataAreaSize ||
+		sb.HeadOffset%storage.SectorSize != 0 || sb.TailOffset%storage.SectorSize != 0 {
+		return fmt.Errorf("%w: data area %d+%d, head %d, tail %d in %d-byte region",
+			ErrJournalCorrupt, sb.DataAreaOffset, sb.DataAreaSize, sb.HeadOffset, sb.TailOffset, r.regionSize)
+	}
+
 	r.superblock = sb
 	return nil
 }
