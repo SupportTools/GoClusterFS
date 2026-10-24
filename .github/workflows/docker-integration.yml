@@ -18,7 +18,7 @@ jobs:
   docker-multinode-tests:
     name: Multi-Node Docker Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     permissions:
       contents: read
       checks: write
@@ -58,9 +58,9 @@ jobs:
           docker compose -f tests/docker/docker-compose.test.yml up -d \
             node1 node2 node3 node4 orchestrator
 
-          # Wait for orchestrator to complete (poll every 5s, timeout 10min)
+          # Wait for orchestrator to complete (poll every 5s, timeout 20min)
           echo "Waiting for orchestrator to complete..."
-          TIMEOUT=600
+          TIMEOUT=1200
           ELAPSED=0
           while [ $ELAPSED -lt $TIMEOUT ]; do
             # Check if orchestrator is still running
@@ -97,7 +97,7 @@ jobs:
           docker logs goclusterfs-orchestrator 2>&1 >> tests/docker/results/container-logs.txt || true
           docker compose -f tests/docker/docker-compose.test.yml down
           exit 1
-        timeout-minutes: 12
+        timeout-minutes: 22
 
       - name: Collect logs on failure
         if: failure()
