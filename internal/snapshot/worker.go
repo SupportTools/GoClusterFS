@@ -158,6 +158,9 @@ func (w *Worker) Stop() {
 // QueueCreateJob queues a refcount increment job for snapshot creation.
 // Returns the job ID immediately.
 func (w *Worker) QueueCreateJob(ctx context.Context, snapshotID uint64, inodeNum uint32, blockNums []uint64) (uint64, error) {
+	// The snapshot descriptor already exists, so the job must be queued even if the caller gives up.
+	ctx = context.WithoutCancel(ctx)
+
 	if !w.running.Load() {
 		return 0, fmt.Errorf("worker not running")
 	}
@@ -182,8 +185,6 @@ func (w *Worker) QueueCreateJob(ctx context.Context, snapshotID uint64, inodeNum
 		log.Printf("[snapshot/worker] Queued create job %d for snapshot %d (%d blocks)",
 			jobID, snapshotID, len(blockNums))
 		return jobID, nil
-	case <-ctx.Done():
-		return 0, ctx.Err()
 	default:
 		return 0, fmt.Errorf("job queue full")
 	}
@@ -192,6 +193,9 @@ func (w *Worker) QueueCreateJob(ctx context.Context, snapshotID uint64, inodeNum
 // QueueDeleteJob queues a refcount decrement job for snapshot deletion.
 // Returns the job ID immediately.
 func (w *Worker) QueueDeleteJob(ctx context.Context, snapshotID uint64, blockNums []uint64) (uint64, error) {
+	// The snapshot descriptor already exists, so the job must be queued even if the caller gives up.
+	ctx = context.WithoutCancel(ctx)
+
 	if !w.running.Load() {
 		return 0, fmt.Errorf("worker not running")
 	}
@@ -215,8 +219,6 @@ func (w *Worker) QueueDeleteJob(ctx context.Context, snapshotID uint64, blockNum
 		log.Printf("[snapshot/worker] Queued delete job %d for snapshot %d (%d blocks)",
 			jobID, snapshotID, len(blockNums))
 		return jobID, nil
-	case <-ctx.Done():
-		return 0, ctx.Err()
 	default:
 		return 0, fmt.Errorf("job queue full")
 	}

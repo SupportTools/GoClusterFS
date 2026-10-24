@@ -62,6 +62,34 @@ func setupTestDevice(t *testing.T) (*storage.Device, string, func()) {
 }
 
 // setupTestComponents creates all components needed for worker testing.
+const jobTimeout = 10 * time.Second
+
+// waitForJob polls done until the worker's background job has finished.
+func waitForJob(t *testing.T, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(jobTimeout)
+	for !done() {
+		if time.Now().After(deadline) {
+			t.Fatalf("Background job did not finish within %v", jobTimeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func snapshotActive(reg *Registry, id uint64) func() bool {
+	return func() bool {
+		desc, err := reg.Get(context.Background(), id)
+		return err == nil && desc.State == StateActive
+	}
+}
+
+func snapshotRemoved(reg *Registry, id uint64) func() bool {
+	return func() bool {
+		_, err := reg.Get(context.Background(), id)
+		return err == ErrSnapshotNotFound
+	}
+}
+
 func setupTestComponents(t *testing.T, dev *storage.Device) (*Registry, *refcount.Region, *extent.Manager, *inode.Table) {
 	t.Helper()
 
@@ -160,8 +188,7 @@ func TestWorkerQueueCreateJob(t *testing.T) {
 		t.Error("Job ID should not be 0")
 	}
 
-	// Wait for job to complete
-	time.Sleep(500 * time.Millisecond)
+	waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
 
 	// Verify refcounts were incremented
 	for _, blockNum := range blockNums {
@@ -229,8 +256,7 @@ func TestWorkerQueueDeleteJob(t *testing.T) {
 		t.Error("Job ID should not be 0")
 	}
 
-	// Wait for job to complete
-	time.Sleep(500 * time.Millisecond)
+	waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
 
 	// Verify refcounts were decremented
 	for _, blockNum := range blockNums {
@@ -297,8 +323,7 @@ func TestWorkerEmptyBlockList(t *testing.T) {
 		t.Fatalf("Failed to queue empty create job: %v", err)
 	}
 
-	// Wait for job to complete
-	time.Sleep(300 * time.Millisecond)
+	waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
 
 	// Verify snapshot state changed to Active
 	updatedDesc, err := snapReg.Get(ctx, desc.SnapshotID)
@@ -307,6 +332,42 @@ func TestWorkerEmptyBlockList(t *testing.T) {
 	}
 	if updatedDesc.State != StateActive {
 		t.Errorf("Snapshot state = %v, want StateActive", updatedDesc.State)
+	}
+}
+
+// TestWorkerQueuesJobsWithCanceledContext checks that a canceled FUSE request
+// context cannot drop a job for a snapshot that already exists.
+func TestWorkerQueuesJobsWithCanceledContext(t *testing.T) {
+	dev, _, cleanup := setupTestDevice(t)
+	defer cleanup()
+
+	snapReg, refReg, extMgr, inodeTbl := setupTestComponents(t, dev)
+
+	worker := NewWorker(snapReg, refReg, extMgr, inodeTbl, DefaultWorkerConfig())
+	worker.Start()
+	defer worker.Stop()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := 0; i < 20; i++ {
+		desc, err := snapReg.Create(context.Background(), fmt.Sprintf("snap-%d", i), 100, 0, 0, 0, 1024, FlagReadOnly)
+		if err != nil {
+			t.Fatalf("Failed to create snapshot %d: %v", i, err)
+		}
+
+		if _, err := worker.QueueCreateJob(canceled, desc.SnapshotID, 100, []uint64{}); err != nil {
+			t.Fatalf("QueueCreateJob %d with canceled context: %v", i, err)
+		}
+		waitForJob(t, snapshotActive(snapReg, desc.SnapshotID))
+
+		if err := snapReg.Delete(context.Background(), desc.SnapshotID); err != nil {
+			t.Fatalf("Failed to delete snapshot %d: %v", i, err)
+		}
+		if _, err := worker.QueueDeleteJob(canceled, desc.SnapshotID, []uint64{}); err != nil {
+			t.Fatalf("QueueDeleteJob %d with canceled context: %v", i, err)
+		}
+		waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
 	}
 }
 
@@ -390,8 +451,7 @@ func TestLeafSnapshotDeletion(t *testing.T) {
 		t.Fatalf("Failed to queue delete job: %v", err)
 	}
 
-	// Wait for job to complete
-	time.Sleep(500 * time.Millisecond)
+	waitForJob(t, snapshotRemoved(snapReg, desc.SnapshotID))
 
 	// Verify refcounts are 0 (all decremented)
 	for _, blockNum := range blockNums {
@@ -479,8 +539,7 @@ func TestMiddleSnapshotDeletionMergeUp(t *testing.T) {
 		t.Fatalf("Failed to queue delete job: %v", err)
 	}
 
-	// Wait for job to complete
-	time.Sleep(500 * time.Millisecond)
+	waitForJob(t, snapshotRemoved(snapReg, middleSnap.SnapshotID))
 
 	// Verify leaf snapshot was re-parented to root
 	updatedLeaf, err := snapReg.Get(ctx, leafSnap.SnapshotID)
@@ -689,7 +748,7 @@ func TestMultipleChildrenMergeUp(t *testing.T) {
 		t.Fatalf("Failed to queue delete job: %v", err)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	waitForJob(t, snapshotRemoved(snapReg, middle.SnapshotID))
 
 	// Verify all children now point to root
 	for i, child := range children {
