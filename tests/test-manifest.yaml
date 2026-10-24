@@ -1357,6 +1357,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_test.go::TestOldSnapshotAndCloneNeverFreeSharedBlocks
 
+  - id: snapshot-old-sharing-cow
+    name: Copy-on-write of blocks an older version shared
+    description: Writing a file and one of its clones from an older version copies the uncounted block but never releases it, so the other clone keeps its data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestOldSharingCopiesWithoutReleasing
+
+  - id: snapshot-delete-job-requires-deleting
+    name: Delete job only for deleting snapshots
+    description: A delete job for an active snapshot fails and leaves the snapshot, its data inode and refcounts alone
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestDeleteJobRequiresDeletingState
+
   - id: snapshot-recovery-after-crash
     name: Snapshot cleanup on mount after a crash
     description: A mount removes a snapshot left half created or half deleted, frees its data inode, and the file's blocks drop back to one owner

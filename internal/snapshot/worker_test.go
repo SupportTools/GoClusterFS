@@ -624,3 +624,33 @@ func TestMultipleChildrenMergeUp(t *testing.T) {
 		t.Errorf("Middle snapshot should be removed, got: %v", err)
 	}
 }
+
+// A delete job for a snapshot that is not marked deleting, such as one another
+// node activated after a mount listed it as creating, must leave it alone.
+func TestDeleteJobRequiresDeletingState(t *testing.T) {
+	env := newWorkerEnv(t)
+	env.start()
+	file, blocks := env.file(1)
+	snap := env.snapshot(file, "active", StateActive)
+
+	if _, err := env.w.QueueDeleteJob(env.ctx, snap.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-env.done:
+		if r.Success {
+			t.Fatal("delete job succeeded on an active snapshot")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("delete job did not finish")
+	}
+	if got, err := env.reg.Get(env.ctx, snap.SnapshotID); err != nil || got.State != StateActive {
+		t.Fatalf("snapshot after refused delete: %+v, %v; want active", got, err)
+	}
+	if ino, err := env.tbl.Read(snap.DataInode); err != nil || ino.Magic == 0 {
+		t.Fatalf("data inode %d freed by a refused delete (err=%v)", snap.DataInode, err)
+	}
+	if e, err := env.refs.Get(env.ctx, blocks[0]); err != nil || e.RefCount != 2 {
+		t.Fatalf("block refcount %+v, %v; want 2", e, err)
+	}
+}

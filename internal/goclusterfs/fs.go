@@ -2716,11 +2716,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 	releaseInodeLock()
 
-	if len(cowDone) > 0 {
-		copied := make([]uint64, len(cowDone))
-		for i, cow := range cowDone {
-			copied[i] = cow.OldPhysBlock
+	var copied []uint64
+	for _, cow := range cowDone {
+		if !cow.Uncounted {
+			copied = append(copied, cow.OldPhysBlock)
 		}
+	}
+	if len(copied) > 0 {
 		f.fs.extentMgr.ReleaseBlocks(ctx, copied)
 	}
 

@@ -908,6 +908,13 @@ func TestRegistryActivateRequiresCreating(t *testing.T) {
 	if err := registry.Activate(ctx, fresh.SnapshotID); err != nil {
 		t.Fatalf("Activate of a creating snapshot: %v", err)
 	}
+	// Another node's mount must not roll back a snapshot that became active.
+	if err := registry.Abandon(ctx, fresh.SnapshotID); !errors.Is(err, ErrSnapshotInvalidState) {
+		t.Fatalf("Abandon of an active snapshot: got %v, want ErrSnapshotInvalidState", err)
+	}
+	if got, err := registry.Get(ctx, fresh.SnapshotID); err != nil || got.State != StateActive {
+		t.Fatalf("snapshot after refused Abandon: %+v, %v; want active", got, err)
+	}
 }
 
 // Two nodes, each with its own lock manager on the shared lock region, create

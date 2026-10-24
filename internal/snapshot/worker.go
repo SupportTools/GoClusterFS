@@ -199,6 +199,9 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 	if err != nil {
 		return fmt.Errorf("failed to get snapshot %d: %w", job.SnapshotID, err)
 	}
+	if snap.State != StateDeleting {
+		return fmt.Errorf("snapshot %d is %s, not deleting: %w", job.SnapshotID, snap.State, ErrSnapshotInvalidState)
+	}
 
 	children, err := w.registry.GetChildren(ctx, job.SnapshotID)
 	if err != nil {
@@ -289,8 +292,9 @@ func (w *Worker) resultHandler() {
 }
 
 // RecoverIncompleteJobs deletes snapshots that a crash left creating or
-// deleting. A snapshot still creating never became visible as active, so it
-// is rolled back. Call this on mount, after Start.
+// deleting. A snapshot still creating was never reported as created, so it is
+// rolled back, unless another node activates it first. Call this on mount,
+// after Start.
 func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -304,8 +308,8 @@ func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
 	for _, snap := range snapshots {
 		switch snap.State {
 		case StateCreating:
-			if err := w.registry.Delete(ctx, snap.SnapshotID); err != nil {
-				log.Printf("[snapshot/worker] Failed to roll back snapshot %d: %v", snap.SnapshotID, err)
+			if err := w.registry.Abandon(ctx, snap.SnapshotID); err != nil {
+				log.Printf("[snapshot/worker] Not rolling back snapshot %d: %v", snap.SnapshotID, err)
 				continue
 			}
 		case StateDeleting:

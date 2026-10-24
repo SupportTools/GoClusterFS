@@ -69,6 +69,9 @@ type CoWResult struct {
 	OldPhysBlock uint64 // Original physical block (for refcount decrement)
 	NewPhysBlock uint64 // New physical block after CoW
 	WasShared    bool   // True if CoW was actually performed
+	// Uncounted means an older version shared the old block without counting
+	// its owners, so it must never be released.
+	Uncounted bool
 }
 
 // Extent represents a contiguous range of blocks.
@@ -557,7 +560,10 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 	if err != nil {
 		return nil, err
 	}
-	result := &CoWResult{OldPhysBlock: cur.PhysicalBlock + offset}
+	result := &CoWResult{
+		OldPhysBlock: cur.PhysicalBlock + offset,
+		Uncounted:    cur.Flags&FlagShared != 0 && cur.Flags&FlagCounted == 0,
+	}
 	block := Extent{logicalBlock, result.OldPhysBlock, 1, cur.Flags}
 
 	needsCoW, err := m.NeedsCoW(ctx, &block, refcountReg)

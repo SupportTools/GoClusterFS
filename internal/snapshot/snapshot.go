@@ -468,6 +468,12 @@ func (r *Registry) Activate(ctx context.Context, snapshotID uint64) error {
 	return r.updateState(ctx, snapshotID, StateActive, StateCreating)
 }
 
+// Abandon marks a snapshot that is still being created as deleting. It fails
+// with ErrSnapshotInvalidState if the snapshot became active meanwhile.
+func (r *Registry) Abandon(ctx context.Context, snapshotID uint64) error {
+	return r.updateState(ctx, snapshotID, StateDeleting, StateCreating)
+}
+
 // updateState sets a snapshot's state, requiring it to be in from unless from
 // is StateInvalid.
 func (r *Registry) updateState(ctx context.Context, snapshotID uint64, newState, from State) error {

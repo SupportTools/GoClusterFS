@@ -490,3 +490,56 @@ func TestOldSnapshotAndCloneNeverFreeSharedBlocks(t *testing.T) {
 	}
 	stillAllocated("deleting the source")
 }
+
+// On an older version's image, file F had two snapshots (refcount 2) and then
+// two clones whose owners were never counted. Copying on write must leave the
+// old block to the other clone instead of releasing it.
+func TestOldSharingCopiesWithoutReleasing(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(8, BlockSize)
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, original, 0)
+	fIno, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fIno.InlineExtents[0].Flags |= extent.FlagShared
+	if err := fsys.inodeTbl.Write(ctx, fIno); err != nil {
+		t.Fatal(err)
+	}
+	old := physicalBlock(t, fsys, f.inodeNum, 0)
+	if err := fsys.refcountReg.Set(ctx, old, 2, refcount.FlagNone); err != nil {
+		t.Fatal(err)
+	}
+	var clones []*File
+	for range 2 {
+		c := newRegularFile(t, fsys)
+		cIno, err := fsys.inodeTbl.Read(c.inodeNum)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cIno.InlineExtents, cIno.ExtentCount = fIno.InlineExtents, fIno.ExtentCount
+		cIno.Size, cIno.AllocatedBlocks, cIno.WrittenBlocks = fIno.Size, fIno.AllocatedBlocks, fIno.WrittenBlocks
+		if err := fsys.inodeTbl.Write(ctx, cIno); err != nil {
+			t.Fatal(err)
+		}
+		clones = append(clones, c)
+	}
+
+	writeAt(t, f, pattern(9, 100), 10)
+	writeAt(t, clones[0], pattern(10, 100), 20)
+
+	if ok, err := fsys.bitmapMgr.IsAllocated(old); err != nil || !ok {
+		t.Fatalf("old block %d freed while the second clone maps it (err=%v)", old, err)
+	}
+	if got := refcountOf(t, fsys, old); got != 2 {
+		t.Fatalf("old block refcount %d, want 2: copies of uncounted blocks must not release them", got)
+	}
+	checkFile(t, clones[1], original)
+	checkFile(t, f, overwritten(original, 10, pattern(9, 100)))
+	checkFile(t, clones[0], overwritten(original, 20, pattern(10, 100)))
+}
