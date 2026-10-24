@@ -2217,6 +2217,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	inodeWritten := false
 	defer func() {
 		if !inodeWritten {
+			// Discarding frees tree blocks, which needs the bitmap lock: drop the inode lock first.
+			releaseInodeLock()
 			f.fs.extentMgr.DiscardPending(ctx, ino)
 		}
 	}()

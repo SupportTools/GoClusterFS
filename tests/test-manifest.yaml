@@ -1428,16 +1428,37 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestSharedLockHeldAfterAnotherReaderReleases
 
-  - id: lock-exclusive-joins-same-node-readers
-    name: Exclusive joins same-node readers
-    description: An exclusive request on a node that already reads the record joins that hold instead of waiting for its own readers
+  - id: lock-exclusive-waits-same-node-readers
+    name: Exclusive waits for same-node readers
+    description: An exclusive request does not join a shared hold from the same node; it waits until this node's readers release
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestExclusiveJoinsSameNodeSharedHold
+      go: internal/lock/safety_test.go::TestExclusiveWaitsForSameNodeReaders
+
+  - id: lock-upgrade-same-goroutine
+    name: Shared to exclusive upgrade rejected
+    description: A goroutine holding a shared lock gets ErrDeadlockRisk when it asks for exclusive on the same record
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSameGoroutineCannotUpgradeSharedToExclusive
+
+  - id: lock-two-node-readers-cannot-write
+    name: Readers on two nodes cannot both write
+    description: When two nodes hold a record shared, neither node's exclusive request succeeds
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReadersOnTwoNodesCannotBothWrite
+
+  - id: lock-join-fails-after-takeover
+    name: Join fails after takeover
+    description: A key joining an exclusive hold that another node took over as stale gets ErrLockLost instead of joining
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestJoinFailsAfterRecordTakenOver
 
   - id: lock-busy-record-renewed
     name: Busy record renewed on join
-    description: A key joining a record this node has held past renewAfter rewrites its AcquireTime, so a busy node does not lose the record as stale
+    description: A key joining an exclusive record this node has held past renewAfter rewrites its AcquireTime, so a busy node does not lose the record as stale
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestJoiningKeyRenewsBusyRecord

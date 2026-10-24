@@ -153,22 +153,71 @@ func TestSharedLockHeldAfterAnotherReaderReleases(t *testing.T) {
 	requireAcquired(t, c, LockTypeInode, 5, LockModeExclusive)
 }
 
-func TestExclusiveJoinsSameNodeSharedHold(t *testing.T) {
+func TestExclusiveWaitsForSameNodeReaders(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 
 	requireAcquired(t, a, LockTypeInode, 9, LockModeShared)
-	errc := make(chan error, 1)
-	go func() {
-		err := acquireWithin(a, 50*time.Millisecond, LockTypeInode, 9, LockModeExclusive)
-		if err == nil {
-			err = a.Release(LockTypeInode, 9)
+
+	writer := func() error {
+		errc := make(chan error, 1)
+		go func() {
+			err := acquireWithin(a, 50*time.Millisecond, LockTypeInode, 9, LockModeExclusive)
+			if err == nil {
+				err = a.Release(LockTypeInode, 9)
+			}
+			errc <- err
+		}()
+		return <-errc
+	}
+
+	if err := writer(); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("exclusive Acquire while a reader on the same node holds the lock: got %v, want ErrLockTimeout", err)
+	}
+	if err := a.Release(LockTypeInode, 9); err != nil {
+		t.Fatalf("Release shared: %v", err)
+	}
+	if err := writer(); err != nil {
+		t.Fatalf("exclusive Acquire after readers left: %v", err)
+	}
+}
+
+func TestSameGoroutineCannotUpgradeSharedToExclusive(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+
+	requireAcquired(t, a, LockTypeInode, 9, LockModeShared)
+	err := acquireWithin(a, time.Second, LockTypeInode, 9, LockModeExclusive)
+	if !errors.Is(err, ErrDeadlockRisk) {
+		t.Fatalf("upgrade in the same goroutine: got %v, want ErrDeadlockRisk", err)
+	}
+}
+
+func TestReadersOnTwoNodesCannotBothWrite(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+
+	requireAcquired(t, a, LockTypeInode, 77, LockModeShared)
+	requireAcquired(t, b, LockTypeInode, 77, LockModeShared)
+
+	errs := make(chan error, 2)
+	for _, m := range []*Manager{a, b} {
+		go func(m *Manager) {
+			err := acquireWithin(m, 50*time.Millisecond, LockTypeInode, 77, LockModeExclusive)
+			if err == nil {
+				m.Release(LockTypeInode, 77)
+			}
+			errs <- err
+		}(m)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; !errors.Is(err, ErrLockTimeout) {
+			t.Fatalf("exclusive Acquire while both nodes read: got %v, want ErrLockTimeout", err)
 		}
-		errc <- err
-	}()
-	if err := <-errc; err != nil {
-		t.Fatalf("exclusive Acquire while this node reads the record: %v", err)
 	}
 }
 
@@ -326,4 +375,21 @@ func TestNewReadersDoNotKeepLeakedSharedLockFresh(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	requireAcquired(t, writer, LockTypeInode, 2, LockModeExclusive)
+}
+
+func TestJoinFailsAfterRecordTakenOver(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, RecordSize, 1)
+	b := newTestNode(dev, 0, RecordSize, 2)
+	defer func(d time.Duration) { renewAfter = d }(renewAfter)
+	renewAfter = 0
+
+	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
+	ageRecord(t, a, LockTypeInode, 1, pastStale)
+	requireAcquired(t, b, LockTypeInode, 2, LockModeExclusive)
+
+	if err := acquireWithin(a, time.Second, LockTypeInode, 3, LockModeExclusive); !errors.Is(err, ErrLockLost) {
+		t.Fatalf("joining a record another node took over: got %v, want ErrLockLost", err)
+	}
 }
