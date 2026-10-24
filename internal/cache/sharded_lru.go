@@ -56,6 +56,11 @@ func (s *ShardedLRU[K, V]) Get(key K) (V, bool) {
 	return s.shards[s.shard(key)].Get(key)
 }
 
+// GetIf retrieves a value if valid accepts it; otherwise the entry is removed.
+func (s *ShardedLRU[K, V]) GetIf(key K, valid func(V) bool) (V, bool) {
+	return s.shards[s.shard(key)].GetIf(key, valid)
+}
+
 // Peek retrieves a value without affecting LRU ordering.
 func (s *ShardedLRU[K, V]) Peek(key K) (V, bool) {
 	return s.shards[s.shard(key)].Peek(key)

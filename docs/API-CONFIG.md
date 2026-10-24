@@ -43,7 +43,7 @@ These flags are passed when starting `goclusterfs`:
 | `-cache-strict` | bool | `false` | Enable strict cache mode (always validate against disk) |
 | `-cache-ttl` | duration | `5s` | Cache entry TTL before revalidation required |
 
-The kernel does not cache file attributes or directory entries: the mount sets the FUSE attribute and entry timeouts to 0, so every `stat` and path lookup reaches GoClusterFS. Opening a file reads its inode from disk, so a node sees another node's completed writes when it next opens the file. Reads through a file that is already open use the inode cache and see other nodes' changes within `-cache-ttl`, or sooner when broadcast is enabled.
+The kernel caches file attributes and directory entries for 1s (the FUSE attribute and entry timeouts). For up to 1s after another node changes a file, `stat` and path lookups on this node can return the old size, and a read can stop at the old size even right after `open`. After that, opening a file reads its inode from disk, so the reader sees the other node's completed writes. Reads through a file that is already open use the inode cache and can use the old size and block mappings for up to `-cache-ttl`, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
 
 ### Journal Flags
 

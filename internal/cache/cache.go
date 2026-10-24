@@ -263,7 +263,8 @@ func (m *Manager) BroadcastEnabled() bool {
 }
 
 // BroadcastInvalidateInode invalidates an inode locally AND broadcasts
-// the invalidation to peer nodes. Call this after modifying an inode.
+// the invalidation to peer nodes. Call this after modifying an inode, and
+// cache the new inode after this call, since it drops the local entry.
 //
 // Parameters:
 //   - inodeNum: The inode number being invalidated

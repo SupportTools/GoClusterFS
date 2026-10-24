@@ -64,6 +64,28 @@ func (l *LRU[K, V]) Get(key K) (V, bool) {
 	return zero, false
 }
 
+// GetIf is Get for entries that can go stale: an entry for which valid
+// returns false is removed and counted as a miss.
+func (l *LRU[K, V]) GetIf(key K, valid func(V) bool) (V, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if elem, exists := l.items[key]; exists {
+		entry := elem.Value.(*lruEntry[K, V])
+		if valid(entry.value) {
+			l.order.MoveToFront(elem)
+			l.hits++
+			return entry.value, true
+		}
+		l.order.Remove(elem)
+		delete(l.items, key)
+	}
+
+	var zero V
+	l.misses++
+	return zero, false
+}
+
 // Peek retrieves a value without affecting LRU ordering.
 // Use this for validation checks that shouldn't promote entries.
 func (l *LRU[K, V]) Peek(key K) (V, bool) {

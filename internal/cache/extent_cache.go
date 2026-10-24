@@ -49,16 +49,12 @@ func (m *Manager) GetExtent(ino *inode.Inode, logicalBlock uint64) (physicalBloc
 		LogicalBlock: logicalBlock,
 	}
 
-	cached, ok := m.extents.Get(key)
+	cached, ok := m.extents.GetIf(key, func(c *CachedExtent) bool {
+		return !c.IsStale(ino.DataGeneration, ino.MetaGeneration)
+	})
 	if !ok {
 		return 0, false
 	}
-
-	if cached.IsStale(ino.DataGeneration, ino.MetaGeneration) {
-		m.extents.Delete(key)
-		return 0, false
-	}
-
 	return cached.PhysicalBlock, true
 }
 
