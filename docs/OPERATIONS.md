@@ -173,8 +173,14 @@ rm /mnt/fs/.snapshots/snapshot_name
 ### Node Requirements
 
 - **Clocks:** Nodes judge each other's heartbeats by wall clock. A node more than about 10 seconds ahead treats live peers as failed, replays their journals and takes their registry slots. Run NTP on every node.
-- **Hostnames:** A restarted mount takes back the registry slot of a mount process that exited on the same host, identified by hostname, kernel boot ID and process ID. Containers on one host share the boot ID, so give them distinct hostnames.
+- **Restarts:** A restarted mount takes back the registry slot of a mount that exited on the same host (same hostname and kernel boot ID) and replays its journal before serving. In the same PID namespace it checks the old process ID; across PID namespaces it waits for the old slot's heartbeat to go stale.
 - **Node count:** The device has 64 registry slots, each with its own 4 MB journal. A crashed node's slot frees once another node replays its journal, or when the same host mounts again.
+
+### Known Gaps in Slot Ownership
+
+- Slot claims use a read-compare-write on the device, then re-read the slot after 100 ms. Two nodes can still both keep a slot if one node's write lands more than 100 ms after its read, for example during a storage stall.
+- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed. Another node can replay and reset its journal, or a new mount can take its slot. The paused node exits on its next heartbeat after it resumes, up to 1 second later, and can write to the journal region in that second.
+- A restarted container comes back in a new PID namespace, so its mount cannot prove by PID that the previous incarnation exited. It waits up to about 12 seconds for the old slot's heartbeat to go stale, then replays that journal before serving.
 
 ### Adding a New Node
 

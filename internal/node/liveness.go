@@ -21,14 +21,30 @@ func readBootID() (id [16]byte) {
 	return id
 }
 
+func readPIDNamespace() uint64 {
+	var st syscall.Stat_t
+	if err := syscall.Stat("/proc/self/ns/pid", &st); err != nil {
+		return 0
+	}
+	return st.Ino
+}
+
 func hostnameOf(slot *Slot) string {
 	return string(bytes.TrimRight(slot.Hostname[:], "\x00"))
 }
 
-// deadLocalOwner reports whether slot belongs to a mount process on this host that has exited.
-// Containers on one host share the boot ID, so they must have distinct hostnames.
+// sameHost reports whether slot was registered under this node's hostname and kernel boot.
+func (r *Registry) sameHost(slot *Slot) bool {
+	return r.bootID != ([16]byte{}) && slot.BootID == r.bootID && hostnameOf(slot) == r.hostname
+}
+
+// deadLocalOwner reports whether slot belongs to an exited mount process in
+// this node's PID namespace. PIDs from other namespaces prove nothing.
 func (r *Registry) deadLocalOwner(slot *Slot) bool {
-	if r.bootID == ([16]byte{}) || slot.BootID != r.bootID || slot.PID == 0 || hostnameOf(slot) != r.hostname {
+	if slot.State != NodeStateActive && slot.State != NodeStateLeaving {
+		return false
+	}
+	if !r.sameHost(slot) || r.pidNS == 0 || slot.PIDNamespace != r.pidNS || slot.PID == 0 {
 		return false
 	}
 	if int(slot.PID) == os.Getpid() {

@@ -121,7 +121,7 @@ For clustered deployments:
 1. **Shared Storage**: All nodes must access the same block device (SAN, iSCSI, NVMe-oF)
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
-4. **Limits**: At most 64 nodes mount a device at once. Node clocks must agree within a few seconds (run NTP), and nodes that share a host, such as containers, need distinct hostnames
+4. **Limits**: At most 64 nodes mount a device at once, and node clocks must agree within a few seconds (run NTP)
 5. **Format version**: This release uses on-disk format version 2, which gives each node its own journal. It refuses devices formatted by earlier builds; copy their data off and reformat
 
 Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:

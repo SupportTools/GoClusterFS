@@ -88,3 +88,74 @@ func TestRecoverResumesInterruptedReplay(t *testing.T) {
 		t.Errorf("resumed replay applied %d transactions and left the journal %v, want 1 and clean", replayed, region.State())
 	}
 }
+
+func journalWithTxns(t *testing.T, n int) (*Region, func()) {
+	t.Helper()
+	dev, cleanup := createTestDevice(t, 10<<20)
+	region, err := InitRegion(dev, 0, DefaultJournalSlotSize, [16]byte{1}, 1)
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	if err := region.MarkDirty(); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		txn := NewTransaction(region.NextSeq(), [16]byte{1}, 1)
+		txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(10 + i)})
+		data, _ := txn.Serialize()
+		if _, err := region.WriteAt(data); err != nil {
+			cleanup()
+			t.Fatal(err)
+		}
+	}
+	return region, cleanup
+}
+
+func TestRecoverDoesNotReapplyFinishedTransactions(t *testing.T) {
+	region, cleanup := journalWithTxns(t, 3)
+	defer cleanup()
+
+	var applied []uint64
+	failSecond := func(txn *RecoveredTxn) error {
+		if len(applied) == 1 {
+			return errors.New("replaying node killed")
+		}
+		applied = append(applied, txn.Header.Seq)
+		return nil
+	}
+	if _, err := Recover(region, failSecond); err == nil {
+		t.Fatal("interrupted replay: want an error")
+	}
+	if _, err := Recover(region, func(txn *RecoveredTxn) error {
+		applied = append(applied, txn.Header.Seq)
+		return nil
+	}); err != nil {
+		t.Fatalf("resumed replay: %v", err)
+	}
+	if len(applied) != 3 || applied[0] == applied[1] {
+		t.Errorf("applied transactions %v, want each of the 3 once", applied)
+	}
+}
+
+func TestRecoverCheckedStopsWhenLeaseIsLost(t *testing.T) {
+	region, cleanup := journalWithTxns(t, 2)
+	defer cleanup()
+
+	checks := 0
+	lost := errors.New("lease lost")
+	_, err := RecoverChecked(region, func(*RecoveredTxn) error { return nil }, func() error {
+		checks++
+		if checks > 2 {
+			return lost
+		}
+		return nil
+	})
+	if !errors.Is(err, lost) {
+		t.Fatalf("err = %v, want the lost lease", err)
+	}
+	if region.State() != JournalStateRecovering {
+		t.Errorf("journal is %v after losing the lease before reset, want Recovering", region.State())
+	}
+}

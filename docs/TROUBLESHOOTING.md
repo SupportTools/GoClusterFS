@@ -519,6 +519,8 @@ For low-level FUSE debugging:
 
 ## fsck Guide
 
+**Before `-repair`:** unmount the device on every node, then mount and cleanly unmount it once from one node. fsck does not check for mounted nodes or replay journals: repairing while a node is mounted, or while a crashed node's journal is still dirty, can undo or corrupt that node's changes.
+
 ### fsck Phases Explained
 
 GoClusterFS fsck runs 8 verification phases:

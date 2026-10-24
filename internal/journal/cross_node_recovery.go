@@ -100,8 +100,7 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 		return nil
 	}
 
-	// Perform recovery
-	stats, err := Recover(region, handler)
+	stats, err := RecoverChecked(region, handler, info.CheckLease)
 	if err != nil {
 		return result, fmt.Errorf("journal recovery failed: %w", err)
 	}

@@ -785,7 +785,8 @@ func TestUnregisterKeepsNewOwner(t *testing.T) {
 func writeLocalSlot(t *testing.T, reg *Registry, idx int, pid int, procStart int64) {
 	t.Helper()
 	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{byte(idx + 1)},
-		HeartbeatTime: time.Now().Unix(), BootID: reg.bootID, PID: uint32(pid), ProcStart: procStart}
+		HeartbeatTime: time.Now().Unix(), BootID: reg.bootID, PID: uint32(pid), ProcStart: procStart,
+		PIDNamespace: reg.pidNS}
 	copy(slot.Hostname[:], "node")
 	if err := reg.writeSlot(idx, slot); err != nil {
 		t.Fatal(err)
@@ -904,5 +905,110 @@ func TestHeartbeatReportsLostSlot(t *testing.T) {
 		}
 	case <-time.After(3 * HeartbeatInterval):
 		t.Error("heartbeat did not report the lost slot")
+	}
+}
+
+func writeOtherNamespaceSlot(t *testing.T, reg *Registry, idx int, heartbeat time.Time) *Slot {
+	t.Helper()
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{byte(idx + 1)},
+		HeartbeatTime: heartbeat.Unix(), BootID: reg.bootID, PID: 1, ProcStart: 1,
+		PIDNamespace: reg.pidNS + 1}
+	copy(slot.Hostname[:], "node")
+	if err := reg.writeSlot(idx, slot); err != nil {
+		t.Fatal(err)
+	}
+	return slot
+}
+
+func TestRegisterLeavesLiveSlotOfOtherPIDNamespace(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	sibling := writeOtherNamespaceSlot(t, reg, 0, time.Now())
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(250 * time.Millisecond):
+				sibling.HeartbeatSeq++
+				sibling.HeartbeatTime = time.Now().Unix()
+				reg.writeSlot(0, sibling)
+			}
+		}
+	}()
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot == 0 {
+		t.Error("Register took the live slot of a mount in another PID namespace with the same hostname")
+	}
+}
+
+func TestRegisterTakesOtherPIDNamespaceSlotOnceStale(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	writeOtherNamespaceSlot(t, reg, 2, time.Now().Add(-HeartbeatTimeout+time.Second))
+
+	start := time.Now()
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 2 {
+		t.Errorf("Register took slot %d, want slot 2 of this host's previous container once its heartbeat went stale", slot)
+	}
+	t.Logf("waited %v for the slot to go stale", time.Since(start))
+}
+
+func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	failed := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5},
+		HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
+	if err := reg.writeSlot(4, failed); err != nil {
+		t.Fatal(err)
+	}
+	info, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := info.CheckLease(); err != nil {
+		t.Fatalf("CheckLease right after acquire: %v", err)
+	}
+
+	held, _ := reg.readSlot(4)
+	held.RecoveryStart = time.Now().Add(-recoveryLease / 2).Unix()
+	if err := reg.writeSlot(4, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := info.CheckLease(); err != nil {
+		t.Fatalf("CheckLease halfway through the lease: %v", err)
+	}
+	if renewed, _ := reg.readSlot(4); time.Since(time.Unix(renewed.RecoveryStart, 0)) > 5*time.Second {
+		t.Errorf("lease not renewed: started %v", time.Unix(renewed.RecoveryStart, 0))
+	}
+
+	held.RecoveryOwner = [16]byte{6}
+	if err := reg.writeSlot(4, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := info.CheckLease(); !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("CheckLease after another node took over: err = %v, want ErrLeaseLost", err)
 	}
 }

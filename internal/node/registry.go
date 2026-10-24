@@ -69,8 +69,9 @@ type Slot struct {
 	PID           uint32     // Mount process ID
 	ProcStart     int64      // Mount process start time (Unix ns)
 	RecoveryOwner [16]byte   // Dead slots: node replaying the journal
-	RecoveryStart int64      // Dead slots: when that replay started (Unix s)
-	Reserved      [3912]byte // Padding to 4096 bytes
+	RecoveryStart int64      // Dead slots: when that replay last renewed its lease (Unix s)
+	PIDNamespace  uint64     // Inode of the mount process's PID namespace
+	Reserved      [3904]byte // Padding to 4096 bytes
 	Checksum      uint32     // CRC32C of bytes 0-4091
 }
 
@@ -90,6 +91,7 @@ type Registry struct {
 
 	hostname   string
 	bootID     [16]byte
+	pidNS      uint64
 	onSlotLost func(slot int, owner [16]byte)
 
 	// Cross-node recovery
@@ -105,6 +107,7 @@ var (
 	ErrNotRegistered      = errors.New("node is not registered")
 	ErrInvalidSlot        = errors.New("invalid slot data")
 	ErrRecoveryInProgress = errors.New("recovery already in progress for this node")
+	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 )
 
 // FailedNodeInfo contains information about a failed node for recovery.
@@ -115,6 +118,11 @@ type FailedNodeInfo struct {
 	JournalSize   uint64
 	LastHeartbeat time.Time
 	Hostname      string
+
+	// CheckLease fails once this node no longer holds the slot's recovery
+	// lease, and renews the lease while it does. Replay calls it before each
+	// transaction and before resetting the journal.
+	CheckLease func() error
 }
 
 // RecoveryHandler is called when a failed node is detected.
@@ -135,6 +143,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
 		bootID:               readBootID(),
+		pidNS:                readPIDNamespace(),
 	}
 
 	// Generate a unique UUID for this node
@@ -183,9 +192,11 @@ func (r *Registry) journalRegion(slotIdx int) (offset, size uint64) {
 }
 
 // Register claims a slot in the node registry and returns its index.
-// It first takes back a slot left by a mount process on this host that has
-// exited, so the caller replays that journal before serving. Otherwise it
-// takes an empty slot or one whose node has failed.
+// It first takes back a failed slot of this host, most likely this node's
+// previous incarnation, so the caller replays that journal before serving.
+// Slots of this host in another PID namespace (a restarted container, or a
+// host-network container) cannot be checked by PID; Register waits for each
+// to heartbeat or go stale. Otherwise it takes an empty or failed slot.
 func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -198,27 +209,82 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	copy(name[:], hostname)
 	r.hostname = string(bytes.TrimRight(name[:], "\x00"))
 
-	for _, claimable := range []func(*Slot) bool{
-		r.deadLocalOwner,
-		func(slot *Slot) bool { return slot.State == NodeStateEmpty || r.failed(slot, HeartbeatTimeout) },
-	} {
-		for i := 0; i < MaxNodes; i++ {
-			raw, slot, err := r.readSlotRaw(i)
-			if err != nil || !claimable(slot) {
+	ownFailed := func(slot *Slot) bool {
+		return r.sameHost(slot) && (r.deadLocalOwner(slot) || r.failed(slot, HeartbeatTimeout))
+	}
+	if i, err := r.claimFirst(allSlots(), ownFailed); i >= 0 || err != nil {
+		return i, err
+	}
+	if i, err := r.claimFirst(r.awaitOtherNamespaceSlots(), ownFailed); i >= 0 || err != nil {
+		return i, err
+	}
+	i, err := r.claimFirst(allSlots(), func(slot *Slot) bool {
+		return slot.State == NodeStateEmpty || r.failed(slot, HeartbeatTimeout)
+	})
+	if i < 0 && err == nil {
+		err = ErrNoFreeSlots
+	}
+	return i, err
+}
+
+func allSlots() []int {
+	slots := make([]int, MaxNodes)
+	for i := range slots {
+		slots[i] = i
+	}
+	return slots
+}
+
+// claimFirst claims the first of slots that claimable accepts. It returns -1 if none could be claimed.
+func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, error) {
+	for _, i := range slots {
+		raw, slot, err := r.readSlotRaw(i)
+		if err != nil || !claimable(slot) {
+			continue
+		}
+		if err := r.claimSlot(i, raw); err != nil {
+			if errors.Is(err, ErrSlotTaken) {
 				continue
 			}
-			if err := r.claimSlot(i, raw); err != nil {
-				if errors.Is(err, ErrSlotTaken) {
-					continue
-				}
-				return -1, err
-			}
-			r.localSlot = i
-			return i, nil
+			return -1, err
+		}
+		r.localSlot = i
+		return i, nil
+	}
+	return -1, nil
+}
+
+// awaitOtherNamespaceSlots watches the live-looking slots of this host in
+// another PID namespace until each heartbeats or goes stale, and returns the stale ones.
+func (r *Registry) awaitOtherNamespaceSlots() []int {
+	type beat struct {
+		seq  uint64
+		time int64
+	}
+	watch := map[int]beat{}
+	for i := 0; i < MaxNodes; i++ {
+		_, slot, err := r.readSlotRaw(i)
+		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !r.failed(slot, HeartbeatTimeout) {
+			watch[i] = beat{slot.HeartbeatSeq, slot.HeartbeatTime}
 		}
 	}
 
-	return -1, ErrNoFreeSlots
+	var stale []int
+	deadline := time.Now().Add(HeartbeatTimeout + 2*HeartbeatInterval)
+	for len(watch) > 0 && time.Now().Before(deadline) {
+		time.Sleep(HeartbeatInterval / 4)
+		for i, last := range watch {
+			_, slot, err := r.readSlotRaw(i)
+			switch {
+			case err != nil || beat{slot.HeartbeatSeq, slot.HeartbeatTime} != last:
+				delete(watch, i)
+			case r.failed(slot, HeartbeatTimeout):
+				stale = append(stale, i)
+				delete(watch, i)
+			}
+		}
+	}
+	return stale
 }
 
 // Unregister gracefully releases the node's slot.
@@ -347,6 +413,7 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		BootID:        r.bootID,
 		PID:           uint32(os.Getpid()),
 		ProcStart:     processStart,
+		PIDNamespace:  r.pidNS,
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
@@ -506,6 +573,7 @@ func serializeSlot(slot *Slot) []byte {
 	binary.LittleEndian.PutUint64(buf[148:156], uint64(slot.ProcStart))
 	copy(buf[156:172], slot.RecoveryOwner[:])
 	binary.LittleEndian.PutUint64(buf[172:180], uint64(slot.RecoveryStart))
+	binary.LittleEndian.PutUint64(buf[180:188], slot.PIDNamespace)
 
 	// Compute checksum
 	checksum := storage.CRC32C(buf[:SlotSize-4])
@@ -538,6 +606,7 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 		PID:           binary.LittleEndian.Uint32(buf[144:148]),
 		ProcStart:     int64(binary.LittleEndian.Uint64(buf[148:156])),
 		RecoveryStart: int64(binary.LittleEndian.Uint64(buf[172:180])),
+		PIDNamespace:  binary.LittleEndian.Uint64(buf[180:188]),
 		Checksum:      stored,
 	}
 	copy(slot.UUID[:], buf[8:24])
@@ -664,6 +733,10 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 	if success, err := r.casSlot(slotIdx, raw, serializeSlot(slot)); err != nil || !success {
 		return nil, ErrSlotTaken
 	}
+	time.Sleep(claimSettle)
+	if current, err := r.readSlot(slotIdx); err != nil || current.RecoveryOwner != r.localUUID {
+		return nil, ErrSlotTaken
+	}
 
 	return &FailedNodeInfo{
 		SlotIndex:     slotIdx,
@@ -672,7 +745,33 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		JournalSize:   slot.JournalSize,
 		LastHeartbeat: time.Unix(slot.HeartbeatTime, 0),
 		Hostname:      hostnameOf(slot),
+		CheckLease:    r.leaseCheck(slotIdx, slot.UUID),
 	}, nil
+}
+
+// leaseCheck returns a check that fails once this node no longer holds the
+// recovery lease of the slot, and renews the lease after a quarter of its term.
+func (r *Registry) leaseCheck(slotIdx int, uuid [16]byte) func() error {
+	return func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		raw, slot, err := r.readSlotRaw(slotIdx)
+		if err != nil {
+			return err
+		}
+		if slot.State != NodeStateDead || slot.UUID != uuid || slot.RecoveryOwner != r.localUUID {
+			return ErrLeaseLost
+		}
+		if time.Since(time.Unix(slot.RecoveryStart, 0)) < recoveryLease/4 {
+			return nil
+		}
+		slot.RecoveryStart = time.Now().Unix()
+		if success, err := r.casSlot(slotIdx, raw, serializeSlot(slot)); err != nil || !success {
+			return ErrLeaseLost
+		}
+		return nil
+	}
 }
 
 // clearFailedSlot empties a slot after this node replayed its journal, unless
