@@ -825,6 +825,7 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		if errors.Is(err, extent.ErrTreeConflict) {
 			return errRetryAdd
 		}
+		blockUsed = true // the inode on disk may already map physBlock
 		return fmt.Errorf("failed to write directory inode: %w", err)
 	}
 

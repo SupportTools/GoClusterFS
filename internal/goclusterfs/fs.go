@@ -2854,7 +2854,10 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	ino.Mtime = time.Now().UnixNano()
 
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
-		_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+		// Only a conflict proves the inode on disk does not map newBlock.
+		if errors.Is(err, extent.ErrTreeConflict) {
+			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+		}
 		return retryOnTreeConflict(err)
 	}
 
@@ -3197,6 +3200,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 		if errors.Is(err, extent.ErrTreeConflict) {
 			return 0, err
 		}
+		committed = true // the inode on disk may already map newBlocks
 		return syscall.EIO, nil
 	}
 	committed = true
