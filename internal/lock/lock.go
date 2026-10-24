@@ -239,13 +239,14 @@ type heldLock struct {
 }
 
 type heldRecord struct {
-	mode LockMode
-	keys int
+	mode    LockMode
+	keys    int
+	renewed time.Time
 }
 
-func covers(held, want LockMode) bool {
-	return held == LockModeExclusive || held == want
-}
+// renewAfter is the hold age after which a key joining the record rewrites
+// AcquireTime, so a record kept busy by overlapping keys never looks stale.
+var renewAfter = StaleThreshold / 3
 
 // Errors
 var (
@@ -330,7 +331,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 	gid := getGoroutineID()
 
 	m.mu.Lock()
-	if m.reuseHeldKeyLocked(key, mode, gid) {
+	if m.reuseHeldKeyLocked(key, gid) {
 		m.mu.Unlock()
 		return nil
 	}
@@ -395,24 +396,28 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 
 // attemptAcquire makes one acquisition attempt. added reports whether this
 // call registered the key rather than joining another goroutine's hold.
+//
+// A key whose record this node already holds joins that hold in any mode. Exclusive
+// requests never wait for this node's readers, who may need a mutex the writer holds;
+// meanwhile the record on disk stays shared, so other nodes can read but not write.
 func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gid uint64) (held, added bool, err error) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
 
 	m.mu.Lock()
-	if m.reuseHeldKeyLocked(key, mode, gid) {
-		m.mu.Unlock()
-		return true, false, nil
-	}
 	if rec, ok := m.records[recordID]; ok {
-		if !covers(rec.mode, mode) {
-			selfDeadlock := m.goroutineHoldsRecordLocked(recordID, gid)
+		renew := time.Since(rec.renewed) > renewAfter
+		m.mu.Unlock()
+		if renew {
+			m.renewRecord(recordID, rec)
+		}
+		m.mu.Lock()
+		if held, ok := m.heldLocks[key]; ok {
+			held.refCount++
+			held.goroutines[gid]++
 			m.mu.Unlock()
-			if selfDeadlock {
-				return false, false, fmt.Errorf("%w: cannot upgrade a shared lock to exclusive", ErrDeadlockRisk)
-			}
-			return false, false, nil
+			return true, false, nil
 		}
 		rec.keys++
 		m.addHeldKeyLocked(key, recordID, mode, gid)
@@ -427,15 +432,15 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	}
 
 	m.mu.Lock()
-	m.records[recordID] = &heldRecord{mode: mode, keys: 1}
+	m.records[recordID] = &heldRecord{mode: mode, keys: 1, renewed: time.Now()}
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
 	return true, true, nil
 }
 
-func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) bool {
+func (m *Manager) reuseHeldKeyLocked(key lockKey, gid uint64) bool {
 	held, ok := m.heldLocks[key]
-	if !ok || !covers(m.records[held.RecordID].mode, mode) {
+	if !ok || time.Since(m.records[held.RecordID].renewed) > renewAfter {
 		return false
 	}
 	held.refCount++
@@ -450,15 +455,6 @@ func (m *Manager) addHeldKeyLocked(key lockKey, recordID uint64, mode LockMode, 
 		refCount:   1,
 		goroutines: map[uint64]int{gid: 1},
 	}
-}
-
-func (m *Manager) goroutineHoldsRecordLocked(recordID uint64, gid uint64) bool {
-	for _, held := range m.heldLocks {
-		if held.RecordID == recordID && held.goroutines[gid] > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *Manager) recordGate(recordID uint64) *sync.Mutex {
@@ -661,6 +657,37 @@ func (m *Manager) tryAcquireOptimistic(recordID uint64, lockType LockType, resou
 	}
 
 	return acquired, newSeq, nil
+}
+
+// renewRecord rewrites AcquireTime on a record this node holds. It runs under
+// the record gate.
+func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) {
+	for {
+		record, err := m.readRecord(recordID)
+		if err != nil {
+			log.Printf("[WARN] lock: renewing record %d: %v", recordID, err)
+			return
+		}
+		ours := record.Mode == rec.mode && (rec.mode == LockModeShared || record.OwnerUUID == m.nodeUUID)
+		if !ours {
+			log.Printf("[WARN] lock: record %d was taken over while this node held it", recordID)
+			return
+		}
+		renewed := *record
+		renewed.AcquireTime = time.Now().Unix()
+		renewed.Sequence++
+		ok, err := m.casRecord(recordID, record, &renewed)
+		if err != nil {
+			log.Printf("[WARN] lock: renewing record %d: %v", recordID, err)
+			return
+		}
+		if ok {
+			m.mu.Lock()
+			rec.renewed = time.Now()
+			m.mu.Unlock()
+			return
+		}
+	}
 }
 
 // releaseRecord releases this node's hold on a lock record.

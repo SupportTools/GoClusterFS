@@ -153,46 +153,41 @@ func TestSharedLockHeldAfterAnotherReaderReleases(t *testing.T) {
 	requireAcquired(t, c, LockTypeInode, 5, LockModeExclusive)
 }
 
-func TestExclusiveWaitsForSameNodeReaders(t *testing.T) {
+func TestExclusiveJoinsSameNodeSharedHold(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 
 	requireAcquired(t, a, LockTypeInode, 9, LockModeShared)
-
-	writer := func() error {
-		errc := make(chan error, 1)
-		go func() {
-			err := acquireWithin(a, 50*time.Millisecond, LockTypeInode, 9, LockModeExclusive)
-			if err == nil {
-				err = a.Release(LockTypeInode, 9)
-			}
-			errc <- err
-		}()
-		return <-errc
-	}
-
-	if err := writer(); !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("exclusive Acquire while a reader on the same node holds the lock: got %v, want ErrLockTimeout", err)
-	}
-	if err := a.Release(LockTypeInode, 9); err != nil {
-		t.Fatalf("Release shared: %v", err)
-	}
-	if err := writer(); err != nil {
-		t.Fatalf("exclusive Acquire after readers left: %v", err)
+	errc := make(chan error, 1)
+	go func() {
+		err := acquireWithin(a, 50*time.Millisecond, LockTypeInode, 9, LockModeExclusive)
+		if err == nil {
+			err = a.Release(LockTypeInode, 9)
+		}
+		errc <- err
+	}()
+	if err := <-errc; err != nil {
+		t.Fatalf("exclusive Acquire while this node reads the record: %v", err)
 	}
 }
 
-func TestSameGoroutineCannotUpgradeSharedToExclusive(t *testing.T) {
+func TestJoiningKeyRenewsBusyRecord(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
+	a := newTestNode(dev, 0, RecordSize, 1)
+	b := newTestNode(dev, 0, RecordSize, 2)
+	defer func(d time.Duration) { renewAfter = d }(renewAfter)
+	renewAfter = 0
 
-	requireAcquired(t, a, LockTypeInode, 9, LockModeShared)
-	err := acquireWithin(a, time.Second, LockTypeInode, 9, LockModeExclusive)
-	if !errors.Is(err, ErrDeadlockRisk) {
-		t.Fatalf("upgrade in the same goroutine: got %v, want ErrDeadlockRisk", err)
+	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
+	ageRecord(t, a, LockTypeInode, 1, pastStale)
+	requireAcquired(t, a, LockTypeInode, 2, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 1); err != nil {
+		t.Fatalf("Release: %v", err)
 	}
+
+	requireBlocked(t, b, LockTypeInode, 3, LockModeExclusive)
 }
 
 func TestStaleLockIsReclaimedFromPausedHolder(t *testing.T) {
