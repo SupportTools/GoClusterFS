@@ -837,6 +837,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: fsck-release-dead-slot
+    name: fsck releases a dead node's slot
+    description: -release-slot exits 8 while the node is mounted; after the node dies with a damaged journal header, -list-slots shows the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
+    environments:
+      go: fsck_test.go::TestFsckReleasesDeadSlot
+      docker: TODO
+      vm: TODO
+
   - id: fsck-runtime-image-unit
     name: fsck accepts everything the runtime writes
     description: Snapshots, clones, snapshot clones, copies on write in inline and tree files, deletes and unlinks leave no fsck problem
@@ -871,6 +881,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
+
+  - id: fsck-release-slot
+    name: fsck slot release checks
+    description: Release refuses while any node runs or the slot's heartbeat or recovery lease is recent; an expired slot with a damaged journal is released, its journal reads as never initialized, and a new node registers in it
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: fsck-release-slot-refusals
+    name: fsck slot release refusals
+    description: Release refuses a slot number the registry lacks (ErrNoSuchSlot), a journal a mount can replay unless forced, an unreadable slot, and a superblock mount would reject
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotRefusals
+
+  - id: fsck-release-slot-lease
+    name: fsck slot release holds the recovery lease
+    description: A node that takes the slot before fsck's lease stops the release with the journal untouched; a node mounting during the lease takes another slot; a slot written during the lease is reported as reset but not free
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotLease
+
+  - id: fsck-release-slot-crash
+    name: fsck slot release survives a crash
+    description: After fsck crashes holding the lease, before or after the journal reset, mounts and peers skip the slot until the lease lapses; then a peer fails on the untouched damaged journal, or frees the slot after replaying the reset one
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotCrash
+
+  - id: release-slot-slow-reset
+    name: Slot release gives up on a slow journal reset
+    description: When the journal reset outlasts half the recovery lease, ReleaseSlot leaves the slot dead under its lease instead of freeing it
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotGivesUpOnSlowReset
 
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust

@@ -3,18 +3,22 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -248,5 +252,71 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 	}
 	if out := expectFsck(t, 0, "Status: CLEAN", mfs.ImagePath); len(problemLines(out)) > 0 {
 		t.Fatalf("problems after using the repaired image:\n%s", out)
+	}
+}
+
+// TestFsckReleasesDeadSlot frees the slot of a node that will not return and
+// whose journal header is damaged, so a mount can use the slot again.
+func TestFsckReleasesDeadSlot(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 1, 50)
+	mfs := cluster.Node(0)
+	formatted := &syncBuffer{}
+	mfs.Log = formatted
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start: %v", err)
+	}
+	slot := mustMatch(t, slotRe, formatted, "registration")
+	offset := mustMatch(t, journalInitRe, formatted, "journal init")
+	image := cluster.ImagePath
+
+	expectFsck(t, 8, "mounted by node "+slot, "-release-slot", slot, image)
+
+	if err := cluster.KillNode(0); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	backdateHeartbeat(t, image, slot, time.Hour)
+	damageJournalHeader(t, image, offset)
+
+	expectFsck(t, 0, "damaged: journal superblock checksum mismatch", "-list-slots", image)
+	expectFsck(t, 16, "-discard-journal needs -release-slot", "-discard-journal", image)
+	expectFsck(t, 16, "no such node registry slot", "-release-slot", "64", image)
+	expectFsck(t, 0, "Nothing was written", "-release-slot", slot, image)
+	expectFsck(t, 1, "Released slot "+slot, "-release-slot", slot, "-discard-journal", image)
+
+	restarted := &syncBuffer{}
+	mfs.Log = restarted
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount after releasing the slot: %v", err)
+	}
+	if got := mustMatch(t, journalInitRe, restarted, "journal init"); got != offset {
+		t.Errorf("mount started its journal at offset %s, want the released slot's offset %s", got, offset)
+	}
+}
+
+func backdateHeartbeat(t *testing.T, imagePath, slot string, by time.Duration) {
+	t.Helper()
+	dev, err := storage.Open(imagePath)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatalf("read superblock: %v", err)
+	}
+	i, err := strconv.Atoi(slot)
+	if err != nil {
+		t.Fatalf("parse slot %q: %v", slot, err)
+	}
+
+	off := int64(sb.NodeRegistryOffset) + int64(i)*node.SlotSize
+	buf := storage.NewAlignedBuffer(node.SlotSize).Bytes()
+	if _, err := dev.ReadAt(buf, off); err != nil {
+		t.Fatalf("read slot %d: %v", i, err)
+	}
+	binary.LittleEndian.PutUint64(buf[32:40], uint64(time.Now().Add(-by).Unix()))
+	binary.LittleEndian.PutUint32(buf[node.SlotSize-4:], storage.CRC32C(buf[:node.SlotSize-4]))
+	if _, err := dev.WriteAt(buf, off); err != nil {
+		t.Fatalf("write slot %d: %v", i, err)
 	}
 }
