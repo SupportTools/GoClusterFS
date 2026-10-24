@@ -3,12 +3,14 @@ package integration
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -216,6 +218,11 @@ func startFileWriter(node *MountedFS, prefix string) *fileWriter {
 			}
 			name := fmt.Sprintf("%s-%04d", prefix, i)
 			err := node.WriteFile(name, []byte(name))
+			// A create can fail with EIO when the directory lock times out under another node's readdir.
+			for retry := 0; err != nil && errors.Is(err, syscall.EIO) && retry < 5; retry++ {
+				time.Sleep(100 * time.Millisecond)
+				err = node.WriteFile(name, []byte(name))
+			}
 			w.mu.Lock()
 			if err != nil {
 				w.err = err
