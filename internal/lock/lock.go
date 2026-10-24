@@ -64,9 +64,9 @@ const (
 	// RetryBaseDelay is the initial retry delay.
 	RetryBaseDelay = 10 * time.Millisecond
 
-	// RetryMaxDelay is the maximum retry delay. It is short so a waiter notices
-	// soon after another node lets a cached hold go.
-	RetryMaxDelay = 100 * time.Millisecond
+	// RetryMaxDelay is the maximum retry delay. It is short so a waiter polls at
+	// least once while another node yields a record.
+	RetryMaxDelay = 25 * time.Millisecond
 
 	// ClaimSettleDelay is how long a node waits after writing a claim before it
 	// re-reads the record to check the claim survived. Taking a lock is a read
@@ -76,7 +76,12 @@ const (
 
 	// CacheGrace is how long a node keeps a record after its last local holder
 	// releases it, so the next local acquire needs no disk I/O and no settle wait.
+	// A record held from disk for longer than this is released and yielded instead.
 	CacheGrace = 250 * time.Millisecond
+
+	// YieldGap is how long a node waits before claiming a record it yielded, so
+	// another node polling for it gets a turn.
+	YieldGap = 2 * RetryMaxDelay
 
 	// StaleThreshold is how old a lock must be to consider it stale.
 	StaleThreshold = 15 * time.Second
@@ -221,6 +226,8 @@ type Manager struct {
 	records map[uint64]*heldRecord
 	// gates serialize this node's on-disk operations per record.
 	gates map[uint64]*sync.Mutex
+	// yieldUntil holds records this node gave up and will not claim again before then.
+	yieldUntil map[uint64]time.Time
 
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
@@ -252,6 +259,7 @@ type heldLock struct {
 type heldRecord struct {
 	mode    LockMode
 	keys    int
+	since   time.Time // when this node took the record from disk
 	renewed time.Time
 	lost    bool
 	// cacheGen identifies the current cached period; keys == 0 means cached.
@@ -269,6 +277,7 @@ var renewAfter = StaleThreshold / 3
 var (
 	claimSettleDelay = ClaimSettleDelay
 	cacheGrace       = CacheGrace
+	yieldGap         = YieldGap
 )
 
 // holdAge is the time since a hold was last written to disk. It takes the larger
@@ -290,15 +299,16 @@ var (
 // NewManager creates a new lock manager.
 func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nodeSlot int) *Manager {
 	return &Manager{
-		dev:       dev,
-		offset:    offset,
-		size:      size,
-		nodeUUID:  nodeUUID,
-		nodeSlot:  nodeSlot,
-		heldLocks: make(map[lockKey]*heldLock),
-		records:   make(map[uint64]*heldRecord),
-		gates:     make(map[uint64]*sync.Mutex),
-		hintCache: newHintLRU(HintCacheSize),
+		dev:        dev,
+		offset:     offset,
+		size:       size,
+		nodeUUID:   nodeUUID,
+		nodeSlot:   nodeSlot,
+		heldLocks:  make(map[lockKey]*heldLock),
+		records:    make(map[uint64]*heldRecord),
+		gates:      make(map[uint64]*sync.Mutex),
+		yieldUntil: make(map[uint64]time.Time),
+		hintCache:  newHintLRU(HintCacheSize),
 	}
 }
 
@@ -306,15 +316,16 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 // Use this for testing or when you need to tune the cache size.
 func NewManagerWithHintCacheSize(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nodeSlot int, hintCacheSize int) *Manager {
 	return &Manager{
-		dev:       dev,
-		offset:    offset,
-		size:      size,
-		nodeUUID:  nodeUUID,
-		nodeSlot:  nodeSlot,
-		heldLocks: make(map[lockKey]*heldLock),
-		records:   make(map[uint64]*heldRecord),
-		gates:     make(map[uint64]*sync.Mutex),
-		hintCache: newHintLRU(hintCacheSize),
+		dev:        dev,
+		offset:     offset,
+		size:       size,
+		nodeUUID:   nodeUUID,
+		nodeSlot:   nodeSlot,
+		heldLocks:  make(map[lockKey]*heldLock),
+		records:    make(map[uint64]*heldRecord),
+		gates:      make(map[uint64]*sync.Mutex),
+		yieldUntil: make(map[uint64]time.Time),
+		hintCache:  newHintLRU(hintCacheSize),
 	}
 }
 
@@ -475,6 +486,13 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 		m.mu.Unlock()
 		return true, true, nil
 	}
+	if until, ok := m.yieldUntil[recordID]; ok {
+		if time.Now().Before(until) {
+			m.mu.Unlock()
+			return false, false, nil
+		}
+		delete(m.yieldUntil, recordID)
+	}
 	m.mu.Unlock()
 
 	acquired, err := m.tryAcquire(recordID, key.Type, key.ResourceID, mode)
@@ -483,7 +501,8 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	}
 
 	m.mu.Lock()
-	m.records[recordID] = &heldRecord{mode: mode, keys: 1, renewed: time.Now()}
+	now := time.Now()
+	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: now, renewed: now}
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
 	return true, true, nil
@@ -585,6 +604,13 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 	if rec.keys > 0 {
 		m.mu.Unlock()
 		return nil
+	}
+	if holdAge(rec.since) > cacheGrace {
+		// Held long enough: give other nodes a turn instead of keeping it.
+		delete(m.records, recordID)
+		m.yieldUntil[recordID] = time.Now().Add(yieldGap)
+		m.mu.Unlock()
+		return m.releaseRecord(recordID, rec.mode)
 	}
 	rec.cacheGen++
 	gen := rec.cacheGen

@@ -554,3 +554,36 @@ func TestRestartedNodeTakesLocksOfItsSlotsPreviousOwner(t *testing.T) {
 		t.Fatalf("node that took over slot 3 could not take its crashed predecessor's lock: %v", err)
 	}
 }
+
+// A node that keeps using a record must still let it go soon enough for another
+// node that wants it.
+func TestBusyNodeYieldsCachedRecord(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	busy := newTestNode(dev, 0, 1<<20, 1)
+	other := newTestNode(dev, 0, 1<<20, 2)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := acquireWithin(busy, time.Second, LockTypeInode, 12, LockModeExclusive); err == nil {
+				time.Sleep(time.Millisecond)
+				busy.Release(LockTypeInode, 12)
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := acquireWithin(other, 2*time.Second, LockTypeInode, 12, LockModeExclusive); err != nil {
+		t.Fatalf("other node never got a record a busy node keeps reusing: %v", err)
+	}
+	other.Release(LockTypeInode, 12)
+}

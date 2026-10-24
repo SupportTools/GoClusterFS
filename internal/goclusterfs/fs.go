@@ -2281,6 +2281,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		// Only a block that was already allocated, written and unshared can skip the extent lock.
 		plainBlock := err == nil && ext.Flags&(extent.FlagUnwritten|extent.FlagShared) == 0
+		// A block allocated by this write stays invisible to other nodes until the inode,
+		// whose lock this write holds, is committed, so nobody else can write it meanwhile.
+		newBlock := false
 		if err != nil {
 			// Need to allocate - must acquire lock first
 			if !lockHeld && f.fs.lockMgr != nil {
@@ -2329,6 +2332,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				ino = freshIno
 				inoDirty = true
 				ext = newExt
+				newBlock = true
 			} else {
 				// Allocate block (acquires bitmap lock internally, then releases it)
 				ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
@@ -2503,7 +2507,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// Whole sectors of a plain block are written without reading them, so they need no lock.
 		wholeSectors := blockOffset%storage.SectorSize == 0 && toWrite%storage.SectorSize == 0
 		extentLockHeld := false
-		if f.fs.lockMgr != nil && !(plainBlock && wholeSectors) {
+		if f.fs.lockMgr != nil && !newBlock && !(plainBlock && wholeSectors) {
 			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
 				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
