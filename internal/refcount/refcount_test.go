@@ -26,21 +26,23 @@ func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		tb.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		tb.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -635,13 +637,19 @@ func TestScan(t *testing.T) {
 	// - Rest: refcount 0 (free)
 
 	for i := uint64(0); i < 10; i++ {
-		region.Set(ctx, i, 1, FlagNone)
+		if err := region.Set(ctx, i, 1, FlagNone); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for i := uint64(10); i < 15; i++ {
-		region.Set(ctx, i, 2, FlagNone)
+		if err := region.Set(ctx, i, 2, FlagNone); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for i := uint64(15); i < 20; i++ {
-		region.Set(ctx, i, 5, FlagSnapshot)
+		if err := region.Set(ctx, i, 5, FlagSnapshot); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	stats, err := region.Scan(ctx)
@@ -678,8 +686,12 @@ func TestInitialize(t *testing.T) {
 	ctx := context.Background()
 
 	// First set some values
-	region.Set(ctx, 0, 10, FlagSnapshot)
-	region.Set(ctx, 500, 5, FlagCowPending)
+	if err := region.Set(ctx, 0, 10, FlagSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := region.Set(ctx, 500, 5, FlagCowPending); err != nil {
+		t.Fatal(err)
+	}
 
 	// Initialize should reset everything
 	err := region.Initialize(ctx)
@@ -729,7 +741,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	testFile := filepath.Join(tmpDir, "test_refcount_persist.bin")
-	defer os.Remove(testFile)
+	defer func() { _ = os.Remove(testFile) }()
 
 	// Create and set some values
 	func() {
@@ -738,25 +750,35 @@ func TestPersistence(t *testing.T) {
 			t.Skipf("Cannot create test file: %v", err)
 		}
 		if err := f.Truncate(10 << 20); err != nil {
-			f.Close()
+			_ = f.Close()
 			t.Skipf("Cannot truncate: %v", err)
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
 
 		dev, err := storage.Open(testFile)
 		if err != nil {
 			t.Skipf("O_DIRECT not supported: %v", err)
 		}
-		defer dev.Close()
+		defer func() { _ = dev.Close() }()
 
 		region := NewRegion(dev, 0, 1000, nil)
 		ctx := context.Background()
 
 		// Set various refcounts and flags
-		region.Set(ctx, 0, 1, FlagNone)
-		region.Set(ctx, 50, 10, FlagSnapshot)
-		region.Set(ctx, 100, 3, FlagCowPending|FlagMetadata)
-		region.Set(ctx, 999, 2, FlagPinned)
+		if err := region.Set(ctx, 0, 1, FlagNone); err != nil {
+			t.Fatal(err)
+		}
+		if err := region.Set(ctx, 50, 10, FlagSnapshot); err != nil {
+			t.Fatal(err)
+		}
+		if err := region.Set(ctx, 100, 3, FlagCowPending|FlagMetadata); err != nil {
+			t.Fatal(err)
+		}
+		if err := region.Set(ctx, 999, 2, FlagPinned); err != nil {
+			t.Fatal(err)
+		}
 	}()
 
 	// Reopen and verify
@@ -764,7 +786,7 @@ func TestPersistence(t *testing.T) {
 	if err != nil {
 		t.Skipf("Cannot reopen: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	region := NewRegion(dev, 0, 1000, nil)
 	ctx := context.Background()
@@ -941,7 +963,9 @@ func BenchmarkGet(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.Get(ctx, uint64(i%10000))
+		if _, err := region.Get(ctx, uint64(i%10000)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -954,7 +978,9 @@ func BenchmarkIncrement(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.Increment(ctx, uint64(i))
+		if _, err := region.Increment(ctx, uint64(i)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -967,12 +993,16 @@ func BenchmarkDecrement(b *testing.B) {
 
 	// Pre-set all counts to 1
 	for i := 0; i < b.N; i++ {
-		region.Set(ctx, uint64(i), 1, FlagNone)
+		if err := region.Set(ctx, uint64(i), 1, FlagNone); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.Decrement(ctx, uint64(i))
+		if _, err := region.Decrement(ctx, uint64(i)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -991,7 +1021,9 @@ func BenchmarkIncrementBatch(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.IncrementBatch(ctx, batch)
+		if _, err := region.IncrementBatch(ctx, batch); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -1004,11 +1036,15 @@ func BenchmarkScan(b *testing.B) {
 
 	// Set some values
 	for i := uint64(0); i < 1000; i++ {
-		region.Set(ctx, i, uint32(i%10+1), FlagNone)
+		if err := region.Set(ctx, i, uint32(i%10+1), FlagNone); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		region.Scan(ctx)
+		if _, err := region.Scan(ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

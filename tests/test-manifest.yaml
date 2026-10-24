@@ -581,6 +581,13 @@ scenarios:
   # The two-phase protocol: Commit (INTENT POINT) → Execute → CompleteIntent (COMPLETION POINT)
   # Recovery replays only transactions without matching completion records.
 
+  - id: journal-batch-sync-error
+    name: Batched commit reports a failed sync
+    description: A commit in batch mode returns the error of the batch sync it waited for instead of nil
+    priority: go_only
+    environments:
+      go: internal/journal/journal_test.go::TestBatchCommitReturnsSyncError
+
   - id: intent-completion-serialize
     name: IntentCompletion serialization
     description: IntentCompletion record serializes and deserializes correctly

@@ -30,14 +30,16 @@ func testDeviceAt(t *testing.T, size int64) (*storage.Device, string) {
 	if err := f.Truncate(size); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
 
 	dev, err := storage.Open(path)
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 	return dev, path
 }
 

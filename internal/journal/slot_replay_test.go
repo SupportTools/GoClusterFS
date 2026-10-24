@@ -71,7 +71,9 @@ func TestRecoverResumesInterruptedReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	txn := NewTransaction(region.NextSeq(), [16]byte{1}, 1)
-	txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 7})
+	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 7}); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := txn.Serialize()
 	if _, err := region.WriteAt(data); err != nil {
 		t.Fatal(err)
@@ -103,7 +105,9 @@ func journalWithTxns(t *testing.T, n int) (*Region, func()) {
 	}
 	for i := 0; i < n; i++ {
 		txn := NewTransaction(region.NextSeq(), [16]byte{1}, 1)
-		txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(10 + i)})
+		if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(10 + i)}); err != nil {
+			t.Fatal(err)
+		}
 		data, _ := txn.Serialize()
 		if _, err := region.WriteAt(data); err != nil {
 			cleanup()

@@ -25,11 +25,13 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 	}
 	testFile := f.Name()
 	if err := f.Truncate(10 * 1024 * 1024); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		t.Fatalf("Failed to truncate: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Layout: 0-1MB reserved, 1-2MB bitmap, 2-3MB inodes, 3MB+ data
 	const (
@@ -42,7 +44,7 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
 
@@ -63,8 +65,8 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return rctx, cleanup
@@ -394,7 +396,9 @@ func TestApplyDirRemoveEntry(t *testing.T) {
 	}
 	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	parentIno.LinkCount = 2
-	rctx.InodeTbl.Write(ctx, parentIno)
+	if err := rctx.InodeTbl.Write(ctx, parentIno); err != nil {
+		t.Fatal(err)
+	}
 	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
 	if err := rctx.DirMgr.InitDirectory(ctx, parentIno, uint64(inode.InodeRoot)); err != nil {
 		t.Fatalf("Setup: failed to init directory: %v", err)

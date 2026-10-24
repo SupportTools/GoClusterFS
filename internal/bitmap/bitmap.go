@@ -93,7 +93,7 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire bitmap lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeBlockBitmap, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -107,11 +107,7 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 	for sectorIdx := uint64(0); sectorIdx < numSectors && len(allocated) < count; sectorIdx++ {
 		sectorData, err := r.readSector(sectorIdx)
 		if err != nil {
-			// Rollback allocations made so far
-			for _, blockNum := range allocated {
-				r.freeBlockInSector(blockNum)
-			}
-			return nil, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+			return nil, r.rollback(allocated, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err))
 		}
 
 		modified := false
@@ -141,25 +137,38 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 
 		if modified {
 			if err := r.writeSector(sectorIdx, sectorData); err != nil {
-				// Rollback allocations made so far
-				for _, blockNum := range allocated {
-					r.freeBlockInSector(blockNum)
-				}
-				return nil, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+				return nil, r.rollback(allocated, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err))
 			}
 		}
 	}
 
 	if len(allocated) < count {
-		// Not enough free blocks - rollback
-		for _, blockNum := range allocated {
-			r.freeBlockInSector(blockNum)
-		}
-		return nil, ErrNoFreeBlocks
+		return nil, r.rollback(allocated, ErrNoFreeBlocks)
 	}
 
 	log.Printf("[DEBUG] bitmap.Alloc: allocated blocks %v", allocated)
 	return allocated, nil
+}
+
+// rollback frees the blocks a failed Alloc had marked and returns cause, joined
+// with an error naming each block it could not free.
+func (r *Region) rollback(blocks []uint64, cause error) error {
+	errs := []error{cause}
+	for _, b := range blocks {
+		if err := r.freeBlockInSector(b); err != nil {
+			errs = append(errs, fmt.Errorf("rolling back block %d: %w", b, err))
+		}
+	}
+	if len(errs) == 1 {
+		return cause
+	}
+	return errors.Join(errs...)
+}
+
+func (r *Region) unlock() {
+	if err := r.lockMgr.Release(lock.LockTypeBlockBitmap, 0); err != nil {
+		log.Printf("[WARN] bitmap: releasing the bitmap lock failed: %v", err)
+	}
 }
 
 // Free releases a single block back to the free pool.
@@ -173,7 +182,7 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire bitmap lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeBlockBitmap, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()

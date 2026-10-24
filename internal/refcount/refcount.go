@@ -19,6 +19,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -126,6 +127,12 @@ func NewRegion(dev *storage.Device, offset, totalBlocks uint64, lockMgr *lock.Ma
 	}
 }
 
+func (r *Region) unlock() {
+	if err := r.lockMgr.Release(lock.LockTypeRefCount, 0); err != nil {
+		log.Printf("[WARN] refcount: releasing the refcount lock failed: %v", err)
+	}
+}
+
 // Get returns the reference count entry for a block.
 func (r *Region) Get(ctx context.Context, blockNum uint64) (Entry, error) {
 	if blockNum >= r.totalBlocks {
@@ -137,7 +144,7 @@ func (r *Region) Get(ctx context.Context, blockNum uint64) (Entry, error) {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeShared); err != nil {
 			return Entry{}, fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
+		defer r.unlock()
 	}
 
 	r.mu.RLock()
@@ -158,7 +165,7 @@ func (r *Region) Increment(ctx context.Context, blockNum uint64) (uint32, error)
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
 			return 0, fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -195,7 +202,7 @@ func (r *Region) Decrement(ctx context.Context, blockNum uint64) (uint32, error)
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
 			return 0, fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -231,7 +238,7 @@ func (r *Region) Set(ctx context.Context, blockNum uint64, count uint32, flags E
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -255,7 +262,7 @@ func (r *Region) SetFlags(ctx context.Context, blockNum uint64, flags EntryFlags
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -360,7 +367,7 @@ func (r *Region) updateBatch(ctx context.Context, blockNums []uint64, fn func(i 
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire refcount lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeRefCount, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()

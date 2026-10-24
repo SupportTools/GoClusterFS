@@ -75,7 +75,11 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 	if err != nil {
 		return nil, fmt.Errorf("failed to open journal region: %w", err)
 	}
-	defer region.Close()
+	defer func() {
+		if err := region.Close(); err != nil {
+			log.Printf("[Recovery] Closing journal region failed: %v", err)
+		}
+	}()
 	if owner := region.Superblock().NodeUUID; owner != info.UUID {
 		log.Printf("[Recovery] Journal was written by earlier slot owner %x", owner[:4])
 	}

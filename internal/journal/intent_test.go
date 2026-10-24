@@ -80,7 +80,9 @@ func TestJournalCompleteIntent(t *testing.T) {
 
 	// Begin and commit a transaction
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 
 	intentSeq, err := j.Commit(txn)
 	if err != nil {
@@ -126,7 +128,9 @@ func TestRecoveryWithIntentCompletion(t *testing.T) {
 
 	// Transaction 1: Commit and complete
 	txn1 := j1.Begin()
-	txn1.LogInodeCreate(testInodePayload(100))
+	if err := txn1.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	seq1, err := j1.Commit(txn1)
 	if err != nil {
 		t.Fatalf("Commit txn1 failed: %v", err)
@@ -137,7 +141,9 @@ func TestRecoveryWithIntentCompletion(t *testing.T) {
 
 	// Transaction 2: Commit but DON'T complete (simulates crash during execution)
 	txn2 := j1.Begin()
-	txn2.LogInodeCreate(testInodePayload(101))
+	if err := txn2.LogInodeCreate(testInodePayload(101)); err != nil {
+		t.Fatal(err)
+	}
 	seq2, err := j1.Commit(txn2)
 	if err != nil {
 		t.Fatalf("Commit txn2 failed: %v", err)
@@ -146,7 +152,9 @@ func TestRecoveryWithIntentCompletion(t *testing.T) {
 
 	// Transaction 3: Commit and complete
 	txn3 := j1.Begin()
-	txn3.LogInodeCreate(testInodePayload(102))
+	if err := txn3.LogInodeCreate(testInodePayload(102)); err != nil {
+		t.Fatal(err)
+	}
 	seq3, err := j1.Commit(txn3)
 	if err != nil {
 		t.Fatalf("Commit txn3 failed: %v", err)

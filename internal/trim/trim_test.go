@@ -104,20 +104,22 @@ func createTestDevice(t *testing.T) (*storage.Device, func()) {
 
 	// Extend to reasonable size
 	if err := f.Truncate(100 * 1024 * 1024); err != nil {
-		os.Remove(f.Name())
+		_ = os.Remove(f.Name())
 		t.Fatal(err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	dev, err := storage.Open(f.Name())
 	if err != nil {
-		os.Remove(f.Name())
+		_ = os.Remove(f.Name())
 		t.Fatal(err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(f.Name())
+		_ = dev.Close()
+		_ = os.Remove(f.Name())
 	}
 
 	return dev, cleanup
@@ -136,7 +138,7 @@ func TestBatchThreshold(t *testing.T) {
 
 	m := NewManager(dev, cfg)
 	m.Start()
-	defer m.Stop()
+	defer func() { _ = m.Stop() }()
 
 	// Queue 9 blocks - should not trigger flush
 	for i := uint64(0); i < 9; i++ {
@@ -180,7 +182,7 @@ func TestAgeThreshold(t *testing.T) {
 
 	m := NewManager(dev, cfg)
 	m.Start()
-	defer m.Stop()
+	defer func() { _ = m.Stop() }()
 
 	// Queue a few blocks
 	m.Queue(100)
@@ -251,7 +253,9 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 
 	// Stop should flush pending
-	m.Stop()
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
 
 	stats = m.Stats()
 	if stats.BlocksDiscarded != 50 {
@@ -275,7 +279,7 @@ func TestCoalesceRatio(t *testing.T) {
 
 	m := NewManager(dev, cfg)
 	m.Start()
-	defer m.Stop()
+	defer func() { _ = m.Stop() }()
 
 	// Queue contiguous blocks 0-9 - should coalesce to 1 range
 	for i := uint64(0); i < 10; i++ {
@@ -321,7 +325,7 @@ func TestStatsAreThreadSafe(t *testing.T) {
 
 	m := NewManager(dev, cfg)
 	m.Start()
-	defer m.Stop()
+	defer func() { _ = m.Stop() }()
 
 	// Concurrent Queue and Stats calls
 	done := make(chan bool)

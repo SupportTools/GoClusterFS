@@ -80,13 +80,15 @@ func TestRecoveryOneTransaction(t *testing.T) {
 	// Create and write a transaction
 	seq := region.NextSeq()
 	txn := NewTransaction(seq, nodeUUID, 1)
-	txn.LogInodeCreate(&InodeCreatePayload{
+	if err := txn.LogInodeCreate(&InodeCreatePayload{
 		InodeNum:       100,
 		Mode:           0755,
 		UID:            1000,
 		GID:            1000,
 		ParentInodeNum: 1,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	data, err := txn.Serialize()
 	if err != nil {
@@ -163,18 +165,22 @@ func TestRecoveryMultipleTransactions(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		seq := region.NextSeq()
 		txn := NewTransaction(seq, nodeUUID, 1)
-		txn.LogInodeCreate(&InodeCreatePayload{
+		if err := txn.LogInodeCreate(&InodeCreatePayload{
 			InodeNum:       uint64(100 + i),
 			Mode:           0755,
 			UID:            1000,
 			GID:            1000,
 			ParentInodeNum: 1,
-		})
-		txn.LogDirAddEntry(&DirAddEntryPayload{
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.LogDirAddEntry(&DirAddEntryPayload{
 			ParentInodeNum: 1,
 			ChildInodeNum:  uint64(100 + i),
 			Name:           "file",
-		})
+		}); err != nil {
+			t.Fatal(err)
+		}
 
 		data, _ := txn.Serialize()
 		if _, err := region.WriteAt(data); err != nil {
@@ -234,10 +240,16 @@ func TestRecoveryHandlerError(t *testing.T) {
 
 	seq := region.NextSeq()
 	txn := NewTransaction(seq, nodeUUID, 1)
-	txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100})
+	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100}); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := txn.Serialize()
-	region.WriteAt(data)
-	region.Sync()
+	if _, err := region.WriteAt(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := region.Sync(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Handler that returns an error
 	handlerErr := errors.New("handler failed")
@@ -277,11 +289,17 @@ func TestDryRunRecover(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		seq := region.NextSeq()
 		txn := NewTransaction(seq, nodeUUID, 1)
-		txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(100 + i)})
+		if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(100 + i)}); err != nil {
+			t.Fatal(err)
+		}
 		data, _ := txn.Serialize()
-		region.WriteAt(data)
+		if _, err := region.WriteAt(data); err != nil {
+			t.Fatal(err)
+		}
 	}
-	region.Sync()
+	if err := region.Sync(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Dry run should not modify state
 	initialState := region.State()
@@ -326,8 +344,12 @@ func TestRecoveryCleanState(t *testing.T) {
 
 	// Write partial (uncommitted) transaction - just raw bytes that won't parse
 	garbage := make([]byte, 100)
-	region.WriteAt(garbage)
-	region.Sync()
+	if _, err := region.WriteAt(garbage); err != nil {
+		t.Fatal(err)
+	}
+	if err := region.Sync(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Recover should handle this gracefully
 	stats, err := Recover(region, nil)
@@ -363,14 +385,20 @@ func TestRecoveryVerifiesChecksum(t *testing.T) {
 
 	seq := region.NextSeq()
 	txn := NewTransaction(seq, nodeUUID, 1)
-	txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100})
+	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100}); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := txn.Serialize()
 
 	// Corrupt the data (flip a bit in the middle)
 	data[len(data)/2] ^= 0xFF
 
-	region.WriteAt(data)
-	region.Sync()
+	if _, err := region.WriteAt(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := region.Sync(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Recovery should detect checksum mismatch and treat as incomplete
 	stats, err := Recover(region, nil)

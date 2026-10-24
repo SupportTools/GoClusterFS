@@ -46,7 +46,7 @@ func createTestJournal(t *testing.T, config Config) (*Journal, func()) {
 	}
 
 	return j, func() {
-		j.Stop()
+		_ = j.Stop()
 		cleanup()
 	}
 }
@@ -96,7 +96,9 @@ func TestJournalBeginCommit(t *testing.T) {
 	}
 
 	// Add an operation
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Commit
 	if _, err := j.Commit(txn); err != nil {
@@ -122,7 +124,9 @@ func TestJournalBeginAbort(t *testing.T) {
 
 	// Begin and abort
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 
 	j.Abort(txn)
 
@@ -146,7 +150,9 @@ func TestJournalMultipleTransactions(t *testing.T) {
 		if txn.Seq() != i {
 			t.Errorf("Transaction %d seq = %d, want %d", i, txn.Seq(), i)
 		}
-		txn.LogInodeCreate(testInodePayload(100 + i))
+		if err := txn.LogInodeCreate(testInodePayload(100 + i)); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := j.Commit(txn); err != nil {
 			t.Fatalf("Commit %d failed: %v", i, err)
 		}
@@ -174,9 +180,15 @@ func TestJournalConcurrentTransactions(t *testing.T) {
 	}
 
 	// Add operations
-	txn1.LogInodeCreate(testInodePayload(100))
-	txn2.LogInodeCreate(testInodePayload(101))
-	txn3.LogInodeCreate(testInodePayload(102))
+	if err := txn1.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn2.LogInodeCreate(testInodePayload(101)); err != nil {
+		t.Fatal(err)
+	}
+	if err := txn3.LogInodeCreate(testInodePayload(102)); err != nil {
+		t.Fatal(err)
+	}
 
 	// Commit out of order
 	if _, err := j.Commit(txn2); err != nil {
@@ -223,7 +235,9 @@ func TestJournalMarksDirtyOnCommit(t *testing.T) {
 
 	// Commit a transaction
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
@@ -249,7 +263,9 @@ func TestJournalCleanOnStop(t *testing.T) {
 	}
 
 	txn := j1.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := j1.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
@@ -264,7 +280,7 @@ func TestJournalCleanOnStop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer j2.Stop()
+	defer func() { _ = j2.Stop() }()
 
 	if j2.NeedsRecovery() {
 		t.Error("Should not need recovery after clean shutdown")
@@ -281,7 +297,9 @@ func TestJournalStartStop(t *testing.T) {
 	// Do some operations
 	for i := 0; i < 5; i++ {
 		txn := j.Begin()
-		txn.LogInodeCreate(testInodePayload(uint64(100 + i)))
+		if err := txn.LogInodeCreate(testInodePayload(uint64(100 + i))); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := j.Commit(txn); err != nil {
 			t.Fatalf("Commit failed: %v", err)
 		}
@@ -300,7 +318,9 @@ func TestJournalAsyncCommitMode(t *testing.T) {
 
 	// Commit should work in async mode
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit in async mode failed: %v", err)
 	}
@@ -333,7 +353,9 @@ func TestJournalAvailableSpace(t *testing.T) {
 
 	// After commit, space should decrease
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit failed: %v", err)
 	}
@@ -352,8 +374,12 @@ func TestJournalLargeTransaction(t *testing.T) {
 	txn := j.Begin()
 
 	for i := uint64(0); i < 100; i++ {
-		txn.LogInodeCreate(testInodePayload(100 + i))
-		txn.LogDirAddEntry(testDirAddPayload(1, 100+i, "file"+string(rune('a'+int(i%26)))))
+		if err := txn.LogInodeCreate(testInodePayload(100 + i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := txn.LogDirAddEntry(testDirAddPayload(1, 100+i, "file"+string(rune('a'+int(i%26))))); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if _, err := j.Commit(txn); err != nil {
@@ -383,7 +409,9 @@ func TestJournalStats(t *testing.T) {
 
 	// After commit
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	j.Commit(txn) //nolint:errcheck
 
 	stats = j.Stats()
@@ -419,9 +447,13 @@ func TestJournalOpen(t *testing.T) {
 		t.Fatalf("CreateTemp failed: %v", err)
 	}
 	path := f.Name()
-	f.Truncate(10 * 1024 * 1024)
-	f.Close()
-	defer os.Remove(path)
+	if err := f.Truncate(10 * 1024 * 1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(path) }()
 
 	// Need to import storage for this test
 	// Instead, let's use the helper
@@ -441,16 +473,20 @@ func TestJournalOpen(t *testing.T) {
 
 	// Commit something
 	txn := j1.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	j1.Commit(txn) //nolint:errcheck
-	j1.Stop()
+	if err := j1.Stop(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Open
 	j2, err := Open(dev, regionOffset, regionSize, nodeUUID, config)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer j2.Stop()
+	defer func() { _ = j2.Stop() }()
 
 	// Should be able to continue
 	txn2 := j2.Begin()
@@ -473,7 +509,9 @@ func TestJournalBatchCommitMode(t *testing.T) {
 	// Single commit should work (will wait for timer)
 	start := time.Now()
 	txn := j.Begin()
-	txn.LogInodeCreate(testInodePayload(100))
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := j.Commit(txn); err != nil {
 		t.Fatalf("Commit in batch mode failed: %v", err)
 	}
@@ -518,7 +556,10 @@ func TestJournalBatchTriggerByCount(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			txn := j.Begin()
-			txn.LogInodeCreate(testInodePayload(uint64(100 + idx)))
+			if err := txn.LogInodeCreate(testInodePayload(uint64(100 + idx))); err != nil {
+				errors <- err
+				return
+			}
 			if _, err := j.Commit(txn); err != nil {
 				errors <- fmt.Errorf("commit %d failed: %v", idx, err)
 			}
@@ -570,7 +611,10 @@ func TestJournalBatchConcurrent(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			txn := j.Begin()
-			txn.LogInodeCreate(testInodePayload(uint64(100 + id)))
+			if err := txn.LogInodeCreate(testInodePayload(uint64(100 + id))); err != nil {
+				errors <- err
+				return
+			}
 			if _, err := j.Commit(txn); err != nil {
 				errors <- err
 			}
@@ -605,5 +649,50 @@ func TestJournalBatchConfigDefaults(t *testing.T) {
 	}
 	if config.MaxBatchAge != 100*time.Millisecond {
 		t.Errorf("MaxBatchAge = %v, want 100ms", config.MaxBatchAge)
+	}
+}
+
+// A batched commit must report a failed batch sync, not success.
+func TestBatchCommitReturnsSyncError(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+	config := DefaultConfig()
+	config.CommitMode = CommitBatch
+	config.BatchConfig = BatchConfig{MaxBatchTransactions: 100, MaxBatchAge: 500 * time.Millisecond}
+	j, err := Init(dev, 0, DefaultJournalSlotSize, [16]byte{1}, 1, config)
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	defer func() { _ = j.Stop() }()
+
+	txn := j.Begin()
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := j.Commit(txn)
+		result <- err
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		j.batchMu.Lock()
+		pending := j.batchPendingCount
+		j.batchMu.Unlock()
+		if pending == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("commit never joined a batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-result; err == nil {
+		t.Fatal("Commit returned nil after its batch sync failed")
 	}
 }
