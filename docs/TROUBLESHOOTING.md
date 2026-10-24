@@ -483,16 +483,16 @@ As with fsck(8), the codes add up: a repair that fixed some errors and left othe
 
 | Phase | Name | Checks |
 |-------|------|--------|
-| 1 | Superblock | Magic, version, block and inode size, checksum, and the format v2 layout (below). fsck stops here when a region lies outside the device or overlaps another. |
-| 2 | Bitmap | Sector checksums; counts allocated blocks |
+| 1 | Superblock | Magic, version, block and inode size, checksum, and the format v3 layout (below). fsck stops here on a version 2 volume, or when a region lies outside the device or overlaps another. |
+| 2 | Bitmap | The bitmap covers every data block; sector checksums; counts allocated blocks |
 | 3 | Inodes | Inode checksums, file type, link count, block counts; reads extent trees |
 | 4 | Extents | Extents stay inside the device and are allocated; two inodes share a block only if both mark it shared; extent tree structure |
-| 5 | Refcounts | Sector checksums; each block's refcount covers the inodes that map it |
+| 5 | Refcounts | The table covers every data block; sector checksums; each block's refcount covers the inodes that map it |
 | 6 | Directories | Entry lengths and names; entries point at inodes in use |
 | 7 | Snapshots | Registry sector and descriptor checksums, duplicate IDs and names, snapshot data inodes |
 | 8 | Cross-Validation | Allocated blocks that no inode maps, mapped blocks the bitmap calls free, inodes no directory names |
 
-The format v2 layout checks in phase 1:
+The format v3 layout checks in phase 1:
 
 - Every region starts on a 4 KB boundary, lies inside the device, and does not overlap another region.
 - The journal region splits evenly into one journal per node, and each journal is a multiple of 4 KB and at least 8 KB.

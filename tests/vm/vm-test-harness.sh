@@ -521,7 +521,8 @@ setup_goclusterfs() {
     local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device /dev/vda"
     if [[ "$format_disk" == "true" ]]; then
         log_info "Formatting shared disk on VM $vm_id..."
-        mount_args="$mount_args -format"
+        # One inode per 64 KB gives the 1 GB disk 16384 inodes, enough for test_more_than_4096_files
+        mount_args="$mount_args -format -bytes-per-inode 65536"
     fi
 
     # /var/log/goclusterfs.log is lost when the VM dies; the log device keeps a copy on the host

@@ -56,21 +56,21 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 
 ## On-Disk Layout
 
-`internal/superblock` (`calculateLayout`) defines this layout, format version 2. `-format` writes it into the 4 KB superblock at offset 0, and mount takes every offset from there. Data blocks are 1 MB. Metadata I/O uses 4 KB sectors.
+`internal/superblock` (`calculateLayout`) defines this layout, format version 3. `-format` writes it into the 4 KB superblock at offset 0, and mount takes every offset from there. Data blocks are 1 MB. Metadata I/O uses 4 KB sectors.
 
 | Offset | Size | Region |
 |--------|------|--------|
 | 0 | 1 MB | Superblock (first 4 KB) |
-| 1 MB | 1 MB | Block bitmap |
-| 2 MB | 1 MB | Inode table: 4096 inodes of 256 bytes; root is inode 2 |
-| 3 MB | 1 MB | Node registry: 64 slots of 4 KB |
-| 4 MB | 1 MB | Lock records |
-| 5 MB | 256 MB | Journals: 64 × 4 MB, one per registry slot |
-| 261 MB | 1 MB | Block refcounts |
-| 262 MB | 1 MB | Snapshot registry |
-| 263 MB | rest | Data blocks |
+| 1 MB | 1 MB | Node registry: 64 slots of 4 KB |
+| 2 MB | 1 MB | Lock records |
+| 3 MB | 1 MB | Snapshot registry |
+| 4 MB | 256 MB | Journals: 64 × 4 MB, one per registry slot |
+| 260 MB | 1 MB per 8 TB of device | Block bitmap |
+| next | about 8 MB per TB of device | Block refcounts |
+| next | 256 bytes per inode | Inode table: one inode per `-bytes-per-inode` bytes of device (default 1 MB), 4096 to 16M inodes; root is inode 2 |
+| next | rest | Data blocks |
 
-The smallest device is 264 MB. Registry slot `i` owns the journal at `5 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes); copy the data off with the old build and reformat.
+The last three metadata regions are sized at format time, each at least 1 MB and rounded up to whole MB. On devices up to 4 GB the data blocks start at 263 MB. The smallest device is 264 MB. Registry slot `i` owns the journal at `4 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes) and version 2 images (1 MB bitmap, refcount and inode regions: 4096 inodes, refcounts overflow past 128 GB); copy the data off with the old build and reformat.
 
 ## Snapshots and Clones
 
@@ -89,7 +89,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
 - At most 64 nodes mount a volume at once, one per registry slot. Heartbeats compare wall clocks, so node clocks must agree within a few seconds.
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, and the superblock checksum. It reports every other problem without fixing it.
-- The inode count is fixed at 4096.
+- The inode count is set at format time and cannot change. `statfs` (`df -i`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - No rename, symlinks, or hard links.
 

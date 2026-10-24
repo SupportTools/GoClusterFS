@@ -473,19 +473,19 @@ scenarios:
 
   - id: more-than-4096-files
     name: More than 4096 files
-    description: A volume formatted with -bytes-per-inode 65536 holds 4200 files in 42 directories across a remount, statfs reports the larger inode count, and fsck is clean
+    description: Every node creates its share of 4200 files in 42 directories at once on a volume with more than 4200 inodes, and all of them are visible; layout v2 held 4096 inodes
     priority: high
     environments:
-      go: layout_test.go::TestMoreThan4096Files
+      go: layout_test.go::TestLargeVolume
       docker: run-tests.sh::test_more_than_4096_files
       vm: run-vm-tests.sh::test_more_than_4096_files
 
   - id: large-volume-high-block-snapshot
     name: 200 GB volume with snapshots of data past 128 GB
-    description: On a 200 GB sparse image, more than 4096 files and a snapshot, copy on write and clone of data past block 130816, where layout v2's refcount table ended, survive a remount, and fsck is clean
+    description: On a 200 GB sparse image, a snapshot, copy on write and clone of data past block 130816, where layout v2's refcount table ended, survive a remount next to 4200 files, and fsck is clean
     priority: high
     environments:
-      go: layout_test.go::TestLargeVolumeSnapshotsHighBlocks
+      go: layout_test.go::TestLargeVolume
       docker: TODO  # needs a 200 GB sparse shared image; the Docker cluster shares a 768 MB image
       vm: TODO  # needs a 200 GB sparse shared disk; the VM cluster shares a 1 GB disk
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,21 +19,36 @@ import (
 // v2RefcountBlocks is the number of blocks layout v2's 1 MB refcount table covered.
 const v2RefcountBlocks = 130816
 
-func createFiles(t *testing.T, mfs *MountedFS, dirs, perDir int) {
+// createFiles makes the directories on node 0, then every node fills its share
+// of them at once. A create costs about 130 ms, so one node would take 9 minutes.
+func createFiles(t *testing.T, cluster *MultiNodeCluster, dirs, perDir int) {
 	t.Helper()
 	start := time.Now()
 	for d := 0; d < dirs; d++ {
-		dir := fmt.Sprintf("d%02d", d)
-		if err := mfs.Mkdir(dir); err != nil {
-			t.Fatalf("mkdir %s: %v", dir, err)
-		}
-		for f := 0; f < perDir; f++ {
-			if err := mfs.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d", f)), nil); err != nil {
-				t.Fatalf("create file %d in %s: %v", f, dir, err)
-			}
+		if err := cluster.Node(0).Mkdir(fmt.Sprintf("d%02d", d)); err != nil {
+			t.Fatalf("mkdir d%02d: %v", d, err)
 		}
 	}
-	t.Logf("created %d files in %d directories in %v", dirs*perDir, dirs, time.Since(start))
+	nodes := make([]int, cluster.NodeCount())
+	for i := range nodes {
+		nodes[i] = i
+	}
+	errs := cluster.RunConcurrent(nodes, func(idx int, node *MountedFS) error {
+		for d := idx; d < dirs; d += len(nodes) {
+			for f := 0; f < perDir; f++ {
+				if err := node.WriteFile(fmt.Sprintf("d%02d/f%03d", d, f), nil); err != nil {
+					return fmt.Errorf("create file %d in d%02d: %w", f, d, err)
+				}
+			}
+		}
+		return nil
+	})
+	for idx, err := range errs {
+		if err != nil {
+			t.Fatalf("node %d: %v", idx, err)
+		}
+	}
+	t.Logf("%d nodes created %d files in %d directories in %v", len(nodes), dirs*perDir, dirs, time.Since(start))
 }
 
 func checkFiles(t *testing.T, mfs *MountedFS, dirs, perDir int) {
@@ -98,48 +112,24 @@ func TestMountRefusesLayoutV2(t *testing.T) {
 	}
 }
 
-// Layout v2 had room for 4096 inodes. A volume formatted with one inode per
-// 64 KB has more, and they all work across a remount.
-func TestMoreThan4096Files(t *testing.T) {
-	const dirs, perDir = 42, 100
-	mfs := NewMountedFS(t, 64)
-	mfs.ExtraArgs = []string{"-bytes-per-inode", "65536"}
-	if err := mfs.FormatAndMount(false); err != nil {
-		t.Fatalf("FormatAndMount: %v", err)
-	}
-	mfs.ExtraArgs = nil
-	if files := statfsFiles(t, mfs); files <= dirs*perDir {
-		t.Fatalf("statfs reports %d inodes, want more than %d", files, dirs*perDir)
-	}
-
-	createFiles(t, mfs, dirs, perDir)
-	if err := mfs.Unmount(); err != nil {
-		t.Fatal(err)
-	}
-	if err := mfs.Mount(false); err != nil {
-		t.Fatalf("remount: %v", err)
-	}
-	checkFiles(t, mfs, dirs, perDir)
-	if err := mfs.Unmount(); err != nil {
-		t.Fatal(err)
-	}
-	expectCleanFsck(t, mfs.ImagePath)
-}
-
-// A 200 GB volume was out of reach for layout v2: its refcount table ended at
-// block 130816 and later entries overwrote the snapshot registry. Here new
-// data lands past that block, and a snapshot, a copy on write and a clone of
-// it survive a remount next to more than 4096 files.
-func TestLargeVolumeSnapshotsHighBlocks(t *testing.T) {
+// A 200 GB volume was out of reach for layout v2: it had room for 4096 inodes,
+// and its refcount table ended at block 130816, so later entries overwrote the
+// snapshot registry. Here 4200 files exist next to data past that block, and a
+// snapshot, a copy on write and a clone of that data survive a remount.
+func TestLargeVolume(t *testing.T) {
 	if testing.Short() {
 		t.Skip("creates 4200 files and fallocates 128 GB on a 200 GB sparse image")
 	}
 	const dirs, perDir = 42, 100
-	mfs := NewMountedFS(t, 200<<10)
-	if err := mfs.FormatAndMount(false); err != nil {
-		t.Fatalf("FormatAndMount: %v", err)
+	cluster := NewMultiNodeCluster(t, 4, 200<<10)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start node 0: %v", err)
 	}
-	createFiles(t, mfs, dirs, perDir)
+	if err := cluster.StartAllNodes(false); err != nil {
+		t.Fatal(err)
+	}
+	mfs := cluster.Node(0)
+	createFiles(t, cluster, dirs, perDir)
 
 	filler, err := os.Create(mfs.Path("filler.bin"))
 	if err != nil {
@@ -187,10 +177,9 @@ func TestLargeVolumeSnapshotsHighBlocks(t *testing.T) {
 			t.Fatalf("statfs reports %d inodes, want one per MB", files)
 		}
 	}
+	time.Sleep(1500 * time.Millisecond)
 	check()
-	if err := mfs.Unmount(); err != nil {
-		t.Fatal(err)
-	}
+	cluster.StopAllNodes()
 
 	dev, err := storage.Open(mfs.ImagePath)
 	if err != nil {

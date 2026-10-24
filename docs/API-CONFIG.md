@@ -34,6 +34,7 @@ These flags are passed when starting `goclusterfs`:
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Format the device (destroys all data) |
+| `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
 | `-debug` | bool | `false` | Enable verbose debug logging |
 
 ### Cache Flags
