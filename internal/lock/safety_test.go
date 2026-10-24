@@ -709,6 +709,49 @@ func TestLateReadClaimAdmitsNoMoreReaders(t *testing.T) {
 	requireBlocked(t, d, LockTypeInode, 26, LockModeShared)
 }
 
+// A fence write that cannot start within fenceWindow of its read writes nothing,
+// so it cannot land on a claim another node made after the record went stale.
+func TestLateFenceLeavesStaleTakeoverAlone(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	b := newTestNode(dev, 0, 1<<20, 2)
+	z := newTestNode(dev, 0, 1<<20, 3)
+	defer func(w time.Duration) { fenceWindow = w }(fenceWindow)
+	fenceWindow = ClaimSettleDelay
+	fencing, takenOver := make(chan struct{}), make(chan struct{})
+	fenceWrite := func(buf []byte, offset int64, deadline time.Time) (int, error) {
+		close(fencing)
+		<-takenOver
+		if !time.Now().Before(deadline) {
+			return 0, storage.ErrWriteDeadline
+		}
+		return b.dev.WriteAt(buf, offset)
+	}
+	var once sync.Once
+	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay, 0), func(buf []byte, offset int64, deadline time.Time) (int, error) {
+		write := b.dev.WriteAtBefore
+		once.Do(func() { write = fenceWrite })
+		return write(buf, offset, deadline)
+	}, make(chan struct{}))
+
+	errb := make(chan error, 1)
+	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 27, LockModeShared) }()
+	<-fencing
+	ageRecord(t, z, LockTypeInode, 27, pastStale)
+	requireAcquired(t, z, LockTypeInode, 27, LockModeExclusive)
+	close(takenOver)
+	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("node B with a late read claim: got %v, want ErrLockTimeout", err)
+	}
+	rec, err := z.readRecord(z.hashToRecord(LockTypeInode, 27))
+	if err != nil {
+		t.Fatalf("readRecord: %v", err)
+	}
+	if rec.Mode != LockModeExclusive || rec.OwnerUUID != z.nodeUUID {
+		t.Fatalf("record after node B's late fence: mode=%d owner=%x, want node Z's write claim", rec.Mode, rec.OwnerUUID[:8])
+	}
+}
+
 // returnsWithin fails the test if fn has not returned after 3s.
 func returnsWithin(t *testing.T, what string, fn func()) {
 	t.Helper()

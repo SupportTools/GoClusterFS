@@ -1916,6 +1916,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestLateReadClaimAdmitsNoMoreReaders
 
+  - id: lock-late-fence-leaves-stale-takeover
+    name: Late fence leaves a stale takeover alone
+    description: A fence write that cannot start within fenceWindow of its read writes nothing, so it cannot overwrite a claim another node made after the record went stale
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLateFenceLeavesStaleTakeoverAlone
+
   - id: lock-release-cached-parallel
     name: Unmount frees kept locks in parallel
     description: On slow storage ReleaseCached frees kept records in parallel, so 16 records take about as long as one

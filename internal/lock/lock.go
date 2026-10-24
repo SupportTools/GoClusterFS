@@ -280,6 +280,7 @@ var (
 	claimSettleDelay = ClaimSettleDelay
 	cacheGrace       = CacheGrace
 	yieldGap         = YieldGap
+	fenceWindow      = StaleThreshold / 2
 )
 
 // releaseParallelism is how many kept records ReleaseCached frees at once.
@@ -821,11 +822,13 @@ func (m *Manager) giveUpLateClaim(recordID uint64, written *Record) {
 
 // fenceLateReadClaim turns a read claim this node wrote late into its own write
 // claim, so no more readers join beside a writer the claim may have landed on.
-// Its writes need no deadline: they can only make the record exclusive to this node.
+// Its writes can only make the record exclusive to this node, so they may start
+// up to fenceWindow after their read. That bound, and leaving stale records alone,
+// keep a fence from landing on a claim another node makes once the record is stale.
 func (m *Manager) fenceLateReadClaim(recordID uint64) {
 	for attempt := 0; attempt < maxRecordUpdates; attempt++ {
 		record, err := m.readRecord(recordID)
-		if err != nil || record.Mode != LockModeShared {
+		if err != nil || record.Mode != LockModeShared || m.isLockStale(record) {
 			return
 		}
 		fence := *record
@@ -834,7 +837,7 @@ func (m *Manager) fenceLateReadClaim(recordID uint64) {
 		fence.OwnerSlot = uint32(m.nodeSlot)
 		fence.SharedCount = 0
 		fence.Sequence++
-		ok, err := m.casRecordIf(recordID, &fence, false, func(seq uint64, _ LockMode) bool {
+		ok, err := m.casRecordIf(recordID, &fence, fenceWindow, func(seq uint64, _ LockMode) bool {
 			return seq == record.Sequence
 		})
 		if err != nil || ok {
@@ -1038,22 +1041,22 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 // casRecordOptimistic writes new over a record that is free and at expectedSeq.
 // This saves one disk read compared to casRecord when the hint is correct.
 func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *Record) (bool, error) {
-	return m.casRecordIf(recordID, new, true, func(seq uint64, mode LockMode) bool {
+	return m.casRecordIf(recordID, new, ClaimSettleDelay/2, func(seq uint64, mode LockMode) bool {
 		return seq == expectedSeq && mode == LockModeNone
 	})
 }
 
 // casRecord writes new over a record that is still at expected's sequence.
 func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error) {
-	return m.casRecordIf(recordID, new, true, func(seq uint64, _ LockMode) bool {
+	return m.casRecordIf(recordID, new, ClaimSettleDelay/2, func(seq uint64, _ LockMode) bool {
 		return seq == expected.Sequence
 	})
 }
 
 // casRecordIf reads a record and writes new over it if match accepts what it read.
-// If timed, it skips the write if the write would start more than ClaimSettleDelay/2
-// after the read, and returns errLateWrite, with the write done, if it finished later than that.
-func (m *Manager) casRecordIf(recordID uint64, new *Record, timed bool, match func(seq uint64, mode LockMode) bool) (bool, error) {
+// It skips the write if the write would start more than window after the read,
+// and returns errLateWrite, with the write done, if it finished later than that.
+func (m *Manager) casRecordIf(recordID uint64, new *Record, window time.Duration, match func(seq uint64, mode LockMode) bool) (bool, error) {
 	offset := int64(m.offset) + int64(recordID)*RecordSize
 
 	buf := storage.GetBuffer(RecordSize)
@@ -1071,19 +1074,15 @@ func (m *Manager) casRecordIf(recordID uint64, new *Record, timed bool, match fu
 	if m.casWrite != nil {
 		write = m.casWrite
 	}
-	var deadline time.Time
-	if timed {
-		deadline = start.Add(ClaimSettleDelay / 2)
-	}
 	copy(buf.Bytes(), serializeRecord(new))
-	if _, err := write(buf.Bytes(), offset, deadline); err != nil {
+	if _, err := write(buf.Bytes(), offset, start.Add(window)); err != nil {
 		if errors.Is(err, storage.ErrWriteDeadline) {
 			log.Printf("[WARN] lock: record %d read was %v old when its write could start; retrying the update", recordID, age(start))
 			return false, nil
 		}
 		return false, err
 	}
-	if took := age(start); timed && took > ClaimSettleDelay/2 {
+	if took := age(start); took > window {
 		log.Printf("[WARN] lock: record %d write finished %v after its read", recordID, took)
 		return true, errLateWrite
 	}
