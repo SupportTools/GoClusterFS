@@ -2196,6 +2196,24 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		log.Printf("[DEBUG] Write inode %d: Read failed: %v", f.inodeNum, err)
 		return 0, syscall.EIO
 	}
+	// persistAndUnlock writes changes made under the inode lock and drops it, so
+	// the bitmap lock, which comes first in lock order, can be taken next.
+	persistAndUnlock := func() error {
+		if !lockHeld || f.fs.lockMgr == nil {
+			return nil
+		}
+		if inoDirty {
+			if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
+				log.Printf("[DEBUG] Write inode %d: persisting inode before unlocking failed: %v", f.inodeNum, err)
+				releaseInodeLock()
+				f.fs.extentMgr.DiscardPending(ctx, ino)
+				return retryOnTreeConflict(err)
+			}
+			inoDirty = false
+		}
+		releaseInodeLock()
+		return nil
+	}
 	inodeWritten := false
 	defer func() {
 		if !inodeWritten {
@@ -2266,20 +2284,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				}
 			}
 
-			// Release inode lock before allocation to respect lock ordering:
-			// bitmap (6) must be acquired before inode (8)
-			if lockHeld && f.fs.lockMgr != nil {
-				// The inode is re-read after allocation, so persist changes made under the lock first.
-				if inoDirty {
-					if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
-						log.Printf("[DEBUG] Write inode %d: persisting inode before allocation failed: %v", f.inodeNum, err)
-						releaseInodeLock()
-						f.fs.extentMgr.DiscardPending(ctx, ino)
-						return 0, retryOnTreeConflict(err)
-					}
-					inoDirty = false
-				}
-				releaseInodeLock()
+			// The inode is re-read after allocation, so persist changes made under the lock first.
+			if err := persistAndUnlock(); err != nil {
+				return 0, err
 			}
 
 			if f.fs.lockMgr != nil {
@@ -2403,49 +2410,48 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Check if this is an unwritten extent (from fallocate).
 		// If so, we need to clear the Unwritten flag on first write.
-		if ext.Flags&extent.FlagUnwritten != 0 {
-			// First write to unwritten block - need to clear flag
-			if !lockHeld && f.fs.lockMgr != nil {
-				// Acquire lock before modifying extent
-				if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-					log.Printf("[DEBUG] Write inode %d: failed to acquire lock for unwritten: %v", f.inodeNum, err)
-					return 0, syscall.EIO
-				}
-				lockHeld = true
-
-				// Re-read inode after acquiring lock
-				freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
-				if err != nil {
-					log.Printf("[DEBUG] Write inode %d: re-read for unwritten failed: %v", f.inodeNum, err)
-					return 0, syscall.EIO
-				}
-				if freshIno.MetaGeneration != ino.MetaGeneration {
-					log.Printf("[DEBUG] Write inode %d: MetaGeneration changed during unwritten clear",
-						f.inodeNum)
-					return 0, errRetryWrite
-				}
-				ino = freshIno
-
-				// Re-lookup extent - another node may have already cleared it
-				ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum)
-				if err != nil {
-					log.Printf("[DEBUG] Write inode %d: extent disappeared during unwritten clear",
-						f.inodeNum)
-					return 0, errRetryWrite
-				}
+		if ext.Flags&extent.FlagUnwritten != 0 && f.fs.lockMgr != nil {
+			// Splitting the extent may allocate tree blocks, which needs the bitmap lock
+			// before the inode lock. Clear on an unlocked copy, then keep it only if no
+			// node wrote the inode before the lock was taken.
+			if err := persistAndUnlock(); err != nil {
+				return 0, err
 			}
-
-			// Clear the Unwritten flag (if still set)
+			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ctx, ino, blockNum)
+			if clearErr != nil {
+				log.Printf("[DEBUG] Write inode %d: clearing Unwritten flag at block %d failed: %v",
+					f.inodeNum, blockNum, clearErr)
+				f.fs.extentMgr.DiscardPending(ctx, ino)
+				if errors.Is(clearErr, extent.ErrStaleTree) {
+					return 0, errRetryWrite
+				}
+				return 0, syscall.EIO
+			}
+			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+				log.Printf("[DEBUG] Write inode %d: failed to acquire lock for unwritten: %v", f.inodeNum, err)
+				f.fs.extentMgr.DiscardPending(ctx, ino)
+				return 0, syscall.EIO
+			}
+			lockHeld = true
+			freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+			if err != nil || freshIno.MetaGeneration != ino.MetaGeneration {
+				log.Printf("[DEBUG] Write inode %d: inode changed during unwritten clear (err=%v)", f.inodeNum, err)
+				releaseInodeLock()
+				f.fs.extentMgr.DiscardPending(ctx, ino)
+				return 0, errRetryWrite
+			}
+			inoDirty = inoDirty || cleared
+			zeroFirst = cleared
+			if ext, extOffset, err = f.fs.extentMgr.Lookup(ino, blockNum); err != nil {
+				log.Printf("[DEBUG] Write inode %d: lookup after unwritten clear failed: %v", f.inodeNum, err)
+				return 0, syscall.EIO
+			}
+		} else if ext.Flags&extent.FlagUnwritten != 0 {
 			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ctx, ino, blockNum)
 			if clearErr != nil {
 				log.Printf("[DEBUG] Write inode %d: clearing Unwritten flag at block %d failed: %v",
 					f.inodeNum, blockNum, clearErr)
 				return 0, syscall.EIO
-			}
-			if cleared {
-				inoDirty = true
-				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
-					f.inodeNum, blockNum)
 			}
 			zeroFirst = cleared
 		}

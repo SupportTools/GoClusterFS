@@ -324,6 +324,15 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: write-inside-fallocated-range
+    name: Write inside a fallocated range
+    description: A 4KB write into the middle of a fallocated range splits the unwritten extent under the live lock and zero-fills the rest of the block
+    priority: medium
+    environments:
+      go: tree_reservation_test.go::TestWriteInsideFallocatedRange
+      docker: TODO
+      vm: TODO
+
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
     description: Multiple nodes write to same block at different offsets

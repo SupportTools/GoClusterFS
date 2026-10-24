@@ -40,3 +40,48 @@ func TestTreeReservationsDoNotLeakBlocks(t *testing.T) {
 		t.Fatalf("writing %d MB into an empty volume of %d blocks failed: %v", fill/mb, st.Blocks, err)
 	}
 }
+
+// TestWriteInsideFallocatedRange writes 4KB into the middle of a fallocated
+// range. Clearing the unwritten flag splits one extent into three, which needs
+// extent-tree blocks, and the rest of the block must read as zeros even though
+// the block held another file's data before.
+func TestWriteInsideFallocatedRange(t *testing.T) {
+	mfs := NewMountedFS(t, 64)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+	old := make([]byte, 4*mb)
+	for i := range old {
+		old[i] = 0xEE
+	}
+	if err := mfs.WriteFile("old.bin", old); err != nil {
+		t.Fatalf("write old.bin failed: %v", err)
+	}
+	if err := mfs.Remove("old.bin"); err != nil {
+		t.Fatalf("Remove failed: %v", err)
+	}
+
+	if err := mfs.WriteFile("falloc.bin", nil); err != nil {
+		t.Fatalf("create falloc.bin failed: %v", err)
+	}
+	f, err := mfs.OpenFile("falloc.bin")
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	if err := syscall.Fallocate(int(f.Fd()), 0, 0, 4*mb); err != nil {
+		f.Close()
+		t.Fatalf("Fallocate failed: %v", err)
+	}
+	data := chunk(7, 4096)
+	const at = mb + 512*1024
+	if _, err := f.WriteAt(data, at); err != nil {
+		f.Close()
+		t.Fatalf("write inside the fallocated range failed: %v", err)
+	}
+	f.Close()
+
+	remount(t, mfs)
+	want := make([]byte, 4*mb)
+	copy(want[at:], data)
+	checkFile(t, mfs, "falloc.bin", want)
+}
