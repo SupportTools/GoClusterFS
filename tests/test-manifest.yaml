@@ -1371,6 +1371,13 @@ scenarios:
     environments:
       go: internal/snapshot/worker_test.go::TestDeleteJobRequiresDeletingState
 
+  - id: snapshot-failed-write-releases-once
+    name: Failed write after a mid-write copy commit
+    description: When the final inode write fails after a mid-write persist committed one copied block, each old block loses the file's ownership once across the retry, and uncounted blocks from an older version lose none
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestFailedWriteReleasesCommittedCopiesOnce
+
   - id: snapshot-recovery-after-crash
     name: Snapshot cleanup on mount after a crash
     description: A mount removes a snapshot left half created or half deleted, frees its data inode, and the file's blocks drop back to one owner

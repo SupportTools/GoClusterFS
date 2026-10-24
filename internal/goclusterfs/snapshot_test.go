@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -554,4 +555,72 @@ func TestOldSharingCopiesWithoutReleasing(t *testing.T) {
 	checkFile(t, clones[1], original)
 	checkFile(t, f, overwritten(original, 10, pattern(9, 100)))
 	checkFile(t, clones[0], overwritten(original, 20, pattern(10, 100)))
+}
+
+// A write over two shared blocks commits the first copy mid-write. When the
+// final inode write then fails, each old block must lose this file's
+// ownership exactly once across the failed write and its retry, and blocks an
+// older version shared without counting must never lose any.
+func TestFailedWriteReleasesCommittedCopiesOnce(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
+			fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+			ctx := context.Background()
+			if err := fsys.InitRoot(ctx); err != nil {
+				t.Fatal(err)
+			}
+			original := pattern(1, 2*BlockSize)
+			f := newRegularFile(t, fsys)
+			writeAt(t, f, original, 0)
+			old := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
+			want := uint32(1)
+			if legacy {
+				ino, err := fsys.inodeTbl.Read(f.inodeNum)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ino.InlineExtents[0].Flags |= extent.FlagShared
+				if err := fsys.inodeTbl.Write(ctx, ino); err != nil {
+					t.Fatal(err)
+				}
+				for _, b := range old {
+					if err := fsys.refcountReg.Set(ctx, b, 2, refcount.FlagNone); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want = 2
+			} else {
+				setxattr(t, f, "user.snapshot", "before")
+			}
+
+			conflicts := 1
+			testHookBeforeInodeCommit = func() error {
+				if conflicts > 0 {
+					conflicts--
+					return extent.ErrTreeConflict
+				}
+				return nil
+			}
+			t.Cleanup(func() { testHookBeforeInodeCommit = nil })
+			updated := pattern(2, 2*BlockSize)
+			writeAt(t, f, updated, 0)
+			if conflicts != 0 {
+				t.Fatal("the final inode write never ran")
+			}
+
+			for _, b := range old {
+				if got := refcountOf(t, fsys, b); got != want {
+					t.Errorf("old block %d refcount %d, want %d", b, got, want)
+				}
+				if ok, err := fsys.bitmapMgr.IsAllocated(b); err != nil || !ok {
+					t.Errorf("old block %d freed (err=%v)", b, err)
+				}
+			}
+			checkFile(t, f, updated)
+			if !legacy {
+				setxattr(t, f, "user.snapshot.clone", "before:/before-clone")
+				checkFile(t, lookupFile(t, fsys, "before-clone"), original)
+			}
+		})
+	}
 }
