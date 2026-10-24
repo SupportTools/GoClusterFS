@@ -35,8 +35,8 @@ func snapshotStates(t *testing.T, path string) map[string]string {
 	return states
 }
 
-// pollSnapshotState polls until every named snapshot of path is in state; "" means gone.
-func pollSnapshotState(t *testing.T, path, state string, names ...string) (map[string]string, bool) {
+// waitForSnapshotState polls until every named snapshot of path is in state; "" means gone.
+func waitForSnapshotState(t *testing.T, path, state string, names ...string) {
 	t.Helper()
 	var states map[string]string
 	took, ok := waitFor(snapshotJobTimeout, func() bool {
@@ -48,28 +48,10 @@ func pollSnapshotState(t *testing.T, path, state string, names ...string) (map[s
 		}
 		return true
 	})
-	if ok {
-		t.Logf("Snapshots %v reached state %q in %v", names, state, took)
-	}
-	return states, ok
-}
-
-// waitForSnapshotsActive only logs on timeout: the worker drops create jobs
-// queued with a canceled request context, leaving the snapshot "creating".
-func waitForSnapshotsActive(t *testing.T, path string, names ...string) map[string]string {
-	t.Helper()
-	states, ok := pollSnapshotState(t, path, "active", names...)
 	if !ok {
-		t.Logf("Snapshots %v not active within %v: %v", names, snapshotJobTimeout, states)
+		t.Fatalf("Snapshots %v did not reach state %q within %v: %v", names, state, snapshotJobTimeout, states)
 	}
-	return states
-}
-
-func waitForSnapshotsRemoved(t *testing.T, path string, names ...string) {
-	t.Helper()
-	if states, ok := pollSnapshotState(t, path, "", names...); !ok {
-		t.Fatalf("Snapshots %v not removed within %v: %v", names, snapshotJobTimeout, states)
-	}
+	t.Logf("Snapshots %v reached state %q in %v", names, state, took)
 }
 
 // TestSnapshotCreation tests creating a snapshot via extended attributes.
@@ -103,9 +85,7 @@ func TestSnapshotCreation(t *testing.T) {
 
 	t.Logf("Snapshot created in %v", duration)
 
-	if states := waitForSnapshotsActive(t, filePath, snapName); states[snapName] == "" {
-		t.Errorf("Snapshot %q not found in list: %v", snapName, states)
-	}
+	waitForSnapshotState(t, filePath, "active", snapName)
 
 	t.Log("Snapshot creation test passed")
 }
@@ -134,7 +114,7 @@ func TestSnapshotCoW(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	waitForSnapshotsActive(t, filePath, "cow-snapshot")
+	waitForSnapshotState(t, filePath, "active", "cow-snapshot")
 
 	// Write new content - this should trigger CoW
 	modifiedContent := []byte("Modified content after snapshot - new blocks allocated")
@@ -178,7 +158,7 @@ func TestSnapshotDataIntegrity(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	waitForSnapshotsActive(t, filePath, "integrity-snap")
+	waitForSnapshotState(t, filePath, "active", "integrity-snap")
 
 	// Modify the live file
 	newContent := []byte("Modified: XXXXXYYYYYZZZZZZ")
@@ -235,9 +215,7 @@ func TestSnapshotDelete(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	if states := waitForSnapshotsActive(t, filePath, snapName); states[snapName] == "" {
-		t.Fatalf("Snapshot %q should exist before deletion", snapName)
-	}
+	waitForSnapshotState(t, filePath, "active", snapName)
 
 	// Delete snapshot via removexattr
 	// Note: The attribute name format is "user.snapshot.<name>"
@@ -246,14 +224,7 @@ func TestSnapshotDelete(t *testing.T) {
 		t.Fatalf("Removexattr for snapshot deletion failed: %v", err)
 	}
 
-	// Only logs if never removed: the worker can drop delete jobs the same way as create jobs.
-	states, removed := pollSnapshotState(t, filePath, "", snapName)
-	if !removed {
-		t.Logf("Snapshot %q not removed within %v: %v", snapName, snapshotJobTimeout, states)
-	}
-	if states[snapName] == "active" {
-		t.Errorf("Snapshot %q still active after deletion", snapName)
-	}
+	waitForSnapshotState(t, filePath, "", snapName)
 
 	t.Log("Snapshot delete test passed")
 }
@@ -346,12 +317,7 @@ func TestSnapshotMultiple(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	states := waitForSnapshotsActive(t, filePath, snapNames...)
-	for _, name := range snapNames {
-		if states[name] == "" {
-			t.Errorf("Snapshot %q not found in list: %v", name, states)
-		}
-	}
+	waitForSnapshotState(t, filePath, "active", snapNames...)
 
 	t.Log("Multiple snapshots test passed")
 }
@@ -393,7 +359,7 @@ func TestSnapshotLargeFile(t *testing.T) {
 
 	t.Logf("Large file snapshot created in %v", duration)
 
-	waitForSnapshotsActive(t, filePath, "large-snap")
+	waitForSnapshotState(t, filePath, "active", "large-snap")
 
 	// Verify original data intact
 	readBack, err := mfs.ReadFile("large.bin")
@@ -467,12 +433,7 @@ func TestSnapshotMiddleDeletion(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	states := waitForSnapshotsActive(t, filePath, snapNames...)
-	for _, name := range snapNames {
-		if states[name] == "" {
-			t.Fatalf("Snapshot %q should exist before deletion", name)
-		}
-	}
+	waitForSnapshotState(t, filePath, "active", snapNames...)
 
 	// Delete the middle snapshot (snap-2)
 	t.Logf("Calling Removexattr for snap-2...")
@@ -482,15 +443,15 @@ func TestSnapshotMiddleDeletion(t *testing.T) {
 		t.Fatalf("Removexattr for middle snapshot deletion failed: %v", err)
 	}
 
-	waitForSnapshotsRemoved(t, filePath, "snap-2")
+	waitForSnapshotState(t, filePath, "", "snap-2")
 
-	states = snapshotStates(t, filePath)
+	states := snapshotStates(t, filePath)
 	t.Logf("Snapshot states after merge-up: %v", states)
-	if states["snap-1"] == "" {
-		t.Errorf("snap-1 should still exist")
+	if states["snap-1"] != "active" {
+		t.Errorf("snap-1 should still be active")
 	}
-	if states["snap-3"] == "" {
-		t.Errorf("snap-3 should still exist (re-parented to snap-1)")
+	if states["snap-3"] != "active" {
+		t.Errorf("snap-3 should still be active (re-parented to snap-1)")
 	}
 
 	t.Log("Middle snapshot deletion (merge-up) test passed")
@@ -527,7 +488,7 @@ func TestSnapshotDeleteAndReuse(t *testing.T) {
 		}
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
-	waitForSnapshotsActive(t, filePath, "temp-snap")
+	waitForSnapshotState(t, filePath, "active", "temp-snap")
 
 	// Overwrite the file (triggers CoW, allocates new blocks)
 	newContent := make([]byte, 512*1024)
@@ -834,7 +795,7 @@ func TestCloneFromSnapshot(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	waitForSnapshotsActive(t, filePath, "snap1")
+	waitForSnapshotState(t, filePath, "active", "snap1")
 
 	// Modify the source after snapshot
 	modifiedContent := []byte("Modified after snapshot")
