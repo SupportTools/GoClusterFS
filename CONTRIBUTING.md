@@ -18,7 +18,7 @@ GoClusterFS builds and runs on Linux only. The storage layer opens devices with 
 make build
 ```
 
-This builds `goclusterfs-mount` in the repository root.
+This builds `goclusterfs-mount` and `goclusterfs-fsck` in the repository root.
 
 ## Test
 
@@ -32,7 +32,15 @@ This builds `goclusterfs-mount` in the repository root.
 
 Run `make test-unit` and `make test-integration` before you open a pull request. Also run the Docker or VM suite when you change multi-node behavior, such as locking, the journal, caches, broadcast, or recovery.
 
-CI runs `go vet`, a `gofmt` check, the unit and integration tests, and the Docker suite on every pull request. Run `make fmt` and `make vet` before you push.
+On every pull request, CI runs:
+
+- `go vet` and a `gofmt` check
+- golangci-lint (`make lint`)
+- govulncheck (`make vuln`)
+- a check that `go mod tidy` changes nothing
+- unit tests with `-race` and coverage, integration tests, and the Docker suite
+
+Run `make fmt`, `make vet`, and `make lint` before you push.
 
 ## Adding tests
 
