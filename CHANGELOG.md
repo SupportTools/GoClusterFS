@@ -30,7 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Batched TRIM of freed blocks (`-trim`).
 - SFB containers for files under 64 KB, disabled: every file uses normal extents and `-sfb` has no effect. A file that an older build stored in an SFB slot stays readable, moves to a full block on its next write or truncate, and frees its slot when deleted.
 - Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Read a snapshot by cloning it with `user.snapshot.clone`.
-- `goclusterfs-fsck` consistency checker. `-repair` rebuilds block refcounts from every file, snapshot and clone. It refuses to run while the device is in use, and `-repair -dry-run` shows what it would change. Exit codes: `0` no errors, `1` errors remain, `2` repaired, `4` failed or refused.
+- `goclusterfs-fsck` consistency checker. `-repair` rebuilds block refcounts from every file, snapshot and clone. It refuses to run while the device is in use, and `-repair -dry-run` shows what it would change. Exit codes follow fsck(8): `0` no errors, `1` repaired, `4` errors remain, `8` failed or refused, `16` usage error.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
 - Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records) and the journal recovery scan.

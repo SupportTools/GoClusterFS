@@ -123,8 +123,22 @@ func (c *Checker) checkRefcounts() error {
 			"not rebuilt, because some references could not be read: "+strings.Join(c.refsIncomplete, "; "), false)
 		return nil
 	}
+	if !c.opts.DryRun {
+		if beforeRepairWrites != nil {
+			beforeRepairWrites()
+		}
+		if err := c.registryUnchanged(); err != nil {
+			return err
+		}
+	}
 	if err := c.writeRefcounts(fixes); err != nil {
 		return err
+	}
+	// The runtime trusts counted sharing, so the counts must be on disk first.
+	if !c.opts.DryRun {
+		if err := c.dev.Sync(); err != nil {
+			return fmt.Errorf("sync refcounts: %w", err)
+		}
 	}
 	return c.markSharingCounted()
 }

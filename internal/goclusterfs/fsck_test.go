@@ -250,15 +250,15 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 	}
 
 	check := runFsck(t, fsys, fsck.DefaultOptions())
-	if check.ExitCode() != fsck.ExitErrors || !strings.Contains(problemList(check), "older versions") {
-		t.Fatalf("check exit %d, want %d with older sharing reported:%s", check.ExitCode(), fsck.ExitErrors, problemList(check))
+	if check.ExitCode() != fsck.ExitUncorrected || !strings.Contains(problemList(check), "older versions") {
+		t.Fatalf("check exit %d, want %d with older sharing reported:%s", check.ExitCode(), fsck.ExitUncorrected, problemList(check))
 	}
 
 	dry := fsck.DefaultOptions()
 	dry.Mode, dry.DryRun = fsck.Repair, true
-	if r := runFsck(t, fsys, dry); r.ExitCode() != fsck.ExitErrors || r.RepairedCount != 0 {
+	if r := runFsck(t, fsys, dry); r.ExitCode() != fsck.ExitUncorrected || r.RepairedCount != 0 {
 		t.Fatalf("dry run: exit %d, repaired %d, want exit %d and nothing repaired:%s",
-			r.ExitCode(), r.RepairedCount, fsck.ExitErrors, problemList(r))
+			r.ExitCode(), r.RepairedCount, fsck.ExitUncorrected, problemList(r))
 	}
 	if again := runFsck(t, fsys, fsck.DefaultOptions()); problemList(again) != problemList(check) {
 		t.Fatalf("dry run changed the image: before%s\nafter%s", problemList(check), problemList(again))
@@ -266,8 +266,8 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 
 	repair := fsck.DefaultOptions()
 	repair.Mode = fsck.Repair
-	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitRepaired {
-		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), fsck.ExitRepaired, problemList(r))
+	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitCorrected {
+		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), fsck.ExitCorrected, problemList(r))
 	}
 	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
 		t.Fatalf("problems left after repair:%s", problemList(r))
@@ -328,13 +328,13 @@ func TestFsckRebuildsCorruptRefcountSector(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if r := runFsck(t, fsys, fsck.DefaultOptions()); r.ExitCode() != fsck.ExitErrors || !strings.Contains(problemList(r), "checksum mismatch") {
-		t.Fatalf("check exit %d, want %d with a checksum mismatch:%s", r.ExitCode(), fsck.ExitErrors, problemList(r))
+	if r := runFsck(t, fsys, fsck.DefaultOptions()); r.ExitCode() != fsck.ExitUncorrected || !strings.Contains(problemList(r), "checksum mismatch") {
+		t.Fatalf("check exit %d, want %d with a checksum mismatch:%s", r.ExitCode(), fsck.ExitUncorrected, problemList(r))
 	}
 	repair := fsck.DefaultOptions()
 	repair.Mode = fsck.Repair
-	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitRepaired {
-		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), fsck.ExitRepaired, problemList(r))
+	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitCorrected {
+		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), fsck.ExitCorrected, problemList(r))
 	}
 	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
 		t.Fatalf("problems left after repair:%s", problemList(r))

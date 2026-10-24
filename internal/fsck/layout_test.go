@@ -108,9 +108,9 @@ func TestFsckStopsOnBadLayout(t *testing.T) {
 			opts.Output = &bytes.Buffer{}
 			opts.StopOnFatal = false
 			r := fsck.New(formattedDevice(t, mutate), opts).Check()
-			if !r.Aborted || r.ExitCode() != fsck.ExitFailed || r.CompletedPhase > fsck.PhaseSuperblock {
+			if !r.Aborted || r.ExitCode() != fsck.ExitOperational || r.CompletedPhase > fsck.PhaseSuperblock {
 				t.Errorf("aborted=%v exit=%d completed=%s, want an abort in phase 1 with exit %d",
-					r.Aborted, r.ExitCode(), r.CompletedPhase, fsck.ExitFailed)
+					r.Aborted, r.ExitCode(), r.CompletedPhase, fsck.ExitOperational)
 			}
 		})
 	}
@@ -150,9 +150,8 @@ func TestFsckRepairRefusesInUseFilesystem(t *testing.T) {
 	if err := reg.StartHeartbeat(); err != nil {
 		t.Fatal(err)
 	}
-	expect(run(fsck.Repair, false, true), fsck.ExitFailed, "mounted by node")
-	expect(run(fsck.Repair, true, false), fsck.ExitClean, "")
-	expect(run(fsck.CheckOnly, false, false), fsck.ExitClean, "results may include changes in flight")
+	expect(run(fsck.Repair, false, true), fsck.ExitOperational, "mounted by node")
+	expect(run(fsck.Repair, true, false), fsck.ExitClean, "repair would refuse: filesystem is mounted by node")
 
 	// A stopped mount leaves its slot active with a recent heartbeat.
 	reg.Stop()
@@ -176,7 +175,7 @@ func TestFsckRepairRefusesInUseFilesystem(t *testing.T) {
 		writeSector(t, dev, journalAt, jsb.Serialize())
 	}
 	setJournal(journal.JournalStateDirty)
-	expect(run(fsck.Repair, false, false), fsck.ExitFailed, "stopped with a dirty journal")
+	expect(run(fsck.Repair, false, false), fsck.ExitOperational, "stopped with a dirty journal")
 	expect(run(fsck.Repair, false, true), fsck.ExitClean, "")
 	setJournal(journal.JournalStateClean)
 	expect(run(fsck.Repair, false, false), fsck.ExitClean, "")
@@ -186,6 +185,67 @@ func TestFsckRepairRefusesInUseFilesystem(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(run(fsck.Repair, false, false), fsck.ExitClean, "")
+}
+
+// A node that mounts while repair watches the registry, or after the watch
+// but before repair writes, stops the repair.
+func TestFsckRepairNoticesNodeMounting(t *testing.T) {
+	t.Cleanup(fsck.SetHeartbeatWatch(3*node.HeartbeatInterval, 3*node.HeartbeatInterval))
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
+	ctx := context.Background()
+	repair := func(lastPhase fsck.Phase) *fsck.Result {
+		opts := fsck.DefaultOptions()
+		opts.Output = &bytes.Buffer{}
+		opts.Mode = fsck.Repair
+		for p := lastPhase + 1; p <= fsck.PhaseCrossValidation; p++ {
+			opts.SkipPhases[p] = true
+		}
+		return fsck.New(dev, opts).Check()
+	}
+
+	stopped := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	if _, err := stopped.Register(ctx, "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *fsck.Result)
+	go func() { done <- repair(fsck.PhaseSuperblock) }()
+	time.Sleep(node.HeartbeatInterval)
+	late := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	if _, err := late.Register(ctx, "late"); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-done; r.ExitCode() != fsck.ExitOperational || !strings.Contains(r.AbortReason, "mounted by node 1 (late)") {
+		t.Errorf("node mounting during the watch: exit %d, reason %q", r.ExitCode(), r.AbortReason)
+	}
+	for _, reg := range []*node.Registry{stopped, late} {
+		if err := reg.Unregister(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A free block with a count gives repair something to write.
+	sector := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
+	binary.LittleEndian.PutUint32(sector[0:], 3)
+	binary.LittleEndian.PutUint32(sector[storage.SectorSize-4:], storage.CRC32C(sector[:storage.SectorSize-4]))
+	writeSector(t, dev, int64(sb.RefCountTableOffset), sector)
+	var afterWatch *node.Registry
+	t.Cleanup(fsck.SetBeforeRepairWrites(func() {
+		afterWatch = node.NewRegistry(dev, sb.NodeRegistryOffset)
+		if _, err := afterWatch.Register(ctx, "after-watch"); err != nil {
+			t.Error(err)
+		}
+	}))
+	r := repair(fsck.PhaseRefcounts)
+	if r.ExitCode()&fsck.ExitOperational == 0 || !strings.Contains(r.AbortReason, "changed its node registry slot") {
+		t.Errorf("node mounting before the writes: exit %d, reason %q", r.ExitCode(), r.AbortReason)
+	}
+	if _, err := dev.ReadAt(sector, int64(sb.RefCountTableOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint32(sector) != 3 {
+		t.Error("repair wrote refcounts after a node mounted")
+	}
 }
 
 func TestFsckExitCodes(t *testing.T) {
@@ -200,11 +260,12 @@ func TestFsckExitCodes(t *testing.T) {
 	}{
 		{"clean", false, nil, fsck.ExitClean},
 		{"warnings only", false, []fsck.Problem{problem(fsck.Warning, false, false)}, fsck.ExitClean},
-		{"error", false, []fsck.Problem{problem(fsck.Error, false, false)}, fsck.ExitErrors},
-		{"error a dry run would fix", false, []fsck.Problem{problem(fsck.Error, false, true)}, fsck.ExitErrors},
-		{"all errors repaired", false, []fsck.Problem{problem(fsck.Critical, true, false), problem(fsck.Warning, false, false)}, fsck.ExitRepaired},
-		{"some errors repaired", false, []fsck.Problem{problem(fsck.Error, true, false), problem(fsck.Error, false, false)}, fsck.ExitErrors},
-		{"aborted", true, []fsck.Problem{problem(fsck.Fatal, false, false)}, fsck.ExitFailed},
+		{"error", false, []fsck.Problem{problem(fsck.Error, false, false)}, fsck.ExitUncorrected},
+		{"error a dry run would fix", false, []fsck.Problem{problem(fsck.Error, false, true)}, fsck.ExitUncorrected},
+		{"all errors repaired", false, []fsck.Problem{problem(fsck.Critical, true, false), problem(fsck.Warning, false, false)}, fsck.ExitCorrected},
+		{"some errors repaired", false, []fsck.Problem{problem(fsck.Error, true, false), problem(fsck.Error, false, false)}, fsck.ExitCorrected | fsck.ExitUncorrected},
+		{"aborted", true, []fsck.Problem{problem(fsck.Fatal, false, false)}, fsck.ExitOperational},
+		{"aborted after repairs", true, []fsck.Problem{problem(fsck.Error, true, false), problem(fsck.Fatal, false, false)}, fsck.ExitCorrected | fsck.ExitOperational},
 	} {
 		r := &fsck.Result{Aborted: tc.aborted}
 		for _, p := range tc.problems {

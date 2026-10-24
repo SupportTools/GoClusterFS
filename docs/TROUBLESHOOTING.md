@@ -538,10 +538,12 @@ For low-level FUSE debugging:
 2. Back up the device, for example with `dd`.
 3. Run `-repair -dry-run` and read the problems marked `[WOULD FIX]`.
 
-`-repair` refuses to run, with exit code 4, in two cases:
+`-repair` refuses to run, with exit code 8, in two cases:
 
 - **A node has the device mounted.** fsck watches the heartbeat counter in each node slot. The mount binary leaves its slot behind when it stops, so right after an unmount fsck can wait up to 11 seconds before it knows the node is gone.
 - **A node stopped without replaying its journal.** Mount the device on one node, which replays its own journal and recovers the journals of crashed nodes, then unmount it and run fsck again. `-force` repairs anyway, but changes still in that journal can then be lost or undone.
+
+If a node mounts the device while `-repair` runs, repair stops before its next write and exits 8. `-repair -dry-run` reports both cases as warnings.
 
 ### What `-repair` Changes
 
@@ -557,9 +559,12 @@ It never frees blocks, deletes inodes, or edits directories. Problems not marked
 | Code | Meaning |
 |------|---------|
 | 0 | No errors. Warnings may remain. |
-| 1 | Errors remain on disk. A dry run that would fix them also exits 1. |
-| 2 | Every error found was repaired. |
-| 4 | Usage error, I/O failure, fsck could not finish, or `-repair` was refused. |
+| 1 | Errors were repaired. |
+| 4 | Errors remain on disk. A dry run that would fix them also exits 4. |
+| 8 | I/O failure, fsck could not finish, or `-repair` was refused. |
+| 16 | Usage error. |
+
+As with fsck(8), the codes add up: a repair that fixed some errors and left others exits 5.
 
 ### fsck Phases
 

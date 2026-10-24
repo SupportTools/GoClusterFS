@@ -735,7 +735,7 @@ scenarios:
 
   - id: fsck-runtime-image
     name: fsck passes a runtime image
-    description: An image the mount binary wrote, with snapshots, clones, copies on write and extent trees, passes goclusterfs-fsck with no problems; -repair exits 4 while mounted and 0 after a clean unmount
+    description: An image the mount binary wrote, with snapshots, clones, copies on write and extent trees, passes goclusterfs-fsck with no problems; -repair exits 8 while mounted and 0 after a clean unmount
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
     environments:
@@ -745,7 +745,7 @@ scenarios:
 
   - id: fsck-repair-older-sharing
     name: fsck -repair counts sharing from older versions
-    description: Snapshots of a file an older version shared fail with ENOTSUP; -repair -dry-run changes nothing, -repair exits 2, and snapshots, clones and copies on write work afterwards
+    description: Snapshots of a file an older version shared fail with ENOTSUP; -repair -dry-run changes nothing, -repair exits 1, and snapshots, clones and copies on write work afterwards
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
     environments:
@@ -783,14 +783,14 @@ scenarios:
 
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust
-    description: A zero inode size, no or too many data blocks, a wrapping offset or overlapping regions abort fsck in phase 1 with exit code 4
+    description: A zero inode size, no or too many data blocks, a wrapping offset or overlapping regions abort fsck in phase 1 with exit code 8
     priority: go_only
     environments:
       go: internal/fsck/layout_test.go::TestFsckStopsOnBadLayout
 
   - id: fsck-exit-codes
     name: fsck exit codes
-    description: 0 no errors, 1 errors remain, 2 every error repaired, 4 aborted
+    description: fsck(8) bits - 0 no errors, 1 repaired, 4 errors remain, 8 aborted, and their sums
     priority: go_only
     environments:
       go: internal/fsck/layout_test.go::TestFsckExitCodes
@@ -808,6 +808,27 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/parse_fuzz_test.go::FuzzParseDirBlock
+
+  - id: fsck-repair-node-mounting
+    name: fsck -repair stops when a node mounts
+    description: A node that mounts while repair watches the registry, or after the watch but before repair writes, stops the repair with exit code 8 and nothing written
+    priority: go_only
+    environments:
+      go: internal/fsck/layout_test.go::TestFsckRepairNoticesNodeMounting
+
+  - id: fsck-directory-chunk
+    name: fsck checks directory entries fill one chunk
+    description: Directory entries whose record lengths stop short of or run past the 4KB chunk are reported
+    priority: go_only
+    environments:
+      go: internal/fsck/parse_fuzz_test.go::TestParseDirBlockChunkBoundary
+
+  - id: fsck-fuzz-records
+    name: Fuzz fsck fixed-size record parsers
+    description: Arbitrary bytes never panic the superblock, inode, refcount and snapshot descriptor parsers
+    priority: go_only
+    environments:
+      go: internal/fsck/parse_fuzz_test.go::FuzzParseRecords
 
   - id: extent-tree-node-fuzz
     name: Fuzz the extent tree node decoder

@@ -18,11 +18,13 @@
 package fsck
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -242,25 +244,28 @@ func (r *Result) unrepairedErrors() int {
 	return n
 }
 
-// Exit codes of goclusterfs-fsck.
+// Exit codes of goclusterfs-fsck. As with fsck(8), they are bits: a repair
+// that fixed some errors and left others exits 5.
 const (
-	ExitClean    = 0 // no errors (warnings may remain)
-	ExitErrors   = 1 // errors remain on disk
-	ExitRepaired = 2 // every error found was repaired
-	ExitFailed   = 4 // usage error, I/O failure, or the check could not finish or was refused
+	ExitClean       = 0  // no errors (warnings may remain)
+	ExitCorrected   = 1  // errors were repaired
+	ExitUncorrected = 4  // errors remain on disk
+	ExitOperational = 8  // I/O failure, or the check could not finish or was refused
+	ExitUsage       = 16 // usage error
 )
 
-// ExitCode returns the exit code for the result.
 func (r *Result) ExitCode() int {
+	code := ExitClean
+	if r.RepairedCount > 0 {
+		code |= ExitCorrected
+	}
 	switch {
 	case r.Aborted:
-		return ExitFailed
+		code |= ExitOperational
 	case r.UnrepairedErrors() > 0:
-		return ExitErrors
-	case r.RepairedCount > 0:
-		return ExitRepaired
+		code |= ExitUncorrected
 	}
-	return ExitClean
+	return code
 }
 
 // IsClean returns true if no problems of any kind were found.
@@ -391,6 +396,7 @@ type Checker struct {
 	uncounted       map[uint32]int // inodes an older version shared -> problem index
 	refsIncomplete  []string       // why inodeBlocks may miss references
 	superblockFix   func() error   // runs once repair knows no node uses the filesystem
+	registry        []*node.Slot   // node slots as startRepair last saw them
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
@@ -498,7 +504,7 @@ func (c *Checker) Check() *Result {
 			})
 
 			// Later phases read regions the superblock places.
-			if c.opts.StopOnFatal || p.phase == PhaseSuperblock {
+			if c.opts.StopOnFatal || p.phase == PhaseSuperblock || errors.Is(err, errRepairStopped) {
 				c.result.Aborted = true
 				c.result.AbortReason = fmt.Sprintf("%s failed: %v", p.phase, err)
 				break

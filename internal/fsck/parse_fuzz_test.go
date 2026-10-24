@@ -2,6 +2,7 @@ package fsck
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -15,6 +16,28 @@ func dirEntry(inodeNum uint64, recLen int, name string) []byte {
 	e[11] = DT_REG
 	copy(e[DirEntryHeaderSize:], name)
 	return e
+}
+
+func TestParseDirBlockChunkBoundary(t *testing.T) {
+	head := append(dirEntry(2, 16, "."), dirEntry(2, 16, "..")...)
+	for name, tc := range map[string]struct {
+		block   []byte
+		entries int
+		errText string
+	}{
+		"fills the chunk":     {append(head, dirEntry(5, DirChunkSize-32, "a.txt")...), 3, ""},
+		"empty block":         {nil, 0, ""},
+		"stops short":         {append(head, dirEntry(5, 32, "a.txt")...), 3, "entries end at offset 64"},
+		"runs past the chunk": {append(dirEntry(2, DirChunkSize+16, "."), make([]byte, 16)...), 0, "runs past the 4096-byte chunk"},
+	} {
+		buf := make([]byte, DirBlockSize)
+		copy(buf, tc.block)
+		entries, errs := parseDirBlock(buf)
+		got := strings.Join(errs, "; ")
+		if len(entries) != tc.entries || (tc.errText == "") != (got == "") || !strings.Contains(got, tc.errText) {
+			t.Errorf("%s: %d entries, errors %q; want %d entries, errors containing %q", name, len(entries), got, tc.entries, tc.errText)
+		}
+	}
 }
 
 func FuzzParseDirBlock(f *testing.F) {

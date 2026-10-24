@@ -177,8 +177,6 @@ func (c *Checker) checkDirectories() error {
 
 // readDirectoryEntries reads all entries from a directory inode.
 // Returns parsed entries and a list of error messages for problems found.
-// Like the runtime, it reads each block as one list of entries that ends at
-// the first entry with RecLen 0.
 func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOffset uint64) ([]*DirEntryData, []string) {
 	var entries []*DirEntryData
 	var errors []string
@@ -210,24 +208,36 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 	return entries, errors
 }
 
+// parseDirBlock parses the entries of one directory block. The runtime keeps
+// them in the first chunk, and their record lengths add up to exactly the
+// chunk, so a chain that stops short or runs past it hides or invents entries.
 func parseDirBlock(buf []byte) ([]*DirEntryData, []string) {
 	var entries []*DirEntryData
 	var errors []string
-	for pos := 0; pos+DirEntryHeaderSize <= len(buf); {
+	end := min(len(buf), DirChunkSize)
+	pos := 0
+	for pos < end {
+		if pos+DirEntryHeaderSize > end {
+			errors = append(errors, fmt.Sprintf("entry at offset %d runs past the %d-byte chunk", pos, DirChunkSize))
+			break
+		}
 		entryInodeNum := binary.LittleEndian.Uint64(buf[pos : pos+8])
 		recLen := int(binary.LittleEndian.Uint16(buf[pos+8 : pos+10]))
 		nameLen := buf[pos+10]
 		fileType := buf[pos+11]
 
 		if recLen == 0 {
+			if pos > 0 {
+				errors = append(errors, fmt.Sprintf("entries end at offset %d, before the end of the %d-byte chunk", pos, DirChunkSize))
+			}
 			break
 		}
 		if recLen < MinDirEntrySize {
 			errors = append(errors, fmt.Sprintf("invalid RecLen %d at offset %d", recLen, pos))
 			break
 		}
-		if pos+recLen > len(buf) {
-			errors = append(errors, fmt.Sprintf("RecLen %d at offset %d runs past the block", recLen, pos))
+		if pos+recLen > end {
+			errors = append(errors, fmt.Sprintf("RecLen %d at offset %d runs past the %d-byte chunk", recLen, pos, DirChunkSize))
 			break
 		}
 		if DirEntryHeaderSize+int(nameLen) > recLen {

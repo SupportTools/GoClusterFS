@@ -2,6 +2,7 @@ package fsck
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -15,7 +16,6 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-// lastProblem returns the index of the most recently added problem.
 func (c *Checker) lastProblem() int {
 	c.result.mu.Lock()
 	defer c.result.mu.Unlock()
@@ -79,6 +79,11 @@ func (c *Checker) markSharingCounted() error {
 	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset)
 	tbl.SetTreeFlusher(mgr)
 
+	if !c.opts.DryRun {
+		if err := c.registryUnchanged(); err != nil {
+			return err
+		}
+	}
 	for num, problem := range c.uncounted {
 		if c.opts.DryRun {
 			c.markRepaired(problem)
@@ -99,41 +104,50 @@ func (c *Checker) markSharingCounted() error {
 		}
 		c.markRepaired(problem)
 	}
-	return nil
+	if c.opts.DryRun {
+		return nil
+	}
+	return c.dev.Sync()
 }
 
-// startRepair runs after phase 1, before repair writes anything. A check
-// only warns that a mounted filesystem may change while it reads.
+// errRepairStopped stops the check whatever StopOnFatal says, since the
+// filesystem may be in use.
+var errRepairStopped = errors.New("repair stopped")
+
+// startRepair runs after phase 1, before repair writes anything. A dry run
+// only warns about what would make repair refuse.
 func (c *Checker) startRepair() error {
-	live, unclean := c.nodes()
 	if c.opts.Mode != Repair {
-		if len(live) > 0 {
-			c.addProblem(PhaseSuperblock, Warning, "node registry",
-				fmt.Sprintf("filesystem is mounted by %s; results may include changes in flight", strings.Join(live, ", ")),
-				false)
+		return nil
+	}
+	live, unclean := c.nodes()
+	if c.opts.DryRun {
+		for _, why := range append(live, unclean...) {
+			c.addProblem(PhaseSuperblock, Warning, "node registry", "repair would refuse: "+why, false)
 		}
 		return nil
 	}
-	if !c.opts.DryRun {
-		if len(live) > 0 {
-			return fmt.Errorf("repair refused: filesystem is mounted by %s; unmount it on every node first", strings.Join(live, ", "))
-		}
-		if len(unclean) > 0 && !c.opts.AllowUncleanNodes {
-			return fmt.Errorf("repair refused: %s, so the journal may hold changes fsck cannot see; "+
-				"mount the filesystem so the journal is replayed and unmount it, or pass -force", strings.Join(unclean, "; "))
-		}
+	if len(live) > 0 {
+		return fmt.Errorf("repair refused: %s; unmount it on every node first", strings.Join(live, ", "))
+	}
+	if len(unclean) > 0 && !c.opts.AllowUncleanNodes {
+		return fmt.Errorf("repair refused: %s, so the journal may hold changes fsck cannot see; "+
+			"mount the filesystem so the journal is replayed and unmount it, or pass -force", strings.Join(unclean, "; "))
 	}
 	if c.superblockFix != nil {
 		if err := c.superblockFix(); err != nil {
 			return fmt.Errorf("repair superblock checksum: %w", err)
 		}
+		if err := c.dev.Sync(); err != nil {
+			return fmt.Errorf("sync: %w", err)
+		}
 	}
 	return nil
 }
 
-// How long fsck watches a node's heartbeat counter before it counts the node
-// as stopped: briefly when the heartbeat is older than the runtime's failure
-// timeout, in case the node's clock lags, and otherwise for that timeout.
+// How long fsck watches the node registry before it decides no node is
+// running: briefly when every heartbeat is older than the runtime's failure
+// timeout, in case a node's clock lags, and otherwise for that timeout.
 var (
 	staleHeartbeatWatch  = 3 * node.HeartbeatInterval
 	recentHeartbeatWatch = node.HeartbeatTimeout + node.HeartbeatInterval
@@ -141,69 +155,92 @@ var (
 
 // nodes describes the nodes that have the filesystem mounted, and those that
 // stopped without replaying their journal. An unreadable slot counts as the
-// second kind.
+// second kind. It keeps the registry it saw for registryUnchanged.
 func (c *Checker) nodes() (live, unclean []string) {
 	reg := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset)
 	slots, err := reg.Slots()
 	if err != nil {
 		unclean = append(unclean, fmt.Sprintf("a node slot is unreadable (%v)", err))
 	}
-	beating := c.watchHeartbeats(reg, slots)
-	for i, slot := range slots {
-		if slot == nil {
-			continue
-		}
-		host := strings.TrimRight(string(slot.Hostname[:]), "\x00")
-		if beating[i] {
-			live = append(live, fmt.Sprintf("node %d (%s)", i, host))
-			continue
-		}
-		age := time.Since(time.Unix(slot.HeartbeatTime, 0)).Round(time.Second)
-		if why := c.journalNeedsReplay(i); why != "" {
-			unclean = append(unclean, fmt.Sprintf("node %d (%s, last heartbeat %s ago) %s", i, host, age, why))
+	running := c.watchRegistry(reg, slots)
+	for i, slot := range c.registry {
+		switch {
+		case running[i]:
+			live = append(live, "filesystem is mounted by "+slotName(i, slot))
+		case slot == nil:
+		default:
+			if why := c.journalNeedsReplay(i); why != "" {
+				age := time.Since(time.Unix(slot.HeartbeatTime, 0)).Round(time.Second)
+				unclean = append(unclean, fmt.Sprintf("%s, last heartbeat %s ago, %s", slotName(i, slot), age, why))
+			}
 		}
 	}
 	return live, unclean
 }
 
-// watchHeartbeats reports which active nodes still heartbeat. The mount
-// binary leaves its slot active when it stops, so only a heartbeat counter
-// that moves shows a running node.
-func (c *Checker) watchHeartbeats(reg *node.Registry, slots []*node.Slot) map[int]bool {
-	beating := make(map[int]bool)
-	deadline := make(map[int]time.Time)
-	start := time.Now()
-	for i, slot := range slots {
+func slotName(i int, slot *node.Slot) string {
+	return fmt.Sprintf("node %d (%s)", i, strings.TrimRight(string(slot.Hostname[:]), "\x00"))
+}
+
+// slotChanged reports whether a node wrote its slot between two reads.
+func slotChanged(a, b *node.Slot) bool {
+	if a == nil || b == nil {
+		return a != b
+	}
+	return a.UUID != b.UUID || a.State != b.State || a.HeartbeatSeq != b.HeartbeatSeq
+}
+
+// watchRegistry reports which slots belong to running nodes. The mount binary
+// leaves its slot active when it stops, so only a slot that changes shows a
+// running node: a heartbeat, or a node mounting during the watch.
+func (c *Checker) watchRegistry(reg *node.Registry, slots []*node.Slot) map[int]bool {
+	watch := time.Duration(0)
+	for _, slot := range slots {
 		if slot == nil || slot.State != node.NodeStateActive {
 			continue
 		}
-		watch := recentHeartbeatWatch
 		if time.Since(time.Unix(slot.HeartbeatTime, 0)) > node.HeartbeatTimeout {
-			watch = staleHeartbeatWatch
+			watch = max(watch, staleHeartbeatWatch)
+		} else {
+			watch = max(watch, recentHeartbeatWatch)
 		}
-		deadline[i] = start.Add(watch)
 	}
-	if len(deadline) > 0 {
-		c.logf("  Watching %d node heartbeats...\n", len(deadline))
+	if watch > 0 {
+		c.logf("  Watching the node registry for up to %s...\n", watch)
 	}
-	for {
-		for i, d := range deadline {
-			if !time.Now().Before(d) {
-				delete(deadline, i)
-			}
-		}
-		if len(deadline) == 0 {
-			return beating
-		}
+	running := make(map[int]bool)
+	c.registry = slots
+	for deadline := time.Now().Add(watch); len(running) == 0 && time.Now().Before(deadline); {
 		time.Sleep(node.HeartbeatInterval / 4)
 		now, _ := reg.Slots()
-		for i := range deadline {
-			if now[i] == nil || now[i].UUID != slots[i].UUID || now[i].HeartbeatSeq != slots[i].HeartbeatSeq {
-				beating[i] = now[i] != nil && now[i].State == node.NodeStateActive
-				delete(deadline, i)
+		for i := range now {
+			if slotChanged(slots[i], now[i]) && now[i] != nil && now[i].State == node.NodeStateActive {
+				running[i] = true
 			}
 		}
+		c.registry = now
 	}
+	return running
+}
+
+// beforeRepairWrites lets tests change the registry after the watch.
+var beforeRepairWrites func()
+
+// registryUnchanged fails when a node wrote its slot since startRepair
+// watched the registry: a node may have mounted the filesystem.
+func (c *Checker) registryUnchanged() error {
+	now, _ := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).Slots()
+	for i := range now {
+		if slotChanged(c.registry[i], now[i]) {
+			slot := now[i]
+			if slot == nil {
+				slot = c.registry[i]
+			}
+			return fmt.Errorf("%w: %s changed its node registry slot during repair; unmount it and run fsck again",
+				errRepairStopped, slotName(i, slot))
+		}
+	}
+	return nil
 }
 
 // journalNeedsReplay says why node i's journal may hold changes fsck cannot

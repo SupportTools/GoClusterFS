@@ -120,7 +120,7 @@ func TestFsckCleanAfterWorkload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	expectFsck(t, 4, "mounted by", "-repair", mfs.ImagePath)
+	expectFsck(t, 8, "mounted by", "-repair", mfs.ImagePath)
 	if err := mfs.Unmount(); err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +131,8 @@ func TestFsckCleanAfterWorkload(t *testing.T) {
 	}
 	// The mount binary leaves its slot behind with a clean journal.
 	expectFsck(t, 0, "Status: CLEAN", "-repair", mfs.ImagePath)
-	expectFsck(t, 4, "-dry-run needs -repair", "-dry-run", mfs.ImagePath)
-	expectFsck(t, 4, "Failed to open device", filepath.Join(t.TempDir(), "missing.img"))
+	expectFsck(t, 16, "-dry-run needs -repair", "-dry-run", mfs.ImagePath)
+	expectFsck(t, 8, "Failed to open device", filepath.Join(t.TempDir(), "missing.img"))
 }
 
 // shareLikeOlderVersions edits an unmounted image the way versions before
@@ -209,12 +209,12 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before := expectFsck(t, 1, "older versions", mfs.ImagePath)
-	expectFsck(t, 1, "nothing was written", "-repair", "-dry-run", mfs.ImagePath)
-	if after := expectFsck(t, 1, "older versions", mfs.ImagePath); strings.Join(problemLines(after), "\n") != strings.Join(problemLines(before), "\n") {
+	before := expectFsck(t, 4, "older versions", mfs.ImagePath)
+	expectFsck(t, 4, "nothing was written", "-repair", "-dry-run", mfs.ImagePath)
+	if after := expectFsck(t, 4, "older versions", mfs.ImagePath); strings.Join(problemLines(after), "\n") != strings.Join(problemLines(before), "\n") {
 		t.Fatalf("dry run changed the image:\nbefore:\n%s\nafter:\n%s", before, after)
 	}
-	expectFsck(t, 2, "Status: REPAIRED", "-repair", mfs.ImagePath)
+	expectFsck(t, 1, "Status: REPAIRED", "-repair", mfs.ImagePath)
 	if out := expectFsck(t, 0, "Status: CLEAN", mfs.ImagePath); len(problemLines(out)) > 0 {
 		t.Fatalf("problems left after repair:\n%s", out)
 	}

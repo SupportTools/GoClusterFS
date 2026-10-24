@@ -15,12 +15,13 @@
 //	-force: Keep checking after a fatal error; with -repair, repair even if
 //	        a stopped node's journal still needs replay
 //
-// Exit codes:
+// Exit codes, bits as with fsck(8):
 //
 //	0: No errors (warnings may remain)
-//	1: Errors remain on disk
-//	2: Every error found was repaired
-//	4: Usage error, I/O failure, or the check could not finish or was refused
+//	1: Errors were repaired
+//	4: Errors remain on disk
+//	8: I/O failure, or the check could not finish or was refused
+//	16: Usage error
 package main
 
 import (
@@ -58,11 +59,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -verbose -repair /dev/sdc    # Verbose repair\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -repair -dry-run /dev/sdc     # Show what repair would change\n", os.Args[0])
 		fmt.Fprint(os.Stderr, repairHelp)
-		fmt.Fprintf(os.Stderr, "\nExit codes:\n")
+		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
 		fmt.Fprintf(os.Stderr, "  0: No errors (warnings may remain)\n")
-		fmt.Fprintf(os.Stderr, "  1: Errors remain on disk\n")
-		fmt.Fprintf(os.Stderr, "  2: Every error found was repaired\n")
-		fmt.Fprintf(os.Stderr, "  4: Usage error, I/O failure, or the check could not finish or was refused\n")
+		fmt.Fprintf(os.Stderr, "  1: Errors were repaired\n")
+		fmt.Fprintf(os.Stderr, "  4: Errors remain on disk\n")
+		fmt.Fprintf(os.Stderr, "  8: I/O failure, or the check could not finish or was refused\n")
+		fmt.Fprintf(os.Stderr, "  16: Usage error\n")
 	}
 	flag.Parse()
 
@@ -80,11 +82,11 @@ func main() {
 	// Validate arguments
 	if flag.NArg() != 1 {
 		flag.Usage()
-		os.Exit(fsck.ExitFailed)
+		os.Exit(fsck.ExitUsage)
 	}
 	if *dryRun && !*repair {
 		fmt.Fprintln(os.Stderr, "Error: -dry-run needs -repair")
-		os.Exit(fsck.ExitFailed)
+		os.Exit(fsck.ExitUsage)
 	}
 	devicePath := flag.Arg(0)
 
@@ -105,7 +107,7 @@ func main() {
 	dev, err := storage.Open(devicePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: Failed to open device: %v\n", err)
-		os.Exit(fsck.ExitFailed)
+		os.Exit(fsck.ExitOperational)
 	}
 	defer dev.Close()
 
