@@ -24,7 +24,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -396,7 +395,7 @@ type Checker struct {
 	uncounted       map[uint32]int // inodes an older version shared -> problem index
 	refsIncomplete  []string       // why inodeBlocks may miss references
 	superblockFix   func() error   // runs once repair knows no node uses the filesystem
-	registry        []*node.Slot   // node slots as startRepair last saw them
+	registry        []byte         // node registry as startRepair last saw it
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.

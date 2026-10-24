@@ -1,6 +1,7 @@
 package fsck
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -162,11 +163,15 @@ func (c *Checker) nodes() (live, unclean []string) {
 	if err != nil {
 		unclean = append(unclean, fmt.Sprintf("a node slot is unreadable (%v)", err))
 	}
-	running := c.watchRegistry(reg, slots)
-	for i, slot := range c.registry {
+	running, err := c.watchRegistry(slots)
+	if err != nil {
+		live = append(live, fmt.Sprintf("the node registry is unreadable (%v)", err))
+	}
+	latest, _ := reg.Slots()
+	for i, slot := range slots {
 		switch {
 		case running[i]:
-			live = append(live, "filesystem is mounted by "+slotName(i, slot))
+			live = append(live, "filesystem is mounted by "+slotName(i, latest[i], slot))
 		case slot == nil:
 		default:
 			if why := c.journalNeedsReplay(i); why != "" {
@@ -178,22 +183,42 @@ func (c *Checker) nodes() (live, unclean []string) {
 	return live, unclean
 }
 
-func slotName(i int, slot *node.Slot) string {
-	return fmt.Sprintf("node %d (%s)", i, strings.TrimRight(string(slot.Hostname[:]), "\x00"))
+// slotName names node i after the first readable copy of its slot.
+func slotName(i int, slots ...*node.Slot) string {
+	for _, slot := range slots {
+		if slot != nil {
+			return fmt.Sprintf("node %d (%s)", i, strings.TrimRight(string(slot.Hostname[:]), "\x00"))
+		}
+	}
+	return fmt.Sprintf("node %d", i)
 }
 
-// slotChanged reports whether a node wrote its slot between two reads.
-func slotChanged(a, b *node.Slot) bool {
-	if a == nil || b == nil {
-		return a != b
+// readRegistry reads the node slots as raw bytes, so that a write to an
+// unreadable slot shows as a change too.
+func (c *Checker) readRegistry() ([]byte, error) {
+	size := min(c.sbData.NodeRegistrySize, node.MaxNodes*node.SlotSize) / node.SlotSize * node.SlotSize
+	buf := storage.NewAlignedBuffer(int(size)).Bytes()
+	if err := c.readSector(buf, c.sbData.NodeRegistryOffset); err != nil {
+		return nil, err
 	}
-	return a.UUID != b.UUID || a.State != b.State || a.HeartbeatSeq != b.HeartbeatSeq
+	return buf, nil
+}
+
+// changedSlots lists the slots whose bytes differ between two registry reads.
+func changedSlots(a, b []byte) []int {
+	var changed []int
+	for off := 0; off < len(a); off += node.SlotSize {
+		if !bytes.Equal(a[off:off+node.SlotSize], b[off:off+node.SlotSize]) {
+			changed = append(changed, off/node.SlotSize)
+		}
+	}
+	return changed
 }
 
 // watchRegistry reports which slots belong to running nodes. The mount binary
 // leaves its slot active when it stops, so only a slot that changes shows a
 // running node: a heartbeat, or a node mounting during the watch.
-func (c *Checker) watchRegistry(reg *node.Registry, slots []*node.Slot) map[int]bool {
+func (c *Checker) watchRegistry(slots []*node.Slot) (map[int]bool, error) {
 	watch := time.Duration(0)
 	for _, slot := range slots {
 		if slot == nil || slot.State != node.NodeStateActive {
@@ -209,18 +234,22 @@ func (c *Checker) watchRegistry(reg *node.Registry, slots []*node.Slot) map[int]
 		c.logf("  Watching the node registry for up to %s...\n", watch)
 	}
 	running := make(map[int]bool)
-	c.registry = slots
+	before, err := c.readRegistry()
+	if err != nil {
+		return running, err
+	}
+	c.registry = before
 	for deadline := time.Now().Add(watch); len(running) == 0 && time.Now().Before(deadline); {
 		time.Sleep(node.HeartbeatInterval / 4)
-		now, _ := reg.Slots()
-		for i := range now {
-			if slotChanged(slots[i], now[i]) && now[i] != nil && now[i].State == node.NodeStateActive {
-				running[i] = true
-			}
+		now, err := c.readRegistry()
+		if err != nil {
+			return running, err
 		}
-		c.registry = now
+		for _, i := range changedSlots(before, now) {
+			running[i] = true
+		}
 	}
-	return running
+	return running, nil
 }
 
 // beforeRepairWrites lets tests change the registry after the watch.
@@ -229,16 +258,14 @@ var beforeRepairWrites func()
 // registryUnchanged fails when a node wrote its slot since startRepair
 // watched the registry: a node may have mounted the filesystem.
 func (c *Checker) registryUnchanged() error {
-	now, _ := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).Slots()
-	for i := range now {
-		if slotChanged(c.registry[i], now[i]) {
-			slot := now[i]
-			if slot == nil {
-				slot = c.registry[i]
-			}
-			return fmt.Errorf("%w: %s changed its node registry slot during repair; unmount it and run fsck again",
-				errRepairStopped, slotName(i, slot))
-		}
+	now, err := c.readRegistry()
+	if err != nil {
+		return fmt.Errorf("%w: cannot read the node registry: %v", errRepairStopped, err)
+	}
+	if changed := changedSlots(c.registry, now); len(changed) > 0 {
+		latest, _ := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).Slots()
+		return fmt.Errorf("%w: %s changed its node registry slot during repair; unmount it and run fsck again",
+			errRepairStopped, slotName(changed[0], latest[changed[0]]))
 	}
 	return nil
 }
