@@ -105,6 +105,11 @@ const (
 	// FlagAutoDelete indicates the snapshot should be auto-deleted
 	// when no longer referenced.
 	FlagAutoDelete Flags = 1 << 3
+
+	// FlagHasData marks the current descriptor format: DataInode names a hidden
+	// inode that maps the blocks the snapshot captured. Descriptors written by
+	// older versions lack it and hold no data.
+	FlagHasData Flags = 1 << 4
 )
 
 // Errors
@@ -135,7 +140,8 @@ var (
 //	24      1     State (Creating/Active/Deleting)
 //	25      1     Flags (ReadOnly/Writable/Hidden)
 //	26      2     Reserved1
-//	28      8     ExtentTreeRoot (copied from inode at snapshot time)
+//	28      4     DataInode (hidden inode with the captured extents; only with FlagHasData)
+//	32      4     Reserved2 (older versions wrote an unused extent tree root at 28-35)
 //	36      8     TotalBlocks (block count at snapshot time)
 //	44      8     TotalSize (file size at snapshot time)
 //	52      8     CreateTime (Unix timestamp)
@@ -144,26 +150,32 @@ var (
 //	76      48    Name (null-terminated UTF-8 string)
 //	124     4     Checksum (CRC32C of bytes 0-123)
 type Descriptor struct {
-	Magic          uint32                   // 0x534E4150 "SNAP"
-	SnapshotID     uint64                   // Unique snapshot identifier
-	ParentID       uint64                   // Parent snapshot (0 for root)
-	TargetInode    uint32                   // Inode number of snapshotted file
-	State          State                    // Current state
-	Flags          Flags                    // Snapshot flags
-	Reserved1      uint16                   // Alignment padding
-	ExtentTreeRoot uint64                   // Extent tree root block
-	TotalBlocks    uint64                   // Number of blocks at snapshot time
-	TotalSize      uint64                   // File size at snapshot time
-	CreateTime     int64                    // Creation timestamp
-	DeleteTime     int64                    // Deletion timestamp (0 if active)
-	RefCountJobID  uint64                   // Background refcount job ID
-	Name           [MaxSnapshotNameLen]byte // Snapshot name
-	Checksum       uint32                   // CRC32C checksum
+	Magic         uint32                   // 0x534E4150 "SNAP"
+	SnapshotID    uint64                   // Unique snapshot identifier
+	ParentID      uint64                   // Parent snapshot (0 for root)
+	TargetInode   uint32                   // Inode number of snapshotted file
+	State         State                    // Current state
+	Flags         Flags                    // Snapshot flags
+	Reserved1     uint16                   // Alignment padding
+	DataInode     uint32                   // Hidden inode holding the captured extents
+	Reserved2     uint32                   // Reserved
+	TotalBlocks   uint64                   // Number of blocks at snapshot time
+	TotalSize     uint64                   // File size at snapshot time
+	CreateTime    int64                    // Creation timestamp
+	DeleteTime    int64                    // Deletion timestamp (0 if active)
+	RefCountJobID uint64                   // Background refcount job ID
+	Name          [MaxSnapshotNameLen]byte // Snapshot name
+	Checksum      uint32                   // CRC32C checksum
 }
 
 // IsValid returns true if this is a valid snapshot descriptor.
 func (d *Descriptor) IsValid() bool {
 	return d.Magic == DescriptorMagic && d.State != StateInvalid
+}
+
+// HasData reports whether the snapshot captured data that can be cloned.
+func (d *Descriptor) HasData() bool {
+	return d.Flags&FlagHasData != 0 && d.DataInode != 0
 }
 
 // IsFree returns true if this slot is free (can be reused).
@@ -247,14 +259,14 @@ func NewRegistry(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager
 //   - name: Human-readable snapshot name
 //   - targetInode: Inode number being snapshotted
 //   - parentID: Parent snapshot ID (0 for root snapshot)
-//   - extentTreeRoot: Extent tree root block from the inode
+//   - dataInode: Hidden inode holding the captured extents (0 for none)
 //   - totalBlocks: Number of blocks at snapshot time
 //   - totalSize: File size at snapshot time
 //   - flags: Snapshot flags (ReadOnly, Writable, etc.)
 //
 // Returns the new snapshot ID and descriptor.
 func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
-	parentID uint64, extentTreeRoot uint64, totalBlocks uint64,
+	parentID uint64, dataInode uint32, totalBlocks uint64,
 	totalSize uint64, flags Flags) (*Descriptor, error) {
 
 	if len(name) >= MaxSnapshotNameLen {
@@ -283,18 +295,20 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 	snapshotID := r.nextID
 	r.nextID++
 
-	// Create the descriptor
+	if dataInode != 0 {
+		flags |= FlagHasData
+	}
 	desc := &Descriptor{
-		Magic:          DescriptorMagic,
-		SnapshotID:     snapshotID,
-		ParentID:       parentID,
-		TargetInode:    targetInode,
-		State:          StateCreating, // Will be marked Active after refcount job
-		Flags:          flags | FlagReadOnly,
-		ExtentTreeRoot: extentTreeRoot,
-		TotalBlocks:    totalBlocks,
-		TotalSize:      totalSize,
-		CreateTime:     time.Now().Unix(),
+		Magic:       DescriptorMagic,
+		SnapshotID:  snapshotID,
+		ParentID:    parentID,
+		TargetInode: targetInode,
+		State:       StateCreating, // Will be marked Active after refcount job
+		Flags:       flags | FlagReadOnly,
+		DataInode:   dataInode,
+		TotalBlocks: totalBlocks,
+		TotalSize:   totalSize,
+		CreateTime:  time.Now().Unix(),
 	}
 	if err := desc.SetName(name); err != nil {
 		return nil, err
@@ -787,20 +801,21 @@ func decodeDescriptor(sectorData []byte, descIdx uint64) (*Descriptor, error) {
 	}
 
 	desc := &Descriptor{
-		Magic:          magic,
-		SnapshotID:     binary.LittleEndian.Uint64(data[4:12]),
-		ParentID:       binary.LittleEndian.Uint64(data[12:20]),
-		TargetInode:    binary.LittleEndian.Uint32(data[20:24]),
-		State:          State(data[24]),
-		Flags:          Flags(data[25]),
-		Reserved1:      binary.LittleEndian.Uint16(data[26:28]),
-		ExtentTreeRoot: binary.LittleEndian.Uint64(data[28:36]),
-		TotalBlocks:    binary.LittleEndian.Uint64(data[36:44]),
-		TotalSize:      binary.LittleEndian.Uint64(data[44:52]),
-		CreateTime:     int64(binary.LittleEndian.Uint64(data[52:60])),
-		DeleteTime:     int64(binary.LittleEndian.Uint64(data[60:68])),
-		RefCountJobID:  binary.LittleEndian.Uint64(data[68:76]),
-		Checksum:       stored,
+		Magic:         magic,
+		SnapshotID:    binary.LittleEndian.Uint64(data[4:12]),
+		ParentID:      binary.LittleEndian.Uint64(data[12:20]),
+		TargetInode:   binary.LittleEndian.Uint32(data[20:24]),
+		State:         State(data[24]),
+		Flags:         Flags(data[25]),
+		Reserved1:     binary.LittleEndian.Uint16(data[26:28]),
+		DataInode:     binary.LittleEndian.Uint32(data[28:32]),
+		Reserved2:     binary.LittleEndian.Uint32(data[32:36]),
+		TotalBlocks:   binary.LittleEndian.Uint64(data[36:44]),
+		TotalSize:     binary.LittleEndian.Uint64(data[44:52]),
+		CreateTime:    int64(binary.LittleEndian.Uint64(data[52:60])),
+		DeleteTime:    int64(binary.LittleEndian.Uint64(data[60:68])),
+		RefCountJobID: binary.LittleEndian.Uint64(data[68:76]),
+		Checksum:      stored,
 	}
 	copy(desc.Name[:], data[76:124])
 
@@ -829,7 +844,8 @@ func encodeDescriptor(sectorData []byte, descIdx uint64, desc *Descriptor) {
 	data[24] = byte(desc.State)
 	data[25] = byte(desc.Flags)
 	binary.LittleEndian.PutUint16(data[26:28], desc.Reserved1)
-	binary.LittleEndian.PutUint64(data[28:36], desc.ExtentTreeRoot)
+	binary.LittleEndian.PutUint32(data[28:32], desc.DataInode)
+	binary.LittleEndian.PutUint32(data[32:36], desc.Reserved2)
 	binary.LittleEndian.PutUint64(data[36:44], desc.TotalBlocks)
 	binary.LittleEndian.PutUint64(data[44:52], desc.TotalSize)
 	binary.LittleEndian.PutUint64(data[52:60], uint64(desc.CreateTime))

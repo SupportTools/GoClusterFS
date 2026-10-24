@@ -257,8 +257,8 @@ func TestRegistryCreate(t *testing.T) {
 	if desc.GetName() != "snap1" {
 		t.Errorf("Name = %q, want %q", desc.GetName(), "snap1")
 	}
-	if desc.ExtentTreeRoot != 1000 {
-		t.Errorf("ExtentTreeRoot = %d, want 1000", desc.ExtentTreeRoot)
+	if desc.DataInode != 1000 {
+		t.Errorf("DataInode = %d, want 1000", desc.DataInode)
 	}
 	if desc.TotalBlocks != 50 {
 		t.Errorf("TotalBlocks = %d, want 50", desc.TotalBlocks)
@@ -681,8 +681,8 @@ func TestRegistryPersistence(t *testing.T) {
 	if desc.State != StateActive {
 		t.Errorf("State = %v, want %v", desc.State, StateActive)
 	}
-	if desc.ExtentTreeRoot != 1000 {
-		t.Errorf("ExtentTreeRoot = %d, want 1000", desc.ExtentTreeRoot)
+	if desc.DataInode != 1000 {
+		t.Errorf("DataInode = %d, want 1000", desc.DataInode)
 	}
 }
 
@@ -740,7 +740,7 @@ func TestMultipleSectors(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		name := fmt.Sprintf("snap%d", i)
 		_, err := registry.Create(ctx, name, uint32(100+i), InvalidSnapshotID,
-			uint64(1000+i), uint64(50+i), uint64(1024*(i+1)), FlagReadOnly)
+			uint32(1000+i), uint64(50+i), uint64(1024*(i+1)), FlagReadOnly)
 		if err != nil {
 			t.Fatalf("Create(%s) failed: %v", name, err)
 		}

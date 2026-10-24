@@ -202,6 +202,9 @@ func NewWithComponents(
 	nodeUUID [16]byte,
 	dataOffset uint64,
 ) *FS {
+	if refcountReg != nil {
+		extentMgr.SetRefcounts(refcountReg)
+	}
 	return &FS{
 		dev:         dev,
 		lockMgr:     lockMgr,
@@ -246,7 +249,7 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 
 	// Create and start background worker
 	cfg := snapshot.DefaultWorkerConfig()
-	f.snapshotWkr = snapshot.NewWorker(f.snapshotReg, f.refcountReg, f.extentMgr, f.inodeTbl, cfg)
+	f.snapshotWkr = snapshot.NewWorker(f.snapshotReg, f.extentMgr, f.inodeTbl, cfg)
 	f.snapshotWkr.Start()
 
 	// Recover any incomplete jobs from crash
@@ -2704,16 +2707,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 	releaseInodeLock()
 
-	for _, cow := range cowDone {
-		newCount, decErr := f.fs.refcountReg.Decrement(ctx, cow.OldPhysBlock)
-		if decErr != nil {
-			// Log but don't fail - the write succeeded, refcount is secondary
-			log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
-				f.inodeNum, cow.OldPhysBlock, decErr)
-		} else if newCount == 0 {
-			log.Printf("[DEBUG] Write inode %d: old block %d refcount reached 0 (can be freed)",
-				f.inodeNum, cow.OldPhysBlock)
+	if len(cowDone) > 0 {
+		copied := make([]uint64, len(cowDone))
+		for i, cow := range cowDone {
+			copied[i] = cow.OldPhysBlock
 		}
+		f.fs.extentMgr.ReleaseBlocks(ctx, copied)
 	}
 
 	// Cache the freshly-written inode for subsequent reads
@@ -3284,8 +3283,8 @@ func (f *File) Removexattr(ctx context.Context, attr string) syscall.Errno {
 }
 
 // markShared marks every extent shared so writes to either copy use CoW.
-func (f *File) markShared(ino *inode.Inode) error {
-	if err := f.fs.extentMgr.MarkAllShared(ino); err != nil {
+func (f *FS) markShared(ino *inode.Inode) error {
+	if err := f.extentMgr.MarkAllShared(ino); err != nil {
 		return err
 	}
 	ino.Flags |= inode.FlagHasSnapshot
@@ -3293,29 +3292,128 @@ func (f *File) markShared(ino *inode.Inode) error {
 	return nil
 }
 
-// createSnapshot creates a new snapshot of this file.
+// shareInto gives dst the extents of inode srcNum, sharing its data blocks.
+// Each block gains an owner before dst maps it, and src is marked shared last,
+// so from then on writes to either inode copy blocks before changing them. On
+// error the caller discards dst, which gives back any blocks it maps.
+func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode) error {
+	src, err := f.inodeTbl.Read(srcNum)
+	if err != nil {
+		return err
+	}
+	blocks, err := f.extentMgr.DataBlocks(src)
+	if err != nil {
+		return err
+	}
+	if err := f.refcountReg.Share(ctx, blocks); err != nil {
+		return err
+	}
+	if err := f.extentMgr.CopyExtentsForClone(ctx, src, dst); err != nil {
+		f.extentMgr.ReleaseBlocks(ctx, blocks)
+		return err
+	}
+	dst.Size = src.Size
+	if err := f.inodeTbl.Write(ctx, dst); err != nil {
+		f.extentMgr.DiscardPending(ctx, dst)
+		// Only a conflict proves dst on disk does not map the blocks.
+		if errors.Is(err, extent.ErrTreeConflict) {
+			f.extentMgr.ReleaseBlocks(ctx, blocks)
+		}
+		return err
+	}
+	_, err = f.updateInode(ctx, srcNum, f.markShared)
+	return err
+}
+
+// claimInode allocates an inode slot, retrying when another node takes the
+// free slot first.
+func (f *FS) claimInode(ctx context.Context) (*inode.Inode, error) {
+	for attempt := 0; ; attempt++ {
+		num, err := f.inodeTbl.FindFreeSlot()
+		if err != nil {
+			return nil, err
+		}
+		ino, err := f.inodeTbl.ClaimSlot(ctx, num)
+		if !errors.Is(err, inode.ErrInodeInUse) || attempt == maxConflictRetries-1 {
+			return ino, err
+		}
+	}
+}
+
+// discardInode gives back the blocks an unlinked inode maps and frees it. The
+// empty extent map is committed before any block is released.
+func (f *FS) discardInode(ctx context.Context, num uint32) {
+	_, err := f.updateInode(ctx, num, func(ino *inode.Inode) error {
+		return f.extentMgr.Truncate(ctx, ino, 0)
+	})
+	if err == nil {
+		err = f.inodeTbl.Free(ctx, num)
+	}
+	if err != nil {
+		log.Printf("[clone] Failed to discard inode %d: %v", num, err)
+	}
+}
+
+// dropSnapshot marks a snapshot deleting and queues the job that gives back
+// its blocks. A snapshot left deleting is finished by the next mount.
+func (f *FS) dropSnapshot(ctx context.Context, snapshotID uint64) error {
+	if err := f.snapshotReg.Delete(ctx, snapshotID); err != nil {
+		return err
+	}
+	if _, err := f.snapshotWkr.QueueDeleteJob(ctx, snapshotID); err != nil {
+		log.Printf("[snapshot] Delete of snapshot %d waits for the next mount: %v", snapshotID, err)
+	}
+	return nil
+}
+
+// sharableInode reads this file's inode, moving it out of an SFB container
+// first: container slots are written in place and cannot be shared.
+func (f *File) sharableInode(ctx context.Context) (*inode.Inode, error) {
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil || !ino.IsSFBBacked() {
+		return ino, err
+	}
+	if err := f.migrateToExtent(ctx, ino); err != nil {
+		return nil, err
+	}
+	return f.fs.inodeTbl.Read(f.inodeNum)
+}
+
+// createSnapshot creates a new snapshot of this file. The snapshot's data is a
+// hidden inode that shares the file's blocks as they are now.
 func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	if f.fs.snapshotReg == nil || f.fs.snapshotWkr == nil {
 		log.Printf("[DEBUG] createSnapshot: snapshot subsystem not initialized")
 		return syscall.ENOTSUP
 	}
+	if len(name) >= snapshot.MaxSnapshotNameLen {
+		return syscall.ENAMETOOLONG
+	}
 
-	// Mark all extents as shared BEFORE creating snapshot (CoW active immediately)
-	ino, err := f.fs.updateInode(ctx, f.inodeNum, f.markShared)
+	src, err := f.sharableInode(ctx)
 	if err != nil {
-		log.Printf("[snapshot] Failed to mark extents shared for inode %d: %v", f.inodeNum, err)
+		log.Printf("[snapshot] Failed to read inode %d: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
 
-	blockNums, err := f.fs.extentMgr.DataBlocks(ino)
+	data, err := f.fs.claimInode(ctx)
 	if err != nil {
-		log.Printf("[snapshot] Failed to list blocks for inode %d: %v", f.inodeNum, err)
+		log.Printf("[snapshot] No inode for the data of a snapshot of inode %d: %v", f.inodeNum, err)
+		return syscall.ENOSPC
+	}
+	data.Mode, data.UID, data.GID = src.Mode, src.UID, src.GID
+	data.Mtime, data.Ctime = src.Mtime, src.Ctime
+	data.Flags |= inode.FlagSnapshotData
+	if err := f.fs.inodeTbl.Write(ctx, data); err != nil {
+		f.fs.inodeTbl.Free(ctx, data.InodeNum)
+		log.Printf("[snapshot] Failed to write data inode %d: %v", data.InodeNum, err)
 		return syscall.EIO
 	}
 
 	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
-		ino.ExtentTreeRoot, uint64(len(blockNums)), ino.Size, snapshot.FlagReadOnly)
+		data.InodeNum, src.AllocatedBlocks, src.Size, snapshot.FlagReadOnly)
 	if err != nil {
+		f.fs.inodeTbl.Free(ctx, data.InodeNum)
 		if errors.Is(err, snapshot.ErrSnapshotExists) {
 			return syscall.EEXIST
 		}
@@ -3325,9 +3423,16 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	// Queue background refcount increment (returns immediately)
-	if _, err := f.fs.snapshotWkr.QueueCreateJob(ctx, desc.SnapshotID, f.inodeNum, blockNums); err != nil {
-		log.Printf("[snapshot] Warning: queue job failed: %v", err)
+	err = f.fs.shareInto(ctx, f.inodeNum, data)
+	if err == nil {
+		err = f.fs.snapshotReg.UpdateState(ctx, desc.SnapshotID, snapshot.StateActive)
+	}
+	if err != nil {
+		log.Printf("[snapshot] Failed to create '%s' for inode %d: %v", name, f.inodeNum, err)
+		if dropErr := f.fs.dropSnapshot(ctx, desc.SnapshotID); dropErr != nil {
+			log.Printf("[snapshot] Failed to roll back snapshot %d: %v", desc.SnapshotID, dropErr)
+		}
+		return syscall.EIO
 	}
 
 	log.Printf("[snapshot] Created '%s' (ID=%d) for inode %d", name, desc.SnapshotID, f.inodeNum)
@@ -3352,19 +3457,9 @@ func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EINVAL
 	}
 
-	if err := f.fs.snapshotReg.Delete(ctx, desc.SnapshotID); err != nil {
+	if err := f.fs.dropSnapshot(ctx, desc.SnapshotID); err != nil {
+		log.Printf("[snapshot] Failed to delete '%s': %v", name, err)
 		return syscall.EIO
-	}
-
-	var blockNums []uint64
-	if ino, err := f.fs.inodeTbl.Read(f.inodeNum); err == nil {
-		if blockNums, err = f.fs.extentMgr.DataBlocks(ino); err != nil {
-			log.Printf("[snapshot] Failed to list blocks for inode %d: %v", f.inodeNum, err)
-		}
-	}
-
-	if _, err := f.fs.snapshotWkr.QueueDeleteJob(ctx, desc.SnapshotID, blockNums); err != nil {
-		log.Printf("[snapshot] Warning: queue delete job failed: %v", err)
 	}
 
 	log.Printf("[snapshot] Deleting '%s' (ID=%d)", name, desc.SnapshotID)
@@ -3376,6 +3471,18 @@ func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
 // point Copy-on-Write allocates new blocks for the modified data.
 func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 	log.Printf("[clone] Creating clone of inode %d at %s", f.inodeNum, destPath)
+	if _, err := f.sharableInode(ctx); err != nil {
+		log.Printf("[clone] Failed to read inode %d: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
+	return f.cloneInode(ctx, f.inodeNum, destPath)
+}
+
+// cloneInode creates a file at destPath that shares the blocks of inode srcNum.
+func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string) syscall.Errno {
+	if f.fs.refcountReg == nil {
+		return syscall.ENOTSUP
+	}
 
 	// Parse destination path
 	parentPath, cloneName, err := parseClonePath(destPath)
@@ -3403,10 +3510,9 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 		return syscall.EEXIST
 	}
 
-	// Mark source extents as shared (enables CoW on source)
-	srcIno, err := f.fs.updateInode(ctx, f.inodeNum, f.markShared)
+	srcIno, err := f.fs.inodeTbl.Read(srcNum)
 	if err != nil {
-		log.Printf("[clone] Failed to update source inode: %v", err)
+		log.Printf("[clone] Failed to read source inode %d: %v", srcNum, err)
 		return syscall.EIO
 	}
 
@@ -3435,47 +3541,24 @@ func (f *File) createClone(ctx context.Context, destPath string) syscall.Errno {
 		return syscall.ENOSPC
 	}
 
-	// Copy extents with FlagShared set
-	if err := f.fs.extentMgr.CopyExtentsForClone(ctx, srcIno, cloneIno); err != nil {
-		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
-		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
-		log.Printf("[clone] Failed to copy extents: %v", err)
-		return syscall.EIO
-	}
-
-	// Copy attributes from source
 	now := time.Now().UnixNano()
 	cloneIno.Mode = srcIno.Mode
 	cloneIno.UID = srcIno.UID
 	cloneIno.GID = srcIno.GID
-	cloneIno.Size = srcIno.Size
 	cloneIno.LinkCount = 1
 	cloneIno.Flags |= inode.FlagHasSnapshot
 	cloneIno.Atime = now
 	cloneIno.Mtime = now
 	cloneIno.Ctime = now
 
-	// Write clone inode
-	if err := f.fs.inodeTbl.Write(ctx, cloneIno); err != nil {
-		f.fs.extentMgr.DiscardPending(ctx, cloneIno)
+	if err := f.fs.shareInto(ctx, srcNum, cloneIno); err != nil {
 		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
-		f.fs.inodeTbl.Free(ctx, cloneInodeNum)
-		log.Printf("[clone] Failed to write clone inode: %v", err)
+		f.fs.discardInode(ctx, cloneInodeNum)
+		log.Printf("[clone] Failed to share blocks of inode %d: %v", srcNum, err)
 		return syscall.EIO
 	}
 
-	// Queue background refcount increment for shared blocks
-	blockNums, err := f.fs.extentMgr.DataBlocks(srcIno)
-	if err != nil {
-		log.Printf("[clone] Failed to list source blocks: %v", err)
-	}
-	if len(blockNums) > 0 && f.fs.snapshotWkr != nil {
-		if _, err := f.fs.snapshotWkr.QueueCreateJob(ctx, 0, f.inodeNum, blockNums); err != nil {
-			log.Printf("[clone] Warning: queue refcount job failed: %v", err)
-		}
-	}
-
-	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, f.inodeNum)
+	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, srcNum)
 	return 0
 }
 
@@ -3507,8 +3590,15 @@ func (f *File) createCloneFromSnapshot(ctx context.Context, data string) syscall
 		log.Printf("[clone] Snapshot '%s' belongs to inode %d, not %d", snapName, desc.TargetInode, f.inodeNum)
 		return syscall.EINVAL
 	}
+	if desc.State != snapshot.StateActive {
+		return syscall.EBUSY
+	}
+	if !desc.HasData() {
+		log.Printf("[clone] Snapshot '%s' was made by an older version and holds no data", snapName)
+		return syscall.ENOTSUP
+	}
 
-	return f.createClone(ctx, destPath)
+	return f.cloneInode(ctx, desc.DataInode, destPath)
 }
 
 // listSnapshots returns snapshot names for this file.

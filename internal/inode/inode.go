@@ -64,6 +64,7 @@ const (
 	FlagSync          uint16 = 1 << 3 // Synchronous updates
 	FlagImmutable     uint16 = 1 << 4 // Cannot be modified
 	FlagAppend        uint16 = 1 << 5 // Append-only
+	FlagSnapshotData  uint16 = 1 << 6 // Holds a snapshot's frozen extents; in no directory
 )
 
 // Errors
