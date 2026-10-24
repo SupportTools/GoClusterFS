@@ -1539,6 +1539,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
 
+  - id: write-failure-keeps-committed-blocks
+    name: Failed write keeps blocks committed mid-write
+    description: When the final inode write fails after a mid-write persist committed a new block, the retry finds that block still allocated and mapped
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestFailedWriteKeepsBlocksCommittedMidWrite
+
   - id: lock-region-bounded
     name: Lock region stays bounded
     description: Many acquire/release cycles across resources and two nodes reuse the fixed region, leave no record held, and write nothing outside it

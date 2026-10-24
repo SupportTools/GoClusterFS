@@ -2097,6 +2097,10 @@ func (f *FS) zeroBlock(physBlock uint64) error {
 	return err
 }
 
+// testHookBeforeInodeCommit, when set by a test, runs before writeInternal's final
+// inode write; an error it returns is handled as if that write had failed.
+var testHookBeforeInodeCommit func() error
+
 // allocateBlockLocked maps a new data block at blockNum and returns the inode
 // re-read under the inode lock, which stays held on success. The bitmap comes
 // before the inode in lock order, so the data block and any extent-tree blocks
@@ -2182,6 +2186,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	}, 0)
 	// Snapshot refcounts drop only after the inode write commits the copies.
 	var cowDone []*extent.CoWResult
+	// How many of allocatedExtents and cowDone a mid-write persist already put on disk.
+	committedAllocs, committedCoW := 0, 0
 	// Abort transaction on error path
 	defer func() {
 		if txn != nil && f.fs.journal != nil {
@@ -2210,6 +2216,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return retryOnTreeConflict(err)
 			}
 			inoDirty = false
+			committedAllocs, committedCoW = len(allocatedExtents), len(cowDone)
 		}
 		releaseInodeLock()
 		return nil
@@ -2620,8 +2627,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	ino.Size = newSize
 	ino.Mtime = newMtime
 
-	// On a tree conflict the blocks allocated here are unreferenced. Close the
-	// intent first so journal replay cannot map them again, then free them.
+	// On a tree conflict the blocks allocated since the last mid-write persist are
+	// unreferenced. Close the intent first so journal replay cannot map them again,
+	// then free them. Blocks the persist committed stay mapped on disk.
 	writeFailed := func(err error) error {
 		// The bitmap lock comes before the inode lock, so free only after dropping it.
 		releaseInodeLock()
@@ -2636,12 +2644,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 		var unused []uint64
-		for _, alloc := range allocatedExtents {
+		for _, alloc := range allocatedExtents[committedAllocs:] {
 			for i := uint64(0); i < uint64(alloc.count); i++ {
 				unused = append(unused, alloc.physicalBlock+i)
 			}
 		}
-		for _, cow := range cowDone {
+		for _, cow := range cowDone[committedCoW:] {
 			unused = append(unused, cow.NewPhysBlock)
 		}
 		for _, b := range unused {
@@ -2649,7 +2657,20 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				log.Printf("[DEBUG] Write inode %d: freeing block %d after tree conflict failed: %v", f.inodeNum, b, err)
 			}
 		}
+		// The retry finds these blocks already copied, so release the old ones now.
+		for _, cow := range cowDone[:committedCoW] {
+			if _, err := f.fs.refcountReg.Decrement(ctx, cow.OldPhysBlock); err != nil {
+				log.Printf("[WARN] Write inode %d: failed to decrement refcount on old block %d: %v",
+					f.inodeNum, cow.OldPhysBlock, err)
+			}
+		}
 		return errRetryWrite
+	}
+
+	if testHookBeforeInodeCommit != nil {
+		if err := testHookBeforeInodeCommit(); err != nil {
+			return 0, writeFailed(err)
+		}
 	}
 
 	// Write inode - use WriteWithLockHeld if we hold the lock
