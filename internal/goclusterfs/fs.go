@@ -1187,6 +1187,9 @@ func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) sys
 		log.Printf("[DEBUG] Setattr directory inode %d failed: %v", num, err)
 		return syscall.EIO
 	}
+	if f.cacheMgr != nil {
+		f.cacheMgr.BroadcastInvalidateInode(num, updated.DataGeneration, updated.MetaGeneration)
+	}
 	f.cacheInode(updated)
 	return 0
 }
@@ -3093,7 +3096,9 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		return syscall.EIO, nil
 	}
 
-	// Cache the freshly-written inode for subsequent reads
+	if f.fs.cacheMgr != nil {
+		f.fs.cacheMgr.BroadcastInvalidateInode(f.inodeNum, ino.DataGeneration, ino.MetaGeneration)
+	}
 	f.fs.cacheInode(ino)
 
 	// === WAL: Mark intent complete ===
