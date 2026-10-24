@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -306,6 +307,59 @@ func TestMultiNodeCrashRecovery(t *testing.T) {
 	}
 
 	t.Log("Crash recovery test completed - filesystem remains functional after crash")
+}
+
+// TestMultiNodeCreateDuringDirectoryGrowth checks that no entries are lost when two
+// nodes create files in one directory while it grows past its first block.
+func TestMultiNodeCreateDuringDirectoryGrowth(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+
+	// 255-byte names fit 3840 entries in a 1 MB directory block; the volume has 4093 free inodes.
+	const perNode = 2000
+	prefix := strings.Repeat("x", 248)
+	name := func(node, i int) string { return fmt.Sprintf("%s-%d-%04d", prefix, node, i) }
+
+	errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+		for i := 0; i < perNode; i++ {
+			if err := node.WriteFile(name(idx, i), nil); err != nil {
+				return fmt.Errorf("create %d: %w", i, err)
+			}
+		}
+		return nil
+	})
+	for idx, err := range errs {
+		if err != nil {
+			t.Fatalf("Node %d: %v", idx, err)
+		}
+	}
+
+	for idx := 0; idx < 2; idx++ {
+		entries, err := cluster.Node(idx).ReadDir("")
+		if err != nil {
+			t.Fatalf("Node %d: list root: %v", idx, err)
+		}
+		seen := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			seen[e.Name()] = true
+		}
+		missing := 0
+		for node := 0; node < 2; node++ {
+			for i := 0; i < perNode; i++ {
+				if !seen[name(node, i)] {
+					missing++
+				}
+			}
+		}
+		if missing > 0 {
+			t.Errorf("Node %d lists %d entries; %d of %d created files are missing", idx, len(entries), missing, 2*perNode)
+		}
+	}
 }
 
 // TestMultiNodeConcurrentDirectoryOps tests multiple nodes performing directory operations
