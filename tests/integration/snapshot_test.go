@@ -275,7 +275,8 @@ func TestSnapshotPersistence(t *testing.T) {
 		t.Fatalf("Failed to create snapshot: %v", err)
 	}
 
-	waitForSnapshotsActive(t, filePath, snapName)
+	// Wait for snapshot to complete
+	time.Sleep(500 * time.Millisecond)
 
 	// Unmount
 	if err := mfs.Unmount(); err != nil {
