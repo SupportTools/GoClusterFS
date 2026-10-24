@@ -228,6 +228,8 @@ type Manager struct {
 	gates map[uint64]*sync.Mutex
 	// yieldUntil holds records this node gave up and will not claim again before then.
 	yieldUntil map[uint64]time.Time
+	// writeWindow is how long after its read a record write may start and finish.
+	writeWindow time.Duration
 	// casWrite, when set by a test, replaces the device write of a record CAS.
 	casWrite func(buf []byte, offset int64, deadline time.Time) (int, error)
 
@@ -281,6 +283,8 @@ var (
 	cacheGrace       = CacheGrace
 	yieldGap         = YieldGap
 	fenceWindow      = StaleThreshold / 2
+	// claimWriteWindow is each new Manager's writeWindow.
+	claimWriteWindow = ClaimSettleDelay / 2
 )
 
 // releaseParallelism is how many kept records ReleaseCached frees at once.
@@ -320,34 +324,26 @@ var (
 // NewManager creates a new lock manager.
 func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nodeSlot int) *Manager {
 	return &Manager{
-		dev:        dev,
-		offset:     offset,
-		size:       size,
-		nodeUUID:   nodeUUID,
-		nodeSlot:   nodeSlot,
-		heldLocks:  make(map[lockKey]*heldLock),
-		records:    make(map[uint64]*heldRecord),
-		gates:      make(map[uint64]*sync.Mutex),
-		yieldUntil: make(map[uint64]time.Time),
-		hintCache:  newHintLRU(HintCacheSize),
+		dev:         dev,
+		offset:      offset,
+		size:        size,
+		nodeUUID:    nodeUUID,
+		nodeSlot:    nodeSlot,
+		heldLocks:   make(map[lockKey]*heldLock),
+		records:     make(map[uint64]*heldRecord),
+		gates:       make(map[uint64]*sync.Mutex),
+		yieldUntil:  make(map[uint64]time.Time),
+		hintCache:   newHintLRU(HintCacheSize),
+		writeWindow: claimWriteWindow,
 	}
 }
 
 // NewManagerWithHintCacheSize creates a lock manager with a custom hint cache size.
 // Use this for testing or when you need to tune the cache size.
 func NewManagerWithHintCacheSize(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nodeSlot int, hintCacheSize int) *Manager {
-	return &Manager{
-		dev:        dev,
-		offset:     offset,
-		size:       size,
-		nodeUUID:   nodeUUID,
-		nodeSlot:   nodeSlot,
-		heldLocks:  make(map[lockKey]*heldLock),
-		records:    make(map[uint64]*heldRecord),
-		gates:      make(map[uint64]*sync.Mutex),
-		yieldUntil: make(map[uint64]time.Time),
-		hintCache:  newHintLRU(hintCacheSize),
-	}
+	m := NewManager(dev, offset, size, nodeUUID, nodeSlot)
+	m.hintCache = newHintLRU(hintCacheSize)
+	return m
 }
 
 // SetOnAcquire registers a callback that is invoked when a lock is acquired.
@@ -1041,14 +1037,14 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 // casRecordOptimistic writes new over a record that is free and at expectedSeq.
 // This saves one disk read compared to casRecord when the hint is correct.
 func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *Record) (bool, error) {
-	return m.casRecordIf(recordID, new, ClaimSettleDelay/2, func(seq uint64, mode LockMode) bool {
+	return m.casRecordIf(recordID, new, m.writeWindow, func(seq uint64, mode LockMode) bool {
 		return seq == expectedSeq && mode == LockModeNone
 	})
 }
 
 // casRecord writes new over a record that is still at expected's sequence.
 func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error) {
-	return m.casRecordIf(recordID, new, ClaimSettleDelay/2, func(seq uint64, _ LockMode) bool {
+	return m.casRecordIf(recordID, new, m.writeWindow, func(seq uint64, _ LockMode) bool {
 		return seq == expected.Sequence
 	})
 }

@@ -48,9 +48,17 @@ jobs:
             exit 1
           fi
 
+      # Test images go on tmpfs: 4KB O_DIRECT writes on the runner's disk can take
+      # longer than the 10ms a lock record write is allowed.
       - name: Unit Tests
         shell: bash
-        run: make test-unit 2>&1 | tee unit-test.log
+        env:
+          TMPDIR: /dev/shm/gcfs-unit
+          GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-unit
+        run: |
+          mkdir -p "$TMPDIR"
+          dd if=/dev/zero of="$TMPDIR/odirect-check" bs=4096 count=1 oflag=direct
+          make test-unit 2>&1 | tee unit-test.log
 
       - name: Coverage summary
         run: |

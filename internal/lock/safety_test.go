@@ -617,18 +617,25 @@ func slowWrite(m *Manager, stall, queued, after time.Duration) func([]byte, int6
 	}
 }
 
+// useWrites sends m's record writes through write and holds them to the real
+// write window, which TestMain relaxes for tests that are not about it.
+func useWrites(m *Manager, write func([]byte, int64, time.Time) (int, error)) {
+	m.writeWindow = ClaimSettleDelay / 2
+	m.casWrite = write
+}
+
 // slowFirstWrite makes m's first record write go through first, closing started
 // as it begins, and every later one through then.
 func slowFirstWrite(m *Manager, first, then func([]byte, int64, time.Time) (int, error), started chan<- struct{}) {
 	var once sync.Once
-	m.casWrite = func(buf []byte, offset int64, deadline time.Time) (int, error) {
+	useWrites(m, func(buf []byte, offset int64, deadline time.Time) (int, error) {
 		write := then
 		once.Do(func() {
 			write = first
 			close(started)
 		})
 		return write(buf, offset, deadline)
-	}
+	})
 }
 
 // A node whose claim write cannot start within half the settle delay of its
@@ -774,7 +781,7 @@ func TestReleaseWithSlowWritesGivesUp(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	requireAcquired(t, a, LockTypeInode, 23, LockModeExclusive)
-	a.casWrite = slowWrite(a, ClaimSettleDelay, 0, 0)
+	useWrites(a, slowWrite(a, ClaimSettleDelay, 0, 0))
 
 	returnsWithin(t, "release", func() {
 		a.Release(LockTypeInode, 23)
@@ -790,7 +797,7 @@ func TestRenewalWithSlowWritesGivesUp(t *testing.T) {
 	defer func(d time.Duration) { renewAfter = d }(renewAfter)
 	renewAfter = 0
 	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
-	a.casWrite = slowWrite(a, ClaimSettleDelay, 0, 0)
+	useWrites(a, slowWrite(a, ClaimSettleDelay, 0, 0))
 
 	var err error
 	returnsWithin(t, "renewal", func() { err = acquireWithin(a, time.Minute, LockTypeInode, 2, LockModeExclusive) })
@@ -819,7 +826,7 @@ func TestReleaseCachedWithSlowWritesRunsInParallel(t *testing.T) {
 			t.Fatalf("Release: %v", err)
 		}
 	}
-	a.casWrite = slowWrite(a, ClaimSettleDelay, 0, 0)
+	useWrites(a, slowWrite(a, ClaimSettleDelay, 0, 0))
 
 	start := time.Now()
 	a.ReleaseCached()
