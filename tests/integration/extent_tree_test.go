@@ -5,7 +5,6 @@ import (
 	"os"
 	"syscall"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -262,13 +261,7 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	if err := unix.Removexattr(path, "user.snapshot.tree-snap"); err != nil && err != syscall.ENODATA {
 		t.Fatalf("deleting snapshot failed: %v", err)
 	}
-	listed := make([]byte, 4096)
-	if _, ok := waitFor(10*time.Second, func() bool {
-		n, err := unix.Getxattr(path, "user.snapshots", listed)
-		return err == nil && !bytes.Contains(listed[:n], []byte("tree-snap"))
-	}); !ok {
-		t.Fatal("snapshot still listed 10s after delete")
-	}
+	waitForSnapshotState(t, path, "", "tree-snap")
 	// The snapshot's own extent tree node is the only block nothing else maps.
 	if got := freeBlocks() - before; got != 1 {
 		t.Errorf("deleting the snapshot freed %d blocks, want 1", got)

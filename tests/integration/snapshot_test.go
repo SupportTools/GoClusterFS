@@ -504,9 +504,7 @@ func TestSnapshotDeleteAndReuse(t *testing.T) {
 	if err != nil && err != syscall.ENODATA {
 		t.Fatalf("Removexattr failed: %v", err)
 	}
-
-	// Wait for background deletion and block freeing
-	time.Sleep(500 * time.Millisecond)
+	waitForSnapshotState(t, filePath, "", "temp-snap")
 
 	// Verify the live file still has the new content
 	readBack, err := mfs.ReadFile("reuse.txt")
@@ -940,13 +938,7 @@ func TestSnapshotDeleteAfterOverwrite(t *testing.T) {
 	if err := unix.Removexattr(mfs.Path("data.bin"), "user.snapshot.temp"); err != nil {
 		t.Fatalf("delete snapshot: %v", err)
 	}
-	listed := make([]byte, 4096)
-	if _, ok := waitFor(10*time.Second, func() bool {
-		n, err := unix.Getxattr(mfs.Path("data.bin"), "user.snapshots", listed)
-		return err == nil && !bytes.Contains(listed[:n], []byte("temp"))
-	}); !ok {
-		t.Fatal("snapshot still listed 10s after delete")
-	}
+	waitForSnapshotState(t, mfs.Path("data.bin"), "", "temp")
 	if got := freeBlocks(t, mfs); got != free {
 		t.Fatalf("free blocks after deleting the snapshot = %d, want %d", got, free)
 	}

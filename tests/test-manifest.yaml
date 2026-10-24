@@ -1306,7 +1306,7 @@ scenarios:
     description: A delete job queued with an already canceled request context still runs
     priority: go_only
     environments:
-      go: internal/snapshot/worker_test.go::TestQueueDeleteJobIgnoresCanceledContext
+      go: internal/snapshot/worker_test.go::TestWorkerQueuesJobsWithCanceledContext
 
   - id: refcount-share-release
     name: Block reference sharing
