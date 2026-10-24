@@ -594,6 +594,27 @@ func (r *Registry) GetActiveNodes() ([]*Slot, error) {
 	return active, nil
 }
 
+// Slots returns every node slot, with nil for empty or unreadable ones. The
+// error names the unreadable ones.
+func (r *Registry) Slots() ([]*Slot, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	slots := make([]*Slot, MaxNodes)
+	var errs []error
+	for i := range slots {
+		slot, err := r.readSlot(i)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("slot %d: %w", i, err))
+			continue
+		}
+		if slot.State != NodeStateEmpty {
+			slots[i] = slot
+		}
+	}
+	return slots, errors.Join(errs...)
+}
+
 // LocalUUID returns this node's UUID.
 func (r *Registry) LocalUUID() [16]byte {
 	return r.localUUID
