@@ -57,9 +57,13 @@ func (env *treeEnv) remount(nodeCap int) {
 
 func (env *treeEnv) newInode() *inode.Inode {
 	env.t.Helper()
-	ino, err := env.tbl.Alloc(env.ctx)
+	num, err := env.tbl.FindFreeSlot()
 	if err != nil {
-		env.t.Fatalf("Alloc inode: %v", err)
+		env.t.Fatalf("find free inode: %v", err)
+	}
+	ino, err := env.tbl.ClaimSlot(env.ctx, num)
+	if err != nil {
+		env.t.Fatalf("claim inode %d: %v", num, err)
 	}
 	ino.Mode = inode.S_IFREG | 0o644
 	return ino

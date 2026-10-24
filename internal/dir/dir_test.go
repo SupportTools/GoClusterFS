@@ -739,7 +739,11 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 
 	ctx := context.Background()
-	dirIno, err := inodeTbl.Alloc(ctx)
+	num, err := inodeTbl.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirIno, err := inodeTbl.ClaimSlot(ctx, num)
 	if err != nil {
 		t.Fatal(err)
 	}

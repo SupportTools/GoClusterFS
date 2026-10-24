@@ -534,18 +534,21 @@ func TestFsckExtentTree(t *testing.T) {
 	mgr := extent.NewManager(dev, bm, nil, dataOffset)
 	tbl.SetTreeFlusher(mgr)
 
-	// Two files appended alternately end up with one extent per block.
-	a, err := tbl.Alloc(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := tbl.Alloc(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, ino := range []*inode.Inode{a, b} {
+	newFile := func() *inode.Inode {
+		num, err := tbl.FindFreeSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino, err := tbl.ClaimSlot(ctx, num)
+		if err != nil {
+			t.Fatal(err)
+		}
 		ino.Mode = inode.S_IFREG | 0o644
+		return ino
 	}
+
+	// Two files appended alternately end up with one extent per block.
+	a, b := newFile(), newFile()
 	for blk := uint64(0); blk < 6; blk++ {
 		for _, ino := range []*inode.Inode{a, b} {
 			if _, err := mgr.AllocateBlocks(ctx, ino, blk, 1); err != nil {

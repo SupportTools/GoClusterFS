@@ -61,9 +61,13 @@ func newTreeFSImage(t *testing.T) string {
 
 func newRegularFile(t *testing.T, fsys *FS) *File {
 	t.Helper()
-	ino, err := fsys.inodeTbl.Alloc(context.Background())
+	num, err := fsys.inodeTbl.FindFreeSlot()
 	if err != nil {
-		t.Fatalf("Alloc inode: %v", err)
+		t.Fatalf("find free inode: %v", err)
+	}
+	ino, err := fsys.inodeTbl.ClaimSlot(context.Background(), num)
+	if err != nil {
+		t.Fatalf("claim inode %d: %v", num, err)
 	}
 	ino.Mode = inode.S_IFREG | 0o644
 	if err := fsys.inodeTbl.Write(context.Background(), ino); err != nil {
