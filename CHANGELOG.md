@@ -45,6 +45,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Writes failed with `EAGAIN` once a file needed a third extent, so most files over 2 MB could not be written. Extents past the first two now go in an on-disk extent tree, and adjacent extents merge.
+- `goclusterfs-fsck` phase 4 never checked file extents, because it read inodes into unaligned buffers that `O_DIRECT` rejects.
 - A node could serve a stale cached inode after another node freed and reused its inode number. Inode generations now survive free and reuse, and opening a file reloads its inode from disk.
 - Journal recovery no longer panics, loops forever, or allocates gigabytes on a corrupt journal. It now rejects short entries and bad ring geometry as corrupt.
 - Lock-order violations when several nodes create files and directories at the same time.
