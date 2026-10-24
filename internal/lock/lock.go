@@ -572,6 +572,7 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 
 	// A record held for a colliding resource is still held; taking it over lets two nodes hold it.
 	var sharedCount uint32
+	acquireTime := now.Unix()
 	reason := ""
 	switch {
 	case record.Mode == LockModeNone:
@@ -584,6 +585,8 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	case mode == LockModeShared && record.Mode == LockModeShared:
 		reason = "shared_add"
 		sharedCount = record.SharedCount
+		// Keep the first reader's time: a count leaked by a lost CAS update must still go stale.
+		acquireTime = record.AcquireTime
 
 	case record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID:
 		// Leftover from a failed release or an earlier mount; this node holds no key on it.
@@ -604,7 +607,7 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		ResourceID:  resourceID,
 		OwnerUUID:   m.nodeUUID,
 		OwnerSlot:   uint32(m.nodeSlot),
-		AcquireTime: now.Unix(),
+		AcquireTime: acquireTime,
 		Sequence:    record.Sequence + 1,
 	}
 	if mode == LockModeShared {

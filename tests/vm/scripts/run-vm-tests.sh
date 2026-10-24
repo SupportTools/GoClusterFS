@@ -2330,6 +2330,43 @@ test_stability() {
 # =============================================================================
 
 # Test 10: Two VMs write to same file at different offsets
+# Two VMs write different ranges of each new file's first block at once.
+# Without the inode lock the later inode write drops the other VM's extent.
+test_concurrent_first_write_same_block() {
+    log_info "Testing concurrent first writes to the same block (2 VMs)..."
+    ensure_cluster_healthy 2
+
+    local files=10
+    local size=65536
+    local offset0=262144
+    local offset1=524288
+
+    for i in $(seq 1 $files); do
+        ssh_run 1 "touch /mnt/goclusterfs/first_write_$i.bin"
+    done
+    sleep 2
+
+    for i in $(seq 1 $files); do
+        write_pattern_at_on_vm 1 "first_write_$i.bin" "A" "$size" "$offset0" &
+        write_pattern_at_on_vm 2 "first_write_$i.bin" "B" "$size" "$offset1" &
+        wait
+    done
+    sleep 2
+
+    # Each writer caches its own extent, so a lost update shows on either reader.
+    local lost=0
+    for i in $(seq 1 $files); do
+        verify_pattern_at_on_vm 1 "first_write_$i.bin" "A" "$offset0" 4096 || lost=$((lost + 1))
+        verify_pattern_at_on_vm 1 "first_write_$i.bin" "B" "$offset1" 4096 || lost=$((lost + 1))
+    done
+    if [[ $lost -gt 0 ]]; then
+        log_error "$lost of $((files * 2)) concurrent first writes lost"
+        return 1
+    fi
+    log_success "All concurrent first writes survived"
+    return 0
+}
+
 test_concurrent_same_file_writes() {
     log_info "Testing concurrent same-file writes (2 VMs)..."
     ensure_cluster_healthy 2
@@ -2874,6 +2911,7 @@ main() {
     run_test "Long-Running Stability" test_stability
 
     # Run concurrent same-file write tests (using pre-extension pattern)
+    run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
     run_test "Concurrent Same-File Writes (2 VMs)" test_concurrent_same_file_writes
     run_test "Concurrent Same-File Writes (3 VMs)" test_concurrent_same_file_writes_3vms
     run_test "Mixed Size Writes" test_mixed_size_writes

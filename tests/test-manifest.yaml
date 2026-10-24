@@ -304,6 +304,15 @@ scenarios:
       docker: run-tests.sh::test_mixed_size_writes
       vm: run-vm-tests.sh::test_mixed_size_writes
 
+  - id: multinode-concurrent-first-write-same-block
+    name: Concurrent first write to the same block
+    description: Two nodes write different ranges of a new file's first block at once; both writes survive
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeConcurrentFirstWriteToSameBlock
+      docker: run-tests.sh::test_concurrent_first_write_same_block
+      vm: run-vm-tests.sh::test_concurrent_first_write_same_block
+
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
     description: Multiple nodes write to same block at different offsets
@@ -1381,6 +1390,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestStaleSharedLockReclaimResetsReaderCount
+
+  - id: lock-leaked-shared-count-goes-stale
+    name: Leaked reader count goes stale
+    description: New readers do not refresh a shared record's age, so a reader count leaked by a lost update cannot block writers forever
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
 
   - id: lock-region-bounded
     name: Lock region stays bounded
