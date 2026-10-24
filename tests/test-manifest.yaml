@@ -535,6 +535,20 @@ scenarios:
     environments:
       go: internal/lock/reclaim_test.go::TestAdoptOwnerHoldsDeadNodesLocksUntilReleased
 
+  - id: refcount-blocks-past-region
+    name: Refcounts never write past their region
+    description: On a 200 GiB volume, changes to blocks the 1 MB refcount region has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the snapshot registry after the region is unchanged
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheSnapshotRegistryAlone
+
+  - id: snapshot-refuses-blocks-past-refcount-region
+    name: Snapshot and clone refuse blocks the refcount region cannot count
+    description: Snapshot and clone of a file with blocks past the refcount region fail with ENOTSUP and leave the file unmarked, so later writes do not copy blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotRefusesBlocksPastRefcountRegion
+
   - id: registry-slot-journal-region
     name: Registry records each slot's journal region
     description: Register stores a distinct journal region in each slot
@@ -836,6 +850,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckRepairsOlderSharing
+
+  - id: fsck-sharing-past-refcount-table
+    name: fsck reports sharing the refcount table cannot count
+    description: On a 200 GiB volume fsck warns that the refcount table covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckReportsSharingPastRefcountTable
 
   - id: fsck-rebuild-refcount-sector
     name: fsck -repair rebuilds a corrupt refcount sector
@@ -1175,6 +1196,23 @@ scenarios:
       docker: TODO - the kernel serializes writes to one file per mount, so a shell version checks nothing the Go mount test does not
       vm: TODO - same reason as docker
 
+  # chmod has no multi-node side, and the Go test runs it through a real mount.
+  - id: chmod-keeps-file-type
+    name: chmod keeps the file type
+    description: chmod on a file, a directory and the mount root changes only permission bits; the file stays readable, stat shows the right type, and fsck is clean
+    priority: medium
+    environments:
+      go: chmod_test.go::TestChmodKeepsFileType
+      docker: TODO - single-node FUSE behavior already covered by the Go mount test
+      vm: TODO - same reason as docker
+
+  - id: cache-stats-hit-rate
+    name: Cache stats hit rate is a percentage
+    description: The unmount cache summary prints hit rates between 0 and 100 percent
+    priority: go_only
+    environments:
+      go: internal/cache/stats_test.go::TestStatsStringShowsHitRatePercent
+
   # Block 0 belongs to the root directory on a formatted volume, so FUSE cannot reach this case.
   - id: read-physical-block-zero
     name: Data in physical block 0 is readable
@@ -1370,6 +1408,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cache/extent_cache_test.go::TestGetExtentCountsStaleEntryAsMiss
+
+  - id: inode-update-locked-two-nodes
+    name: Locked inode update waits for another node
+    description: Another node's link count update between this node's read and write of a directory inode is not lost
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/inode_update_test.go::TestUpdateInodeLockedWaitsForOtherNode
 
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages

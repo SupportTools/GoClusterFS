@@ -29,7 +29,7 @@ This guide covers deploying GoClusterFS in both single-node and multi-node clust
 ### Software Requirements
 
 - **Operating System**: Linux (kernel 4.x or later)
-- **Go**: Version 1.21 or later (for building from source)
+- **Go**: Version 1.26 or later (for building from source)
 - **FUSE**: `fuse3` package with `fusermount3` utility
 
 ```bash
@@ -62,7 +62,7 @@ newgrp fuse
 | Requirement | Details |
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
-| Multicast | UDP multicast support (or unicast fallback) |
+| Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
 | Ports | UDP 31337 (configurable) |
 | Latency | < 10ms between nodes recommended |
 
@@ -77,28 +77,27 @@ newgrp fuse
 git clone https://github.com/supporttools/GoClusterFS.git
 cd GoClusterFS
 
-# Build mount binary
-go build -o goclusterfs ./cmd/mount
-
-# Build fsck binary
-go build -o goclusterfs-fsck ./cmd/fsck
+# Build goclusterfs-mount and goclusterfs-fsck
+make build
 
 # Optional: Install to system path
-sudo cp goclusterfs goclusterfs-fsck /usr/local/bin/
+sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
 ```
 
 ### Verify Build
 
 ```bash
-./goclusterfs -help
-./goclusterfs-fsck -help
+./goclusterfs-mount -h
+./goclusterfs-fsck -version
 ```
+
+Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the GitHub Releases page.
 
 ---
 
 ## Block Device Setup
 
-GoClusterFS can use any O_DIRECT-capable block device.
+GoClusterFS can use any O_DIRECT-capable block device of at least 264 MB. The layout reserves 256 MB for 64 node journals of 4 MB.
 
 ### Option 1: File-Backed Device (Development/Testing)
 
@@ -109,8 +108,8 @@ truncate -s 10G /path/to/goclusterfs.img
 # Or create pre-allocated file (better performance)
 dd if=/dev/zero of=/path/to/goclusterfs.img bs=1M count=10240
 
-# Verify O_DIRECT support
-# Note: tmpfs does NOT support O_DIRECT
+# Verify O_DIRECT support (tmpfs supports it only on Linux 6.6 and later)
+dd if=/dev/zero of=/path/to/goclusterfs.img bs=4k count=1 oflag=direct conv=notrunc
 ```
 
 ### Option 2: LVM Logical Volume
@@ -157,18 +156,21 @@ nvme connect -t tcp -n <nqn> -a <target-ip> -s 4420
 
 ### Basic Format
 
+`-format` needs a mount point. It writes a new superblock, zeroes all metadata, and then mounts the filesystem.
+
 ```bash
-./goclusterfs -format -device /path/to/device
+mkdir -p /mnt/goclusterfs
+./goclusterfs-mount -device /path/to/device -mount /mnt/goclusterfs -format
 ```
 
-### Format with Custom Block Size
+Press Ctrl+C or run `fusermount3 -u /mnt/goclusterfs` to unmount. Never pass `-format` again on a device that holds data, and never while another node has it mounted.
 
-The default block size is 1 MB. This is fixed in the current version.
+The block size is fixed at 1 MB, and the inode count at 4096.
 
 ### Verify Format
 
 ```bash
-# Check superblock
+# After unmounting
 ./goclusterfs-fsck /path/to/device
 ```
 
@@ -182,21 +184,16 @@ The default block size is 1 MB. This is fixed in the current version.
 # Create mount point
 mkdir -p /mnt/goclusterfs
 
-# Mount with defaults
-./goclusterfs -device /path/to/device -mount /mnt/goclusterfs
+# Mount with defaults (journal, broadcast, TRIM and snapshots on)
+./goclusterfs-mount -device /path/to/device -mount /mnt/goclusterfs
 ```
 
-### Mount with Journaling
+### Mount with FUSE Request Tracing
+
+`-debug` logs every FUSE request. The mount logs its own `[DEBUG]` lines either way.
 
 ```bash
-./goclusterfs -device /path/to/device -mount /mnt/goclusterfs \
-    -journal
-```
-
-### Mount with Debug Logging
-
-```bash
-./goclusterfs -device /path/to/device -mount /mnt/goclusterfs \
+./goclusterfs-mount -device /path/to/device -mount /mnt/goclusterfs \
     -debug
 ```
 
@@ -212,11 +209,10 @@ Requires=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/goclusterfs \
+ExecStart=/usr/local/bin/goclusterfs-mount \
     -device /dev/vg_data/goclusterfs \
-    -mount /mnt/goclusterfs \
-    -journal
-ExecStop=/bin/fusermount -u /mnt/goclusterfs
+    -mount /mnt/goclusterfs
+ExecStop=/usr/bin/fusermount3 -u /mnt/goclusterfs
 Restart=on-failure
 RestartSec=5
 
@@ -270,30 +266,32 @@ udevadm info --query=all --name=/dev/mapper/shared_lun | grep SERIAL
 
 ### Step 2: Format (Once, from Any Node)
 
+Format on one node while no other node has the device mounted, then unmount:
+
 ```bash
-# Format only needs to run once
-./goclusterfs -format -device /dev/mapper/shared_lun
+./goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster -format
+# In another shell, once it has mounted:
+fusermount3 -u /mnt/cluster
 ```
 
 ### Step 3: Mount on All Nodes
 
-Use identical mount options on all nodes:
+Use identical mount options and the same GoClusterFS version on all nodes:
 
 ```bash
-# All nodes must use the same options
-./goclusterfs -device /dev/mapper/shared_lun -mount /mnt/cluster \
-    -journal \
-    -broadcast \
+./goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster \
     -mcast-group 239.192.74.75 \
-    -mcast-port 31337
+    -mcast-port 31337 \
+    -broadcast-secret "your-shared-secret"
 ```
+
+Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) first. Node clocks must agree, and nodes must not stall.
 
 ### Step 4: Verify Cluster Communication
 
-```bash
-# Check broadcast stats
-cat /sys/fs/fuse/connections/*/stats  # (if exposed)
+Each mount logs `Broadcast: enabled on 239.192.74.75:31337` at startup, or a warning if broadcast could not start. It logs `Broadcast stats` when it unmounts.
 
+```bash
 # Verify multicast is working
 tcpdump -i eth0 udp port 31337
 ```
@@ -303,8 +301,7 @@ tcpdump -i eth0 udp port 31337
 #### Multicast (Default)
 
 ```bash
-./goclusterfs ... \
-    -broadcast \
+./goclusterfs-mount ... \
     -mcast-group 239.192.74.75 \
     -mcast-port 31337 \
     -broadcast-iface eth0
@@ -313,8 +310,7 @@ tcpdump -i eth0 udp port 31337
 #### With Authentication
 
 ```bash
-./goclusterfs ... \
-    -broadcast \
+./goclusterfs-mount ... \
     -mcast-group 239.192.74.75 \
     -broadcast-secret "your-shared-secret-here"
 ```
@@ -333,15 +329,13 @@ Wants=iscsi.service multipathd.service
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 5
-ExecStart=/usr/local/bin/goclusterfs \
+ExecStart=/usr/local/bin/goclusterfs-mount \
     -device /dev/mapper/shared_lun \
     -mount /mnt/cluster \
-    -journal \
-    -broadcast \
     -mcast-group 239.192.74.75 \
     -mcast-port 31337 \
     -broadcast-secret "${GOCLUSTERFS_SECRET}"
-ExecStop=/bin/fusermount -u /mnt/cluster
+ExecStop=/usr/bin/fusermount3 -u /mnt/cluster
 Restart=on-failure
 RestartSec=10
 EnvironmentFile=-/etc/default/goclusterfs
@@ -350,11 +344,13 @@ EnvironmentFile=-/etc/default/goclusterfs
 WantedBy=multi-user.target
 ```
 
-Create `/etc/default/goclusterfs`:
+Create `/etc/default/goclusterfs`, readable only by root:
 
 ```bash
 GOCLUSTERFS_SECRET="your-shared-secret"
 ```
+
+systemd passes the secret on the command line, so local users can still see it with `ps`. See the [Security Model](OPERATIONS.md#security-model).
 
 ---
 
@@ -365,42 +361,37 @@ GOCLUSTERFS_SECRET="your-shared-secret"
 Good for general workloads:
 
 ```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -journal \
-    -cache-ttl 5s \
-    -trim
+./goclusterfs-mount -device /dev/device -mount /mnt/fs
 ```
+
+These defaults are: journal on, broadcast on, `-cache-ttl 5s`, `-attr-timeout 1s`, TRIM on.
 
 ### High Consistency
 
-For workloads requiring strong consistency (databases, shared configs):
+For workloads where every node must see other nodes' changes as soon as possible. `stat` and `ls` get much slower, because each path step reads the directory under a cluster lock:
 
 ```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -journal \
+./goclusterfs-mount -device /dev/device -mount /mnt/fs \
     -cache-strict \
-    -broadcast \
-    -mcast-group 239.192.74.75
+    -attr-timeout 0
 ```
 
 ### High Performance
 
-For read-heavy workloads where eventual consistency is acceptable:
+For read-heavy workloads where open files may see other nodes' changes up to 30 seconds late:
 
 ```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -journal \
+./goclusterfs-mount -device /dev/device -mount /mnt/fs \
     -cache-ttl 30s \
-    -trim \
     -trim-batch 512
 ```
 
 ### Minimal (Testing/Development)
 
-Disable advanced features for debugging:
+Disable optional features for debugging, on a single node only. `-journal=false` gives no crash consistency and skips replay of this node's journal slot:
 
 ```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
+./goclusterfs-mount -device /dev/device -mount /mnt/fs \
     -journal=false \
     -broadcast=false \
     -trim=false \
@@ -414,15 +405,17 @@ Disable advanced features for debugging:
 
 ### Broadcast Authentication
 
-Enable HMAC authentication for broadcast messages:
+Without `-broadcast-secret`, broadcast messages are not authenticated. Set the same secret on every node:
 
 ```bash
 # Generate a secret
 openssl rand -hex 32
 
 # Use the secret on all nodes (must match)
-./goclusterfs ... -broadcast-secret "generated-hex-secret"
+./goclusterfs-mount ... -broadcast-secret "generated-hex-secret"
 ```
+
+See the [Security Model](OPERATIONS.md#security-model) for what this does and does not protect.
 
 ### Firewall Rules
 
@@ -475,7 +468,7 @@ stat -f /mnt/goclusterfs
 # On Node 1: Create file
 echo "from node1" > /mnt/cluster/node1.txt
 
-# On Node 2: Verify file appears (should be immediate with broadcast)
+# On Node 2: Verify file appears (within -attr-timeout, 1s by default, while broadcast works; up to -cache-ttl without it)
 cat /mnt/cluster/node1.txt
 
 # On Node 2: Create file
@@ -489,12 +482,11 @@ cat /mnt/cluster/node2.txt
 
 ```bash
 # Unmount first
-fusermount -u /mnt/goclusterfs
+fusermount3 -u /mnt/goclusterfs
 
-# Run fsck
+# Run fsck; exit code 0 means no errors
 ./goclusterfs-fsck /path/to/device
-
-# Expected output: All 8 phases pass
+echo $?
 ```
 
 ---

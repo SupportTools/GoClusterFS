@@ -20,16 +20,14 @@ This guide helps diagnose and resolve common issues with GoClusterFS.
 
 **Symptom**: Mount fails immediately with permission or I/O errors.
 
-**Cause**: The storage backend doesn't support O_DIRECT (e.g., tmpfs, some network filesystems).
+**Cause**: The storage backend doesn't support O_DIRECT, for example tmpfs before Linux 6.6 or some FUSE and network filesystems.
 
 **Solution**:
 ```bash
-# Verify O_DIRECT support
-dd if=/dev/zero of=/path/to/device bs=4k count=1 oflag=direct
+# Verify O_DIRECT support; conv=notrunc keeps an image file's size
+dd if=/dev/zero of=/path/to/device bs=4k count=1 oflag=direct conv=notrunc
 
-# If this fails, use a different storage location
-# O_DIRECT is supported on: ext4, xfs, block devices, NFS (v4.2+)
-# O_DIRECT is NOT supported on: tmpfs, older NFS, some FUSE filesystems
+# If this fails, put the device or image somewhere else, for example ext4 or XFS
 ```
 
 ### "device or resource busy"
@@ -48,7 +46,7 @@ fuser -v /dev/device
 mount | grep device
 
 # Force unmount if needed (data loss possible)
-fusermount -uz /mnt/existing_mount
+fusermount3 -uz /mnt/existing_mount
 ```
 
 ### "permission denied"
@@ -64,7 +62,7 @@ sudo usermod -aG fuse $USER
 newgrp fuse
 
 # Or run as root
-sudo ./goclusterfs ...
+sudo ./goclusterfs-mount ...
 
 # Check device permissions
 ls -la /dev/device
@@ -75,117 +73,99 @@ ls -la /dev/device
 
 **Symptom**: Mount point exists but operations fail with this error.
 
-**Cause**: Previous mount crashed without clean unmount.
+**Cause**: The mount process exited without unmounting. It was killed, crashed, or stopped itself: a mount exits on purpose when it cannot write its heartbeat or another node took its registry slot. Check its log for `Node registry slot N is no longer this node's` or `heartbeats to node registry slot N have failed`.
 
 **Solution**:
 ```bash
 # Force unmount the stale mount point
-fusermount -uz /mnt/goclusterfs
+fusermount3 -uz /mnt/goclusterfs
 
 # If that fails
 sudo umount -l /mnt/goclusterfs
 
-# Then remount
-./goclusterfs -device /dev/device -mount /mnt/goclusterfs
+# Then remount; it replays the journal it left behind
+./goclusterfs-mount -device /dev/device -mount /mnt/goclusterfs
 ```
 
-### "bad superblock" or "invalid magic"
+### "no GoClusterFS superblock" or "superblock checksum mismatch"
 
-**Symptom**: Mount fails because filesystem metadata is invalid.
+**Symptom**: Mount exits with `Cannot use <device>: no GoClusterFS superblock; format the device with -format`, or `Cannot use <device>: superblock checksum mismatch - possible corruption`. (fsck reports a missing superblock as `invalid superblock magic`.)
 
-**Cause**: Device not formatted, wrong device, or corruption.
+**Cause**: Device not formatted, wrong device, or a damaged superblock.
 
 **Solution**:
 ```bash
 # Verify correct device
 lsblk
-fdisk -l
 
-# Check if formatted
-hexdump -C /dev/device | head -20
-# Look for GoClusterFS magic bytes
+# A formatted device starts with "GOCLUSTERFS"
+head -c 16 /dev/device | hexdump -C
 
-# If not formatted
-./goclusterfs -format -device /dev/device
+# Only if the device is new or its data can go: format it (destroys all data)
+./goclusterfs-mount -device /dev/device -mount /mnt/goclusterfs -format
 
-# If corrupted, try fsck
+# A superblock checksum error can be repaired
 ./goclusterfs-fsck -repair /dev/device
 ```
 
-### "device has the pre-v2 layout"
+### "device has an inode table but no GoClusterFS superblock"
 
-**Symptom**: Mount exits with `Cannot use <device>: device has the pre-v2 layout, where all nodes share one journal`.
+**Symptom**: Mount exits with `Cannot use <device>: device has an inode table but no GoClusterFS superblock: it has the pre-v2 layout, where all nodes share one journal, or its superblock was destroyed. ...`
 
-**Cause**: An older GoClusterFS build formatted the device. In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
+**Cause**: One of two things, and you need to know which build formatted the device:
 
-**Solution**: Copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
+- **A build from before format version 2 formatted it.** In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
+- **A version 2 build formatted it, and its superblock was overwritten.** Both layouts keep the inode table at 2 MB, so the device looks old.
+
+**Solution**:
+- Pre-v2 device: copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
+- Version 2 device: do not run an old build on it; it would read the wrong layout. There is no tool to rebuild the superblock, so restore from backup.
 
 ---
 
 ## Error Messages
 
-### "lock acquisition failed" / "lock timeout"
+### Operations Hang Waiting for a Lock
 
-**Symptom**: Operations fail with lock errors.
+**Symptom**: File operations hang. The mount log shows many `lock.Acquire` lines for the same lock, or `TIMEOUT after N retries` once the waiting program is interrupted. Lock waits have no time limit.
 
 **Causes**:
-1. Another node holding the lock
-2. Deadlock situation
-3. Crashed node left stale lock
+1. Another node holds the lock for a long operation, or is stalled
+2. A crashed node still holds it
 
 **Solutions**:
 
 ```bash
-# Check which nodes are active
-tcpdump -i eth0 udp port 31337 -c 20
+# Look at lock waits in the mount log
+grep "lock.Acquire" /var/log/goclusterfs.log | tail -20
 
-# If node crashed while holding lock:
-# Wait for heartbeat timeout (default 30s)
-# Lock will be automatically released
-
-# If deadlock suspected:
-# Identify the lock holder from debug logs
-./goclusterfs -debug ...
-
-# Check for stuck processes on other nodes
-ps aux | grep goclusterfs
+# Check for stuck or stopped mount processes on other nodes
+ps aux | grep goclusterfs-mount
 ```
 
-### "journal recovery required"
+A crashed node's locks free up on their own: other nodes take them over once they are 15 seconds old, or once the node is proven dead. A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
 
-**Symptom**: Mount fails, requires journal recovery.
+### "Journal recovery for slot N failed"
 
-**Cause**: Previous mount crashed with uncommitted journal entries.
+**Symptom**: Mount exits with `Journal recovery for slot N failed: ... (mount with -skip-recovery to discard this journal)`.
 
-**Solution**:
-```bash
-# Allow automatic recovery (default)
-./goclusterfs -device /dev/device -mount /mnt/fs -journal
+**Cause**: The mount could not replay the journal in the registry slot it took. A normal crash does not cause this: the next mount on the same host replays the journal by itself. Read the rest of the error:
 
-# If recovery fails, skip it (may lose recent data)
-./goclusterfs -device /dev/device -mount /mnt/fs -journal -skip-recovery
+- An I/O error, or `journal recovery failed: ...`: the storage failed or a transaction could not be applied. The journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
+- `journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`: the journal header is damaged and cannot be replayed.
 
-# Then run fsck
-fusermount -u /mnt/fs
-./goclusterfs-fsck -repair /dev/device
-```
+**Solution**: Only for a damaged header, discard the journal with `-skip-recovery`. That flag discards the journal of whichever slot the mount takes, which may belong to another crashed node, so follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot) exactly.
 
-### "stale file handle"
+### Another Node's Change Shows Up Late
 
-**Symptom**: File operations fail with "stale file handle" error.
+**Symptom**: A file changed or deleted on one node still looks unchanged on another for a short time.
 
-**Cause**: File was deleted/modified by another node while handle was open.
+**Cause**: Caching. `stat` and `ls` can lag up to `-attr-timeout` (1s by default), and open files up to `-cache-ttl` (5s by default).
 
 **Solutions**:
 ```bash
-# Application should close and reopen the file
-# This is expected behavior in clustered environments
-
-# If happening frequently, enable stricter caching:
-./goclusterfs ... -cache-strict
-
-# Or reduce cache TTL
-./goclusterfs ... -cache-ttl 1s
+# Shorter windows, at a cost in speed
+./goclusterfs-mount ... -cache-strict -attr-timeout 0
 ```
 
 ### "no space left on device"
@@ -193,23 +173,16 @@ fusermount -u /mnt/fs
 **Symptom**: Writes fail despite apparent free space.
 
 **Causes**:
-1. Filesystem genuinely full
-2. Inode exhaustion
-3. Journal full
+1. Out of 1 MB blocks. Every file with data uses at least one full block, so many small files fill the device fast.
+2. Out of inodes. A volume has 4096.
+3. The underlying thin-provisioned storage is full.
 
 **Solutions**:
 ```bash
-# Check space
+# Check blocks and inodes
 df -h /mnt/fs
-df -i /mnt/fs  # Check inodes
+df -i /mnt/fs
 
-# If journal is full, force checkpoint
-# (This happens automatically at 75% full)
-
-# If thin provisioning, check underlying storage
-# Overcommitment may have caught up
-
-# Clean up deleted files
 # Check for deleted-but-open files
 lsof +D /mnt/fs | grep deleted
 ```
@@ -234,9 +207,9 @@ smartctl -a /dev/sda  # For local drives
 # For iSCSI/network storage
 iscsiadm -m session -P 3  # Check session state
 
-# Run fsck
-fusermount -u /mnt/fs
-./goclusterfs-fsck -repair /dev/device
+# Run fsck after unmounting on every node
+fusermount3 -u /mnt/fs
+./goclusterfs-fsck /dev/device
 ```
 
 ### "invalid extent" / "block out of range"
@@ -247,14 +220,14 @@ fusermount -u /mnt/fs
 
 **Solution**:
 ```bash
-# Unmount
-fusermount -u /mnt/fs
+# Unmount on every node
+fusermount3 -u /mnt/fs
 
-# Run fsck with repair
-./goclusterfs-fsck -repair /dev/device
-
-# If fsck fails, restore from backup
+# See what fsck finds
+./goclusterfs-fsck /dev/device
 ```
+
+`-repair` does not fix bad extents, so restore the affected files from backup.
 
 ---
 
@@ -262,25 +235,11 @@ fusermount -u /mnt/fs
 
 ### High Cache Miss Rate
 
-**Symptom**: Operations slower than expected, cache hit rate below 50%.
+**Symptom**: Operations slower than expected.
 
-**Diagnosis**:
-```bash
-# Check cache stats (if exposed via debug interface)
-# Look for InodeCacheHitRate, ExtentCacheHitRate
-```
+**Diagnosis**: The mount logs `Cache stats: inodes=... (hit=...%), extents=... (hit=...%)` when it unmounts. There is no live view, and the hit percentages are wrong today (they can read far above 100%).
 
-**Solutions**:
-```bash
-# Increase cache sizes (via configuration)
-# Default InodeCacheSize: 10000
-# Default ExtentCacheSize: 50000
-
-# For larger working sets, increase proportionally
-
-# If random access pattern, cache won't help much
-# Consider adjusting application access patterns
-```
+**Solutions**: Cache sizes are fixed in code (10,000 inodes, 50,000 extents). A longer `-cache-ttl` or `-attr-timeout` avoids some disk reads, but other nodes' changes then show up later. See [Cache Tuning](OPERATIONS.md#cache-tuning).
 
 ### High Lock Contention
 
@@ -288,11 +247,8 @@ fusermount -u /mnt/fs
 
 **Diagnosis**:
 ```bash
-# Enable debug logging
-./goclusterfs -debug ...
-
-# Look for lock acquisition retries
-grep "lock" /var/log/goclusterfs.log
+# Lock waits are always logged
+grep "lock.Acquire" /var/log/goclusterfs.log
 ```
 
 **Solutions**:
@@ -313,16 +269,11 @@ Check which phase is slow:
 
 **Solutions**:
 ```bash
-# If journal commit is slow, consider batch mode
-# (Configure via code: CommitBatch mode)
-
-# If data write is slow, check storage performance
-dd if=/dev/zero of=/mnt/fs/test bs=1M count=100 oflag=direct
-
-# If network invalidation is slow
-# Check multicast latency
-ping -c 10 239.192.74.75  # (multicast ping may not work)
+# Check raw storage speed outside GoClusterFS (destroys data on the target)
+dd if=/dev/zero of=/path/on/same/storage/test bs=1M count=100 oflag=direct
 ```
+
+Journal commits are synchronous, and each block write takes a cluster lock. Batch commit mode exists in code but has no flag.
 
 ### Memory Usage Growth
 
@@ -338,11 +289,10 @@ ping -c 10 239.192.74.75  # (multicast ping may not work)
 # Reduce cache sizes to test
 
 # Monitor memory over time
-watch -n 60 'ps aux | grep goclusterfs'
-
-# If leak suspected, capture heap profile
-# (Requires pprof endpoint enabled)
+watch -n 60 'ps aux | grep goclusterfs-mount'
 ```
+
+There is no profiling endpoint.
 
 ---
 
@@ -353,9 +303,8 @@ watch -n 60 'ps aux | grep goclusterfs'
 **Symptom**: File changes on one node not visible on others.
 
 **Causes**:
-1. Broadcast not working
-2. Cache TTL not expired
-3. Network partition
+1. Caching: changes can show up to `-attr-timeout` (1s) or `-cache-ttl` (5s) late, even with broadcast working
+2. Broadcast not working, so caches only catch up after `-cache-ttl`
 
 **Solutions**:
 ```bash
@@ -374,64 +323,47 @@ iptables -L -n | grep 31337
 ip maddr show
 
 # 3. Network interface
-./goclusterfs ... -broadcast-iface eth0
+./goclusterfs-mount ... -broadcast-iface eth0
 
 # If packets visible but not applied:
 # Check for secret mismatch
 # All nodes must use same -broadcast-secret
 ```
 
-### Split-Brain Scenario
+### Nodes Disagree After a Network Partition
 
-**Symptom**: Different nodes have different versions of same file.
+Nodes coordinate through the shared device, not the network, so a network partition alone does not let them write independently. It only stops cache invalidations, and each node catches up after `-cache-ttl`.
 
-**Cause**: Network partition caused nodes to write independently.
+Two nodes can write the same metadata when a node stalls (VM pause, storage path failover) while it holds a lock, or when two nodes share a registry slot. See [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) and [Known Gaps in Slot Ownership](OPERATIONS.md#known-gaps-in-slot-ownership). If you suspect this:
 
-**Solution**:
 ```bash
-# This is a serious situation requiring manual intervention
+# Step 1: Unmount on every node
+fusermount3 -u /mnt/cluster
 
-# Step 1: Stop all nodes
-# On each node:
-fusermount -u /mnt/cluster
+# Step 2: Check
+./goclusterfs-fsck /dev/device
 
-# Step 2: Run fsck
-./goclusterfs-fsck -repair /dev/device
-
-# Step 3: Identify correct data
-# Compare file versions, timestamps
-# Manual decision required
-
-# Step 4: Restart cluster
-# Start one node first, verify data
-# Then start remaining nodes
+# Step 3: Compare and restore affected files from backup, then start one node first
 ```
 
-### Heartbeat Timeouts
+### Heartbeat Failures
 
-**Symptom**: Logs show heartbeat timeout warnings.
+**Symptom**: A mount stops with `heartbeats to node registry slot N have failed`, or `Node registry slot N is no longer this node's`.
 
-**Causes**:
-1. Node failed
-2. Network congestion
-3. Process overloaded
+**Cause**: Node heartbeats are writes to the shared device every second, not network messages. A node stops when its heartbeat writes fail for 5 seconds, or when another node took its slot after it looked dead (heartbeat older than 10 seconds to a new mount, about 20 seconds to running nodes).
 
 **Solutions**:
 ```bash
-# Check if node is actually down
-ping node2
-ssh node2 "systemctl status goclusterfs"
+# Check the storage path on that node
+dmesg | tail -50
+multipath -ll
+iscsiadm -m session -P 3
 
-# If node up but heartbeats timing out:
-# Check network latency
-ping -c 100 node2 | tail -5
-
-# Check for packet loss
-ping -c 1000 -f node2
-
-# Increase heartbeat interval if network is slow
-# (Configure via code: HeartbeatInterval)
+# Check its clock against the other nodes
+chronyc tracking
 ```
+
+See [Node Requirements](OPERATIONS.md#node-requirements).
 
 ---
 
@@ -450,28 +382,25 @@ Signs of corruption:
 ```bash
 # Step 1: Unmount all nodes immediately
 # On each node:
-fusermount -u /mnt/cluster
+fusermount3 -u /mnt/cluster
 
-# Step 2: Run fsck on one node
+# Step 2: Back up the device, then check it on one node
+./goclusterfs-fsck -repair -dry-run /dev/device
+
+# Step 3: Repair what fsck can fix
 ./goclusterfs-fsck -repair /dev/device
 
-# Step 3: Review fsck output
-# Note which files were affected
+# Step 4: Mount on one node (there is no read-only mount) and check critical data
+./goclusterfs-mount -device /dev/device -mount /mnt/cluster
 
-# Step 4: Mount read-only first (if supported)
-# Verify critical data before write access
-
-# Step 5: Mount normally
-./goclusterfs -device /dev/device -mount /mnt/cluster
-
-# Step 6: Restore affected files from backup if needed
+# Step 5: Restore affected files from backup if needed
 ```
 
 ### Preventing Corruption
 
 1. **Always unmount cleanly** before shutting down
-2. **Use journaling** (`-journal` flag)
-3. **Enable broadcast** for cache coherency
+2. **Keep journaling on** (`-journal`, on by default)
+3. **Keep node clocks in sync and avoid stalls** (see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits))
 4. **Run periodic fsck** during maintenance windows
 5. **Maintain backups** - no filesystem is immune to hardware failure
 
@@ -479,40 +408,24 @@ fusermount -u /mnt/cluster
 
 ## Debug Mode
 
-### Enabling Debug Output
+### Log Output
+
+The mount always logs `[DEBUG]` lines for file operations, lock acquire and release, journal recovery, and broadcast. Capture stderr and filter it:
 
 ```bash
-./goclusterfs -device /dev/device -mount /mnt/fs -debug
+./goclusterfs-mount -device /dev/device -mount /mnt/fs 2>&1 | tee mount.log
+
+grep "lock.Acquire" mount.log
+grep "\[broadcast\]" mount.log
+grep "\[Recovery\]" mount.log
 ```
 
-### What Debug Mode Shows
+### FUSE Request Tracing (Very Verbose)
 
-- FUSE operation details (open, read, write, etc.)
-- Lock acquisition/release events
-- Cache hits/misses
-- Journal commits
-- Network broadcast messages
-
-### Analyzing Debug Output
+`-debug` adds a log line for every FUSE request and reply:
 
 ```bash
-# Filter for specific operation types
-./goclusterfs -debug 2>&1 | grep -E "(WRITE|READ|LOCK)"
-
-# Watch lock activity
-./goclusterfs -debug 2>&1 | grep -i lock
-
-# Monitor cache behavior
-./goclusterfs -debug 2>&1 | grep -i cache
-```
-
-### FUSE Debug (Very Verbose)
-
-For low-level FUSE debugging:
-
-```bash
-# Mount with FUSE debug (extremely verbose)
-./goclusterfs -device /dev/device -mount /mnt/fs -debug -fuse-debug 2>&1 | tee fuse.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee fuse.log
 ```
 
 ---
@@ -604,14 +517,10 @@ Each problem is one line: severity, phase, location, message, and repair status.
 If fsck reports unrecoverable errors:
 
 1. **Restore from backup** (preferred)
-2. **Salvage readable data**:
-   ```bash
-   # Mount read-only if possible
-   # Copy readable files to new location
-   ```
+2. **Salvage readable data**: mount on one node and copy readable files somewhere else. There is no read-only mount.
 3. **Reformat** (last resort, data loss):
    ```bash
-   ./goclusterfs -format -device /dev/device
+   ./goclusterfs-mount -device /dev/device -mount /mnt/goclusterfs -format
    ```
 
 ---
@@ -626,11 +535,11 @@ If this guide doesn't resolve your issue:
    uname -a
    cat /etc/os-release
 
-   # GoClusterFS version
-   ./goclusterfs -version
+   # GoClusterFS version (goclusterfs-mount has no -version flag yet)
+   ./goclusterfs-fsck -version
 
-   # Recent logs
-   ./goclusterfs -debug ... 2>&1 | head -1000 > debug.log
+   # Recent mount log
+   tail -1000 /var/log/goclusterfs.log > mount.log
 
    # fsck output
    ./goclusterfs-fsck /dev/device > fsck.log 2>&1

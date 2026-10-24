@@ -275,8 +275,12 @@ func main() {
 	}
 
 	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write.
-	refcountReg := refcount.NewRegion(dev, refcountOffset, totalBlocks, lockMgr)
+	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
 	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
+	if covered := refcount.BlocksForSize(sb.RefCountTableSize); totalBlocks > covered {
+		log.Printf("[WARN] Refcount: region covers blocks 0-%d of %d; snapshots and clones of files with data in higher blocks fail",
+			covered-1, totalBlocks)
+	}
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)
@@ -404,9 +408,7 @@ func main() {
 
 	// Print final cache stats
 	stats := cacheMgr.Stats()
-	log.Printf("Cache stats: inodes=%d (hit=%.1f%%), extents=%d (hit=%.1f%%)",
-		stats.InodeCacheSize, stats.InodeHitRate*100,
-		stats.ExtentCacheSize, stats.ExtentHitRate*100)
+	log.Printf("Cache stats: %s", stats)
 	if stats.BroadcastEnabled {
 		log.Printf("Broadcast stats: sent=%d, received=%d, duplicates=%d",
 			stats.InvalidationsSent, stats.InvalidationsReceived, stats.BroadcastDuplicates)
