@@ -378,6 +378,16 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
+  # The Docker and VM harnesses have no per-node mount flags, so they cannot run one node with -attr-timeout=0.
+  - id: multinode-attr-timeout-zero
+    name: Attribute timeout 0 shows remote size changes
+    description: A node mounted with -attr-timeout=0 sees another node's size change on its next stat
+    priority: medium
+    environments:
+      go: multinode_test.go::TestMultiNodeAttrTimeoutZero
+      docker: TODO
+      vm: TODO
+
   # ===========================================================================
   # NETWORK AND RESILIENCE TESTS
   # ===========================================================================

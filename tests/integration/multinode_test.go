@@ -1181,6 +1181,37 @@ func TestMultiNodeExtentCacheCoherency(t *testing.T) {
 	})
 }
 
+// TestMultiNodeAttrTimeoutZero checks that with -attr-timeout=0 a node's next stat
+// shows another node's size change, with no kernel attribute cache delay.
+func TestMultiNodeAttrTimeoutZero(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false", "-attr-timeout=0"}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	const name = "grow.txt"
+	writeOrFail(t, writer, name, []byte("0123456789"), 0)
+	expectSize(t, reader, name, 10)
+	writeOrFail(t, writer, name, []byte("abcdefghij"), 10)
+	expectSize(t, reader, name, 20)
+}
+
+func expectSize(t *testing.T, m *MountedFS, name string, want int64) {
+	t.Helper()
+	fi, err := m.Stat(name)
+	if err != nil {
+		t.Fatalf("stat %s: %v", name, err)
+	}
+	if fi.Size() != want {
+		t.Errorf("stat %s: size %d, want %d", name, fi.Size(), want)
+	}
+}
+
 func writeOrFail(t *testing.T, m *MountedFS, name string, data []byte, offset int64) {
 	t.Helper()
 	if err := m.WriteFileAt(name, data, offset); err != nil {
