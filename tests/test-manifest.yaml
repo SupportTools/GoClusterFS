@@ -826,6 +826,23 @@ scenarios:
     environments:
       go: integration_test.go::TestFallocateUnwrittenBlocks
 
+  - id: fallocate-partial-write-zeros
+    name: Fallocated blocks read as zeros after a partial write
+    description: A partial write into one block of a fallocated range leaves the rest of that block and the other fallocated blocks reading as zeros, not old disk contents
+    priority: high
+    environments:
+      go: internal/goclusterfs/data_safety_test.go::TestFallocatedBlocksReadZerosAfterPartialWrite
+      docker: TODO - needs old data in the blocks fallocate hands out; reusing a deleted file's blocks races TRIM (on by default, 5s flush), so a shell test would be flaky
+      vm: TODO - same reason as docker
+
+  # Block 0 belongs to the root directory on a formatted volume, so FUSE cannot reach this case.
+  - id: read-physical-block-zero
+    name: Data in physical block 0 is readable
+    description: File.Read returns data mapped to physical block 0 instead of treating it as a hole
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/data_safety_test.go::TestReadDataInPhysicalBlockZero
+
   - id: multiblock-file-stat
     name: Multi-block file stat
     description: Tests st_blocks for files spanning multiple blocks

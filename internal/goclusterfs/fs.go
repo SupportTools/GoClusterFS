@@ -323,7 +323,7 @@ func (f *FS) cacheInode(ino *inode.Inode) {
 }
 
 // lookupPhysical finds the physical block for a logical block, using cache.
-// Returns 0 for holes (sparse file regions with no allocated blocks).
+// Returns extent.Hole for holes (sparse file regions with no data on disk).
 // This is the preferred method for read paths.
 func (f *FS) lookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64, error) {
 	phys, err := f.lookupPhysicalIn(ino, logicalBlock)
@@ -1985,8 +1985,7 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 		if err != nil {
 			return nil, syscall.EIO
 		}
-		if physBlock == 0 {
-			// Hole - return zeros
+		if physBlock == extent.Hole {
 			toRead := int(BlockSize - blockOffset)
 			if toRead > readSize-bytesRead {
 				toRead = readSize - bytesRead
@@ -2067,6 +2066,14 @@ func retryOnTreeConflict(err error) error {
 	if errors.Is(err, extent.ErrTreeConflict) {
 		return errRetryWrite
 	}
+	return err
+}
+
+func (f *FS) zeroBlock(physBlock uint64) error {
+	buf := storage.GetBuffer(BlockSize)
+	defer storage.PutBuffer(buf)
+	clear(buf.Bytes())
+	_, err := f.dev.WriteAt(buf.Bytes(), int64(f.dataOffset+physBlock*BlockSize))
 	return err
 }
 
@@ -2203,6 +2210,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	for bytesWritten < len(data) {
 		blockNum := offset / BlockSize
 		blockOffset := offset % BlockSize
+		zeroFirst := false
 
 		// Try to find existing extent first (without lock for read-only check)
 		ext, extOffset, err := f.fs.extentMgr.Lookup(ino, blockNum)
@@ -2410,7 +2418,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 
 			// Clear the Unwritten flag (if still set)
-			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ino, ext)
+			cleared, clearErr := f.fs.extentMgr.ClearUnwritten(ctx, ino, blockNum)
 			if clearErr != nil {
 				log.Printf("[DEBUG] Write inode %d: clearing Unwritten flag at block %d failed: %v",
 					f.inodeNum, blockNum, clearErr)
@@ -2420,6 +2428,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				log.Printf("[DEBUG] Write inode %d: cleared Unwritten flag for block %d",
 					f.inodeNum, blockNum)
 			}
+			zeroFirst = cleared
 		}
 
 		// Calculate physical location
@@ -2431,6 +2440,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if toWrite > len(data)-bytesWritten {
 			toWrite = len(data) - bytesWritten
 		}
+		zeroFirst = zeroFirst && toWrite < BlockSize
 
 		// Acquire extent lock on the physical block to prevent lost-update race.
 		// When multiple nodes write to different offsets within the same block,
@@ -2444,6 +2454,17 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return 0, syscall.EIO
 			}
 			extentLockHeld = true
+		}
+
+		// The rest of a block first written here would otherwise expose old disk contents.
+		if zeroFirst {
+			if err := f.fs.zeroBlock(physBlock); err != nil {
+				log.Printf("[DEBUG] Write inode %d: zeroing block %d failed: %v", f.inodeNum, physBlock, err)
+				if extentLockHeld {
+					f.fs.lockMgr.ReleaseExtent(physBlock)
+				}
+				return 0, syscall.EIO
+			}
 		}
 
 		// Handle unaligned writes by read-modify-write
