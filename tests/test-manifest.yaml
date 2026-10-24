@@ -896,6 +896,38 @@ scenarios:
     environments:
       go: integration_test.go::TestStatfsAvailableBlocks
 
+  - id: statfs-free-blocks-remount
+    name: Statfs free blocks after remount
+    description: A remounted node reports the free blocks on disk, not the whole volume
+    priority: high
+    environments:
+      go: integration_test.go::TestStatfsFreeBlocksAfterRemount
+      docker: run-tests.sh::test_statfs_after_remount
+      vm: run-vm-tests.sh::test_statfs_after_remount
+
+  - id: statfs-free-blocks-multinode
+    name: Statfs free blocks across nodes
+    description: Each node's statfs includes blocks another node allocated and freed
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeStatfsFreeBlocks
+      docker: run-tests.sh::test_statfs_multinode
+      vm: run-vm-tests.sh::test_statfs_multinode
+
+  - id: bitmap-free-count-reads-disk
+    name: Bitmap free count reads disk
+    description: A new bitmap region, and one whose blocks another region freed, report the free blocks on disk
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestFreeCountReadsDisk
+
+  - id: bitmap-free-count-unreadable-sector
+    name: Bitmap free count with an unreadable sector
+    description: FreeCount counts an unreadable bitmap sector as allocated; Scan returns the checksum error
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestFreeCountUnreadableSector
+
   - id: sparse-file-blocks
     name: Sparse file block reporting
     description: Tests that sparse files report Size > Blocks × 512
