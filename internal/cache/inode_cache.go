@@ -117,6 +117,7 @@ func (m *Manager) cacheInode(in *inode.Inode) {
 		LastValidated:  now,
 	}
 	m.inodes.Put(in.InodeNum, cached)
+	m.negatives.Delete(in.InodeNum)
 }
 
 // updateValidationTime updates the LastValidated timestamp for a cached inode.

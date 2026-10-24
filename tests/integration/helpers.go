@@ -17,6 +17,7 @@ import (
 type MountedFS struct {
 	ImagePath  string
 	MountPoint string
+	ExtraArgs  []string // Appended to the mount command by Mount
 	MountCmd   *exec.Cmd
 	BinaryPath string
 	t          *testing.T
@@ -190,6 +191,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	if debug {
 		args = append(args, "-debug")
 	}
+	args = append(args, m.ExtraArgs...)
 
 	// Create a fresh context for this mount operation
 	m.ctx, m.cancel = context.WithCancel(context.Background())

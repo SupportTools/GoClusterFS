@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1052,6 +1053,85 @@ func TestMultiNodeReversedWriteOrder(t *testing.T) {
 	}
 
 	t.Logf("Reversed write order test completed - file size: %d bytes", len(fullContent))
+}
+
+// TestMultiNodeInodeReuseStaleRead checks that a node which read a file reads the
+// right data after another node deletes it and a new file reuses its inode number.
+func TestMultiNodeInodeReuseStaleRead(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	// The reader must rely on its own cache validation, like VMs on separate networks.
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false"}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	t.Run("SmallFile", func(t *testing.T) {
+		readAfterInodeReuse(t, writer, reader, "small",
+			[]byte("v5\n"), []byte("from vm 1\n"), nil)
+	})
+
+	// The padding file pushes the new data away from the old block, so a stale extent mapping reads wrong data.
+	t.Run("BlockFile", func(t *testing.T) {
+		readAfterInodeReuse(t, writer, reader, "block",
+			bytes.Repeat([]byte("o"), 200<<10),
+			bytes.Repeat([]byte("n"), 300<<10),
+			bytes.Repeat([]byte("p"), 200<<10))
+	})
+}
+
+func readAfterInodeReuse(t *testing.T, writer, reader *MountedFS, prefix string, oldData, newData, padData []byte) {
+	t.Helper()
+	oldName, newName, padName := prefix+"_old", prefix+"_new", prefix+"_pad"
+
+	if err := writer.WriteFile(oldName, oldData); err != nil {
+		t.Fatalf("Writer: create %s: %v", oldName, err)
+	}
+	oldIno := inodeNumber(t, writer, oldName)
+
+	got, err := reader.ReadFile(oldName)
+	if err != nil || !bytes.Equal(got, oldData) {
+		t.Fatalf("Reader: read %s: %d bytes, err=%v, want %d bytes", oldName, len(got), err, len(oldData))
+	}
+
+	if err := writer.Remove(oldName); err != nil {
+		t.Fatalf("Writer: remove %s: %v", oldName, err)
+	}
+	if err := writer.WriteFile(newName, nil); err != nil {
+		t.Fatalf("Writer: create %s: %v", newName, err)
+	}
+	if ino := inodeNumber(t, writer, newName); ino != oldIno {
+		t.Fatalf("%s got inode %d, want reused inode %d", newName, ino, oldIno)
+	}
+	if padData != nil {
+		if err := writer.WriteFile(padName, padData); err != nil {
+			t.Fatalf("Writer: create %s: %v", padName, err)
+		}
+	}
+	if err := writer.WriteFile(newName, newData); err != nil {
+		t.Fatalf("Writer: write %s: %v", newName, err)
+	}
+
+	got, err = reader.ReadFile(newName)
+	if err != nil {
+		t.Fatalf("Reader: read %s: %v", newName, err)
+	}
+	if !bytes.Equal(got, newData) {
+		t.Errorf("Reader: %s has %d bytes starting %q, want %d bytes starting %q",
+			newName, len(got), got[:min(len(got), 16)], len(newData), newData[:min(len(newData), 16)])
+	}
+}
+
+func inodeNumber(t *testing.T, m *MountedFS, name string) uint64 {
+	t.Helper()
+	fi, err := m.Stat(name)
+	if err != nil {
+		t.Fatalf("stat %s: %v", name, err)
+	}
+	return fi.Sys().(*syscall.Stat_t).Ino
 }
 
 // TestNetworkPartition simulates network partition handling by testing node isolation

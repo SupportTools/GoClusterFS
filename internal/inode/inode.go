@@ -260,19 +260,25 @@ func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
 		return nil, ErrInodeInUse
 	}
 
-	// Initialize the inode
-	newInode := &Inode{
-		Magic:            InodeMagic,
-		InodeNum:         num,
-		LinkCount:        1,
-		LastModifierUUID: t.nodeUUID,
-	}
-
+	newInode := t.newInodeInSlot(num, existing)
 	if err := t.writeInodeUnlocked(newInode); err != nil {
 		return nil, fmt.Errorf("failed to write new inode: %w", err)
 	}
 
 	return newInode, nil
+}
+
+// newInodeInSlot initializes an inode for a free slot. Its generations are higher
+// than any previous occupant's, so caches on other nodes can detect the reuse.
+func (t *Table) newInodeInSlot(num uint32, free *Inode) *Inode {
+	return &Inode{
+		Magic:            InodeMagic,
+		InodeNum:         num,
+		LinkCount:        1,
+		DataGeneration:   free.DataGeneration + 1,
+		MetaGeneration:   free.MetaGeneration + 1,
+		LastModifierUUID: t.nodeUUID,
+	}
 }
 
 // Alloc allocates a new inode.
@@ -293,13 +299,7 @@ func (t *Table) Alloc(ctx context.Context) (*Inode, error) {
 
 		// Check if inode is free (Magic == 0)
 		if inode.Magic == 0 {
-			// Found a free slot - initialize it
-			newInode := &Inode{
-				Magic:            InodeMagic,
-				InodeNum:         num,
-				LinkCount:        1,
-				LastModifierUUID: t.nodeUUID,
-			}
+			newInode := t.newInodeInSlot(num, inode)
 
 			// Acquire distributed lock if available
 			if t.lockMgr != nil {
@@ -352,9 +352,11 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 		return ErrInodeNotInUse
 	}
 
-	// Clear the inode (set Magic to 0)
+	// Keep the generations so the slot's next occupant gets higher ones.
 	emptyInode := &Inode{
-		InodeNum: inodeNum,
+		InodeNum:       inodeNum,
+		DataGeneration: inode.DataGeneration,
+		MetaGeneration: inode.MetaGeneration,
 	}
 
 	return t.writeInodeUnlocked(emptyInode)
@@ -567,11 +569,12 @@ func deserializeInode(buf []byte) (*Inode, error) {
 		return nil, ErrInvalidInode
 	}
 
-	// Check for empty inode (all zeros = free)
 	magic := binary.LittleEndian.Uint32(buf[0:4])
 	if magic == 0 {
-		// Return empty inode with just the position
-		return &Inode{}, nil
+		return &Inode{
+			DataGeneration: binary.LittleEndian.Uint64(buf[72:80]),
+			MetaGeneration: binary.LittleEndian.Uint64(buf[80:88]),
+		}, nil
 	}
 
 	// Verify checksum
