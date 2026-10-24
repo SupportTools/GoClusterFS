@@ -140,3 +140,26 @@ func TestReadRejectsForeignJournalGeometry(t *testing.T) {
 		t.Errorf("Read with 16 node slots: err = %v, want ErrUnsupportedLayout", err)
 	}
 }
+
+func TestReadRejectsMovedRegion(t *testing.T) {
+	dev := testDevice(t, MinDeviceSize)
+	sb := New(dev.Size())
+	sb.RefCountTableOffset += 4096
+	writeAt(t, dev, 0, sb.Serialize())
+
+	if _, err := Read(dev); !errors.Is(err, ErrUnsupportedLayout) {
+		t.Errorf("Read with a moved refcount region: err = %v, want ErrUnsupportedLayout", err)
+	}
+}
+
+func TestReadLegacyLayoutWithLeftoverBytes(t *testing.T) {
+	dev := testDevice(t, MinDeviceSize)
+	writeAt(t, dev, 0, []byte("leftover partition table"))
+	inode := make([]byte, 2*inodeSize+4)
+	binary.LittleEndian.PutUint32(inode[2*inodeSize:], legacyInodeMagic)
+	writeAt(t, dev, 2<<20, inode)
+
+	if _, err := Read(dev); !errors.Is(err, ErrLegacyLayout) {
+		t.Errorf("Read on pre-v2 device with bytes at offset 0: err = %v, want ErrLegacyLayout", err)
+	}
+}

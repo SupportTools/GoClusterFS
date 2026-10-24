@@ -122,6 +122,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to register node: %v", err)
 	}
+	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
+		log.Fatalf("Node registry slot %d now belongs to node %x; stopping so two nodes never share a journal", slot, owner[:8])
+	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		log.Fatalf("Failed to start node heartbeat: %v", err)
 	}
@@ -346,6 +349,7 @@ func main() {
 		log.Println("Received signal, unmounting...")
 
 		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
+		nodeReg.Stop()
 		if err := gfs.Close(); err != nil {
 			log.Printf("Warning: Failed to close filesystem: %v", err)
 		}
@@ -365,6 +369,7 @@ func main() {
 	server.Wait()
 
 	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
+	nodeReg.Stop()
 	if err := gfs.Close(); err != nil {
 		log.Printf("Warning: Failed to close filesystem on exit: %v", err)
 	}

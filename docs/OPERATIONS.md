@@ -170,6 +170,12 @@ rm /mnt/fs/.snapshots/snapshot_name
 
 ## Cluster Management
 
+### Node Requirements
+
+- **Clocks:** Nodes judge each other's heartbeats by wall clock. A node more than about 10 seconds ahead treats live peers as failed, replays their journals and takes their registry slots. Run NTP on every node.
+- **Hostnames:** A restarted mount takes back the registry slot of a mount process that exited on the same host, identified by hostname, kernel boot ID and process ID. Containers on one host share the boot ID, so give them distinct hostnames.
+- **Node count:** The device has 64 registry slots, each with its own 4 MB journal. A crashed node's slot frees once another node replays its journal, or when the same host mounts again.
+
 ### Adding a New Node
 
 1. **Prepare the node**:

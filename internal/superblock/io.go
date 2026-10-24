@@ -31,8 +31,9 @@ const (
 var (
 	ErrDeviceTooSmall = errors.New("device too small")
 	ErrNotFormatted   = errors.New("no GoClusterFS superblock; format the device with -format")
-	ErrLegacyLayout   = errors.New("device has the pre-v2 layout, where all nodes share one journal; " +
-		"this version cannot mount it. Copy the data off with the old version, then reformat with -format")
+	ErrLegacyLayout   = errors.New("device has an inode table but no GoClusterFS superblock: it has the pre-v2 layout, " +
+		"where all nodes share one journal, or its superblock was destroyed. This version cannot mount it. " +
+		"Copy the data off with the version that formatted it, then reformat with -format")
 	ErrUnsupportedLayout = errors.New("superblock layout is not supported by this version")
 )
 
@@ -44,8 +45,8 @@ func Read(dev *storage.Device) (*Superblock, error) {
 	if _, err := dev.ReadAt(buf.Bytes(), 0); err != nil {
 		return nil, err
 	}
-	if isZero(buf.Bytes()) {
-		return nil, blankSuperblockError(dev)
+	if string(buf.Bytes()[:len(Magic)]) != Magic {
+		return nil, missingSuperblockError(dev)
 	}
 
 	sb, err := Deserialize(buf.Bytes())
@@ -61,7 +62,7 @@ func Read(dev *storage.Device) (*Superblock, error) {
 	return sb, nil
 }
 
-func blankSuperblockError(dev *storage.Device) error {
+func missingSuperblockError(dev *storage.Device) error {
 	buf := storage.GetBuffer(storage.SectorSize)
 	defer storage.PutBuffer(buf)
 
@@ -76,18 +77,30 @@ func blankSuperblockError(dev *storage.Device) error {
 	return ErrNotFormatted
 }
 
+// checkLayout requires the exact layout this version formats; only the data size depends on the device.
 func (sb *Superblock) checkLayout(deviceSize int64) error {
+	want := New(deviceSize)
 	switch {
-	case sb.BlockSize != storage.DefaultBlockSize:
-		return fmt.Errorf("%w: block size %d", ErrUnsupportedLayout, sb.BlockSize)
-	case sb.MaxNodes != MaxNodes || sb.JournalRegionSize != MaxNodes*NodeJournalSize:
-		return fmt.Errorf("%w: %d node slots in a %d-byte journal region",
-			ErrUnsupportedLayout, sb.MaxNodes, sb.JournalRegionSize)
-	case sb.DataRegionOffset+sb.TotalBlocks*uint64(sb.BlockSize) > uint64(deviceSize):
+	case sb.BlockSize != want.BlockSize || sb.MetaBlockSize != want.MetaBlockSize ||
+		sb.InodeSize != want.InodeSize || sb.MaxNodes != want.MaxNodes || sb.InodeCount != want.InodeCount:
+		return fmt.Errorf("%w: block size %d, metadata block %d, inode size %d, %d node slots, %d inodes",
+			ErrUnsupportedLayout, sb.BlockSize, sb.MetaBlockSize, sb.InodeSize, sb.MaxNodes, sb.InodeCount)
+	case sb.regions() != want.regions():
+		return fmt.Errorf("%w: region offsets or sizes differ from layout v%d", ErrUnsupportedLayout, CurrentVersion)
+	case sb.TotalBlocks == 0 || sb.TotalBlocks > want.TotalBlocks:
 		return fmt.Errorf("%w: %d data blocks at offset %d do not fit the %d-byte device",
 			ErrUnsupportedLayout, sb.TotalBlocks, sb.DataRegionOffset, deviceSize)
 	}
 	return nil
+}
+
+func (sb *Superblock) regions() [15]uint64 {
+	return [15]uint64{
+		sb.BlockBitmapOffset, sb.BlockBitmapSize, sb.InodeTableOffset, sb.InodeTableSize,
+		sb.NodeRegistryOffset, sb.NodeRegistrySize, sb.LockBitmapOffset, sb.LockBitmapSize,
+		sb.JournalRegionOffset, sb.JournalRegionSize, sb.RefCountTableOffset, sb.RefCountTableSize,
+		sb.SnapshotRegOffset, sb.SnapshotRegSize, sb.DataRegionOffset,
+	}
 }
 
 // JournalSlotSize returns the size of each node slot's journal region.
@@ -153,6 +166,9 @@ func Format(dev *storage.Device) (*Superblock, error) {
 		}
 	}
 
+	if err := dev.Sync(); err != nil {
+		return nil, err
+	}
 	if err := Write(dev, sb); err != nil {
 		return nil, err
 	}

@@ -19,6 +19,7 @@ import (
 
 var (
 	registeredRe   = regexp.MustCompile(`Registered as node \d+ \(UUID: ([0-9a-f]+)\)`)
+	slotRe         = regexp.MustCompile(`Registered as node (\d+) `)
 	journalInitRe  = regexp.MustCompile(`Journal: initialized at offset (\d+)`)
 	selfRecoveryRe = regexp.MustCompile(`Journal recovery: replayed \d+ committed transactions .* from crashed node ([0-9a-f]+)`)
 )
@@ -79,7 +80,7 @@ func TestMultiNodeRestartKeepsPeerJournal(t *testing.T) {
 	}
 	crashAcked, _ := writer.stop()
 
-	assertDirtyJournal(t, cluster.ImagePath, offsetB, uuidB)
+	assertJournalOwner(t, cluster.ImagePath, offsetB, uuidB)
 
 	recoveredRe := regexp.MustCompile(`\[Recovery\] Journal region: offset=` + offsetB + `\b`)
 	deadline := time.Now().Add(45 * time.Second)
@@ -92,7 +93,7 @@ func TestMultiNodeRestartKeepsPeerJournal(t *testing.T) {
 	verifyFiles(t, nodeA, append(acked, crashAcked...))
 }
 
-func assertDirtyJournal(t *testing.T, imagePath, offset, uuidPrefix string) {
+func assertJournalOwner(t *testing.T, imagePath, offset, uuidPrefix string) {
 	t.Helper()
 	dev, err := storage.Open(imagePath)
 	if err != nil {
@@ -110,9 +111,49 @@ func assertDirtyJournal(t *testing.T, imagePath, offset, uuidPrefix string) {
 	if owner := fmt.Sprintf("%x", sb.NodeUUID[:8]); owner != uuidPrefix {
 		t.Errorf("journal at offset %d belongs to %s, want crashed node B %s", off, owner, uuidPrefix)
 	}
-	if !region.NeedsRecovery() {
-		t.Errorf("crashed node B's journal at offset %d is %v, want dirty", off, sb.State)
+}
+
+// TestNodeRestartReplaysOwnJournalAtMount crashes a node and restarts it well
+// inside the heartbeat timeout. It must take back its slot and replay its own
+// journal before serving, not leave the replay to failure detection later.
+func TestNodeRestartReplaysOwnJournalAtMount(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 1, 50)
+	node := cluster.Node(0)
+	before := &syncBuffer{}
+	node.Log = before
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start: %v", err)
 	}
+	uuid := mustMatch(t, registeredRe, before, "registration")
+	slot := mustMatch(t, slotRe, before, "registration")
+
+	var names []string
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("before-crash-%d", i)
+		if err := node.WriteFile(name, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+
+	after := &syncBuffer{}
+	node.Log = after
+	if err := cluster.KillNode(0); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	start := time.Now()
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	t.Logf("restarted %v after the crash", time.Since(start))
+
+	if got := mustMatch(t, slotRe, after, "registration after restart"); got != slot {
+		t.Errorf("restarted node took slot %s, want its old slot %s", got, slot)
+	}
+	if got := mustMatch(t, selfRecoveryRe, after, "journal replay at mount"); got != uuid {
+		t.Errorf("mount replayed the journal of node %s, want its own crashed journal %s", got, uuid)
+	}
+	verifyFiles(t, node, names)
 }
 
 func verifyFiles(t *testing.T, node *MountedFS, names []string) {

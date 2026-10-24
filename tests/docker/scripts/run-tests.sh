@@ -1275,8 +1275,9 @@ test_restart_keeps_peer_journal() {
         echo ok \$i > /tmp/peer-writer.done"
     sleep 1
 
-    local since
+    local since slot_before
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    slot_before=$(docker logs "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
     docker kill "$node_a" >/dev/null 2>&1 || true
     sleep 1
     docker start "$node_a" >/dev/null
@@ -1319,6 +1320,12 @@ test_restart_keeps_peer_journal() {
     fi
     if docker logs --since "$since" "$node_a" 2>&1 | grep -q "from crashed node $uuid_b"; then
         log "ERROR: Node A replayed live node B's journal during its restart"
+        return 1
+    fi
+    local slot_after
+    slot_after=$(docker logs --since "$since" "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
+    if [[ "$slot_after" != "$slot_before" ]]; then
+        log "ERROR: Node A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount"
         return 1
     fi
 

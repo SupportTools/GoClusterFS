@@ -386,7 +386,7 @@ scenarios:
 
   - id: multinode-restart-keeps-peer-journal
     name: Restart while a peer writes keeps the peer's journal
-    description: Node A restarts while node B creates files. Each node journals in its own registry slot region, A does not replay B's live journal, and after B crashes A replays B's journal from B's slot.
+    description: Node A crashes and restarts while node B creates files. A takes back its own registry slot and journal, does not replay or reset B's live journal, and B's files stay readable. The Go test also crashes B and checks A replays B's journal from B's slot.
     priority: critical
     environments:
       go: journal_slots_test.go::TestMultiNodeRestartKeepsPeerJournal
@@ -400,12 +400,44 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesLegacyLayout
 
+  - id: crashed-peer-journal-replay
+    name: Peer replays a crashed node's journal from its slot
+    description: After node B crashes, node A finds B's journal through B's registry slot and replays it
+    priority: high
+    environments:
+      go: journal_slots_test.go::TestMultiNodeRestartKeepsPeerJournal
+      docker: TODO  # needs node log access after a 20s failure-detection wait; the Go test covers it
+      vm: TODO  # same as docker
+
+  - id: node-restart-replays-own-journal
+    name: Restarted node replays its own journal at mount
+    description: A node that crashes and restarts within the heartbeat timeout takes back its slot and replays its journal before serving
+    priority: high
+    environments:
+      go: journal_slots_test.go::TestNodeRestartReplaysOwnJournalAtMount
+      docker: run-tests.sh::test_restart_keeps_peer_journal
+      vm: run-vm-tests.sh::test_restart_keeps_peer_journal
+
   - id: registry-slot-journal-region
     name: Registry records each slot's journal region
-    description: Register stores a distinct journal region per slot, skips slots a peer is recovering, and yields a slot to a racing writer
+    description: Register stores a distinct journal region in each slot
     priority: go_only
     environments:
       go: internal/node/registry_test.go::TestRegisterRecordsJournalRegion
+
+  - id: registry-reclaims-exited-local-slot
+    name: Registry reclaims the slot of an exited local mount
+    description: Register takes back a slot whose mount process on this host has exited, and failure detection replays such slots without waiting for the heartbeat timeout
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterReclaimsSlotOfExitedLocalProcess
+
+  - id: registry-recovery-lease
+    name: Recovery lease lets another node resume an interrupted replay
+    description: A dead slot's recovery lease blocks other nodes until it lapses, and Recover replays a journal left Recovering
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRecoveryLeaseBlocksOthersUntilItLapses
 
   - id: journal-recovery-multiple-files
     name: Recovery with multiple files

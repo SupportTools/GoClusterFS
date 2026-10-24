@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -55,5 +56,35 @@ func TestReplayJournalOfPreviousSlotOwner(t *testing.T) {
 	ino, err := rctx.InodeTbl.Read(42)
 	if err != nil || ino.Magic != inode.InodeMagic {
 		t.Errorf("inode 42 not recreated from the previous owner's journal: %v", err)
+	}
+}
+
+func TestRecoverResumesInterruptedReplay(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	region, err := InitRegion(dev, 0, DefaultJournalSlotSize, [16]byte{1}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.MarkDirty(); err != nil {
+		t.Fatal(err)
+	}
+	txn := NewTransaction(region.NextSeq(), [16]byte{1}, 1)
+	txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 7})
+	data, _ := txn.Serialize()
+	if _, err := region.WriteAt(data); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Recover(region, func(*RecoveredTxn) error { return errors.New("device closed") }); err == nil {
+		t.Fatal("first replay: want the handler error")
+	}
+	replayed := 0
+	if _, err := Recover(region, func(*RecoveredTxn) error { replayed++; return nil }); err != nil {
+		t.Fatalf("resumed replay: %v", err)
+	}
+	if replayed != 1 || region.State() != JournalStateClean {
+		t.Errorf("resumed replay applied %d transactions and left the journal %v, want 1 and clean", replayed, region.State())
 	}
 }

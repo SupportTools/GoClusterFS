@@ -606,6 +606,8 @@ test_restart_keeps_peer_journal() {
         echo ok \$i > /tmp/peer-writer.done' >/dev/null 2>&1 &"
     sleep 1
 
+    local slot_before
+    slot_before=$(ssh_run "$vm_a" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1")
     ssh_run "$vm_a" "pkill -9 goclusterfs-mount; sleep 1; umount -l /mnt/goclusterfs 2>/dev/null; true"
     if ! setup_goclusterfs "$vm_a" false; then
         ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
@@ -646,6 +648,12 @@ test_restart_keeps_peer_journal() {
     fi
     if ssh_run "$vm_a" "grep -q 'from crashed node $uuid_b' /var/log/goclusterfs.log"; then
         log_error "VM A replayed live VM B's journal during its restart"
+        return 1
+    fi
+    local slot_after
+    slot_after=$(ssh_run "$vm_a" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1")
+    if [[ "$slot_after" != "$slot_before" ]]; then
+        log_error "VM A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount"
         return 1
     fi
 

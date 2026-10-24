@@ -7,12 +7,14 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -62,8 +64,13 @@ type Slot struct {
 	MountTime     int64      // When this node mounted
 	JournalOffset uint64     // This node's journal region offset
 	JournalSize   uint64     // This node's journal size
-	Hostname      [64]byte   // Node hostname (informational)
-	Reserved      [3964]byte // Padding to 4096 bytes
+	Hostname      [64]byte   // Node hostname
+	BootID        [16]byte   // Kernel boot ID of the node's host
+	PID           uint32     // Mount process ID
+	ProcStart     int64      // Mount process start time (Unix ns)
+	RecoveryOwner [16]byte   // Dead slots: node replaying the journal
+	RecoveryStart int64      // Dead slots: when that replay started (Unix s)
+	Reserved      [3912]byte // Padding to 4096 bytes
 	Checksum      uint32     // CRC32C of bytes 0-4091
 }
 
@@ -80,6 +87,10 @@ type Registry struct {
 
 	journalOffset   uint64
 	journalSlotSize uint64
+
+	hostname   string
+	bootID     [16]byte
+	onSlotLost func(slot int, owner [16]byte)
 
 	// Cross-node recovery
 	recoveryHandler      RecoveryHandler
@@ -123,6 +134,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		stopCh:               make(chan struct{}),
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
+		bootID:               readBootID(),
 	}
 
 	// Generate a unique UUID for this node
@@ -137,6 +149,14 @@ func (r *Registry) SetRecoveryHandler(handler RecoveryHandler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.recoveryHandler = handler
+}
+
+// SetSlotLostHandler sets what the heartbeat does when it finds another node in this node's slot.
+// Without a handler it only logs.
+func (r *Registry) SetSlotLostHandler(fn func(slot int, owner [16]byte)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.onSlotLost = fn
 }
 
 // SetJournalArea makes Register record a journal region in the claimed slot:
@@ -162,9 +182,10 @@ func (r *Registry) journalRegion(slotIdx int) (offset, size uint64) {
 	return r.journalOffset + uint64(slotIdx)*r.journalSlotSize, r.journalSlotSize
 }
 
-// Register claims a slot in the node registry.
-// Returns the slot index on success.
-// Dead slots are skipped: the peer that marked them is replaying their journal.
+// Register claims a slot in the node registry and returns its index.
+// It first takes back a slot left by a mount process on this host that has
+// exited, so the caller replays that journal before serving. Otherwise it
+// takes an empty slot or one whose node has failed.
 func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -173,28 +194,22 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 		return r.localSlot, nil // Already registered
 	}
 
-	// Find a free slot or reclaim a dead one
-	for i := 0; i < MaxNodes; i++ {
-		slot, err := r.readSlot(i)
-		if err != nil {
-			continue
-		}
+	var name [64]byte
+	copy(name[:], hostname)
+	r.hostname = string(bytes.TrimRight(name[:], "\x00"))
 
-		canClaim := false
-		switch slot.State {
-		case NodeStateEmpty:
-			canClaim = true
-		case NodeStateActive, NodeStateLeaving:
-			// Check if heartbeat is stale
-			if r.isHeartbeatStale(slot) {
-				canClaim = true
+	for _, claimable := range []func(*Slot) bool{
+		r.deadLocalOwner,
+		func(slot *Slot) bool { return slot.State == NodeStateEmpty || r.failed(slot, HeartbeatTimeout) },
+	} {
+		for i := 0; i < MaxNodes; i++ {
+			raw, slot, err := r.readSlotRaw(i)
+			if err != nil || !claimable(slot) {
+				continue
 			}
-		}
-
-		if canClaim {
-			if err := r.claimSlot(i, hostname); err != nil {
+			if err := r.claimSlot(i, raw); err != nil {
 				if errors.Is(err, ErrSlotTaken) {
-					continue // Race condition, try next slot
+					continue
 				}
 				return -1, err
 			}
@@ -218,8 +233,7 @@ func (r *Registry) Unregister(ctx context.Context) error {
 	// Save slot number for later
 	slotNum := r.localSlot
 
-	// Signal goroutines to stop
-	close(r.stopCh)
+	r.closeStop()
 
 	// IMPORTANT: Release lock before waiting on WaitGroup to avoid deadlock.
 	// Background goroutines (failureDetectionLoop, heartbeatLoop) may be holding
@@ -246,6 +260,23 @@ func (r *Registry) Unregister(ctx context.Context) error {
 	r.localSlot = -1
 	r.stopCh = make(chan struct{})
 	return nil
+}
+
+// Stop ends the heartbeat and failure detection. It waits for a journal
+// replay in progress, so call it before closing the device.
+func (r *Registry) Stop() {
+	r.mu.Lock()
+	r.closeStop()
+	r.mu.Unlock()
+	r.heartbeatWg.Wait()
+}
+
+func (r *Registry) closeStop() {
+	select {
+	case <-r.stopCh:
+	default:
+		close(r.stopCh)
+	}
 }
 
 // StartHeartbeat begins the background heartbeat goroutine.
@@ -280,40 +311,32 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 		case <-ticker.C:
 			r.mu.Lock()
 			slot, err := r.readSlot(slotIdx)
-			switch {
-			case err != nil:
-			case slot.UUID == r.localUUID:
+			takenOver := err == nil && slot.UUID != r.localUUID && !lost
+			if err == nil && slot.UUID == r.localUUID {
 				slot.HeartbeatSeq = seq
 				slot.HeartbeatTime = time.Now().Unix()
 				r.writeSlot(slotIdx, slot)
 				seq++
-			case !lost:
-				lost = true
-				log.Printf("ERROR: node registry slot %d was taken over by node %x; "+
-					"this node no longer owns its journal region", slotIdx, slot.UUID[:8])
 			}
+			onSlotLost := r.onSlotLost
 			r.mu.Unlock()
+
+			if takenOver {
+				lost = true
+				if onSlotLost != nil {
+					onSlotLost(slotIdx, slot.UUID)
+				} else {
+					log.Printf("ERROR: node registry slot %d was taken over by node %x; "+
+						"this node no longer owns its journal region", slotIdx, slot.UUID[:8])
+				}
+			}
 		}
 	}
 }
 
-// claimSlot attempts to atomically claim a slot using CAS.
-func (r *Registry) claimSlot(slotIdx int, hostname string) error {
-	offset := int64(r.offset) + int64(slotIdx)*SlotSize
-
-	// Read raw bytes directly (not deserialize) for CAS comparison
-	oldBuf := storage.GetBuffer(SlotSize)
-	defer storage.PutBuffer(oldBuf)
-
-	if _, err := r.dev.ReadAt(oldBuf.Bytes(), offset); err != nil {
-		return err
-	}
-
-	// Make a copy of old data for comparison
-	oldData := make([]byte, SlotSize)
-	copy(oldData, oldBuf.Bytes())
-
-	// Prepare new slot
+// claimSlot replaces the slot bytes Register judged claimable with this node's
+// registration, then re-reads the slot to catch a racing node.
+func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 	newSlot := &Slot{
 		Magic:         SlotMagic,
 		State:         NodeStateActive,
@@ -321,14 +344,14 @@ func (r *Registry) claimSlot(slotIdx int, hostname string) error {
 		HeartbeatSeq:  1,
 		HeartbeatTime: time.Now().Unix(),
 		MountTime:     time.Now().Unix(),
+		BootID:        r.bootID,
+		PID:           uint32(os.Getpid()),
+		ProcStart:     processStart,
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
-	copy(newSlot.Hostname[:], hostname)
+	copy(newSlot.Hostname[:], r.hostname)
 
-	newData := serializeSlot(newSlot)
-
-	// Perform CAS with raw bytes
-	success, err := r.casSlot(slotIdx, oldData, newData)
+	success, err := r.casSlot(slotIdx, expected, serializeSlot(newSlot))
 	if err != nil {
 		return err
 	}
@@ -374,6 +397,23 @@ func (r *Registry) casSlot(slotIdx int, expected, new []byte) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// readSlotRaw reads a node slot and returns its bytes for a later CAS along with the parsed slot.
+func (r *Registry) readSlotRaw(slotIdx int) ([]byte, *Slot, error) {
+	if slotIdx < 0 || slotIdx >= MaxNodes {
+		return nil, nil, fmt.Errorf("slot index out of range: %d", slotIdx)
+	}
+
+	buf := storage.GetBuffer(SlotSize)
+	defer storage.PutBuffer(buf)
+
+	if _, err := r.dev.ReadAt(buf.Bytes(), int64(r.offset)+int64(slotIdx)*SlotSize); err != nil {
+		return nil, nil, err
+	}
+	raw := bytes.Clone(buf.Bytes())
+	slot, err := deserializeSlot(raw)
+	return raw, slot, err
 }
 
 // readSlot reads a node slot from disk.
@@ -461,6 +501,11 @@ func serializeSlot(slot *Slot) []byte {
 	binary.LittleEndian.PutUint64(buf[48:56], slot.JournalOffset)
 	binary.LittleEndian.PutUint64(buf[56:64], slot.JournalSize)
 	copy(buf[64:128], slot.Hostname[:])
+	copy(buf[128:144], slot.BootID[:])
+	binary.LittleEndian.PutUint32(buf[144:148], slot.PID)
+	binary.LittleEndian.PutUint64(buf[148:156], uint64(slot.ProcStart))
+	copy(buf[156:172], slot.RecoveryOwner[:])
+	binary.LittleEndian.PutUint64(buf[172:180], uint64(slot.RecoveryStart))
 
 	// Compute checksum
 	checksum := storage.CRC32C(buf[:SlotSize-4])
@@ -490,16 +535,21 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 		MountTime:     int64(binary.LittleEndian.Uint64(buf[40:48])),
 		JournalOffset: binary.LittleEndian.Uint64(buf[48:56]),
 		JournalSize:   binary.LittleEndian.Uint64(buf[56:64]),
+		PID:           binary.LittleEndian.Uint32(buf[144:148]),
+		ProcStart:     int64(binary.LittleEndian.Uint64(buf[148:156])),
+		RecoveryStart: int64(binary.LittleEndian.Uint64(buf[172:180])),
 		Checksum:      stored,
 	}
 	copy(slot.UUID[:], buf[8:24])
 	copy(slot.Hostname[:], buf[64:128])
+	copy(slot.BootID[:], buf[128:144])
+	copy(slot.RecoveryOwner[:], buf[156:172])
 
 	return slot, nil
 }
 
-// StartFailureDetection begins the background failure detection goroutine.
-// This scans for failed nodes and triggers recovery via the registered handler.
+// StartFailureDetection replays the journals of failed nodes it finds now,
+// then keeps scanning in the background.
 func (r *Registry) StartFailureDetection() {
 	r.mu.RLock()
 	if r.localSlot < 0 {
@@ -508,6 +558,7 @@ func (r *Registry) StartFailureDetection() {
 	}
 	r.mu.RUnlock()
 
+	r.detectAndRecoverFailedNodes()
 	r.heartbeatWg.Add(1)
 	go r.failureDetectionLoop()
 }
@@ -552,21 +603,8 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			continue
 		}
 
-		// Check for failed nodes
-		needsRecovery := false
-		switch slot.State {
-		case NodeStateActive, NodeStateLeaving:
-			// Check for stale heartbeat (2x timeout for consensus)
-			age := time.Since(time.Unix(slot.HeartbeatTime, 0))
-			if age > 2*HeartbeatTimeout {
-				needsRecovery = true
-			}
-		case NodeStateDead:
-			// Already marked dead, try to recover if we haven't
-			needsRecovery = true
-		}
-
-		if !needsRecovery {
+		// Stale heartbeats need 2x timeout for consensus
+		if !r.failed(slot, 2*HeartbeatTimeout) {
 			r.mu.Unlock()
 			continue
 		}
@@ -580,7 +618,7 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		r.mu.Unlock()
 
 		// Try to acquire the slot for recovery
-		info, err := r.acquireForRecovery(i, slot)
+		info, err := r.acquireForRecovery(i, slot, 2*HeartbeatTimeout)
 		if err != nil {
 			r.mu.Lock()
 			delete(r.recoveryInProgress, i)
@@ -588,10 +626,9 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			continue // Another node beat us to it
 		}
 
-		// Perform recovery
 		if err := handler(info); err != nil {
-			// Recovery failed, release lock
-			r.releaseRecoveryLock(i, slot)
+			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v",
+				i, info.UUID[:8], err, recoveryLease)
 			r.mu.Lock()
 			delete(r.recoveryInProgress, i)
 			r.mu.Unlock()
@@ -606,46 +643,26 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 	}
 }
 
-// acquireForRecovery attempts to atomically acquire a failed node's slot.
-// Uses CAS to ensure only one node performs recovery.
-func (r *Registry) acquireForRecovery(slotIdx int, currentSlot *Slot) (*FailedNodeInfo, error) {
+// acquireForRecovery marks a failed node's slot Dead with this node as the
+// recovery lease holder. The CAS lets only one node replay the journal; a
+// lease that lapses lets another node resume an interrupted replay.
+func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.Duration) (*FailedNodeInfo, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Re-read to get current state for CAS
-	slot, err := r.readSlot(slotIdx)
+	raw, slot, err := r.readSlotRaw(slotIdx)
 	if err != nil {
 		return nil, err
 	}
-
-	// Verify slot still needs recovery
-	if slot.State == NodeStateEmpty {
-		return nil, ErrSlotTaken // Already cleared
-	}
-	if slot.UUID != currentSlot.UUID {
-		return nil, ErrSlotTaken // Different node claimed it
+	if slot.UUID != observed.UUID || !r.failed(slot, timeout) {
+		return nil, ErrSlotTaken
 	}
 
-	// Prepare slot for recovery (mark as Dead if not already)
-	if slot.State != NodeStateDead {
-		oldData := serializeSlot(slot)
-
-		slot.State = NodeStateDead
-		newData := serializeSlot(slot)
-
-		success, err := r.casSlot(slotIdx, oldData, newData)
-		if err != nil || !success {
-			return nil, ErrSlotTaken
-		}
-	}
-
-	// Extract hostname as string
-	hostname := string(slot.Hostname[:])
-	for i, b := range slot.Hostname {
-		if b == 0 {
-			hostname = string(slot.Hostname[:i])
-			break
-		}
+	slot.State = NodeStateDead
+	slot.RecoveryOwner = r.localUUID
+	slot.RecoveryStart = time.Now().Unix()
+	if success, err := r.casSlot(slotIdx, raw, serializeSlot(slot)); err != nil || !success {
+		return nil, ErrSlotTaken
 	}
 
 	return &FailedNodeInfo{
@@ -654,19 +671,12 @@ func (r *Registry) acquireForRecovery(slotIdx int, currentSlot *Slot) (*FailedNo
 		JournalOffset: slot.JournalOffset,
 		JournalSize:   slot.JournalSize,
 		LastHeartbeat: time.Unix(slot.HeartbeatTime, 0),
-		Hostname:      hostname,
+		Hostname:      hostnameOf(slot),
 	}, nil
 }
 
-// releaseRecoveryLock releases the lock on a failed slot after a failed recovery.
-// The slot stays in Dead state for another node to retry.
-func (r *Registry) releaseRecoveryLock(slotIdx int, originalSlot *Slot) {
-	// Nothing to do - slot stays in Dead state
-	// Another node can retry recovery
-}
-
-// clearFailedSlot empties a slot after successful recovery, unless another
-// node has claimed it since.
+// clearFailedSlot empties a slot after this node replayed its journal, unless
+// another node has claimed it or taken over the recovery since.
 func (r *Registry) clearFailedSlot(slotIdx int, uuid [16]byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -675,7 +685,7 @@ func (r *Registry) clearFailedSlot(slotIdx int, uuid [16]byte) error {
 	if err != nil {
 		return err
 	}
-	if slot.UUID != uuid || slot.State != NodeStateDead {
+	if slot.UUID != uuid || slot.State != NodeStateDead || slot.RecoveryOwner != r.localUUID {
 		return nil
 	}
 	_, err = r.casSlot(slotIdx, serializeSlot(slot), serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
@@ -745,18 +755,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 		return err
 	}
 
-	// Verify node is actually failed
-	needsRecovery := false
-	switch slot.State {
-	case NodeStateActive, NodeStateLeaving:
-		if r.isHeartbeatStale(slot) {
-			needsRecovery = true
-		}
-	case NodeStateDead:
-		needsRecovery = true
-	}
-
-	if !needsRecovery {
+	if !r.failed(slot, HeartbeatTimeout) {
 		r.mu.Unlock()
 		return errors.New("node is not in a failed state")
 	}
@@ -774,7 +773,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 		r.mu.Unlock()
 	}()
 
-	info, err := r.acquireForRecovery(slotIdx, slot)
+	info, err := r.acquireForRecovery(slotIdx, slot, HeartbeatTimeout)
 	if err != nil {
 		return err
 	}

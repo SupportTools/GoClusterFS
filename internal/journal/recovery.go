@@ -9,10 +9,9 @@ import (
 
 // Recovery errors
 var (
-	ErrRecoveryFailed     = errors.New("journal recovery failed")
-	ErrCorruptTxn         = errors.New("corrupt transaction found")
-	ErrUnexpectedEnd      = errors.New("unexpected end of journal data")
-	ErrRecoveryInProgress = errors.New("another recovery already in progress")
+	ErrRecoveryFailed = errors.New("journal recovery failed")
+	ErrCorruptTxn     = errors.New("corrupt transaction found")
+	ErrUnexpectedEnd  = errors.New("unexpected end of journal data")
 )
 
 // RecoveredTxn represents a transaction found during recovery.
@@ -54,15 +53,13 @@ type RecoveryHandler func(txn *RecoveredTxn) error
 // 3. Scan from head to tail
 // 4. For each committed transaction, call handler
 // 5. On success, mark state as Clean and reset pointers
+//
+// A journal left Recovering by a failed or interrupted replay is replayed
+// again. Replay is idempotent, and the node registry's recovery lease keeps
+// two nodes from replaying one journal at once.
 func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
 	if !region.NeedsRecovery() {
 		return &RecoveryStats{}, nil
-	}
-
-	// Prevent concurrent recovery
-	state := region.State()
-	if state == JournalStateRecovering {
-		return nil, ErrRecoveryInProgress
 	}
 
 	// Mark as recovering
@@ -75,7 +72,7 @@ func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
 	// Scan and recover
 	err := scanJournal(region, handler, stats)
 	if err != nil {
-		// Recovery failed - leave in recovering state for manual intervention
+		// Leave the journal Recovering so the next attempt replays it again
 		return stats, fmt.Errorf("recovery failed: %w", err)
 	}
 

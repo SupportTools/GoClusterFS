@@ -2,7 +2,9 @@ package node
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -687,18 +689,21 @@ func TestRegisterSkipsSlotUnderRecovery(t *testing.T) {
 	defer cleanup()
 
 	reg := NewRegistry(dev, 0)
-	dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{9},
-		HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
-	if err := reg.writeSlot(0, dead); err != nil {
-		t.Fatal(err)
+	for i, started := range []time.Duration{0, 2 * recoveryLease} {
+		dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{byte(9 + i)},
+			HeartbeatTime: time.Now().Add(-time.Hour).Unix(), RecoveryOwner: [16]byte{7},
+			RecoveryStart: time.Now().Add(-started).Unix()}
+		if err := reg.writeSlot(i, dead); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	slot, err := reg.Register(context.Background(), "node")
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if slot == 0 {
-		t.Error("Register claimed a slot that a peer is recovering")
+	if slot != 1 {
+		t.Errorf("Register took slot %d, want slot 1, whose recovery lease lapsed", slot)
 	}
 }
 
@@ -774,5 +779,130 @@ func TestUnregisterKeepsNewOwner(t *testing.T) {
 	}
 	if got.UUID != newOwner.UUID {
 		t.Errorf("Unregister cleared slot %d now owned by %x", slot, newOwner.UUID)
+	}
+}
+
+func writeLocalSlot(t *testing.T, reg *Registry, idx int, pid int, procStart int64) {
+	t.Helper()
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{byte(idx + 1)},
+		HeartbeatTime: time.Now().Unix(), BootID: reg.bootID, PID: uint32(pid), ProcStart: procStart}
+	copy(slot.Hostname[:], "node")
+	if err := reg.writeSlot(idx, slot); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func exitedPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Skipf("cannot run true: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+func TestRegisterReclaimsSlotOfExitedLocalProcess(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) {
+		t.Skip("no kernel boot ID")
+	}
+	writeLocalSlot(t, reg, 0, os.Getppid(), 1)
+	writeLocalSlot(t, reg, 1, os.Getpid(), processStart)
+	writeLocalSlot(t, reg, 3, exitedPID(t), 1)
+
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if slot != 3 {
+		t.Errorf("Register took slot %d, want slot 3 of the exited local mount", slot)
+	}
+}
+
+func TestRecoveryOfExitedLocalProcessSkipsHeartbeatTimeout(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) {
+		t.Skip("no kernel boot ID")
+	}
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalSlot(t, reg, 2, exitedPID(t), 1)
+	writeLocalSlot(t, reg, 3, os.Getppid(), 1)
+
+	var recovered []int
+	reg.SetRecoveryHandler(func(info *FailedNodeInfo) error {
+		recovered = append(recovered, info.SlotIndex)
+		return nil
+	})
+	reg.detectAndRecoverFailedNodes()
+
+	if len(recovered) != 1 || recovered[0] != 2 {
+		t.Errorf("recovered slots %v, want only slot 2 of the exited local mount", recovered)
+	}
+}
+
+func TestRecoveryLeaseBlocksOthersUntilItLapses(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	failed := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{5},
+		RecoveryOwner: [16]byte{6}, RecoveryStart: time.Now().Unix()}
+	if err := reg.writeSlot(4, failed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout); !errors.Is(err, ErrSlotTaken) {
+		t.Fatalf("acquire during another node's lease: err = %v, want ErrSlotTaken", err)
+	}
+
+	failed.RecoveryStart = time.Now().Add(-2 * recoveryLease).Unix()
+	if err := reg.writeSlot(4, failed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout); err != nil {
+		t.Fatalf("acquire after the lease lapsed: %v", err)
+	}
+	slot, err := reg.readSlot(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot.RecoveryOwner != reg.LocalUUID() || time.Since(time.Unix(slot.RecoveryStart, 0)) > time.Minute {
+		t.Errorf("lease owner %x started %v, want this node now", slot.RecoveryOwner, time.Unix(slot.RecoveryStart, 0))
+	}
+}
+
+func TestHeartbeatReportsLostSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+
+	reg := NewRegistry(dev, 0)
+	lost := make(chan [16]byte, 1)
+	reg.SetSlotLostHandler(func(slot int, owner [16]byte) { lost <- owner })
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Stop()
+
+	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{8}, HeartbeatTime: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case owner := <-lost:
+		if owner != ([16]byte{8}) {
+			t.Errorf("lost slot to %x, want 08", owner)
+		}
+	case <-time.After(3 * HeartbeatInterval):
+		t.Error("heartbeat did not report the lost slot")
 	}
 }
