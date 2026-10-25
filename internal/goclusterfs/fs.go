@@ -56,8 +56,9 @@ var beforeInPlaceWrite func()
 var beforeShareMark func()
 
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
-// when concurrent modifications are detected.
-const MaxWriteRetries = 3
+// when concurrent modifications are detected. Back-to-back snapshots on another
+// node can force a retry each time; with conflictBackoff, 10 tries span up to 5s.
+const MaxWriteRetries = 10
 
 // errRetryCreate is an internal sentinel error indicating that an inode slot
 // collision was detected during Create/Mkdir and the operation should be retried.
