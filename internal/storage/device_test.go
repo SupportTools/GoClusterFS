@@ -1,11 +1,13 @@
 package storage
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestDeviceOpenNonExistent verifies error handling for missing files.
@@ -367,5 +369,49 @@ func TestMultiShardIO(t *testing.T) {
 				i, readBuf.Bytes()[i], buf.Bytes()[i])
 			break
 		}
+	}
+}
+
+// A write that waits for its I/O shard past its deadline writes nothing.
+func TestWriteAtBeforeSkipsWriteAfterShardWait(t *testing.T) {
+	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
+	if tmpDir == "" {
+		tmpDir = t.TempDir()
+	}
+	testFile := filepath.Join(tmpDir, "test_write_deadline.bin")
+	if err := os.WriteFile(testFile, make([]byte, IOShardSize), 0o600); err != nil {
+		t.Skipf("Cannot create test file: %v", err)
+	}
+	defer func() { _ = os.Remove(testFile) }()
+	dev, err := Open(testFile)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	buf := NewAlignedBuffer(SectorSize)
+	buf.Bytes()[0] = 0xAB
+	shard := &dev.ioShards[shardIndex(0)]
+	shard.Lock()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := dev.WriteAtBefore(buf.Bytes(), 0, time.Now().Add(10*time.Millisecond))
+		errc <- err
+	}()
+	time.Sleep(30 * time.Millisecond)
+	shard.Unlock()
+	if err := <-errc; !errors.Is(err, ErrWriteDeadline) {
+		t.Fatalf("write after a 30ms shard wait with a 10ms deadline: got %v, want ErrWriteDeadline", err)
+	}
+
+	got := NewAlignedBuffer(SectorSize)
+	if _, err := dev.ReadAt(got.Bytes(), 0); err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if got.Bytes()[0] != 0 {
+		t.Fatalf("the skipped write reached the device: first byte %#x", got.Bytes()[0])
+	}
+	if _, err := dev.WriteAtBefore(buf.Bytes(), 0, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("write well before its deadline: %v", err)
 	}
 }

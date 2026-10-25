@@ -129,6 +129,14 @@ func TestRecordSize(t *testing.T) {
 
 // createTestDevice creates a test file for O_DIRECT testing.
 // Uses testing.TB interface to support both tests and benchmarks.
+// TestMain relaxes the record write window: these tests run on whatever disk
+// holds the checkout, which can take longer than 10ms per write. Tests of the
+// window itself set it back with useWrites.
+func TestMain(m *testing.M) {
+	claimWriteWindow = time.Minute
+	os.Exit(m.Run())
+}
+
 func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	tb.Helper()
 
@@ -529,6 +537,7 @@ func TestHintCacheOptimisticAcquire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Release failed: %v", err)
 	}
+	mgr.ReleaseCached()
 
 	// Second acquire should use the hint cache (optimistic path)
 	err = mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)

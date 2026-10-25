@@ -65,8 +65,9 @@ var beforeSizeUpdate func(*File)
 var beforeShareMark func()
 
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
-// when concurrent modifications are detected.
-const MaxWriteRetries = 3
+// when concurrent modifications are detected. Back-to-back snapshots on another
+// node can force a retry each time; with conflictBackoff, 10 tries span up to 5s.
+const MaxWriteRetries = 10
 
 // errRetryCreate is an internal sentinel error indicating that an inode slot
 // collision was detected during Create/Mkdir and the operation should be retried.
@@ -307,6 +308,13 @@ func (f *FS) Close() error {
 		if err := f.journal.Stop(); err != nil {
 			log.Printf("Warning: failed to stop journal cleanly: %v", err)
 		}
+	}
+	// Other nodes would otherwise wait for these holds to go stale.
+	if f.lockMgr != nil {
+		f.lockMgr.ReleaseCached()
+		t := f.lockMgr.WriteTimings()
+		log.Printf("lock: %d record writes, %d skipped and %d late; the missed ones spent %v waiting in this process and %v in the device",
+			t.Writes, t.Skipped, t.Late, t.InProcess, t.Device)
 	}
 	return f.dev.Close()
 }
@@ -2425,6 +2433,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 			return 0, syscall.EIO
 		}
+		// Only a block that was already allocated, written and unshared can skip the extent lock.
+		plainBlock := err == nil && ext.Flags&(extent.FlagUnwritten|extent.FlagShared) == 0
+		// A block allocated by this write stays invisible to other nodes until the inode,
+		// whose lock this write holds, is committed, so nobody else can write it meanwhile.
+		newBlock := false
 		if err != nil {
 			// Need to allocate - must acquire lock first
 			if !lockHeld && f.fs.lockMgr != nil {
@@ -2473,6 +2486,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				ino = freshIno
 				inoDirty = true
 				ext = newExt
+				newBlock = true
 			} else {
 				// Allocate block (acquires bitmap lock internally, then releases it)
 				ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
@@ -2663,8 +2677,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// When multiple nodes write to different offsets within the same block,
 		// they must serialize their read-modify-write operations to avoid
 		// one node's changes being overwritten by another's stale read.
+		// Whole sectors of a plain block are written without reading them, so they need no lock.
+		wholeSectors := blockOffset%storage.SectorSize == 0 && toWrite%storage.SectorSize == 0
+		skipExtentLock := newBlock || (plainBlock && wholeSectors)
 		extentLockHeld := false
-		if f.fs.lockMgr != nil {
+		if f.fs.lockMgr != nil && !skipExtentLock {
 			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
 				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
@@ -2695,19 +2712,22 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		sectorOffset := diskOffset - alignedOffset
 
 		for bytesInBlock := 0; bytesInBlock < toWrite; {
-			// Read existing sector
-			if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
-				// New sector - zero it
-				for i := range buf.Bytes() {
-					buf.Bytes()[i] = 0
-				}
-			}
-
-			// Modify
 			copyLen := storage.SectorSize - int(sectorOffset)
 			if copyLen > toWrite-bytesInBlock {
 				copyLen = toWrite - bytesInBlock
 			}
+
+			// Read existing sector unless this write replaces all of it
+			if copyLen < storage.SectorSize {
+				if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
+					// New sector - zero it
+					for i := range buf.Bytes() {
+						buf.Bytes()[i] = 0
+					}
+				}
+			}
+
+			// Modify
 			copy(buf.Bytes()[sectorOffset:], data[bytesWritten+bytesInBlock:bytesWritten+bytesInBlock+copyLen])
 
 			// Write back

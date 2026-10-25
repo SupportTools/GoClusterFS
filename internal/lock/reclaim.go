@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"errors"
 	"log"
 	"time"
 )
@@ -48,7 +49,7 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
 	gate.Lock()
 	defer gate.Unlock()
 
-	for {
+	for attempt := 0; ; attempt++ {
 		record, err := m.readRecord(recordID)
 		if err != nil {
 			return false, err
@@ -62,12 +63,21 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
 		adopted.AcquireTime = time.Now().Unix()
 		adopted.Sequence++
 		ok, err := m.casRecord(recordID, record, &adopted)
+		if errors.Is(err, errLateWrite) {
+			m.giveUpLateClaim(recordID, &adopted)
+			return false, nil
+		}
 		if err != nil {
 			return false, err
 		}
 		if ok {
 			return true, nil
 		}
+		if attempt == maxRecordUpdates-1 {
+			log.Printf("[WARN] lock: could not take over record %d of dead node %x in %d tries; it frees itself once stale", recordID, owner[:8], maxRecordUpdates)
+			return false, nil
+		}
+		updateBackoff(attempt)
 	}
 }
 
@@ -94,7 +104,7 @@ func (m *Manager) releaseAdopted(recordID uint64) error {
 		return nil
 	}
 
-	for {
+	for attempt := 0; ; attempt++ {
 		record, err := m.readRecord(recordID)
 		if err != nil {
 			return err
@@ -103,9 +113,17 @@ func (m *Manager) releaseAdopted(recordID uint64) error {
 			return nil
 		}
 		ok, err := m.casRecord(recordID, record, &Record{Sequence: record.Sequence + 1})
+		if errors.Is(err, errLateWrite) {
+			return nil
+		}
 		if err != nil || ok {
 			return err
 		}
+		if attempt == maxRecordUpdates-1 {
+			log.Printf("[WARN] lock: could not release taken-over record %d in %d tries; it frees itself once stale", recordID, maxRecordUpdates)
+			return nil
+		}
+		updateBackoff(attempt)
 	}
 }
 

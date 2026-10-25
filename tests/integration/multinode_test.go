@@ -17,9 +17,6 @@ import (
 // This validates that bitmap allocation and inode table updates don't corrupt when accessed
 // concurrently by multiple processes.
 func TestMultiNodeConcurrentFileCreation(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping concurrent file creation test in short mode - known race condition in distributed lock (Task #5177)")
-	}
 	cluster := NewMultiNodeCluster(t, 2, 50) // 2 nodes, 50MB image
 
 	// Format and start first node
@@ -1638,9 +1635,6 @@ func TestStressRandomFailures(t *testing.T) {
 // inode lock around its read-modify-write of the extents, or the later inode
 // write drops the other node's extent and its data.
 func TestMultiNodeConcurrentFirstWriteToSameBlock(t *testing.T) {
-	if testing.Short() {
-		t.Skip("two nodes can still both take a free inode lock (about 1 file in 150 loses a write) until lock claims are confirmed")
-	}
 	cluster := NewMultiNodeCluster(t, 2, 100)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("Failed to format and start first node: %v", err)
@@ -1707,6 +1701,146 @@ func TestMultiNodeConcurrentFirstWriteToSameBlock(t *testing.T) {
 	}
 	if lost > 0 {
 		t.Fatalf("%d of %d files lost a node's write", lost, files)
+	}
+}
+
+// TestMultiNodeSubBlockWritesToOneBlock has two nodes write into one allocated
+// block at once: whole 4KB sectors, which need no extent lock, and each node's
+// half of the same 64 sectors, which need it for their read-modify-write.
+// Every write survives.
+func TestMultiNodeSubBlockWritesToOneBlock(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 100)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	const files, sector, halves = 4, 4096, 64
+	name := func(i int) string { return fmt.Sprintf("subblock_%02d.bin", i) }
+	for i := 0; i < files; i++ {
+		if err := cluster.Node(0).WriteFile(name(i), make([]byte, 1024*1024)); err != nil {
+			t.Fatalf("Failed to create %s: %v", name(i), err)
+		}
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	fill := func(c byte, n int) []byte { return bytes.Repeat([]byte{c}, n) }
+	const halfStart = 64
+	for i := 0; i < files; i++ {
+		errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+			f, err := node.OpenFile(name(i))
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			for s := halfStart; s < halfStart+halves; s++ {
+				if _, err := f.WriteAt(fill(byte('a'+idx), sector/2), int64(s*sector+idx*sector/2)); err != nil {
+					return err
+				}
+			}
+			for s := idx; s < 32; s += 2 {
+				if _, err := f.WriteAt(fill(byte('A'+idx), sector), int64(s*sector)); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		for idx, err := range errs {
+			if err != nil {
+				t.Fatalf("%s: node %d write failed: %v", name(i), idx, err)
+			}
+		}
+	}
+
+	cluster.StopAllNodes()
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("Failed to remount node 0: %v", err)
+	}
+	for i := 0; i < files; i++ {
+		got, err := cluster.Node(0).ReadFile(name(i))
+		if err != nil {
+			t.Fatalf("Failed to read %s: %v", name(i), err)
+		}
+		for s := 0; s < 32; s++ {
+			if want := fill(byte('A'+s%2), sector); !bytes.Equal(got[s*sector:(s+1)*sector], want) {
+				t.Fatalf("%s: sector %d lost node %d's whole-sector write", name(i), s, s%2)
+			}
+		}
+		for s := halfStart; s < halfStart+halves; s++ {
+			for idx := 0; idx < 2; idx++ {
+				off := s*sector + idx*sector/2
+				if want := fill(byte('a'+idx), sector/2); !bytes.Equal(got[off:off+sector/2], want) {
+					t.Fatalf("%s: sector %d lost node %d's half-sector write", name(i), s, idx)
+				}
+			}
+		}
+	}
+}
+
+// TestMultiNodeWritesToOneFallocatedBlock has two nodes write different sectors
+// of one fallocated block at once. The first write zero-fills the block, so these
+// writes must take the extent lock: both survive and the rest reads as zeros.
+func TestMultiNodeWritesToOneFallocatedBlock(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 100)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	const files, sector = 10, 4096
+	name := func(i int) string { return fmt.Sprintf("falloc_shared_%02d.bin", i) }
+	for i := 0; i < files; i++ {
+		if err := cluster.Node(0).WriteFile(name(i), nil); err != nil {
+			t.Fatalf("Failed to create %s: %v", name(i), err)
+		}
+		f, err := cluster.Node(0).OpenFile(name(i))
+		if err != nil {
+			t.Fatalf("OpenFile %s: %v", name(i), err)
+		}
+		err = syscall.Fallocate(int(f.Fd()), 0, 0, 1024*1024)
+		f.Close()
+		if err != nil {
+			t.Fatalf("Fallocate %s: %v", name(i), err)
+		}
+	}
+	time.Sleep(1500 * time.Millisecond)
+
+	for i := 0; i < files; i++ {
+		errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+			return node.WriteFileAt(name(i), bytes.Repeat([]byte{byte('A' + idx)}, sector), int64((10+idx)*sector))
+		})
+		for idx, err := range errs {
+			if err != nil {
+				t.Fatalf("%s: node %d write failed: %v", name(i), idx, err)
+			}
+		}
+	}
+
+	cluster.StopAllNodes()
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("Failed to remount node 0: %v", err)
+	}
+	for i := 0; i < files; i++ {
+		got, err := cluster.Node(0).ReadFile(name(i))
+		if err != nil {
+			t.Fatalf("Failed to read %s: %v", name(i), err)
+		}
+		want := make([]byte, 1024*1024)
+		copy(want[10*sector:], bytes.Repeat([]byte{'A'}, sector))
+		copy(want[11*sector:], bytes.Repeat([]byte{'B'}, sector))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: a node's write was lost or the block was not zero-filled", name(i))
+		}
 	}
 }
 

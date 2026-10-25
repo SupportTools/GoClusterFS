@@ -349,6 +349,34 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  # Docker/VM TODO: these need two nodes writing sub-block ranges of one block at
+  # the same moment and a byte-exact check after a remount; the Go tests run the
+  # real mount binary for both nodes.
+  - id: multinode-sub-block-writes
+    name: Sub-block writes to one block from two nodes
+    description: Two nodes write whole sectors (no extent lock) and halves of the same sectors (extent lock) of one block at once; every write survives
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeSubBlockWritesToOneBlock
+      docker: TODO
+      vm: TODO
+
+  - id: multinode-fallocated-block-writes
+    name: Writes to one fallocated block from two nodes
+    description: Two nodes write different sectors of one fallocated block at once; both survive and the rest reads as zeros
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeWritesToOneFallocatedBlock
+      docker: TODO
+      vm: TODO
+
+  - id: multinode-reader-sees-no-uncommitted-blocks
+    name: Reader never sees uncommitted blocks
+    description: While node A writes a new file of fresh blocks without extent locks, node B's reads show only holes, the old size or each block's own data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestReaderNeverSeesUncommittedBlocks
+
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
     description: Multiple nodes write to same block at different offsets
@@ -2022,7 +2050,6 @@ scenarios:
     name: Snapshots on one node while another overwrites the file
     description: Every snapshot node B takes while node A overwrites the file chunk by chunk shows one moment of the file and never changes afterwards
     priority: high
-    # Skipped in all three suites until #29: two nodes can both hold the refcount lock and lose a count.
     environments:
       go: snapshot_test.go::TestSnapshotsDuringWritesAcrossNodes
       docker: run-tests.sh::test_snapshot_during_writes
@@ -2032,7 +2059,6 @@ scenarios:
     name: Concurrent snapshots on two nodes
     description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's
     priority: high
-    # Skipped in all three suites (Go in -short mode) until #29: two nodes can both claim one free inode.
     environments:
       go: snapshot_test.go::TestSnapshotConcurrentCreatesAcrossNodes
       docker: run-tests.sh::test_snapshot_concurrent_creates
@@ -2218,6 +2244,139 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestFailedWriteKeepsBlocksCommittedMidWrite
+
+  - id: lock-claim-overwritten-during-settle
+    name: Claim overwritten during settle wait
+    description: A node whose claim another node overwrites during the settle wait does not keep the lock
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestClaimOverwrittenDuringSettleIsNotHeld
+
+  - id: lock-released-hold-cached
+    name: Released hold cached for grace
+    description: After its last local holder releases, a node keeps the record for CacheGrace, and another node gets it soon after
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleasedHoldIsCachedForGrace
+
+  - id: lock-cached-rejoin-skips-settle
+    name: Cached rejoin skips settle wait
+    description: Re-acquiring a cached hold on the same node needs no disk I/O and no settle wait
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCachedHoldRejoinSkipsSettleWait
+
+  - id: lock-paused-node-drops-cached-hold
+    name: Paused node drops a cached hold taken over
+    description: A cached read hold older than renewAfter is released and acquired afresh, so a node waking from a pause does not reuse a record another node took over
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestPausedNodeDropsCachedHoldTakenOver
+
+  - id: lock-release-cached
+    name: Release cached holds
+    description: ReleaseCached lets other nodes take kept records at once
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
+
+  - id: lock-busy-node-yields
+    name: Busy node yields a cached record
+    description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
+
+  - id: lock-shared-claim-join-during-settle
+    name: Shared claim survives a join during settle
+    description: A reader on another node joining a fresh shared claim during its settle wait does not leak a reader count
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSharedClaimSurvivesJoinDuringSettle
+
+  - id: lock-concurrent-dir-reads-create
+    name: Concurrent directory reads do not delay create or unlink
+    description: Two nodes taking a shared claim on one directory at once leave no reader count behind, so a create or unlink there finishes within 2s
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestConcurrentDirReadsDoNotDelayCreateOrUnlink
+
+  - id: lock-concurrent-refcount-reads-snapshots
+    name: Concurrent refcount reads do not delay snapshots
+    description: Two nodes reading refcounts at once leave no reader count behind, so snapshot create, copy-on-write and snapshot delete each finish within 2s
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestConcurrentRefcountReadsDoNotDelaySnapshots
+
+  - id: lock-slow-claim-write-skipped
+    name: Slow claim write is skipped
+    description: A claim write that cannot start within half the settle delay of its read writes nothing, and the node gets the lock once the holder releases
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlowClaimWriteIsSkipped
+
+  - id: lock-late-claim-write-not-held
+    name: Late claim write is not held
+    description: A claim write that lands more than half the settle delay after its read, over another node's confirmed claim, is not held, so two nodes cannot both hold the lock
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLateClaimWriteIsNotHeld
+
+  - id: lock-late-read-claim-admits-no-readers
+    name: Late read claim admits no more readers
+    description: A read claim that lands late on another node's write claim is turned into a write claim, with no write deadline, so no reader joins beside the writer after that
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLateReadClaimAdmitsNoMoreReaders
+
+  - id: lock-late-fence-leaves-stale-takeover
+    name: Late fence leaves a stale takeover alone
+    description: A fence write that cannot start within fenceWindow of its read writes nothing, so it cannot overwrite a claim another node made after the record went stale
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLateFenceLeavesStaleTakeoverAlone
+
+  - id: lock-timeout-logs-holder
+    name: Timed-out acquire logs the holder
+    description: An acquire that gives up logs at WARN which node holds the record and how
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTimedOutAcquireLogsHolder
+
+  - id: lock-release-cached-parallel
+    name: Unmount frees kept locks in parallel
+    description: On slow storage ReleaseCached frees kept records in parallel, so 16 records take about as long as one
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseCachedWithSlowWritesRunsInParallel
+
+  - id: lock-slow-release-gives-up
+    name: Release with slow writes gives up
+    description: A release whose writes keep missing their deadline stops after a bounded number of tries and leaves the record to go stale
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseWithSlowWritesGivesUp
+
+  - id: lock-slow-renewal-gives-up
+    name: Renewal with slow writes gives up
+    description: A renewal whose writes keep missing their deadline stops after a bounded number of tries and fails the joining acquire
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestRenewalWithSlowWritesGivesUp
+
+  - id: storage-write-deadline-after-shard-wait
+    name: Deadline write skipped after shard wait
+    description: A write that waits for its I/O shard past its deadline writes nothing
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestWriteAtBeforeSkipsWriteAfterShardWait
+
+  - id: lock-cancelled-context-waits
+    name: Cancelled context keeps waiting
+    description: A cancelled context (FUSE interrupt) does not end a lock wait; only a deadline or DefaultTimeout does
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCancelledContextStillWaitsForLock
 
   - id: lock-region-bounded
     name: Lock region stays bounded
