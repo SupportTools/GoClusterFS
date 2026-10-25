@@ -304,10 +304,11 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 	}
 }
 
-// On a 200 GiB volume the 1 MB refcount table has entries for blocks 0-130815
-// only. Several inodes counting on a share of a higher block lose data when
-// one is deleted, and marking older sharing of such blocks counted would
-// cause the same, so repair leaves that sharing alone.
+// A refcount table of 1 MB, like layout v2's, has entries for blocks 0-130815
+// only; mount refuses that on a 200 GiB volume, but fsck checks it. Several
+// inodes counting on a share of a higher block lose data when one is deleted,
+// and marking older sharing of such blocks counted would cause the same, so
+// repair leaves that sharing alone.
 func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
 	path := newFormattedImageOfSize(t, 200<<30)
 	fsys := openFormattedFS(t, path)
@@ -316,8 +317,8 @@ func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	covered := sb.RefCountTableSize / 4096 * 511
-	counted, older := covered+5, covered+9
+	const covered = 1 << 20 / 4096 * 511
+	counted, older := uint64(covered+5), uint64(covered+9)
 
 	share := func(name string, block uint64, flags uint32) *File {
 		f := createFile(t, fsys, name)
@@ -339,6 +340,10 @@ func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
 	share("counted-b", counted, extent.FlagShared|extent.FlagCounted)
 	oldA := share("older-a", older, extent.FlagShared)
 	share("older-b", older, extent.FlagShared)
+	sb.RefCountTableSize = 1 << 20
+	if err := superblock.Write(fsys.dev, sb); err != nil {
+		t.Fatal(err)
+	}
 
 	check := runFsck(t, fsys, fsck.DefaultOptions())
 	problems := problemList(check)

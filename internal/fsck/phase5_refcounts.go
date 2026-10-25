@@ -75,14 +75,8 @@ func (c *Checker) checkRefcounts() error {
 		c.logf("  Refcount table not present (size=0)\n")
 		return nil
 	}
-	needSectors := (sb.TotalBlocks + RefcountEntriesPerSector - 1) / RefcountEntriesPerSector
-	totalSectors := min(sb.RefCountTableSize/RefcountSectorSize, needSectors)
-	if totalSectors < needSectors {
-		c.addProblem(PhaseRefcounts, Error, "refcount table size",
-			fmt.Sprintf("refcount table too small: %d sectors, need %d for %d blocks",
-				totalSectors, needSectors, sb.TotalBlocks),
-			false)
-	}
+	totalSectors := min(sb.RefCountTableSize/RefcountSectorSize,
+		(sb.TotalBlocks+RefcountEntriesPerSector-1)/RefcountEntriesPerSector)
 
 	c.logf("  Refcount table offset: 0x%X\n", sb.RefCountTableOffset)
 	c.logf("  Refcount table size: %d bytes (%d sectors)\n", sb.RefCountTableSize, totalSectors)
@@ -121,8 +115,8 @@ func (c *Checker) checkRefcounts() error {
 		}
 	}
 	if covered := c.refcountCoverage(); sb.TotalBlocks > covered {
-		c.addProblem(PhaseRefcounts, Warning, "refcount table",
-			fmt.Sprintf("has entries for blocks 0-%d of %d; snapshots and clones of files with data in higher blocks fail", covered-1, sb.TotalBlocks), false)
+		c.addProblem(PhaseRefcounts, Error, "refcount table",
+			fmt.Sprintf("has entries for blocks 0-%d of %d, so mount refuses the volume", covered-1, sb.TotalBlocks), false)
 		c.checkSharingPastTable(covered)
 	}
 	c.reportUncounted()
