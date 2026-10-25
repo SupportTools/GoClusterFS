@@ -2340,6 +2340,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	var cowDone []*extent.CoWResult
 	// How many of allocatedExtents and cowDone a mid-write persist already put on disk.
 	committedAllocs, committedCoW := 0, 0
+	// An inode write that failed may still have reached the disk, so copies it
+	// carried can no longer be freed.
+	copiesMayBeOnDisk := false
 	// Abort transaction on error path
 	defer func() {
 		if txn != nil && f.fs.journal != nil {
@@ -2361,6 +2364,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			return nil
 		}
 		if inoDirty {
+			copiesMayBeOnDisk = true
 			if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 				log.Printf("[DEBUG] Write inode %d: persisting inode before unlocking failed: %v", f.inodeNum, err)
 				releaseInodeLock()
@@ -2368,6 +2372,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return retryOnTreeConflict(err)
 			}
 			inoDirty = false
+			copiesMayBeOnDisk = false
 			committedAllocs, committedCoW = len(allocatedExtents), len(cowDone)
 		}
 		releaseInodeLock()
@@ -2379,6 +2384,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			// Discarding frees tree blocks, which needs the bitmap lock: drop the inode lock first.
 			releaseInodeLock()
 			f.fs.extentMgr.DiscardPending(ctx, ino)
+			if !copiesMayBeOnDisk {
+				for _, cow := range cowDone[committedCoW:] {
+					if err := f.fs.extentMgr.FreePhysicalBlock(ctx, cow.NewPhysBlock); err != nil {
+						log.Printf("[DEBUG] Write inode %d: freeing unused copy %d failed: %v", f.inodeNum, cow.NewPhysBlock, err)
+					}
+				}
+			}
 		}
 	}()
 
@@ -2854,6 +2866,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		// The retry finds these blocks already copied, so release the old ones now.
 		releaseCopied(cowDone[:committedCoW])
+		cowDone = cowDone[:committedCoW]
 		return errRetryWrite
 	}
 
@@ -2863,6 +2876,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}
 	// Write inode - use WriteWithLockHeld if we hold the lock
+	copiesMayBeOnDisk = true
 	if lockHeld {
 		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 			log.Printf("[DEBUG] Write inode %d: WriteWithLockHeld failed: %v", f.inodeNum, err)

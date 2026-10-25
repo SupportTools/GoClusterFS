@@ -561,6 +561,36 @@ func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
 	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
 }
 
+// A write that copied a shared block and then fails before any inode write
+// gives the copy back, and the file keeps its old block.
+func TestFailedWriteFreesUnusedCopy(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	if err := fsys.InitRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, BlockSize)
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, original, 0)
+	setxattr(t, f, "user.snapshot", "keep")
+	old := physicalBlock(t, fsys, f.inodeNum, 0)
+	free := fsys.bitmapMgr.FreeCount()
+
+	t.Cleanup(func() { testHookBeforeInodeCommit = nil })
+	testHookBeforeInodeCommit = func() error { return errors.New("injected failure") }
+	if _, errno := f.Write(context.Background(), nil, pattern(2, 4096), 0); errno != syscall.EIO {
+		t.Fatalf("write with a failing commit: errno %v, want EIO", errno)
+	}
+	testHookBeforeInodeCommit = nil
+
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Errorf("free blocks %d after the failed write, want %d: the copy leaked", got, free)
+	}
+	if got := physicalBlock(t, fsys, f.inodeNum, 0); got != old {
+		t.Errorf("file moved to block %d after the failed write, want %d", got, old)
+	}
+	checkFile(t, f, original)
+}
+
 // Node A changes the file after node B's snapshot counted its blocks and before
 // it marks the file shared. The snapshot shares the file as changed, and once
 // the snapshot is gone every block the file no longer maps is free again.
