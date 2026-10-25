@@ -45,7 +45,7 @@ func main() {
 
 		// Journal configuration
 		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
-		skipRecovery   = flag.Bool("skip-recovery", false, "Skip journal recovery (emergency maintenance only)")
+		skipRecovery   = flag.Int("skip-recovery", -1, "Discard the journal of registry slot N instead of replaying it, if this mount takes slot N (emergency maintenance only)")
 
 		// Network broadcast configuration
 		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
@@ -152,7 +152,13 @@ func main() {
 
 	// Check for and recover any dirty journal from a previous crash
 	// This must happen BEFORE we create our own journal to avoid data loss
-	if *journalEnabled && !*skipRecovery {
+	// -skip-recovery names the slot whose journal the operator chose to discard;
+	// a mount that takes any other slot replays that slot's journal.
+	skip := *skipRecovery >= 0 && *skipRecovery == slotIdx
+	if *skipRecovery >= 0 && !skip {
+		log.Printf("Journal: ignoring -skip-recovery=%d: this mount took slot %d, so it replays that slot's journal", *skipRecovery, slotIdx)
+	}
+	if *journalEnabled && !skip {
 		// Set up recovery context with our managers
 		recoveryCtx := &journal.RecoveryContext{
 			Dev:       dev,
@@ -167,14 +173,14 @@ func main() {
 		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := journal.ScanAndRecover(dev, journalOffset, journalSize, recoveryHandler)
 		if err != nil {
-			log.Fatalf("Journal recovery for slot %d failed: %v (mount with -skip-recovery to discard this journal)", slotIdx, err)
+			log.Fatalf("Journal recovery for slot %d failed: %v (to discard this journal, mount with -skip-recovery=%d)", slotIdx, err, slotIdx)
 		}
 		if result != nil && result.WasNeeded {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
 				result.Stats.TxnCommitted, result.Stats.BytesScanned, result.NodeUUID[:8])
 		}
-	} else if *skipRecovery {
-		log.Println("Journal: WARNING - skipping recovery (emergency mode)")
+	} else if skip {
+		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
 	}
 	releasePrevious()
 

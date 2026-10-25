@@ -489,6 +489,13 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesDamagedJournal
 
+  - id: skip-recovery-discards-only-named-slot
+    name: -skip-recovery discards only the named slot
+    description: A mount that takes another host's crashed slot ignores -skip-recovery naming a different slot and replays that slot, also on a retry after its own failed mount stamped the slot; -skip-recovery naming the slot discards its journal
+    priority: go_only
+    environments:
+      go: journal_slots_test.go::TestSkipRecoveryDiscardsOnlyNamedSlot
+
   - id: journal-scan-never-initialized
     name: Recovery scan of a never-initialized journal
     description: ScanAndRecover treats an all-zero journal header as nothing to recover
