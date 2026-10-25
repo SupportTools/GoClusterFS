@@ -21,11 +21,12 @@ const (
 	Magic = "GOCLUSTERFS"
 
 	// CurrentVersion is the format version this code produces.
-	// Version 2 gives each node slot its own journal region.
-	CurrentVersion uint32 = 2
+	// Version 2 gives each node slot its own journal region. Version 3 sizes the
+	// block bitmap, refcount table and inode table from the device.
+	CurrentVersion uint32 = 3
 
 	// MinSupportedVersion is the oldest format we can read.
-	MinSupportedVersion uint32 = 2
+	MinSupportedVersion uint32 = 3
 )
 
 // Feature flags - optional features (can mount without understanding)
@@ -51,7 +52,7 @@ var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots
 var (
 	ErrInvalidMagic     = errors.New("invalid superblock magic")
 	ErrNewerVersion     = errors.New("superblock version newer than supported - upgrade GoClusterFS")
-	ErrTooOldVersion    = errors.New("superblock version too old - reformat with -format")
+	ErrTooOldVersion    = errors.New("superblock version too old")
 	ErrChecksumMismatch = errors.New("superblock checksum mismatch - possible corruption")
 	ErrUnknownRequired  = errors.New("superblock requires features this version doesn't support")
 )
@@ -116,16 +117,8 @@ type Superblock struct {
 // CanMount checks if this version of GoClusterFS can safely mount the volume.
 // Returns nil if safe to mount, or an appropriate error.
 func (sb *Superblock) CanMount() error {
-	// Check if superblock is from a newer version we can't safely read
-	if sb.Version > CurrentVersion {
-		return fmt.Errorf("%w: volume is v%d, we support up to v%d",
-			ErrNewerVersion, sb.Version, CurrentVersion)
-	}
-
-	// Check if superblock is too old (we no longer support it)
-	if sb.Version < MinSupportedVersion {
-		return fmt.Errorf("%w: volume is v%d, minimum supported is v%d",
-			ErrTooOldVersion, sb.Version, MinSupportedVersion)
+	if err := CheckVersion(sb.Version); err != nil {
+		return err
 	}
 
 	// Check for required features we don't understand
@@ -136,6 +129,22 @@ func (sb *Superblock) CanMount() error {
 			ErrUnknownRequired, unknownFlags)
 	}
 
+	return nil
+}
+
+// CheckVersion returns an error that says what to do when this build cannot
+// mount a volume of the given format version.
+func CheckVersion(version uint32) error {
+	switch {
+	case version > CurrentVersion:
+		return fmt.Errorf("%w: volume is v%d, we support up to v%d",
+			ErrNewerVersion, version, CurrentVersion)
+	case version < MinSupportedVersion:
+		return fmt.Errorf("%w: volume is v%d, this version mounts v%d. Layout v2 has fixed 1 MB regions: "+
+			"at most 4096 inodes, and refcounts for data past 128 GB overwrite the snapshot registry. "+
+			"Copy the data off with the version that formatted it, then reformat with -format",
+			ErrTooOldVersion, version, MinSupportedVersion)
+	}
 	return nil
 }
 

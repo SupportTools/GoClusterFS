@@ -2320,6 +2320,56 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
+# Test: more than 4096 files. Layout v2 held 4096 inodes; the cluster is
+# formatted with one inode per 64 KB, so the shared image holds more. A create
+# takes about 130 ms, so every node creates and removes its share at once.
+test_more_than_4096_files() {
+    log "Testing more than 4096 files..."
+
+    local first="${NODE_ARRAY[0]}"
+    local nodes=${#NODE_ARRAY[@]}
+    local dir=/mnt/goclusterfs/many_files
+    local inodes
+    inodes=$(exec_on_node "$first" stat -f -c %c /mnt/goclusterfs)
+    if [[ "$inodes" -le 4200 ]]; then
+        log "ERROR: statfs reports $inodes inodes, want more than 4200"
+        return 1
+    fi
+
+    if ! exec_on_node "$first" sh -c "mkdir $dir && for d in \$(seq 0 41); do mkdir $dir/d\$d || exit 1; done"; then
+        log "ERROR: creating directories on $first failed"
+        exec_on_node "$first" rm -rf "$dir"
+        return 1
+    fi
+    local i pid failed=0 pids=()
+    for i in "${!NODE_ARRAY[@]}"; do
+        exec_on_node "${NODE_ARRAY[$i]}" sh -c "for d in \$(seq $i $nodes 41); do cd $dir/d\$d && touch \$(seq 0 99 | sed 's/^/f/') || exit 1; done" &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+    done
+    sleep 1.5
+    local count
+    count=$(exec_on_node "$first" sh -c "find $dir -type f | wc -l")
+
+    pids=()
+    for i in "${!NODE_ARRAY[@]}"; do
+        exec_on_node "${NODE_ARRAY[$i]}" sh -c "for d in \$(seq $i $nodes 41); do rm -f $dir/d\$d/f*; done" &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    exec_on_node "$first" rm -rf "$dir"
+
+    if [[ $failed -ne 0 || "$count" -ne 4200 ]]; then
+        log "ERROR: a node failed to create its files ($failed) or $first sees $count files, want 4200"
+        return 1
+    fi
+
+    log "More than 4096 files test passed"
+    return 0
+}
+
 # Test: Extent cache coherency across nodes
 # Node 1 reads files, node 0 changes their block mappings (truncate and rewrite,
 # hole fill), and node 1 must read the new data.
@@ -3217,6 +3267,7 @@ run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidatio
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
+run_test "More Than 4096 Files" test_more_than_4096_files
 run_test "Extent Cache Coherency" test_extent_cache_coherency
 run_test "Statfs After Remount" test_statfs_after_remount
 run_test "Statfs Multi-Node" test_statfs_multinode

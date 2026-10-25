@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -54,11 +55,11 @@ func writeAt(t *testing.T, dev *storage.Device, offset int64, data []byte) {
 
 func TestFormatThenRead(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize+8<<20)
-	for _, offset := range []int64{1 << 20, 3 << 20, 5<<20 + 7*NodeJournalSize, 262 << 20} {
+	for _, offset := range []int64{1 << 20, 3 << 20, 4<<20 + 7*NodeJournalSize, 260 << 20, 262 << 20} {
 		writeAt(t, dev, offset, []byte("stale metadata from an earlier format"))
 	}
 
-	formatted, err := Format(dev)
+	formatted, err := Format(dev, 0)
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
@@ -66,13 +67,13 @@ func TestFormatThenRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read after Format: %v", err)
 	}
-	if got.UUID != formatted.UUID || got.TotalBlocks != 9 || got.Version != 2 {
-		t.Errorf("read back UUID %x, %d blocks, v%d; want %x, 9 blocks, v2",
+	if got.UUID != formatted.UUID || got.TotalBlocks != 9 || got.Version != 3 {
+		t.Errorf("read back UUID %x, %d blocks, v%d; want %x, 9 blocks, v3",
 			got.UUID, got.TotalBlocks, got.Version, formatted.UUID)
 	}
 
 	buf := storage.NewAlignedBuffer(storage.SectorSize)
-	for _, offset := range []int64{1 << 20, 3 << 20, 5<<20 + 7*NodeJournalSize, 262 << 20} {
+	for _, offset := range []int64{1 << 20, 3 << 20, 4<<20 + 7*NodeJournalSize, 260 << 20, 262 << 20} {
 		if _, err := dev.ReadAt(buf.Bytes(), offset); err != nil {
 			t.Fatal(err)
 		}
@@ -84,7 +85,7 @@ func TestFormatThenRead(t *testing.T) {
 
 func TestFormatKeepsSparseImageSparse(t *testing.T) {
 	dev, path := testDeviceAt(t, MinDeviceSize)
-	if _, err := Format(dev); err != nil {
+	if _, err := Format(dev, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	var st syscall.Stat_t
@@ -98,7 +99,7 @@ func TestFormatKeepsSparseImageSparse(t *testing.T) {
 
 func TestFormatRejectsSmallDevice(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize-1<<20)
-	if _, err := Format(dev); !errors.Is(err, ErrDeviceTooSmall) {
+	if _, err := Format(dev, 0); !errors.Is(err, ErrDeviceTooSmall) {
 		t.Errorf("Format on %d-byte device: err = %v, want ErrDeviceTooSmall", dev.Size(), err)
 	}
 }
@@ -123,7 +124,7 @@ func TestReadLegacyLayout(t *testing.T) {
 
 func TestReadRejectsVersion1(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size())
+	sb := New(dev.Size(), 0)
 	sb.Version = 1
 	writeAt(t, dev, 0, sb.Serialize())
 
@@ -132,9 +133,46 @@ func TestReadRejectsVersion1(t *testing.T) {
 	}
 }
 
+func TestReadRejectsVersion2(t *testing.T) {
+	dev := testDevice(t, MinDeviceSize)
+	sb := New(dev.Size(), 0)
+	sb.Version = 2
+	writeAt(t, dev, 0, sb.Serialize())
+
+	_, err := Read(dev)
+	if !errors.Is(err, ErrTooOldVersion) || !strings.Contains(err.Error(), "reformat with -format") {
+		t.Errorf("Read v2 superblock: err = %v, want ErrTooOldVersion saying to reformat", err)
+	}
+}
+
+func TestReadAfterDeviceGrows(t *testing.T) {
+	dev, path := testDeviceAt(t, MinDeviceSize+8<<20)
+	formatted, err := Format(dev, 64<<10)
+	if err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	if err := os.Truncate(path, 2<<30); err != nil {
+		t.Fatal(err)
+	}
+	grown, err := storage.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = grown.Close() })
+
+	got, err := Read(grown)
+	if err != nil {
+		t.Fatalf("Read after the device grew: %v", err)
+	}
+	if got.TotalBlocks != formatted.TotalBlocks || got.InodeCount != formatted.InodeCount {
+		t.Errorf("read %d blocks and %d inodes, want the formatted %d and %d",
+			got.TotalBlocks, got.InodeCount, formatted.TotalBlocks, formatted.InodeCount)
+	}
+}
+
 func TestReadRejectsForeignJournalGeometry(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size())
+	sb := New(dev.Size(), 0)
 	sb.MaxNodes = 16
 	writeAt(t, dev, 0, sb.Serialize())
 
@@ -145,7 +183,7 @@ func TestReadRejectsForeignJournalGeometry(t *testing.T) {
 
 func TestReadRejectsMovedRegion(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size())
+	sb := New(dev.Size(), 0)
 	sb.RefCountTableOffset += 4096
 	writeAt(t, dev, 0, sb.Serialize())
 

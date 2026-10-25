@@ -115,8 +115,8 @@ func (c *Checker) checkRefcounts() error {
 		}
 	}
 	if covered := c.refcountCoverage(); sb.TotalBlocks > covered {
-		c.addProblem(PhaseRefcounts, Warning, "refcount table",
-			fmt.Sprintf("has entries for blocks 0-%d of %d; snapshots and clones of files with data in higher blocks fail", covered-1, sb.TotalBlocks), false)
+		c.addProblem(PhaseRefcounts, Error, "refcount table",
+			fmt.Sprintf("has entries for blocks 0-%d of %d, so mount refuses the volume", covered-1, sb.TotalBlocks), false)
 		c.checkSharingPastTable(covered)
 	}
 	c.reportUncounted()

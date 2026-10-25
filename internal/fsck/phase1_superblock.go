@@ -50,11 +50,8 @@ func (c *Checker) checkSuperblock() error {
 	c.logf("  Magic: OK\n")
 
 	// Check version
-	if sb.Version < superblock.MinSupportedVersion || sb.Version > superblock.CurrentVersion {
-		c.addProblem(PhaseSuperblock, Fatal, "offset 12",
-			fmt.Sprintf("unsupported version: %d (supported: %d-%d)",
-				sb.Version, superblock.MinSupportedVersion, superblock.CurrentVersion),
-			false)
+	if err := superblock.CheckVersion(sb.Version); err != nil {
+		c.addProblem(PhaseSuperblock, Fatal, "offset 12", err.Error(), false)
 		return fmt.Errorf("unsupported superblock version")
 	}
 	c.logf("  Version: %d (OK)\n", sb.Version)

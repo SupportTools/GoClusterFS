@@ -20,7 +20,7 @@ func formattedDevice(t *testing.T, mutate func(*superblock.Superblock)) *storage
 	dev, cleanup := testDevice(t, superblock.MinDeviceSize>>20+64)
 	t.Cleanup(cleanup)
 
-	sb, err := superblock.Format(dev)
+	sb, err := superblock.Format(dev, 0)
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
@@ -84,7 +84,11 @@ func TestFsckBitmapAcceptsUnwrittenSectors(t *testing.T) {
 		t.Errorf("phase 2 problems on a freshly formatted device: %v", problems)
 	}
 
-	writeSector(t, dev, 1<<20, []byte{0xff})
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSector(t, dev, int64(sb.BlockBitmapOffset), []byte{0xff})
 	problems := phaseProblems(dev, fsck.PhaseBitmap)
 	if len(problems) == 0 || !strings.Contains(problems[0].Message, "checksum mismatch") {
 		t.Errorf("phase 2 problems = %v, want a checksum mismatch in sector 0", problems)

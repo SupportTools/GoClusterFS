@@ -29,7 +29,8 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **Name lookups are slow.** Each lookup reads the whole directory from disk and scans it entry by entry. In one test on a single node, a lookup took about 25 ms, and `ls -l` on a 1,000-file directory took about 47 seconds.
 - **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime, and a read can stop at the old size. A file that stays open can use the old size and block mappings for up to `-cache-ttl` (default 5s). Opening the file after `-attr-timeout` has passed reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
-- **On-disk format version 2** since [#15](https://github.com/SupportTools/GoClusterFS/pull/15). Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
+- **On-disk format version 3.** Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
+- **The inode count is set at format time.** `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB, so one per data block), between 4096 and 16,777,216. It cannot change later.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
 - **fsck repairs little.** `-repair` rebuilds refcounts and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
@@ -85,6 +86,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-device` | (required) | Path to block device or image file |
 | `-mount` | (required) | Mount point directory (must exist) |
 | `-format` | `false` | Format the device, then mount it (destroys data) |
+| `-bytes-per-inode` | `1048576` | With `-format`: one inode per this many bytes of device (4096 to 16,777,216 inodes) |
 | `-debug` | `false` | Log every FUSE request |
 
 ### Cache Options
@@ -134,7 +136,7 @@ For clustered deployments:
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
 4. **Limits**: At most 64 nodes mount a device at once, and node clocks must agree within a few seconds (run NTP)
-5. **Format version**: This release uses on-disk format version 2, which gives each node its own journal. It refuses devices formatted by earlier builds; copy their data off and reformat
+5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
 
 Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:
 

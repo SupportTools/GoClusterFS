@@ -36,7 +36,9 @@ func main() {
 		devicePath = flag.String("device", "", "Path to block device or image file")
 		mountPoint = flag.String("mount", "", "Mount point directory")
 		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
-		debug      = flag.Bool("debug", false, "Enable FUSE debug output")
+		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
+			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes)", superblock.MinInodes, superblock.MaxInodes))
+		debug = flag.Bool("debug", false, "Enable FUSE debug output")
 
 		// Cache configuration
 		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
@@ -92,7 +94,7 @@ func main() {
 
 	var sb *superblock.Superblock
 	if *format {
-		sb, err = superblock.Format(dev)
+		sb, err = superblock.Format(dev, *inodeRatio)
 	} else {
 		sb, err = superblock.Read(dev)
 	}
@@ -283,10 +285,6 @@ func main() {
 	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write.
 	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
 	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
-	if covered := refcount.BlocksForSize(sb.RefCountTableSize); totalBlocks > covered {
-		log.Printf("[WARN] Refcount: region covers blocks 0-%d of %d; snapshots and clones of files with data in higher blocks fail",
-			covered-1, totalBlocks)
-	}
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)

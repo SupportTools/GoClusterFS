@@ -32,6 +32,8 @@ const (
 	// InodesPerSector is the number of inodes per disk sector.
 	InodesPerSector = SectorSize / InodeSize // 16
 
+	scanBytes = 1 << 20
+
 	// InodeMagic identifies a valid inode.
 	InodeMagic uint32 = 0x494E4F44 // "INOD"
 
@@ -314,18 +316,42 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	usable := t.totalInodes - uint64(InodeFirstUsable)
-	for i := uint64(0); i < usable; i++ {
-		num := InodeFirstUsable + uint32((t.scanStart+i)%usable)
-		inode, err := t.readInodeUnlocked(num)
-		if err != nil {
-			continue // Skip unreadable inodes
+	start := uint64(InodeFirstUsable) + t.scanStart
+	free := uint32(0)
+	isFree := func(num, magic uint32) bool {
+		if magic == 0 {
+			free = num
 		}
-		if inode.Magic == 0 {
-			return num, nil
-		}
+		return magic != 0
+	}
+	if t.scanMagic(start, t.totalInodes, isFree); free != 0 {
+		return free, nil
+	}
+	if t.scanMagic(uint64(InodeFirstUsable), start, isFree); free != 0 {
+		return free, nil
 	}
 	return 0, ErrInodeFull
+}
+
+// scanMagic calls fn with the magic of each inode in [from, to) until fn
+// returns false. It reads 1 MB at a time and skips ranges it cannot read.
+func (t *Table) scanMagic(from, to uint64, fn func(num, magic uint32) bool) {
+	buf := storage.GetBuffer(scanBytes)
+	defer storage.PutBuffer(buf)
+
+	for sector := from / InodesPerSector; sector*InodesPerSector < to; {
+		sectors := min(scanBytes/SectorSize, (to+InodesPerSector-1)/InodesPerSector-sector)
+		data := buf.Bytes()[:sectors*SectorSize]
+		if _, err := t.dev.ReadAt(data, int64(t.offset+sector*SectorSize)); err == nil {
+			for num := max(from, sector*InodesPerSector); num < min(to, (sector+sectors)*InodesPerSector); num++ {
+				i := num - sector*InodesPerSector
+				if !fn(uint32(num), binary.LittleEndian.Uint32(data[i*InodeSize:])) {
+					return
+				}
+			}
+		}
+		sector += sectors
+	}
 }
 
 // ClaimSlot attempts to claim a specific inode slot found by FindFreeSlot().
@@ -463,15 +489,12 @@ func (t *Table) FreeCount() uint64 {
 	defer t.mu.RUnlock()
 
 	freeCount := uint64(0)
-	for num := InodeFirstUsable; uint64(num) < t.totalInodes; num++ {
-		inode, err := t.readInodeUnlocked(num)
-		if err != nil {
-			continue
-		}
-		if inode.Magic == 0 {
+	t.scanMagic(uint64(InodeFirstUsable), t.totalInodes, func(_, magic uint32) bool {
+		if magic == 0 {
 			freeCount++
 		}
-	}
+		return true
+	})
 	return freeCount
 }
 

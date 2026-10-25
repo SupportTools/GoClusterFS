@@ -253,7 +253,7 @@ func printPhases() {
 		name string
 		desc string
 	}{
-		{1, "Superblock", "Validates magic, version, sizes, the format v2 region layout, checksum"},
+		{1, "Superblock", "Validates magic, version, sizes, the format v3 region layout, checksum"},
 		{2, "Bitmap", "Checks sector checksums, counts allocated blocks"},
 		{3, "Inodes", "Validates per-inode checksums, mode, link count, extent trees"},
 		{4, "Extents", "Verifies block bounds, allocation, overlap detection"},
