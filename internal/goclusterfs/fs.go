@@ -43,13 +43,22 @@ import (
 // modification was detected and the Write operation should be retried.
 var errRetryWrite = errors.New("retry write operation")
 
-// beforeCoWCommit lets tests run another node's write after a copy-on-write,
-// before this write takes the inode lock and commits the copy.
+// beforeCoWCommit lets tests run another node's write after this write mapped
+// its copy of a shared block, before it takes the inode lock to copy the data
+// and commit it.
 var beforeCoWCommit func()
 
 // beforeInPlaceWrite lets tests run another node's snapshot after a write
 // decided to write a block in place, before it writes the data.
 var beforeInPlaceWrite func()
+
+// duringInPlaceWrite lets tests act on other nodes while a write holds the
+// locks for an in-place write, before its data lands.
+var duringInPlaceWrite func()
+
+// beforeSizeUpdate lets tests hold a write after its data landed, before it
+// takes the inode lock to update size and mtime.
+var beforeSizeUpdate func(*File)
 
 // beforeShareMark lets tests change a file after a snapshot or clone counted
 // its blocks, before it marks the file shared.
@@ -2331,6 +2340,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	var cowDone []*extent.CoWResult
 	// How many of allocatedExtents and cowDone a mid-write persist already put on disk.
 	committedAllocs, committedCoW := 0, 0
+	// An inode write that failed may still have reached the disk, so copies it
+	// carried can no longer be freed.
+	copiesMayBeOnDisk := false
 	// Abort transaction on error path
 	defer func() {
 		if txn != nil && f.fs.journal != nil {
@@ -2352,6 +2364,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			return nil
 		}
 		if inoDirty {
+			copiesMayBeOnDisk = true
 			if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 				log.Printf("[DEBUG] Write inode %d: persisting inode before unlocking failed: %v", f.inodeNum, err)
 				releaseInodeLock()
@@ -2359,6 +2372,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return retryOnTreeConflict(err)
 			}
 			inoDirty = false
+			copiesMayBeOnDisk = false
 			committedAllocs, committedCoW = len(allocatedExtents), len(cowDone)
 		}
 		releaseInodeLock()
@@ -2370,6 +2384,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			// Discarding frees tree blocks, which needs the bitmap lock: drop the inode lock first.
 			releaseInodeLock()
 			f.fs.extentMgr.DiscardPending(ctx, ino)
+			if !copiesMayBeOnDisk {
+				for _, cow := range cowDone[committedCoW:] {
+					if err := f.fs.extentMgr.FreePhysicalBlock(ctx, cow.NewPhysBlock); err != nil {
+						log.Printf("[DEBUG] Write inode %d: freeing unused copy %d failed: %v", f.inodeNum, cow.NewPhysBlock, err)
+					}
+				}
+			}
 		}
 	}()
 
@@ -2498,7 +2519,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return 0, syscall.EIO
 			}
 			if needsCoW {
-				cowResult, cowErr := f.fs.extentMgr.CopyOnWrite(ctx, ino, ext, blockNum, f.fs.dataOffset, f.fs.refcountReg)
+				// Allocating the copy and mapping it may take bitmap and tree blocks, which come before
+				// the inode lock; the data is copied under the lock, after any in-place write has landed.
+				cowResult, cowErr := f.fs.extentMgr.MapCopy(ctx, ino, blockNum)
 				if cowErr != nil {
 					log.Printf("[DEBUG] Write inode %d: CoW failed for block %d: %v",
 						f.inodeNum, ext.PhysicalBlock, cowErr)
@@ -2509,36 +2532,41 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					}
 					return 0, syscall.EIO
 				}
-				if cowResult.WasShared {
-					if beforeCoWCommit != nil {
-						beforeCoWCommit()
-					}
-					// Copied on an unlocked copy: keep it only if no node wrote the inode meanwhile.
-					if f.fs.lockMgr != nil {
-						if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-							log.Printf("[DEBUG] Write inode %d: failed to acquire lock for CoW: %v", f.inodeNum, err)
-							f.fs.extentMgr.DiscardPending(ctx, ino)
-							f.fs.extentMgr.FreePhysicalBlock(ctx, cowResult.NewPhysBlock)
-							return 0, syscall.EIO
-						}
-						lockHeld = true
-						freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
-						if err != nil || freshIno.MetaGeneration != ino.MetaGeneration {
-							log.Printf("[DEBUG] Write inode %d: inode changed during CoW (err=%v)", f.inodeNum, err)
-							releaseInodeLock()
-							f.fs.extentMgr.DiscardPending(ctx, ino)
-							f.fs.extentMgr.FreePhysicalBlock(ctx, cowResult.NewPhysBlock)
-							return 0, errRetryWrite
-						}
-					}
-					inoDirty = true
-					cowDone = append(cowDone, cowResult)
-					log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
-						f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
-					if ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum); cowErr != nil {
-						log.Printf("[DEBUG] Write inode %d: extent lookup after CoW failed: %v", f.inodeNum, cowErr)
+				dropCopy := func() {
+					releaseInodeLock()
+					f.fs.extentMgr.DiscardPending(ctx, ino)
+					f.fs.extentMgr.FreePhysicalBlock(ctx, cowResult.NewPhysBlock)
+				}
+				if beforeCoWCommit != nil {
+					beforeCoWCommit()
+				}
+				// Mapped on an unlocked copy: keep it only if no node wrote the inode meanwhile.
+				if f.fs.lockMgr != nil {
+					if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+						log.Printf("[DEBUG] Write inode %d: failed to acquire lock for CoW: %v", f.inodeNum, err)
+						dropCopy()
 						return 0, syscall.EIO
 					}
+					lockHeld = true
+					freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
+					if err != nil || freshIno.MetaGeneration != ino.MetaGeneration {
+						log.Printf("[DEBUG] Write inode %d: inode changed during CoW (err=%v)", f.inodeNum, err)
+						dropCopy()
+						return 0, errRetryWrite
+					}
+				}
+				if err := f.fs.extentMgr.CopyBlockData(cowResult, f.fs.dataOffset); err != nil {
+					log.Printf("[DEBUG] Write inode %d: copying block %d failed: %v", f.inodeNum, cowResult.OldPhysBlock, err)
+					dropCopy()
+					return 0, syscall.EIO
+				}
+				inoDirty = true
+				cowDone = append(cowDone, cowResult)
+				log.Printf("[DEBUG] Write inode %d: CoW completed, old block %d -> new block %d",
+					f.inodeNum, cowResult.OldPhysBlock, cowResult.NewPhysBlock)
+				if ext, extOffset, cowErr = f.fs.extentMgr.Lookup(ino, blockNum); cowErr != nil {
+					log.Printf("[DEBUG] Write inode %d: extent lookup after CoW failed: %v", f.inodeNum, cowErr)
+					return 0, syscall.EIO
 				}
 			}
 		}
@@ -2645,6 +2673,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 			extentLockHeld = true
 		}
+		if inPlaceLockHeld && duringInPlaceWrite != nil {
+			duringInPlaceWrite()
+		}
 
 		// The rest of a block first written here would otherwise expose old disk contents.
 		if zeroFirst {
@@ -2713,6 +2744,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	// 3. Calculate newSize = max(fresh_size, our_write_end)
 	// 4. Write inode with updated size
 	// This serializes the read-modify-write cycle.
+	if beforeSizeUpdate != nil {
+		beforeSizeUpdate(f)
+	}
 	acquiredLockForSize := false
 	if !lockHeld && f.fs.lockMgr != nil {
 		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
@@ -2832,6 +2866,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		// The retry finds these blocks already copied, so release the old ones now.
 		releaseCopied(cowDone[:committedCoW])
+		cowDone = cowDone[:committedCoW]
 		return errRetryWrite
 	}
 
@@ -2841,6 +2876,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}
 	// Write inode - use WriteWithLockHeld if we hold the lock
+	copiesMayBeOnDisk = true
 	if lockHeld {
 		if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 			log.Printf("[DEBUG] Write inode %d: WriteWithLockHeld failed: %v", f.inodeNum, err)

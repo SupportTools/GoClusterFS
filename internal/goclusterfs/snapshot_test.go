@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -491,6 +492,103 @@ func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
 			checkFile(t, lookupFile(t, nodeB, "mid-clone"), original)
 		})
 	}
+}
+
+// Node A has checked a block and is writing it in place when node B's snapshot
+// counts the block and node C starts a write that must copy it. C copies the
+// block only after A's data lands, so neither acknowledged write is lost, even
+// when C commits before A updates the inode's size and mtime.
+func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	nodeA := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := nodeA.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, BlockSize)
+	f := newRegularFile(t, nodeA)
+	writeAt(t, f, original, 0)
+	setxattr(t, f, "user.snapshot", "gone")
+	if errno := f.Removexattr(ctx, "user.snapshot.gone"); errno != 0 {
+		t.Fatalf("delete snapshot: %v", errno)
+	}
+	waitSnapshotGone(t, nodeA, "gone")
+	shared := physicalBlock(t, nodeA, f.inodeNum, 0)
+
+	nodeB := openSnapshotFS(t, path)
+	nodeC := openSnapshotFS(t, path)
+	copying := make(chan struct{})
+	cDone := make(chan syscall.Errno, 1)
+	var waitForC, copyStarted sync.Once
+	// The hooks are set before node C's goroutine starts and stay set, so they need no locking.
+	t.Cleanup(func() { duringInPlaceWrite, beforeCoWCommit, beforeSizeUpdate = nil, nil, nil })
+	beforeCoWCommit = func() { copyStarted.Do(func() { close(copying) }) }
+	beforeSizeUpdate = func(w *File) {
+		if w.fs == nodeA {
+			waitForC.Do(func() {
+				if errno := <-cDone; errno != 0 {
+					t.Errorf("node C write: %v", errno)
+				}
+			})
+		}
+	}
+	inPlace := false
+	duringInPlaceWrite = func() {
+		if inPlace {
+			return
+		}
+		inPlace = true
+		// Node B's snapshot counts the block before it marks the file shared.
+		if err := nodeB.refcountReg.Share(ctx, []uint64{shared}); err != nil {
+			t.Error(err)
+		}
+		go func() {
+			_, errno := (&File{fs: nodeC, inodeNum: f.inodeNum}).Write(ctx, nil, pattern(3, 4096), BlockSize/2)
+			cDone <- errno
+		}()
+		<-copying
+	}
+	writeAt(t, f, pattern(2, 4096), 0)
+	if !inPlace {
+		t.Fatal("node A's write never wrote in place")
+	}
+
+	after := openSnapshotFS(t, path)
+	if physicalBlock(t, after, f.inodeNum, 0) == shared {
+		t.Fatal("node C wrote in place instead of copying the block it saw shared")
+	}
+	want := overwritten(overwritten(original, 0, pattern(2, 4096)), BlockSize/2, pattern(3, 4096))
+	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
+}
+
+// A write that copied a shared block and then fails before any inode write
+// gives the copy back, and the file keeps its old block.
+func TestFailedWriteFreesUnusedCopy(t *testing.T) {
+	fsys := openSnapshotFS(t, newSnapshotFSImage(t))
+	if err := fsys.InitRoot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, BlockSize)
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, original, 0)
+	setxattr(t, f, "user.snapshot", "keep")
+	old := physicalBlock(t, fsys, f.inodeNum, 0)
+	free := fsys.bitmapMgr.FreeCount()
+
+	t.Cleanup(func() { testHookBeforeInodeCommit = nil })
+	testHookBeforeInodeCommit = func() error { return errors.New("injected failure") }
+	if _, errno := f.Write(context.Background(), nil, pattern(2, 4096), 0); errno != syscall.EIO {
+		t.Fatalf("write with a failing commit: errno %v, want EIO", errno)
+	}
+	testHookBeforeInodeCommit = nil
+
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Errorf("free blocks %d after the failed write, want %d: the copy leaked", got, free)
+	}
+	if got := physicalBlock(t, fsys, f.inodeNum, 0); got != old {
+		t.Errorf("file moved to block %d after the failed write, want %d", got, old)
+	}
+	checkFile(t, f, original)
 }
 
 // Node A changes the file after node B's snapshot counted its blocks and before
