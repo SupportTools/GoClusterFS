@@ -149,14 +149,8 @@ jobs:
       - name: Build
         run: make build
 
-      # Test images go on tmpfs, as in the unit job: lock record writes on the runner's disk
-      # can miss their 10ms limit and stall a lock for 15s.
       - name: Integration Tests
-        env:
-          TMPDIR: /dev/shm/gcfs-integration
         run: |
-          mkdir -p "$TMPDIR"
-          dd if=/dev/zero of="$TMPDIR/odirect-check" bs=4096 count=1 oflag=direct
           # Run integration tests with -short to skip stress tests that timeout in CI
           # Stress tests (TestStressRandomFailures, TestStress) require local execution
           # Lock order violation fix (Task #4798) enables concurrent file/directory creation tests

@@ -246,6 +246,10 @@ type Manager struct {
 	// Metrics for hint cache effectiveness
 	hintHits   uint64 // Optimistic acquires that succeeded
 	hintMisses uint64 // Optimistic acquires that failed (fell back to read)
+
+	// Record writes, and where the time of those that missed their window went.
+	writes, skippedWrites, lateWrites atomic.Uint64
+	missInProcess, missDevice         atomic.Int64
 }
 
 type lockKey struct {
@@ -370,6 +374,44 @@ func (m *Manager) HintStats() (hits, misses uint64, hitRate float64) {
 		hitRate = float64(hits) / float64(total)
 	}
 	return
+}
+
+// WriteTimings counts a node's lock record writes. For the writes that missed
+// their window, it sums the time spent waiting inside this process (device
+// locks shared with other I/O, the Go scheduler) and in read and write system calls.
+type WriteTimings struct {
+	Writes, Skipped, Late uint64
+	InProcess, Device     time.Duration
+}
+
+// WriteTimings returns this node's lock record write counts so far.
+func (m *Manager) WriteTimings() WriteTimings {
+	return WriteTimings{
+		Writes:    m.writes.Load(),
+		Skipped:   m.skippedWrites.Load(),
+		Late:      m.lateWrites.Load(),
+		InProcess: time.Duration(m.missInProcess.Load()),
+		Device:    time.Duration(m.missDevice.Load()),
+	}
+}
+
+// casTiming is where the time of one record CAS went.
+type casTiming struct {
+	readWait, read, between, writeWait, write time.Duration
+}
+
+func (t casTiming) inProcess() time.Duration { return t.readWait + t.between + t.writeWait }
+func (t casTiming) device() time.Duration    { return t.read + t.write }
+
+func (t casTiming) String() string {
+	return fmt.Sprintf("in process %v: lock waits %v+%v, between calls %v; device %v: read %v, write %v",
+		t.inProcess(), t.readWait, t.writeWait, t.between, t.device(), t.read, t.write)
+}
+
+func (m *Manager) countMissedWrite(counter *atomic.Uint64, t casTiming) {
+	counter.Add(1)
+	m.missInProcess.Add(int64(t.inProcess()))
+	m.missDevice.Add(int64(t.device()))
 }
 
 // Acquire attempts to acquire a lock with the given parameters.
@@ -1080,27 +1122,36 @@ func (m *Manager) casRecordIf(recordID uint64, new *Record, window time.Duration
 	defer storage.PutBuffer(buf)
 
 	start := time.Now()
-	if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
+	_, rt, err := m.dev.ReadAtTimed(buf.Bytes(), offset)
+	if err != nil {
 		return false, err
 	}
+	readDone := time.Now()
 	if !match(binary.LittleEndian.Uint64(buf.Bytes()[48:56]), LockMode(buf.Bytes()[5])) {
 		return false, nil
 	}
 
-	write := m.dev.WriteAtBefore
-	if m.casWrite != nil {
-		write = m.casWrite
-	}
 	copy(buf.Bytes(), serializeRecord(new))
-	if _, err := write(buf.Bytes(), offset, start.Add(window)); err != nil {
+	m.writes.Add(1)
+	writeCalled := time.Now()
+	var wt storage.IOTiming
+	if m.casWrite != nil {
+		_, err = m.casWrite(buf.Bytes(), offset, start.Add(window))
+	} else {
+		_, wt, err = m.dev.WriteAtBeforeTimed(buf.Bytes(), offset, start.Add(window))
+	}
+	t := casTiming{readWait: rt.Wait, read: rt.Syscall, between: writeCalled.Sub(readDone), writeWait: wt.Wait, write: wt.Syscall}
+	if err != nil {
 		if errors.Is(err, storage.ErrWriteDeadline) {
-			log.Printf("[WARN] lock: record %d read was %v old when its write could start; retrying the update", recordID, age(start))
+			m.countMissedWrite(&m.skippedWrites, t)
+			log.Printf("[WARN] lock: record %d read was %v old when its write could start (%v); retrying the update", recordID, age(start), t)
 			return false, nil
 		}
 		return false, err
 	}
 	if took := age(start); took > window {
-		log.Printf("[WARN] lock: record %d write finished %v after its read", recordID, took)
+		m.countMissedWrite(&m.lateWrites, t)
+		log.Printf("[WARN] lock: record %d write finished %v after its read (%v)", recordID, took, t)
 		return true, errLateWrite
 	}
 	return true, nil

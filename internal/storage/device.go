@@ -172,17 +172,30 @@ func (d *Device) Path() string {
 	return d.path
 }
 
+// IOTiming splits the time of one I/O call into waiting for this device's
+// locks, which other I/O of this process can hold, and the system call itself.
+type IOTiming struct {
+	Wait, Syscall time.Duration
+}
+
 // ReadAt reads data from the device at the specified offset.
 // Both offset and len(buf) MUST be aligned to SectorSize.
 // Concurrent reads to different 1MB regions proceed in parallel.
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
+	n, _, err := d.ReadAtTimed(buf, offset)
+	return n, err
+}
+
+// ReadAtTimed is ReadAt that also reports where the call's time went.
+func (d *Device) ReadAtTimed(buf []byte, offset int64) (int, IOTiming, error) {
 	if err := validateAlignment(buf, offset); err != nil {
-		return 0, err
+		return 0, IOTiming{}, err
 	}
 	if len(buf) == 0 {
-		return 0, nil
+		return 0, IOTiming{}, nil
 	}
 
+	start := time.Now()
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
@@ -191,7 +204,9 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 	startShard, endShard := d.lockIORange(offset, len(buf))
 	defer d.unlockIORange(startShard, endShard)
 
-	return d.file.ReadAt(buf, offset)
+	issued := time.Now()
+	n, err := d.file.ReadAt(buf, offset)
+	return n, IOTiming{Wait: issued.Sub(start), Syscall: time.Since(issued)}, err
 }
 
 // WriteAt writes data to the device at the specified offset.
@@ -205,13 +220,20 @@ func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
 // ErrWriteDeadline if deadline has passed once it holds the I/O shard and is
 // about to start the write. A zero deadline never passes.
 func (d *Device) WriteAtBefore(buf []byte, offset int64, deadline time.Time) (int, error) {
+	n, _, err := d.WriteAtBeforeTimed(buf, offset, deadline)
+	return n, err
+}
+
+// WriteAtBeforeTimed is WriteAtBefore that also reports where the call's time went.
+func (d *Device) WriteAtBeforeTimed(buf []byte, offset int64, deadline time.Time) (int, IOTiming, error) {
 	if err := validateAlignment(buf, offset); err != nil {
-		return 0, err
+		return 0, IOTiming{}, err
 	}
 	if len(buf) == 0 {
-		return 0, nil
+		return 0, IOTiming{}, nil
 	}
 
+	start := time.Now()
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
@@ -220,10 +242,12 @@ func (d *Device) WriteAtBefore(buf []byte, offset int64, deadline time.Time) (in
 	startShard, endShard := d.lockIORange(offset, len(buf))
 	defer d.unlockIORange(startShard, endShard)
 
-	if !deadline.IsZero() && !time.Now().Before(deadline) {
-		return 0, ErrWriteDeadline
+	issued := time.Now()
+	if !deadline.IsZero() && !issued.Before(deadline) {
+		return 0, IOTiming{Wait: issued.Sub(start)}, ErrWriteDeadline
 	}
-	return d.file.WriteAt(buf, offset)
+	n, err := d.file.WriteAt(buf, offset)
+	return n, IOTiming{Wait: issued.Sub(start), Syscall: time.Since(issued)}, err
 }
 
 // Sync ensures all written data is persisted to the device.

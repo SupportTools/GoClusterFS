@@ -303,6 +303,9 @@ func (f *FS) Close() error {
 	// Other nodes would otherwise wait for these holds to go stale.
 	if f.lockMgr != nil {
 		f.lockMgr.ReleaseCached()
+		t := f.lockMgr.WriteTimings()
+		log.Printf("lock: %d record writes, %d skipped and %d late; the missed ones spent %v waiting in this process and %v in the device",
+			t.Writes, t.Skipped, t.Late, t.InProcess, t.Device)
 	}
 	return f.dev.Close()
 }
