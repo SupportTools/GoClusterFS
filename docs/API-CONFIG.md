@@ -98,7 +98,7 @@ Without `-api-token`, the API answers only requests whose `Host` header is `loca
 
 By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty. The token is a command-line flag, so local users can read it with `ps`.
 
-The rate limit counts requests per connecting IP address, and per /64 for IPv6. It ignores `X-Forwarded-For`, so behind a proxy every client shares the proxy's limit. `/health` and `/metrics` are never limited. The limiter tracks at most 65,536 clients at once; while it is full, new clients get 429 until idle ones age out, which takes twice the rate interval (2 s at the default burst for 1 request per second).
+The rate limit counts requests per connecting IP address, and per /64 for IPv6. It ignores `X-Forwarded-For`, so behind a proxy every client shares the proxy's limit. `/health` and `/metrics` are never limited. The limiter tracks at most 65,536 clients at once; while it is full, new clients get 429 until idle clients' buckets refill and are dropped, about 2 seconds (longer below 0.5 requests per second).
 
 Each mount on a host needs its own `-api-addr`. When the port is taken, mount logs a warning and runs without the API.
 
