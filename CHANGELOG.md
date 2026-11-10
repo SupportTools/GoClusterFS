@@ -8,8 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
-- The on-disk format is now version 2. Mount refuses devices formatted by earlier builds, because they kept one journal for all nodes and data blocks at a different offset. Copy the data off with the old build, reformat with `-format`, and copy it back.
-- Devices must be at least 264 MB: version 2 reserves 256 MB for 64 node journals of 4 MB.
+- The on-disk format is now version 3. Mount refuses devices formatted by earlier builds. Version 1 kept one journal for all nodes. Version 2 had room for 4096 inodes, and on devices over 128 GB its refcounts overwrote the snapshot registry and then data blocks. Copy the data off with the old build, reformat with `-format`, and copy it back.
+- Devices must be at least 264 MB: the layout reserves 256 MB for 64 node journals of 4 MB.
 - Node clocks must agree within a few seconds. See the node requirements in `docs/OPERATIONS.md`.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `goclusterfs-mount`: a FUSE filesystem that several Linux nodes can mount from one shared block device.
+- `-format` sizes the block bitmap, refcount table and inode table from the device. `-bytes-per-inode` sets the inode count (default one per MB of device, 4096 to 16,777,216).
 - `O_DIRECT` device I/O, split into shards so requests can run in parallel.
 - Distributed compare-and-swap locks on the shared device for block allocation, inode updates, and directory changes. File writes do not take these locks yet, so two nodes extending the same file can lose each other's data.
 - Write-ahead journal with batch commits and a recovery check on mount.

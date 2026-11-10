@@ -17,10 +17,10 @@ import (
 
 func formattedDevice(t *testing.T, mutate func(*superblock.Superblock)) *storage.Device {
 	t.Helper()
-	dev, cleanup := testDevice(t, superblock.MinDeviceSize>>20+64)
+	dev, cleanup := testDevice(t, 64)
 	t.Cleanup(cleanup)
 
-	sb, err := superblock.Format(dev)
+	sb, err := superblock.Format(dev, 0)
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
@@ -66,15 +66,35 @@ func TestFsckAcceptsFormattedLayout(t *testing.T) {
 
 func TestFsckRejectsUnevenJournalSlots(t *testing.T) {
 	problems := phase1Problems(t, func(sb *superblock.Superblock) { sb.MaxNodes = 48 })
-	if len(problems) != 1 || !strings.Contains(problems[0].Message, "do not split into 48 node journals") {
-		t.Errorf("phase 1 problems = %v, want one uneven journal split", problems)
+	if len(problems) != 2 || !strings.Contains(problems[0].Message, "do not split into 48 node journals") ||
+		!strings.Contains(problems[1].Message, "mount refuses this layout") {
+		t.Errorf("phase 1 problems = %v, want an uneven journal split and a layout mount refuses", problems)
 	}
 }
 
 func TestFsckRejectsMoreJournalsThanRegistrySlots(t *testing.T) {
 	problems := phase1Problems(t, func(sb *superblock.Superblock) { sb.MaxNodes = 512 })
-	if len(problems) != 1 || !strings.Contains(problems[0].Message, "registry holds 256 node slots") {
-		t.Errorf("phase 1 problems = %v, want registry too small for 512 journals", problems)
+	if len(problems) != 2 || !strings.Contains(problems[0].Message, "registry holds 256 node slots") ||
+		!strings.Contains(problems[1].Message, "mount refuses this layout") {
+		t.Errorf("phase 1 problems = %v, want registry too small for 512 journals and a layout mount refuses", problems)
+	}
+}
+
+func TestFsckReportsLayoutsMountRefuses(t *testing.T) {
+	for name, mutate := range map[string]func(*superblock.Superblock){
+		"bitmap and refcounts swapped": func(sb *superblock.Superblock) {
+			sb.BlockBitmapOffset, sb.RefCountTableOffset = sb.RefCountTableOffset, sb.BlockBitmapOffset
+		},
+		"inode count below the table": func(sb *superblock.Superblock) { sb.InodeCount = 100 },
+		"gap before the data": func(sb *superblock.Superblock) {
+			sb.DataRegionOffset += 1 << 20
+			sb.TotalBlocks--
+		},
+	} {
+		problems := phase1Problems(t, mutate)
+		if len(problems) != 1 || problems[0].Severity != fsck.Error || !strings.Contains(problems[0].Message, "mount refuses this layout") {
+			t.Errorf("%s: phase 1 problems = %v, want one error for a layout mount refuses", name, problems)
+		}
 	}
 }
 
@@ -84,7 +104,11 @@ func TestFsckBitmapAcceptsUnwrittenSectors(t *testing.T) {
 		t.Errorf("phase 2 problems on a freshly formatted device: %v", problems)
 	}
 
-	writeSector(t, dev, 1<<20, []byte{0xff})
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSector(t, dev, int64(sb.BlockBitmapOffset), []byte{0xff})
 	problems := phaseProblems(dev, fsck.PhaseBitmap)
 	if len(problems) == 0 || !strings.Contains(problems[0].Message, "checksum mismatch") {
 		t.Errorf("phase 2 problems = %v, want a checksum mismatch in sector 0", problems)
@@ -113,6 +137,45 @@ func TestFsckStopsOnBadLayout(t *testing.T) {
 					r.Aborted, r.ExitCode(), r.CompletedPhase, fsck.ExitOperational)
 			}
 		})
+	}
+}
+
+// With the bitmap and refcount offsets swapped, phase 5 would rebuild refcounts over the real bitmap.
+func TestFsckRepairRefusesLayoutMountRefuses(t *testing.T) {
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) {
+		s.BlockBitmapOffset, s.RefCountTableOffset = s.RefCountTableOffset, s.BlockBitmapOffset
+		sb = s
+	})
+	bitmap := make([]byte, storage.SectorSize)
+	bitmap[0] = 0x0f
+	binary.LittleEndian.PutUint32(bitmap[storage.SectorSize-4:], storage.CRC32C(bitmap[:storage.SectorSize-4]))
+	writeSector(t, dev, int64(sb.RefCountTableOffset), bitmap)
+	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
+
+	for _, dryRun := range []bool{true, false} {
+		opts := fsck.DefaultOptions()
+		opts.Output = &bytes.Buffer{}
+		opts.Mode, opts.DryRun = fsck.Repair, dryRun
+		r := fsck.New(dev, opts).Check()
+		text := r.AbortReason
+		for _, p := range r.Problems {
+			text += "\n" + p.String()
+		}
+		want, code := "repair refused: mount refuses this layout", fsck.ExitOperational
+		if dryRun {
+			want, code = "repair would refuse: mount refuses this layout", fsck.ExitUncorrected
+		}
+		if r.ExitCode() != code || !strings.Contains(text, want) {
+			t.Errorf("repair (dry run %v): exit %d, want %d with %q in:\n%s", dryRun, r.ExitCode(), code, want, text)
+		}
+	}
+	got := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := dev.ReadAt(got.Bytes(), int64(sb.RefCountTableOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), bitmap) {
+		t.Error("repair changed the bitmap sector a swapped layout calls the refcount table")
 	}
 }
 

@@ -16,15 +16,16 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-const (
-	fuzzBlocks       = 29
-	fuzzBitmap       = 1 << 20
-	fuzzInodes       = 2 << 20
-	fuzzRegistry     = 3 << 20
-	fuzzRefcounts    = 9 << 20
-	fuzzSnapshots    = 10 << 20
-	fuzzDataOffset   = 11 << 20
-	fuzzSnapshotSize = 1 << 20
+const fuzzBlocks = 29
+
+var (
+	fuzzBitmap       = testLayout.BlockBitmapOffset
+	fuzzInodes       = testLayout.InodeTableOffset
+	fuzzRegistry     = testLayout.NodeRegistryOffset
+	fuzzRefcounts    = testLayout.RefCountTableOffset
+	fuzzSnapshots    = testLayout.SnapshotRegOffset
+	fuzzDataOffset   = testLayout.DataRegionOffset
+	fuzzSnapshotSize = testLayout.SnapshotRegSize
 )
 
 // fuzzTarget is a metadata sector the fuzzer overwrites. fix recomputes its
@@ -79,7 +80,7 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 		}
 	}
 	bm := bitmap.NewRegion(dev, fuzzBitmap, fuzzBlocks, nil, uuid)
-	tbl := inode.NewTable(dev, fuzzInodes, 4096*inode.InodeSize, nil, uuid)
+	tbl := inode.NewTable(dev, fuzzInodes, testLayout.InodeTableSize, nil, uuid)
 	mgr := extent.NewManager(dev, bm, nil, fuzzDataOffset)
 	tbl.SetTreeFlusher(mgr)
 	refs := refcount.NewRegion(dev, fuzzRefcounts, refcount.SizeForBlocks(fuzzBlocks), fuzzBlocks, nil)
@@ -140,11 +141,11 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 	must(err)
 	targets := []fuzzTarget{
 		{"superblock", 0, sectorCRC},
-		{"bitmap", fuzzBitmap, sectorCRC},
-		{"inodes", fuzzInodes, inodeCRCs},
-		{"node registry", fuzzRegistry, sectorCRC},
-		{"refcounts", fuzzRefcounts, sectorCRC},
-		{"snapshots", fuzzSnapshots, snapshotCRCs},
+		{"bitmap", int64(fuzzBitmap), sectorCRC},
+		{"inodes", int64(fuzzInodes), inodeCRCs},
+		{"node registry", int64(fuzzRegistry), sectorCRC},
+		{"refcounts", int64(fuzzRefcounts), sectorCRC},
+		{"snapshots", int64(fuzzSnapshots), snapshotCRCs},
 		{"extent tree", extent.TreeNodeOffset(fuzzDataOffset, a.ExtentTreeRoot, a.ExtentTreeGen), treeNodeCRC},
 		{"root directory", int64(fuzzDataOffset + rootBlock*extent.BlockSize), func([]byte) {}},
 	}
