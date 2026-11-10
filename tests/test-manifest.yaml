@@ -2327,3 +2327,35 @@ scenarios:
     priority: go_only
     environments:
       go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice
+
+  # ===========================================================================
+  # HTTP API writes (one mount on one host)
+  # ===========================================================================
+
+  - id: api-snapshot-lifecycle
+    name: API snapshot, clone and delete
+    description: The API creates, lists, clones and deletes snapshots and clones files through setxattr on the mount, the same path as setfattr; bad paths, names and destinations are refused
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPISnapshotLifecycle
+
+  - id: api-writes-off-without-token
+    name: API writes need a token
+    description: Without -api-token, write endpoints answer 403 and mount logs that writes are off; reads still work
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIWritesOffWithoutToken
+
+  - id: api-writes-during-file-io
+    name: API writes while files are written
+    description: Snapshot, clone and delete requests run while other goroutines write and read the same files, with no deadlock, whole 4 KB chunks in every clone, and a clean fsck
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIWritesDuringFileIO
+
+  - id: api-shutdown-during-snapshots
+    name: Mount exits cleanly during API snapshots
+    description: SIGTERM while snapshot requests run makes mount wait for them, unmount and exit 0, and fsck stays clean
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestMountExitsCleanlyDuringSnapshots
