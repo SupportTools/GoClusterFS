@@ -84,7 +84,7 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 			},
 		},
 		journal: &JournalStatsResponse{
-			State:             "open",
+			State:             "dirty",
 			HeadOffset:        4096,
 			TailOffset:        2048,
 			AvailableSpace:    1048576,
@@ -210,17 +210,16 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 	}
 }
 
-func TestMetricsEndpoint_JournalClosedState(t *testing.T) {
+func TestMetricsEndpoint_JournalCleanState(t *testing.T) {
 	cfg := DefaultConfig().WithListenAddr(":0")
 	server, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
 	}
 
-	// Set up mock provider with closed journal
 	server.SetStatsProvider(&mockStatsProvider{
 		journal: &JournalStatsResponse{
-			State: "closed",
+			State: "clean",
 		},
 	})
 
@@ -243,9 +242,35 @@ func TestMetricsEndpoint_JournalClosedState(t *testing.T) {
 
 	content := string(body)
 
-	// Journal state should be 0 for closed
 	if !strings.Contains(content, "goclusterfs_journal_state 0") {
-		t.Error("expected journal_state to be 0 for closed state")
+		t.Error("expected journal_state to be 0 for a clean journal")
+	}
+}
+
+func TestMetricsEndpoint_ExportsCapacity(t *testing.T) {
+	server, err := NewServer(DefaultConfig().WithListenAddr("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("NewServer error: %v", err)
+	}
+	server.SetStatusProvider(&mockStatusProvider{capacity: &CapacityInfo{TotalBytes: 3 << 20, FreeBytes: 1 << 20}})
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("Start error: %v", err)
+	}
+	defer server.Stop()
+
+	resp, err := http.Get("http://" + server.Addr() + "/metrics")
+	if err != nil {
+		t.Fatalf("request error: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body error: %v", err)
+	}
+	for _, want := range []string{"goclusterfs_fs_size_bytes 3.145728e+06", "goclusterfs_fs_free_bytes 1.048576e+06"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("/metrics lacks %q", want)
+		}
 	}
 }
 

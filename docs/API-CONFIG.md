@@ -5,12 +5,13 @@ This document provides a comprehensive reference for all configuration options i
 ## Table of Contents
 
 1. [Command-Line Flags](#command-line-flags)
-2. [Cache Configuration](#cache-configuration)
-3. [Journal Configuration](#journal-configuration)
-4. [TRIM Configuration](#trim-configuration)
-5. [Broadcast Configuration](#broadcast-configuration)
-6. [Configuration Presets](#configuration-presets)
-7. [Tuning Recommendations](#tuning-recommendations)
+2. [HTTP API Statistics](#http-api-statistics)
+3. [Cache Configuration](#cache-configuration)
+4. [Journal Configuration](#journal-configuration)
+5. [TRIM Configuration](#trim-configuration)
+6. [Broadcast Configuration](#broadcast-configuration)
+7. [Configuration Presets](#configuration-presets)
+8. [Tuning Recommendations](#tuning-recommendations)
 
 ---
 
@@ -92,7 +93,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-cors` | string | (empty) | Comma-separated CORS allowed origins, or `*` |
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...` and, with `-api-token`, the [write endpoints](#http-api-write-endpoints). Mount does not feed statistics to the API yet, so `/api/v1/stats/...` answers 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up` plus Go runtime and process metrics. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...` and, with `-api-token`, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
 
 Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the dashboard's origin instead, for example `-api-cors http://localhost:5173`.
 
@@ -124,6 +125,26 @@ The snapshot and clone endpoints call `setxattr` on the file through the mount, 
 Errors answer with `{error, code, details}`: 400 for a bad path, name, destination or body; 404 when the file or snapshot does not exist; 409 when the name exists, the file is busy, or the feature is off (`-snapshots=false`, `-journal=false`, `-trim=false`) or the file has old-style sharing that needs `goclusterfs-fsck -repair`; 507 when the device is full.
 
 Mount logs each write at INFO with the client address, the action, its arguments and the result. On shutdown, mount stops taking requests, waits for writes in flight to finish, and only then unmounts.
+
+---
+
+## HTTP API Statistics
+
+Mount copies its managers' counters every second and reads the block bitmap and node registry from the device every 15 seconds. Requests get the latest copy, so `/metrics` and `/api/v1/...` never read the device. Capacity and cluster data can be 15 seconds old; `df` reads the device on every call. Counters start at zero when the mount starts and count this node only. Times are RFC 3339 in UTC.
+
+| Endpoint | Returns |
+|----------|---------|
+| `/api/v1/status` | Version, uptime, mount and device paths, and `capacity`: total, used and free blocks and bytes of the data region, for the whole volume |
+| `/api/v1/stats` | `cache` and `journal`, as below |
+| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `hits`, `misses` and `hit_rate` (0 to 1) |
+| `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
+| `/api/v1/stats/trim` | `trim_enabled`. With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges), `last_trim_at` and `batch_size`. On a device or image file that cannot discard, ranges still count as discarded |
+| `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests still waiting), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate` |
+| `/api/v1/stats/cluster` | This node's `node_id` (UUID in hex), `node_address` (hostname), `state`, `last_heartbeat_at` and `joined_at`; `cluster_size` (registered nodes); `healthy_nodes` (active with a heartbeat under 10 seconds old); and `peers`, each with `node_id`, `address` (hostname), `state` and `last_seen`. A state is `active`, `leaving`, `dead`, or `stale` when the heartbeat is over 10 seconds old and no node has declared it dead yet. `role` is always `peer`: there is no leader |
+| `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
+| `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |
+
+`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*`, `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
 

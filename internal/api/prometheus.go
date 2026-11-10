@@ -97,7 +97,12 @@ type fsCollector struct {
 	clusterSizeDesc         *prometheus.Desc
 	clusterHealthyNodesDesc *prometheus.Desc
 	clusterIsLeaderDesc     *prometheus.Desc
+
+	fsSizeBytesDesc *prometheus.Desc
+	fsFreeBytesDesc *prometheus.Desc
 }
+
+var journalStates = map[string]float64{"clean": 0, "dirty": 1, "recovering": 2, "corrupt": 3}
 
 func newFSCollector(s *Server) *fsCollector {
 	return &fsCollector{
@@ -201,7 +206,7 @@ func newFSCollector(s *Server) *fsCollector {
 		// Journal
 		journalStateDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "journal", "state"),
-			"Journal state (1=open, 0=closed)",
+			"Journal state: 0=clean, 1=dirty, 2=recovering, 3=corrupt, -1=unknown",
 			nil, nil,
 		),
 		journalHeadOffsetDesc: prometheus.NewDesc(
@@ -367,6 +372,17 @@ func newFSCollector(s *Server) *fsCollector {
 			"Whether this node is the cluster leader (1) or not (0)",
 			nil, nil,
 		),
+
+		fsSizeBytesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "fs", "size_bytes"),
+			"Size of the data region in bytes",
+			nil, nil,
+		),
+		fsFreeBytesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "fs", "free_bytes"),
+			"Free bytes in the data region",
+			nil, nil,
+		),
 	}
 }
 
@@ -434,6 +450,9 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.clusterSizeDesc
 	ch <- c.clusterHealthyNodesDesc
 	ch <- c.clusterIsLeaderDesc
+
+	ch <- c.fsSizeBytesDesc
+	ch <- c.fsFreeBytesDesc
 }
 
 // Collect is called by the Prometheus registry when collecting metrics.
@@ -441,6 +460,13 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 func (c *fsCollector) Collect(ch chan<- prometheus.Metric) {
 	// Always report up metric
 	ch <- prometheus.MustNewConstMetric(c.upDesc, prometheus.GaugeValue, 1)
+
+	if status := c.server.GetStatusProvider(); status != nil {
+		if capacity := status.Capacity(); capacity != nil {
+			ch <- prometheus.MustNewConstMetric(c.fsSizeBytesDesc, prometheus.GaugeValue, float64(capacity.TotalBytes))
+			ch <- prometheus.MustNewConstMetric(c.fsFreeBytesDesc, prometheus.GaugeValue, float64(capacity.FreeBytes))
+		}
+	}
 
 	// Get stats provider
 	provider := c.server.GetStatsProvider()
@@ -506,10 +532,9 @@ func (c *fsCollector) collectCacheStats(ch chan<- prometheus.Metric, stats *Cach
 }
 
 func (c *fsCollector) collectJournalStats(ch chan<- prometheus.Metric, stats *JournalStatsResponse) {
-	// Convert state to numeric (1=open, 0=other)
-	stateValue := 0.0
-	if stats.State == "open" {
-		stateValue = 1.0
+	stateValue, ok := journalStates[stats.State]
+	if !ok {
+		stateValue = -1
 	}
 	ch <- prometheus.MustNewConstMetric(c.journalStateDesc, prometheus.GaugeValue, stateValue)
 	ch <- prometheus.MustNewConstMetric(c.journalHeadOffsetDesc, prometheus.GaugeValue, float64(stats.HeadOffset))

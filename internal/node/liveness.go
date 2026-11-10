@@ -45,13 +45,14 @@ func readPIDNamespace() uint64 {
 	return st.Ino
 }
 
-func hostnameOf(slot *Slot) string {
-	return string(bytes.TrimRight(slot.Hostname[:], "\x00"))
+// Host returns the hostname the slot's node registered with.
+func (s *Slot) Host() string {
+	return string(bytes.TrimRight(s.Hostname[:], "\x00"))
 }
 
 // sameHost reports whether slot was registered under this node's hostname and kernel boot.
 func (r *Registry) sameHost(slot *Slot) bool {
-	return r.bootID != ([16]byte{}) && slot.BootID == r.bootID && hostnameOf(slot) == r.hostname
+	return r.bootID != ([16]byte{}) && slot.BootID == r.bootID && slot.Host() == r.hostname
 }
 
 // deadLocalOwner reports whether slot belongs to an exited mount process in

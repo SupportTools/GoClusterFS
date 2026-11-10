@@ -66,7 +66,7 @@ func startAPIMount(t *testing.T, token string, sizeMB int) *apiMount {
 	}
 }
 
-var apiClient = &http.Client{Timeout: 60 * time.Second}
+var writeClient = &http.Client{Timeout: 60 * time.Second}
 
 func (m *apiMount) call(method, path string, body any) (int, string, error) {
 	var r io.Reader
@@ -84,7 +84,7 @@ func (m *apiMount) call(method, path string, body any) (int, string, error) {
 	if m.token != "" {
 		req.Header.Set("Authorization", "Bearer "+m.token)
 	}
-	resp, err := apiClient.Do(req)
+	resp, err := writeClient.Do(req)
 	if err != nil {
 		return 0, "", err
 	}

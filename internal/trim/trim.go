@@ -105,6 +105,8 @@ type Manager struct {
 	blocksQueued    uint64
 	blocksDiscarded uint64
 	discardCalls    uint64
+	discardErrors   uint64
+	lastDiscard     time.Time
 	coalesceRatio   float64 // Average blocks per ioctl
 }
 
@@ -272,11 +274,12 @@ func (m *Manager) flush(reason string) int {
 func (m *Manager) discardBlocks(blocks []uint64) {
 	ranges := coalesceBlocks(blocks)
 
-	var discarded, calls uint64
+	var discarded, calls, failed uint64
 	for _, r := range ranges {
 		if err := m.issueDiscard(r); err != nil {
 			log.Printf("[trim] discard failed for range [%d, %d): %v",
 				r.startBlock, r.startBlock+r.count, err)
+			failed++
 			continue
 		}
 		discarded += r.count
@@ -287,6 +290,10 @@ func (m *Manager) discardBlocks(blocks []uint64) {
 	defer m.mu.Unlock()
 	m.blocksDiscarded += discarded
 	m.discardCalls += calls
+	m.discardErrors += failed
+	if calls > 0 {
+		m.lastDiscard = time.Now()
+	}
 	if len(ranges) > 0 {
 		m.coalesceRatio = float64(discarded) / float64(len(ranges))
 	}
@@ -381,16 +388,22 @@ func (m *Manager) Stats() Stats {
 		BlocksQueued:    m.blocksQueued,
 		BlocksDiscarded: m.blocksDiscarded,
 		DiscardCalls:    m.discardCalls,
+		DiscardErrors:   m.discardErrors,
+		LastDiscard:     m.lastDiscard,
 		PendingBlocks:   uint64(len(m.pending)),
 		CoalesceRatio:   m.coalesceRatio,
+		BatchSize:       m.config.BatchSize,
 	}
 }
 
 // Stats holds TRIM manager statistics.
 type Stats struct {
-	BlocksQueued    uint64  // Total blocks queued for TRIM
-	BlocksDiscarded uint64  // Total blocks successfully discarded
-	DiscardCalls    uint64  // Number of BLKDISCARD ioctls issued
-	PendingBlocks   uint64  // Blocks currently waiting
-	CoalesceRatio   float64 // Average blocks per ioctl call
+	BlocksQueued    uint64    // Total blocks queued for TRIM
+	BlocksDiscarded uint64    // Total blocks successfully discarded
+	DiscardCalls    uint64    // Number of BLKDISCARD ioctls issued
+	DiscardErrors   uint64    // Ranges whose BLKDISCARD failed
+	LastDiscard     time.Time // When a BLKDISCARD last succeeded
+	PendingBlocks   uint64    // Blocks currently waiting
+	CoalesceRatio   float64   // Average blocks per ioctl call
+	BatchSize       int
 }

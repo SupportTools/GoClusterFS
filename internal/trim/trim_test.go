@@ -1,6 +1,7 @@
 package trim
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -367,5 +368,32 @@ func TestFlushDiscardsQueuedBlocksNow(t *testing.T) {
 	}
 	if n := m.Flush(); n != 0 {
 		t.Fatalf("second Flush() = %d, want 0", n)
+	}
+}
+
+func TestStatsCountFailedDiscardsAndLastSuccess(t *testing.T) {
+	dev, cleanup := createTestDevice(t)
+	defer cleanup()
+
+	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+		if offset == 10*BlockSize {
+			return errors.New("device refused")
+		}
+		return nil
+	}})
+	m.Start()
+	m.Queue(5)
+	m.Queue(10)
+	before := time.Now()
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := m.Stats()
+	if got.DiscardCalls != 1 || got.BlocksDiscarded != 1 || got.DiscardErrors != 1 || got.BatchSize != 1000 {
+		t.Errorf("Stats = %+v, want 1 call, 1 block, 1 error, batch 1000", got)
+	}
+	if got.LastDiscard.Before(before) {
+		t.Errorf("LastDiscard = %v, want after %v", got.LastDiscard, before)
 	}
 }

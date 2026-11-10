@@ -232,7 +232,7 @@ func (s *Server) handleStatsSFB(w http.ResponseWriter, r *http.Request) {
 
 	stats := provider.SFBStats()
 	if stats == nil {
-		writeError(w, http.StatusNotFound, "sfb stats not available", "block allocator not initialized")
+		writeError(w, http.StatusNotFound, "sfb stats not available", "SFB containers are disabled")
 		return
 	}
 

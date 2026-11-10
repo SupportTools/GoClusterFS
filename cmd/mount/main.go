@@ -31,54 +31,23 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
+	"github.com/supporttools/GoClusterFS/internal/stats"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 	"github.com/supporttools/GoClusterFS/internal/version"
 )
 
-// fsStatusProvider implements api.StatusProvider by wrapping the filesystem.
 type fsStatusProvider struct {
 	mountPath  string
 	devicePath string
-	dev        *storage.Device
-	bitmapMgr  *bitmap.Region
+	sampler    *stats.Sampler
 }
 
-func (p *fsStatusProvider) MountPath() string  { return p.mountPath }
-func (p *fsStatusProvider) DevicePath() string { return p.devicePath }
-
-func (p *fsStatusProvider) MountState() api.MountState {
-	// If we get here, the filesystem is mounted and running
-	return api.MountStateMounted
-}
-
-func (p *fsStatusProvider) Capacity() *api.CapacityInfo {
-	totalBlocks := p.bitmapMgr.TotalBlocks()
-	freeBlocks := p.bitmapMgr.FreeCount()
-	usedBlocks := totalBlocks - freeBlocks
-
-	const blockSize uint64 = goclusterfs.BlockSize
-	totalBytes := totalBlocks * blockSize
-	usedBytes := usedBlocks * blockSize
-	freeBytes := freeBlocks * blockSize
-
-	var usedPercent float64
-	if totalBlocks > 0 {
-		usedPercent = float64(usedBlocks) / float64(totalBlocks) * 100
-	}
-
-	return &api.CapacityInfo{
-		TotalBytes:     totalBytes,
-		UsedBytes:      usedBytes,
-		FreeBytes:      freeBytes,
-		UsedPercent:    usedPercent,
-		TotalBlocks:    totalBlocks,
-		UsedBlocks:     usedBlocks,
-		FreeBlocks:     freeBlocks,
-		BlockSizeBytes: blockSize,
-	}
-}
+func (p *fsStatusProvider) MountPath() string           { return p.mountPath }
+func (p *fsStatusProvider) DevicePath() string          { return p.devicePath }
+func (p *fsStatusProvider) MountState() api.MountState  { return api.MountStateMounted }
+func (p *fsStatusProvider) Capacity() *api.CapacityInfo { return p.sampler.Capacity() }
 
 func apiConfig(addr, token, corsList string, rateLimit float64) api.Config {
 	var origins []string
@@ -453,18 +422,20 @@ func main() {
 
 	// Start API server for management and monitoring
 	var apiServer *api.Server
+	var sampler *stats.Sampler
 	if *apiEnabled {
 		var err error
 		apiServer, err = api.NewServer(apiCfg)
 		if err != nil {
 			log.Printf("Warning: Failed to create API server: %v", err)
 		} else {
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, j, trimMgr, bm, nodeReg))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
-				dev:        dev,
-				bitmapMgr:  bm,
+				sampler:    sampler,
 			})
+			apiServer.SetStatsProvider(sampler)
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
 			apiServer.SetFileService(fileops.New(*mountPoint, gfs.SnapshotRegistry()))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
@@ -472,6 +443,8 @@ func main() {
 				log.Printf("Warning: Failed to start API server: %v", err)
 				apiServer.Stop()
 				apiServer = nil
+				sampler.Stop()
+				sampler = nil
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
@@ -496,6 +469,7 @@ func main() {
 			if err := apiServer.Stop(); err != nil {
 				log.Printf("Warning: Failed to stop API server: %v", err)
 			}
+			sampler.Stop()
 		}
 
 		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
@@ -523,6 +497,7 @@ func main() {
 		if err := apiServer.Stop(); err != nil {
 			log.Printf("Warning: Failed to stop API server on exit: %v", err)
 		}
+		sampler.Stop()
 	}
 
 	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
@@ -566,6 +541,17 @@ func main() {
 	}
 
 	log.Println("Filesystem unmounted.")
+}
+
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry) stats.Sources {
+	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
+	if j != nil {
+		src.Journal = j
+	}
+	if trimMgr != nil {
+		src.Trim = trimMgr
+	}
+	return src
 }
 
 // adoptLocks takes over a dead node's exclusive locks before its journal is

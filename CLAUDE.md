@@ -54,7 +54,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/fsck` | The fsck phases |
 | `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
 | `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
-| `internal/stats` | Stats types and collector behind `/api/v1/stats` |
+| `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
 
 ## On-Disk Layout
