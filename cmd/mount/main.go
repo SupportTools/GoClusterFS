@@ -91,7 +91,11 @@ func apiConfig(addr, token, corsList string, rateLimit float64) api.Config {
 		WithAuthToken(token).
 		WithCORSOrigins(origins...)
 	if rateLimit != 0 {
-		cfg = cfg.WithRateLimit(rateLimit, int(math.Ceil(2*rateLimit)))
+		burst := 1
+		if rateLimit > 0 && rateLimit <= api.MaxRateLimit {
+			burst = int(math.Ceil(2 * rateLimit))
+		}
+		cfg = cfg.WithRateLimit(rateLimit, burst)
 	}
 	return cfg
 }
@@ -463,6 +467,7 @@ func main() {
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start API server: %v", err)
+				apiServer.Stop()
 				apiServer = nil
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",

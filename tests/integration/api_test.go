@@ -145,6 +145,9 @@ func TestMountRejectsBadAPISettingsBeforeOpeningDevice(t *testing.T) {
 		{"-api-cors=not-a-url", "Invalid API settings"},
 		{"-api-cors=*", "-api-cors"},
 		{"-api-rate-limit=-1", "Invalid API settings"},
+		{"-api-rate-limit=NaN", "Invalid API settings"},
+		{"-api-rate-limit=+Inf", "Invalid API settings"},
+		{"-api-rate-limit=1e19", "Invalid API settings"},
 	} {
 		out, err := runMount(t, "-device", missing, "-mount", dir, tt.flag)
 		if err == nil || !strings.Contains(out, tt.want) || strings.Contains(out, "Failed to open device") {
