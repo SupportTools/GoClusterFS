@@ -235,14 +235,15 @@ func (m *Manager) checkAndFlush() {
 	}
 }
 
-// flush discards the pending blocks. The guard runs without m.mu held, because
-// Free takes the bitmap lock before m.mu.
-// Flush discards every queued block now instead of waiting for the batch
-// size or age, and returns how many blocks it took.
+// Flush hands every queued block to the discard path now instead of waiting
+// for the batch size or age, and returns how many it took. The free guard can
+// still skip blocks that were reallocated since they were queued.
 func (m *Manager) Flush() int {
 	return m.flush("requested")
 }
 
+// flush discards the pending blocks. The guard runs without m.mu held, because
+// Free takes the bitmap lock before m.mu.
 func (m *Manager) flush(reason string) int {
 	m.mu.Lock()
 	blocks := make([]uint64, len(m.pending))

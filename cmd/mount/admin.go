@@ -35,7 +35,7 @@ func (a adminOps) ForceTrim() (string, error) {
 	if a.trim == nil {
 		return "", fmt.Errorf("TRIM is %w (-trim=false)", api.ErrDisabled)
 	}
-	return fmt.Sprintf("flushed %d queued blocks", a.trim.Flush()), nil
+	return fmt.Sprintf("sent %d queued blocks to discard", a.trim.Flush()), nil
 }
 
 func (a adminOps) ClearCache() (string, error) {
