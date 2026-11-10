@@ -329,7 +329,7 @@ type mockStatsProvider struct {
 	all     *AllStatsResponse
 }
 
-func (m *mockStatsProvider) CacheStats() *CacheStatsResponse   { return m.cache }
+func (m *mockStatsProvider) CacheStats() *CacheStatsResponse     { return m.cache }
 func (m *mockStatsProvider) JournalStats() *JournalStatsResponse { return m.journal }
 func (m *mockStatsProvider) TrimStats() *TrimStatsResponse       { return m.trim }
 func (m *mockStatsProvider) LockStats() *LockStatsResponse       { return m.lock }
@@ -629,11 +629,11 @@ func TestServer_StatsSFB_Success(t *testing.T) {
 
 	mockProvider := &mockStatsProvider{
 		sfb: &SFBStatsResponse{
-			TotalBlocks:       10000,
-			AllocatedBlocks:   7500,
-			FreeBlocks:        2500,
-			AllocationPercent: 75.0,
-			AllocationsTotal:  5000,
+			TotalBlocks:        10000,
+			AllocatedBlocks:    7500,
+			FreeBlocks:         2500,
+			AllocationPercent:  75.0,
+			AllocationsTotal:   5000,
 			DeallocationsTotal: 2500,
 		},
 	}

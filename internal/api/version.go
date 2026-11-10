@@ -3,9 +3,10 @@ package api
 import "runtime"
 
 // Build-time variables set via ldflags:
-//   -ldflags "-X github.com/supporttools/GoClusterFS/internal/api.Version=1.0.0
-//             -X github.com/supporttools/GoClusterFS/internal/api.GitCommit=abc123
-//             -X github.com/supporttools/GoClusterFS/internal/api.BuildTime=2024-01-01T00:00:00Z"
+//
+//	-ldflags "-X github.com/supporttools/GoClusterFS/internal/api.Version=1.0.0
+//	          -X github.com/supporttools/GoClusterFS/internal/api.GitCommit=abc123
+//	          -X github.com/supporttools/GoClusterFS/internal/api.BuildTime=2024-01-01T00:00:00Z"
 var (
 	// Version is the semantic version of the build.
 	Version = "dev"

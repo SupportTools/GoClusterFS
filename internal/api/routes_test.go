@@ -212,9 +212,9 @@ type mockStatusProvider struct {
 	capacity   *CapacityInfo
 }
 
-func (m *mockStatusProvider) MountPath() string      { return m.mountPath }
-func (m *mockStatusProvider) DevicePath() string     { return m.devicePath }
-func (m *mockStatusProvider) MountState() MountState { return m.mountState }
+func (m *mockStatusProvider) MountPath() string       { return m.mountPath }
+func (m *mockStatusProvider) DevicePath() string      { return m.devicePath }
+func (m *mockStatusProvider) MountState() MountState  { return m.mountState }
 func (m *mockStatusProvider) Capacity() *CapacityInfo { return m.capacity }
 
 func TestRoutes_Status_WithStatusProvider(t *testing.T) {

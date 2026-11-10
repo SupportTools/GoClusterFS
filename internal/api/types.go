@@ -9,8 +9,8 @@ import (
 type HealthStatus string
 
 const (
-	HealthStatusOK       HealthStatus = "ok"
-	HealthStatusDegraded HealthStatus = "degraded"
+	HealthStatusOK        HealthStatus = "ok"
+	HealthStatusDegraded  HealthStatus = "degraded"
 	HealthStatusUnhealthy HealthStatus = "unhealthy"
 )
 
@@ -70,26 +70,26 @@ const (
 // StatusResponse is returned by GET /api/v1/status.
 // Provides comprehensive system status information.
 type StatusResponse struct {
-	Status       string        `json:"status"`
-	Version      string        `json:"version"`
-	GitCommit    string        `json:"git_commit,omitempty"`
-	BuildTime    string        `json:"build_time,omitempty"`
-	GoVersion    string        `json:"go_version,omitempty"`
-	UptimeSeconds int64        `json:"uptime_seconds"`
-	MountPath    string        `json:"mount_path,omitempty"`
-	DevicePath   string        `json:"device_path,omitempty"`
-	MountState   MountState    `json:"mount_state,omitempty"`
-	ReadOnly     bool          `json:"read_only,omitempty"`
-	Capacity     *CapacityInfo `json:"capacity,omitempty"`
-	Cluster      *ClusterInfo  `json:"cluster,omitempty"`
+	Status        string        `json:"status"`
+	Version       string        `json:"version"`
+	GitCommit     string        `json:"git_commit,omitempty"`
+	BuildTime     string        `json:"build_time,omitempty"`
+	GoVersion     string        `json:"go_version,omitempty"`
+	UptimeSeconds int64         `json:"uptime_seconds"`
+	MountPath     string        `json:"mount_path,omitempty"`
+	DevicePath    string        `json:"device_path,omitempty"`
+	MountState    MountState    `json:"mount_state,omitempty"`
+	ReadOnly      bool          `json:"read_only,omitempty"`
+	Capacity      *CapacityInfo `json:"capacity,omitempty"`
+	Cluster       *ClusterInfo  `json:"cluster,omitempty"`
 }
 
 // CacheHitRateInfo contains hit rate metrics for a cache type.
 type CacheHitRateInfo struct {
-	Size     int     `json:"size"`
-	Hits     uint64  `json:"hits"`
-	Misses   uint64  `json:"misses"`
-	HitRate  float64 `json:"hit_rate"`
+	Size    int     `json:"size"`
+	Hits    uint64  `json:"hits"`
+	Misses  uint64  `json:"misses"`
+	HitRate float64 `json:"hit_rate"`
 }
 
 // CacheStatsResponse is returned by GET /api/v1/stats/cache.

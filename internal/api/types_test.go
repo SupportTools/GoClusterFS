@@ -23,7 +23,7 @@ func TestHealthResponse_JSONMarshaling(t *testing.T) {
 			resp: HealthResponse{
 				Status: HealthStatusDegraded,
 				Checks: map[string]ComponentHealth{
-					"cache": {Status: HealthStatusOK},
+					"cache":   {Status: HealthStatusOK},
 					"journal": {Status: HealthStatusDegraded, Message: "low disk space"},
 				},
 			},
