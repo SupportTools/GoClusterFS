@@ -108,11 +108,12 @@ func main() {
 		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
 
 		// API server configuration
-		apiEnabled = flag.Bool("api", true, "Enable HTTP API server for management")
-		apiAddr    = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs -api-token")
-		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled, loopback only)")
-		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
-		apiRate    = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
+		apiEnabled   = flag.Bool("api", true, "Enable HTTP API server for management")
+		apiAddr      = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs a token")
+		apiTokenFile = flag.String("api-token-file", "", "File (mode 0600) holding the API bearer token; a token also turns on API writes. Or set "+apiTokenEnv)
+		apiToken     = flag.String("api-token", "", "API bearer token; visible to all local users in ps, prefer -api-token-file")
+		apiCORS      = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
+		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
 	)
 	flag.Parse()
 
@@ -127,7 +128,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS, *apiRate)
+	token, tokenSrc, err := loadAPIToken(*apiTokenFile, *apiToken)
+	if err != nil {
+		log.Fatalf("Invalid API settings: %v", err)
+	}
+	if tokenSrc == tokenFromFlag {
+		log.Printf("WARNING: -api-token is visible to every local user in ps and /proc/<pid>/cmdline, and it unlocks API writes. Use -api-token-file or %s instead.", apiTokenEnv)
+	}
+	apiCfg := apiConfig(*apiAddr, token, *apiCORS, *apiRate)
 	if *apiEnabled {
 		if err := apiCfg.Validate(); err != nil {
 			log.Fatalf("Invalid API settings: %v", err)
@@ -137,7 +145,7 @@ func main() {
 			if errors.Is(err, api.ErrWildcardCORSWithoutToken) {
 				hint = "list the allowed origins in -api-cors"
 			}
-			log.Fatalf("Refusing to start the API: %v. Set -api-token, %s, or pass -api=false", err, hint)
+			log.Fatalf("Refusing to start the API: %v. Set -api-token-file (or %s), %s, or pass -api=false", err, apiTokenEnv, hint)
 		}
 	}
 	if *broadcastEnabled && *broadcastSecret == "" {
@@ -449,7 +457,7 @@ func main() {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
 				if !apiServer.WritesEnabled() {
-					log.Printf("API: snapshot, clone and admin endpoints are off; set -api-token to turn them on")
+					log.Printf("API: snapshot, clone and admin endpoints are off; set -api-token-file or %s to turn them on", apiTokenEnv)
 				}
 			}
 		}
