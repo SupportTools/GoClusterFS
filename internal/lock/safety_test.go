@@ -5,6 +5,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -391,5 +394,47 @@ func TestJoinFailsAfterRecordTakenOver(t *testing.T) {
 
 	if err := acquireWithin(a, time.Second, LockTypeInode, 3, LockModeExclusive); !errors.Is(err, ErrLockLost) {
 		t.Fatalf("joining a record another node took over: got %v, want ErrLockLost", err)
+	}
+}
+
+// A caller whose context never ends, as FUSE handlers that detach theirs, still
+// gets ErrLockTimeout once acquireTimeout passes.
+func TestAcquireWithoutDeadlineGivesUp(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	defer func(d time.Duration) { acquireTimeout = d }(acquireTimeout)
+	acquireTimeout = 200 * time.Millisecond
+	requireAcquired(t, a, LockTypeInode, 40, LockModeExclusive)
+
+	errc := make(chan error, 1)
+	go func() {
+		errc <- b.Acquire(context.WithoutCancel(context.Background()), LockTypeInode, 40, LockModeExclusive)
+	}()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrLockTimeout) {
+			t.Fatalf("Acquire: got %v, want ErrLockTimeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire with a context that never ends was still waiting after 5s")
+	}
+}
+
+// An acquire that gives up logs which node holds the record, so operators can find it.
+func TestTimedOutAcquireLogsHolder(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	requireAcquired(t, a, LockTypeInode, 41, LockModeExclusive)
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	requireBlocked(t, b, LockTypeInode, 41, LockModeExclusive)
+	log.SetOutput(os.Stderr)
+	if got := logs.String(); !strings.Contains(got, "gave up waiting") || !strings.Contains(got, "write-locked by node slot 1") {
+		t.Fatalf("timeout log does not name the holder:\n%s", got)
 	}
 }
