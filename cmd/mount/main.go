@@ -91,7 +91,8 @@ func main() {
 		// Network broadcast configuration
 		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
 		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group address")
-		multicastPort    = flag.Int("mcast-port", 31337, "Multicast/unicast port")
+		multicastPort    = flag.Int("mcast-port", 31337, "UDP port for multicast messages")
+		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
 
@@ -140,7 +141,7 @@ func main() {
 		}
 	}
 	if *broadcastEnabled && *broadcastSecret == "" {
-		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to port %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort)
+		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to ports %d and %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort, *unicastPort)
 	}
 
 	// Check mount point exists
@@ -282,7 +283,7 @@ func main() {
 		Enabled:              *broadcastEnabled,
 		MulticastGroup:       *multicastGroup,
 		MulticastPort:        *multicastPort,
-		UnicastPort:          *multicastPort,
+		UnicastPort:          *unicastPort,
 		MulticastTTL:         1, // Same subnet
 		MaxMulticastFailures: 3,
 		HeartbeatInterval:    30 * time.Second,
@@ -310,12 +311,13 @@ func main() {
 
 	// Start network broadcast for cross-node cache invalidation
 	if *broadcastEnabled {
+		// Without broadcast, peers see this node's changes only after -cache-ttl,
+		// so a mount that asked for broadcast does not continue without it.
 		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
-			log.Printf("Warning: Failed to start cache broadcast: %v (continuing without broadcast)", err)
-		} else if cacheMgr.BroadcastEnabled() {
-			log.Printf("Broadcast: enabled on %s:%d (secret=%v)",
-				*multicastGroup, *multicastPort, *broadcastSecret != "")
+			log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
 		}
+		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
+			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
 	} else {
 		log.Println("Broadcast: disabled (using storage-only cache validation)")
 	}

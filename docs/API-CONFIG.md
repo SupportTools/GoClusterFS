@@ -64,7 +64,8 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 |------|------|---------|-------------|
 | `-broadcast` | bool | `true` | Enable network cache invalidation |
 | `-mcast-group` | string | `239.192.74.75` | Multicast group IP address |
-| `-mcast-port` | int | `31337` | UDP port for multicast/unicast |
+| `-mcast-port` | int | `31337` | UDP port for multicast |
+| `-unicast-port` | int | `31338` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | string | (empty) | HMAC secret for message authentication |
 | `-broadcast-iface` | string | (auto) | Network interface for multicast |
 
@@ -413,7 +414,7 @@ IPv4 multicast group address. All cluster nodes must use the same group.
 | Default | `31337` |
 | Range | 1024 - 65535 |
 
-UDP port for multicast and unicast fallback.
+UDP port for multicast. Unicast uses `UnicastPort` (default `31338`), which must differ: the multicast socket holds this port. If either port cannot be bound, the mount fails unless `-broadcast=false`.
 
 #### MulticastTTL
 
@@ -505,6 +506,7 @@ func NetworkEnabledConfig() Config {
         Enabled:           true,
         MulticastGroup:    "239.192.74.75",
         MulticastPort:     31337,
+        UnicastPort:       31338,
         MulticastTTL:      1,
         HeartbeatInterval: 30 * time.Second,
     }

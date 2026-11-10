@@ -110,11 +110,12 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 |------|---------|-------------|
 | `-broadcast` | `true` | Enable network cache invalidation |
 | `-mcast-group` | `239.192.74.75` | Multicast group address |
-| `-mcast-port` | `31337` | Multicast/unicast port |
+| `-mcast-port` | `31337` | UDP port for multicast |
+| `-unicast-port` | `31338` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | (empty) | HMAC secret for message authentication |
 | `-broadcast-iface` | (auto) | Network interface for multicast |
 
-With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to the port can make nodes drop their caches. Set the same secret on every node.
+With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-broadcast=false` to run without broadcast. With no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to those ports can make nodes drop their caches. Set the same secret on every node.
 
 ### TRIM Options
 

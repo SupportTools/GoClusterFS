@@ -14,7 +14,7 @@ import (
 type Transport struct {
 	config Config
 
-	// Multicast connection (for sending and receiving)
+	// Multicast connection (receive only; sends go through unicastConn)
 	multicastConn *net.UDPConn
 	multicastAddr *net.UDPAddr
 
@@ -52,8 +52,9 @@ type Config struct {
 	// Default: 31337
 	MulticastPort int
 
-	// UnicastPort is the UDP port for unicast fallback.
-	// Default: same as MulticastPort
+	// UnicastPort is the UDP port for unicast messages. It must differ from
+	// MulticastPort, which the multicast socket holds.
+	// Default: 31338
 	UnicastPort int
 
 	// MulticastTTL controls how far multicast packets travel.
@@ -83,7 +84,7 @@ func DefaultConfig() Config {
 		Enabled:              true,
 		MulticastGroup:       "239.192.74.75",
 		MulticastPort:        31337,
-		UnicastPort:          31337,
+		UnicastPort:          31338,
 		MulticastTTL:         1,
 		MaxMulticastFailures: 3,
 		HeartbeatInterval:    30 * time.Second,
@@ -127,6 +128,10 @@ func (t *Transport) Start(ctx context.Context, handler func(*Message, *net.UDPAd
 		return nil
 	}
 
+	if t.config.UnicastPort == t.config.MulticastPort {
+		return fmt.Errorf("unicast port %d is also the multicast port; the multicast socket holds it, so the unicast port must differ", t.config.UnicastPort)
+	}
+
 	if t.running.Swap(true) {
 		return fmt.Errorf("transport already running")
 	}
@@ -167,6 +172,18 @@ func (t *Transport) Start(ctx context.Context, handler func(*Message, *net.UDPAd
 		return fmt.Errorf("failed to bind unicast port: %w", err)
 	}
 	t.unicastConn = unicastConn
+
+	if t.multicastConn != nil {
+		ttl := t.config.MulticastTTL
+		if ttl <= 0 {
+			ttl = 1
+		}
+		if err := setMulticastSendOptions(unicastConn, ifi, ttl); err != nil {
+			t.multicastConn.Close()
+			unicastConn.Close()
+			return fmt.Errorf("failed to set multicast options on the send socket: %w", err)
+		}
+	}
 
 	// Start receiver goroutines
 	if t.multicastConn != nil {
@@ -254,9 +271,11 @@ func (t *Transport) Send(msg *Message) error {
 		return fmt.Errorf("marshal error: %w", err)
 	}
 
-	// Try multicast first
+	// Try multicast first. It goes out on the unicast socket: ListenMulticastUDP
+	// turns off multicast loopback on its socket, so other nodes on this host
+	// would not receive what that socket sends.
 	if t.multicastConn != nil && atomic.LoadUint64(&t.multicastFailures) < uint64(t.config.MaxMulticastFailures) {
-		_, err := t.multicastConn.WriteToUDP(data, t.multicastAddr)
+		_, err := t.unicastConn.WriteToUDP(data, t.multicastAddr)
 		if err != nil {
 			atomic.AddUint64(&t.multicastFailures, 1)
 			log.Printf("[broadcast] multicast send failed (%d failures): %v",

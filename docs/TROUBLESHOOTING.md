@@ -306,6 +306,24 @@ There is no profiling endpoint.
 
 ## Cluster Issues
 
+### Mount Fails: "Failed to start cache broadcast"
+
+**Symptom**: The mount exits at startup with `Failed to start cache broadcast: ...`.
+
+**Cause**: With `-broadcast` on (the default), the node must bind UDP `-mcast-port` (31337) and `-unicast-port` (31338). Another process holds one of them, the two flags are set to the same port, or `-broadcast-iface` names a missing interface.
+
+**Solutions**:
+```bash
+# Find what holds the ports
+ss -ulpn | grep -E ':3133[78]'
+
+# Use other ports (every node must use the same -mcast-port)
+./goclusterfs-mount ... -mcast-port 41337 -unicast-port 41338
+
+# Or run without broadcast; peers then see changes after -cache-ttl
+./goclusterfs-mount ... -broadcast=false
+```
+
 ### Nodes Not Seeing Updates
 
 **Symptom**: File changes on one node not visible on others.
@@ -318,14 +336,14 @@ There is no profiling endpoint.
 ```bash
 # Verify multicast working
 # On receiver node:
-tcpdump -i eth0 udp port 31337
+tcpdump -i eth0 udp port 31337 or udp port 31338
 
 # On sender node:
 # Modify a file and watch for packets
 
 # If no packets, check:
 # 1. Firewall rules
-iptables -L -n | grep 31337
+iptables -L -n | grep -E '3133[78]'
 
 # 2. Multicast routing
 ip maddr show
