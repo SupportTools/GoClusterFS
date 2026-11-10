@@ -535,8 +535,8 @@ If this guide doesn't resolve your issue:
    uname -a
    cat /etc/os-release
 
-   # GoClusterFS version (goclusterfs-mount has no -version flag yet)
-   ./goclusterfs-fsck -version
+   # GoClusterFS version
+   ./goclusterfs-mount -version
 
    # Recent mount log
    tail -1000 /var/log/goclusterfs.log > mount.log

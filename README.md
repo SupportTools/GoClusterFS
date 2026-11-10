@@ -86,6 +86,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-mount` | (required) | Mount point directory (must exist) |
 | `-format` | `false` | Format the device, then mount it (destroys data) |
 | `-debug` | `false` | Log every FUSE request |
+| `-version` | `false` | Print the version and exit |
 
 ### Cache Options
 
@@ -111,6 +112,8 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-broadcast-secret` | (empty) | HMAC secret for message authentication |
 | `-broadcast-iface` | (auto) | Network interface for multicast |
 
+With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to the port can make nodes drop their caches. Set the same secret on every node.
+
 ### TRIM Options
 
 | Flag | Default | Description |
@@ -125,6 +128,17 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 |------|---------|-------------|
 | `-sfb` | `true` | Ignored. SFB containers are disabled and every file uses full blocks |
 | `-snapshots` | `true` | Enable O(1) file snapshots |
+
+### HTTP API Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-api` | `true` | Serve the HTTP API (`/health`, `/metrics`, `/api/v1/...`) |
+| `-api-addr` | `127.0.0.1:8080` | API listen address |
+| `-api-token` | (empty) | Bearer token required on `/api/v1/...` |
+| `-api-cors` | (empty) | Comma-separated CORS allowed origins |
+
+The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and `-api-token` is empty. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
 
 ## Multi-Node Setup
 

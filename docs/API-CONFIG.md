@@ -35,6 +35,7 @@ These flags are passed when starting `goclusterfs`:
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Format the device (destroys all data) |
 | `-debug` | bool | `false` | Enable verbose debug logging |
+| `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 
 ### Cache Flags
 
@@ -79,6 +80,21 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 |------|------|---------|-------------|
 | `-sfb` | bool | `true` | Ignored. SFB containers are disabled |
 | `-snapshots` | bool | `true` | Enable O(1) file snapshots |
+
+### HTTP API Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-api` | bool | `true` | Serve the HTTP API |
+| `-api-addr` | string | `127.0.0.1:8080` | Listen address |
+| `-api-token` | string | (empty) | Bearer token for `/api/v1/...` requests |
+| `-api-cors` | string | (empty) | Comma-separated CORS allowed origins, or `*` |
+
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status` and `GET /api/v1/stats/...`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` answers 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up`. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
+
+By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty. The token is a command-line flag, so local users can read it with `ps`.
+
+Each mount on a host needs its own `-api-addr`. When the port is taken, mount logs a warning and runs without the API.
 
 ---
 
@@ -412,7 +428,7 @@ Interval between heartbeat messages to detect node failures.
 |----------|-------|
 | Default | (empty) |
 
-HMAC secret for message authentication. All nodes must use the same secret.
+HMAC secret for message authentication. All nodes must use the same secret. With broadcast on and no secret, mount logs a `WARNING` line at startup.
 
 **Generating a secret**:
 ```bash
