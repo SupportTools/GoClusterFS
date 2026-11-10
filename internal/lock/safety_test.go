@@ -633,7 +633,7 @@ func slowWrite(m *Manager, stall, queued, after time.Duration) func([]byte, int6
 // useWrites sends m's record writes through write and holds them to the real
 // write window, which TestMain relaxes for tests that are not about it.
 func useWrites(m *Manager, write func([]byte, int64, time.Time) (int, error)) {
-	m.writeWindow = ClaimSettleDelay / 2
+	m.writeWindow = ClaimSettleDelay
 	m.casWrite = write
 }
 
@@ -770,6 +770,17 @@ func TestLateFenceLeavesStaleTakeoverAlone(t *testing.T) {
 	if rec.Mode != LockModeExclusive || rec.OwnerUUID != z.nodeUUID {
 		t.Fatalf("record after node B's late fence: mode=%d owner=%x, want node Z's write claim", rec.Mode, rec.OwnerUUID[:8])
 	}
+}
+
+// A claim write that started in time and finished within ClaimSettleDelay of
+// its read landed before any other claimant's confirm re-read, so it is held.
+func TestClaimWriteFinishingWithinSettleDelayIsHeld(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	b := newTestNode(dev, 0, 1<<20, 2)
+	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay/4, 0), b.dev.WriteAtBefore, make(chan struct{}))
+
+	requireAcquired(t, b, LockTypeInode, 29, LockModeExclusive)
 }
 
 // returnsWithin fails the test if fn has not returned after 3s.

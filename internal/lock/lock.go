@@ -231,7 +231,7 @@ type Manager struct {
 	gates map[uint64]*sync.Mutex
 	// yieldUntil holds records this node gave up and will not claim again before then.
 	yieldUntil map[uint64]time.Time
-	// writeWindow is how long after its read a record write may start and finish.
+	// writeWindow is how long after its read a record write may finish; it must start within a quarter of that.
 	writeWindow time.Duration
 	// casWrite, when set by a test, replaces the device write of a record CAS.
 	casWrite func(buf []byte, offset int64, deadline time.Time) (int, error)
@@ -295,7 +295,7 @@ var (
 	yieldGap         = YieldGap
 	fenceWindow      = StaleThreshold / 2
 	// claimWriteWindow is each new Manager's writeWindow.
-	claimWriteWindow = ClaimSettleDelay / 2
+	claimWriteWindow = ClaimSettleDelay
 )
 
 // releaseParallelism is how many kept records ReleaseCached frees at once.
@@ -990,7 +990,7 @@ func (m *Manager) fenceLateReadClaim(recordID uint64) {
 		fence.OwnerSlot = uint32(m.nodeSlot)
 		fence.SharedCount = 0
 		fence.Sequence++
-		ok, err := m.casRecordIf(recordID, &fence, fenceWindow, func(seq uint64, _ LockMode) bool {
+		ok, err := m.casRecordIf(recordID, &fence, fenceWindow, fenceWindow, func(seq uint64, _ LockMode) bool {
 			return seq == record.Sequence
 		})
 		if err != nil || ok {
@@ -1173,7 +1173,7 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 
 	// A read racing another node's write of the record can come back torn; read again.
 	for attempt := 0; ; attempt++ {
-		if _, err := m.dev.ReadAt(buf.Bytes(), offset); err != nil {
+		if _, _, err := m.dev.ReadAtUnshardedTimed(buf.Bytes(), offset); err != nil {
 			return nil, err
 		}
 		record, err := deserializeRecord(buf.Bytes())
@@ -1187,29 +1187,30 @@ func (m *Manager) readRecord(recordID uint64) (*Record, error) {
 // casRecordOptimistic writes new over a record that is free and at expectedSeq.
 // This saves one disk read compared to casRecord when the hint is correct.
 func (m *Manager) casRecordOptimistic(recordID uint64, expectedSeq uint64, new *Record) (bool, error) {
-	return m.casRecordIf(recordID, new, m.writeWindow, func(seq uint64, mode LockMode) bool {
+	return m.casRecordIf(recordID, new, m.writeWindow/4, m.writeWindow, func(seq uint64, mode LockMode) bool {
 		return seq == expectedSeq && mode == LockModeNone
 	})
 }
 
 // casRecord writes new over a record that is still at expected's sequence.
 func (m *Manager) casRecord(recordID uint64, expected, new *Record) (bool, error) {
-	return m.casRecordIf(recordID, new, m.writeWindow, func(seq uint64, _ LockMode) bool {
+	return m.casRecordIf(recordID, new, m.writeWindow/4, m.writeWindow, func(seq uint64, _ LockMode) bool {
 		return seq == expected.Sequence
 	})
 }
 
 // casRecordIf reads a record and writes new over it if match accepts what it read.
-// It skips the write if the write would start more than window after the read,
-// and returns errLateWrite, with the write done, if it finished later than that.
-func (m *Manager) casRecordIf(recordID uint64, new *Record, window time.Duration, match func(seq uint64, mode LockMode) bool) (bool, error) {
+// It skips the write if it cannot start within startBy of the read, and returns
+// errLateWrite, with the write done, if it finished more than finishBy after the read.
+// Record I/O skips the device's shard lock: the record gates serialize it.
+func (m *Manager) casRecordIf(recordID uint64, new *Record, startBy, finishBy time.Duration, match func(seq uint64, mode LockMode) bool) (bool, error) {
 	offset := int64(m.offset) + int64(recordID)*RecordSize
 
 	buf := storage.GetBuffer(RecordSize)
 	defer storage.PutBuffer(buf)
 
 	start := time.Now()
-	_, rt, err := m.dev.ReadAtTimed(buf.Bytes(), offset)
+	_, rt, err := m.dev.ReadAtUnshardedTimed(buf.Bytes(), offset)
 	if err != nil {
 		return false, err
 	}
@@ -1223,9 +1224,9 @@ func (m *Manager) casRecordIf(recordID uint64, new *Record, window time.Duration
 	writeCalled := time.Now()
 	var wt storage.IOTiming
 	if m.casWrite != nil {
-		_, err = m.casWrite(buf.Bytes(), offset, start.Add(window))
+		_, err = m.casWrite(buf.Bytes(), offset, start.Add(startBy))
 	} else {
-		_, wt, err = m.dev.WriteAtBeforeTimed(buf.Bytes(), offset, start.Add(window))
+		_, wt, err = m.dev.WriteAtBeforeUnshardedTimed(buf.Bytes(), offset, start.Add(startBy))
 	}
 	t := casTiming{readWait: rt.Wait, read: rt.Syscall, between: writeCalled.Sub(readDone), writeWait: wt.Wait, write: wt.Syscall}
 	if err == nil {
@@ -1239,7 +1240,7 @@ func (m *Manager) casRecordIf(recordID uint64, new *Record, window time.Duration
 		}
 		return false, err
 	}
-	if took := age(start); took > window {
+	if took := age(start); took > finishBy {
 		m.countMissedWrite(&m.lateWrites, t)
 		log.Printf("[WARN] lock: record %d write finished %v after its read (%v)", recordID, took, t)
 		return true, errLateWrite

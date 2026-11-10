@@ -188,6 +188,16 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 
 // ReadAtTimed is ReadAt that also reports where the call's time went.
 func (d *Device) ReadAtTimed(buf []byte, offset int64) (int, IOTiming, error) {
+	return d.readAt(buf, offset, true)
+}
+
+// ReadAtUnshardedTimed is ReadAtTimed without the shard lock, so other I/O to
+// the same 1MB region cannot delay it. Callers must serialize their own I/O to the range.
+func (d *Device) ReadAtUnshardedTimed(buf []byte, offset int64) (int, IOTiming, error) {
+	return d.readAt(buf, offset, false)
+}
+
+func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, IOTiming, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, IOTiming{}, err
 	}
@@ -200,9 +210,10 @@ func (d *Device) ReadAtTimed(buf []byte, offset int64) (int, IOTiming, error) {
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
 
-	// Lock the affected shard(s)
-	startShard, endShard := d.lockIORange(offset, len(buf))
-	defer d.unlockIORange(startShard, endShard)
+	if sharded {
+		startShard, endShard := d.lockIORange(offset, len(buf))
+		defer d.unlockIORange(startShard, endShard)
+	}
 
 	issued := time.Now()
 	n, err := d.file.ReadAt(buf, offset)
@@ -226,6 +237,16 @@ func (d *Device) WriteAtBefore(buf []byte, offset int64, deadline time.Time) (in
 
 // WriteAtBeforeTimed is WriteAtBefore that also reports where the call's time went.
 func (d *Device) WriteAtBeforeTimed(buf []byte, offset int64, deadline time.Time) (int, IOTiming, error) {
+	return d.writeAtBefore(buf, offset, deadline, true)
+}
+
+// WriteAtBeforeUnshardedTimed is WriteAtBeforeTimed without the shard lock, so
+// other I/O to the same 1MB region cannot delay it. Callers must serialize their own I/O to the range.
+func (d *Device) WriteAtBeforeUnshardedTimed(buf []byte, offset int64, deadline time.Time) (int, IOTiming, error) {
+	return d.writeAtBefore(buf, offset, deadline, false)
+}
+
+func (d *Device) writeAtBefore(buf []byte, offset int64, deadline time.Time, sharded bool) (int, IOTiming, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, IOTiming{}, err
 	}
@@ -238,9 +259,10 @@ func (d *Device) WriteAtBeforeTimed(buf []byte, offset int64, deadline time.Time
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
 
-	// Lock the affected shard(s)
-	startShard, endShard := d.lockIORange(offset, len(buf))
-	defer d.unlockIORange(startShard, endShard)
+	if sharded {
+		startShard, endShard := d.lockIORange(offset, len(buf))
+		defer d.unlockIORange(startShard, endShard)
+	}
 
 	issued := time.Now()
 	if !deadline.IsZero() && !issued.Before(deadline) {

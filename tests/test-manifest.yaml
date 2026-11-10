@@ -2317,17 +2317,24 @@ scenarios:
 
   - id: lock-slow-claim-write-skipped
     name: Slow claim write is skipped
-    description: A claim write that cannot start within half the settle delay of its read writes nothing, and the node gets the lock once the holder releases
+    description: A claim write that cannot start within a quarter of the settle delay of its read writes nothing, and the node gets the lock once the holder releases
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestSlowClaimWriteIsSkipped
 
   - id: lock-late-claim-write-not-held
     name: Late claim write is not held
-    description: A claim write that lands more than half the settle delay after its read, over another node's confirmed claim, is not held, so two nodes cannot both hold the lock
+    description: A claim write that lands more than the settle delay after its read, over another node's confirmed claim, is not held, so two nodes cannot both hold the lock
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestLateClaimWriteIsNotHeld
+
+  - id: lock-claim-write-within-settle-held
+    name: Claim write finishing within the settle delay is held
+    description: A claim write that starts within a quarter of ClaimSettleDelay and finishes within ClaimSettleDelay of its read is held, not given up
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestClaimWriteFinishingWithinSettleDelayIsHeld
 
   - id: lock-late-read-claim-admits-no-readers
     name: Late read claim admits no more readers
