@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -27,6 +26,7 @@ Available components:
   trim     - TRIM operation statistics
   lock     - Lock contention statistics
   sfb      - Sub-File Block allocation statistics
+  cluster  - Cluster membership and peers
   all      - All statistics combined
 
 If no component is specified, shows an overview of key stats.
@@ -51,7 +51,6 @@ func init() {
 func runStats(cmd *cobra.Command, args []string) error {
 	// Watch mode not compatible with JSON output
 	if statsWatch && GetOutputFormat() == "json" {
-		printError("watch mode is not compatible with JSON output")
 		return fmt.Errorf("watch mode is not compatible with JSON output")
 	}
 
@@ -63,10 +62,10 @@ func runStats(cmd *cobra.Command, args []string) error {
 
 	// Validate component name upfront
 	switch component {
-	case "", "cache", "journal", "trim", "lock", "sfb", "all":
+	case "", "cache", "journal", "trim", "lock", "sfb", "cluster", "all":
 		// valid
 	default:
-		return fmt.Errorf("unknown component: %s (valid: cache, journal, trim, lock, sfb, all)", component)
+		return fmt.Errorf("unknown component: %s (valid: cache, journal, trim, lock, sfb, cluster, all)", component)
 	}
 
 	// Create the display function
@@ -98,6 +97,8 @@ func displayStats(cmd *cobra.Command, ctx context.Context, component string) err
 		return showLockStats(ctx, apiClient, f)
 	case "sfb":
 		return showSFBStats(ctx, apiClient, f)
+	case "cluster":
+		return showClusterStats(ctx, apiClient, f)
 	case "all":
 		return showAllStats(ctx, apiClient, f)
 	default:
@@ -108,8 +109,7 @@ func displayStats(cmd *cobra.Command, ctx context.Context, component string) err
 func showStatsOverview(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.StatsOverview(ctx)
 	if err != nil {
-		printError("failed to get stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -131,15 +131,14 @@ func showStatsOverview(ctx context.Context, c *client.Client, f *Formatter) erro
 		f.KeyValue("  Bytes Written", FormatBytes(stats.Journal.BytesWritten))
 	}
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }
 
 func showCacheStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.CacheStats(ctx)
 	if err != nil {
-		printError("failed to get cache stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get cache stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -173,15 +172,14 @@ func showCacheStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	}
 	table.Render()
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }
 
 func showJournalStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.JournalStats(ctx)
 	if err != nil {
-		printError("failed to get journal stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get journal stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -204,15 +202,14 @@ func showJournalStats(ctx context.Context, c *client.Client, f *Formatter) error
 	f.KeyValue("Last Checkpoint", fmt.Sprintf("%d", stats.LastCheckpointSeq))
 	f.KeyValue("Batch Syncs", fmt.Sprintf("%d", stats.BatchSyncCount))
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }
 
 func showTrimStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.TrimStats(ctx)
 	if err != nil {
-		printError("failed to get trim stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get trim stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -241,15 +238,14 @@ func showTrimStats(ctx context.Context, c *client.Client, f *Formatter) error {
 		f.KeyValue("Last TRIM", stats.LastTrimAt)
 	}
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }
 
 func showLockStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.LockStats(ctx)
 	if err != nil {
-		printError("failed to get lock stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get lock stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -264,15 +260,14 @@ func showLockStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	f.KeyValue("Active Locks", fmt.Sprintf("%d", stats.ActiveLocks))
 	f.KeyValue("Pending Locks", fmt.Sprintf("%d", stats.PendingLocks))
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }
 
 func showSFBStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.SFBStats(ctx)
 	if err != nil {
-		printError("failed to get sfb stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get sfb stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -297,15 +292,43 @@ func showSFBStats(ctx context.Context, c *client.Client, f *Formatter) error {
 		f.KeyValueColor("Allocation Failures", fmt.Sprintf("%d", stats.AllocationFailures), "error")
 	}
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
+	return nil
+}
+
+func showClusterStats(ctx context.Context, c *client.Client, f *Formatter) error {
+	stats, err := c.ClusterInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get cluster stats: %w", err)
+	}
+
+	if f.IsJSON() {
+		return f.JSON(stats)
+	}
+
+	f.Header("Cluster")
+	f.KeyValue("Node ID", stats.NodeID)
+	f.KeyValue("Role", stats.Role)
+	f.KeyValue("State", stats.State)
+	f.KeyValue("Cluster Size", fmt.Sprintf("%d", stats.ClusterSize))
+	f.KeyValue("Healthy Nodes", fmt.Sprintf("%d", stats.HealthyNodes))
+	if len(stats.Peers) > 0 {
+		f.Printf("\n")
+		table := f.NewTable("Peer", "Address", "State", "Last Seen")
+		for _, p := range stats.Peers {
+			table.AddRow(p.NodeID, p.Address, p.State, p.LastSeen)
+		}
+		table.Render()
+	}
+
+	f.Println()
 	return nil
 }
 
 func showAllStats(ctx context.Context, c *client.Client, f *Formatter) error {
 	stats, err := c.AllStats(ctx)
 	if err != nil {
-		printError("failed to get all stats: %v", err)
-		return err
+		return fmt.Errorf("failed to get all stats: %w", err)
 	}
 
 	if f.IsJSON() {
@@ -371,6 +394,6 @@ func showAllStats(ctx context.Context, c *client.Client, f *Formatter) error {
 		f.KeyValue("Healthy Nodes", fmt.Sprintf("%d", stats.Cluster.HealthyNodes))
 	}
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }

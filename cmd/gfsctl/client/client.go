@@ -6,12 +6,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
 // Client is an HTTP client for the GoClusterFS API.
 type Client struct {
+	host       string
+	port       int
 	baseURL    string
 	token      string
 	httpClient *http.Client
@@ -20,25 +25,17 @@ type Client struct {
 // Option configures a Client.
 type Option func(*Client)
 
-// WithHost sets the API server host.
+// WithHost sets the API server host name or IP address.
 func WithHost(host string) Option {
 	return func(c *Client) {
-		c.baseURL = fmt.Sprintf("http://%s", host)
+		c.host = host
 	}
 }
 
 // WithPort sets the API server port.
 func WithPort(port int) Option {
 	return func(c *Client) {
-		// Extract host from existing baseURL or default to localhost
-		host := "localhost"
-		if c.baseURL != "" {
-			// Parse existing host
-			if len(c.baseURL) > 7 { // len("http://")
-				host = c.baseURL[7:]
-			}
-		}
-		c.baseURL = fmt.Sprintf("http://%s:%d", host, port)
+		c.port = port
 	}
 }
 
@@ -59,7 +56,8 @@ func WithTimeout(timeout time.Duration) Option {
 // New creates a new API client with the given options.
 func New(opts ...Option) *Client {
 	c := &Client{
-		baseURL: "http://localhost:8080",
+		host: "localhost",
+		port: 8080,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -67,6 +65,7 @@ func New(opts ...Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+	c.baseURL = "http://" + net.JoinHostPort(strings.Trim(c.host, "[]"), strconv.Itoa(c.port))
 	return c
 }
 

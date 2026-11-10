@@ -84,3 +84,17 @@ func (c *Client) AllStats(ctx context.Context) (*AllStatsResponse, error) {
 	}
 	return &resp, nil
 }
+
+// ClusterInfo returns cluster membership from /api/v1/stats/cluster.
+func (c *Client) ClusterInfo(ctx context.Context) (*ClusterInfoResponse, error) {
+	var resp ClusterInfoResponse
+	if err := c.Get(ctx, "/api/v1/stats/cluster", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// Metrics returns the Prometheus text from /metrics.
+func (c *Client) Metrics(ctx context.Context) ([]byte, error) {
+	return c.GetRaw(ctx, "/metrics")
+}

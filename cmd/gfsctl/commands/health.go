@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 )
@@ -30,8 +29,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	health, err := client.Health(ctx)
 	if err != nil {
-		printError("failed to get health: %v", err)
-		return err
+		return fmt.Errorf("failed to get health: %w", err)
 	}
 
 	f := NewFormatter(cmd.OutOrStdout(), GetOutputFormat())
@@ -59,7 +57,7 @@ func runHealth(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 
 	// Return error if unhealthy (for scripting)
 	if health.Status == "unhealthy" {

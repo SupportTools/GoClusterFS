@@ -3,7 +3,6 @@ package commands
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -37,7 +36,6 @@ func init() {
 func runStatus(cmd *cobra.Command, args []string) error {
 	// Watch mode not compatible with JSON output
 	if statusWatch && GetOutputFormat() == "json" {
-		printError("watch mode is not compatible with JSON output")
 		return fmt.Errorf("watch mode is not compatible with JSON output")
 	}
 
@@ -58,8 +56,7 @@ func displayStatus(cmd *cobra.Command, ctx context.Context) error {
 
 	status, err := client.Status(ctx)
 	if err != nil {
-		printError("failed to get status: %v", err)
-		return err
+		return fmt.Errorf("failed to get status: %w", err)
 	}
 
 	f := NewFormatter(cmd.OutOrStdout(), GetOutputFormat())
@@ -140,6 +137,6 @@ func displayStatus(cmd *cobra.Command, ctx context.Context) error {
 		}
 	}
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }

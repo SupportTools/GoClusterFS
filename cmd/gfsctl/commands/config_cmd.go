@@ -99,35 +99,31 @@ func showCurrentConfig(cmd *cobra.Command) error {
 	f.KeyValue("Output", cfgOutput)
 	f.KeyValue("Timeout", cfgTimeout.String())
 
-	fmt.Fprintln(os.Stdout)
+	f.Println()
 	return nil
 }
 
 func initConfigFile(cmd *cobra.Command) error {
 	path := configPath()
 	if path == "" {
-		printError("unable to determine config directory")
 		return fmt.Errorf("unable to determine config directory")
 	}
 
 	// Check if file already exists
 	if _, err := os.Stat(path); err == nil {
-		printError("config file already exists: %s", path)
 		return fmt.Errorf("config file already exists: %s", path)
 	}
 
 	// Create directory if needed
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		printError("failed to create config directory: %v", err)
-		return err
+		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
 	// Write sample config
 	content := GenerateSampleConfig()
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		printError("failed to write config file: %v", err)
-		return err
+		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Created config file: %s\n", path)

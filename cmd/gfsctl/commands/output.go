@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -11,11 +12,22 @@ import (
 type Formatter struct {
 	w      io.Writer
 	format string
+	color  bool
 }
 
 // NewFormatter creates a new formatter with the given writer and format.
+// It colors output only for a terminal, and never when NO_COLOR is set.
 func NewFormatter(w io.Writer, format string) *Formatter {
-	return &Formatter{w: w, format: format}
+	return &Formatter{w: w, format: format, color: isTerminal(w) && os.Getenv("NO_COLOR") == ""}
+}
+
+func isTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 // IsJSON returns true if the output format is JSON.
@@ -58,8 +70,10 @@ func (f *Formatter) KeyValue(key string, value interface{}) {
 
 // KeyValueColor prints a key-value pair with color for status values.
 func (f *Formatter) KeyValueColor(key string, value string, status string) {
-	colored := colorize(value, status)
-	fmt.Fprintf(f.w, "  %-20s %s\n", key+":", colored)
+	if f.color {
+		value = colorize(value, status)
+	}
+	fmt.Fprintf(f.w, "  %-20s %s\n", key+":", value)
 }
 
 // Table prints a simple table with headers and rows.

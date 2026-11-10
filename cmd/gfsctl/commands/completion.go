@@ -1,8 +1,6 @@
 package commands
 
 import (
-	"os"
-
 	"github.com/spf13/cobra"
 )
 
@@ -52,13 +50,13 @@ PowerShell:
 	RunE: func(cmd *cobra.Command, args []string) error {
 		switch args[0] {
 		case "bash":
-			return rootCmd.GenBashCompletion(os.Stdout)
+			return rootCmd.GenBashCompletion(cmd.OutOrStdout())
 		case "zsh":
-			return rootCmd.GenZshCompletion(os.Stdout)
+			return rootCmd.GenZshCompletion(cmd.OutOrStdout())
 		case "fish":
-			return rootCmd.GenFishCompletion(os.Stdout, true)
+			return rootCmd.GenFishCompletion(cmd.OutOrStdout(), true)
 		case "powershell":
-			return rootCmd.GenPowerShellCompletionWithDesc(os.Stdout)
+			return rootCmd.GenPowerShellCompletionWithDesc(cmd.OutOrStdout())
 		}
 		return nil
 	},

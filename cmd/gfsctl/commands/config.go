@@ -73,40 +73,6 @@ func loadConfig() (*AppConfig, error) {
 	return &cfg, nil
 }
 
-// initConfig loads the config file and applies values to global flags.
-// Environment variables and command-line flags take precedence.
-func initConfig() {
-	cfg, err := loadConfig()
-	if err != nil {
-		// Silently ignore config errors - CLI should still work
-		return
-	}
-
-	// Apply config values only if not already set by env/flag
-	// Note: cobra doesn't easily support checking if a flag was set,
-	// so we check if values are at their defaults
-
-	if cfg.Host != "" && cfgHost == "localhost" && os.Getenv("GFSCTL_HOST") == "" {
-		cfgHost = cfg.Host
-	}
-
-	if cfg.Port != 0 && cfgPort == 8080 && os.Getenv("GFSCTL_PORT") == "" {
-		cfgPort = cfg.Port
-	}
-
-	if cfg.Token != "" && cfgToken == "" && os.Getenv("GFSCTL_TOKEN") == "" {
-		cfgToken = cfg.Token
-	}
-
-	if cfg.Output != "" && cfgOutput == "text" && os.Getenv("GFSCTL_OUTPUT") == "" {
-		cfgOutput = cfg.Output
-	}
-
-	if cfg.Timeout != 0 && cfgTimeout == 30*time.Second && os.Getenv("GFSCTL_TIMEOUT") == "" {
-		cfgTimeout = cfg.Timeout
-	}
-}
-
 // GenerateSampleConfig returns a sample configuration file content.
 func GenerateSampleConfig() string {
 	return `# gfsctl configuration file
