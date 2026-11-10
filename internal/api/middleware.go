@@ -3,8 +3,11 @@ package api
 import (
 	"crypto/subtle"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -144,15 +147,21 @@ func CORSMiddleware(origins []string) Middleware {
 	}
 }
 
-// RateLimiter implements a token bucket rate limiter per client IP.
+// MaxRateLimitClients bounds the limiter's memory. While this many clients
+// have live buckets, requests from new clients get 429.
+const MaxRateLimitClients = 65536
+
+// RateLimiter implements a token bucket rate limiter per client.
 type RateLimiter struct {
-	mu       sync.Mutex
-	clients  map[string]*tokenBucket
-	rate     float64 // tokens per second
-	burst    int     // max tokens (bucket capacity)
-	stop     chan struct{}
-	stopped  chan struct{}
-	stopOnce sync.Once
+	mu         sync.Mutex
+	clients    map[string]*tokenBucket
+	rate       float64 // tokens per second
+	burst      int     // max tokens (bucket capacity)
+	maxClients int
+	idle       time.Duration // a bucket idle this long is full again, so it is dropped
+	stop       chan struct{}
+	stopped    chan struct{}
+	stopOnce   sync.Once
 }
 
 // tokenBucket tracks rate limit state for a single client.
@@ -163,29 +172,37 @@ type tokenBucket struct {
 
 // NewRateLimiter creates a new rate limiter with the specified rate and burst.
 func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
-	rl := &RateLimiter{
-		clients: make(map[string]*tokenBucket),
-		rate:    requestsPerSecond,
-		burst:   burst,
-		stop:    make(chan struct{}),
-		stopped: make(chan struct{}),
+	idle := time.Hour
+	if refill := float64(burst) / requestsPerSecond; refill < idle.Seconds() {
+		idle = time.Duration(refill * float64(time.Second))
 	}
-	// Start cleanup goroutine to prevent memory leaks
-	go rl.cleanup()
+	rl := &RateLimiter{
+		clients:    make(map[string]*tokenBucket),
+		rate:       requestsPerSecond,
+		burst:      burst,
+		maxClients: MaxRateLimitClients,
+		idle:       idle,
+		stop:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+	}
+	go rl.cleanup(min(max(idle, time.Second), time.Minute))
 	return rl
 }
 
-// Allow checks if a request from the given IP should be allowed.
-func (rl *RateLimiter) Allow(ip string) bool {
+// Allow checks if a request from the given client should be allowed.
+func (rl *RateLimiter) Allow(key string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
 	now := time.Now()
-	bucket, exists := rl.clients[ip]
+	bucket, exists := rl.clients[key]
 
 	if !exists {
+		if len(rl.clients) >= rl.maxClients {
+			return false
+		}
 		// New client starts with a full bucket
-		rl.clients[ip] = &tokenBucket{
+		rl.clients[key] = &tokenBucket{
 			tokens:   float64(rl.burst) - 1, // Consume one token for this request
 			lastSeen: now,
 		}
@@ -209,26 +226,28 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	return true
 }
 
-// cleanup removes stale entries to prevent memory leaks.
-func (rl *RateLimiter) cleanup() {
+func (rl *RateLimiter) cleanup(every time.Duration) {
 	defer close(rl.stopped)
-	ticker := time.NewTicker(5 * time.Minute)
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-rl.stop:
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
+			rl.sweep(now)
 		}
-		rl.mu.Lock()
-		cutoff := time.Now().Add(-10 * time.Minute)
-		for ip, bucket := range rl.clients {
-			if bucket.lastSeen.Before(cutoff) {
-				delete(rl.clients, ip)
-			}
+	}
+}
+
+func (rl *RateLimiter) sweep(now time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for key, bucket := range rl.clients {
+		if now.Sub(bucket.lastSeen) >= rl.idle {
+			delete(rl.clients, key)
 		}
-		rl.mu.Unlock()
 	}
 }
 
@@ -237,29 +256,42 @@ func (rl *RateLimiter) Stop() {
 	rl.stopOnce.Do(func() { close(rl.stop) })
 }
 
-// RateLimitMiddleware returns a middleware that enforces rate limiting per client IP.
-// If limiter is nil, no rate limiting is applied.
-func RateLimitMiddleware(limiter *RateLimiter) Middleware {
+func (rl *RateLimiter) retryAfter() string {
+	return strconv.Itoa(int(min(max(math.Ceil(1/rl.rate), 1), 3600)))
+}
+
+// RateLimitMiddleware returns a middleware that enforces rate limiting per client.
+// If limiter is nil, no rate limiting is applied. Paths in skipPaths are never limited.
+func RateLimitMiddleware(limiter *RateLimiter, skipPaths ...string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// If no limiter configured, skip rate limiting
-			if limiter == nil {
+			if limiter == nil || slices.Contains(skipPaths, r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
 
-			// Extract client IP
-			ip := getClientIP(r)
-
-			// Check rate limit
-			if !limiter.Allow(ip) {
-				w.Header().Set("Retry-After", "1")
+			if !limiter.Allow(rateLimitKey(r)) {
+				w.Header().Set("Retry-After", limiter.retryAfter())
 				writeError(w, http.StatusTooManyRequests, "rate limit exceeded", "please slow down")
 				return
 			}
 
 			next.ServeHTTP(w, r)
 		})
+	}
+}
+
+// rateLimitKey groups IPv6 clients by /64, the block one host usually controls.
+func rateLimitKey(r *http.Request) string {
+	host := getClientIP(r)
+	ip := net.ParseIP(host)
+	switch {
+	case ip == nil:
+		return host
+	case ip.To4() != nil:
+		return ip.String()
+	default:
+		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 	}
 }
 

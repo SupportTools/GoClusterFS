@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// MaxRateLimit is the highest per-client rate limit, in requests per second.
+const MaxRateLimit = 1e6
+
 // Config holds the configuration for the API server.
 type Config struct {
 	// ListenAddr is the address to listen on (e.g., "127.0.0.1:8080" or ":8080").
@@ -135,8 +138,8 @@ func (c *Config) Validate() error {
 
 	// Validate rate limit configuration
 	if c.RateLimitEnabled {
-		if c.RateLimitRequestsPerSecond <= 0 {
-			return fmt.Errorf("%w: requests per second must be > 0", ErrInvalidRateLimit)
+		if !(c.RateLimitRequestsPerSecond > 0) || c.RateLimitRequestsPerSecond > MaxRateLimit {
+			return fmt.Errorf("%w: requests per second must be more than 0 and at most %g", ErrInvalidRateLimit, MaxRateLimit)
 		}
 		if c.RateLimitBurst <= 0 {
 			return fmt.Errorf("%w: burst must be > 0", ErrInvalidRateLimit)
