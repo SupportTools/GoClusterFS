@@ -137,7 +137,7 @@ With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at 
 |------|---------|-------------|
 | `-api` | `true` | Serve the HTTP API (`/health`, `/metrics`, `/api/v1/...`) |
 | `-api-addr` | `127.0.0.1:8080` | API listen address |
-| `-api-token` | (empty) | Bearer token required on `/api/v1/...` |
+| `-api-token` | (empty) | Bearer token required on `/api/v1/...`; also turns on the snapshot, clone and admin endpoints |
 | `-api-cors` | (empty) | Comma-separated CORS allowed origins |
 | `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
 
