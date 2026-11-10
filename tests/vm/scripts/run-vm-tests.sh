@@ -1698,6 +1698,7 @@ test_inode_reuse_stale_read() {
 # Test: more than 4096 files. Layout v2 held 4096 inodes; the cluster is
 # formatted with one inode per 64 KB, so the shared disk holds more. A create
 # takes about 130 ms, so every VM creates and removes its share at once.
+# VMs see new directories and files only after their attribute cache expires.
 test_more_than_4096_files() {
     log_info "Testing more than 4096 files..."
 
@@ -1718,15 +1719,18 @@ test_more_than_4096_files() {
     fi
     local vm pid failed=0 pids=()
     for vm in $(seq 1 "$NODE_COUNT"); do
-        ssh_run "$vm" "for d in \$(seq $((vm - 1)) $NODE_COUNT 41); do cd $dir/d\$d && touch \$(seq 0 99 | sed 's/^/f/') || exit 1; done" &
+        ssh_run "$vm" "for d in \$(seq $((vm - 1)) $NODE_COUNT 41); do t=0; until [ -d $dir/d\$d ]; do t=\$((t + 1)); [ \$t -le 120 ] || exit 1; sleep 0.5; done; cd $dir/d\$d && touch \$(seq 0 99 | sed 's/^/f/') || exit 1; done" &
         pids+=($!)
     done
     for pid in "${pids[@]}"; do
         wait "$pid" || failed=1
     done
-    sleep 1.5
-    local count
-    count=$(ssh_run 1 "find $dir -type f | wc -l")
+    local count=0 waited=0
+    while [[ $failed -eq 0 && "$count" -ne 4200 && $waited -lt 60 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        count=$(ssh_run 1 "find $dir -type f | wc -l")
+    done
 
     pids=()
     for vm in $(seq 1 "$NODE_COUNT"); do
