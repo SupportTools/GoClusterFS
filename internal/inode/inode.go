@@ -333,8 +333,7 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 	return 0, ErrInodeFull
 }
 
-// scanMagic calls fn with the magic of each inode in [from, to) until fn
-// returns false. It reads 1 MB at a time and skips ranges it cannot read.
+// scanMagic reads the inode table 1 MB at a time and calls fn with each magic in [from, to) until fn returns false.
 func (t *Table) scanMagic(from, to uint64, fn func(num, magic uint32) bool) {
 	buf := storage.GetBuffer(scanBytes)
 	defer storage.PutBuffer(buf)
@@ -482,12 +481,8 @@ func (t *Table) TotalInodes() uint64 {
 	return t.totalInodes
 }
 
-// FreeCount returns an estimate of free inodes.
-// For simplicity in Phase 2, this scans the table to count free slots.
+// FreeCount estimates free inodes; it scans without t.mu, so a full-table scan never stalls inode writes.
 func (t *Table) FreeCount() uint64 {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
 	freeCount := uint64(0)
 	t.scanMagic(uint64(InodeFirstUsable), t.totalInodes, func(_, magic uint32) bool {
 		if magic == 0 {
