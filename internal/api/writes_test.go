@@ -117,8 +117,8 @@ func TestWritesNeedToken(t *testing.T) {
 	if len(files.calls) != 0 || len(admin.ops) != 0 {
 		t.Fatalf("services ran without a token: %v %v", files.calls, admin.ops)
 	}
-	if status, body := call(t, srv, "GET", "/api/v1/snapshots?path=/f", "", ""); status != http.StatusOK || !strings.Contains(body, `"total":1`) {
-		t.Fatalf("list without token on loopback: %d %s", status, body)
+	if status, _ := call(t, srv, "GET", "/api/v1/snapshots?path=/f", "", ""); status != http.StatusForbidden {
+		t.Fatalf("list without a token on loopback: %d, want 403", status)
 	}
 }
 
@@ -160,6 +160,8 @@ func TestWriteErrorsMapToStatus(t *testing.T) {
 		{syscall.EIO, http.StatusInternalServerError},
 		{fmt.Errorf("%w: bad", ErrInvalidPath), http.StatusBadRequest},
 		{fmt.Errorf("snapshots are %w", ErrDisabled), http.StatusConflict},
+		{fmt.Errorf("%w", ErrNotMounted), http.StatusServiceUnavailable},
+		{syscall.ENOSYS, http.StatusNotImplemented},
 	} {
 		files.err = tc.err
 		if status, _ := call(t, srv, "POST", "/api/v1/snapshots", "secret", `{"path":"/f","name":"s"}`); status != tc.want {
@@ -170,14 +172,17 @@ func TestWriteErrorsMapToStatus(t *testing.T) {
 
 func TestWriteRequestValidation(t *testing.T) {
 	srv, files, _ := startWriteServer(t, "secret")
-	for _, tc := range []struct{ method, path, body string }{
-		{"POST", "/api/v1/snapshots", `{"path":"/f","name":"s","extra":1}`},
-		{"POST", "/api/v1/snapshots", `{"path":"/f","name":"s"}{}`},
-		{"POST", "/api/v1/snapshots", `not json`},
-		{"POST", "/api/v1/snapshots", `{"path":"` + strings.Repeat("a", maxWriteBody) + `"}`},
+	for _, tc := range []struct {
+		body string
+		want int
+	}{
+		{`{"path":"/f","name":"s","extra":1}`, http.StatusBadRequest},
+		{`{"path":"/f","name":"s"}{}`, http.StatusBadRequest},
+		{`not json`, http.StatusBadRequest},
+		{`{"path":"` + strings.Repeat("a", maxWriteBody) + `"}`, http.StatusRequestEntityTooLarge},
 	} {
-		if status, _ := call(t, srv, tc.method, tc.path, "secret", tc.body); status != http.StatusBadRequest {
-			t.Errorf("body %.40q: status %d, want 400", tc.body, status)
+		if status, _ := call(t, srv, "POST", "/api/v1/snapshots", "secret", tc.body); status != tc.want {
+			t.Errorf("body %.40q: status %d, want %d", tc.body, status, tc.want)
 		}
 	}
 	for _, tc := range []struct {
@@ -189,6 +194,9 @@ func TestWriteRequestValidation(t *testing.T) {
 		{"GET", "/api/v1/admin/clear-cache", http.StatusMethodNotAllowed},
 		{"POST", "/api/v1/admin/format", http.StatusNotFound},
 		{"POST", "/api/v1/snapshots/s1/rename", http.StatusNotFound},
+		{"HEAD", "/api/v1/snapshots/s1/clone", http.StatusMethodNotAllowed},
+		{"HEAD", "/api/v1/clones", http.StatusMethodNotAllowed},
+		{"HEAD", "/api/v1/admin/flush-journal", http.StatusMethodNotAllowed},
 	} {
 		if status, _ := call(t, srv, tc.method, tc.path, "secret", "{}"); status != tc.want {
 			t.Errorf("%s %s: status %d, want %d", tc.method, tc.path, status, tc.want)
@@ -238,5 +246,76 @@ func TestStopWaitsForWritesInFlight(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Stop did not return after the write finished")
+	}
+}
+
+func TestWritesRefuseOtherOrigins(t *testing.T) {
+	srv, err := NewServer(DefaultConfig().WithListenAddr("127.0.0.1:0").WithAuthToken("secret").WithCORSOrigins("http://localhost:5173"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := &fakeFiles{}
+	srv.SetFileService(files)
+	if err := srv.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Stop() })
+
+	send := func(method, origin string, header map[string]string) *http.Response {
+		req, _ := http.NewRequest(method, "http://"+srv.Addr()+"/api/v1/clones", strings.NewReader(`{"path":"/f","dest":"/c"}`))
+		req.Header.Set("Authorization", "Bearer secret")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp
+	}
+
+	for _, m := range []string{"POST", "DELETE"} {
+		resp := send("OPTIONS", "http://localhost:5173", map[string]string{"Access-Control-Request-Method": m, "Access-Control-Request-Headers": "authorization"})
+		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Access-Control-Allow-Origin") != "" {
+			t.Errorf("preflight for %s from an allowed origin: %d, Allow-Origin %q; want 403 and none", m, resp.StatusCode, resp.Header.Get("Access-Control-Allow-Origin"))
+		}
+	}
+	if resp := send("OPTIONS", "http://localhost:5173", map[string]string{"Access-Control-Request-Method": "GET"}); resp.StatusCode != http.StatusNoContent {
+		t.Errorf("preflight for GET: %d, want 204", resp.StatusCode)
+	}
+	for _, origin := range []string{"http://localhost:5173", "http://evil.example", "null"} {
+		if resp := send("POST", origin, nil); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("POST with Origin %q: %d, want 403", origin, resp.StatusCode)
+		}
+	}
+	if resp := send("POST", "http://"+srv.Addr(), nil); resp.StatusCode != http.StatusCreated {
+		t.Errorf("same-origin POST: %d, want 201", resp.StatusCode)
+	}
+	if files.lastCall() != "clone /f /c" || len(files.calls) != 1 {
+		t.Errorf("service calls = %v, want only the same-origin clone", files.calls)
+	}
+}
+
+func TestTokenInQueryIsIgnored(t *testing.T) {
+	srv, files, _ := startWriteServer(t, "secret")
+	if status, _ := call(t, srv, "POST", "/api/v1/clones?token=secret&access_token=secret", "", `{"path":"/f","dest":"/c"}`); status != http.StatusUnauthorized {
+		t.Fatalf("token in the query: %d, want 401", status)
+	}
+	if len(files.calls) != 0 {
+		t.Fatalf("service ran: %v", files.calls)
+	}
+}
+
+func TestDeleteTakesEscapedNames(t *testing.T) {
+	srv, files, _ := startWriteServer(t, "secret")
+	if status, body := call(t, srv, "DELETE", "/api/v1/snapshots/nightly%2F2026%3A1?path=/f", "secret", ""); status != http.StatusOK {
+		t.Fatalf("delete of an escaped name: %d %s", status, body)
+	}
+	if got := files.lastCall(); got != "delete /f nightly/2026:1" {
+		t.Fatalf("service got %q", got)
 	}
 }

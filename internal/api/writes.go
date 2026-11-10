@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"syscall"
 	"time"
@@ -37,6 +38,9 @@ var (
 
 	// ErrDisabled is returned when the feature is turned off by a mount flag.
 	ErrDisabled = errors.New("disabled")
+
+	// ErrNotMounted is returned when the filesystem is no longer mounted.
+	ErrNotMounted = errors.New("not mounted")
 )
 
 // SnapshotInfo describes one snapshot in the registry.
@@ -102,8 +106,8 @@ func (s *Server) SetAdminService(as AdminService) {
 	s.adminService = as
 }
 
-// WritesEnabled reports whether write endpoints accept requests. They need an
-// auth token even on loopback: the Host check stops browsers, not local processes.
+// WritesEnabled reports whether write and snapshot endpoints accept requests. They
+// need an auth token even on loopback: the Host check stops browsers, not local processes.
 func (s *Server) WritesEnabled() bool {
 	return s.config.AuthToken != ""
 }
@@ -114,10 +118,24 @@ func (s *Server) services() (FileService, AdminService) {
 	return s.fileService, s.adminService
 }
 
-// beginWrite refuses writes without a token and counts the request so Stop can wait for it.
-func (s *Server) beginWrite(w http.ResponseWriter) (func(), bool) {
+// requireToken refuses requests when no token is set. Snapshot data needs one
+// even on loopback, like writes: the API reads it as the mount's user.
+func (s *Server) requireToken(w http.ResponseWriter) bool {
 	if !s.WritesEnabled() {
-		writeError(w, http.StatusForbidden, "writes are disabled", "start goclusterfs-mount with -api-token")
+		writeError(w, http.StatusForbidden, "snapshot and admin endpoints are disabled", "start goclusterfs-mount with -api-token-file or GOCLUSTERFS_API_TOKEN")
+		return false
+	}
+	return true
+}
+
+// beginWrite refuses writes without a token or from another origin, and
+// counts the request so Stop can wait for it.
+func (s *Server) beginWrite(w http.ResponseWriter, r *http.Request) (func(), bool) {
+	if !s.requireToken(w) {
+		return nil, false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+		writeError(w, http.StatusForbidden, "cross-origin writes are refused", "")
 		return nil, false
 	}
 	s.mu.Lock()
@@ -131,10 +149,20 @@ func (s *Server) beginWrite(w http.ResponseWriter) (func(), bool) {
 	return s.writes.Done, true
 }
 
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, host)
+}
+
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxWriteBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body too large", fmt.Sprintf("at most %d bytes", maxWriteBody))
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "invalid request body", err.Error())
 		return false
 	}
@@ -155,9 +183,14 @@ func logWrite(r *http.Request, action, detail string, err error) {
 
 // handleSnapshots serves /api/v1/snapshots, /api/v1/snapshots/{name} and /api/v1/snapshots/{name}/clone.
 func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/api/v1/snapshots")
+	rest := strings.TrimPrefix(r.URL.EscapedPath(), "/api/v1/snapshots")
 	rest = strings.TrimPrefix(rest, "/")
-	name, sub, _ := strings.Cut(rest, "/")
+	escapedName, sub, _ := strings.Cut(rest, "/")
+	name, err := url.PathUnescape(escapedName)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid snapshot name", err.Error())
+		return
+	}
 
 	switch {
 	case name == "" && r.Method == http.MethodGet:
@@ -184,6 +217,9 @@ func (s *Server) fileServiceOrError(w http.ResponseWriter) FileService {
 }
 
 func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
+	if !s.requireToken(w) {
+		return
+	}
 	fs := s.fileServiceOrError(w)
 	if fs == nil {
 		return
@@ -200,7 +236,7 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createSnapshot(w http.ResponseWriter, r *http.Request) {
-	done, ok := s.beginWrite(w)
+	done, ok := s.beginWrite(w, r)
 	if !ok {
 		return
 	}
@@ -224,7 +260,7 @@ func (s *Server) createSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteSnapshot(w http.ResponseWriter, r *http.Request, name string) {
-	done, ok := s.beginWrite(w)
+	done, ok := s.beginWrite(w, r)
 	if !ok {
 		return
 	}
@@ -234,6 +270,7 @@ func (s *Server) deleteSnapshot(w http.ResponseWriter, r *http.Request, name str
 		return
 	}
 	path := r.URL.Query().Get("path")
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(writeOpTimeout))
 	err := fs.DeleteSnapshot(r.Context(), path, name)
 	logWrite(r, "snapshot.delete", fmt.Sprintf("path=%q name=%q", path, name), err)
 	if err != nil {
@@ -244,7 +281,7 @@ func (s *Server) deleteSnapshot(w http.ResponseWriter, r *http.Request, name str
 }
 
 func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, name string) {
-	done, ok := s.beginWrite(w)
+	done, ok := s.beginWrite(w, r)
 	if !ok {
 		return
 	}
@@ -277,7 +314,7 @@ func (s *Server) handleClones(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use POST")
 		return
 	}
-	done, ok := s.beginWrite(w)
+	done, ok := s.beginWrite(w, r)
 	if !ok {
 		return
 	}
@@ -311,7 +348,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use POST")
 		return
 	}
-	done, ok := s.beginWrite(w)
+	done, ok := s.beginWrite(w, r)
 	if !ok {
 		return
 	}
@@ -349,6 +386,8 @@ func writeOpError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrDisabled):
 		status = http.StatusConflict
+	case errors.Is(err, ErrNotMounted):
+		status = http.StatusServiceUnavailable
 	case errors.As(err, &errno):
 		switch errno {
 		case syscall.ENOENT:
@@ -361,6 +400,8 @@ func writeOpError(w http.ResponseWriter, err error) {
 			status = http.StatusInsufficientStorage
 		case syscall.EACCES, syscall.EPERM:
 			status = http.StatusForbidden
+		case syscall.ENOSYS:
+			status = http.StatusNotImplemented
 		}
 	}
 	writeError(w, status, http.StatusText(status), err.Error())

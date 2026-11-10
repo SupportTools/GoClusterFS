@@ -135,6 +135,15 @@ func CORSMiddleware(origins []string) Middleware {
 				return
 			}
 
+			// POST is CORS-safelisted, so browsers send it whenever the preflight
+			// succeeds. Writes must stay same-origin: fail every preflight but GET and HEAD.
+			if r.Method == http.MethodOptions {
+				if m := r.Header.Get("Access-Control-Request-Method"); m != "" && m != http.MethodGet && m != http.MethodHead {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+			}
+
 			// Set CORS headers
 			w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
