@@ -135,7 +135,7 @@ head -c 16 /dev/device | hexdump -C
 
 ### Operations Hang Waiting for a Lock
 
-**Symptom**: File operations hang. The mount log shows many `lock.Acquire` lines for the same lock, or `TIMEOUT after N retries` once the waiting program is interrupted. Lock waits have no time limit.
+**Symptom**: File operations hang for up to 30 seconds, then fail with EIO. The mount log shows many `lock.Acquire` lines for the same lock, then a `[WARN] lock: gave up waiting` line that names the node holding it. A signal to the waiting program does not end the wait; `SIGKILL` does.
 
 **Causes**:
 1. Another node holds the lock for a long operation, or is stalled

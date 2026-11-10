@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -306,6 +308,61 @@ func TestMultiNodeCrashRecovery(t *testing.T) {
 	}
 
 	t.Log("Crash recovery test completed - filesystem remains functional after crash")
+}
+
+// TestMultiNodeCreateWithSignals creates files on two nodes while the threads
+// doing the creates keep getting signals, as the Go runtime sends for
+// preemption. Each signal interrupts the FUSE request in flight; no create or
+// write may fail.
+func TestMultiNodeCreateWithSignals(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 200)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+
+	var tids [2]atomic.Int32
+	stop, signalled := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(signalled)
+		tick := time.NewTicker(200 * time.Microsecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				for i := range tids {
+					if tid := tids[i].Load(); tid != 0 {
+						_ = syscall.Tgkill(os.Getpid(), int(tid), syscall.SIGURG)
+					}
+				}
+			}
+		}
+	}()
+
+	const perNode = 60
+	errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		tids[idx].Store(int32(syscall.Gettid()))
+		defer tids[idx].Store(0)
+		for i := 0; i < perNode; i++ {
+			if err := node.WriteFile(fmt.Sprintf("sig-%d-%02d", idx, i), []byte("x")); err != nil {
+				return fmt.Errorf("file %d: %w", i, err)
+			}
+		}
+		return nil
+	})
+	close(stop)
+	<-signalled
+	for idx, err := range errs {
+		if err != nil {
+			t.Errorf("Node %d: %v", idx, err)
+		}
+	}
 }
 
 // TestMultiNodeConcurrentDirectoryOps tests multiple nodes performing directory operations
