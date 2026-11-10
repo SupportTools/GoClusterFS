@@ -600,3 +600,16 @@ func TestClusterInfo_WithPeers(t *testing.T) {
 		t.Errorf("expected second peer Latency 2.1, got %f", snapshot.Cluster.Peers[1].Latency)
 	}
 }
+
+func TestCollector_FilesystemProvider(t *testing.T) {
+	collector := NewCollector(DefaultConfig())
+	collector.SetFilesystemProvider(&mockFilesystemProvider{stats: &FilesystemStats{TotalBytes: 1 << 30, UsedBytes: 1 << 20}})
+
+	snapshot := collector.Collect()
+	if snapshot.Filesystem == nil || snapshot.Filesystem.TotalBytes != 1<<30 || snapshot.Filesystem.UsedBytes != 1<<20 {
+		t.Fatalf("Collect().Filesystem = %+v, want the provider's stats", snapshot.Filesystem)
+	}
+	if got := collector.FilesystemStats(); got == nil || got.TotalBytes != 1<<30 {
+		t.Fatalf("FilesystemStats() = %+v, want the provider's stats", got)
+	}
+}
