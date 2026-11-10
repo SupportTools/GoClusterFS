@@ -449,37 +449,54 @@ func TestGetClientIP_RemoteAddr(t *testing.T) {
 	}
 }
 
-func TestGetClientIP_XForwardedFor(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	req.Header.Set("X-Forwarded-For", "203.0.113.50, 70.41.3.18, 150.172.238.178")
-
-	ip := getClientIP(req)
-	if ip != "203.0.113.50" {
-		t.Errorf("expected '203.0.113.50' (first IP), got %q", ip)
-	}
-}
-
-func TestGetClientIP_XRealIP(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	req.Header.Set("X-Real-IP", "198.51.100.78")
-
-	ip := getClientIP(req)
-	if ip != "198.51.100.78" {
-		t.Errorf("expected '198.51.100.78', got %q", ip)
-	}
-}
-
-func TestGetClientIP_XForwardedForPrecedence(t *testing.T) {
+func TestGetClientIP_IgnoresProxyHeaders(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
 	req.Header.Set("X-Forwarded-For", "203.0.113.50")
 	req.Header.Set("X-Real-IP", "198.51.100.78")
 
-	// X-Forwarded-For should take precedence
-	ip := getClientIP(req)
-	if ip != "203.0.113.50" {
-		t.Errorf("expected '203.0.113.50' (X-Forwarded-For takes precedence), got %q", ip)
+	if ip := getClientIP(req); ip != "10.0.0.1" {
+		t.Errorf("expected the connection's IP 10.0.0.1, got %q", ip)
+	}
+}
+
+func TestRateLimitIgnoresForwardedFor(t *testing.T) {
+	srv := startServer(t, DefaultConfig().WithListenAddr("127.0.0.1:0").WithRateLimit(0.001, 1))
+	if got := get(t, srv, "/health", "", map[string]string{"X-Forwarded-For": "203.0.113.1"}).StatusCode; got != http.StatusOK {
+		t.Fatalf("first request: status %d, want 200", got)
+	}
+	if got := get(t, srv, "/health", "", map[string]string{"X-Forwarded-For": "203.0.113.2"}).StatusCode; got != http.StatusTooManyRequests {
+		t.Fatalf("second request with a new X-Forwarded-For: status %d, want 429", got)
+	}
+}
+
+func TestRateLimiterStopEndsCleanup(t *testing.T) {
+	rl := NewRateLimiter(1, 1)
+	rl.Stop()
+	rl.Stop()
+	select {
+	case <-rl.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup goroutine still running after Stop")
+	}
+}
+
+func TestServerStopStopsRateLimiter(t *testing.T) {
+	for _, start := range []bool{true, false} {
+		srv, err := NewServer(DefaultConfig().WithListenAddr("127.0.0.1:0").WithRateLimit(10, 20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if start {
+			if err := srv.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		srv.Stop()
+		select {
+		case <-srv.rateLimiter.stopped:
+		case <-time.After(time.Second):
+			t.Fatalf("started=%v: rate limiter cleanup still running after Stop", start)
+		}
 	}
 }

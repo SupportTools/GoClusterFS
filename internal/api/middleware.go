@@ -146,10 +146,13 @@ func CORSMiddleware(origins []string) Middleware {
 
 // RateLimiter implements a token bucket rate limiter per client IP.
 type RateLimiter struct {
-	mu      sync.Mutex
-	clients map[string]*tokenBucket
-	rate    float64 // tokens per second
-	burst   int     // max tokens (bucket capacity)
+	mu       sync.Mutex
+	clients  map[string]*tokenBucket
+	rate     float64 // tokens per second
+	burst    int     // max tokens (bucket capacity)
+	stop     chan struct{}
+	stopped  chan struct{}
+	stopOnce sync.Once
 }
 
 // tokenBucket tracks rate limit state for a single client.
@@ -164,6 +167,8 @@ func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
 		clients: make(map[string]*tokenBucket),
 		rate:    requestsPerSecond,
 		burst:   burst,
+		stop:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
 	// Start cleanup goroutine to prevent memory leaks
 	go rl.cleanup()
@@ -206,10 +211,16 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 // cleanup removes stale entries to prevent memory leaks.
 func (rl *RateLimiter) cleanup() {
+	defer close(rl.stopped)
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-rl.stop:
+			return
+		case <-ticker.C:
+		}
 		rl.mu.Lock()
 		cutoff := time.Now().Add(-10 * time.Minute)
 		for ip, bucket := range rl.clients {
@@ -219,6 +230,11 @@ func (rl *RateLimiter) cleanup() {
 		}
 		rl.mu.Unlock()
 	}
+}
+
+// Stop ends the cleanup goroutine. It is safe to call more than once.
+func (rl *RateLimiter) Stop() {
+	rl.stopOnce.Do(func() { close(rl.stop) })
 }
 
 // RateLimitMiddleware returns a middleware that enforces rate limiting per client IP.
@@ -247,25 +263,8 @@ func RateLimitMiddleware(limiter *RateLimiter) Middleware {
 	}
 }
 
-// getClientIP extracts the client IP from the request.
-// It checks X-Forwarded-For and X-Real-IP headers first (for proxied requests),
-// then falls back to RemoteAddr.
+// getClientIP returns the connection's IP. Proxy headers are ignored: any client can set them.
 func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (may contain multiple IPs)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP (original client)
-		if idx := strings.Index(xff, ","); idx != -1 {
-			return strings.TrimSpace(xff[:idx])
-		}
-		return strings.TrimSpace(xff)
-	}
-
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-
-	// Fall back to RemoteAddr (strip port)
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr

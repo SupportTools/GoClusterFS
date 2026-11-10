@@ -122,6 +122,9 @@ func (s *Server) Start(ctx context.Context) error {
 // ShutdownTimeout before forcefully closing them.
 func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
+		if s.rateLimiter != nil {
+			s.rateLimiter.Stop()
+		}
 		s.mu.Lock()
 		if !s.started {
 			s.mu.Unlock()
