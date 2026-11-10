@@ -451,6 +451,7 @@ func main() {
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start API server: %v", err)
+				apiServer = nil
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
