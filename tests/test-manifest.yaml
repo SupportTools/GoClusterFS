@@ -569,10 +569,10 @@ scenarios:
 
   - id: refcount-blocks-past-region
     name: Refcounts never write past their region
-    description: On a 200 GiB volume, changes to blocks the 1 MB refcount region has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the snapshot registry after the region is unchanged
+    description: In a refcount region smaller than its volume, like layout v2's 1 MB table on 200 GiB, changes to blocks it has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the next region is unchanged
     priority: go_only
     environments:
-      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheSnapshotRegistryAlone
+      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheNextRegionAlone
 
   - id: snapshot-refuses-blocks-past-refcount-region
     name: Snapshot and clone refuse blocks the refcount region cannot count
@@ -895,7 +895,7 @@ scenarios:
 
   - id: fsck-sharing-past-refcount-table
     name: fsck reports sharing the refcount table cannot count
-    description: On a 200 GiB volume fsck warns that the refcount table covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
+    description: With the refcount table of a 200 GiB volume shrunk to 1 MB in the superblock, fsck reports an error that it covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckReportsSharingPastRefcountTable
