@@ -524,7 +524,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
-**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
+**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default, unicast on `31338`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
 
 - With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.
@@ -540,7 +540,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 
-**Network listeners.** Each node listens on UDP port 31337 on all interfaces, plus the multicast group, and on TCP `-api-addr`. Limit the UDP port, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
+**Network listeners.** Each node listens on UDP port 31337 (multicast group) and UDP port 31338 (unicast) on all interfaces, and on TCP `-api-addr`. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 
 ---
 

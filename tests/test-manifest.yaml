@@ -1615,6 +1615,41 @@ scenarios:
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestConfigDefaults
 
+  - id: broadcast-default-layout-starts
+    name: Broadcast starts with the default ports
+    description: The default multicast and unicast ports differ and Start succeeds
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestDefaultLayoutStarts
+
+  - id: broadcast-shared-port-rejected
+    name: Broadcast rejects one port for both sockets
+    description: Start refuses a unicast port equal to the multicast port with a clear error
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestSharedPortRejected
+
+  - id: broadcast-two-nodes-one-host
+    name: Broadcast between two nodes on one host
+    description: Two transports sharing a host and multicast port exchange messages over multicast and unicast
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestTwoNodesOnOneHost
+
+  - id: broadcast-send-socket-options
+    name: Broadcast send socket options
+    description: The send socket loops multicast back to this host and uses the configured TTL
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/sockopt_linux_test.go::TestSendSocketMulticastOptions
+
+  - id: broadcast-explicit-interface
+    name: Broadcast on an explicit interface
+    description: With -broadcast-iface, two nodes exchange multicast through that interface
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/sockopt_linux_test.go::TestTwoNodesOnExplicitInterface
+
   - id: broadcast-dedup-per-sender
     name: Broadcast dedup per sender
     description: The same sequence number from two senders is processed twice
@@ -1689,6 +1724,15 @@ scenarios:
       go: broadcast_test.go::TestBroadcastBidirectional
       docker: run-tests.sh::test_broadcast_bidirectional
       vm: run-vm-tests.sh::test_broadcast_bidirectional
+
+  - id: broadcast-invalidates-peer-cache
+    name: Broadcast invalidates a peer's cached inode
+    description: With a 1h cache TTL on node 1, only a broadcast lets its open file read data node 0 appended
+    priority: medium
+    environments:
+      go: broadcast_test.go::TestBroadcastInvalidatesPeerCache
+      docker: TODO  # needs a per-node -cache-ttl in the compose file
+      vm: TODO  # VMs use QEMU user networking, so they cannot reach each other
 
   # ===========================================================================
   # SNAPSHOT TESTS (Phase 7: Snapshots)
@@ -2375,6 +2419,13 @@ scenarios:
     priority: go_only
     environments:
       go: api_writes_test.go::TestMountTokenSources
+
+  - id: gfsctl-reads-live-mount
+    name: gfsctl reads a live mount
+    description: gfsctl status, health and metrics work against a mounted filesystem's API
+    priority: go_only
+    environments:
+      go: api_test.go::TestGfsctlReadsLiveMount
 
   - id: api-stats-live-values
     name: API stats report live values

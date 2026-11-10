@@ -28,10 +28,12 @@ for platform in $platforms; do
 		CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 			go build -trimpath -ldflags "$ldflags" -o "$dir/goclusterfs-$cmd" "./cmd/$cmd"
 	done
+	CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+		go build -trimpath -ldflags "$ldflags" -o "$dir/gfsctl" ./cmd/gfsctl
 
 	cp LICENSE README.md "$dir/"
 	cp "$go_license" "$dir/licenses/go/"
-	go version -m "$dir"/goclusterfs-* | awk '$1 == "dep" { print $2 }' | sort -u |
+	go version -m "$dir"/goclusterfs-* "$dir"/gfsctl | awk '$1 == "dep" { print $2 }' | sort -u |
 		while read -r mod; do
 			mkdir -p "$dir/licenses/$mod"
 			cp "$(go list -m -f '{{.Dir}}' "$mod")"/LICENSE* "$dir/licenses/$mod/"

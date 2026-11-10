@@ -63,7 +63,7 @@ newgrp fuse
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
 | Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
-| Ports | UDP 31337 (configurable). TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
+| Ports | UDP 31337 (multicast) and UDP 31338 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
 | Latency | < 10ms between nodes recommended |
 
 ---
@@ -77,11 +77,11 @@ newgrp fuse
 git clone https://github.com/supporttools/GoClusterFS.git
 cd GoClusterFS
 
-# Build goclusterfs-mount and goclusterfs-fsck
+# Build goclusterfs-mount, goclusterfs-fsck and gfsctl
 make build
 
 # Optional: Install to system path
-sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
+sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ```
 
 ### Verify Build
@@ -89,6 +89,7 @@ sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
 ```bash
 ./goclusterfs-mount -version
 ./goclusterfs-fsck -version
+./gfsctl version
 ```
 
 Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the GitHub Releases page.
@@ -289,7 +290,7 @@ Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock 
 
 ### Step 4: Verify Cluster Communication
 
-Each mount logs `Broadcast: enabled on 239.192.74.75:31337` at startup, or a warning if broadcast could not start. It logs `Broadcast stats` when it unmounts.
+Each mount logs `Broadcast: enabled on 239.192.74.75:31337, unicast port 31338` at startup. If broadcast cannot start, for example because a port is taken, the mount fails; pass `-broadcast=false` to run without it. It logs `Broadcast stats` when it unmounts.
 
 ```bash
 # Verify multicast is working
@@ -435,11 +436,11 @@ Mount refuses a non-loopback `-api-addr` without a token, and a token file that 
 
 ```bash
 # Allow multicast traffic between cluster nodes
-iptables -A INPUT -p udp --dport 31337 -j ACCEPT
-iptables -A OUTPUT -p udp --dport 31337 -j ACCEPT
+iptables -A INPUT -p udp -m multiport --dports 31337,31338 -j ACCEPT
+iptables -A OUTPUT -p udp -m multiport --dports 31337,31338 -j ACCEPT
 
 # Or with firewalld
-firewall-cmd --permanent --add-port=31337/udp
+firewall-cmd --permanent --add-port=31337-31338/udp
 firewall-cmd --reload
 ```
 

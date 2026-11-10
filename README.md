@@ -46,7 +46,7 @@ cd GoClusterFS
 make build
 ```
 
-This builds `goclusterfs-mount` and `goclusterfs-fsck` in the repo root.
+This builds `goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` in the repo root.
 
 ### Format and Mount
 
@@ -110,11 +110,12 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 |------|---------|-------------|
 | `-broadcast` | `true` | Enable network cache invalidation |
 | `-mcast-group` | `239.192.74.75` | Multicast group address |
-| `-mcast-port` | `31337` | Multicast/unicast port |
+| `-mcast-port` | `31337` | UDP port for multicast |
+| `-unicast-port` | `31338` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | (empty) | HMAC secret for message authentication |
 | `-broadcast-iface` | (auto) | Network interface for multicast |
 
-With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to the port can make nodes drop their caches. Set the same secret on every node.
+With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-broadcast=false` to run without broadcast. With no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to those ports can make nodes drop their caches. Set the same secret on every node.
 
 ### TRIM Options
 
@@ -143,6 +144,31 @@ With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at 
 | `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
 
 The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and no token is set. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
+
+## gfsctl
+
+`gfsctl` reads a mount's HTTP API from the command line. It only reads; it changes nothing. `make build` builds it, and release archives include it.
+
+```bash
+./gfsctl status              # mount state, version, capacity
+./gfsctl health              # exits 1 when a component is unhealthy
+./gfsctl stats               # overview; also: cache, journal, trim, lock, sfb, cluster, all
+./gfsctl metrics             # Prometheus text from /metrics
+./gfsctl status -w -i 5s     # refresh every 5 s
+./gfsctl stats all -o json   # JSON for scripts
+```
+
+It connects to `localhost:8080` by default. Each setting comes from the first of: a flag, an environment variable, the config file (`gfsctl config path`; `gfsctl config init` writes a sample with mode 0600), then the default.
+
+| Flag | Environment | Default |
+|------|-------------|---------|
+| `--host` | `GFSCTL_HOST` | `localhost` |
+| `--port` | `GFSCTL_PORT` | `8080` |
+| `--token` | `GFSCTL_TOKEN` | (none) |
+| `--output`, `-o` | `GFSCTL_OUTPUT` | `text` (or `json`) |
+| `--timeout` | `GFSCTL_TIMEOUT` | `30s` |
+
+Use `GFSCTL_TOKEN` or the config file for the token: other local users can read `--token` with `ps`. Statistics answer 503 until mount feeds them to the API, and `gfsctl` prints that error.
 
 ## Multi-Node Setup
 

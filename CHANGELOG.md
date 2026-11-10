@@ -42,6 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` or `-api-cors '*'` without `-api-token`, and checks the API flags before it opens the device. `/metrics` uses the Prometheus client library and adds Go runtime and process metrics. `-api-rate-limit` limits requests per client IP (off by default).
 - `-api-token-file` (mode 0600 or stricter) and `GOCLUSTERFS_API_TOKEN` for the API token. Mount warns when it comes from `-api-token`, which `ps` shows to every local user.
 - HTTP API write endpoints, only with a token: create, list, clone and delete snapshots, clone files, and flush the journal, flush TRIM or clear caches on this node. Snapshot and clone requests call `setxattr` through the mount, like `setfattr`.
+- `gfsctl`, a read-only CLI for the HTTP API: `status`, `health`, `stats`, `metrics`, with watch mode and JSON output. Release archives include it.
 - `goclusterfs-mount -version`, which prints the same version string as `goclusterfs-fsck -version`. `/api/v1/status` reports it too.
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
