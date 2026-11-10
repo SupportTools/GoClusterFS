@@ -267,6 +267,9 @@ in_test_group() {
     case "$1" in
         "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|"Inode Reuse Stale Read"|"Rolling Restart")
             group=2 ;;
+        # Takes about 14 minutes in CI, so it runs alone.
+        "More Than 4096 Files")
+            group=3 ;;
     esac
     [[ "$group" == "$TEST_GROUP" ]]
 }
@@ -2320,6 +2323,57 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
+# Test: more than 4096 files, which layout v2 could not hold. Nodes work in parallel and poll past the attribute cache.
+test_more_than_4096_files() {
+    log "Testing more than 4096 files..."
+
+    local first="${NODE_ARRAY[0]}"
+    local nodes=${#NODE_ARRAY[@]}
+    local dir=/mnt/goclusterfs/many_files
+    local inodes
+    inodes=$(exec_on_node "$first" stat -f -c %c /mnt/goclusterfs)
+    if [[ "$inodes" -le 4200 ]]; then
+        log "ERROR: statfs reports $inodes inodes, want more than 4200"
+        return 1
+    fi
+
+    if ! exec_on_node "$first" sh -c "mkdir $dir && for d in \$(seq 0 41); do mkdir $dir/d\$d || exit 1; done"; then
+        log "ERROR: creating directories on $first failed"
+        exec_on_node "$first" rm -rf "$dir"
+        return 1
+    fi
+    local i pid failed=0 pids=()
+    for i in "${!NODE_ARRAY[@]}"; do
+        exec_on_node "${NODE_ARRAY[$i]}" sh -c "for d in \$(seq $i $nodes 41); do t=0; until [ -d $dir/d\$d ]; do t=\$((t + 1)); [ \$t -le 120 ] || exit 1; sleep 0.5; done; cd $dir/d\$d && touch \$(seq 0 99 | sed 's/^/f/') || exit 1; done" &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+    done
+    local count=0 waited=0
+    while [[ $failed -eq 0 && "$count" -ne 4200 && $waited -lt 60 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        count=$(exec_on_node "$first" sh -c "find $dir -type f | wc -l")
+    done
+
+    pids=()
+    for i in "${!NODE_ARRAY[@]}"; do
+        exec_on_node "${NODE_ARRAY[$i]}" sh -c "for d in \$(seq $i $nodes 41); do rm -f $dir/d\$d/f*; done" &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    exec_on_node "$first" rm -rf "$dir"
+
+    if [[ $failed -ne 0 || "$count" -ne 4200 ]]; then
+        log "ERROR: a node failed to create its files ($failed) or $first sees $count files, want 4200"
+        return 1
+    fi
+
+    log "More than 4096 files test passed"
+    return 0
+}
+
 # Test: Extent cache coherency across nodes
 # Node 1 reads files, node 0 changes their block mappings (truncate and rewrite,
 # hole fill), and node 1 must read the new data.
@@ -3217,6 +3271,7 @@ run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidatio
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
+run_test "More Than 4096 Files" test_more_than_4096_files
 run_test "Extent Cache Coherency" test_extent_cache_coherency
 run_test "Statfs After Remount" test_statfs_after_remount
 run_test "Statfs Multi-Node" test_statfs_multinode
