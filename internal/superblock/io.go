@@ -120,7 +120,7 @@ type region struct {
 func (sb *Superblock) layout() []region {
 	return []region{
 		{"node registry", sb.NodeRegistryOffset, sb.NodeRegistrySize, regionSize, true},
-		{"lock records", sb.LockBitmapOffset, sb.LockBitmapSize, regionSize, true},
+		{"lock records", sb.LockBitmapOffset, sb.LockBitmapSize, LockRegionSize, true},
 		{"snapshot registry", sb.SnapshotRegOffset, sb.SnapshotRegSize, regionSize, true},
 		{"journals", sb.JournalRegionOffset, sb.JournalRegionSize, MaxNodes * NodeJournalSize, true},
 		{"block bitmap", sb.BlockBitmapOffset, sb.BlockBitmapSize, BlockBitmapBytes(sb.TotalBlocks), false},
