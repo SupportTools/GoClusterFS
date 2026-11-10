@@ -123,7 +123,7 @@ Unmount the device on every node first. The device is a positional argument, and
 ./goclusterfs-fsck -repair /dev/device
 ```
 
-`-repair` refuses to run while a node has the device mounted or a stopped node's journal still needs replay. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
+`-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
 
 ### Managing Snapshots
 

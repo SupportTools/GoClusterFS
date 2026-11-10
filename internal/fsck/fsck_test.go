@@ -18,9 +18,8 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
-// testDevice creates a temporary file-backed device for testing.
-// Uses a directory that supports O_DIRECT (not tmpfs).
-func testDevice(t testing.TB, sizeMB int) (*storage.Device, func()) {
+// testDevice creates a sparse device with dataMB of room after the smallest v3 metadata, in a directory that supports O_DIRECT.
+func testDevice(t testing.TB, dataMB int) (*storage.Device, func()) {
 	t.Helper()
 
 	// Create temp directory in /tmp (not tmpfs, which doesn't support O_DIRECT)
@@ -38,7 +37,7 @@ func testDevice(t testing.TB, sizeMB int) (*storage.Device, func()) {
 	}
 
 	// Size the file
-	sizeBytes := int64(sizeMB * 1024 * 1024)
+	sizeBytes := superblock.MinDeviceSize + int64(dataMB)<<20
 	if err := f.Truncate(sizeBytes); err != nil {
 		f.Close()
 		os.RemoveAll(tmpDir)
@@ -64,52 +63,14 @@ func testDevice(t testing.TB, sizeMB int) (*storage.Device, func()) {
 	return dev, cleanup
 }
 
-// writeSuperblock writes a valid superblock to the device.
+// testLayout is the layout of every test device: up to 4 GB, data blocks start at 263 MB.
+var testLayout = superblock.New(superblock.MinDeviceSize, 0)
+
+// writeSuperblock writes the v3 superblock for dev with totalBlocks data blocks.
 func writeSuperblock(t testing.TB, dev *storage.Device, totalBlocks uint64) {
 	t.Helper()
-
-	const (
-		bitmapOffset       = 1 * 1024 * 1024
-		inodeOffset        = 2 * 1024 * 1024
-		nodeRegistryOffset = 3 * 1024 * 1024
-		lockOffset         = 4 * 1024 * 1024
-		journalOffset      = 5 * 1024 * 1024
-		refcountOffset     = 9 * 1024 * 1024
-		snapshotOffset     = 10 * 1024 * 1024
-		dataOffset         = 11 * 1024 * 1024
-	)
-
-	sb := &superblock.Superblock{
-		Magic:               [12]byte{'G', 'O', 'C', 'L', 'U', 'S', 'T', 'E', 'R', 'F', 'S', 0},
-		Version:             superblock.CurrentVersion,
-		FeatureFlags:        0,
-		RequiredFlags:       superblock.RequiredJournal,
-		BlockSize:           1048576, // 1MB
-		TotalBlocks:         totalBlocks,
-		MetaBlockSize:       4096,
-		MaxNodes:            16,
-		InodeSize:           256,
-		NodeRegistryOffset:  nodeRegistryOffset,
-		JournalRegionOffset: journalOffset,
-		LockBitmapOffset:    lockOffset,
-		InodeTableOffset:    inodeOffset,
-		BlockBitmapOffset:   bitmapOffset,
-		RefCountTableOffset: refcountOffset,
-		SnapshotRegOffset:   snapshotOffset,
-		DataRegionOffset:    dataOffset,
-		NodeRegistrySize:    1 * 1024 * 1024,
-		JournalRegionSize:   4 * 1024 * 1024,
-		LockBitmapSize:      1 * 1024 * 1024,
-		InodeTableSize:      1 * 1024 * 1024,
-		BlockBitmapSize:     1 * 1024 * 1024,
-		RefCountTableSize:   1 * 1024 * 1024,
-		SnapshotRegSize:     1 * 1024 * 1024,
-		InodeCount:          4096,
-		FreeInodes:          4093, // 3 reserved: 0, 1, 2
-		FreeBlocks:          totalBlocks,
-		SnapshotCount:       0,
-		MountCount:          0,
-	}
+	sb := superblock.New(dev.Size(), 0)
+	sb.TotalBlocks, sb.FreeBlocks = totalBlocks, totalBlocks
 
 	buf := sb.Serialize()
 
@@ -123,13 +84,13 @@ func writeSuperblock(t testing.TB, dev *storage.Device, totalBlocks uint64) {
 func initRootInode(t testing.TB, dev *storage.Device) {
 	t.Helper()
 
+	inodeOffset := testLayout.InodeTableOffset
 	const (
-		inodeOffset = 2 * 1024 * 1024
-		inodeSize   = 256
-		inodeMagic  = 0x494E4F44 // "INOD"
-		inodeRoot   = 2
-		sIfdir      = 0o040000
-		sectorSize  = 4096
+		inodeSize  = 256
+		inodeMagic = 0x494E4F44 // "INOD"
+		inodeRoot  = 2
+		sIfdir     = 0o040000
+		sectorSize = 4096
 	)
 
 	// Calculate which sector contains inode 2
@@ -174,7 +135,7 @@ func initRootInode(t testing.TB, dev *storage.Device) {
 }
 
 func TestFsckCleanFilesystem(t *testing.T) {
-	dev, cleanup := testDevice(t, 20) // 20MB device
+	dev, cleanup := testDevice(t, 20)
 	defer cleanup()
 
 	// Set up a basic formatted filesystem
@@ -518,10 +479,8 @@ func extentProblems(dev *storage.Device) []fsck.Problem {
 }
 
 func TestFsckExtentTree(t *testing.T) {
-	const (
-		totalBlocks = 29
-		dataOffset  = 11 * 1024 * 1024
-	)
+	const totalBlocks = 29
+	dataOffset := testLayout.DataRegionOffset
 	dev, cleanup := testDevice(t, 40)
 	defer cleanup()
 	writeSuperblock(t, dev, totalBlocks)
@@ -529,8 +488,8 @@ func TestFsckExtentTree(t *testing.T) {
 
 	var uuid [16]byte
 	ctx := context.Background()
-	bm := bitmap.NewRegion(dev, 1*1024*1024, totalBlocks, nil, uuid)
-	tbl := inode.NewTable(dev, 2*1024*1024, 4096*inode.InodeSize, nil, uuid)
+	bm := bitmap.NewRegion(dev, testLayout.BlockBitmapOffset, totalBlocks, nil, uuid)
+	tbl := inode.NewTable(dev, testLayout.InodeTableOffset, testLayout.InodeTableSize, nil, uuid)
 	mgr := extent.NewManager(dev, bm, nil, dataOffset)
 	tbl.SetTreeFlusher(mgr)
 

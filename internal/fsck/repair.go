@@ -130,12 +130,19 @@ func (c *Checker) startRepair() error {
 	if c.opts.Mode != Repair {
 		return nil
 	}
+	const badLayout = "mount refuses this layout, so the regions repair writes may hold other data"
 	live, unclean := c.nodes()
 	if c.opts.DryRun {
 		for _, why := range append(live, unclean...) {
 			c.addProblem(PhaseSuperblock, Warning, "node registry", "repair would refuse: "+why, false)
 		}
+		if c.layoutErr != nil {
+			c.addProblem(PhaseSuperblock, Warning, "layout", "repair would refuse: "+badLayout, false)
+		}
 		return nil
+	}
+	if c.layoutErr != nil {
+		return fmt.Errorf("repair refused: %s", badLayout)
 	}
 	if len(live) > 0 {
 		return fmt.Errorf("repair refused: %s; unmount it on every node first", strings.Join(live, ", "))
