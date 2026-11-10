@@ -2,7 +2,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -136,89 +135,6 @@ func (c *Client) Get(ctx context.Context, path string, v interface{}) error {
 // GetRaw performs a GET request and returns the raw response body.
 func (c *Client) GetRaw(ctx context.Context, path string) ([]byte, error) {
 	return c.doRequest(ctx, http.MethodGet, path)
-}
-
-// Post performs a POST request with JSON body and decodes the response into v.
-func (c *Client) Post(ctx context.Context, path string, body interface{}, v interface{}) error {
-	respBody, err := c.doRequestWithBody(ctx, http.MethodPost, path, body)
-	if err != nil {
-		return err
-	}
-	if v != nil {
-		if err := json.Unmarshal(respBody, v); err != nil {
-			return fmt.Errorf("decode response: %w", err)
-		}
-	}
-	return nil
-}
-
-// Delete performs a DELETE request and decodes the response into v.
-func (c *Client) Delete(ctx context.Context, path string, v interface{}) error {
-	respBody, err := c.doRequest(ctx, http.MethodDelete, path)
-	if err != nil {
-		return err
-	}
-	if v != nil {
-		if err := json.Unmarshal(respBody, v); err != nil {
-			return fmt.Errorf("decode response: %w", err)
-		}
-	}
-	return nil
-}
-
-// doRequestWithBody performs an HTTP request with a JSON body.
-func (c *Client) doRequestWithBody(ctx context.Context, method, path string, body interface{}) ([]byte, error) {
-	url := c.baseURL + path
-
-	var reqBody io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("encode request body: %w", err)
-		}
-		reqBody = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	respData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		var errResp ErrorResponse
-		if json.Unmarshal(respData, &errResp) == nil && errResp.Error != "" {
-			return nil, &APIError{
-				StatusCode: resp.StatusCode,
-				Message:    errResp.Error,
-				Details:    errResp.Details,
-			}
-		}
-		return nil, &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    http.StatusText(resp.StatusCode),
-		}
-	}
-
-	return respData, nil
 }
 
 // ErrorResponse represents an API error response.

@@ -156,46 +156,6 @@ type ClusterInfoResponse struct {
 	Peers           []ClusterPeerInfo `json:"peers,omitempty"`
 }
 
-// ClusterNodeInfo provides detailed information about a cluster node.
-type ClusterNodeInfo struct {
-	NodeID        string  `json:"node_id"`
-	Address       string  `json:"address"`
-	Role          string  `json:"role"`
-	State         string  `json:"state"`
-	LastHeartbeat string  `json:"last_heartbeat,omitempty"`
-	JoinedAt      string  `json:"joined_at,omitempty"`
-	Version       string  `json:"version,omitempty"`
-	LatencyMs     float64 `json:"latency_ms,omitempty"`
-	IsSelf        bool    `json:"is_self"`
-}
-
-// ClusterNodesResponse is returned by GET /api/v1/cluster/nodes.
-type ClusterNodesResponse struct {
-	ClusterID    string            `json:"cluster_id,omitempty"`
-	TotalNodes   int               `json:"total_nodes"`
-	HealthyNodes int               `json:"healthy_nodes"`
-	LeaderID     string            `json:"leader_id,omitempty"`
-	Nodes        []ClusterNodeInfo `json:"nodes"`
-}
-
-// DistributedLockInfo provides information about an active distributed lock.
-type DistributedLockInfo struct {
-	LockID       string `json:"lock_id"`
-	Resource     string `json:"resource"`
-	OwnerNodeID  string `json:"owner_node_id"`
-	OwnerProcess string `json:"owner_process,omitempty"`
-	AcquiredAt   string `json:"acquired_at"`
-	ExpiresAt    string `json:"expires_at,omitempty"`
-	LockType     string `json:"lock_type"`
-}
-
-// ClusterLocksResponse is returned by GET /api/v1/cluster/locks.
-type ClusterLocksResponse struct {
-	ActiveLocks  int                   `json:"active_locks"`
-	PendingLocks int                   `json:"pending_locks"`
-	Locks        []DistributedLockInfo `json:"locks"`
-}
-
 // AllStatsResponse is returned by GET /api/v1/stats/all.
 type AllStatsResponse struct {
 	CollectedAt string                `json:"collected_at"`
@@ -211,61 +171,4 @@ type AllStatsResponse struct {
 type StatsOverviewResponse struct {
 	Cache   *CacheStatsResponse   `json:"cache,omitempty"`
 	Journal *JournalStatsResponse `json:"journal,omitempty"`
-}
-
-// SnapshotInfo provides information about a snapshot.
-type SnapshotInfo struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	CreatedAt   string `json:"created_at"`
-	SizeBytes   uint64 `json:"size_bytes"`
-	Status      string `json:"status"`
-	Description string `json:"description,omitempty"`
-}
-
-// SnapshotListResponse is returned by GET /api/v1/snapshots.
-type SnapshotListResponse struct {
-	Snapshots []SnapshotInfo `json:"snapshots"`
-	Total     int            `json:"total"`
-}
-
-// SnapshotCreateRequest is sent to POST /api/v1/snapshots.
-type SnapshotCreateRequest struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-}
-
-// SnapshotCreateResponse is returned by POST /api/v1/snapshots.
-type SnapshotCreateResponse struct {
-	Snapshot SnapshotInfo `json:"snapshot"`
-	Message  string       `json:"message"`
-}
-
-// SnapshotDeleteResponse is returned by DELETE /api/v1/snapshots/:id.
-type SnapshotDeleteResponse struct {
-	ID      string `json:"id"`
-	Message string `json:"message"`
-}
-
-// AdminOperationResponse is returned by admin operations.
-type AdminOperationResponse struct {
-	Operation string `json:"operation"`
-	Status    string `json:"status"`
-	Message   string `json:"message"`
-	Details   string `json:"details,omitempty"`
-}
-
-// FlushJournalRequest is sent to POST /api/v1/admin/flush-journal.
-type FlushJournalRequest struct {
-	Force bool `json:"force,omitempty"`
-}
-
-// ClearCacheRequest is sent to POST /api/v1/admin/clear-cache.
-type ClearCacheRequest struct {
-	CacheType string `json:"cache_type,omitempty"` // all, inode, extent, negative
-}
-
-// ForceTrimRequest is sent to POST /api/v1/admin/force-trim.
-type ForceTrimRequest struct {
-	Force bool `json:"force,omitempty"`
 }
