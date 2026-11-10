@@ -143,6 +143,9 @@ func main() {
 			log.Fatalf("Refusing to start the API: %v. Set -api-token, set -api-addr to a loopback address such as 127.0.0.1:8080, or pass -api=false", err)
 		}
 	}
+	if *broadcastEnabled && *broadcastSecret == "" {
+		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to port %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort)
+	}
 
 	// Check mount point exists
 	if _, err := os.Stat(*mountPoint); os.IsNotExist(err) {
