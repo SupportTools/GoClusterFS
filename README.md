@@ -138,11 +138,12 @@ With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-b
 |------|---------|-------------|
 | `-api` | `true` | Serve the HTTP API (`/health`, `/metrics`, `/api/v1/...`) |
 | `-api-addr` | `127.0.0.1:8080` | API listen address |
-| `-api-token` | (empty) | Bearer token required on `/api/v1/...` |
+| `-api-token-file` | (empty) | File (mode 0600) with the bearer token for `/api/v1/...`; a token also turns on the snapshot, clone and admin endpoints. Or set `GOCLUSTERFS_API_TOKEN` |
+| `-api-token` | (empty) | The token on the command line; visible to all local users in `ps` |
 | `-api-cors` | (empty) | Comma-separated CORS allowed origins |
 | `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
 
-The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and `-api-token` is empty. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
+The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and no token is set. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
 
 ## gfsctl
 

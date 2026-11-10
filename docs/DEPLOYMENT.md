@@ -422,13 +422,15 @@ Mount logs a `WARNING` line at startup when broadcast is on without a secret.
 
 ### HTTP API Access
 
-The API listens on `127.0.0.1:8080` by default. To scrape `/metrics` or call the API from another host, set a token and a reachable address:
+The API listens on `127.0.0.1:8080` by default. A token turns on the snapshot, clone and admin endpoints and is required for any address other hosts can reach. Keep it in a file only the mount's user can read:
 
 ```bash
-./goclusterfs-mount ... -api-addr :8080 -api-token "$(openssl rand -hex 32)"
+install -m 600 /dev/null /etc/goclusterfs/api-token
+openssl rand -hex 32 > /etc/goclusterfs/api-token
+./goclusterfs-mount ... -api-addr :8080 -api-token-file /etc/goclusterfs/api-token
 ```
 
-Mount refuses a non-loopback `-api-addr` without `-api-token`. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
+Mount refuses a non-loopback `-api-addr` without a token, and a token file that group or others can read. Don't use `-api-token`: every local user can read it in `ps`. The API speaks plain HTTP, so for remote access put a TLS proxy in front of it or use an SSH tunnel. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
 
 ### Firewall Rules
 

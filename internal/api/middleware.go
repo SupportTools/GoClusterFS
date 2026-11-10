@@ -35,6 +35,11 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the connection, for per-request write deadlines.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 // LoggingMiddleware logs HTTP requests with method, path, status, and duration.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +133,15 @@ func CORSMiddleware(origins []string) Middleware {
 			if allowOrigin == "" {
 				next.ServeHTTP(w, r)
 				return
+			}
+
+			// POST is CORS-safelisted, so browsers send it whenever the preflight
+			// succeeds. Writes must stay same-origin: fail every preflight but GET and HEAD.
+			if r.Method == http.MethodOptions {
+				if m := r.Header.Get("Access-Control-Request-Method"); m != "" && m != http.MethodGet && m != http.MethodHead {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
 			}
 
 			// Set CORS headers

@@ -35,6 +35,14 @@ type Server struct {
 	// Prometheus metrics handler (lazily initialized)
 	metricsHandler http.Handler
 
+	// Services behind the write endpoints (optional)
+	fileService  FileService
+	adminService AdminService
+
+	// Write requests in flight; Stop waits for them so the mount outlives them.
+	writes   sync.WaitGroup
+	stopping bool
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -127,6 +135,7 @@ func (s *Server) Stop() error {
 			s.rateLimiter.Stop()
 		}
 		s.mu.Lock()
+		s.stopping = true
 		if !s.started {
 			s.mu.Unlock()
 			s.stopErr = ErrServerNotStarted
@@ -148,13 +157,29 @@ func (s *Server) Stop() error {
 			} else {
 				s.stopErr = fmt.Errorf("shutdown error: %w", err)
 			}
-			return
 		}
+		s.waitForWrites()
 
 		log.Printf("api: server stopped")
 	})
 
 	return s.stopErr
+}
+
+// waitForWrites waits for snapshot, clone and admin requests that are still
+// running. They cannot be cancelled once the filesystem has started them.
+func (s *Server) waitForWrites() {
+	done := make(chan struct{})
+	go func() {
+		s.writes.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		log.Printf("api: waiting for write requests in flight to finish")
+		<-done
+	}
 }
 
 // Addr returns the address the server is listening on.

@@ -532,13 +532,13 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. It only answers `GET` requests and changes nothing.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`) it also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
 
-- To expose it, set `-api-addr` and `-api-token`. Mount refuses a non-loopback address without a token.
+- To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
 - `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
 - Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
-- The API uses plain HTTP. Put a TLS proxy in front of it if the token crosses an untrusted network.
-- The token is a command-line flag, so local users can read it with `ps`.
+- The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
+- Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 
 **Network listeners.** Each node listens on UDP port 31337 (multicast group) and UDP port 31338 (unicast) on all interfaces, and on TCP `-api-addr`. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 

@@ -297,7 +297,7 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	slot, maxID, err := r.freeSlotAndMaxID()
+	slot, maxID, err := r.freeSlotAndMaxID(name)
 	if err != nil {
 		return nil, err
 	}
@@ -696,8 +696,9 @@ type ScanStats struct {
 // freeSlotAndMaxID returns a free slot, preferring sectors this node owns, and
 // the highest snapshot ID on disk, which includes snapshots other nodes
 // created since this node's scan. Unreadable slots count as free, as they did
-// before.
-func (r *Registry) freeSlotAndMaxID() (uint64, uint64, error) {
+// before. It refuses a name another snapshot already has: names are global,
+// and delete and clone look them up with GetByName.
+func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	free, owned := r.maxDescriptors, r.maxDescriptors
 	var maxID uint64
 	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
@@ -714,6 +715,9 @@ func (r *Registry) freeSlotAndMaxID() (uint64, uint64, error) {
 					owned = min(owned, slot)
 				}
 				continue
+			}
+			if desc.IsValid() && desc.GetName() == name {
+				return 0, 0, fmt.Errorf("%w: %q", ErrSnapshotExists, name)
 			}
 			maxID = max(maxID, desc.SnapshotID)
 		}
