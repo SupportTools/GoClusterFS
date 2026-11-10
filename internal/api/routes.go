@@ -59,6 +59,12 @@ func (s *Server) handleAPIv1(w http.ResponseWriter, r *http.Request) {
 		s.handleStatus(w, r)
 	case strings.HasPrefix(path, "/stats"):
 		s.handleStats(w, r)
+	case path == "/snapshots" || strings.HasPrefix(path, "/snapshots/"):
+		s.handleSnapshots(w, r)
+	case path == "/clones":
+		s.handleClones(w, r)
+	case strings.HasPrefix(path, "/admin/"):
+		s.handleAdmin(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "endpoint not found", "")
 	}
