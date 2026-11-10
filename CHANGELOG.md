@@ -41,6 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` without `-api-token`.
 - `goclusterfs-mount -version`, which prints the same version string as `goclusterfs-fsck -version`. `/api/v1/status` reports it too.
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
+- `/metrics` uses the Prometheus client library and adds Go runtime and process metrics. New `/api/v1/cluster/{status,nodes,locks}` endpoints. Optional per-client rate limiting in `internal/api` (no mount flag yet).
+- Unfinished: `gfsctl`, a CLI client for the API, and a React dashboard in `web/dashboard`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
 - Apache License 2.0.
 

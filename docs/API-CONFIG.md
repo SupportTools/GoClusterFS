@@ -90,7 +90,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-token` | string | (empty) | Bearer token for `/api/v1/...` requests |
 | `-api-cors` | string | (empty) | Comma-separated CORS allowed origins, or `*` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status` and `GET /api/v1/stats/...`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` answers 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up`. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...` and `GET /api/v1/cluster/{status,nodes,locks}`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` and `/api/v1/cluster/...` answer 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up` plus Go runtime and process metrics. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
 
 By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty. The token is a command-line flag, so local users can read it with `ps`.
 
