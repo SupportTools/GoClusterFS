@@ -135,8 +135,5 @@ func maskToken(token string) string {
 	if token == "" {
 		return "(not set)"
 	}
-	if len(token) <= 8 {
-		return "****"
-	}
-	return token[:4] + "..." + token[len(token)-4:]
+	return fmt.Sprintf("set (%d chars)", len(token))
 }

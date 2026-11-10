@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// MaxResponseSize bounds how much of one response the client reads.
+const MaxResponseSize = 16 << 20
+
 // Client is an HTTP client for the GoClusterFS API.
 type Client struct {
 	host       string
@@ -94,9 +97,13 @@ func (c *Client) doRequest(ctx context.Context, method, path string) ([]byte, er
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if len(body) > MaxResponseSize {
+		return nil, fmt.Errorf("response from %s is larger than %d bytes", path, MaxResponseSize)
 	}
 
 	if resp.StatusCode >= 400 {
