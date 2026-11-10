@@ -2268,7 +2268,7 @@ scenarios:
 
   - id: lock-paused-node-drops-cached-hold
     name: Paused node drops a cached hold taken over
-    description: A cached read hold older than renewAfter is released and acquired afresh, so a node waking from a pause does not reuse a record another node took over
+    description: A cached write hold older than renewAfter is released and acquired afresh, so a node waking from a pause does not reuse a record another node took over
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestPausedNodeDropsCachedHoldTakenOver
@@ -2287,12 +2287,19 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
 
-  - id: lock-shared-claim-join-during-settle
-    name: Shared claim survives a join during settle
-    description: A reader on another node joining a fresh shared claim during its settle wait does not leak a reader count
+  - id: lock-read-claim-skips-settle
+    name: Read claims skip the settle wait
+    description: A read claim on a free record does not wait out ClaimSettleDelay; a write claim does
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestSharedClaimSurvivesJoinDuringSettle
+      go: internal/lock/safety_test.go::TestReadClaimSkipsSettleWait
+
+  - id: lock-released-read-hold-free
+    name: Released read hold is free at once
+    description: A node does not keep a released read hold, so another node's writer takes the record without waiting
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleasedReadHoldIsFreeAtOnce
 
   - id: lock-concurrent-dir-reads-create
     name: Concurrent directory reads do not delay create or unlink

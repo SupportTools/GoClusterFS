@@ -1310,10 +1310,15 @@ func TestNetworkPartition(t *testing.T) {
 	// Surviving nodes can write during partition
 	node1 := cluster.Node(1)
 	duringContent := []byte("Written during partition")
+	start := time.Now()
 	if err := node1.WriteFile("during_partition.txt", duringContent); err != nil {
 		t.Errorf("Surviving node 1 failed to write during partition: %v", err)
 	} else {
 		t.Log("Surviving nodes can write during partition")
+	}
+	// The killed node read the directory just before; a read hold it kept would block this create until it went stale (15s).
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("create during partition took %v, want under 5s", took)
 	}
 
 	// Phase 4: Heal partition by restarting the isolated node

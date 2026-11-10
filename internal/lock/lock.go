@@ -743,6 +743,12 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 		m.mu.Unlock()
 		return nil
 	}
+	if rec.mode == LockModeShared {
+		// Retaking a read hold costs no settle wait, and a node killed while keeping one would hold writers off until it went stale.
+		delete(m.records, recordID)
+		m.mu.Unlock()
+		return m.releaseRecord(recordID, rec.mode)
+	}
 	if age(rec.since) > cacheGrace {
 		// Held long enough: give other nodes a turn instead of keeping it.
 		delete(m.records, recordID)
@@ -846,10 +852,14 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 				return false, err
 			}
 			if acquired {
-				if ok, err := m.confirmClaim(recordID, mode, claim.Sequence); err != nil || !ok {
-					return false, err
+				if mode == LockModeExclusive {
+					if ok, err := m.confirmClaim(recordID, claim.Sequence); err != nil || !ok {
+						return false, err
+					}
+					m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
+				} else {
+					m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.unconfirmed })
 				}
-				m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
 				// Update hint with new sequence
 				m.hintCache.Put(recordID, &lockHint{
 					Sequence: claim.Sequence,
@@ -927,9 +937,9 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	if err != nil {
 		return false, err
 	}
-	// Joins are not confirmed: a lost race can drop a reader's count and let a writer in during that read, never two writers.
-	if acquired && reason != "shared_add" {
-		if acquired, err = m.confirmClaim(recordID, mode, newRecord.Sequence); err != nil {
+	// Only write claims confirm: a read claim's bounded write lands before a racing writer's confirm re-read, which then fails.
+	if acquired && mode == LockModeExclusive {
+		if acquired, err = m.confirmClaim(recordID, newRecord.Sequence); err != nil {
 			return false, err
 		}
 		if acquired {
@@ -993,20 +1003,13 @@ func (m *Manager) fenceLateReadClaim(recordID uint64) {
 
 // confirmClaim waits out the window in which a node that read the record before
 // this node's claim landed can still overwrite it, then checks the claim survived.
-func (m *Manager) confirmClaim(recordID uint64, mode LockMode, sequence uint64) (bool, error) {
+func (m *Manager) confirmClaim(recordID uint64, sequence uint64) (bool, error) {
 	time.Sleep(claimSettleDelay)
 	record, err := m.readRecord(recordID)
 	if err != nil {
 		return false, err
 	}
-	if record.Mode != mode {
-		return false, nil
-	}
-	if record.OwnerUUID == m.nodeUUID && record.Sequence == sequence {
-		return true, nil
-	}
-	// Readers on other nodes may have joined on top of a shared claim.
-	return mode == LockModeShared && record.Sequence > sequence, nil
+	return record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID && record.Sequence == sequence, nil
 }
 
 // tryAcquireOptimistic attempts to acquire a lock using a cached sequence hint.
@@ -1060,7 +1063,7 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 			return err
 		}
 		if ok {
-			if ok, err = m.confirmClaim(recordID, LockModeExclusive, renewed.Sequence); err != nil {
+			if ok, err = m.confirmClaim(recordID, renewed.Sequence); err != nil {
 				return err
 			}
 		}

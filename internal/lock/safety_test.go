@@ -473,16 +473,16 @@ func TestPausedNodeDropsCachedHoldTakenOver(t *testing.T) {
 	b := newTestNode(dev, 0, 1<<20, 2)
 	defer func(d time.Duration) { renewAfter = d }(renewAfter)
 
-	requireAcquired(t, a, LockTypeInode, 8, LockModeShared)
+	requireAcquired(t, a, LockTypeInode, 8, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 8); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	// A pauses past StaleThreshold with the read hold cached, and B takes the record over.
+	// A pauses past StaleThreshold with the write hold cached, and B takes the record over.
 	ageRecord(t, a, LockTypeInode, 8, pastStale)
 	requireAcquired(t, b, LockTypeInode, 8, LockModeExclusive)
 	renewAfter = 0
 
-	requireBlocked(t, a, LockTypeInode, 8, LockModeShared)
+	requireBlocked(t, a, LockTypeInode, 8, LockModeExclusive)
 }
 
 func TestReleaseCachedFreesHoldsAtOnce(t *testing.T) {
@@ -575,32 +575,42 @@ func TestBusyNodeYieldsCachedRecord(t *testing.T) {
 	other.Release(LockTypeInode, 12)
 }
 
-// A reader joining another node's fresh shared claim during its settle wait
-// builds on that claim, so the first reader keeps it and the count stays exact.
-func TestSharedClaimSurvivesJoinDuringSettle(t *testing.T) {
+// Read claims do not wait out the settle delay; write claims do.
+func TestReadClaimSkipsSettleWait(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-	c := newTestNode(dev, 0, 1<<20, 3)
 	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
-	claimSettleDelay = 100 * time.Millisecond
+	claimSettleDelay = 300 * time.Millisecond
 
-	errc := make(chan error, 1)
-	go func() { errc <- acquireWithin(a, 2*time.Second, LockTypeInode, 20, LockModeShared) }()
-	time.Sleep(20 * time.Millisecond)
-	requireAcquired(t, b, LockTypeInode, 20, LockModeShared)
-	if err := <-errc; err != nil {
-		t.Fatalf("node A shared Acquire: %v", err)
+	start := time.Now()
+	requireAcquired(t, a, LockTypeInode, 20, LockModeShared)
+	if took := time.Since(start); took >= claimSettleDelay/2 {
+		t.Fatalf("read claim took %v, want well under the %v settle wait", took, claimSettleDelay)
 	}
-	for _, m := range []*Manager{a, b} {
-		if err := m.Release(LockTypeInode, 20); err != nil {
-			t.Fatalf("Release: %v", err)
-		}
-		m.ReleaseCached()
+	start = time.Now()
+	requireAcquired(t, a, LockTypeInode, 21, LockModeExclusive)
+	if took := time.Since(start); took < claimSettleDelay {
+		t.Fatalf("write claim took %v, want at least the %v settle wait", took, claimSettleDelay)
 	}
-	if err := acquireWithin(c, 500*time.Millisecond, LockTypeInode, 20, LockModeExclusive); err != nil {
-		t.Fatalf("writer after both readers left: %v (a reader count leaked)", err)
+}
+
+// A node does not keep a released read hold, so a node killed right after a
+// read leaves nothing behind for another node's writer to wait out.
+func TestReleasedReadHoldIsFreeAtOnce(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	reader := newTestNode(dev, 0, 1<<20, 1)
+	writer := newTestNode(dev, 0, 1<<20, 2)
+
+	requireAcquired(t, reader, LockTypeInode, 22, LockModeShared)
+	if err := reader.Release(LockTypeInode, 22); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	start := time.Now()
+	requireAcquired(t, writer, LockTypeInode, 22, LockModeExclusive)
+	if took := time.Since(start); took > cacheGrace/2 {
+		t.Fatalf("writer waited %v after the read hold was released, want under %v", took, cacheGrace/2)
 	}
 }
 
