@@ -1559,6 +1559,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/interrupt_test.go::TestWriteFinishesAfterInterruptDuringLockWait
 
+  - id: write-fails-after-lock-timeout
+    name: Interrupted write fails with EIO when a lock is never freed
+    description: A write waiting for an inode lock that another node keeps holding gives up with EIO after lock.DefaultTimeout instead of hanging
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestWriteFailsWhenLockIsNotFreed
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself
