@@ -398,7 +398,7 @@ func TestRateLimitMiddleware_Disabled(t *testing.T) {
 
 func TestRateLimitMiddleware_Enabled(t *testing.T) {
 	// Enable rate limiting with small burst for easy testing
-	cfg := DefaultConfig().WithListenAddr(":0").WithRateLimit(100, 3)
+	cfg := DefaultConfig().WithListenAddr(":0").WithRateLimit(1, 3)
 	server, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
