@@ -235,7 +235,13 @@ func (m *Manager) checkAndFlush() {
 
 // flush discards the pending blocks. The guard runs without m.mu held, because
 // Free takes the bitmap lock before m.mu.
-func (m *Manager) flush(reason string) {
+// Flush discards every queued block now instead of waiting for the batch
+// size or age, and returns how many blocks it took.
+func (m *Manager) Flush() int {
+	return m.flush("requested")
+}
+
+func (m *Manager) flush(reason string) int {
 	m.mu.Lock()
 	blocks := make([]uint64, len(m.pending))
 	for i, p := range m.pending {
@@ -246,19 +252,20 @@ func (m *Manager) flush(reason string) {
 	m.mu.Unlock()
 
 	if len(blocks) == 0 {
-		return
+		return 0
 	}
 	log.Printf("[trim] %s: flushing %d blocks", reason, len(blocks))
 
 	if guard == nil {
 		m.discardBlocks(blocks)
-		return
+		return len(blocks)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), guardTimeout)
 	defer cancel()
 	if err := guard(ctx, blocks, m.discardBlocks); err != nil {
 		log.Printf("[trim] skipping discard of %d blocks: %v", len(blocks), err)
 	}
+	return len(blocks)
 }
 
 // discardBlocks issues one discard per contiguous range of blocks.

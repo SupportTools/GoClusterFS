@@ -696,3 +696,30 @@ func TestBatchCommitReturnsSyncError(t *testing.T) {
 		t.Fatal("Commit returned nil after its batch sync failed")
 	}
 }
+
+func TestCheckpointAdvancesHeadNow(t *testing.T) {
+	j, cleanup := createTestJournal(t, DefaultConfig())
+	defer cleanup()
+
+	if done, err := j.Checkpoint(); err != nil || done {
+		t.Fatalf("empty journal: Checkpoint() = %v, %v; want false, nil", done, err)
+	}
+
+	txn := j.Begin()
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
+	if done, err := j.Checkpoint(); err != nil || done {
+		t.Fatalf("active transaction: Checkpoint() = %v, %v; want false, nil", done, err)
+	}
+	if _, err := j.Commit(txn); err != nil {
+		t.Fatal(err)
+	}
+
+	if done, err := j.Checkpoint(); err != nil || !done {
+		t.Fatalf("after commit: Checkpoint() = %v, %v; want true, nil", done, err)
+	}
+	if head, tail := j.Region().HeadOffset(), j.Region().TailOffset(); head != tail {
+		t.Fatalf("head %d != tail %d after Checkpoint", head, tail)
+	}
+}

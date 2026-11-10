@@ -232,27 +232,33 @@ func (j *Journal) checkpointLoop() {
 }
 
 // periodicCheckpoint advances the head pointer for completed transactions.
+// A failed checkpoint is retried on the next tick.
 func (j *Journal) periodicCheckpoint() {
+	_, _ = j.Checkpoint()
+}
+
+// Checkpoint advances the head past every committed transaction now instead
+// of at the next interval. It reports false when there was nothing to do or
+// a transaction is still active.
+func (j *Journal) Checkpoint() (bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	// Find the oldest active transaction
 	if len(j.activeTxns) > 0 {
-		// Cannot advance past any active transaction
-		return
+		return false, nil
 	}
 
-	// All transactions are complete - can checkpoint to current tail
 	tail := j.region.TailOffset()
-	if tail != j.region.HeadOffset() {
-		sb := j.region.Superblock()
-		if err := j.region.Checkpoint(sb.NextSeq-1, tail); err != nil {
-			// Log error but don't fail - will retry
-			return
-		}
-		j.lastCheckpointSeq = sb.NextSeq - 1
-		j.lastCheckpointTime = time.Now()
+	if tail == j.region.HeadOffset() {
+		return false, nil
 	}
+	sb := j.region.Superblock()
+	if err := j.region.Checkpoint(sb.NextSeq-1, tail); err != nil {
+		return false, err
+	}
+	j.lastCheckpointSeq = sb.NextSeq - 1
+	j.lastCheckpointTime = time.Now()
+	return true, nil
 }
 
 // Begin starts a new transaction.

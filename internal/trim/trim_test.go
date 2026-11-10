@@ -347,3 +347,25 @@ func TestDuplicateBlockDiscardedOnce(t *testing.T) {
 		t.Errorf("discards = %v, want %v", calls, want)
 	}
 }
+
+func TestFlushDiscardsQueuedBlocksNow(t *testing.T) {
+	dev, cleanup := createTestDevice(t)
+	defer cleanup()
+
+	m := NewManager(dev, Config{BatchSize: 100, MaxAge: time.Hour, Enabled: false})
+	m.Start()
+	defer func() { _ = m.Stop() }()
+
+	for i := uint64(0); i < 3; i++ {
+		m.Queue(i)
+	}
+	if n := m.Flush(); n != 3 {
+		t.Fatalf("Flush() = %d, want 3", n)
+	}
+	if stats := m.Stats(); stats.PendingBlocks != 0 || stats.BlocksDiscarded != 3 {
+		t.Fatalf("after Flush: pending %d, discarded %d; want 0, 3", stats.PendingBlocks, stats.BlocksDiscarded)
+	}
+	if n := m.Flush(); n != 0 {
+		t.Fatalf("second Flush() = %d, want 0", n)
+	}
+}
