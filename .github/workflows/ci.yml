@@ -156,4 +156,4 @@ jobs:
           # Lock order violation fix (Task #4798) enables concurrent file/directory creation tests
           # Extent locking fix (Task #4801) enables concurrent same-file writes test
           go test -v -timeout 8m -short ./tests/integration/...
-        timeout-minutes: 12
+        timeout-minutes: 10

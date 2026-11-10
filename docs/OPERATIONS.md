@@ -123,7 +123,7 @@ Unmount the device on every node first. The device is a positional argument, and
 ./goclusterfs-fsck -repair /dev/device
 ```
 
-`-repair` refuses to run while a node has the device mounted or a stopped node's journal still needs replay. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
+`-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
 
 ### Managing Snapshots
 
@@ -539,13 +539,21 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
 
-- With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer.
+- With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.
 - The only replay protection is a sequence number check that forgets messages after 5 minutes, so a recorded message can be sent again later, even with a secret.
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**Network listeners.** GoClusterFS has no HTTP API. Its only listener is UDP port 31337 on all interfaces, plus the multicast group. Limit that port to the cluster nodes with a firewall.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. It only answers `GET` requests and changes nothing.
+
+- To expose it, set `-api-addr` and `-api-token`. Mount refuses a non-loopback address without a token.
+- `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
+- Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
+- The API uses plain HTTP. Put a TLS proxy in front of it if the token crosses an untrusted network.
+- The token is a command-line flag, so local users can read it with `ps`.
+
+**Network listeners.** Each node listens on UDP port 31337 on all interfaces, plus the multicast group, and on TCP `-api-addr`. Limit the UDP port, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 
 ---
 

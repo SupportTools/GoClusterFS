@@ -397,6 +397,7 @@ type Checker struct {
 	uncountedPast   map[uint32]bool // inodes an older version shared with blocks past the refcount table
 	refsIncomplete  []string        // why inodeBlocks may miss references
 	superblockFix   func() error    // runs once repair knows no node uses the filesystem
+	layoutErr       error           // why mount refuses the superblock's layout
 	registry        []byte          // node registry as startRepair last saw it
 }
 

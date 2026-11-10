@@ -492,6 +492,31 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesLegacyLayout
 
+  - id: mount-refuses-layout-v2
+    name: Mount and fsck refuse layout v2
+    description: On a v2 image, whose fixed 1 MB regions hold 4096 inodes and overflow refcounts past 128 GB, mount and fsck exit with a message to copy the data off and reformat
+    priority: go_only
+    environments:
+      go: layout_test.go::TestMountRefusesLayoutV2
+
+  - id: more-than-4096-files
+    name: More than 4096 files
+    description: Every node creates its share of 4200 files in 42 directories at once on a volume with more than 4200 inodes, and all of them are visible; layout v2 held 4096 inodes
+    priority: high
+    environments:
+      go: layout_test.go::TestLargeVolume
+      docker: run-tests.sh::test_more_than_4096_files
+      vm: run-vm-tests.sh::test_more_than_4096_files
+
+  - id: large-volume-high-block-snapshot
+    name: 200 GB volume with snapshots of data past 128 GB
+    description: On a 200 GB sparse image, a snapshot, copy on write and clone of data past block 130816, where layout v2's refcount table ended, survive a remount next to 4200 files, and fsck is clean
+    priority: high
+    environments:
+      go: layout_test.go::TestLargeVolume
+      docker: TODO  # needs a 200 GB sparse shared image; the Docker cluster shares a 768 MB image
+      vm: TODO  # needs a 200 GB sparse shared disk; the VM cluster shares a 1 GB disk
+
   - id: crashed-peer-journal-replay
     name: Peer replays a crashed node's journal from its slot
     description: After node B crashes, node A finds B's journal through B's registry slot and replays it
@@ -572,10 +597,10 @@ scenarios:
 
   - id: refcount-blocks-past-region
     name: Refcounts never write past their region
-    description: On a 200 GiB volume, changes to blocks the 1 MB refcount region has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the snapshot registry after the region is unchanged
+    description: In a refcount region smaller than its volume, like layout v2's 1 MB table on 200 GiB, changes to blocks it has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the next region is unchanged
     priority: go_only
     environments:
-      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheSnapshotRegistryAlone
+      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheNextRegionAlone
 
   - id: snapshot-refuses-blocks-past-refcount-region
     name: Snapshot and clone refuse blocks the refcount region cannot count
@@ -898,7 +923,7 @@ scenarios:
 
   - id: fsck-sharing-past-refcount-table
     name: fsck reports sharing the refcount table cannot count
-    description: On a 200 GiB volume fsck warns that the refcount table covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
+    description: With the refcount table of a 200 GiB volume shrunk to 1 MB in the superblock, fsck reports an error that it covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckReportsSharingPastRefcountTable
@@ -2405,3 +2430,42 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles
+
+  # ===========================================================================
+  # HTTP API (one process on one host; Docker and VM would test nothing more)
+  # ===========================================================================
+
+  - id: api-health-loopback
+    name: API answers /health on loopback
+    description: A mount started with -api-addr on 127.0.0.1 serves GET /health with 200
+    priority: go_only
+    environments:
+      go: api_test.go::TestAPIServesHealthOnLoopback
+
+  - id: api-refuses-remote-without-token
+    name: Mount refuses an unauthenticated remote API
+    description: With -api-addr on all interfaces and no -api-token, mount exits non-zero naming -api-token and never writes the device
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountRefusesUnauthenticatedRemoteAPI
+
+  - id: mount-version-flag
+    name: Mount prints its version
+    description: goclusterfs-mount -version exits 0 and prints the version string
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountPrintsVersion
+
+  - id: broadcast-secret-warning
+    name: Mount warns about unauthenticated broadcast
+    description: With broadcast on and no -broadcast-secret, mount logs a WARNING line; with a secret or -broadcast=false it does not
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountWarnsWithoutBroadcastSecret
+
+  - id: api-settings-checked-before-device
+    name: Mount rejects bad API settings early
+    description: An -api-addr without a port, an invalid -api-cors, or -api-cors * without a token stop mount before it opens the device
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice

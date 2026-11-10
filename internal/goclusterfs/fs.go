@@ -441,6 +441,15 @@ func (f *FS) RootDir() *Dir {
 	}
 }
 
+// SnapshotRegistry returns the snapshot registry for API endpoints.
+// Returns nil if snapshots are not enabled.
+// Thread-safe: the returned Registry has its own internal mutex.
+func (f *FS) SnapshotRegistry() *snapshot.Registry {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.snapshotReg
+}
+
 // hashString returns a 64-bit FNV-1a hash of the string.
 // Used for journal verification of filenames.
 func hashString(s string) uint64 {

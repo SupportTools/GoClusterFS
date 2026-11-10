@@ -23,7 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         # run-tests.sh in_test_group decides which tests each group runs
-        group: [1, 2]
+        group: [1, 2, 3]
     permissions:
       contents: read
       checks: write
