@@ -201,48 +201,6 @@ type AllStatsResponse struct {
 	Cluster     *ClusterInfoResponse  `json:"cluster,omitempty"`
 }
 
-// ClusterNodeInfo provides detailed information about a cluster node.
-type ClusterNodeInfo struct {
-	NodeID        string  `json:"node_id"`
-	Address       string  `json:"address"`
-	Role          string  `json:"role"`
-	State         string  `json:"state"`
-	LastHeartbeat string  `json:"last_heartbeat,omitempty"`
-	JoinedAt      string  `json:"joined_at,omitempty"`
-	Version       string  `json:"version,omitempty"`
-	LatencyMs     float64 `json:"latency_ms,omitempty"`
-	IsSelf        bool    `json:"is_self"`
-}
-
-// ClusterNodesResponse is returned by GET /api/v1/cluster/nodes.
-// Lists all nodes in the cluster with their current status.
-type ClusterNodesResponse struct {
-	ClusterID    string            `json:"cluster_id,omitempty"`
-	TotalNodes   int               `json:"total_nodes"`
-	HealthyNodes int               `json:"healthy_nodes"`
-	LeaderID     string            `json:"leader_id,omitempty"`
-	Nodes        []ClusterNodeInfo `json:"nodes"`
-}
-
-// DistributedLockInfo provides information about an active distributed lock.
-type DistributedLockInfo struct {
-	LockID       string `json:"lock_id"`
-	Resource     string `json:"resource"`
-	OwnerNodeID  string `json:"owner_node_id"`
-	OwnerProcess string `json:"owner_process,omitempty"`
-	AcquiredAt   string `json:"acquired_at"`
-	ExpiresAt    string `json:"expires_at,omitempty"`
-	LockType     string `json:"lock_type"`
-}
-
-// ClusterLocksResponse is returned by GET /api/v1/cluster/locks.
-// Lists all active distributed locks in the cluster.
-type ClusterLocksResponse struct {
-	ActiveLocks  int                   `json:"active_locks"`
-	PendingLocks int                   `json:"pending_locks"`
-	Locks        []DistributedLockInfo `json:"locks"`
-}
-
 // StatsOverviewResponse is returned by GET /api/v1/stats.
 // Provides a summary of all component stats.
 type StatsOverviewResponse struct {
