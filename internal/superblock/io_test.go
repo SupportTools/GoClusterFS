@@ -133,6 +133,29 @@ func TestReadRejectsVersion1(t *testing.T) {
 	}
 }
 
+func TestReadDestroyedSuperblock(t *testing.T) {
+	dev := testDevice(t, MinDeviceSize)
+	if _, err := Format(dev, 0); err != nil {
+		t.Fatalf("Format: %v", err)
+	}
+	slot := make([]byte, 4)
+	binary.LittleEndian.PutUint32(slot, registrySlotMagic)
+	writeAt(t, dev, registryOffset+5*storage.SectorSize, slot)
+	writeAt(t, dev, 0, []byte("overwritten"))
+
+	if _, err := Read(dev); !errors.Is(err, ErrDestroyedSuperblock) {
+		t.Errorf("Read with a destroyed v3 superblock: err = %v, want ErrDestroyedSuperblock", err)
+	}
+}
+
+func TestFormatRefusesNoDataBlocks(t *testing.T) {
+	dev := testDevice(t, MinDeviceSize)
+	_, err := Format(dev, 64<<10)
+	if !errors.Is(err, ErrDeviceTooSmall) || !strings.Contains(err.Error(), "-bytes-per-inode") {
+		t.Errorf("Format with no room for data blocks: err = %v, want ErrDeviceTooSmall naming -bytes-per-inode", err)
+	}
+}
+
 func TestReadRejectsVersion2(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
 	sb := New(dev.Size(), 0)

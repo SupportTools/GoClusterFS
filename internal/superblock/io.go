@@ -37,6 +37,10 @@ const (
 
 	legacyRootInodeOffset = 2*regionSize + 2*inodeSize
 	legacyInodeMagic      = 0x494E4F44
+
+	// Layout v3 keeps the node registry at 1 MB; a node writes its slot's magic when it mounts.
+	registryOffset    = regionSize
+	registrySlotMagic = 0x4E4F4445
 )
 
 var (
@@ -45,6 +49,8 @@ var (
 	ErrLegacyLayout   = errors.New("device has an inode table but no GoClusterFS superblock: it has the pre-v2 layout, " +
 		"where all nodes share one journal, or its superblock was destroyed. This version cannot mount it. " +
 		"Copy the data off with the version that formatted it, then reformat with -format")
+	ErrDestroyedSuperblock = errors.New("device has GoClusterFS node slots but no superblock: its superblock was overwritten. " +
+		"There is no tool to rebuild it; restore the device from backup. Do not run -format, which destroys the data")
 	ErrUnsupportedLayout = errors.New("superblock layout is not supported by this version")
 )
 
@@ -67,7 +73,7 @@ func Read(dev *storage.Device) (*Superblock, error) {
 	if err := sb.CanMount(); err != nil {
 		return nil, err
 	}
-	if err := sb.checkLayout(dev.Size()); err != nil {
+	if err := sb.CheckLayout(dev.Size()); err != nil {
 		return nil, err
 	}
 	return sb, nil
@@ -84,6 +90,17 @@ func missingSuperblockError(dev *storage.Device) error {
 	magic := binary.LittleEndian.Uint32(buf.Bytes()[legacyRootInodeOffset-sector:])
 	if magic == legacyInodeMagic {
 		return ErrLegacyLayout
+	}
+
+	slots := storage.GetBuffer(MaxNodes * storage.SectorSize)
+	defer storage.PutBuffer(slots)
+	if _, err := dev.ReadAt(slots.Bytes()[:MaxNodes*storage.SectorSize], registryOffset); err != nil {
+		return err
+	}
+	for slot := 0; slot < MaxNodes; slot++ {
+		if binary.LittleEndian.Uint32(slots.Bytes()[slot*storage.SectorSize:]) == registrySlotMagic {
+			return ErrDestroyedSuperblock
+		}
 	}
 	return ErrNotFormatted
 }
@@ -108,29 +125,30 @@ func (sb *Superblock) layout() []region {
 	}
 }
 
-// checkLayout requires the v3 region order with every region big enough for the
-// volume's data blocks and inodes. The data blocks may end before the device does.
-func (sb *Superblock) checkLayout(deviceSize int64) error {
+// CheckLayout requires the v3 region order, each region inside the device and big enough for the stored block and inode counts.
+func (sb *Superblock) CheckLayout(deviceSize int64) error {
+	size := uint64(max(deviceSize, 0))
 	if sb.BlockSize != storage.DefaultBlockSize || sb.MetaBlockSize != storage.MetadataBlockSize ||
-		sb.InodeSize != inodeSize || sb.MaxNodes != MaxNodes || sb.InodeCount < MinInodes || sb.InodeCount > MaxInodes {
-		return fmt.Errorf("%w: block size %d, metadata block %d, inode size %d, %d node slots, %d inodes",
-			ErrUnsupportedLayout, sb.BlockSize, sb.MetaBlockSize, sb.InodeSize, sb.MaxNodes, sb.InodeCount)
+		sb.InodeSize != inodeSize || sb.MaxNodes != MaxNodes || sb.InodeCount < MinInodes || sb.InodeCount > MaxInodes ||
+		sb.InodeTableSize != sb.InodeCount*inodeSize {
+		return fmt.Errorf("%w: block size %d, metadata block %d, inode size %d, %d node slots, %d inodes in %d bytes",
+			ErrUnsupportedLayout, sb.BlockSize, sb.MetaBlockSize, sb.InodeSize, sb.MaxNodes, sb.InodeCount, sb.InodeTableSize)
+	}
+	if sb.TotalBlocks == 0 || sb.TotalBlocks > size/uint64(sb.BlockSize) {
+		return fmt.Errorf("%w: %d data blocks do not fit the %d-byte device", ErrUnsupportedLayout, sb.TotalBlocks, deviceSize)
 	}
 	offset := uint64(regionSize)
 	for _, r := range sb.layout() {
-		if r.offset != offset || r.size%regionSize != 0 || r.size < r.need || (r.exact && r.size != alignRegion(r.need)) {
+		if r.offset != offset || offset > size || r.size > size-offset || r.size%regionSize != 0 ||
+			r.size < r.need || (r.exact && r.size != alignRegion(r.need)) {
 			return fmt.Errorf("%w: %s has %d bytes at offset %d, want %d bytes or more at offset %d",
 				ErrUnsupportedLayout, r.name, r.size, r.offset, alignRegion(r.need), offset)
 		}
 		offset += r.size
 	}
-	if sb.DataRegionOffset != offset {
-		return fmt.Errorf("%w: data blocks start at %d, want %d", ErrUnsupportedLayout, sb.DataRegionOffset, offset)
-	}
-	if sb.TotalBlocks == 0 || uint64(deviceSize) < offset ||
-		sb.TotalBlocks > (uint64(deviceSize)-offset)/uint64(sb.BlockSize) {
-		return fmt.Errorf("%w: %d data blocks at offset %d do not fit the %d-byte device",
-			ErrUnsupportedLayout, sb.TotalBlocks, offset, deviceSize)
+	if sb.DataRegionOffset != offset || sb.TotalBlocks > (size-offset)/uint64(sb.BlockSize) {
+		return fmt.Errorf("%w: %d data blocks at offset %d do not fit the %d-byte device after %d bytes of metadata",
+			ErrUnsupportedLayout, sb.TotalBlocks, sb.DataRegionOffset, deviceSize, offset)
 	}
 	return nil
 }
@@ -174,16 +192,17 @@ func Write(dev *storage.Device, sb *Superblock) error {
 	return dev.Sync()
 }
 
-// Format zeroes every metadata region and each node slot's journal header,
-// then writes a new superblock. The superblock goes last, so an interrupted
-// format leaves a device that mount refuses. bytesPerInode sets the inode
-// count; 0 means DefaultBytesPerInode.
+// Format zeroes the metadata and journal headers, then writes the superblock last so an interrupted format never mounts.
 func Format(dev *storage.Device, bytesPerInode uint64) (*Superblock, error) {
 	if dev.Size() < MinDeviceSize {
 		return nil, fmt.Errorf("%w: %d MB, need at least %d MB",
 			ErrDeviceTooSmall, dev.Size()>>20, MinDeviceSize>>20)
 	}
 	sb := New(dev.Size(), bytesPerInode)
+	if sb.TotalBlocks == 0 {
+		return nil, fmt.Errorf("%w: the %d MB inode table leaves no room for data blocks on %d MB; use a larger -bytes-per-inode",
+			ErrDeviceTooSmall, sb.InodeTableSize>>20, dev.Size()>>20)
+	}
 
 	zero := storage.NewAlignedBuffer(regionSize)
 	current := storage.NewAlignedBuffer(regionSize)
@@ -230,8 +249,7 @@ func Format(dev *storage.Device, bytesPerInode uint64) (*Superblock, error) {
 	return sb, nil
 }
 
-// New creates a new superblock with default values for the given device size.
-// bytesPerInode sets the inode count; 0 means DefaultBytesPerInode.
+// New lays out a superblock for the device; bytesPerInode 0 means DefaultBytesPerInode.
 func New(deviceSize int64, bytesPerInode uint64) *Superblock {
 	sb := &Superblock{
 		Version:       CurrentVersion,
@@ -262,10 +280,7 @@ func New(deviceSize int64, bytesPerInode uint64) *Superblock {
 	return sb
 }
 
-// calculateLayout puts the fixed-size regions first, so their offsets never
-// change, then the regions sized from the device: the bitmap and refcount
-// table cover every block the device could hold, and the inode table gets
-// one inode per bytesPerInode of device.
+// calculateLayout puts the fixed-size regions first and sizes the bitmap, refcount and inode tables from the device.
 func calculateLayout(sb *Superblock, deviceSize int64, bytesPerInode uint64) {
 	maxBlocks := uint64(deviceSize) / uint64(sb.BlockSize)
 	inodes := min(max(uint64(deviceSize)/bytesPerInode, MinInodes), MaxInodes)

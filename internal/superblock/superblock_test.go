@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -298,7 +299,7 @@ func TestSectorCapacitiesMatchRegions(t *testing.T) {
 func TestLayoutCoversEveryBlock(t *testing.T) {
 	for _, size := range []int64{MinDeviceSize, 10 << 30, 128 << 30, 200 << 30, 9 << 40, 100 << 40} {
 		sb := New(size, 0)
-		if err := sb.checkLayout(size); err != nil {
+		if err := sb.CheckLayout(size); err != nil {
 			t.Errorf("%d GB: %v", size>>30, err)
 		}
 		if blocks := sb.BlockBitmapSize / storage.SectorSize * bitmap.BitsPerSector; blocks < sb.TotalBlocks {
@@ -329,18 +330,47 @@ func TestBytesPerInode(t *testing.T) {
 			t.Errorf("%d bytes at %d per inode: %d inodes in %d bytes, want %d",
 				tc.size, tc.bytesPerInode, sb.InodeCount, sb.InodeTableSize, tc.want)
 		}
-		if err := sb.checkLayout(tc.size); err != nil {
+		if err := sb.CheckLayout(tc.size); err != nil {
 			t.Errorf("%d bytes at %d per inode: %v", tc.size, tc.bytesPerInode, err)
 		}
+	}
+}
+
+// A bitmap size of nearly 2^64 wraps the next offset back to 1 MB, which would put the refcount table on the node registry.
+func TestCheckLayoutRejectsWrappedOffsets(t *testing.T) {
+	const size = 1 << 30
+	sb := New(size, 0)
+	sb.BlockBitmapSize = -sb.BlockBitmapOffset + regionSize
+	sb.RefCountTableOffset, sb.RefCountTableSize = regionSize, regionSize
+	sb.InodeTableOffset, sb.InodeTableSize, sb.InodeCount = 2*regionSize, regionSize, MinInodes
+	sb.DataRegionOffset = 3 * regionSize
+	sb.TotalBlocks = (size - 3*regionSize) / regionSize
+	if err := sb.CheckLayout(size); !errors.Is(err, ErrUnsupportedLayout) {
+		t.Errorf("CheckLayout with a wrapped bitmap size: err = %v, want ErrUnsupportedLayout", err)
+	}
+}
+
+func TestCheckLayoutRequiresInodeCountToFillTable(t *testing.T) {
+	sb := New(200<<30, 0)
+	sb.InodeCount -= 255
+	if err := sb.CheckLayout(200 << 30); !errors.Is(err, ErrUnsupportedLayout) {
+		t.Errorf("CheckLayout with %d inodes in a %d-inode table: err = %v, want ErrUnsupportedLayout",
+			sb.InodeCount, sb.InodeTableSize/inodeSize, err)
+	}
+}
+
+func TestRegistrySlotMagicMatchesNode(t *testing.T) {
+	if registrySlotMagic != node.SlotMagic {
+		t.Errorf("registrySlotMagic = %#x, node.SlotMagic = %#x", registrySlotMagic, node.SlotMagic)
 	}
 }
 
 func TestCheckLayoutRejectsRegionsTooSmallForBlocks(t *testing.T) {
 	sb := New(1<<40, 0)
 	sb.TotalBlocks = 1500000
-	err := sb.checkLayout(2 << 40)
+	err := sb.CheckLayout(2 << 40)
 	if !errors.Is(err, ErrUnsupportedLayout) || !strings.Contains(err.Error(), "refcount table") {
-		t.Errorf("checkLayout with more blocks than the refcount table covers: err = %v", err)
+		t.Errorf("CheckLayout with more blocks than the refcount table covers: err = %v", err)
 	}
 }
 

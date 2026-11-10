@@ -20,9 +20,7 @@ const (
 	// Magic identifies a valid GoClusterFS superblock.
 	Magic = "GOCLUSTERFS"
 
-	// CurrentVersion is the format version this code produces.
-	// Version 2 gives each node slot its own journal region. Version 3 sizes the
-	// block bitmap, refcount table and inode table from the device.
+	// CurrentVersion is the format version this code produces; v3 sizes the bitmap, refcount and inode tables from the device.
 	CurrentVersion uint32 = 3
 
 	// MinSupportedVersion is the oldest format we can read.
@@ -139,11 +137,13 @@ func CheckVersion(version uint32) error {
 	case version > CurrentVersion:
 		return fmt.Errorf("%w: volume is v%d, we support up to v%d",
 			ErrNewerVersion, version, CurrentVersion)
+	case version == 2:
+		return fmt.Errorf("%w: volume is v2, this version mounts v%d. Layout v2 has fixed 1 MB regions: at most 4096 inodes, "+
+			"and on devices over 128 GB, older v2 builds wrote refcounts into the snapshot registry. Copy the data off with a v2 build "+
+			"(over 128 GB, run its goclusterfs-fsck first), then reformat with -format", ErrTooOldVersion, MinSupportedVersion)
 	case version < MinSupportedVersion:
-		return fmt.Errorf("%w: volume is v%d, this version mounts v%d. Layout v2 has fixed 1 MB regions: "+
-			"at most 4096 inodes, and refcounts for data past 128 GB overwrite the snapshot registry. "+
-			"Copy the data off with the version that formatted it, then reformat with -format",
-			ErrTooOldVersion, version, MinSupportedVersion)
+		return fmt.Errorf("%w: volume is v%d, this version mounts v%d. Copy the data off with the version that formatted it, "+
+			"then reformat with -format", ErrTooOldVersion, version, MinSupportedVersion)
 	}
 	return nil
 }

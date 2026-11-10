@@ -45,6 +45,11 @@ func checkSuperblockDecode(t *testing.T, data []byte) {
 		return
 	}
 	_ = sb.CanMount()
+	for _, size := range []int64{MinDeviceSize, 1 << 40, int64(min(sb.DataRegionOffset+sb.TotalBlocks<<20, 1<<62))} {
+		if sb.CheckLayout(size) == nil {
+			checkRegionsDisjoint(t, sb, size)
+		}
+	}
 
 	again, err := Deserialize(sb.Serialize())
 	if err != nil {
@@ -52,5 +57,20 @@ func checkSuperblockDecode(t *testing.T, data []byte) {
 	}
 	if *again != *sb {
 		t.Fatalf("superblock changed after an encode/decode round trip")
+	}
+}
+
+func checkRegionsDisjoint(t *testing.T, sb *Superblock, size int64) {
+	regions := append(sb.layout(), region{name: "superblock", size: regionSize},
+		region{name: "data", offset: sb.DataRegionOffset, size: sb.TotalBlocks * uint64(sb.BlockSize)})
+	for i, a := range regions {
+		if a.size > uint64(size) || a.offset > uint64(size)-a.size {
+			t.Fatalf("CheckLayout(%d) accepted %s at %d with %d bytes past the device", size, a.name, a.offset, a.size)
+		}
+		for _, b := range regions[i+1:] {
+			if a.offset < b.offset+b.size && b.offset < a.offset+a.size {
+				t.Fatalf("CheckLayout(%d) accepted %s at %d overlapping %s at %d", size, a.name, a.offset, b.name, b.offset)
+			}
+		}
 	}
 }

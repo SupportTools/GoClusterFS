@@ -115,11 +115,19 @@ head -c 16 /dev/device | hexdump -C
 **Cause**: One of two things, and you need to know which build formatted the device:
 
 - **A build from before format version 2 formatted it.** In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
-- **A version 2 build formatted it, and its superblock was overwritten.** Both layouts keep the inode table at 2 MB, so the device looks old.
+- **A version 2 build formatted it, and its superblock was overwritten.** Versions 1 and 2 both keep the inode table at 2 MB, so the device looks old. Version 3 keeps lock records there; see the next entry.
 
 **Solution**:
 - Pre-v2 device: copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
 - Version 2 device: do not run an old build on it; it would read the wrong layout. There is no tool to rebuild the superblock, so restore from backup.
+
+### "device has GoClusterFS node slots but no superblock"
+
+**Symptom**: Mount exits with `Cannot use <device>: device has GoClusterFS node slots but no superblock: its superblock was overwritten. ...`
+
+**Cause**: A version 3 device lost its superblock, the first 4 KB. The node registry at 1 MB still holds the slots of the nodes that mounted it, so the data is likely intact.
+
+**Solution**: Do not run `-format`, which destroys the data. There is no tool to rebuild the superblock, so restore the device from backup.
 
 ---
 
@@ -497,6 +505,7 @@ The format v3 layout checks in phase 1:
 - Every region starts on a 4 KB boundary, lies inside the device, and does not overlap another region.
 - The journal region splits evenly into one journal per node, and each journal is a multiple of 4 KB and at least 8 KB.
 - The node registry has a slot for every node journal.
+- The regions have the order and sizes mount accepts. If not, fsck reports an error and keeps checking.
 
 fsck does not compare the superblock free block, free inode, and snapshot counters, because the runtime never updates them.
 
