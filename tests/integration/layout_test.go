@@ -19,8 +19,7 @@ import (
 // v2RefcountBlocks is the number of blocks layout v2's 1 MB refcount table covered.
 const v2RefcountBlocks = 130816
 
-// createFiles makes the directories on node 0, then every node fills its share
-// of them at once. A create costs about 130 ms, so one node would take 9 minutes.
+// createFiles has every node fill its share of the directories at once, since a create costs about 130 ms.
 func createFiles(t *testing.T, cluster *MultiNodeCluster, dirs, perDir int) {
 	t.Helper()
 	start := time.Now()
@@ -112,10 +111,7 @@ func TestMountRefusesLayoutV2(t *testing.T) {
 	}
 }
 
-// A 200 GB volume was out of reach for layout v2: it had room for 4096 inodes,
-// and its refcount table ended at block 130816, so later entries overwrote the
-// snapshot registry. Here 4200 files exist next to data past that block, and a
-// snapshot, a copy on write and a clone of that data survive a remount.
+// TestLargeVolume holds what layout v2 could not: 4200 files, and snapshots of data past block 130816 on 200 GB.
 func TestLargeVolume(t *testing.T) {
 	if testing.Short() {
 		t.Skip("creates 4200 files and fallocates 128 GB on a 200 GB sparse image")
@@ -177,7 +173,16 @@ func TestLargeVolume(t *testing.T) {
 			t.Fatalf("statfs reports %d inodes, want one per MB", files)
 		}
 	}
-	time.Sleep(1500 * time.Millisecond)
+	if took, ok := waitFor(60*time.Second, func() bool {
+		for d := 0; d < dirs; d++ {
+			if entries, err := mfs.ReadDir(fmt.Sprintf("d%02d", d)); err != nil || len(entries) != perDir {
+				return false
+			}
+		}
+		return true
+	}); !ok {
+		t.Fatalf("node 0 does not see all %d files after %v", dirs*perDir, took)
+	}
 	check()
 	cluster.StopAllNodes()
 

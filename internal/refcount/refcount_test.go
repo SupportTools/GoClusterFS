@@ -955,8 +955,7 @@ func TestRegionOffset(t *testing.T) {
 	}
 }
 
-// A region too small for its blocks, like layout v2's 1 MB table on a 200 GiB
-// volume, refuses blocks past its end and leaves the next region alone.
+// A region too small for its blocks, like layout v2's 1 MB table on 200 GiB, refuses blocks past its end.
 func TestBlocksPastRegionLeaveTheNextRegionAlone(t *testing.T) {
 	ctx := context.Background()
 	const size, totalBlocks = 1 << 20, 204537

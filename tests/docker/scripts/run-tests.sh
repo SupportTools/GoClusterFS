@@ -2323,10 +2323,7 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
-# Test: more than 4096 files. Layout v2 held 4096 inodes; the cluster is
-# formatted with one inode per 64 KB, so the shared image holds more. A create
-# takes about 130 ms, so every node creates and removes its share at once.
-# Nodes see new directories and files only after their attribute cache expires.
+# Test: more than 4096 files, which layout v2 could not hold. Nodes work in parallel and poll past the attribute cache.
 test_more_than_4096_files() {
     log "Testing more than 4096 files..."
 

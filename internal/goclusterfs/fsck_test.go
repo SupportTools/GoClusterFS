@@ -304,11 +304,7 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 	}
 }
 
-// A refcount table of 1 MB, like layout v2's, has entries for blocks 0-130815
-// only; mount refuses that on a 200 GiB volume, but fsck checks it. Several
-// inodes counting on a share of a higher block lose data when one is deleted,
-// and marking older sharing of such blocks counted would cause the same, so
-// repair leaves that sharing alone.
+// Sharing past a 1 MB refcount table loses data on the first delete, so fsck reports it and repair leaves older sharing uncounted.
 func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
 	path := newFormattedImageOfSize(t, 200<<30)
 	fsys := openFormattedFS(t, path)
