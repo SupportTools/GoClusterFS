@@ -438,3 +438,39 @@ func TestTimedOutAcquireLogsHolder(t *testing.T) {
 		t.Fatalf("timeout log does not name the holder:\n%s", got)
 	}
 }
+
+func TestStatsCountsHeldAndWaitingLocks(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, RecordSize, 1)
+	b := newTestNode(dev, 0, RecordSize, 2)
+
+	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
+	if got := a.Stats(); got.Held != 1 || got.Waiting != 0 {
+		t.Fatalf("holder Stats = %+v, want Held 1, Waiting 0", got)
+	}
+
+	granted := make(chan error, 1)
+	go func() { granted <- acquireWithin(b, 10*time.Second, LockTypeInode, 1, LockModeExclusive) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for b.Stats().Waiting != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("waiter Stats = %+v, want Waiting 1", b.Stats())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := a.Release(LockTypeInode, 1); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := <-granted; err != nil {
+		t.Fatalf("waiter Acquire: %v", err)
+	}
+	if got := b.Stats(); got.Held != 1 || got.Waiting != 0 {
+		t.Errorf("waiter Stats after grant = %+v, want Held 1, Waiting 0", got)
+	}
+	if got := a.Stats(); got.Held != 0 {
+		t.Errorf("holder Stats after release = %+v, want Held 0", got)
+	}
+	b.Release(LockTypeInode, 1)
+}
