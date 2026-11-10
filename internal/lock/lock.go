@@ -453,6 +453,7 @@ func (m *Manager) LogStats() {
 	log.Printf("lock: %d record writes, %d skipped and %d late; the missed ones spent %v waiting in this process and %v in the device",
 		t.Writes, t.Skipped, t.Late, t.InProcess, t.Device)
 	log.Printf("lock: %d late claims, each leaving its record alone for up to %v", m.lateClaims.Load(), StaleThreshold)
+	log.Printf("lock: %d claim conflicts (slot claims that backed off)", claimConflicts.Load())
 	for typ := range m.acquires {
 		c := &m.acquires[typ]
 		counts := []uint64{c.held.Load(), c.joined.Load(), c.cached.Load(), c.confirmed.Load(), c.blocked.Load()}
@@ -830,6 +831,10 @@ func (m *Manager) ReleaseCached() {
 
 // describeHolder says who holds a record, for logs.
 func (m *Manager) describeHolder(recordID uint64) string {
+	return m.describeRow(recordID)
+}
+
+func (m *Manager) describeRecordHolder(recordID uint64) string {
 	record, err := m.readRecord(recordID)
 	if err != nil {
 		return fmt.Sprintf("could not be read: %v", err)
@@ -862,6 +867,10 @@ func readerSlots(readers uint64) []int {
 // First tries an optimistic path using cached sequence hints, then falls back
 // to reading the current record if the hint is stale.
 func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint64, mode LockMode) (bool, error) {
+	return m.slotClaim(recordID, lockType, resourceID, mode, -1)
+}
+
+func (m *Manager) tryAcquireRecord(recordID uint64, lockType LockType, resourceID uint64, mode LockMode) (bool, error) {
 	// Try optimistic path first if we have a hint
 	if hint, ok := m.hintCache.Peek(recordID); ok {
 		// Only use hint if the lock was free (Mode == None)
@@ -1067,6 +1076,16 @@ func (m *Manager) tryAcquireOptimistic(recordID uint64, lockType LockType, resou
 // runs under the record gate. If another node took the record over as stale,
 // the hold is marked lost and no new key may join it.
 func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
+	if err := m.writeSlotAt(recordID, m.nodeSlot, &claimSlot{mode: rec.mode, owner: m.nodeUUID, acquireTime: time.Now().Unix()}); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	rec.renewed = time.Now()
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) renewRecordCAS(recordID uint64, rec *heldRecord) error {
 	for attempt := 0; ; attempt++ {
 		record, err := m.readRecord(recordID)
 		if err != nil {
@@ -1108,6 +1127,10 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 // After successful release, caches the new sequence number to enable
 // optimistic acquisition on the next lock attempt.
 func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
+	return m.writeSlotAt(recordID, m.nodeSlot, nil)
+}
+
+func (m *Manager) releaseRecordCAS(recordID uint64, mode LockMode) error {
 	for attempt := 0; ; attempt++ {
 		record, err := m.readRecord(recordID)
 		if err != nil {
@@ -1236,7 +1259,7 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 	hash *= 0xFF51AFD7ED558CCD
 	hash ^= hash >> 33
 
-	maxRecords := m.size / RecordSize
+	maxRecords := m.size / RowSize
 	return hash % maxRecords
 }
 

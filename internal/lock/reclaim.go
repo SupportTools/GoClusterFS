@@ -17,6 +17,10 @@ const adoptSettle = 50 * time.Millisecond
 // operations, while this node's own acquires reuse them. It also clears the
 // dead node's reader bit, ownerSlot, from every record held for reading.
 func (m *Manager) AdoptOwner(owner [16]byte, ownerSlot int) ([]uint64, error) {
+	return m.adoptSlots(owner, ownerSlot)
+}
+
+func (m *Manager) adoptOwnerRecords(owner [16]byte, ownerSlot int) ([]uint64, error) {
 	var taken []uint64
 	cleared := 0
 	for recordID := uint64(0); recordID < m.size/RecordSize; recordID++ {
@@ -121,6 +125,25 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
 // ReleaseAdopted frees the records AdoptOwner returned that this node still
 // holds without using them itself; a record in use is freed by its own release.
 func (m *Manager) ReleaseAdopted(records []uint64) error {
+	for _, recordID := range records {
+		gate := m.recordGate(recordID)
+		gate.Lock()
+		m.mu.Lock()
+		_, inUse := m.records[recordID]
+		m.mu.Unlock()
+		var err error
+		if !inUse {
+			err = m.writeSlotAt(recordID, m.nodeSlot, nil)
+		}
+		gate.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) releaseAdoptedRecords(records []uint64) error {
 	for _, recordID := range records {
 		if err := m.releaseAdopted(recordID); err != nil {
 			return err

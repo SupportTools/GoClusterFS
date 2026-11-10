@@ -32,8 +32,11 @@ const (
 	bitmapBlocksPerSector   = (storage.SectorSize - 4) * 8
 	refcountBlocksPerSector = (storage.SectorSize - 4) / 8
 
+	// LockRegionSize holds 256 lock records of one 4KB claim slot per node.
+	LockRegionSize = 256 * MaxNodes * storage.SectorSize
+
 	// MinDeviceSize holds all metadata regions and one data block.
-	MinDeviceSize = 7*regionSize + MaxNodes*NodeJournalSize + storage.DefaultBlockSize
+	MinDeviceSize = 6*regionSize + LockRegionSize + MaxNodes*NodeJournalSize + storage.DefaultBlockSize
 
 	legacyRootInodeOffset = 2*regionSize + 2*inodeSize
 	legacyInodeMagic      = 0x494E4F44
@@ -294,7 +297,7 @@ func calculateLayout(sb *Superblock, deviceSize int64, bytesPerInode uint64) {
 	}
 
 	sb.NodeRegistryOffset, sb.NodeRegistrySize = next(regionSize)
-	sb.LockBitmapOffset, sb.LockBitmapSize = next(regionSize)
+	sb.LockBitmapOffset, sb.LockBitmapSize = next(LockRegionSize)
 	sb.SnapshotRegOffset, sb.SnapshotRegSize = next(regionSize)
 	sb.JournalRegionOffset, sb.JournalRegionSize = next(MaxNodes * NodeJournalSize)
 	sb.BlockBitmapOffset, sb.BlockBitmapSize = next(BlockBitmapBytes(maxBlocks))
