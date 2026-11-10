@@ -97,3 +97,22 @@ func TestOpenStaysInsideTheRoot(t *testing.T) {
 		t.Errorf("list without a registry: %v, want ErrDisabled", err)
 	}
 }
+
+func TestSameDevice(t *testing.T) {
+	dir := t.TempDir()
+	fd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		t.Fatal(err)
+	}
+	if err := sameDevice(fd, uint64(st.Dev)); err != nil {
+		t.Errorf("same device: %v", err)
+	}
+	if err := sameDevice(fd, uint64(st.Dev)+1); !errors.Is(err, api.ErrNotMounted) {
+		t.Errorf("other device: %v, want ErrNotMounted", err)
+	}
+}

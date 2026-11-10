@@ -26,20 +26,38 @@ type Ops struct {
 	checkRoot func(fd int) error
 }
 
-// New returns Ops for the mount at root. registry is nil when snapshots are off.
+// New returns Ops for the mount at root, which must already be mounted.
+// registry is nil when snapshots are off.
 func New(root string, registry *snapshot.Registry) *Ops {
-	return &Ops{root: root, registry: registry, checkRoot: isFUSE}
+	var st unix.Stat_t
+	dev := uint64(0)
+	if unix.Stat(root, &st) == nil {
+		dev = uint64(st.Dev)
+	}
+	return &Ops{root: root, registry: registry, checkRoot: func(fd int) error { return isOurMount(fd, dev) }}
 }
 
-// isFUSE refuses a root that is a plain directory, for example after FUSE has
-// exited: setxattr there would set a host xattr and report success.
-func isFUSE(fd int) error {
-	var st unix.Statfs_t
-	if err := unix.Fstatfs(fd, &st); err != nil {
+// isOurMount refuses a root that is no longer this FUSE mount, for example a
+// plain directory after FUSE has exited: setxattr there would set a host
+// xattr and report success. dev is the mount's device, recorded by New.
+func isOurMount(fd int, dev uint64) error {
+	var sfs unix.Statfs_t
+	if err := unix.Fstatfs(fd, &sfs); err != nil {
 		return err
 	}
-	if st.Type != unix.FUSE_SUPER_MAGIC {
+	if sfs.Type != unix.FUSE_SUPER_MAGIC {
 		return fmt.Errorf("the filesystem is %w", api.ErrNotMounted)
+	}
+	return sameDevice(fd, dev)
+}
+
+func sameDevice(fd int, dev uint64) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if dev != 0 && uint64(st.Dev) != dev {
+		return fmt.Errorf("the filesystem is %w: another mount replaced it", api.ErrNotMounted)
 	}
 	return nil
 }
