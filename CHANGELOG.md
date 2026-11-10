@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Release workflow: pushing a `v*` tag publishes a GitHub Release with `linux/amd64` and `linux/arm64` archives, checksums, and the matching `CHANGELOG.md` section. `scripts/dist.sh` builds the same archives locally.
 - `goclusterfs-fsck -version` prints the release version, commit, and commit date.
 - HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` or `-api-cors '*'` without `-api-token`, and checks the API flags before it opens the device. `/metrics` uses the Prometheus client library and adds Go runtime and process metrics. `-api-rate-limit` limits requests per client IP (off by default).
+- `gfsctl`, a read-only CLI for the HTTP API: `status`, `health`, `stats`, `metrics`, with watch mode and JSON output. Release archives include it.
 - `goclusterfs-mount -version`, which prints the same version string as `goclusterfs-fsck -version`. `/api/v1/status` reports it too.
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
