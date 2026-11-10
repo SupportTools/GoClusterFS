@@ -2374,6 +2374,13 @@ scenarios:
     environments:
       go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice
 
+  - id: gfsctl-reads-live-mount
+    name: gfsctl reads a live mount
+    description: gfsctl status, health and metrics work against a mounted filesystem's API
+    priority: go_only
+    environments:
+      go: api_test.go::TestGfsctlReadsLiveMount
+
   - id: api-stats-live-values
     name: API stats report live values
     description: After writes, reads, a delete and a mkdir, /api/v1/stats/{cache,journal,lock,all,cluster} and /metrics show non-zero counters, TRIM reports itself disabled on an image file, /stats/sfb answers 404, and a second node sees both nodes and the first node's blocks

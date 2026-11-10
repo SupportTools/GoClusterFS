@@ -77,11 +77,11 @@ newgrp fuse
 git clone https://github.com/supporttools/GoClusterFS.git
 cd GoClusterFS
 
-# Build goclusterfs-mount and goclusterfs-fsck
+# Build goclusterfs-mount, goclusterfs-fsck and gfsctl
 make build
 
 # Optional: Install to system path
-sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
+sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ```
 
 ### Verify Build
@@ -89,6 +89,7 @@ sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
 ```bash
 ./goclusterfs-mount -version
 ./goclusterfs-fsck -version
+./gfsctl version
 ```
 
 Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the GitHub Releases page.

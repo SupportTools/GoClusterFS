@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount build-fsck test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
+.PHONY: build build-mount build-fsck build-gfsctl test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
 
 # Go parameters
 GOCMD=go
@@ -14,6 +14,7 @@ GOMOD=$(GOCMD) mod
 # Binary names
 MOUNT_BINARY=goclusterfs-mount
 FSCK_BINARY=goclusterfs-fsck
+GFSCTL_BINARY=gfsctl
 
 GOLANGCI_LINT_VERSION=v2.15.0
 GOVULNCHECK_VERSION=v1.9.0
@@ -23,7 +24,7 @@ COVER_PROFILE=coverage.out
 .DEFAULT_GOAL := help
 
 # Build all binaries
-build: build-mount build-fsck
+build: build-mount build-fsck build-gfsctl
 
 build-mount:
 	@echo "Building $(MOUNT_BINARY)..."
@@ -34,6 +35,11 @@ build-fsck:
 	@echo "Building $(FSCK_BINARY)..."
 	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/fsck
 	@echo "Built $(FSCK_BINARY) successfully"
+
+build-gfsctl:
+	@echo "Building $(GFSCTL_BINARY)..."
+	$(GOBUILD) -o $(GFSCTL_BINARY) ./cmd/gfsctl
+	@echo "Built $(GFSCTL_BINARY) successfully"
 
 # Unit tests (fast, no FUSE needed)
 test: test-unit
@@ -167,7 +173,7 @@ vuln:
 # Utilities
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(COVER_PROFILE)
+	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(GFSCTL_BINARY) $(COVER_PROFILE)
 	rm -f *.img
 	@echo "Clean complete"
 

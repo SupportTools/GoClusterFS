@@ -2,6 +2,7 @@
 /goclusterfs
 /goclusterfs-mount
 /goclusterfs-fsck
+/gfsctl
 /GoClusterFS
 /coverage.out
 

@@ -11,7 +11,7 @@ FUSE binding: `github.com/hanwen/go-fuse/v2`. Linux only.
 ## Build and Run
 
 ```bash
-make build                 # ./goclusterfs-mount and ./goclusterfs-fsck
+make build                 # ./goclusterfs-mount, ./goclusterfs-fsck and ./gfsctl
 go build ./... && go vet ./...
 ```
 
@@ -35,6 +35,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `cmd/mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
 | `cmd/fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
 | `cmd/crctest` | Prints CRC32C test values |
+| `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics) |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
 | `internal/superblock` | Superblock format and the on-disk layout; `-format` writes it, mount reads it |
