@@ -91,6 +91,9 @@ func (c *Checker) checkSuperblock() error {
 		return err
 	}
 	c.checkJournalSlots(sb)
+	if err := sb.layout().CheckLayout(int64(devSize)); err != nil {
+		c.addProblem(PhaseSuperblock, Error, "layout", "mount refuses this layout: "+err.Error(), false)
+	}
 
 	checksumOffset := SuperblockSize - 4
 	storedChecksum := binary.LittleEndian.Uint32(buf[checksumOffset:])
@@ -120,6 +123,22 @@ func (c *Checker) checkSuperblock() error {
 	c.logf("  Total Inodes: %d\n", c.result.TotalInodes)
 
 	return nil
+}
+
+// layout returns the fields the superblock package checks a layout with.
+func (sb *SuperblockData) layout() *superblock.Superblock {
+	return &superblock.Superblock{
+		BlockSize: sb.BlockSize, TotalBlocks: sb.TotalBlocks, MetaBlockSize: sb.MetaBlockSize,
+		MaxNodes: sb.MaxNodes, InodeSize: sb.InodeSize, InodeCount: sb.InodeCount,
+		NodeRegistryOffset: sb.NodeRegistryOffset, NodeRegistrySize: sb.NodeRegistrySize,
+		LockBitmapOffset: sb.LockBitmapOffset, LockBitmapSize: sb.LockBitmapSize,
+		SnapshotRegOffset: sb.SnapshotRegOffset, SnapshotRegSize: sb.SnapshotRegSize,
+		JournalRegionOffset: sb.JournalRegionOffset, JournalRegionSize: sb.JournalRegionSize,
+		BlockBitmapOffset: sb.BlockBitmapOffset, BlockBitmapSize: sb.BlockBitmapSize,
+		RefCountTableOffset: sb.RefCountTableOffset, RefCountTableSize: sb.RefCountTableSize,
+		InodeTableOffset: sb.InodeTableOffset, InodeTableSize: sb.InodeTableSize,
+		DataRegionOffset: sb.DataRegionOffset,
+	}
 }
 
 // parseSuperblock extracts fields from raw superblock bytes.

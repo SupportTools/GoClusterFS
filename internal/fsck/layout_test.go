@@ -17,7 +17,7 @@ import (
 
 func formattedDevice(t *testing.T, mutate func(*superblock.Superblock)) *storage.Device {
 	t.Helper()
-	dev, cleanup := testDevice(t, superblock.MinDeviceSize>>20+64)
+	dev, cleanup := testDevice(t, 64)
 	t.Cleanup(cleanup)
 
 	sb, err := superblock.Format(dev, 0)
@@ -66,15 +66,35 @@ func TestFsckAcceptsFormattedLayout(t *testing.T) {
 
 func TestFsckRejectsUnevenJournalSlots(t *testing.T) {
 	problems := phase1Problems(t, func(sb *superblock.Superblock) { sb.MaxNodes = 48 })
-	if len(problems) != 1 || !strings.Contains(problems[0].Message, "do not split into 48 node journals") {
-		t.Errorf("phase 1 problems = %v, want one uneven journal split", problems)
+	if len(problems) != 2 || !strings.Contains(problems[0].Message, "do not split into 48 node journals") ||
+		!strings.Contains(problems[1].Message, "mount refuses this layout") {
+		t.Errorf("phase 1 problems = %v, want an uneven journal split and a layout mount refuses", problems)
 	}
 }
 
 func TestFsckRejectsMoreJournalsThanRegistrySlots(t *testing.T) {
 	problems := phase1Problems(t, func(sb *superblock.Superblock) { sb.MaxNodes = 512 })
-	if len(problems) != 1 || !strings.Contains(problems[0].Message, "registry holds 256 node slots") {
-		t.Errorf("phase 1 problems = %v, want registry too small for 512 journals", problems)
+	if len(problems) != 2 || !strings.Contains(problems[0].Message, "registry holds 256 node slots") ||
+		!strings.Contains(problems[1].Message, "mount refuses this layout") {
+		t.Errorf("phase 1 problems = %v, want registry too small for 512 journals and a layout mount refuses", problems)
+	}
+}
+
+func TestFsckReportsLayoutsMountRefuses(t *testing.T) {
+	for name, mutate := range map[string]func(*superblock.Superblock){
+		"bitmap and refcounts swapped": func(sb *superblock.Superblock) {
+			sb.BlockBitmapOffset, sb.RefCountTableOffset = sb.RefCountTableOffset, sb.BlockBitmapOffset
+		},
+		"inode count below the table": func(sb *superblock.Superblock) { sb.InodeCount = 100 },
+		"gap before the data": func(sb *superblock.Superblock) {
+			sb.DataRegionOffset += 1 << 20
+			sb.TotalBlocks--
+		},
+	} {
+		problems := phase1Problems(t, mutate)
+		if len(problems) != 1 || problems[0].Severity != fsck.Error || !strings.Contains(problems[0].Message, "mount refuses this layout") {
+			t.Errorf("%s: phase 1 problems = %v, want one error for a layout mount refuses", name, problems)
+		}
 	}
 }
 
