@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -58,12 +59,18 @@ func TestMountRefusesUnauthenticatedRemoteAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to find binary: %v", err)
 	}
-	mountPoint := t.TempDir()
-	image := mountPoint + ".img"
+	dir := t.TempDir()
+	mountPoint := filepath.Join(dir, "mnt")
+	image := filepath.Join(dir, "disk.img")
+	if err := os.Mkdir(mountPoint, 0o755); err != nil {
+		t.Fatalf("Failed to create mount point: %v", err)
+	}
+	if err := os.WriteFile(image, nil, 0o644); err != nil {
+		t.Fatalf("Failed to create image: %v", err)
+	}
 	if err := allocateImage(image, 20); err != nil {
 		t.Fatalf("Failed to allocate image: %v", err)
 	}
-	t.Cleanup(func() { os.Remove(image) })
 
 	for _, addr := range []string{":8080", "0.0.0.0:8080"} {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
