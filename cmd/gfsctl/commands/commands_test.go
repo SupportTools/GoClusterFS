@@ -284,3 +284,19 @@ func TestVersionNeedsNoServer(t *testing.T) {
 		t.Fatalf("err=%v output=%q", err, out)
 	}
 }
+
+func TestConfigShowHidesToken(t *testing.T) {
+	const token = "abcd1234wxyz"
+	out, _, err := run(t, "--token", token, "config", "show")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []string{"abcd", "wxyz", token} {
+		if strings.Contains(out, part) {
+			t.Errorf("config show reveals %q:\n%s", part, out)
+		}
+	}
+	if !strings.Contains(out, "set (12 chars)") {
+		t.Errorf("config show does not say the token is set:\n%s", out)
+	}
+}

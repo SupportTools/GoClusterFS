@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -48,5 +49,21 @@ func TestAPIErrorCarriesStatusAndDetails(t *testing.T) {
 	c.token = "secret"
 	if _, err := c.GetRaw(context.Background(), "/metrics"); !errors.As(err, &apiErr) || !apiErr.IsServerError() || apiErr.Message != "Service Unavailable" {
 		t.Fatalf("non-JSON 503: %v", err)
+	}
+}
+
+func TestOversizedResponseIsRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk := make([]byte, 1<<20)
+		for written := 0; written <= MaxResponseSize; written += len(chunk) {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	c := &Client{baseURL: srv.URL, httpClient: srv.Client()}
+	if _, err := c.GetRaw(context.Background(), "/metrics"); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Fatalf("oversized response: %v", err)
 	}
 }

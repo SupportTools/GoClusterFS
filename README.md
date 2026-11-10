@@ -167,7 +167,7 @@ It connects to `localhost:8080` by default. Each setting comes from the first of
 | `--output`, `-o` | `GFSCTL_OUTPUT` | `text` (or `json`) |
 | `--timeout` | `GFSCTL_TIMEOUT` | `30s` |
 
-Use `GFSCTL_TOKEN` or the config file for the token: other local users can read `--token` with `ps`. Statistics answer 503 until mount feeds them to the API, and `gfsctl` prints that error.
+Use `GFSCTL_TOKEN` or the config file for the token: other local users can read `--token` with `ps`. gfsctl and the API speak plain HTTP, so for a remote mount don't send the token across the network: tunnel over SSH (`ssh -L 8080:127.0.0.1:8080 node`, then `gfsctl status`) or put a TLS proxy in front of the API. Statistics answer 503 until mount feeds them to the API, and `gfsctl` prints that error.
 
 ## Multi-Node Setup
 
