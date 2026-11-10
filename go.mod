@@ -6,7 +6,7 @@ require github.com/hanwen/go-fuse/v2 v2.9.0
 
 require (
 	github.com/prometheus/client_golang v1.23.2
-	golang.org/x/sys v0.35.0
+	golang.org/x/sys v0.50.0
 )
 
 require (
