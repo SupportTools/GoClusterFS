@@ -2285,7 +2285,7 @@ scenarios:
 
   - id: api-settings-checked-before-device
     name: Mount rejects bad API settings early
-    description: An -api-addr without a port, an invalid -api-cors, or -api-cors * without a token stop mount before it opens the device
+    description: An -api-addr without a port, an invalid -api-cors, -api-cors * without a token, or an -api-rate-limit that is negative, NaN, infinite or too large stop mount before it opens the device
     priority: go_only
     environments:
       go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice

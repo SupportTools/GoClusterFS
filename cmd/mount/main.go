@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -78,17 +79,25 @@ func (p *fsStatusProvider) Capacity() *api.CapacityInfo {
 	}
 }
 
-func apiConfig(addr, token, corsList string) api.Config {
+func apiConfig(addr, token, corsList string, rateLimit float64) api.Config {
 	var origins []string
 	for _, origin := range strings.Split(corsList, ",") {
 		if origin = strings.TrimSpace(origin); origin != "" {
 			origins = append(origins, origin)
 		}
 	}
-	return api.DefaultConfig().
+	cfg := api.DefaultConfig().
 		WithListenAddr(addr).
 		WithAuthToken(token).
 		WithCORSOrigins(origins...)
+	if rateLimit != 0 {
+		burst := 1
+		if rateLimit > 0 && rateLimit <= api.MaxRateLimit {
+			burst = int(math.Ceil(2 * rateLimit))
+		}
+		cfg = cfg.WithRateLimit(rateLimit, burst)
+	}
+	return cfg
 }
 
 func main() {
@@ -133,6 +142,7 @@ func main() {
 		apiAddr    = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs -api-token")
 		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled, loopback only)")
 		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
+		apiRate    = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
 	)
 	flag.Parse()
 
@@ -147,7 +157,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS)
+	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS, *apiRate)
 	if *apiEnabled {
 		if err := apiCfg.Validate(); err != nil {
 			log.Fatalf("Invalid API settings: %v", err)
@@ -457,6 +467,7 @@ func main() {
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start API server: %v", err)
+				apiServer.Stop()
 				apiServer = nil
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",

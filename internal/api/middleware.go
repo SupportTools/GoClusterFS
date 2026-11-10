@@ -3,9 +3,13 @@ package api
 import (
 	"crypto/subtle"
 	"log"
+	"math"
 	"net"
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -141,6 +145,163 @@ func CORSMiddleware(origins []string) Middleware {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// MaxRateLimitClients bounds the limiter's memory. While this many clients
+// have live buckets, requests from new clients get 429.
+const MaxRateLimitClients = 65536
+
+// RateLimiter implements a token bucket rate limiter per client.
+type RateLimiter struct {
+	mu         sync.Mutex
+	clients    map[string]*tokenBucket
+	rate       float64 // tokens per second
+	burst      int     // max tokens (bucket capacity)
+	maxClients int
+	idle       time.Duration // a bucket idle this long is full again, so it is dropped
+	stop       chan struct{}
+	stopped    chan struct{}
+	stopOnce   sync.Once
+}
+
+// tokenBucket tracks rate limit state for a single client.
+type tokenBucket struct {
+	tokens   float64
+	lastSeen time.Time
+}
+
+// NewRateLimiter creates a new rate limiter with the specified rate and burst.
+func NewRateLimiter(requestsPerSecond float64, burst int) *RateLimiter {
+	idle := time.Hour
+	if refill := float64(burst) / requestsPerSecond; refill < idle.Seconds() {
+		idle = time.Duration(refill * float64(time.Second))
+	}
+	rl := &RateLimiter{
+		clients:    make(map[string]*tokenBucket),
+		rate:       requestsPerSecond,
+		burst:      burst,
+		maxClients: MaxRateLimitClients,
+		idle:       idle,
+		stop:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+	}
+	go rl.cleanup(min(max(idle, time.Second), time.Minute))
+	return rl
+}
+
+// Allow checks if a request from the given client should be allowed.
+func (rl *RateLimiter) Allow(key string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	bucket, exists := rl.clients[key]
+
+	if !exists {
+		if len(rl.clients) >= rl.maxClients {
+			return false
+		}
+		// New client starts with a full bucket
+		rl.clients[key] = &tokenBucket{
+			tokens:   float64(rl.burst) - 1, // Consume one token for this request
+			lastSeen: now,
+		}
+		return true
+	}
+
+	// Calculate tokens to add based on time elapsed
+	elapsed := now.Sub(bucket.lastSeen).Seconds()
+	bucket.tokens += elapsed * rl.rate
+	if bucket.tokens > float64(rl.burst) {
+		bucket.tokens = float64(rl.burst)
+	}
+	bucket.lastSeen = now
+
+	// Check if we have tokens available
+	if bucket.tokens < 1 {
+		return false
+	}
+
+	bucket.tokens--
+	return true
+}
+
+func (rl *RateLimiter) cleanup(every time.Duration) {
+	defer close(rl.stopped)
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-rl.stop:
+			return
+		case now := <-ticker.C:
+			rl.sweep(now)
+		}
+	}
+}
+
+func (rl *RateLimiter) sweep(now time.Time) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for key, bucket := range rl.clients {
+		if now.Sub(bucket.lastSeen) >= rl.idle {
+			delete(rl.clients, key)
+		}
+	}
+}
+
+// Stop ends the cleanup goroutine. It is safe to call more than once.
+func (rl *RateLimiter) Stop() {
+	rl.stopOnce.Do(func() { close(rl.stop) })
+}
+
+func (rl *RateLimiter) retryAfter() string {
+	return strconv.Itoa(int(min(max(math.Ceil(1/rl.rate), 1), 3600)))
+}
+
+// RateLimitMiddleware returns a middleware that enforces rate limiting per client.
+// If limiter is nil, no rate limiting is applied. Paths in skipPaths are never limited.
+func RateLimitMiddleware(limiter *RateLimiter, skipPaths ...string) Middleware {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if limiter == nil || slices.Contains(skipPaths, r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if !limiter.Allow(rateLimitKey(r)) {
+				w.Header().Set("Retry-After", limiter.retryAfter())
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded", "please slow down")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// rateLimitKey groups IPv6 clients by /64, the block one host usually controls.
+func rateLimitKey(r *http.Request) string {
+	host := getClientIP(r)
+	ip := net.ParseIP(host)
+	switch {
+	case ip == nil:
+		return host
+	case ip.To4() != nil:
+		return ip.String()
+	default:
+		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+	}
+}
+
+// getClientIP returns the connection's IP. Proxy headers are ignored: any client can set them.
+func getClientIP(r *http.Request) string {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return ip
 }
 
 // LoopbackHostMiddleware rejects requests whose Host header is not a loopback
