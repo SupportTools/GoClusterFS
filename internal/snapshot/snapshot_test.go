@@ -1029,3 +1029,36 @@ func TestRegistryIDsAfterOlderImagesAndSlotReuse(t *testing.T) {
 		t.Fatalf("new owner of slot 5 got ID %d after %d, want a higher ID ending in slot 5", second, first)
 	}
 }
+
+func TestRegistryCreateRefusesTakenName(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	registry := NewRegistry(dev, 0, 10*SectorSize, nil)
+	ctx := context.Background()
+
+	first, err := registry.Create(ctx, "nightly", 100, InvalidSnapshotID, 1000, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inode := range []uint32{100, 200} {
+		if _, err := registry.Create(ctx, "nightly", inode, InvalidSnapshotID, 1001, 1, 1024, FlagReadOnly); !errors.Is(err, ErrSnapshotExists) {
+			t.Errorf("second %q for inode %d: %v, want ErrSnapshotExists", "nightly", inode, err)
+		}
+	}
+	if all, err := registry.List(ctx); err != nil || len(all) != 1 {
+		t.Fatalf("List after refused duplicates: %d snapshots, %v; want 1", len(all), err)
+	}
+
+	if err := registry.Delete(ctx, first.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "nightly", 200, InvalidSnapshotID, 1001, 1, 1024, FlagReadOnly); !errors.Is(err, ErrSnapshotExists) {
+		t.Errorf("name of a snapshot being deleted: %v, want ErrSnapshotExists", err)
+	}
+	if err := registry.Remove(ctx, first.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "nightly", 200, InvalidSnapshotID, 1002, 1, 1024, FlagReadOnly); err != nil {
+		t.Fatalf("reusing a removed name: %v", err)
+	}
+}
