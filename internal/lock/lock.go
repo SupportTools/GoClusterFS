@@ -175,6 +175,12 @@ func (c *hintLRU) Put(key uint64, value *lockHint) {
 	c.items[key] = elem
 }
 
+func (c *hintLRU) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.order.Len()
+}
+
 // Peek returns the value without updating LRU order.
 func (c *hintLRU) Peek(key uint64) (*lockHint, bool) {
 	c.mu.Lock()
@@ -224,6 +230,17 @@ type Manager struct {
 	// Metrics for hint cache effectiveness
 	hintHits   uint64 // Optimistic acquires that succeeded
 	hintMisses uint64 // Optimistic acquires that failed (fell back to read)
+
+	waiting atomic.Int64
+}
+
+// Stats counts this node's lock activity.
+type Stats struct {
+	Held          int // lock keys this node holds
+	Waiting       int // Acquire calls not yet granted
+	HintCacheSize int
+	HintHits      uint64
+	HintMisses    uint64
 }
 
 type lockKey struct {
@@ -343,6 +360,20 @@ func (m *Manager) HintStats() (hits, misses uint64, hitRate float64) {
 	return
 }
 
+// Stats returns this node's lock counts without touching the device.
+func (m *Manager) Stats() Stats {
+	m.mu.Lock()
+	held := len(m.heldLocks)
+	m.mu.Unlock()
+	return Stats{
+		Held:          held,
+		Waiting:       int(m.waiting.Load()),
+		HintCacheSize: m.hintCache.Len(),
+		HintHits:      atomic.LoadUint64(&m.hintHits),
+		HintMisses:    atomic.LoadUint64(&m.hintMisses),
+	}
+}
+
 // Acquire attempts to acquire a lock with the given parameters.
 // Blocks until the lock is acquired or context is cancelled.
 //
@@ -369,6 +400,8 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		return err
 	}
 	m.mu.Unlock()
+	m.waiting.Add(1)
+	defer m.waiting.Add(-1)
 
 	retryCount := 0
 	startTime := time.Now()
