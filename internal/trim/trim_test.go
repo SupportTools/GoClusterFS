@@ -9,18 +9,7 @@ import (
 )
 
 func TestCoalesceBlocks(t *testing.T) {
-	m := &Manager{
-		pending: []pendingBlock{
-			{blockNum: 10, queuedAt: time.Now()},
-			{blockNum: 11, queuedAt: time.Now()},
-			{blockNum: 12, queuedAt: time.Now()},
-			{blockNum: 20, queuedAt: time.Now()},
-			{blockNum: 21, queuedAt: time.Now()},
-			{blockNum: 50, queuedAt: time.Now()},
-		},
-	}
-
-	ranges := m.coalesceBlocks()
+	ranges := coalesceBlocks([]uint64{10, 11, 12, 20, 21, 50})
 
 	if len(ranges) != 3 {
 		t.Fatalf("expected 3 ranges, got %d", len(ranges))
@@ -46,24 +35,14 @@ func TestCoalesceBlocks(t *testing.T) {
 }
 
 func TestCoalesceBlocksEmpty(t *testing.T) {
-	m := &Manager{
-		pending: []pendingBlock{},
-	}
-
-	ranges := m.coalesceBlocks()
+	ranges := coalesceBlocks(nil)
 	if ranges != nil {
 		t.Errorf("expected nil for empty pending, got %v", ranges)
 	}
 }
 
 func TestCoalesceBlocksSingleBlock(t *testing.T) {
-	m := &Manager{
-		pending: []pendingBlock{
-			{blockNum: 42, queuedAt: time.Now()},
-		},
-	}
-
-	ranges := m.coalesceBlocks()
+	ranges := coalesceBlocks([]uint64{42})
 	if len(ranges) != 1 {
 		t.Fatalf("expected 1 range, got %d", len(ranges))
 	}
@@ -75,15 +54,7 @@ func TestCoalesceBlocksSingleBlock(t *testing.T) {
 
 func TestCoalesceBlocksUnsorted(t *testing.T) {
 	// Blocks out of order - should still coalesce correctly
-	m := &Manager{
-		pending: []pendingBlock{
-			{blockNum: 12, queuedAt: time.Now()},
-			{blockNum: 10, queuedAt: time.Now()},
-			{blockNum: 11, queuedAt: time.Now()},
-		},
-	}
-
-	ranges := m.coalesceBlocks()
+	ranges := coalesceBlocks([]uint64{12, 10, 11})
 	if len(ranges) != 1 {
 		t.Fatalf("expected 1 range (after sorting), got %d", len(ranges))
 	}
@@ -350,5 +321,29 @@ func TestStatsAreThreadSafe(t *testing.T) {
 	stats := m.Stats()
 	if stats.BlocksQueued != 100 {
 		t.Errorf("expected 100 queued, got %d", stats.BlocksQueued)
+	}
+}
+
+func TestDuplicateBlockDiscardedOnce(t *testing.T) {
+	dev, cleanup := createTestDevice(t)
+	defer cleanup()
+
+	var calls [][2]uint64
+	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+		calls = append(calls, [2]uint64{offset, length})
+		return nil
+	}})
+	m.Start()
+
+	m.Queue(5)
+	m.Queue(5)
+	m.Queue(6)
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	want := [][2]uint64{{5 * BlockSize, 2 * BlockSize}}
+	if len(calls) != 1 || calls[0] != want[0] {
+		t.Errorf("discards = %v, want %v", calls, want)
 	}
 }

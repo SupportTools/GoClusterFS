@@ -209,6 +209,10 @@ func Unmarshal(data []byte, secret []byte) (*Message, error) {
 	if len(data) < expectedSize {
 		return nil, ErrMessageTooShort
 	}
+	if len(data) > expectedSize {
+		// Trailing bytes would not be covered by the HMAC
+		return nil, ErrMessageTooLong
+	}
 
 	// Verify HMAC if present and secret provided
 	if hasHMAC {

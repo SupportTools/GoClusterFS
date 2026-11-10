@@ -2,7 +2,13 @@ package superblock
 
 import (
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 func TestSerializeDeserialize(t *testing.T) {
@@ -203,7 +209,7 @@ func TestCanMountWithOptionalFeatures(t *testing.T) {
 
 func TestNewSuperblock(t *testing.T) {
 	deviceSize := int64(10 << 30) // 10GB
-	sb := New(deviceSize)
+	sb := New(deviceSize, 0)
 
 	// Check magic
 	if string(sb.Magic[:len(Magic)]) != Magic {
@@ -227,42 +233,42 @@ func TestNewSuperblock(t *testing.T) {
 		name         string
 		offset, size uint64
 	}{
-		{"block bitmap", 1 << 20, 1 << 20},
-		{"inode table", 2 << 20, 1 << 20},
-		{"node registry", 3 << 20, 1 << 20},
-		{"locks", 4 << 20, 1 << 20},
-		{"journals", 5 << 20, 64 * 4 << 20},
+		{"node registry", 1 << 20, 1 << 20},
+		{"locks", 2 << 20, 1 << 20},
+		{"snapshots", 3 << 20, 1 << 20},
+		{"journals", 4 << 20, 64 * 4 << 20},
+		{"block bitmap", 260 << 20, 1 << 20},
 		{"refcounts", 261 << 20, 1 << 20},
-		{"snapshots", 262 << 20, 1 << 20},
+		{"inode table", 262 << 20, 3 << 20},
 	}
 	got := [][2]uint64{
-		{sb.BlockBitmapOffset, sb.BlockBitmapSize},
-		{sb.InodeTableOffset, sb.InodeTableSize},
 		{sb.NodeRegistryOffset, sb.NodeRegistrySize},
 		{sb.LockBitmapOffset, sb.LockBitmapSize},
-		{sb.JournalRegionOffset, sb.JournalRegionSize},
-		{sb.RefCountTableOffset, sb.RefCountTableSize},
 		{sb.SnapshotRegOffset, sb.SnapshotRegSize},
+		{sb.JournalRegionOffset, sb.JournalRegionSize},
+		{sb.BlockBitmapOffset, sb.BlockBitmapSize},
+		{sb.RefCountTableOffset, sb.RefCountTableSize},
+		{sb.InodeTableOffset, sb.InodeTableSize},
 	}
 	for i, w := range want {
 		if got[i] != [2]uint64{w.offset, w.size} {
 			t.Errorf("%s at %d size %d, want %d size %d", w.name, got[i][0], got[i][1], w.offset, w.size)
 		}
 	}
-	if sb.DataRegionOffset != 263<<20 {
-		t.Errorf("DataRegionOffset = %d, want %d", sb.DataRegionOffset, 263<<20)
+	if sb.DataRegionOffset != 265<<20 {
+		t.Errorf("DataRegionOffset = %d, want %d", sb.DataRegionOffset, 265<<20)
 	}
-	if want := uint64(deviceSize-263<<20) >> 20; sb.TotalBlocks != want {
+	if want := uint64(deviceSize-265<<20) >> 20; sb.TotalBlocks != want {
 		t.Errorf("TotalBlocks = %d, want %d", sb.TotalBlocks, want)
 	}
 	if sb.JournalSlotSize() != 4<<20 {
 		t.Errorf("JournalSlotSize = %d, want 4MB", sb.JournalSlotSize())
 	}
-	if sb.InodeCount != 4096 {
-		t.Errorf("InodeCount = %d, want 4096", sb.InodeCount)
+	if sb.InodeCount != 3<<20/256 {
+		t.Errorf("InodeCount = %d, want %d (10240 rounded up to fill 3 MB)", sb.InodeCount, 3<<20/256)
 	}
-	if New(MinDeviceSize).TotalBlocks != 1 {
-		t.Errorf("MinDeviceSize leaves %d data blocks, want 1", New(MinDeviceSize).TotalBlocks)
+	if New(MinDeviceSize, 0).TotalBlocks != 1 {
+		t.Errorf("MinDeviceSize leaves %d data blocks, want 1", New(MinDeviceSize, 0).TotalBlocks)
 	}
 
 	// Check timestamps
@@ -280,6 +286,91 @@ func TestNewSuperblock(t *testing.T) {
 	}
 	if allZero {
 		t.Error("UUID should be randomly generated, not all zeros")
+	}
+}
+
+func TestSectorCapacitiesMatchRegions(t *testing.T) {
+	if bitmapBlocksPerSector != bitmap.BitsPerSector || refcountBlocksPerSector != refcount.EntriesPerSector {
+		t.Errorf("blocks per sector: bitmap %d, refcount %d; the packages use %d and %d",
+			bitmapBlocksPerSector, refcountBlocksPerSector, bitmap.BitsPerSector, refcount.EntriesPerSector)
+	}
+}
+
+func TestLayoutCoversEveryBlock(t *testing.T) {
+	for _, size := range []int64{MinDeviceSize, 10 << 30, 128 << 30, 200 << 30, 9 << 40, 100 << 40} {
+		sb := New(size, 0)
+		if err := sb.CheckLayout(size); err != nil {
+			t.Errorf("%d GB: %v", size>>30, err)
+		}
+		if blocks := sb.BlockBitmapSize / storage.SectorSize * bitmap.BitsPerSector; blocks < sb.TotalBlocks {
+			t.Errorf("%d GB: bitmap tracks %d blocks, volume has %d", size>>30, blocks, sb.TotalBlocks)
+		}
+		if blocks := sb.RefCountTableSize / storage.SectorSize * refcount.EntriesPerSector; blocks < sb.TotalBlocks {
+			t.Errorf("%d GB: refcount table covers %d blocks, volume has %d", size>>30, blocks, sb.TotalBlocks)
+		}
+		wantInodes := min(max(uint64(size)>>20, MinInodes), MaxInodes)
+		if sb.InodeCount < wantInodes || sb.InodeCount >= wantInodes+regionSize/inodeSize {
+			t.Errorf("%d GB: %d inodes, want %d rounded up to a whole MB of table", size>>30, sb.InodeCount, wantInodes)
+		}
+	}
+}
+
+func TestBytesPerInode(t *testing.T) {
+	for _, tc := range []struct {
+		size          int64
+		bytesPerInode uint64
+		want          uint64
+	}{
+		{10 << 30, 64 << 10, 163840},
+		{100 << 40, 4096, MaxInodes},
+		{MinDeviceSize, 1 << 30, MinInodes},
+	} {
+		sb := New(tc.size, tc.bytesPerInode)
+		if sb.InodeCount != tc.want || sb.InodeTableSize != tc.want*inodeSize {
+			t.Errorf("%d bytes at %d per inode: %d inodes in %d bytes, want %d",
+				tc.size, tc.bytesPerInode, sb.InodeCount, sb.InodeTableSize, tc.want)
+		}
+		if err := sb.CheckLayout(tc.size); err != nil {
+			t.Errorf("%d bytes at %d per inode: %v", tc.size, tc.bytesPerInode, err)
+		}
+	}
+}
+
+// A bitmap size of nearly 2^64 wraps the next offset back to 1 MB, which would put the refcount table on the node registry.
+func TestCheckLayoutRejectsWrappedOffsets(t *testing.T) {
+	const size = 1 << 30
+	sb := New(size, 0)
+	sb.BlockBitmapSize = -sb.BlockBitmapOffset + regionSize
+	sb.RefCountTableOffset, sb.RefCountTableSize = regionSize, regionSize
+	sb.InodeTableOffset, sb.InodeTableSize, sb.InodeCount = 2*regionSize, regionSize, MinInodes
+	sb.DataRegionOffset = 3 * regionSize
+	sb.TotalBlocks = (size - 3*regionSize) / regionSize
+	if err := sb.CheckLayout(size); !errors.Is(err, ErrUnsupportedLayout) {
+		t.Errorf("CheckLayout with a wrapped bitmap size: err = %v, want ErrUnsupportedLayout", err)
+	}
+}
+
+func TestCheckLayoutRequiresInodeCountToFillTable(t *testing.T) {
+	sb := New(200<<30, 0)
+	sb.InodeCount -= 255
+	if err := sb.CheckLayout(200 << 30); !errors.Is(err, ErrUnsupportedLayout) {
+		t.Errorf("CheckLayout with %d inodes in a %d-inode table: err = %v, want ErrUnsupportedLayout",
+			sb.InodeCount, sb.InodeTableSize/inodeSize, err)
+	}
+}
+
+func TestRegistrySlotMagicMatchesNode(t *testing.T) {
+	if registrySlotMagic != node.SlotMagic {
+		t.Errorf("registrySlotMagic = %#x, node.SlotMagic = %#x", registrySlotMagic, node.SlotMagic)
+	}
+}
+
+func TestCheckLayoutRejectsRegionsTooSmallForBlocks(t *testing.T) {
+	sb := New(1<<40, 0)
+	sb.TotalBlocks = 1500000
+	err := sb.CheckLayout(2 << 40)
+	if !errors.Is(err, ErrUnsupportedLayout) || !strings.Contains(err.Error(), "refcount table") {
+		t.Errorf("CheckLayout with more blocks than the refcount table covers: err = %v", err)
 	}
 }
 
@@ -330,7 +421,7 @@ func TestFeatureFlags(t *testing.T) {
 }
 
 func BenchmarkSerialize(b *testing.B) {
-	sb := New(10 << 30)
+	sb := New(10<<30, 0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -339,7 +430,7 @@ func BenchmarkSerialize(b *testing.B) {
 }
 
 func BenchmarkDeserialize(b *testing.B) {
-	sb := New(10 << 30)
+	sb := New(10<<30, 0)
 	data := sb.Serialize()
 
 	b.ResetTimer()

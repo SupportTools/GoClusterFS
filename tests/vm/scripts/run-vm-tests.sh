@@ -1695,6 +1695,57 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
+# Test: more than 4096 files, which layout v2 could not hold. VMs work in parallel and poll past the attribute cache.
+test_more_than_4096_files() {
+    log_info "Testing more than 4096 files..."
+
+    ensure_cluster_healthy "$NODE_COUNT"
+
+    local dir=/mnt/goclusterfs/many_files
+    local inodes
+    inodes=$(ssh_run 1 "stat -f -c %c /mnt/goclusterfs")
+    if [[ "$inodes" -le 4200 ]]; then
+        log_error "statfs reports $inodes inodes, want more than 4200"
+        return 1
+    fi
+
+    if ! ssh_run 1 "mkdir $dir && for d in \$(seq 0 41); do mkdir $dir/d\$d || exit 1; done"; then
+        log_error "creating directories on VM 1 failed"
+        ssh_run 1 "rm -rf $dir"
+        return 1
+    fi
+    local vm pid failed=0 pids=()
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        ssh_run "$vm" "for d in \$(seq $((vm - 1)) $NODE_COUNT 41); do t=0; until [ -d $dir/d\$d ]; do t=\$((t + 1)); [ \$t -le 120 ] || exit 1; sleep 0.5; done; cd $dir/d\$d && touch \$(seq 0 99 | sed 's/^/f/') || exit 1; done" &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+    done
+    local count=0 waited=0
+    while [[ $failed -eq 0 && "$count" -ne 4200 && $waited -lt 60 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        count=$(ssh_run 1 "find $dir -type f | wc -l")
+    done
+
+    pids=()
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        ssh_run "$vm" "for d in \$(seq $((vm - 1)) $NODE_COUNT 41); do rm -f $dir/d\$d/f*; done" &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    ssh_run 1 "rm -rf $dir"
+
+    if [[ $failed -ne 0 || "$count" -ne 4200 ]]; then
+        log_error "a VM failed to create its files ($failed) or VM 1 sees $count files, want 4200"
+        return 1
+    fi
+
+    log_info "More than 4096 files test passed"
+    return 0
+}
+
 # Test: Extent cache coherency across VMs
 # VM 2 reads files, VM 1 changes their block mappings (truncate and rewrite,
 # hole fill), and VM 2 must read the new data.
@@ -3105,6 +3156,56 @@ test_snapshot_delete_after_overwrite() {
     return 0
 }
 
+# Node A overwrites a 2 MB file in 64 KB chunks with rounds of a, b, c while
+# node B snapshots it. Every snapshot must show one moment of the file (a
+# prefix of the next round, the rest of the round before) and never change.
+test_snapshot_during_writes() {
+    log_info "Testing snapshots on one VM while another VM overwrites the file..."
+    ensure_cluster_healthy 2
+
+    local run=$$
+    local file=/mnt/goclusterfs/busy.bin
+
+    ssh_run 1 "head -c 2097152 /dev/zero | tr '\\000' c > $file" || return 1
+    ssh_run 1 "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/dev/null || exit 1; done; done; done" &
+    local writer=$!
+
+    local i clone sum
+    local clones=() sums=()
+    for i in $(seq 1 10); do
+        clone=/mnt/goclusterfs/busy_${run}_$i.bin
+        if ! ssh_run 2 "setfattr -n user.snapshot -v busy_${run}_$i $file && setfattr -n user.snapshot.clone -v busy_${run}_$i:/busy_${run}_$i.bin $file"; then
+            log_error "snapshot $i on VM 2 failed"
+            ssh_run 1 "touch /tmp/busy.stop"
+            wait "$writer"
+            return 1
+        fi
+        clones+=("$clone")
+        sums+=("$(ssh_run 2 "md5sum < $clone | cut -d' ' -f1")")
+    done
+    ssh_run 1 "touch /tmp/busy.stop"
+    wait "$writer" || { log_error "writer on VM 1 failed"; return 1; }
+
+    for i in "${!clones[@]}"; do
+        clone=${clones[$i]}
+        sum=$(ssh_run 2 "md5sum < $clone | cut -d' ' -f1")
+        if [ "$sum" != "${sums[$i]}" ]; then
+            log_error "$clone changed after its snapshot was made"
+            return 1
+        fi
+        local shape
+        shape=$(ssh_run 2 "for k in \$(seq 0 31); do dd if=$clone bs=65536 skip=\$k count=1 2>/dev/null | tr -s abc | head -c 2; done")
+        if [ ${#shape} -ne 32 ] || ! [[ $shape =~ ^(b*a*|c*b*|a*c*)$ ]]; then
+            log_error "$clone chunks read $shape; the file never looked like this"
+            return 1
+        fi
+    done
+
+    ssh_run 2 "for i in \$(seq 1 10); do setfattr -x user.snapshot.busy_${run}_\$i $file; rm -f /mnt/goclusterfs/busy_${run}_\$i.bin; done"
+    log_info "Snapshots during writes test passed"
+    return 0
+}
+
 # Two VMs each take 10 snapshots of their own file at the same time. Each file
 # must list all of its snapshots, and deleting one VM's snapshots must leave
 # the other VM's alone.
@@ -3264,6 +3365,8 @@ main() {
     run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
     # Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
     log_info "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
+    # Two nodes can both hold the refcount lock and lose a snapshot's count until #29 confirms lock claims.
+    log_info "SKIPPING: Snapshot During Writes (two nodes can both hold one lock until #29)"
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation
@@ -3283,6 +3386,7 @@ main() {
     run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
     run_test "Broadcast Bidirectional" test_broadcast_bidirectional
     run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
+    run_test "More Than 4096 Files" test_more_than_4096_files
     run_test "Extent Cache Coherency" test_extent_cache_coherency
     run_test "Statfs After Remount" test_statfs_after_remount
     run_test "Statfs Multi-Node" test_statfs_multinode

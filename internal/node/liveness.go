@@ -81,6 +81,19 @@ func (r *Registry) failed(slot *Slot, timeout time.Duration) bool {
 	return false
 }
 
+// LeaseExpiry returns when the slot's node stops counting as alive: its last
+// heartbeat plus HeartbeatTimeout, or for a dead slot, the end of the recovery
+// lease of the peer replaying its journal. An empty slot returns the zero time.
+func (s *Slot) LeaseExpiry() time.Time {
+	switch s.State {
+	case NodeStateActive, NodeStateLeaving:
+		return time.Unix(s.HeartbeatTime, 0).Add(HeartbeatTimeout)
+	case NodeStateDead:
+		return time.Unix(s.RecoveryStart, 0).Add(recoveryLease)
+	}
+	return time.Time{}
+}
+
 // observe records a slot's heartbeat as failure detection sees it. Called with r.mu held.
 func (r *Registry) observe(slotIdx int, slot *Slot) {
 	last, seen := r.sightings[slotIdx]

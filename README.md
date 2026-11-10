@@ -29,7 +29,8 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **Name lookups are slow.** Each lookup reads the whole directory from disk and scans it entry by entry. In one test on a single node, a lookup took about 25 ms, and `ls -l` on a 1,000-file directory took about 47 seconds.
 - **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime, and a read can stop at the old size. A file that stays open can use the old size and block mappings for up to `-cache-ttl` (default 5s). Opening the file after `-attr-timeout` has passed reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
-- **On-disk format version 2** since [#15](https://github.com/SupportTools/GoClusterFS/pull/15). Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
+- **On-disk format version 3.** Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
+- **The inode count is set at format time.** `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB, so one per data block), between 4096 and 16,777,216. It cannot change later.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
 - **fsck repairs little.** `-repair` rebuilds refcounts and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
@@ -85,7 +86,9 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-device` | (required) | Path to block device or image file |
 | `-mount` | (required) | Mount point directory (must exist) |
 | `-format` | `false` | Format the device, then mount it (destroys data) |
+| `-bytes-per-inode` | `1048576` | With `-format`: one inode per this many bytes of device (4096 to 16,777,216 inodes) |
 | `-debug` | `false` | Log every FUSE request |
+| `-version` | `false` | Print the version and exit |
 
 ### Cache Options
 
@@ -99,7 +102,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-journal` | `true` | Enable write-ahead journal |
-| `-skip-recovery` | `false` | Skip journal recovery on mount (dangerous) |
+| `-skip-recovery=N` | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous) |
 
 ### Network Broadcast Options
 
@@ -110,6 +113,8 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-mcast-port` | `31337` | Multicast/unicast port |
 | `-broadcast-secret` | (empty) | HMAC secret for message authentication |
 | `-broadcast-iface` | (auto) | Network interface for multicast |
+
+With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to the port can make nodes drop their caches. Set the same secret on every node.
 
 ### TRIM Options
 
@@ -126,6 +131,18 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-sfb` | `true` | Ignored. SFB containers are disabled and every file uses full blocks |
 | `-snapshots` | `true` | Enable O(1) file snapshots |
 
+### HTTP API Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-api` | `true` | Serve the HTTP API (`/health`, `/metrics`, `/api/v1/...`) |
+| `-api-addr` | `127.0.0.1:8080` | API listen address |
+| `-api-token` | (empty) | Bearer token required on `/api/v1/...` |
+| `-api-cors` | (empty) | Comma-separated CORS allowed origins |
+| `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
+
+The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and `-api-token` is empty. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
+
 ## Multi-Node Setup
 
 For clustered deployments:
@@ -134,7 +151,7 @@ For clustered deployments:
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
 4. **Limits**: At most 64 nodes mount a device at once, and node clocks must agree within a few seconds (run NTP)
-5. **Format version**: This release uses on-disk format version 2, which gives each node its own journal. It refuses devices formatted by earlier builds; copy their data off and reformat
+5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
 
 Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:
 
@@ -173,7 +190,7 @@ Run fsck on an unmounted device. The device is a positional argument, and flags 
 
 Exit codes follow fsck(8) and add up: `0` no errors, `1` errors repaired, `4` errors remain, `8` I/O failure or a check that could not finish or was refused, `16` usage error.
 
-`-repair` refuses to run while a node has the device mounted, or while a stopped node's journal still needs replay. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
+`-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
 
 ## Architecture
 

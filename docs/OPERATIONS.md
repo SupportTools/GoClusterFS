@@ -123,7 +123,7 @@ Unmount the device on every node first. The device is a positional argument, and
 ./goclusterfs-fsck -repair /dev/device
 ```
 
-`-repair` refuses to run while a node has the device mounted or a stopped node's journal still needs replay. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
+`-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide) for what it checks and changes, and for exit codes.
 
 ### Managing Snapshots
 
@@ -281,18 +281,25 @@ goclusterfs-mount -device /dev/device -mount /mnt/cluster
 A mount exits with `Journal recovery for slot N failed: ...` when it cannot replay the journal in the slot it took. Read the rest of the error first:
 
 - **Storage or replay errors** (an I/O error, or `journal recovery failed: ...`): the journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
-- **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery`, which discards the journal.
+- **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery=N`, with the slot number N from the error, which discards slot N's journal.
 
-`-skip-recovery` discards the journal of whichever slot the mount takes, and that is not always the damaged one. About 20 seconds after the failed mount, a running node tries to replay the damaged slot and holds it for 60 seconds. A mount in that window takes a different slot, which may hold another crashed node's journal that has not been replayed yet. To discard the right journal:
+`-skip-recovery=N` discards a journal only when the mount takes slot N. If it takes another slot, it logs `ignoring -skip-recovery=N` and replays that slot's journal as usual, so it never discards a journal you did not name. A mount takes another slot while a running node is replaying slot N: about 20 seconds after the failed mount, a running node tries to replay the damaged slot, holds it for 60 seconds, and tries again every minute. To discard slot N's journal:
 
-1. Either run step 2 right after the failed mount, within about 20 seconds, or first unmount on every other node and wait one minute.
-2. On the same host, before it reboots, mount once with `-skip-recovery`.
-3. Check the mount's `Registered as node N` log line. N must be the slot from the error. If it is not, unmount at once: the mount discarded another slot's journal. Check that node's recent changes, and restore them from backup if needed.
-4. Unmount on every node and run fsck, because discarded transactions may have been only partly applied.
+1. Either mount right after the failed mount, within about 20 seconds, or first unmount on every other node and wait one minute.
+2. On the same host, before it reboots, mount once with `-skip-recovery=N`. The mount logs `discarding the journal of slot N`.
+3. Unmount on every node and run fsck, because discarded transactions may have been only partly applied.
 
-`-skip-recovery` does not stop the node from replaying crashed peers' journals. `-journal=false` also skips the replay of its own slot, and leaves that journal in place for the next mount, so don't use it on a device that may have a dirty journal.
+`-skip-recovery=N` does not stop the node from replaying crashed peers' journals. `-journal=false` also skips the replay of its own slot, and leaves that journal in place for the next mount, so don't use it on a device that may have a dirty journal.
 
-A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` and retry every minute. Between retries, a new mount on any host can take that slot and then fail with the same error. There is no safe tool to free the slot yet.
+A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed` and retry every minute. Between retries, a new mount on any host can take that slot and then fail with the same error. Free the slot with fsck. Unmount the filesystem on every node first, then:
+
+```bash
+./goclusterfs-fsck -list-slots /dev/device                       # find the slot and its journal state
+./goclusterfs-fsck -release-slot N /dev/device                   # check the slot; prints what releasing discards
+./goclusterfs-fsck -release-slot N -discard-journal /dev/device  # reset its journal and free the slot
+```
+
+`-release-slot` refuses while any node has the filesystem mounted, and until a minute after the slot's lease ended: its last heartbeat plus 10 seconds, or for a slot another node was replaying, that node's last lease renewal plus 60 seconds. Without `-force` it also refuses a journal that a mount might still replay: one with committed transactions that fsck reads in full, or one fsck cannot read to the end. Mount a node to replay it instead, and add `-force` only if that replay fails. With `-discard-journal`, fsck holds the slot's recovery lease while it resets the journal, frees the slot, and exits 1. The next node to mount can then use the slot. Run fsck afterwards, because discarded transactions may have been only partly applied.
 
 ### Emergency: All Nodes Down
 
@@ -519,13 +526,21 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
 
-- With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer.
+- With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.
 - The only replay protection is a sequence number check that forgets messages after 5 minutes, so a recorded message can be sent again later, even with a secret.
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**Network listeners.** GoClusterFS has no HTTP API. Its only listener is UDP port 31337 on all interfaces, plus the multicast group. Limit that port to the cluster nodes with a firewall.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. It only answers `GET` requests and changes nothing.
+
+- To expose it, set `-api-addr` and `-api-token`. Mount refuses a non-loopback address without a token.
+- `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
+- Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
+- The API uses plain HTTP. Put a TLS proxy in front of it if the token crosses an untrusted network.
+- The token is a command-line flag, so local users can read it with `ps`.
+
+**Network listeners.** Each node listens on UDP port 31337 on all interfaces, plus the multicast group, and on TCP `-api-addr`. Limit the UDP port, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 
 ---
 

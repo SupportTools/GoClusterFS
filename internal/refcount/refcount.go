@@ -140,6 +140,17 @@ func (r *Region) unlock() {
 	}
 }
 
+// GetUnlocked returns a block's entry without the distributed refcount lock,
+// for callers whose own lock orders them with every Share that matters to them.
+func (r *Region) GetUnlocked(blockNum uint64) (Entry, error) {
+	if blockNum >= r.totalBlocks {
+		return Entry{}, ErrBlockOutOfRange
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readEntry(blockNum)
+}
+
 // Get returns the reference count entry for a block.
 func (r *Region) Get(ctx context.Context, blockNum uint64) (Entry, error) {
 	if blockNum >= r.totalBlocks {

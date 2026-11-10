@@ -267,6 +267,9 @@ in_test_group() {
     case "$1" in
         "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|"Inode Reuse Stale Read"|"Rolling Restart")
             group=2 ;;
+        # Takes about 14 minutes in CI, so it runs alone.
+        "More Than 4096 Files")
+            group=3 ;;
     esac
     [[ "$group" == "$TEST_GROUP" ]]
 }
@@ -2320,6 +2323,57 @@ test_inode_reuse_stale_read() {
     return 0
 }
 
+# Test: more than 4096 files, which layout v2 could not hold. Nodes work in parallel and poll past the attribute cache.
+test_more_than_4096_files() {
+    log "Testing more than 4096 files..."
+
+    local first="${NODE_ARRAY[0]}"
+    local nodes=${#NODE_ARRAY[@]}
+    local dir=/mnt/goclusterfs/many_files
+    local inodes
+    inodes=$(exec_on_node "$first" stat -f -c %c /mnt/goclusterfs)
+    if [[ "$inodes" -le 4200 ]]; then
+        log "ERROR: statfs reports $inodes inodes, want more than 4200"
+        return 1
+    fi
+
+    if ! exec_on_node "$first" sh -c "mkdir $dir && for d in \$(seq 0 41); do mkdir $dir/d\$d || exit 1; done"; then
+        log "ERROR: creating directories on $first failed"
+        exec_on_node "$first" rm -rf "$dir"
+        return 1
+    fi
+    local i pid failed=0 pids=()
+    for i in "${!NODE_ARRAY[@]}"; do
+        exec_on_node "${NODE_ARRAY[$i]}" sh -c "for d in \$(seq $i $nodes 41); do t=0; until [ -d $dir/d\$d ]; do t=\$((t + 1)); [ \$t -le 120 ] || exit 1; sleep 0.5; done; cd $dir/d\$d && touch \$(seq 0 99 | sed 's/^/f/') || exit 1; done" &
+        pids+=($!)
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+    done
+    local count=0 waited=0
+    while [[ $failed -eq 0 && "$count" -ne 4200 && $waited -lt 60 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        count=$(exec_on_node "$first" sh -c "find $dir -type f | wc -l")
+    done
+
+    pids=()
+    for i in "${!NODE_ARRAY[@]}"; do
+        exec_on_node "${NODE_ARRAY[$i]}" sh -c "for d in \$(seq $i $nodes 41); do rm -f $dir/d\$d/f*; done" &
+        pids+=($!)
+    done
+    wait "${pids[@]}"
+    exec_on_node "$first" rm -rf "$dir"
+
+    if [[ $failed -ne 0 || "$count" -ne 4200 ]]; then
+        log "ERROR: a node failed to create its files ($failed) or $first sees $count files, want 4200"
+        return 1
+    fi
+
+    log "More than 4096 files test passed"
+    return 0
+}
+
 # Test: Extent cache coherency across nodes
 # Node 1 reads files, node 0 changes their block mappings (truncate and rewrite,
 # hole fill), and node 1 must read the new data.
@@ -3102,6 +3156,62 @@ test_snapshot_concurrent_creates() {
     return 0
 }
 
+# Node A overwrites a 2 MB file in 64 KB chunks with rounds of a, b, c while
+# node B snapshots it. Every snapshot must show one moment of the file (a
+# prefix of the next round, the rest of the round before) and never change.
+test_snapshot_during_writes() {
+    log "Testing snapshots on one node while another node overwrites the file..."
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]:-}"
+    if [ -z "$node_b" ]; then
+        log "SKIP: needs two nodes"
+        return 0
+    fi
+    local run=$$
+    local file=/mnt/goclusterfs/busy.bin
+
+    exec_on_node "$node_a" sh -c "head -c 2097152 /dev/zero | tr '\\000' c > $file" || return 1
+    exec_on_node "$node_a" sh -c "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/dev/null || exit 1; done; done; done" &
+    local writer=$!
+
+    local i clone sum
+    local clones=() sums=()
+    for i in $(seq 1 10); do
+        clone=/mnt/goclusterfs/busy_${run}_$i.bin
+        if ! exec_on_node "$node_b" setfattr -n user.snapshot -v "busy_${run}_$i" "$file" ||
+            ! exec_on_node "$node_b" setfattr -n user.snapshot.clone -v "busy_${run}_$i:/busy_${run}_$i.bin" "$file"; then
+            log "ERROR: snapshot $i on $node_b failed"
+            exec_on_node "$node_a" touch /tmp/busy.stop
+            wait "$writer"
+            return 1
+        fi
+        clones+=("$clone")
+        sums+=("$(exec_on_node "$node_b" sh -c "md5sum < $clone | cut -d' ' -f1")")
+    done
+    exec_on_node "$node_a" touch /tmp/busy.stop
+    wait "$writer" || { log "ERROR: writer on $node_a failed"; return 1; }
+
+    for i in "${!clones[@]}"; do
+        clone=${clones[$i]}
+        sum=$(exec_on_node "$node_b" sh -c "md5sum < $clone | cut -d' ' -f1")
+        if [ "$sum" != "${sums[$i]}" ]; then
+            log "ERROR: $clone changed after its snapshot was made"
+            return 1
+        fi
+        local shape
+        shape=$(exec_on_node "$node_b" sh -c "for k in \$(seq 0 31); do dd if=$clone bs=65536 skip=\$k count=1 2>/dev/null | tr -s abc | head -c 2; done")
+        if [ ${#shape} -ne 32 ] || ! [[ $shape =~ ^(b*a*|c*b*|a*c*)$ ]]; then
+            log "ERROR: $clone chunks read $shape; the file never looked like this"
+            return 1
+        fi
+    done
+
+    exec_on_node "$node_b" sh -c "for i in \$(seq 1 10); do setfattr -x user.snapshot.busy_${run}_\$i $file; rm -f /mnt/goclusterfs/busy_${run}_\$i.bin; done"
+    log "Snapshots during writes test passed"
+    return 0
+}
+
 run_test "Create and Read File" test_create_read_file
 run_test "Create Directory" test_create_directory
 run_test "File in Directory" test_file_in_directory
@@ -3125,6 +3235,9 @@ run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 # Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
 log "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
 echo "SKIP: Snapshot Concurrent Creates" >> "$RESULTS_DIR/results.txt"
+# Two nodes can both hold the refcount lock and lose a snapshot's count until #29 confirms lock claims.
+log "SKIPPING: Snapshot During Writes (two nodes can both hold one lock until #29)"
+echo "SKIP: Snapshot During Writes" >> "$RESULTS_DIR/results.txt"
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"
@@ -3158,6 +3271,7 @@ run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidatio
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
+run_test "More Than 4096 Files" test_more_than_4096_files
 run_test "Extent Cache Coherency" test_extent_cache_coherency
 run_test "Statfs After Remount" test_statfs_after_remount
 run_test "Statfs Multi-Node" test_statfs_multinode

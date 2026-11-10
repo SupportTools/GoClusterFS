@@ -115,11 +115,19 @@ head -c 16 /dev/device | hexdump -C
 **Cause**: One of two things, and you need to know which build formatted the device:
 
 - **A build from before format version 2 formatted it.** In that layout every node wrote the same journal region and data blocks started at 11 MB, so this version cannot read it safely.
-- **A version 2 build formatted it, and its superblock was overwritten.** Both layouts keep the inode table at 2 MB, so the device looks old.
+- **A version 2 build formatted it, and its superblock was overwritten.** Versions 1 and 2 both keep the inode table at 2 MB, so the device looks old. Version 3 keeps lock records there; see the next entry.
 
 **Solution**:
 - Pre-v2 device: copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
 - Version 2 device: do not run an old build on it; it would read the wrong layout. There is no tool to rebuild the superblock, so restore from backup.
+
+### "device has GoClusterFS node slots but no superblock"
+
+**Symptom**: Mount exits with `Cannot use <device>: device has GoClusterFS node slots but no superblock: its superblock was overwritten. ...`
+
+**Cause**: A version 3 device lost its superblock, the first 4 KB. The node registry at 1 MB still holds the slots of the nodes that mounted it, so the data is likely intact.
+
+**Solution**: Do not run `-format`, which destroys the data. There is no tool to rebuild the superblock, so restore the device from backup. If you wiped the start of the device on purpose, `-format` is safe.
 
 ---
 
@@ -147,14 +155,14 @@ A crashed node's locks free up on their own: other nodes take them over once the
 
 ### "Journal recovery for slot N failed"
 
-**Symptom**: Mount exits with `Journal recovery for slot N failed: ... (mount with -skip-recovery to discard this journal)`.
+**Symptom**: Mount exits with `Journal recovery for slot N failed: ... (to discard this journal, mount with -skip-recovery=N)`.
 
 **Cause**: The mount could not replay the journal in the registry slot it took. A normal crash does not cause this: the next mount on the same host replays the journal by itself. Read the rest of the error:
 
 - An I/O error, or `journal recovery failed: ...`: the storage failed or a transaction could not be applied. The journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - `journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`: the journal header is damaged and cannot be replayed.
 
-**Solution**: Only for a damaged header, discard the journal with `-skip-recovery`. That flag discards the journal of whichever slot the mount takes, which may belong to another crashed node, so follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot) exactly.
+**Solution**: Only for a damaged header, discard the journal with `-skip-recovery=N`. The mount discards it only if it takes slot N again; follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot).
 
 ### Another Node's Change Shows Up Late
 
@@ -483,20 +491,21 @@ As with fsck(8), the codes add up: a repair that fixed some errors and left othe
 
 | Phase | Name | Checks |
 |-------|------|--------|
-| 1 | Superblock | Magic, version, block and inode size, checksum, and the format v2 layout (below). fsck stops here when a region lies outside the device or overlaps another. |
-| 2 | Bitmap | Sector checksums; counts allocated blocks |
+| 1 | Superblock | Magic, version, block and inode size, checksum, and the format v3 layout (below). fsck stops here on a version 2 volume, or when a region lies outside the device or overlaps another. |
+| 2 | Bitmap | The bitmap covers every data block; sector checksums; counts allocated blocks |
 | 3 | Inodes | Inode checksums, file type, link count, block counts; reads extent trees |
 | 4 | Extents | Extents stay inside the device and are allocated; two inodes share a block only if both mark it shared; extent tree structure |
-| 5 | Refcounts | Sector checksums; each block's refcount covers the inodes that map it |
+| 5 | Refcounts | The table covers every data block; sector checksums; each block's refcount covers the inodes that map it |
 | 6 | Directories | Entry lengths and names; entries point at inodes in use |
 | 7 | Snapshots | Registry sector and descriptor checksums, duplicate IDs and names, snapshot data inodes |
 | 8 | Cross-Validation | Allocated blocks that no inode maps, mapped blocks the bitmap calls free, inodes no directory names |
 
-The format v2 layout checks in phase 1:
+The format v3 layout checks in phase 1:
 
 - Every region starts on a 4 KB boundary, lies inside the device, and does not overlap another region.
 - The journal region splits evenly into one journal per node, and each journal is a multiple of 4 KB and at least 8 KB.
 - The node registry has a slot for every node journal.
+- The regions have the order and sizes mount accepts. If not, fsck reports an error and keeps checking.
 
 fsck does not compare the superblock free block, free inode, and snapshot counters, because the runtime never updates them.
 
@@ -535,8 +544,8 @@ If this guide doesn't resolve your issue:
    uname -a
    cat /etc/os-release
 
-   # GoClusterFS version (goclusterfs-mount has no -version flag yet)
-   ./goclusterfs-fsck -version
+   # GoClusterFS version
+   ./goclusterfs-mount -version
 
    # Recent mount log
    tail -1000 /var/log/goclusterfs.log > mount.log

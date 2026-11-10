@@ -59,6 +59,15 @@ func (c *Checker) reportUncounted() {
 	}
 	slices.Sort(nums)
 	for _, num := range nums {
+		// Marked counted, blocks past the table would be freed on their first release.
+		if c.uncountedPast[num] {
+			c.addProblem(PhaseRefcounts, Error, fmt.Sprintf("inode %d", num),
+				"shares blocks past the refcount table the way older versions did, without counting the owners; repair cannot count them, "+
+					"so writes to it change the other files that map those blocks. Copy the file and delete the original to separate it",
+				false)
+			delete(c.uncounted, num)
+			continue
+		}
 		c.addProblem(PhaseRefcounts, Warning, fmt.Sprintf("inode %d", num),
 			"shares blocks the way older versions did, without counting the owners; snapshots and clones of it fail until repaired",
 			true)
@@ -121,12 +130,19 @@ func (c *Checker) startRepair() error {
 	if c.opts.Mode != Repair {
 		return nil
 	}
+	const badLayout = "mount refuses this layout, so the regions repair writes may hold other data"
 	live, unclean := c.nodes()
 	if c.opts.DryRun {
 		for _, why := range append(live, unclean...) {
 			c.addProblem(PhaseSuperblock, Warning, "node registry", "repair would refuse: "+why, false)
 		}
+		if c.layoutErr != nil {
+			c.addProblem(PhaseSuperblock, Warning, "layout", "repair would refuse: "+badLayout, false)
+		}
 		return nil
+	}
+	if c.layoutErr != nil {
+		return fmt.Errorf("repair refused: %s", badLayout)
 	}
 	if len(live) > 0 {
 		return fmt.Errorf("repair refused: %s; unmount it on every node first", strings.Join(live, ", "))
@@ -278,7 +294,7 @@ func (c *Checker) journalNeedsReplay(i int) string {
 	if sb.MaxNodes == 0 || uint32(i) >= sb.MaxNodes {
 		return "has no journal slot"
 	}
-	off := sb.JournalRegionOffset + uint64(i)*(sb.JournalRegionSize/uint64(sb.MaxNodes))
+	off, _ := c.journalArea(i)
 	buf := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
 	if err := c.readSector(buf, off); err != nil {
 		return "has an unreadable journal: " + err.Error()

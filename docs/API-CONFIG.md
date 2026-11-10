@@ -34,7 +34,9 @@ These flags are passed when starting `goclusterfs`:
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Format the device (destroys all data) |
+| `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
 | `-debug` | bool | `false` | Enable verbose debug logging |
+| `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 
 ### Cache Flags
 
@@ -53,7 +55,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-journal` | bool | `true` | Enable write-ahead journal for crash consistency |
-| `-skip-recovery` | bool | `false` | Skip journal recovery on mount (dangerous, may lose data) |
+| `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data) |
 
 ### Network Broadcast Flags
 
@@ -79,6 +81,26 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 |------|------|---------|-------------|
 | `-sfb` | bool | `true` | Ignored. SFB containers are disabled |
 | `-snapshots` | bool | `true` | Enable O(1) file snapshots |
+
+### HTTP API Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `-api` | bool | `true` | Serve the HTTP API |
+| `-api-addr` | string | `127.0.0.1:8080` | Listen address |
+| `-api-token` | string | (empty) | Bearer token for `/api/v1/...` requests |
+| `-api-cors` | string | (empty) | Comma-separated CORS allowed origins, or `*` |
+| `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
+
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status` and `GET /api/v1/stats/...`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` answers 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up` plus Go runtime and process metrics. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
+
+Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the dashboard's origin instead, for example `-api-cors http://localhost:5173`.
+
+By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty. The token is a command-line flag, so local users can read it with `ps`.
+
+The rate limit counts requests per connecting IP address, and per /64 for IPv6. It ignores `X-Forwarded-For`, so behind a proxy every client shares the proxy's limit. `/health` and `/metrics` are never limited. The limiter tracks at most 65,536 clients at once; while it is full, new clients get 429 until idle clients' buckets refill and are dropped, about 2 seconds (longer below 0.5 requests per second).
+
+Each mount on a host needs its own `-api-addr`. When the port is taken, mount logs a warning and runs without the API.
 
 ---
 
@@ -412,7 +434,7 @@ Interval between heartbeat messages to detect node failures.
 |----------|-------|
 | Default | (empty) |
 
-HMAC secret for message authentication. All nodes must use the same secret.
+HMAC secret for message authentication. All nodes must use the same secret. With broadcast on and no secret, mount logs a `WARNING` line at startup.
 
 **Generating a secret**:
 ```bash

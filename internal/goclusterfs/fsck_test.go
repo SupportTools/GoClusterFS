@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +25,16 @@ import (
 // newFormattedImage formats an image the way goclusterfs-mount -format does.
 func newFormattedImage(t *testing.T) string {
 	t.Helper()
+	return newFormattedImageOfSize(t, superblock.MinDeviceSize+64<<20)
+}
+
+func newFormattedImageOfSize(t *testing.T, size int64) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "fs.img")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(path, superblock.MinDeviceSize+64<<20); err != nil {
+	if err := os.Truncate(path, size); err != nil {
 		t.Fatal(err)
 	}
 	dev, err := storage.Open(path)
@@ -36,7 +42,7 @@ func newFormattedImage(t *testing.T) string {
 		t.Fatal(err)
 	}
 	defer dev.Close()
-	if _, err := superblock.Format(dev); err != nil {
+	if _, err := superblock.Format(dev, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	fsys := openFormattedFS(t, path)
@@ -295,6 +301,78 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 
 	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
 		t.Fatalf("problems after using the repaired image:%s", problemList(r))
+	}
+}
+
+// Sharing past a 1 MB refcount table loses data on the first delete, so fsck reports it and repair leaves older sharing uncounted.
+func TestFsckReportsSharingPastRefcountTable(t *testing.T) {
+	path := newFormattedImageOfSize(t, 200<<30)
+	fsys := openFormattedFS(t, path)
+	ctx := context.Background()
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const covered = 1 << 20 / 4096 * 511
+	counted, older := uint64(covered+5), uint64(covered+9)
+
+	share := func(name string, block uint64, flags uint32) *File {
+		f := createFile(t, fsys, name)
+		if _, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error {
+			ino.InlineExtents[0] = inode.InlineExtent{PhysicalBlock: block, Length: 1, Flags: extent.FlagAllocated | flags}
+			ino.ExtentCount, ino.Size, ino.AllocatedBlocks, ino.WrittenBlocks = 1, 4096, 1, 1
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	for _, block := range []uint64{counted, older} {
+		if err := fsys.bitmapMgr.MarkAllocated(ctx, block); err != nil {
+			t.Fatal(err)
+		}
+	}
+	share("counted-a", counted, extent.FlagShared|extent.FlagCounted)
+	share("counted-b", counted, extent.FlagShared|extent.FlagCounted)
+	oldA := share("older-a", older, extent.FlagShared)
+	share("older-b", older, extent.FlagShared)
+	sb.RefCountTableSize = 1 << 20
+	if err := superblock.Write(fsys.dev, sb); err != nil {
+		t.Fatal(err)
+	}
+
+	check := runFsck(t, fsys, fsck.DefaultOptions())
+	problems := problemList(check)
+	for _, want := range []string{
+		fmt.Sprintf("has entries for blocks 0-%d of %d", covered-1, sb.TotalBlocks),
+		fmt.Sprintf("block %d: mapped by 2 inodes but past the refcount table", counted),
+		fmt.Sprintf("inode %d: shares blocks past the refcount table the way older versions did", oldA.inodeNum),
+	} {
+		if !strings.Contains(problems, want) {
+			t.Errorf("fsck did not report %q:%s", want, problems)
+		}
+	}
+	if strings.Contains(problems, fmt.Sprintf("block %d: mapped by", older)) {
+		t.Errorf("block %d is only shared without counts, so it is never freed, yet fsck reported it:%s", older, problems)
+	}
+	if check.ExitCode() != fsck.ExitUncorrected {
+		t.Errorf("check exit %d, want %d", check.ExitCode(), fsck.ExitUncorrected)
+	}
+	for _, p := range check.Problems {
+		if p.Location == fmt.Sprintf("inode %d", oldA.inodeNum) && p.Severity != fsck.Error {
+			t.Errorf("inode %d reported as %v, want an error: writes to it change older-b too", oldA.inodeNum, p.Severity)
+		}
+	}
+
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	runFsck(t, fsys, repair)
+	ino, err := fsys.inodeTbl.Read(oldA.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.InlineExtents[0].Flags&extent.FlagCounted != 0 {
+		t.Fatalf("repair marked older sharing of block %d counted, so its first release would free it", older)
 	}
 }
 

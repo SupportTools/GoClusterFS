@@ -16,3 +16,11 @@ func SetBeforeRepairWrites(f func()) (restore func()) {
 	beforeRepairWrites = f
 	return func() { beforeRepairWrites = old }
 }
+
+// SetReleaseHooks runs before once Release has checked the registry, and
+// during once Release holds the slot's recovery lease.
+func SetReleaseHooks(before, during func()) (restore func()) {
+	oldBefore, oldDuring := beforeReleaseWrites, whileReleaseHoldsLease
+	beforeReleaseWrites, whileReleaseHoldsLease = before, during
+	return func() { beforeReleaseWrites, whileReleaseHoldsLease = oldBefore, oldDuring }
+}

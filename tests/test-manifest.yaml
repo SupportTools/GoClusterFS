@@ -474,6 +474,31 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesLegacyLayout
 
+  - id: mount-refuses-layout-v2
+    name: Mount and fsck refuse layout v2
+    description: On a v2 image, whose fixed 1 MB regions hold 4096 inodes and overflow refcounts past 128 GB, mount and fsck exit with a message to copy the data off and reformat
+    priority: go_only
+    environments:
+      go: layout_test.go::TestMountRefusesLayoutV2
+
+  - id: more-than-4096-files
+    name: More than 4096 files
+    description: Every node creates its share of 4200 files in 42 directories at once on a volume with more than 4200 inodes, and all of them are visible; layout v2 held 4096 inodes
+    priority: high
+    environments:
+      go: layout_test.go::TestLargeVolume
+      docker: run-tests.sh::test_more_than_4096_files
+      vm: run-vm-tests.sh::test_more_than_4096_files
+
+  - id: large-volume-high-block-snapshot
+    name: 200 GB volume with snapshots of data past 128 GB
+    description: On a 200 GB sparse image, a snapshot, copy on write and clone of data past block 130816, where layout v2's refcount table ended, survive a remount next to 4200 files, and fsck is clean
+    priority: high
+    environments:
+      go: layout_test.go::TestLargeVolume
+      docker: TODO  # needs a 200 GB sparse shared image; the Docker cluster shares a 768 MB image
+      vm: TODO  # needs a 200 GB sparse shared disk; the VM cluster shares a 1 GB disk
+
   - id: crashed-peer-journal-replay
     name: Peer replays a crashed node's journal from its slot
     description: After node B crashes, node A finds B's journal through B's registry slot and replays it
@@ -498,6 +523,13 @@ scenarios:
     priority: go_only
     environments:
       go: journal_slots_test.go::TestMountRefusesDamagedJournal
+
+  - id: skip-recovery-discards-only-named-slot
+    name: -skip-recovery discards only the named slot
+    description: A mount that takes another host's crashed slot ignores -skip-recovery naming a different slot and replays that slot, also on a retry after its own failed mount stamped the slot; -skip-recovery naming the slot discards its journal
+    priority: go_only
+    environments:
+      go: journal_slots_test.go::TestSkipRecoveryDiscardsOnlyNamedSlot
 
   - id: journal-scan-never-initialized
     name: Recovery scan of a never-initialized journal
@@ -547,10 +579,10 @@ scenarios:
 
   - id: refcount-blocks-past-region
     name: Refcounts never write past their region
-    description: On a 200 GiB volume, changes to blocks the 1 MB refcount region has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the snapshot registry after the region is unchanged
+    description: In a refcount region smaller than its volume, like layout v2's 1 MB table on 200 GiB, changes to blocks it has no entry for fail with ErrBlockPastRegion, reads and frees treat them as single-owner, and the next region is unchanged
     priority: go_only
     environments:
-      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheSnapshotRegistryAlone
+      go: internal/refcount/refcount_test.go::TestBlocksPastRegionLeaveTheNextRegionAlone
 
   - id: snapshot-refuses-blocks-past-refcount-region
     name: Snapshot and clone refuse blocks the refcount region cannot count
@@ -847,6 +879,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: fsck-release-dead-slot
+    name: fsck releases a dead node's slot
+    description: -release-slot exits 8 while the node is mounted; after the node dies with a damaged journal header, -list-slots shows the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
+    environments:
+      go: fsck_test.go::TestFsckReleasesDeadSlot
+      docker: TODO
+      vm: TODO
+
   - id: fsck-runtime-image-unit
     name: fsck accepts everything the runtime writes
     description: Snapshots, clones, snapshot clones, copies on write in inline and tree files, deletes and unlinks leave no fsck problem
@@ -861,6 +903,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckRepairsOlderSharing
 
+  - id: fsck-sharing-past-refcount-table
+    name: fsck reports sharing the refcount table cannot count
+    description: With the refcount table of a 200 GiB volume shrunk to 1 MB in the superblock, fsck reports an error that it covers blocks 0-130815, reports Critical for a higher block that several inodes share with counts, and repair leaves older uncounted sharing of such blocks uncounted
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckReportsSharingPastRefcountTable
+
   - id: fsck-rebuild-refcount-sector
     name: fsck -repair rebuilds a corrupt refcount sector
     description: A refcount sector with a bad checksum is rebuilt from the extents that map its blocks
@@ -874,6 +923,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
+
+  - id: fsck-release-slot
+    name: fsck slot release checks
+    description: Release refuses while any node runs or the slot's heartbeat or recovery lease is recent; an expired slot with a damaged journal is released, its journal reads as never initialized, and a new node registers in it
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: fsck-release-slot-refusals
+    name: fsck slot release refusals
+    description: Release refuses a slot number the registry lacks (ErrNoSuchSlot), a journal a mount can replay unless forced, an unreadable slot, and a superblock mount would reject
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotRefusals
+
+  - id: fsck-release-slot-lease
+    name: fsck slot release holds the recovery lease
+    description: A node that takes the slot before fsck's lease stops the release with the journal untouched; a node mounting during the lease takes another slot; a slot written during the lease is reported as reset but not free
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotLease
+
+  - id: fsck-release-slot-crash
+    name: fsck slot release survives a crash
+    description: After fsck crashes holding the lease, before or after the journal reset, mounts and peers skip the slot until the lease lapses; then a peer fails on the untouched damaged journal, or frees the slot after replaying the reset one
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotCrash
+
+  - id: release-slot-slow-reset
+    name: Slot release gives up on a slow journal reset
+    description: When the journal reset outlasts half the recovery lease, ReleaseSlot leaves the slot dead under its lease instead of freeing it
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotGivesUpOnSlowReset
 
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust
@@ -1100,6 +1184,55 @@ scenarios:
     priority: go_only
     environments:
       go: internal/trim/trim_test.go::TestStatsAreThreadSafe
+
+  - id: trim-skip-reallocated
+    name: TRIM skips a reallocated block
+    description: A block freed and allocated again before the flush is not discarded
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimSkipsBlockReallocatedBeforeFlush
+
+  - id: trim-skip-remote-allocated
+    name: TRIM skips a block another node allocated
+    description: A freed block another node allocated before the flush is not discarded
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimSkipsBlockAnotherNodeAllocated
+
+  - id: trim-discard-free
+    name: TRIM discards free blocks
+    description: Blocks still free at flush time are discarded
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimDiscardsFreedBlocks
+
+  - id: trim-batch-flush-from-free
+    name: TRIM batch flush from Free
+    description: A full batch flushes in the background without deadlocking Free on the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimBatchFlushFromFree
+
+  - id: trim-discard-without-lock
+    name: TRIM discard without the bitmap lock
+    description: With real locks on two nodes, a block being discarded stays reserved and the other node keeps allocating
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimDiscardHoldsNoBitmapLock
+
+  - id: trim-release-after-slow-discard
+    name: TRIM frees reserved blocks after a slow discard
+    description: Reserved blocks are freed even when the flush context ran out during the discard and another node holds the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/bitmap/trim_test.go::TestTrimReleasesReservationAfterSlowDiscard
+
+  - id: trim-duplicate-block
+    name: TRIM duplicate block
+    description: A block queued twice is discarded once
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestDuplicateBlockDiscardedOnce
 
   # ===========================================================================
   # SPACE REPORTING TESTS (Phase 5: Thin Provisioning)
@@ -1474,6 +1607,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestConfigDefaults
+
+  - id: broadcast-dedup-per-sender
+    name: Broadcast dedup per sender
+    description: The same sequence number from two senders is processed twice
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestSameSequenceFromTwoSenders
+
+  - id: broadcast-hmac-every-byte
+    name: Broadcast HMAC covers every byte
+    description: Flipping any bit, appending a byte or stripping the HMAC is rejected
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::TestHMACCoversEveryByte
+
+  - id: broadcast-truncation
+    name: Broadcast truncated messages
+    description: Every truncation of a message is rejected
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::TestTruncatedMessageRejected
+
+  - id: broadcast-single-datagram
+    name: Broadcast message fits one datagram
+    description: The largest message fits a 1500-byte MTU without fragmentation
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::TestLargestMessageFitsOneDatagram
+
+  - id: broadcast-fuzz-unmarshal
+    name: Broadcast Unmarshal fuzz
+    description: Accepted signed datagrams are exactly what Marshal produces
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/integrity_test.go::FuzzUnmarshal
 
   # ---------------------------------------------------------------------------
   # Broadcast Integration Tests (end-to-end cross-node invalidation)
@@ -1864,6 +2032,44 @@ scenarios:
       docker: run-tests.sh::test_snapshot_delete_after_overwrite
       vm: run-vm-tests.sh::test_snapshot_delete_after_overwrite
 
+  - id: snapshot-during-inplace-write
+    name: Snapshot between an in-place write's decision and its data
+    description: Node A decides to write a never-shared or once-shared block in place, node B snapshots the file before A writes; A finds the block shared under the inode lock, copies it, and the snapshot keeps the old data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotDuringInPlaceWriteAcrossNodes
+
+  - id: cow-keeps-concurrent-inplace-write
+    name: Copy-on-write keeps an in-place write landing on another node
+    description: Node A is writing a block in place when node B's snapshot counts it and node C copies it; C copies the data only under the exclusive inode lock, after A's write landed, so neither write is lost
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsConcurrentInPlaceWrite
+
+  - id: failed-write-frees-unused-copy
+    name: A failed write gives back its unused copy
+    description: A write that copied a shared block and fails before any inode write frees the copy, and the file keeps its old block and data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestFailedWriteFreesUnusedCopy
+
+  - id: snapshot-share-retry
+    name: Snapshot retries when the file changes while it is shared
+    description: A write, copy, truncate or append between a snapshot counting the blocks and marking the file shared makes the snapshot undo the counts and retry; it shares the changed file and no block leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotRetriesWhenFileChangesWhileSharing
+
+  - id: snapshot-during-writes-across-nodes
+    name: Snapshots on one node while another overwrites the file
+    description: Every snapshot node B takes while node A overwrites the file chunk by chunk shows one moment of the file and never changes afterwards
+    priority: high
+    # Skipped in all three suites until #29: two nodes can both hold the refcount lock and lose a count.
+    environments:
+      go: snapshot_test.go::TestSnapshotsDuringWritesAcrossNodes
+      docker: run-tests.sh::test_snapshot_during_writes
+      vm: run-vm-tests.sh::test_snapshot_during_writes
+
   - id: snapshot-concurrent-creates-across-nodes
     name: Concurrent snapshots on two nodes
     description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's
@@ -2061,3 +2267,42 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles
+
+  # ===========================================================================
+  # HTTP API (one process on one host; Docker and VM would test nothing more)
+  # ===========================================================================
+
+  - id: api-health-loopback
+    name: API answers /health on loopback
+    description: A mount started with -api-addr on 127.0.0.1 serves GET /health with 200
+    priority: go_only
+    environments:
+      go: api_test.go::TestAPIServesHealthOnLoopback
+
+  - id: api-refuses-remote-without-token
+    name: Mount refuses an unauthenticated remote API
+    description: With -api-addr on all interfaces and no -api-token, mount exits non-zero naming -api-token and never writes the device
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountRefusesUnauthenticatedRemoteAPI
+
+  - id: mount-version-flag
+    name: Mount prints its version
+    description: goclusterfs-mount -version exits 0 and prints the version string
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountPrintsVersion
+
+  - id: broadcast-secret-warning
+    name: Mount warns about unauthenticated broadcast
+    description: With broadcast on and no -broadcast-secret, mount logs a WARNING line; with a secret or -broadcast=false it does not
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountWarnsWithoutBroadcastSecret
+
+  - id: api-settings-checked-before-device
+    name: Mount rejects bad API settings early
+    description: An -api-addr without a port, an invalid -api-cors, -api-cors * without a token, or an -api-rate-limit that is negative, NaN, infinite or too large stop mount before it opens the device
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice

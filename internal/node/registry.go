@@ -53,6 +53,20 @@ const (
 	NodeStateDead    NodeState = 3 // Node failed (detected by others)
 )
 
+func (s NodeState) String() string {
+	switch s {
+	case NodeStateEmpty:
+		return "empty"
+	case NodeStateActive:
+		return "active"
+	case NodeStateLeaving:
+		return "leaving"
+	case NodeStateDead:
+		return "dead"
+	}
+	return fmt.Sprintf("unknown(%d)", uint32(s))
+}
+
 // Slot represents a node's on-disk registration entry.
 // Size: 4096 bytes (sector-aligned for O_DIRECT atomic writes)
 type Slot struct {
@@ -654,6 +668,11 @@ func serializeSlot(slot *Slot) []byte {
 	return buf
 }
 
+// ParseSlot decodes one raw registry slot.
+func ParseSlot(buf []byte) (*Slot, error) {
+	return deserializeSlot(buf)
+}
+
 // deserializeSlot parses a Slot from bytes.
 func deserializeSlot(buf []byte) (*Slot, error) {
 	if len(buf) < SlotSize {
@@ -874,6 +893,55 @@ func (r *Registry) clearFailedSlot(slotIdx int, uuid [16]byte) error {
 	}
 	_, err = r.casSlot(slotIdx, serializeSlot(slot), serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
 	return err
+}
+
+// releaseLeaseBudget is how long ReleaseSlot trusts its recovery lease before
+// it frees the slot, well inside recoveryLease so peers' clocks have room.
+var releaseLeaseBudget = recoveryLease / 2
+
+// ReleaseSlot frees slot slotIdx, whose node will not return, if the slot
+// still holds expected, the raw bytes the caller checked. Like a peer that
+// replays a crashed node's journal, it first takes the slot's recovery lease,
+// so neither Register nor failure detection touches the slot while reset
+// clears its journal; then it empties the slot. It returns false without
+// running reset if the slot changed or another node won the lease.
+func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error) (bool, error) {
+	if slotIdx < 0 || slotIdx >= MaxNodes {
+		return false, fmt.Errorf("slot index out of range: %d", slotIdx)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	slot, err := deserializeSlot(expected)
+	if err != nil {
+		return false, err
+	}
+	slot.Magic = SlotMagic
+	slot.State = NodeStateDead
+	slot.RecoveryOwner = r.localUUID
+	leaseStart := time.Now()
+	slot.RecoveryStart = leaseStart.Unix()
+	leased := serializeSlot(slot)
+	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
+		return false, err
+	}
+	time.Sleep(claimSettle)
+	if current, _, err := r.readSlotRaw(slotIdx); err != nil || !bytes.Equal(current, leased) {
+		return false, err
+	}
+
+	if err := reset(); err != nil {
+		return false, err
+	}
+	if age := time.Since(leaseStart); age > releaseLeaseBudget {
+		return false, fmt.Errorf("the journal reset took %s, too long to trust the slot's recovery lease; "+
+			"the slot stays dead until the lease lapses", age.Round(time.Millisecond))
+	}
+	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
+	if err == nil && !ok {
+		err = fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
+	}
+	return ok, err
 }
 
 // GetFailedNodes returns information about nodes that have failed (stale heartbeat).
