@@ -133,7 +133,7 @@ Mount logs each write at INFO with the client address, the action, its arguments
 
 ## HTTP API Statistics
 
-Mount copies its managers' counters every second and reads the block bitmap and node registry from the device every 15 seconds. Requests get the latest copy, so `/metrics` and `/api/v1/...` never read the device. Capacity and cluster data can be 15 seconds old; `df` reads the device on every call. Counters start at zero when the mount starts and count this node only. Times are RFC 3339 in UTC.
+Mount copies its managers' counters every second. While requests read capacity or cluster data (`/metrics`, `/api/v1/status`, `/api/v1/stats/cluster`, `/api/v1/stats/all`), it also reads the block bitmap and node registry from the device every 15 seconds. Requests get the latest copy, so they never read the device. Capacity and cluster data can be 15 seconds old, and after a quiet period the first request returns the data from before it and starts a new read. `df` reads the device on every call. Counters start at zero when the mount starts and count this node only. Times are RFC 3339 in UTC.
 
 | Endpoint | Returns |
 |----------|---------|
@@ -141,8 +141,8 @@ Mount copies its managers' counters every second and reads the block bitmap and 
 | `/api/v1/stats` | `cache` and `journal`, as below |
 | `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `hits`, `misses` and `hit_rate` (0 to 1) |
 | `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
-| `/api/v1/stats/trim` | `trim_enabled`. With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges), `last_trim_at` and `batch_size`. On a device or image file that cannot discard, ranges still count as discarded |
-| `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests still waiting), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate` |
+| `/api/v1/stats/trim` | `trim_enabled`, false with `-trim=false` or after the device refused a discard as unsupported (image files always do). With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges, plus flushes skipped because the freed blocks could not be reserved), `last_trim_at` and `batch_size` |
+| `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate` |
 | `/api/v1/stats/cluster` | This node's `node_id` (UUID in hex), `node_address` (hostname), `state`, `last_heartbeat_at` and `joined_at`; `cluster_size` (registered nodes); `healthy_nodes` (active with a heartbeat under 10 seconds old); and `peers`, each with `node_id`, `address` (hostname), `state` and `last_seen`. A state is `active`, `leaving`, `dead`, or `stale` when the heartbeat is over 10 seconds old and no node has declared it dead yet. `role` is always `peer`: there is no leader |
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
 | `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |

@@ -56,9 +56,12 @@ type Sampler struct {
 	counterEvery time.Duration
 	deviceEvery  time.Duration
 
-	current  api.AllStatsResponse
-	all      atomic.Pointer[api.AllStatsResponse]
-	capacity atomic.Pointer[api.CapacityInfo]
+	current    api.AllStatsResponse
+	lastDevice time.Time
+	all        atomic.Pointer[api.AllStatsResponse]
+	capacity   atomic.Pointer[api.CapacityInfo]
+	wanted     atomic.Bool
+	nudge      chan struct{}
 
 	stop     chan struct{}
 	done     chan struct{}
@@ -77,6 +80,7 @@ func startSampler(src Sources, counterEvery, deviceEvery time.Duration) *Sampler
 		src:          src,
 		counterEvery: counterEvery,
 		deviceEvery:  deviceEvery,
+		nudge:        make(chan struct{}, 1),
 		stop:         make(chan struct{}),
 		done:         make(chan struct{}),
 	}
@@ -106,7 +110,14 @@ func (s *Sampler) run() {
 		case <-counters.C:
 			s.sampleCounters()
 		case <-device.C:
-			s.sampleDevice()
+			if s.wanted.Swap(false) {
+				s.sampleDevice()
+			}
+		case <-s.nudge:
+			if time.Since(s.lastDevice) >= s.deviceEvery {
+				s.wanted.Store(false)
+				s.sampleDevice()
+			}
 		}
 	}
 }
@@ -131,7 +142,10 @@ func (s *Sampler) sampleCounters() {
 	s.publish()
 }
 
+// sampleDevice runs only when a request read capacity or cluster data since the
+// last device sample, so an idle mount does not scan the bitmap.
 func (s *Sampler) sampleDevice() {
+	s.lastDevice = time.Now()
 	if s.src.Blocks != nil {
 		s.capacity.Store(capacityInfo(s.src.Blocks.TotalBlocks(), s.src.Blocks.FreeCount(), s.src.BlockSize))
 	}
@@ -140,6 +154,17 @@ func (s *Sampler) sampleDevice() {
 		s.current.Cluster = clusterResponse(s.src.Nodes.LocalUUID(), s.src.Nodes.LocalSlot(), slots, time.Now())
 	}
 	s.publish()
+}
+
+// wantDevice asks for a device sample at the next tick, or right away when the
+// last one is older than the device interval.
+func (s *Sampler) wantDevice() {
+	if !s.wanted.Swap(true) {
+		select {
+		case s.nudge <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (s *Sampler) publish() {
@@ -151,11 +176,22 @@ func (s *Sampler) CacheStats() *api.CacheStatsResponse     { return s.all.Load()
 func (s *Sampler) JournalStats() *api.JournalStatsResponse { return s.all.Load().Journal }
 func (s *Sampler) TrimStats() *api.TrimStatsResponse       { return s.all.Load().Trim }
 func (s *Sampler) LockStats() *api.LockStatsResponse       { return s.all.Load().Lock }
-func (s *Sampler) ClusterInfo() *api.ClusterInfoResponse   { return s.all.Load().Cluster }
-func (s *Sampler) AllStats() *api.AllStatsResponse         { return s.all.Load() }
+
+func (s *Sampler) ClusterInfo() *api.ClusterInfoResponse {
+	s.wantDevice()
+	return s.all.Load().Cluster
+}
+
+func (s *Sampler) AllStats() *api.AllStatsResponse {
+	s.wantDevice()
+	return s.all.Load()
+}
 
 // SFBStats returns nil because SFB containers are disabled.
 func (s *Sampler) SFBStats() *api.SFBStatsResponse { return nil }
 
 // Capacity returns the block bitmap's counts from the last device sample.
-func (s *Sampler) Capacity() *api.CapacityInfo { return s.capacity.Load() }
+func (s *Sampler) Capacity() *api.CapacityInfo {
+	s.wantDevice()
+	return s.capacity.Load()
+}

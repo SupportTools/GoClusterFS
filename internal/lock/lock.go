@@ -237,7 +237,7 @@ type Manager struct {
 // Stats counts this node's lock activity.
 type Stats struct {
 	Held          int // lock keys this node holds
-	Waiting       int // Acquire calls not yet granted
+	Waiting       int // Acquire calls whose first attempt found the lock taken
 	HintCacheSize int
 	HintHits      uint64
 	HintMisses    uint64
@@ -400,8 +400,6 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		return err
 	}
 	m.mu.Unlock()
-	m.waiting.Add(1)
-	defer m.waiting.Add(-1)
 
 	retryCount := 0
 	startTime := time.Now()
@@ -433,6 +431,10 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		}
 
 		retryCount++
+		if retryCount == 1 {
+			m.waiting.Add(1)
+			defer m.waiting.Add(-1)
+		}
 
 		// Check context cancellation, but allow at least 3 retries. A caller whose
 		// context never ends still gives up after acquireTimeout.
