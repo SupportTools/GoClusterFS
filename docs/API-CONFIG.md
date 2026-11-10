@@ -124,7 +124,7 @@ Snapshots belong to single files. A request names the file by its path in the mo
 | `POST /api/v1/admin/force-trim` | | Discards the queued TRIM blocks now | 200 |
 | `POST /api/v1/admin/clear-cache` | | Drops this node's inode, extent and negative caches | 200 |
 
-The snapshot and clone endpoints call `setxattr` on the file through the mount, so they take exactly the path `setfattr` takes. Clones go in the root directory only. Admin endpoints act on this node only.
+The snapshot and clone endpoints call `setxattr` on the file through the mount, so they take exactly the path `setfattr` takes. Delete marks the snapshot `deleting` and returns; the snapshot worker frees its blocks and removes it from the list shortly after, as with `setfattr -n user.snapshot.delete`. Clones go in the root directory only. Admin endpoints act on this node only.
 
 Errors answer with `{error, code, details}`: 400 for a bad path, name, destination or body; 413 for a body over 64 KB; 404 when the file or snapshot does not exist; 409 when the name exists, the file is busy, or the feature is off (`-snapshots=false`, `-journal=false`, `-trim=false`) or the file has old-style sharing that needs `goclusterfs-fsck -repair`; 507 when the device is full; 503 when the filesystem is no longer mounted; 501 when the kernel lacks `openat2` (before Linux 5.6).
 

@@ -183,8 +183,15 @@ func TestAPISnapshotLifecycle(t *testing.T) {
 	}
 
 	m.mustCall(t, http.StatusOK, "DELETE", "/api/v1/snapshots/s1?path=/data", nil)
-	if names := snapshotNames(t, m.mustCall(t, http.StatusOK, "GET", "/api/v1/snapshots", nil)); len(names) != 0 {
-		t.Fatalf("snapshots after delete = %v, want none", names)
+	// The snapshot worker drops the snapshot after DELETE returns; until then it lists as deleting.
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(100 * time.Millisecond) {
+		names := snapshotNames(t, m.mustCall(t, http.StatusOK, "GET", "/api/v1/snapshots", nil))
+		if len(names) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshots 15 s after delete = %v, want none", names)
+		}
 	}
 	if !strings.Contains(m.log.String(), "api write: client=127.0.0.1 action=snapshot.create") {
 		t.Error("mount did not log the snapshot write")
