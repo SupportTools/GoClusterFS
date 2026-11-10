@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
 - Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
 - Snapshots made by older versions captured no data. They still list and delete, but cloning one fails with `ENOTSUP`.
+- `-skip-recovery` now takes the slot number from the recovery error, as `-skip-recovery=N`, and discards a journal only when the mount takes slot N. A bare `-skip-recovery` is a usage error.
 
 ### Added
 

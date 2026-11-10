@@ -569,72 +569,50 @@ func (m *Manager) NeedsCoW(ctx context.Context, ext *Extent, refcountReg *refcou
 	return entry.NeedsCoW(), nil
 }
 
-// CopyOnWrite performs copy-on-write for the shared block at logicalBlock.
-// It allocates a new block, copies the data, and maps just that block to the
-// copy, splitting a multi-block extent if needed. On a copy, ext is updated to
-// the new single-block mapping.
-// The caller must decrement the old block's refcount after this returns.
-func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent,
-	logicalBlock uint64, dataOffset uint64, refcountReg *refcount.Region) (*CoWResult, error) {
-
+// MapCopy allocates a block for a copy of logical block logicalBlock of ino
+// and maps the block there alone, without copying the data. The caller copies
+// it with CopyBlockData before the inode write commits the mapping.
+func (m *Manager) MapCopy(ctx context.Context, ino *inode.Inode, logicalBlock uint64) (*CoWResult, error) {
 	cur, offset, err := m.Lookup(ino, logicalBlock)
 	if err != nil {
 		return nil, err
 	}
-	result := &CoWResult{
-		OldPhysBlock: cur.PhysicalBlock + offset,
-		Uncounted:    cur.Flags&FlagShared != 0 && cur.Flags&FlagCounted == 0,
-	}
-	block := Extent{logicalBlock, result.OldPhysBlock, 1, cur.Flags}
-
-	needsCoW, err := m.NeedsCoW(ctx, &block, refcountReg)
-	if err != nil {
-		return nil, err
-	}
-	if !needsCoW {
-		result.NewPhysBlock = result.OldPhysBlock
-		return result, nil
-	}
-
-	log.Printf("[CoW] Block %d is shared, performing copy-on-write", result.OldPhysBlock)
-
 	newBlocks, err := m.bitmap.Alloc(ctx, 1)
 	if err != nil {
 		return nil, fmt.Errorf("CoW alloc failed: %w", err)
 	}
-	newPhysBlock := newBlocks[0]
-
-	buf := storage.GetBuffer(BlockSize)
-	defer storage.PutBuffer(buf)
-
-	oldOffset := int64(dataOffset + result.OldPhysBlock*BlockSize)
-	newOffset := int64(dataOffset + newPhysBlock*BlockSize)
-
-	if _, err := m.dev.ReadAt(buf.Bytes(), oldOffset); err != nil {
-		m.bitmap.Free(ctx, newPhysBlock)
-		return nil, fmt.Errorf("CoW read failed: %w", err)
-	}
-	if _, err := m.dev.WriteAt(buf.Bytes(), newOffset); err != nil {
-		m.bitmap.Free(ctx, newPhysBlock)
-		return nil, fmt.Errorf("CoW write failed: %w", err)
-	}
-
-	private := Extent{logicalBlock, newPhysBlock, 1, cur.Flags &^ (FlagShared | FlagCounted)}
+	private := Extent{logicalBlock, newBlocks[0], 1, cur.Flags &^ (FlagShared | FlagCounted)}
 	if err := m.remap(ctx, ino, private); err != nil {
-		m.bitmap.Free(ctx, newPhysBlock)
+		m.bitmap.Free(ctx, newBlocks[0])
 		return nil, err
 	}
 	// The caller releases the old block after the inode write, so that write
 	// must fail if another node copied the block first.
 	ensurePending(ino)
-	*ext = private
 	// Readers keep cached block mappings until DataGeneration changes.
 	ino.DataGeneration++
+	return &CoWResult{
+		OldPhysBlock: cur.PhysicalBlock + offset,
+		NewPhysBlock: newBlocks[0],
+		WasShared:    true,
+		Uncounted:    cur.Flags&FlagShared != 0 && cur.Flags&FlagCounted == 0,
+	}, nil
+}
 
-	result.NewPhysBlock = newPhysBlock
-	result.WasShared = true
-	log.Printf("[CoW] Copied block %d -> %d", result.OldPhysBlock, newPhysBlock)
-	return result, nil
+// CopyBlockData copies the old block of a MapCopy into the new one. Unless the
+// file is the caller's alone, the caller holds the inode lock exclusively, so
+// no in-place write lands in the old block during the copy.
+func (m *Manager) CopyBlockData(c *CoWResult, dataOffset uint64) error {
+	buf := storage.GetBuffer(BlockSize)
+	defer storage.PutBuffer(buf)
+	if _, err := m.dev.ReadAt(buf.Bytes(), int64(dataOffset+c.OldPhysBlock*BlockSize)); err != nil {
+		return fmt.Errorf("CoW read failed: %w", err)
+	}
+	if _, err := m.dev.WriteAt(buf.Bytes(), int64(dataOffset+c.NewPhysBlock*BlockSize)); err != nil {
+		return fmt.Errorf("CoW write failed: %w", err)
+	}
+	log.Printf("[CoW] Copied block %d -> %d", c.OldPhysBlock, c.NewPhysBlock)
+	return nil
 }
 
 // remap points the logical blocks covered by x at x's physical blocks without

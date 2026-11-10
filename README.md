@@ -99,7 +99,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-journal` | `true` | Enable write-ahead journal |
-| `-skip-recovery` | `false` | Skip journal recovery on mount (dangerous) |
+| `-skip-recovery=N` | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous) |
 
 ### Network Broadcast Options
 

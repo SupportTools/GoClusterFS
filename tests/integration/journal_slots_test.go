@@ -17,7 +17,9 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 var (
@@ -193,7 +195,7 @@ func TestMountRefusesDamagedJournal(t *testing.T) {
 
 	skipped := &syncBuffer{}
 	node.Log = skipped
-	node.ExtraArgs = []string{"-skip-recovery"}
+	node.ExtraArgs = []string{"-skip-recovery=" + slot}
 	if err := cluster.StartNode(0, false); err != nil {
 		t.Fatalf("mount with -skip-recovery: %v", err)
 	}
@@ -209,6 +211,113 @@ func TestMountRefusesDamagedJournal(t *testing.T) {
 	if err := cluster.StartNode(0, false); err != nil {
 		t.Fatalf("mount after -skip-recovery started a new journal: %v", err)
 	}
+}
+
+// TestSkipRecoveryDiscardsOnlyNamedSlot damages the journal of another host's
+// crashed node, whose slot the mount then takes. -skip-recovery naming a
+// different slot must not discard it, also on a retry, when the slot already
+// carries this host's name from the failed mount. Naming the slot does.
+func TestSkipRecoveryDiscardsOnlyNamedSlot(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 1, 50)
+	mfs := cluster.Node(0)
+	formatted := &syncBuffer{}
+	mfs.Log = formatted
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start: %v", err)
+	}
+	slot := mustMatch(t, slotRe, formatted, "registration")
+	offset := mustMatch(t, journalInitRe, formatted, "journal init")
+	if err := cluster.KillNode(0); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+	moveSlotToOtherHost(t, cluster.ImagePath, slot)
+	damageJournalHeader(t, cluster.ImagePath, offset)
+	damaged := readImageSector(t, cluster.ImagePath, offset)
+
+	other := "1"
+	if slot == other {
+		other = "2"
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		out := &syncBuffer{}
+		mfs.Log = out
+		mfs.ExtraArgs = []string{"-skip-recovery=" + other}
+		if err := cluster.StartNode(0, false); err == nil {
+			t.Fatalf("attempt %d: -skip-recovery=%s mounted over slot %s's damaged journal", attempt, other, slot)
+		}
+		for _, want := range []string{
+			"ignoring -skip-recovery=" + other + ": this mount took slot " + slot,
+			"Journal recovery for slot " + slot + " failed",
+			"mount with -skip-recovery=" + slot,
+		} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("attempt %d: mount output lacks %q:\n%s", attempt, want, out.String())
+			}
+		}
+		if !bytes.Equal(readImageSector(t, cluster.ImagePath, offset), damaged) {
+			t.Fatalf("attempt %d: slot %s's journal changed", attempt, slot)
+		}
+	}
+
+	named := &syncBuffer{}
+	mfs.Log = named
+	mfs.ExtraArgs = []string{"-skip-recovery=" + slot}
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount with -skip-recovery=%s: %v", slot, err)
+	}
+	if got := mustMatch(t, journalInitRe, named, "journal init"); got != offset {
+		t.Errorf("-skip-recovery=%s started a journal at offset %s, want %s", slot, got, offset)
+	}
+}
+
+// moveSlotToOtherHost makes slot look like the slot of a node on another host
+// that crashed an hour ago.
+func moveSlotToOtherHost(t *testing.T, imagePath, slot string) {
+	t.Helper()
+	dev, err := storage.Open(imagePath)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatalf("read superblock: %v", err)
+	}
+	i, err := strconv.Atoi(slot)
+	if err != nil {
+		t.Fatalf("parse slot %q: %v", slot, err)
+	}
+
+	off := int64(sb.NodeRegistryOffset) + int64(i)*node.SlotSize
+	buf := storage.NewAlignedBuffer(node.SlotSize).Bytes()
+	if _, err := dev.ReadAt(buf, off); err != nil {
+		t.Fatalf("read slot %d: %v", i, err)
+	}
+	binary.LittleEndian.PutUint64(buf[32:40], uint64(time.Now().Add(-time.Hour).Unix()))
+	clear(buf[64:128])
+	copy(buf[64:128], "other-host")
+	binary.LittleEndian.PutUint32(buf[node.SlotSize-4:], storage.CRC32C(buf[:node.SlotSize-4]))
+	if _, err := dev.WriteAt(buf, off); err != nil {
+		t.Fatalf("write slot %d: %v", i, err)
+	}
+}
+
+func readImageSector(t *testing.T, imagePath, offset string) []byte {
+	t.Helper()
+	dev, err := storage.Open(imagePath)
+	if err != nil {
+		t.Fatalf("open image: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+	off, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil {
+		t.Fatalf("parse offset %q: %v", offset, err)
+	}
+	buf := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
+	if _, err := dev.ReadAt(buf, off); err != nil {
+		t.Fatalf("read offset %d: %v", off, err)
+	}
+	return buf
 }
 
 func damageJournalHeader(t *testing.T, imagePath, offset string) {
