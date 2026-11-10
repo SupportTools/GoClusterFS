@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -45,11 +46,30 @@ func TestLoadAPIToken(t *testing.T) {
 	if _, _, err := loadAPIToken(dir, ""); err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Errorf("directory: %v", err)
 	}
+	if _, _, err := loadAPIToken(write("big", strings.Repeat("x", maxTokenFile+1), 0o600), ""); err == nil || !strings.Contains(err.Error(), "longer than") {
+		t.Errorf("oversized file: %v", err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loadAPIToken(fifo, ""); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("FIFO: %v", err)
+	}
+	if os.Geteuid() != 0 {
+		if _, err := readTokenFile(good, os.Geteuid()+1); err == nil || !strings.Contains(err.Error(), "owned by uid") {
+			t.Errorf("file owned by another user: %v", err)
+		}
+	}
 
 	if tok, src, err := loadAPIToken("", "from-flag"); err != nil || tok != "from-flag" || src != tokenFromFlag {
 		t.Errorf("flag: %q %v %v", tok, src, err)
 	}
-	t.Setenv(apiTokenEnv, "from-env")
+	t.Setenv(apiTokenEnv, " \t")
+	if _, _, err := loadAPIToken("", ""); err == nil {
+		t.Error("whitespace-only env token accepted")
+	}
+	t.Setenv(apiTokenEnv, " from-env\n")
 	if tok, src, err := loadAPIToken("", ""); err != nil || tok != "from-env" || src != tokenFromEnv {
 		t.Errorf("env: %q %v %v", tok, src, err)
 	}

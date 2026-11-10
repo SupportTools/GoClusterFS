@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"syscall"
 )
 
 const apiTokenEnv = "GOCLUSTERFS_API_TOKEN"
@@ -24,7 +25,11 @@ const (
 // GOCLUSTERFS_API_TOKEN and -api-token. A token file must not be readable by
 // group or others: the token lets its holder change files as the mount's user.
 func loadAPIToken(file, flagValue string) (string, tokenSource, error) {
-	env := os.Getenv(apiTokenEnv)
+	raw := os.Getenv(apiTokenEnv)
+	env := strings.TrimSpace(raw)
+	if raw != "" && env == "" {
+		return "", tokenNone, errors.New(apiTokenEnv + " is only whitespace")
+	}
 	set := 0
 	for _, v := range []string{file, env, flagValue} {
 		if v != "" {
@@ -37,7 +42,7 @@ func loadAPIToken(file, flagValue string) (string, tokenSource, error) {
 
 	switch {
 	case file != "":
-		token, err := readTokenFile(file)
+		token, err := readTokenFile(file, os.Geteuid())
 		return token, tokenFromFile, err
 	case env != "":
 		return env, tokenFromEnv, nil
@@ -48,8 +53,12 @@ func loadAPIToken(file, flagValue string) (string, tokenSource, error) {
 	}
 }
 
-func readTokenFile(path string) (string, error) {
-	f, err := os.Open(path)
+const maxTokenFile = 4096
+
+// readTokenFile reads a token file that only uid (or root) owns and can read.
+// O_NONBLOCK keeps a FIFO at that path from blocking startup.
+func readTokenFile(path string, uid int) (string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", fmt.Errorf("-api-token-file: %w", err)
 	}
@@ -64,9 +73,15 @@ func readTokenFile(path string) (string, error) {
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		return "", fmt.Errorf("-api-token-file %s has mode %04o, readable by group or others; run chmod 600 %s", path, perm, path)
 	}
-	data, err := io.ReadAll(io.LimitReader(f, 4096))
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != uid && st.Uid != 0 {
+		return "", fmt.Errorf("-api-token-file %s is owned by uid %d; it must belong to uid %d or root", path, st.Uid, uid)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxTokenFile+1))
 	if err != nil {
 		return "", fmt.Errorf("-api-token-file: %w", err)
+	}
+	if len(data) > maxTokenFile {
+		return "", fmt.Errorf("-api-token-file %s is longer than %d bytes", path, maxTokenFile)
 	}
 	token := strings.TrimSpace(string(data))
 	if token == "" {
