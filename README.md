@@ -139,6 +139,7 @@ With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at 
 | `-api-addr` | `127.0.0.1:8080` | API listen address |
 | `-api-token` | (empty) | Bearer token required on `/api/v1/...` |
 | `-api-cors` | (empty) | Comma-separated CORS allowed origins |
+| `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
 
 The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and `-api-token` is empty. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
 
