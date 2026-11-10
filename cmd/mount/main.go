@@ -8,12 +8,14 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/supporttools/GoClusterFS/internal/api"
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/cache"
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
@@ -29,7 +31,64 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
+	"github.com/supporttools/GoClusterFS/internal/version"
 )
+
+// fsStatusProvider implements api.StatusProvider by wrapping the filesystem.
+type fsStatusProvider struct {
+	mountPath  string
+	devicePath string
+	dev        *storage.Device
+	bitmapMgr  *bitmap.Region
+}
+
+func (p *fsStatusProvider) MountPath() string  { return p.mountPath }
+func (p *fsStatusProvider) DevicePath() string { return p.devicePath }
+
+func (p *fsStatusProvider) MountState() api.MountState {
+	// If we get here, the filesystem is mounted and running
+	return api.MountStateMounted
+}
+
+func (p *fsStatusProvider) Capacity() *api.CapacityInfo {
+	totalBlocks := p.bitmapMgr.TotalBlocks()
+	freeBlocks := p.bitmapMgr.FreeCount()
+	usedBlocks := totalBlocks - freeBlocks
+
+	const blockSize uint64 = 1024 * 1024 // 1MB blocks
+	totalBytes := totalBlocks * blockSize
+	usedBytes := usedBlocks * blockSize
+	freeBytes := freeBlocks * blockSize
+
+	var usedPercent float64
+	if totalBlocks > 0 {
+		usedPercent = float64(usedBlocks) / float64(totalBlocks) * 100
+	}
+
+	return &api.CapacityInfo{
+		TotalBytes:     totalBytes,
+		UsedBytes:      usedBytes,
+		FreeBytes:      freeBytes,
+		UsedPercent:    usedPercent,
+		TotalBlocks:    totalBlocks,
+		UsedBlocks:     usedBlocks,
+		FreeBlocks:     freeBlocks,
+		BlockSizeBytes: blockSize,
+	}
+}
+
+func apiConfig(addr, token, corsList string) api.Config {
+	var origins []string
+	for _, origin := range strings.Split(corsList, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+	return api.DefaultConfig().
+		WithListenAddr(addr).
+		WithAuthToken(token).
+		WithCORSOrigins(origins...)
+}
 
 func main() {
 	var (
@@ -38,7 +97,8 @@ func main() {
 		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
 		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
 			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes)", superblock.MinInodes, superblock.MaxInodes))
-		debug = flag.Bool("debug", false, "Enable FUSE debug output")
+		debug   = flag.Bool("debug", false, "Enable FUSE debug output")
+		showVer = flag.Bool("version", false, "Print version and exit")
 
 		// Cache configuration
 		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
@@ -66,13 +126,34 @@ func main() {
 
 		// Snapshot configuration
 		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
+
+		// API server configuration
+		apiEnabled = flag.Bool("api", true, "Enable HTTP API server for management")
+		apiAddr    = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs -api-token")
+		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled, loopback only)")
+		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
 	)
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println("goclusterfs-mount", version.String())
+		os.Exit(0)
+	}
 
 	if *devicePath == "" || *mountPoint == "" {
 		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n", os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(1)
+	}
+
+	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS)
+	if *apiEnabled {
+		if err := apiCfg.CheckExposure(); err != nil {
+			log.Fatalf("Refusing to start the API: %v. Set -api-token, set -api-addr to a loopback address such as 127.0.0.1:8080, or pass -api=false", err)
+		}
+	}
+	if *broadcastEnabled && *broadcastSecret == "" {
+		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to port %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort)
 	}
 
 	// Check mount point exists
@@ -351,12 +432,46 @@ func main() {
 		log.Fatalf("Failed to mount: %v", err)
 	}
 
+	// Start API server for management and monitoring
+	var apiServer *api.Server
+	if *apiEnabled {
+		var err error
+		apiServer, err = api.NewServer(apiCfg)
+		if err != nil {
+			log.Printf("Warning: Failed to create API server: %v", err)
+		} else {
+			apiServer.SetStatusProvider(&fsStatusProvider{
+				mountPath:  *mountPoint,
+				devicePath: *devicePath,
+				dev:        dev,
+				bitmapMgr:  bm,
+			})
+			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
+			if err := apiServer.Start(ctx); err != nil {
+				log.Printf("Warning: Failed to start API server: %v", err)
+				apiServer = nil
+			} else {
+				log.Printf("API server listening on %s (auth=%v, cors=%v)",
+					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
+			}
+		}
+	} else {
+		log.Println("API server: disabled")
+	}
+
 	// Handle signals for clean unmount
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
 		log.Println("Received signal, unmounting...")
+
+		// Stop API server first
+		if apiServer != nil {
+			if err := apiServer.Stop(); err != nil {
+				log.Printf("Warning: Failed to stop API server: %v", err)
+			}
+		}
 
 		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
 		nodeReg.Stop()
@@ -377,6 +492,13 @@ func main() {
 
 	// Wait for filesystem to be unmounted - this blocks until unmount
 	server.Wait()
+
+	// Stop API server
+	if apiServer != nil {
+		if err := apiServer.Stop(); err != nil {
+			log.Printf("Warning: Failed to stop API server on exit: %v", err)
+		}
+	}
 
 	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
 	nodeReg.Stop()

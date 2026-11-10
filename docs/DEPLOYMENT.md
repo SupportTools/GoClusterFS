@@ -63,7 +63,7 @@ newgrp fuse
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
 | Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
-| Ports | UDP 31337 (configurable) |
+| Ports | UDP 31337 (configurable). TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
 | Latency | < 10ms between nodes recommended |
 
 ---
@@ -87,7 +87,7 @@ sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
 ### Verify Build
 
 ```bash
-./goclusterfs-mount -h
+./goclusterfs-mount -version
 ./goclusterfs-fsck -version
 ```
 
@@ -416,6 +416,18 @@ openssl rand -hex 32
 ```
 
 See the [Security Model](OPERATIONS.md#security-model) for what this does and does not protect.
+
+Mount logs a `WARNING` line at startup when broadcast is on without a secret.
+
+### HTTP API Access
+
+The API listens on `127.0.0.1:8080` by default. To scrape `/metrics` or call the API from another host, set a token and a reachable address:
+
+```bash
+./goclusterfs-mount ... -api-addr :8080 -api-token "$(openssl rand -hex 32)"
+```
+
+Mount refuses a non-loopback `-api-addr` without `-api-token`. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
 
 ### Firewall Rules
 
