@@ -49,7 +49,7 @@ jobs:
           fi
 
       # Test images go on tmpfs: 4KB O_DIRECT writes on the runner's disk can take
-      # longer than the 10ms a lock record write is allowed.
+      # longer than the 20ms a lock record write is allowed.
       - name: Unit Tests
         shell: bash
         env:
