@@ -20,7 +20,7 @@ import (
 type MountedFS struct {
 	ImagePath  string
 	MountPoint string
-	ExtraArgs  []string  // Appended to the mount command by Mount
+	ExtraArgs  []string  // Appended to the mount command by Mount and FormatAndMount
 	Log        io.Writer // Also receives the mount process output when set
 	MountCmd   *exec.Cmd
 	BinaryPath string
@@ -236,6 +236,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	if debug {
 		args = append(args, "-debug")
 	}
+	args = append(args, m.ExtraArgs...)
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
 	m.MountCmd.Stdout = m.output()
