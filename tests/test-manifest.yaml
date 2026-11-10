@@ -2296,9 +2296,11 @@ scenarios:
   - id: api-health-loopback
     name: API answers /health on loopback
     description: A mount started with -api-addr on 127.0.0.1 serves GET /health with 200
-    priority: go_only
+    priority: high
     environments:
       go: api_test.go::TestAPIServesHealthOnLoopback
+      docker: TODO - the shell suites never query the HTTP API; needs curl in the test image and per-node -api-addr
+      vm: TODO - same reason as docker; the Alpine VMs also need curl
 
   - id: api-refuses-remote-without-token
     name: Mount refuses an unauthenticated remote API
@@ -2330,10 +2332,12 @@ scenarios:
 
   - id: api-stats-live-values
     name: API stats report live values
-    description: After writes, reads, a delete and a mkdir, /api/v1/stats/{cache,journal,lock,trim,all,cluster} and /metrics show non-zero counters, /stats/sfb answers 404, and a second node sees both nodes and the first node's blocks
-    priority: go_only
+    description: After writes, reads, a delete and a mkdir, /api/v1/stats/{cache,journal,lock,all,cluster} and /metrics show non-zero counters, TRIM reports itself disabled on an image file, /stats/sfb answers 404, and a second node sees both nodes and the first node's blocks
+    priority: high
     environments:
       go: api_stats_test.go::TestAPIStatsReportLiveValues
+      docker: TODO - same reason as api-health-loopback
+      vm: TODO - same reason as api-health-loopback; a VM test could also check TRIM counts on a real virtio disk
 
   - id: stats-sampler-serves-snapshot
     name: Stats requests never call the managers
@@ -2348,6 +2352,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/stats/sampler_test.go::TestSamplerRefreshesInBackgroundUntilStopped
+
+  - id: stats-sampler-idle
+    name: Idle stats sampler leaves the device alone
+    description: Without requests for capacity or cluster data, device ticks skip the bitmap and registry reads; the first such request starts a read at once
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestSamplerReadsDeviceOnlyWhenAsked
 
   - id: stats-cache-hit-rates
     name: Cache stats report hit rates as fractions
@@ -2386,7 +2397,7 @@ scenarios:
 
   - id: lock-stats-held-waiting
     name: Lock manager counts held and waiting locks
-    description: Stats reports the holder's lock and a blocked Acquire on another node until the lock is released
+    description: Stats reports the holder's lock and a blocked Acquire on another node until the lock is released; an uncontended Acquire never counts as waiting
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestStatsCountsHeldAndWaitingLocks
@@ -2397,6 +2408,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/trim/trim_test.go::TestStatsCountFailedDiscardsAndLastSuccess
+
+  - id: trim-unsupported-not-counted
+    name: TRIM on a device that cannot discard
+    description: EOPNOTSUPP or ENOTTY marks the device unsupported, stops the flush and counts nothing as discarded or failed
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestUnsupportedDeviceIsNotCountedAsDiscarded
+
+  - id: trim-refused-flush-error
+    name: TRIM counts a flush the bitmap guard refused
+    description: When the free-block guard fails, the flush discards nothing and DiscardErrors goes up by one
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestRefusedFlushCountsAsError
 
   - id: api-metrics-capacity
     name: /metrics exports capacity

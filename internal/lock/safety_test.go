@@ -445,7 +445,12 @@ func TestStatsCountsHeldAndWaitingLocks(t *testing.T) {
 	a := newTestNode(dev, 0, RecordSize, 1)
 	b := newTestNode(dev, 0, RecordSize, 2)
 
+	waitingDuringUncontended := -1
+	a.SetOnAcquire(func(LockType, uint64, LockMode) { waitingDuringUncontended = a.Stats().Waiting })
 	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
+	if waitingDuringUncontended != 0 {
+		t.Errorf("an uncontended Acquire counted as waiting: Waiting = %d inside it", waitingDuringUncontended)
+	}
 	if got := a.Stats(); got.Held != 1 || got.Waiting != 0 {
 		t.Fatalf("holder Stats = %+v, want Held 1, Waiting 0", got)
 	}

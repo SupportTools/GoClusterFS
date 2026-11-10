@@ -111,6 +111,9 @@ func TestTrimResponseCountsBytesAndLastDiscard(t *testing.T) {
 	if never := trimResponse(trim.Stats{}); never.LastTrimAt != "" {
 		t.Errorf("LastTrimAt before any discard = %q, want empty", never.LastTrimAt)
 	}
+	if unsupported := trimResponse(trim.Stats{Unsupported: true}); unsupported.TrimEnabled {
+		t.Error("a device that cannot discard should report TRIM as disabled")
+	}
 }
 
 func TestCapacityInfo(t *testing.T) {
@@ -207,6 +210,22 @@ func TestSamplerAnswersFromSnapshotWithoutCallingSources(t *testing.T) {
 	if all.CollectedAt == "" || all.Cache != s.CacheStats() || all.Cluster != s.ClusterInfo() || all.SFB != nil {
 		t.Errorf("AllStats = %+v", all)
 	}
+}
+
+func TestSamplerReadsDeviceOnlyWhenAsked(t *testing.T) {
+	b, n := &fakeBlocks{}, &fakeNodes{}
+	s := startSampler(Sources{Blocks: b, Nodes: n, BlockSize: 1}, time.Hour, 10*time.Millisecond)
+	defer s.Stop()
+
+	time.Sleep(100 * time.Millisecond)
+	if b.calls.Load() != 1 || n.calls.Load() != 1 {
+		t.Fatalf("idle sampler read the device: free=%d slots=%d times, want 1 each", b.calls.Load(), n.calls.Load())
+	}
+
+	b.free.Store(7)
+	s.Capacity()
+	waitFor(t, "a device sample after the request", func() bool { return b.calls.Load() >= 2 && n.calls.Load() >= 2 })
+	waitFor(t, "the new free count", func() bool { return s.Capacity().FreeBlocks == 7 })
 }
 
 func TestSamplerRefreshesInBackgroundUntilStopped(t *testing.T) {
