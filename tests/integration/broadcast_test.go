@@ -226,3 +226,45 @@ func TestBroadcastBidirectional(t *testing.T) {
 
 	t.Log("Bidirectional broadcast invalidation working correctly")
 }
+
+// TestBroadcastInvalidatesPeerCache checks that broadcast messages reach the
+// other node. Node 1 caches inodes for an hour, so a read through its open
+// file sees data node 0 appended only if a broadcast invalidated the inode.
+func TestBroadcastInvalidatesPeerCache(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	cluster.Node(1).ExtraArgs = []string{"-cache-ttl=1h"}
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("FormatAndStartFirst failed: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("StartNode(1) failed: %v", err)
+	}
+	node0, node1 := cluster.Node(0), cluster.Node(1)
+
+	first := []byte("written before node 1 opened the file\n")
+	if err := node0.WriteFile("grow.txt", first); err != nil {
+		t.Fatal(err)
+	}
+	f, err := node1.OpenFile("grow.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	buf := make([]byte, 128)
+	if n, _ := f.ReadAt(buf, 0); !bytes.Equal(buf[:n], first) {
+		t.Fatalf("node 1 read %q, want %q", buf[:n], first)
+	}
+
+	appended := []byte("appended by node 0\n")
+	if err := node0.WriteFileAt("grow.txt", appended, int64(len(first))); err != nil {
+		t.Fatal(err)
+	}
+	took, ok := waitFor(propagationTimeout, func() bool {
+		n, _ := f.ReadAt(buf, int64(len(first)))
+		return bytes.Equal(buf[:n], appended)
+	})
+	if !ok {
+		t.Fatalf("node 1 never read node 0's appended data through its open file within %v: no broadcast invalidated its cached inode", propagationTimeout)
+	}
+	t.Logf("Node 1 read the appended data after %v", took)
+}

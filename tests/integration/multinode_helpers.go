@@ -56,9 +56,11 @@ func NewMultiNodeCluster(t *testing.T, nodeCount, sizeMB int) *MultiNodeCluster 
 		sizeMB:    sizeMB,
 	}
 
-	// Create mount instances (but don't mount yet)
+	// Create mount instances (but don't mount yet), sharing one multicast port
+	ports := freeUDPPorts(t, nodeCount+1)
 	for i := 0; i < nodeCount; i++ {
 		cluster.Nodes[i] = NewMountedFSWithImage(t, imagePath)
+		cluster.Nodes[i].broadcastArgs = broadcastArgs(ports[0], ports[i+1])
 	}
 
 	// Register cleanup
