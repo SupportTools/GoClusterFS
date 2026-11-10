@@ -26,9 +26,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -250,6 +253,10 @@ type Manager struct {
 	// Record writes, and where the time of those that missed their window went.
 	writes, skippedWrites, lateWrites atomic.Uint64
 	missInProcess, missDevice         atomic.Int64
+	// writeGaps is a histogram of the time from a record CAS's read to its write finishing.
+	writeGaps   [numGapBuckets]atomic.Uint64
+	maxWriteGap atomic.Int64
+	acquires    [numLockTypes]acquireCounts
 }
 
 type lockKey struct {
@@ -395,6 +402,69 @@ func (m *Manager) WriteTimings() WriteTimings {
 	}
 }
 
+const numLockTypes = int(LockTypeExtent) + 1
+
+// acquireCounts says how one lock type's acquires on this node were served:
+// a key this goroutine's node already held, a join of a held record, a cached
+// record, a fresh claim with or without the settle wait, and tries that had to wait.
+type acquireCounts struct {
+	held, joined, cached, confirmed, unconfirmed, blocked atomic.Uint64
+}
+
+func (m *Manager) countAcquire(lockType LockType, pick func(*acquireCounts) *atomic.Uint64) {
+	if int(lockType) < numLockTypes {
+		pick(&m.acquires[lockType]).Add(1)
+	}
+}
+
+// Write gap histogram buckets grow by 20% from 10µs; the last one holds the rest.
+const (
+	numGapBuckets = 71
+	firstGapBound = 10 * time.Microsecond
+	gapGrowth     = 1.2
+)
+
+func gapBound(i int) time.Duration {
+	return time.Duration(float64(firstGapBound) * math.Pow(gapGrowth, float64(i)))
+}
+
+func (m *Manager) recordWriteGap(d time.Duration) {
+	i := 0
+	if d > firstGapBound {
+		i = min(int(math.Ceil(math.Log(float64(d)/float64(firstGapBound))/math.Log(gapGrowth))), numGapBuckets-1)
+	}
+	m.writeGaps[i].Add(1)
+	for {
+		cur := m.maxWriteGap.Load()
+		if int64(d) <= cur || m.maxWriteGap.CompareAndSwap(cur, int64(d)) {
+			return
+		}
+	}
+}
+
+// LogStats logs how this node's acquires were served and how long its record
+// writes took from read to write, the numbers ClaimSettleDelay and CacheGrace are tuned on.
+func (m *Manager) LogStats() {
+	t := m.WriteTimings()
+	log.Printf("lock: %d record writes, %d skipped and %d late; the missed ones spent %v waiting in this process and %v in the device",
+		t.Writes, t.Skipped, t.Late, t.InProcess, t.Device)
+	for typ := range m.acquires {
+		c := &m.acquires[typ]
+		counts := []uint64{c.held.Load(), c.joined.Load(), c.cached.Load(), c.confirmed.Load(), c.unconfirmed.Load(), c.blocked.Load()}
+		if slices.Max(counts) > 0 {
+			log.Printf("lock: type %d acquires: held=%d joined=%d cached=%d confirmed=%d unconfirmed=%d blocked=%d",
+				typ, counts[0], counts[1], counts[2], counts[3], counts[4], counts[5])
+		}
+	}
+	var gaps strings.Builder
+	for i := range m.writeGaps {
+		if n := m.writeGaps[i].Load(); n > 0 {
+			fmt.Fprintf(&gaps, " %d:%d", gapBound(i).Microseconds(), n)
+		}
+	}
+	log.Printf("lock: write gaps (us upper bound:count):%s max=%dus", gaps.String(), time.Duration(m.maxWriteGap.Load()).Microseconds())
+}
+
 // casTiming is where the time of one record CAS went.
 type casTiming struct {
 	readWait, read, between, writeWait, write time.Duration
@@ -433,6 +503,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 	m.mu.Lock()
 	if m.reuseHeldKeyLocked(key, mode, gid) {
 		m.mu.Unlock()
+		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.held })
 		return nil
 	}
 	if err := m.checkLockOrder(lockType); err != nil {
@@ -471,6 +542,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		}
 
 		retryCount++
+		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.blocked })
 
 		// Only a deadline, or DefaultTimeout, ends the wait: FUSE cancels a request's
 		// context whenever the caller gets a signal, and the caller expects the op to finish.
@@ -539,7 +611,13 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			held.refCount++
 			held.goroutines[gid]++
 			m.mu.Unlock()
+			m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.held })
 			return true, false, nil
+		}
+		if rec.keys == 0 {
+			m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.cached })
+		} else {
+			m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.joined })
 		}
 		rec.keys++
 		m.addHeldKeyLocked(key, recordID, mode, gid)
@@ -771,6 +849,7 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 				if ok, err := m.confirmClaim(recordID, mode, claim.Sequence); err != nil || !ok {
 					return false, err
 				}
+				m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
 				// Update hint with new sequence
 				m.hintCache.Put(recordID, &lockHint{
 					Sequence: claim.Sequence,
@@ -853,6 +932,11 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		if acquired, err = m.confirmClaim(recordID, mode, newRecord.Sequence); err != nil {
 			return false, err
 		}
+		if acquired {
+			m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
+		}
+	} else if acquired {
+		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.unconfirmed })
 	}
 
 	if acquired {
@@ -1141,6 +1225,9 @@ func (m *Manager) casRecordIf(recordID uint64, new *Record, window time.Duration
 		_, wt, err = m.dev.WriteAtBeforeTimed(buf.Bytes(), offset, start.Add(window))
 	}
 	t := casTiming{readWait: rt.Wait, read: rt.Syscall, between: writeCalled.Sub(readDone), writeWait: wt.Wait, write: wt.Syscall}
+	if err == nil {
+		m.recordWriteGap(age(start))
+	}
 	if err != nil {
 		if errors.Is(err, storage.ErrWriteDeadline) {
 			m.countMissedWrite(&m.skippedWrites, t)

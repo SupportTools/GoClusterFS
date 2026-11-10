@@ -79,7 +79,11 @@ jobs:
               echo "=== Orchestrator Logs ==="
               docker logs goclusterfs-orchestrator
 
-              # Stop remaining containers
+              # Nodes log their lock statistics when they unmount, so stop them before reading their logs.
+              docker compose -f tests/docker/docker-compose.test.yml stop node1 node2 node3 node4
+              for n in 1 2 3 4; do
+                docker logs goclusterfs-node$n 2>&1 | grep -E "lock: |\[WARN\] lock" > tests/docker/results/node$n-lock.log || true
+              done
               docker compose -f tests/docker/docker-compose.test.yml down
               exit $EXIT_CODE
             fi
