@@ -51,13 +51,16 @@ func NewServer(cfg Config) (*Server, error) {
 	// Register routes
 	s.registerRoutes()
 
-	// Build middleware chain (order: logging -> CORS -> auth)
-	handler := Chain(
-		s.router,
-		LoggingMiddleware,
+	// Build middleware chain (order: logging -> loopback Host check -> CORS -> auth)
+	middlewares := []Middleware{LoggingMiddleware}
+	if cfg.AuthToken == "" && cfg.LoopbackOnly() {
+		middlewares = append(middlewares, LoopbackHostMiddleware)
+	}
+	middlewares = append(middlewares,
 		CORSMiddleware(cfg.CORSOrigins),
 		AuthMiddleware(cfg.AuthToken, "/health", "/metrics"),
 	)
+	handler := Chain(s.router, middlewares...)
 
 	// Create HTTP server
 	s.server = &http.Server{
