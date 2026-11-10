@@ -127,7 +127,7 @@ head -c 16 /dev/device | hexdump -C
 
 **Cause**: A version 3 device lost its superblock, the first 4 KB. The node registry at 1 MB still holds the slots of the nodes that mounted it, so the data is likely intact.
 
-**Solution**: Do not run `-format`, which destroys the data. There is no tool to rebuild the superblock, so restore the device from backup.
+**Solution**: Do not run `-format`, which destroys the data. There is no tool to rebuild the superblock, so restore the device from backup. If you wiped the start of the device on purpose, `-format` is safe.
 
 ---
 

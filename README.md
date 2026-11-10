@@ -175,7 +175,7 @@ Run fsck on an unmounted device. The device is a positional argument, and flags 
 
 Exit codes follow fsck(8) and add up: `0` no errors, `1` errors repaired, `4` errors remain, `8` I/O failure or a check that could not finish or was refused, `16` usage error.
 
-`-repair` refuses to run while a node has the device mounted, or while a stopped node's journal still needs replay. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
+`-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
 
 ## Architecture
 

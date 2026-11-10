@@ -50,7 +50,8 @@ var (
 		"where all nodes share one journal, or its superblock was destroyed. This version cannot mount it. " +
 		"Copy the data off with the version that formatted it, then reformat with -format")
 	ErrDestroyedSuperblock = errors.New("device has GoClusterFS node slots but no superblock: its superblock was overwritten. " +
-		"There is no tool to rebuild it; restore the device from backup. Do not run -format, which destroys the data")
+		"There is no tool to rebuild it; restore the device from backup. Do not run -format, which destroys the data, " +
+		"unless you wiped the device on purpose")
 	ErrUnsupportedLayout = errors.New("superblock layout is not supported by this version")
 )
 

@@ -140,6 +140,45 @@ func TestFsckStopsOnBadLayout(t *testing.T) {
 	}
 }
 
+// With the bitmap and refcount offsets swapped, phase 5 would rebuild refcounts over the real bitmap.
+func TestFsckRepairRefusesLayoutMountRefuses(t *testing.T) {
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) {
+		s.BlockBitmapOffset, s.RefCountTableOffset = s.RefCountTableOffset, s.BlockBitmapOffset
+		sb = s
+	})
+	bitmap := make([]byte, storage.SectorSize)
+	bitmap[0] = 0x0f
+	binary.LittleEndian.PutUint32(bitmap[storage.SectorSize-4:], storage.CRC32C(bitmap[:storage.SectorSize-4]))
+	writeSector(t, dev, int64(sb.RefCountTableOffset), bitmap)
+	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
+
+	for _, dryRun := range []bool{true, false} {
+		opts := fsck.DefaultOptions()
+		opts.Output = &bytes.Buffer{}
+		opts.Mode, opts.DryRun = fsck.Repair, dryRun
+		r := fsck.New(dev, opts).Check()
+		text := r.AbortReason
+		for _, p := range r.Problems {
+			text += "\n" + p.String()
+		}
+		want, code := "repair refused: mount refuses this layout", fsck.ExitOperational
+		if dryRun {
+			want, code = "repair would refuse: mount refuses this layout", fsck.ExitUncorrected
+		}
+		if r.ExitCode() != code || !strings.Contains(text, want) {
+			t.Errorf("repair (dry run %v): exit %d, want %d with %q in:\n%s", dryRun, r.ExitCode(), code, want, text)
+		}
+	}
+	got := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := dev.ReadAt(got.Bytes(), int64(sb.RefCountTableOffset)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), bitmap) {
+		t.Error("repair changed the bitmap sector a swapped layout calls the refcount table")
+	}
+}
+
 func TestFsckRepairRefusesInUseFilesystem(t *testing.T) {
 	var sb *superblock.Superblock
 	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })

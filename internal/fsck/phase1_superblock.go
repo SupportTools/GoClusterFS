@@ -92,6 +92,7 @@ func (c *Checker) checkSuperblock() error {
 	}
 	c.checkJournalSlots(sb)
 	if err := sb.layout().CheckLayout(int64(devSize)); err != nil {
+		c.layoutErr = err
 		c.addProblem(PhaseSuperblock, Error, "layout", "mount refuses this layout: "+err.Error(), false)
 	}
 
