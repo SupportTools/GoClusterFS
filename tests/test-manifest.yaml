@@ -2255,6 +2255,20 @@ scenarios:
   # HTTP API (one process on one host; Docker and VM would test nothing more)
   # ===========================================================================
 
+  - id: lock-acquire-without-deadline-gives-up
+    name: Acquire without a deadline gives up
+    description: An acquire whose context never ends returns ErrLockTimeout after DefaultTimeout instead of waiting forever
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestAcquireWithoutDeadlineGivesUp
+
+  - id: lock-timeout-logs-holder
+    name: Timed-out acquire logs the holder
+    description: An acquire that gives up logs at WARN which node holds the record and how
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTimedOutAcquireLogsHolder
+
   - id: api-health-loopback
     name: API answers /health on loopback
     description: A mount started with -api-addr on 127.0.0.1 serves GET /health with 200
