@@ -267,6 +267,9 @@ in_test_group() {
     case "$1" in
         "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|"Inode Reuse Stale Read"|"Rolling Restart")
             group=2 ;;
+        # Takes about 14 minutes in CI, so it runs alone.
+        "More Than 4096 Files")
+            group=3 ;;
     esac
     [[ "$group" == "$TEST_GROUP" ]]
 }
