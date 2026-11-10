@@ -23,6 +23,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
+	"github.com/supporttools/GoClusterFS/internal/fileops"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
@@ -465,6 +466,8 @@ func main() {
 				bitmapMgr:  bm,
 			})
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
+			apiServer.SetFileService(fileops.New(*mountPoint, gfs.SnapshotRegistry()))
+			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start API server: %v", err)
 				apiServer.Stop()
@@ -472,6 +475,9 @@ func main() {
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
+				if !apiServer.WritesEnabled() {
+					log.Printf("API: snapshot, clone and admin endpoints are off; set -api-token to turn them on")
+				}
 			}
 		}
 	} else {
