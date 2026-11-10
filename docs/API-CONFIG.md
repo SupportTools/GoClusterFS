@@ -92,6 +92,8 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 
 The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status` and `GET /api/v1/stats/...`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` answers 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up`. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
 
+Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the dashboard's origin instead, for example `-api-cors http://localhost:5173`.
+
 By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty. The token is a command-line flag, so local users can read it with `ps`.
 
 Each mount on a host needs its own `-api-addr`. When the port is taken, mount logs a warning and runs without the API.

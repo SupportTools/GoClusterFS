@@ -532,6 +532,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 - To expose it, set `-api-addr` and `-api-token`. Mount refuses a non-loopback address without a token.
 - `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
+- Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
 - The API uses plain HTTP. Put a TLS proxy in front of it if the token crosses an untrusted network.
 - The token is a command-line flag, so local users can read it with `ps`.
 
