@@ -1316,9 +1316,9 @@ func TestNetworkPartition(t *testing.T) {
 	} else {
 		t.Log("Surviving nodes can write during partition")
 	}
-	// The killed node read the directory just before; a read hold it kept would block this create until it went stale (15s).
-	if took := time.Since(start); took > 5*time.Second {
-		t.Errorf("create during partition took %v, want under 5s", took)
+	// The killed node kept a read hold on the directory; survivors clear it once they prove the node dead, at the next 5s check.
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("create during partition took %v, want under 10s", took)
 	}
 
 	// Phase 4: Heal partition by restarting the isolated node

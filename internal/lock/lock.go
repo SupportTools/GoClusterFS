@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/bits"
 	"math/rand"
 	"runtime"
 	"slices"
@@ -132,8 +133,9 @@ type Record struct {
 	OwnerSlot   uint32     // Owner's slot in node registry
 	AcquireTime int64      // When lock was acquired (Unix timestamp)
 	Sequence    uint64     // Monotonic sequence for CAS
-	SharedCount uint32     // Number of shared lock holders (for shared mode)
-	Reserved    [4032]byte // Padding to 4096 bytes
+	SharedCount uint32     // Number of bits set in Readers
+	Readers     uint64     // One bit per registry slot whose node holds the record for reading
+	Reserved    [4024]byte // Padding to 4096 bytes
 	Checksum    uint32     // CRC32C of bytes 0-4091
 }
 
@@ -233,6 +235,8 @@ type Manager struct {
 	yieldUntil map[uint64]time.Time
 	// writeWindow is how long after its read a record write may finish; it must start within a quarter of that.
 	writeWindow time.Duration
+	// verifiers tracks background checks that cleared reader bits stay cleared.
+	verifiers sync.WaitGroup
 	// casWrite, when set by a test, replaces the device write of a record CAS.
 	casWrite func(buf []byte, offset int64, deadline time.Time) (int, error)
 
@@ -251,8 +255,8 @@ type Manager struct {
 	hintMisses uint64 // Optimistic acquires that failed (fell back to read)
 
 	// Record writes, and where the time of those that missed their window went.
-	writes, skippedWrites, lateWrites atomic.Uint64
-	missInProcess, missDevice         atomic.Int64
+	writes, skippedWrites, lateWrites, lateClaims atomic.Uint64
+	missInProcess, missDevice                     atomic.Int64
 	// writeGaps is a histogram of the time from a record CAS's read to its write finishing.
 	writeGaps   [numGapBuckets]atomic.Uint64
 	maxWriteGap atomic.Int64
@@ -405,10 +409,10 @@ func (m *Manager) WriteTimings() WriteTimings {
 const numLockTypes = int(LockTypeExtent) + 1
 
 // acquireCounts says how one lock type's acquires on this node were served:
-// a key this goroutine's node already held, a join of a held record, a cached
-// record, a fresh claim with or without the settle wait, and tries that had to wait.
+// a key this node already held, a join of a held record, a cached record, a
+// fresh claim (which waits out the settle delay), and tries that had to wait.
 type acquireCounts struct {
-	held, joined, cached, confirmed, unconfirmed, blocked atomic.Uint64
+	held, joined, cached, confirmed, blocked atomic.Uint64
 }
 
 func (m *Manager) countAcquire(lockType LockType, pick func(*acquireCounts) *atomic.Uint64) {
@@ -448,12 +452,13 @@ func (m *Manager) LogStats() {
 	t := m.WriteTimings()
 	log.Printf("lock: %d record writes, %d skipped and %d late; the missed ones spent %v waiting in this process and %v in the device",
 		t.Writes, t.Skipped, t.Late, t.InProcess, t.Device)
+	log.Printf("lock: %d late claims, each leaving its record alone for up to %v", m.lateClaims.Load(), StaleThreshold)
 	for typ := range m.acquires {
 		c := &m.acquires[typ]
-		counts := []uint64{c.held.Load(), c.joined.Load(), c.cached.Load(), c.confirmed.Load(), c.unconfirmed.Load(), c.blocked.Load()}
+		counts := []uint64{c.held.Load(), c.joined.Load(), c.cached.Load(), c.confirmed.Load(), c.blocked.Load()}
 		if slices.Max(counts) > 0 {
-			log.Printf("lock: type %d acquires: held=%d joined=%d cached=%d confirmed=%d unconfirmed=%d blocked=%d",
-				typ, counts[0], counts[1], counts[2], counts[3], counts[4], counts[5])
+			log.Printf("lock: type %d acquires: held=%d joined=%d cached=%d confirmed=%d blocked=%d",
+				typ, counts[0], counts[1], counts[2], counts[3], counts[4])
 		}
 	}
 	var gaps strings.Builder
@@ -482,6 +487,20 @@ func (m *Manager) countMissedWrite(counter *atomic.Uint64, t casTiming) {
 	counter.Add(1)
 	m.missInProcess.Add(int64(t.inProcess()))
 	m.missDevice.Add(int64(t.device()))
+}
+
+// lateWriteError is errLateWrite with how long the write took from its read.
+type lateWriteError struct{ took time.Duration }
+
+func (e lateWriteError) Error() string        { return fmt.Sprintf("%v after %v", errLateWrite, e.took) }
+func (e lateWriteError) Is(target error) bool { return target == errLateWrite }
+
+func lateWriteTook(err error) time.Duration {
+	var late lateWriteError
+	if errors.As(err, &late) {
+		return late.took
+	}
+	return 0
 }
 
 // Acquire attempts to acquire a lock with the given parameters.
@@ -743,12 +762,6 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if rec.mode == LockModeShared {
-		// Retaking a read hold costs no settle wait, and a node killed while keeping one would hold writers off until it went stale.
-		delete(m.records, recordID)
-		m.mu.Unlock()
-		return m.releaseRecord(recordID, rec.mode)
-	}
 	if age(rec.since) > cacheGrace {
 		// Held long enough: give other nodes a turn instead of keeping it.
 		delete(m.records, recordID)
@@ -812,6 +825,7 @@ func (m *Manager) ReleaseCached() {
 		})
 	}
 	wg.Wait()
+	m.verifiers.Wait()
 }
 
 // describeHolder says who holds a record, for logs.
@@ -829,9 +843,19 @@ func (m *Manager) describeHolder(recordID uint64) string {
 	case LockModeExclusive:
 		return fmt.Sprintf("is write-locked by %s, taken %v ago", who, held)
 	case LockModeShared:
-		return fmt.Sprintf("is read-locked by %d readers, latest %s, first taken %v ago", record.SharedCount, who, held)
+		return fmt.Sprintf("is read-locked by the nodes in registry slots %v, last taken %v ago", readerSlots(record.Readers), held)
 	}
 	return "is free"
+}
+
+func readerSlots(readers uint64) []int {
+	var slots []int
+	for slot := range 64 {
+		if readers&readerBit(slot) != 0 {
+			slots = append(slots, slot)
+		}
+	}
+	return slots
 }
 
 // tryAcquire attempts a single lock acquisition.
@@ -845,21 +869,17 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		if hint.Mode == LockModeNone {
 			acquired, claim, err := m.tryAcquireOptimistic(recordID, lockType, resourceID, mode, hint.Sequence)
 			if errors.Is(err, errLateWrite) {
-				m.giveUpLateClaim(recordID, claim)
+				m.giveUpLateClaim(recordID, claim, lateWriteTook(err))
 				return false, nil
 			}
 			if err != nil {
 				return false, err
 			}
 			if acquired {
-				if mode == LockModeExclusive {
-					if ok, err := m.confirmClaim(recordID, claim.Sequence); err != nil || !ok {
-						return false, err
-					}
-					m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
-				} else {
-					m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.unconfirmed })
+				if ok, err := m.confirmClaim(recordID, mode, claim.Sequence); err != nil || !ok {
+					return false, err
 				}
+				m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
 				// Update hint with new sequence
 				m.hintCache.Put(recordID, &lockHint{
 					Sequence: claim.Sequence,
@@ -882,25 +902,32 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 		return false, err
 	}
 
-	now := time.Now()
+	// Every claim writes the time: a reader's bit is cleared by its own release or,
+	// once its node is proven dead, by AdoptOwner, so readers may keep a record fresh.
+	newRecord := &Record{
+		Magic:       RecordMagic,
+		Type:        lockType,
+		Mode:        mode,
+		ResourceID:  resourceID,
+		OwnerUUID:   m.nodeUUID,
+		OwnerSlot:   uint32(m.nodeSlot),
+		AcquireTime: time.Now().Unix(),
+		Sequence:    record.Sequence + 1,
+	}
 
 	// A record held for a colliding resource is still held; taking it over lets two nodes hold it.
-	var sharedCount uint32
-	acquireTime := now.Unix()
 	reason := ""
 	switch {
-	case record.Mode == LockModeNone:
+	case record.Mode == LockModeNone, record.Mode == LockModeShared && record.Readers == 0:
 		reason = "free"
 
 	case m.isLockStale(record):
-		// Owner presumed dead; its shared holders are gone too.
+		// Owner presumed dead; its readers are gone too.
 		reason = "stale"
 
 	case mode == LockModeShared && record.Mode == LockModeShared:
-		reason = "shared_add"
-		sharedCount = record.SharedCount
-		// Keep the first reader's time: a count leaked by a lost CAS update must still go stale.
-		acquireTime = record.AcquireTime
+		reason = "join"
+		newRecord.Readers = record.Readers
 
 	case record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID:
 		// Leftover from a failed release or an earlier mount; this node holds no key on it.
@@ -912,41 +939,26 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 	}
 
 	log.Printf("[DEBUG] lock.tryAcquire: type=%d res=%d - canAcquire=true reason=%s", lockType, resourceID, reason)
-
-	// Prepare new record
-	newRecord := &Record{
-		Magic:       RecordMagic,
-		Type:        lockType,
-		Mode:        mode,
-		ResourceID:  resourceID,
-		OwnerUUID:   m.nodeUUID,
-		OwnerSlot:   uint32(m.nodeSlot),
-		AcquireTime: acquireTime,
-		Sequence:    record.Sequence + 1,
-	}
 	if mode == LockModeShared {
-		newRecord.SharedCount = sharedCount + 1
+		newRecord.Readers |= m.readerBit()
 	}
 
 	// CAS the record
 	acquired, err := m.casRecord(recordID, record, newRecord)
 	if errors.Is(err, errLateWrite) {
-		m.giveUpLateClaim(recordID, newRecord)
+		m.giveUpLateClaim(recordID, newRecord, lateWriteTook(err))
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	// Only write claims confirm: a read claim's bounded write lands before a racing writer's confirm re-read, which then fails.
-	if acquired && mode == LockModeExclusive {
-		if acquired, err = m.confirmClaim(recordID, newRecord.Sequence); err != nil {
+	if acquired {
+		if acquired, err = m.confirmClaim(recordID, mode, newRecord.Sequence); err != nil {
 			return false, err
 		}
 		if acquired {
 			m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.confirmed })
 		}
-	} else if acquired {
-		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.unconfirmed })
 	}
 
 	if acquired {
@@ -964,7 +976,10 @@ func (m *Manager) tryAcquire(recordID uint64, lockType LockType, resourceID uint
 // giveUpLateClaim leaves alone, until it is stale, a record whose claim write
 // finished late. The write may have replaced a claim another node confirmed, and
 // that node may still hold the lock while the record names this node.
-func (m *Manager) giveUpLateClaim(recordID uint64, written *Record) {
+func (m *Manager) giveUpLateClaim(recordID uint64, written *Record, took time.Duration) {
+	m.lateClaims.Add(1)
+	log.Printf("[WARN] lock: claim on type=%d res=%d (record %d) finished %v after its read; leaving the record alone until it is stale, up to %v",
+		written.Type, written.ResourceID, recordID, took, StaleThreshold)
 	if written.Mode == LockModeShared {
 		m.fenceLateReadClaim(recordID)
 	}
@@ -988,7 +1003,7 @@ func (m *Manager) fenceLateReadClaim(recordID uint64) {
 		fence.Mode = LockModeExclusive
 		fence.OwnerUUID = m.nodeUUID
 		fence.OwnerSlot = uint32(m.nodeSlot)
-		fence.SharedCount = 0
+		fence.Readers = 0
 		fence.Sequence++
 		ok, err := m.casRecordIf(recordID, &fence, fenceWindow, fenceWindow, func(seq uint64, _ LockMode) bool {
 			return seq == record.Sequence
@@ -1003,14 +1018,23 @@ func (m *Manager) fenceLateReadClaim(recordID uint64) {
 
 // confirmClaim waits out the window in which a node that read the record before
 // this node's claim landed can still overwrite it, then checks the claim survived.
-func (m *Manager) confirmClaim(recordID uint64, sequence uint64) (bool, error) {
+func (m *Manager) confirmClaim(recordID uint64, mode LockMode, sequence uint64) (bool, error) {
 	time.Sleep(claimSettleDelay)
 	record, err := m.readRecord(recordID)
 	if err != nil {
 		return false, err
 	}
+	if mode == LockModeShared {
+		// Readers on other nodes may have set their own bits since; only this node's matters.
+		return record.Mode == LockModeShared && record.Readers&m.readerBit() != 0, nil
+	}
 	return record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID && record.Sequence == sequence, nil
 }
+
+// readerBit is this node's bit in a record's Readers.
+func (m *Manager) readerBit() uint64 { return readerBit(m.nodeSlot) }
+
+func readerBit(slot int) uint64 { return 1 << (uint(slot) % 64) }
 
 // tryAcquireOptimistic attempts to acquire a lock using a cached sequence hint.
 // This saves one disk read when the hint is correct (common case for uncontended locks).
@@ -1031,7 +1055,7 @@ func (m *Manager) tryAcquireOptimistic(recordID uint64, lockType LockType, resou
 		Sequence:    newSeq,
 	}
 	if mode == LockModeShared {
-		newRecord.SharedCount = 1
+		newRecord.Readers = m.readerBit()
 	}
 
 	// Try direct CAS with expected sequence
@@ -1063,7 +1087,7 @@ func (m *Manager) renewRecord(recordID uint64, rec *heldRecord) error {
 			return err
 		}
 		if ok {
-			if ok, err = m.confirmClaim(recordID, renewed.Sequence); err != nil {
+			if ok, err = m.confirmClaim(recordID, LockModeExclusive, renewed.Sequence); err != nil {
 				return err
 			}
 		}
@@ -1092,15 +1116,13 @@ func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
 
 		var newRecord *Record
 		switch {
-		case mode == LockModeExclusive && record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID,
-			mode == LockModeShared && record.Mode == LockModeShared && record.SharedCount <= 1:
+		case mode == LockModeExclusive && record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID:
 			newRecord = &Record{Sequence: record.Sequence + 1}
 		case mode == LockModeShared && record.Mode == LockModeShared:
-			// OwnerUUID names only the latest reader, so readers release by count.
-			next := *record
-			next.SharedCount--
-			next.Sequence++
-			newRecord = &next
+			if record.Readers&m.readerBit() == 0 {
+				return nil
+			}
+			newRecord = withoutReader(record, m.readerBit())
 		default:
 			// Another node reclaimed the record after it went stale.
 			return ErrNotLockOwner
@@ -1116,6 +1138,9 @@ func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
 				Mode:     newRecord.Mode,
 				UpdateAt: time.Now(),
 			})
+			if mode == LockModeShared {
+				m.verifyReaderCleared(recordID, m.readerBit())
+			}
 			return nil
 		}
 		if attempt == maxRecordUpdates-1 {
@@ -1124,6 +1149,57 @@ func (m *Manager) releaseRecord(recordID uint64, mode LockMode) error {
 		}
 		updateBackoff(attempt)
 	}
+}
+
+// withoutReader is record with bit cleared from Readers, or a free record if no reader is left.
+func withoutReader(record *Record, bit uint64) *Record {
+	if record.Readers&^bit == 0 {
+		return &Record{Sequence: record.Sequence + 1}
+	}
+	next := *record
+	next.Readers &^= bit
+	next.Sequence++
+	return &next
+}
+
+// verifyReaderCleared checks, a settle delay after a reader bit was cleared,
+// that no concurrent update from another node put it back, and clears it again
+// if one did. It runs off the request path, under the record gate.
+func (m *Manager) verifyReaderCleared(recordID uint64, bit uint64) {
+	settle := claimSettleDelay
+	m.verifiers.Add(1)
+	go func() {
+		defer m.verifiers.Done()
+		for attempt := 0; attempt < maxRecordUpdates; attempt++ {
+			time.Sleep(settle)
+			if done := m.clearReaderAgain(recordID, bit); done {
+				return
+			}
+		}
+		log.Printf("[WARN] lock: reader bit %#x on record %d kept coming back; it clears once the record is stale", bit, recordID)
+	}()
+}
+
+// clearReaderAgain clears bit on recordID if a concurrent update put it back,
+// and reports whether nothing is left to check.
+func (m *Manager) clearReaderAgain(recordID uint64, bit uint64) bool {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	m.mu.Lock()
+	_, held := m.records[recordID]
+	m.mu.Unlock()
+	if held && bit == m.readerBit() {
+		return true
+	}
+	record, err := m.readRecord(recordID)
+	if err != nil || record.Mode != LockModeShared || record.Readers&bit == 0 {
+		return true
+	}
+	log.Printf("[DEBUG] lock: reader bit %#x came back on record %d; clearing it again", bit, recordID)
+	m.casRecord(recordID, record, withoutReader(record, bit))
+	return false
 }
 
 // isLockStale checks if a lock's owner is dead.
@@ -1243,7 +1319,7 @@ func (m *Manager) casRecordIf(recordID uint64, new *Record, startBy, finishBy ti
 	if took := age(start); took > finishBy {
 		m.countMissedWrite(&m.lateWrites, t)
 		log.Printf("[WARN] lock: record %d write finished %v after its read (%v)", recordID, took, t)
-		return true, errLateWrite
+		return true, lateWriteError{took}
 	}
 	return true, nil
 }
@@ -1260,7 +1336,8 @@ func serializeRecord(r *Record) []byte {
 	binary.LittleEndian.PutUint32(buf[32:36], r.OwnerSlot)
 	binary.LittleEndian.PutUint64(buf[40:48], uint64(r.AcquireTime))
 	binary.LittleEndian.PutUint64(buf[48:56], r.Sequence)
-	binary.LittleEndian.PutUint32(buf[56:60], r.SharedCount)
+	binary.LittleEndian.PutUint32(buf[56:60], uint32(bits.OnesCount64(r.Readers)))
+	binary.LittleEndian.PutUint64(buf[64:72], r.Readers)
 
 	// Checksum
 	checksum := storage.CRC32C(buf[:RecordSize-4])
@@ -1304,6 +1381,7 @@ func deserializeRecord(buf []byte) (*Record, error) {
 		AcquireTime: int64(binary.LittleEndian.Uint64(buf[40:48])),
 		Sequence:    sequence,
 		SharedCount: binary.LittleEndian.Uint32(buf[56:60]),
+		Readers:     binary.LittleEndian.Uint64(buf[64:72]),
 		Checksum:    stored,
 	}
 	copy(r.OwnerUUID[:], buf[16:32])

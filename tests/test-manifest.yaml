@@ -2231,13 +2231,6 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestStaleSharedLockReclaimResetsReaderCount
 
-  - id: lock-leaked-shared-count-goes-stale
-    name: Leaked reader count goes stale
-    description: New readers do not refresh a shared record's age, so a reader count leaked by a lost update cannot block writers forever
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
-
   - id: write-failure-keeps-committed-blocks
     name: Failed write keeps blocks committed mid-write
     description: When the final inode write fails after a mid-write persist committed a new block, the retry finds that block still allocated and mapped
@@ -2287,20 +2280,6 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
 
-  - id: lock-read-claim-skips-settle
-    name: Read claims skip the settle wait
-    description: A read claim on a free record does not wait out ClaimSettleDelay; a write claim does
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestReadClaimSkipsSettleWait
-
-  - id: lock-released-read-hold-free
-    name: Released read hold is free at once
-    description: A node does not keep a released read hold, so another node's writer takes the record without waiting
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestReleasedReadHoldIsFreeAtOnce
-
   - id: lock-concurrent-dir-reads-create
     name: Concurrent directory reads do not delay create or unlink
     description: Two nodes taking a shared claim on one directory at once leave no reader count behind, so a create or unlink there finishes within 2s
@@ -2335,6 +2314,34 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestClaimWriteFinishingWithinSettleDelayIsHeld
+
+  - id: lock-racing-read-claims-both-hold
+    name: Racing read claims both hold
+    description: When two nodes' read claims race and one overwrites the other's reader bit, the loser claims again, so a writer waits for both readers
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestRacingReadClaimsBothHold
+
+  - id: lock-lost-read-release-cleared-again
+    name: Lost read release is cleared again
+    description: A reader bit put back by another node's older update is cleared again after a settle delay, so writers do not wait until the record is stale
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLostReadReleaseIsClearedAgain
+
+  - id: lock-read-claim-replaced-by-writer
+    name: Read claim replaced by a writer is not held
+    description: A read claim that a racing write claim replaces fails its confirm, so the reader does not read beside the writer
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReadClaimReplacedByWriterIsNotHeld
+
+  - id: lock-adopt-owner-clears-dead-reader
+    name: Dead node's reader bit cleared on takeover
+    description: AdoptOwner clears a proven-dead node's reader bit, so a writer gets a record the dead node kept for reading
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerClearsDeadReader
 
   - id: lock-late-read-claim-admits-no-readers
     name: Late read claim admits no more readers

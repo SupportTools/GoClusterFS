@@ -14,12 +14,11 @@ const adoptSettle = 50 * time.Millisecond
 // holds and returns their IDs. Call it only once owner is proven dead, before
 // replaying owner's journal, and pass the result to ReleaseAdopted after the
 // replay: until then peers cannot take the locks of the dead node's unfinished
-// operations, while this node's own acquires reuse them.
-//
-// Shared records are left to the staleness rule: OwnerUUID names only the
-// latest reader, who may have released already while others still read.
-func (m *Manager) AdoptOwner(owner [16]byte) ([]uint64, error) {
+// operations, while this node's own acquires reuse them. It also clears the
+// dead node's reader bit, ownerSlot, from every record held for reading.
+func (m *Manager) AdoptOwner(owner [16]byte, ownerSlot int) ([]uint64, error) {
 	var taken []uint64
+	cleared := 0
 	for recordID := uint64(0); recordID < m.size/RecordSize; recordID++ {
 		ok, err := m.adoptRecord(recordID, owner)
 		if err != nil {
@@ -28,6 +27,16 @@ func (m *Manager) AdoptOwner(owner [16]byte) ([]uint64, error) {
 		if ok {
 			taken = append(taken, recordID)
 		}
+		ok, err = m.clearDeadReader(recordID, readerBit(ownerSlot))
+		if err != nil {
+			return taken, err
+		}
+		if ok {
+			cleared++
+		}
+	}
+	if cleared > 0 {
+		log.Printf("lock: cleared dead node %x's read holds on %d lock records", owner[:8], cleared)
 	}
 	if len(taken) == 0 {
 		return nil, nil
@@ -42,6 +51,34 @@ func (m *Manager) AdoptOwner(owner [16]byte) ([]uint64, error) {
 	}
 	log.Printf("lock: took over %d lock records of dead node %x", len(adopted), owner[:8])
 	return adopted, nil
+}
+
+// clearDeadReader clears a dead node's reader bit from recordID and checks
+// later that no live node's update put it back.
+func (m *Manager) clearDeadReader(recordID uint64, bit uint64) (bool, error) {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	for attempt := 0; attempt < maxRecordUpdates; attempt++ {
+		record, err := m.readRecord(recordID)
+		if err != nil {
+			return false, err
+		}
+		if record.Mode != LockModeShared || record.Readers&bit == 0 {
+			return false, nil
+		}
+		ok, err := m.casRecord(recordID, record, withoutReader(record, bit))
+		if err != nil && !errors.Is(err, errLateWrite) {
+			return false, err
+		}
+		if ok {
+			m.verifyReaderCleared(recordID, bit)
+			return true, nil
+		}
+		updateBackoff(attempt)
+	}
+	return false, nil
 }
 
 func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
@@ -64,7 +101,7 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
 		adopted.Sequence++
 		ok, err := m.casRecord(recordID, record, &adopted)
 		if errors.Is(err, errLateWrite) {
-			m.giveUpLateClaim(recordID, &adopted)
+			m.giveUpLateClaim(recordID, &adopted, lateWriteTook(err))
 			return false, nil
 		}
 		if err != nil {

@@ -367,25 +367,6 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 	}
 }
 
-func TestNewReadersDoNotKeepLeakedSharedLockFresh(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	leaked := newTestNode(dev, 0, 1<<20, 1)
-	reader := newTestNode(dev, 0, 1<<20, 2)
-	writer := newTestNode(dev, 0, 1<<20, 3)
-
-	requireAcquired(t, leaked, LockTypeInode, 2, LockModeShared)
-	ageRecord(t, leaked, LockTypeInode, 2, StaleThreshold-2*time.Second)
-
-	requireAcquired(t, reader, LockTypeInode, 2, LockModeShared)
-	if err := reader.Release(LockTypeInode, 2); err != nil {
-		t.Fatalf("reader Release: %v", err)
-	}
-	time.Sleep(3 * time.Second)
-
-	requireAcquired(t, writer, LockTypeInode, 2, LockModeExclusive)
-}
-
 func TestJoinFailsAfterRecordTakenOver(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
@@ -573,45 +554,6 @@ func TestBusyNodeYieldsCachedRecord(t *testing.T) {
 		t.Fatalf("other node never got a record a busy node keeps reusing: %v", err)
 	}
 	other.Release(LockTypeInode, 12)
-}
-
-// Read claims do not wait out the settle delay; write claims do.
-func TestReadClaimSkipsSettleWait(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
-	claimSettleDelay = 300 * time.Millisecond
-
-	start := time.Now()
-	requireAcquired(t, a, LockTypeInode, 20, LockModeShared)
-	if took := time.Since(start); took >= claimSettleDelay/2 {
-		t.Fatalf("read claim took %v, want well under the %v settle wait", took, claimSettleDelay)
-	}
-	start = time.Now()
-	requireAcquired(t, a, LockTypeInode, 21, LockModeExclusive)
-	if took := time.Since(start); took < claimSettleDelay {
-		t.Fatalf("write claim took %v, want at least the %v settle wait", took, claimSettleDelay)
-	}
-}
-
-// A node does not keep a released read hold, so a node killed right after a
-// read leaves nothing behind for another node's writer to wait out.
-func TestReleasedReadHoldIsFreeAtOnce(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	reader := newTestNode(dev, 0, 1<<20, 1)
-	writer := newTestNode(dev, 0, 1<<20, 2)
-
-	requireAcquired(t, reader, LockTypeInode, 22, LockModeShared)
-	if err := reader.Release(LockTypeInode, 22); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	start := time.Now()
-	requireAcquired(t, writer, LockTypeInode, 22, LockModeExclusive)
-	if took := time.Since(start); took > cacheGrace/2 {
-		t.Fatalf("writer waited %v after the read hold was released, want under %v", took, cacheGrace/2)
-	}
 }
 
 // slowWrite is a record write on slow storage. It waits stall before its
@@ -873,5 +815,127 @@ func TestTimedOutAcquireLogsHolder(t *testing.T) {
 	log.SetOutput(os.Stderr)
 	if got := logs.String(); !strings.Contains(got, "gave up waiting") || !strings.Contains(got, "write-locked by node slot 1") {
 		t.Fatalf("timeout log does not name the holder:\n%s", got)
+	}
+}
+
+// writeAfter returns a record write that waits for proceed before writing,
+// ignoring its deadline, so a test can order two nodes' writes.
+func writeAfter(m *Manager, reached chan<- struct{}, proceed <-chan struct{}) func([]byte, int64, time.Time) (int, error) {
+	var once sync.Once
+	return func(buf []byte, offset int64, deadline time.Time) (int, error) {
+		first := false
+		once.Do(func() { first = true })
+		if !first {
+			return m.dev.WriteAtBefore(buf, offset, deadline)
+		}
+		close(reached)
+		<-proceed
+		return m.dev.WriteAt(buf, offset)
+	}
+}
+
+// writeThenSignal returns a record write that signals done after its first write lands.
+func writeThenSignal(m *Manager, done chan<- struct{}) func([]byte, int64, time.Time) (int, error) {
+	var once sync.Once
+	return func(buf []byte, offset int64, deadline time.Time) (int, error) {
+		n, err := m.dev.WriteAtBefore(buf, offset, deadline)
+		once.Do(func() { close(done) })
+		return n, err
+	}
+}
+
+// Two nodes' read claims race and one overwrites the other's reader bit. The
+// node that lost its bit sees that on its confirm and claims again, so both
+// hold the record and a writer waits for both.
+func TestRacingReadClaimsBothHold(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	w := newTestNode(dev, 0, 1<<20, 3)
+	aRead, bLanded := make(chan struct{}), make(chan struct{})
+	a.casWrite = writeAfter(a, aRead, bLanded)
+	b.casWrite = writeThenSignal(b, bLanded)
+
+	errA := make(chan error, 1)
+	go func() { errA <- acquireWithin(a, 2*time.Second, LockTypeInode, 30, LockModeShared) }()
+	<-aRead
+	requireAcquired(t, b, LockTypeInode, 30, LockModeShared)
+	if err := <-errA; err != nil {
+		t.Fatalf("node A read claim: %v", err)
+	}
+
+	requireBlocked(t, w, LockTypeInode, 30, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 30); err != nil {
+		t.Fatalf("node A Release: %v", err)
+	}
+	a.ReleaseCached()
+	requireBlocked(t, w, LockTypeInode, 30, LockModeExclusive)
+	if err := b.Release(LockTypeInode, 30); err != nil {
+		t.Fatalf("node B Release: %v", err)
+	}
+	b.ReleaseCached()
+	requireAcquired(t, w, LockTypeInode, 30, LockModeExclusive)
+}
+
+// A node clears its reader bit while another node's update, based on an older
+// read, puts it back. The releasing node checks again later and clears it, so a
+// writer waits a settle delay or two, not until the record is stale.
+func TestLostReadReleaseIsClearedAgain(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	w := newTestNode(dev, 0, 1<<20, 3)
+	requireAcquired(t, a, LockTypeInode, 31, LockModeShared)
+	requireAcquired(t, b, LockTypeInode, 31, LockModeShared)
+
+	bRead, aReleased := make(chan struct{}), make(chan struct{})
+	b.casWrite = writeAfter(b, bRead, aReleased)
+	done := make(chan error, 1)
+	go func() {
+		if err := b.Release(LockTypeInode, 31); err != nil {
+			done <- err
+			return
+		}
+		b.ReleaseCached()
+		done <- nil
+	}()
+	<-bRead
+	if err := a.Release(LockTypeInode, 31); err != nil {
+		t.Fatalf("node A Release: %v", err)
+	}
+	a.casWrite = writeThenSignal(a, aReleased)
+	a.ReleaseCached()
+	if err := <-done; err != nil {
+		t.Fatalf("node B release: %v", err)
+	}
+
+	start := time.Now()
+	requireAcquired(t, w, LockTypeInode, 31, LockModeExclusive)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("writer waited %v for a reader bit that was put back", took)
+	}
+}
+
+// A read claim lands, then a writer's claim, based on an older read, replaces
+// it. The reader sees that on its confirm and does not read beside the writer.
+func TestReadClaimReplacedByWriterIsNotHeld(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	r := newTestNode(dev, 0, 1<<20, 1)
+	w := newTestNode(dev, 0, 1<<20, 2)
+	wRead, rLanded := make(chan struct{}), make(chan struct{})
+	w.casWrite = writeAfter(w, wRead, rLanded)
+	r.casWrite = writeThenSignal(r, rLanded)
+
+	errW := make(chan error, 1)
+	go func() { errW <- acquireWithin(w, 2*time.Second, LockTypeInode, 32, LockModeExclusive) }()
+	<-wRead
+	if err := acquireWithin(r, 300*time.Millisecond, LockTypeInode, 32, LockModeShared); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("read claim replaced by a write claim: got %v, want ErrLockTimeout while the writer holds", err)
+	}
+	if err := <-errW; err != nil {
+		t.Fatalf("writer: %v", err)
 	}
 }

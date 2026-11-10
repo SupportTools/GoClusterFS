@@ -37,7 +37,7 @@ func TestAdoptOwnerHoldsDeadNodesLocksUntilReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	adopted, err := replayer.AdoptOwner([16]byte{1})
+	adopted, err := replayer.AdoptOwner([16]byte{1}, 1)
 	if err != nil {
 		t.Fatalf("AdoptOwner: %v", err)
 	}
@@ -91,10 +91,40 @@ func TestAdoptOwnerLeavesSharedRecordOfReleasedReader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if adopted, err := replayer.AdoptOwner([16]byte{1}); err != nil || len(adopted) != 0 {
+	if adopted, err := replayer.AdoptOwner([16]byte{1}, 1); err != nil || len(adopted) != 0 {
 		t.Fatalf("AdoptOwner = %v, %v; want nothing taken from a reader that already released", adopted, err)
 	}
 	if err := acquireWithin(writer, time.Second, LockTypeInode, 9, LockModeExclusive); err == nil {
 		t.Error("a writer took a record another node is still reading")
+	}
+}
+
+// A node killed while it kept a read hold leaves its reader bit set. Once it is
+// proven dead, AdoptOwner clears the bit and a writer gets the record at once.
+func TestAdoptOwnerClearsDeadReader(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+
+	dead := NewManager(dev, 0, 1<<20, [16]byte{1}, 1)
+	alive := NewManager(dev, 0, 1<<20, [16]byte{2}, 2)
+	writer := NewManager(dev, 0, 1<<20, [16]byte{3}, 3)
+	ctx := context.Background()
+	for _, m := range []*Manager{dead, alive} {
+		if err := m.Acquire(ctx, LockTypeInode, 9, LockModeShared); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := alive.Release(LockTypeInode, 9); err != nil {
+		t.Fatal(err)
+	}
+	alive.ReleaseCached()
+
+	if _, err := writer.AdoptOwner([16]byte{1}, 1); err != nil {
+		t.Fatalf("AdoptOwner: %v", err)
+	}
+	short, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if err := writer.Acquire(short, LockTypeInode, 9, LockModeExclusive); err != nil {
+		t.Fatalf("writer after the dead reader's bit was cleared: %v", err)
 	}
 }
