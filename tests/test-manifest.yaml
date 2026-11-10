@@ -2268,3 +2268,24 @@ scenarios:
     priority: go_only
     environments:
       go: api_test.go::TestMountRefusesUnauthenticatedRemoteAPI
+
+  - id: mount-version-flag
+    name: Mount prints its version
+    description: goclusterfs-mount -version exits 0 and prints the version string
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountPrintsVersion
+
+  - id: broadcast-secret-warning
+    name: Mount warns about unauthenticated broadcast
+    description: With broadcast on and no -broadcast-secret, mount logs a WARNING line; with a secret or -broadcast=false it does not
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountWarnsWithoutBroadcastSecret
+
+  - id: api-settings-checked-before-device
+    name: Mount rejects bad API settings early
+    description: An -api-addr without a port, an invalid -api-cors, or -api-cors * without a token stop mount before it opens the device
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice

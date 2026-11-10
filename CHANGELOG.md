@@ -39,7 +39,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CI gates: unit tests with the race detector and coverage, golangci-lint (`make lint`), govulncheck (`make vuln`), and a `go mod tidy` check.
 - Release workflow: pushing a `v*` tag publishes a GitHub Release with `linux/amd64` and `linux/arm64` archives, checksums, and the matching `CHANGELOG.md` section. `scripts/dist.sh` builds the same archives locally.
 - `goclusterfs-fsck -version` prints the release version, commit, and commit date.
-- HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` without `-api-token`.
+- HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` or `-api-cors '*'` without `-api-token`, and checks the API flags before it opens the device.
 - `goclusterfs-mount -version`, which prints the same version string as `goclusterfs-fsck -version`. `/api/v1/status` reports it too.
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.

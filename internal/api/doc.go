@@ -1,15 +1,13 @@
 // Package api provides the HTTP JSON API server for GoClusterFS.
 //
 // The API server runs embedded within the mount process and exposes
-// endpoints for health checks, status queries, statistics, and
-// administrative operations. It is consumed by the gfsctl CLI tool
-// and the web dashboard.
+// read-only endpoints for health checks, status queries and statistics.
 //
 // # Endpoints
 //
 // The following endpoints are available:
 //
-//   - GET /health         - Health check (always returns 200)
+//   - GET /health         - Health check (503 when a checker reports unhealthy)
 //   - GET /api/v1/status  - Filesystem status overview
 //   - GET /api/v1/stats/* - Detailed component statistics
 //   - GET /metrics        - Prometheus metrics export
@@ -18,16 +16,19 @@
 //
 // Authentication is via Bearer token when configured. Set the AuthToken
 // in Config to enable authentication. When enabled, all endpoints except
-// /health require a valid Authorization header:
+// /health and /metrics require a valid Authorization header:
 //
 //	Authorization: Bearer <token>
+//
+// Without a token, Config.CheckExposure refuses non-loopback addresses and
+// CORS "*", and the server rejects requests whose Host is not a loopback name.
 //
 // # Configuration
 //
 // Use DefaultConfig() to get sensible defaults, then customize as needed:
 //
 //	cfg := api.DefaultConfig()
-//	cfg.ListenAddr = ":9090"
+//	cfg.ListenAddr = "127.0.0.1:9090"
 //	cfg.AuthToken = "secret-token"
 //	server, err := api.NewServer(cfg)
 //

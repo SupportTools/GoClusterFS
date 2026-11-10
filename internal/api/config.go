@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -133,10 +134,16 @@ func (c *Config) LoopbackOnly() bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// CheckExposure refuses a config that serves other hosts without an auth token.
+// CheckExposure refuses a config that lets other hosts, or any web page, read the API without an auth token.
 func (c *Config) CheckExposure() error {
-	if c.AuthToken == "" && !c.LoopbackOnly() {
+	if c.AuthToken != "" {
+		return nil
+	}
+	if !c.LoopbackOnly() {
 		return fmt.Errorf("%w: %s", ErrUnauthenticatedRemote, c.ListenAddr)
+	}
+	if slices.Contains(c.CORSOrigins, "*") {
+		return ErrWildcardCORSWithoutToken
 	}
 	return nil
 }
