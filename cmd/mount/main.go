@@ -31,6 +31,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
+	"github.com/supporttools/GoClusterFS/internal/version"
 )
 
 // fsStatusProvider implements api.StatusProvider by wrapping the filesystem.
@@ -95,6 +96,7 @@ func main() {
 		mountPoint = flag.String("mount", "", "Mount point directory")
 		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
 		debug      = flag.Bool("debug", false, "Enable FUSE debug output")
+		showVer    = flag.Bool("version", false, "Print version and exit")
 
 		// Cache configuration
 		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
@@ -130,6 +132,11 @@ func main() {
 		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
 	)
 	flag.Parse()
+
+	if *showVer {
+		fmt.Println("goclusterfs-mount", version.String())
+		os.Exit(0)
+	}
 
 	if *devicePath == "" || *mountPoint == "" {
 		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n", os.Args[0])

@@ -1,21 +1,9 @@
 package api
 
-import "runtime"
+import (
+	"runtime"
 
-// Build-time variables set via ldflags:
-//
-//	-ldflags "-X github.com/supporttools/GoClusterFS/internal/api.Version=1.0.0
-//	          -X github.com/supporttools/GoClusterFS/internal/api.GitCommit=abc123
-//	          -X github.com/supporttools/GoClusterFS/internal/api.BuildTime=2024-01-01T00:00:00Z"
-var (
-	// Version is the semantic version of the build.
-	Version = "dev"
-
-	// GitCommit is the git commit hash of the build.
-	GitCommit = ""
-
-	// BuildTime is the time the build was created.
-	BuildTime = ""
+	"github.com/supporttools/GoClusterFS/internal/version"
 )
 
 // BuildInfo contains build version information.
@@ -26,12 +14,12 @@ type BuildInfo struct {
 	GoVersion string `json:"go_version"`
 }
 
-// GetBuildInfo returns the current build information.
+// GetBuildInfo returns the build metadata from internal/version.
 func GetBuildInfo() BuildInfo {
 	return BuildInfo{
-		Version:   Version,
-		GitCommit: GitCommit,
-		BuildTime: BuildTime,
+		Version:   version.Version,
+		GitCommit: version.Commit,
+		BuildTime: version.Date,
 		GoVersion: runtime.Version(),
 	}
 }
