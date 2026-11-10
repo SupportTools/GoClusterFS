@@ -98,7 +98,7 @@ func TestAPIStatsReportLiveValues(t *testing.T) {
 			cacheStats.InodeCache.Hits+cacheStats.InodeCache.Misses > 0 &&
 			journalStats.CommitCount > 0 && journalStats.BytesWritten > 0 &&
 			lockStats.HintCacheHits+lockStats.HintCacheMisses > 0 &&
-			trimStats.TrimBlocks > 0
+			!trimStats.TrimEnabled
 	})
 	if !ok {
 		t.Fatalf("stats never showed node 0's I/O:\ncache=%+v\njournal=%+v\nlock=%+v\ntrim=%+v", cacheStats, journalStats, lockStats, trimStats)
@@ -106,8 +106,8 @@ func TestAPIStatsReportLiveValues(t *testing.T) {
 	if journalStats.State != "clean" && journalStats.State != "dirty" {
 		t.Errorf("journal state = %q, want clean or dirty", journalStats.State)
 	}
-	if !trimStats.TrimEnabled || trimStats.TrimBytes != trimStats.TrimBlocks<<20 {
-		t.Errorf("trim = %+v", trimStats)
+	if trimStats.TrimBlocks != 0 || trimStats.TrimOperations != 0 || trimStats.LastTrimAt != "" {
+		t.Errorf("trim on an image file = %+v, want nothing counted as discarded", trimStats)
 	}
 
 	if code := getAPI(t, first+"/api/v1/stats/sfb", nil); code != http.StatusNotFound {
@@ -129,10 +129,13 @@ func TestAPIStatsReportLiveValues(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	metrics := string(body)
-	for _, name := range []string{"goclusterfs_journal_commits_total", "goclusterfs_journal_bytes_written_total", "goclusterfs_cache_inode_size", "goclusterfs_trim_blocks_total", "goclusterfs_fs_size_bytes", "goclusterfs_fs_free_bytes", "goclusterfs_cluster_size", "goclusterfs_trim_enabled"} {
+	for _, name := range []string{"goclusterfs_journal_commits_total", "goclusterfs_journal_bytes_written_total", "goclusterfs_cache_inode_size", "goclusterfs_fs_size_bytes", "goclusterfs_fs_free_bytes", "goclusterfs_cluster_size"} {
 		if v, ok := metricValue(metrics, name); !ok || v <= 0 {
 			t.Errorf("/metrics %s = %v (found %v), want > 0", name, v, ok)
 		}
+	}
+	if v, ok := metricValue(metrics, "goclusterfs_trim_enabled"); !ok || v != 0 {
+		t.Errorf("/metrics goclusterfs_trim_enabled = %v (found %v), want 0 on an image file", v, ok)
 	}
 	if v, ok := metricValue(metrics, "goclusterfs_journal_state"); !ok || (v != 0 && v != 1) {
 		t.Errorf("/metrics goclusterfs_journal_state = %v (found %v), want 0 or 1", v, ok)

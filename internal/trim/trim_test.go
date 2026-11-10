@@ -1,6 +1,7 @@
 package trim
 
 import (
+	"context"
 	"errors"
 	"os"
 	"testing"
@@ -373,5 +374,52 @@ func TestStatsCountFailedDiscardsAndLastSuccess(t *testing.T) {
 	}
 	if got.LastDiscard.Before(before) {
 		t.Errorf("LastDiscard = %v, want after %v", got.LastDiscard, before)
+	}
+}
+
+func TestUnsupportedDeviceIsNotCountedAsDiscarded(t *testing.T) {
+	dev, cleanup := createTestDevice(t)
+	defer cleanup()
+
+	calls := 0
+	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+		calls++
+		return errDiscardUnsupported
+	}})
+	m.Start()
+	m.Queue(5)
+	m.Queue(10)
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := m.Stats()
+	if !got.Unsupported || got.BlocksDiscarded != 0 || got.DiscardCalls != 0 || got.DiscardErrors != 0 || !got.LastDiscard.IsZero() {
+		t.Errorf("Stats = %+v, want Unsupported and nothing counted", got)
+	}
+	if calls != 1 {
+		t.Errorf("Discard called %d times, want 1: later ranges of the flush should be skipped", calls)
+	}
+}
+
+func TestRefusedFlushCountsAsError(t *testing.T) {
+	dev, cleanup := createTestDevice(t)
+	defer cleanup()
+
+	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+		t.Error("Discard ran although the guard refused the flush")
+		return nil
+	}})
+	m.SetFreeGuard(func(ctx context.Context, blocks []uint64, discard func(free []uint64)) error {
+		return errors.New("bitmap lock timed out")
+	})
+	m.Start()
+	m.Queue(5)
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := m.Stats(); got.DiscardErrors != 1 || got.BlocksDiscarded != 0 {
+		t.Errorf("Stats = %+v, want 1 error and nothing discarded", got)
 	}
 }

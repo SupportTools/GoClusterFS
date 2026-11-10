@@ -527,11 +527,11 @@ func main() {
 	}
 
 	// Print final cache stats
-	stats := cacheMgr.Stats()
-	log.Printf("Cache stats: %s", stats)
-	if stats.BroadcastEnabled {
+	cacheStats := cacheMgr.Stats()
+	log.Printf("Cache stats: %s", cacheStats)
+	if cacheStats.BroadcastEnabled {
 		log.Printf("Broadcast stats: sent=%d, received=%d, duplicates=%d",
-			stats.InvalidationsSent, stats.InvalidationsReceived, stats.BroadcastDuplicates)
+			cacheStats.InvalidationsSent, cacheStats.InvalidationsReceived, cacheStats.BroadcastDuplicates)
 	}
 
 	log.Println("Filesystem unmounted.")

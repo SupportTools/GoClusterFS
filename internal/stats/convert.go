@@ -65,7 +65,7 @@ func trimResponse(t trim.Stats) *api.TrimStatsResponse {
 		PendingTrimBlocks: t.PendingBlocks,
 		LastTrimAt:        timestamp(t.LastDiscard),
 		TrimErrors:        t.DiscardErrors,
-		TrimEnabled:       true,
+		TrimEnabled:       !t.Unsupported,
 		BatchSize:         t.BatchSize,
 	}
 }
