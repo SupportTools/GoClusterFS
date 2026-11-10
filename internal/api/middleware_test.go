@@ -281,8 +281,8 @@ func TestCORSMiddleware_Wildcard(t *testing.T) {
 	defer resp.Body.Close()
 
 	cors := resp.Header.Get("Access-Control-Allow-Origin")
-	if cors != "http://any-origin.com" {
-		t.Errorf("expected CORS header 'http://any-origin.com', got %q", cors)
+	if cors != "*" {
+		t.Errorf("expected CORS header '*', got %q", cors)
 	}
 }
 

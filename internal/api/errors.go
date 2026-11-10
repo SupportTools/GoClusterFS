@@ -22,6 +22,9 @@ var (
 	// ErrUnauthenticatedRemote is returned when other hosts could reach the API without a token.
 	ErrUnauthenticatedRemote = errors.New("api: no auth token set for an address other hosts can reach")
 
+	// ErrWildcardCORSWithoutToken is returned when CORS allows every origin and no token is set.
+	ErrWildcardCORSWithoutToken = errors.New("api: CORS origin \"*\" without an auth token lets any web page open on this host read the API")
+
 	// ErrShutdownTimeout is returned when graceful shutdown times out.
 	ErrShutdownTimeout = errors.New("api: shutdown timed out")
 

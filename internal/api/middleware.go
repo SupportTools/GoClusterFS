@@ -63,7 +63,7 @@ func AuthMiddleware(token string, skipPaths ...string) Middleware {
 
 			// Check if path should skip auth
 			for _, path := range skipPaths {
-				if r.URL.Path == path || strings.HasPrefix(r.URL.Path, path+"/") {
+				if r.URL.Path == path {
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -105,6 +105,7 @@ func CORSMiddleware(origins []string) Middleware {
 				next.ServeHTTP(w, r)
 				return
 			}
+			w.Header().Add("Vary", "Origin")
 
 			origin := r.Header.Get("Origin")
 			if origin == "" {
@@ -113,22 +114,22 @@ func CORSMiddleware(origins []string) Middleware {
 			}
 
 			// Check if origin is allowed
-			allowed := false
+			allowOrigin := ""
 			for _, o := range origins {
 				if o == "*" || o == origin {
-					allowed = true
+					allowOrigin = o
 					break
 				}
 			}
 
-			if !allowed {
+			if allowOrigin == "" {
 				next.ServeHTTP(w, r)
 				return
 			}
 
 			// Set CORS headers
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 
@@ -270,4 +271,29 @@ func getClientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return ip
+}
+
+// LoopbackHostMiddleware rejects requests whose Host header is not a loopback
+// name, so a DNS-rebinding web page cannot read an API that has no token.
+func LoopbackHostMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackHost(r.Host) {
+			writeError(w, http.StatusForbidden, "host not allowed", "without an auth token, use localhost, 127.0.0.1 or [::1]")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
