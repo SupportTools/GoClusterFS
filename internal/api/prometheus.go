@@ -15,7 +15,6 @@ const (
 // MetricsHandler returns an HTTP handler for Prometheus metrics scraping.
 // It uses a custom collector that pulls fresh stats from the StatsProvider.
 func (s *Server) MetricsHandler() http.Handler {
-	// Create a custom registry to avoid default Go metrics
 	registry := prometheus.NewRegistry()
 
 	// Register the filesystem collector
@@ -27,7 +26,8 @@ func (s *Server) MetricsHandler() http.Handler {
 	registry.MustRegister(collectors.NewGoCollector())
 
 	return promhttp.HandlerFor(registry, promhttp.HandlerOpts{
-		EnableOpenMetrics: true,
+		EnableOpenMetrics:   true,
+		MaxRequestsInFlight: 2,
 	})
 }
 

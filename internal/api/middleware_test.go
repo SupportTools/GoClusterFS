@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"testing"
 	"time"
@@ -397,7 +398,7 @@ func TestRateLimitMiddleware_Disabled(t *testing.T) {
 
 func TestRateLimitMiddleware_Enabled(t *testing.T) {
 	// Enable rate limiting with small burst for easy testing
-	cfg := DefaultConfig().WithListenAddr(":0").WithRateLimit(100, 3)
+	cfg := DefaultConfig().WithListenAddr(":0").WithRateLimit(1, 3)
 	server, err := NewServer(cfg)
 	if err != nil {
 		t.Fatalf("NewServer error: %v", err)
@@ -411,7 +412,7 @@ func TestRateLimitMiddleware_Enabled(t *testing.T) {
 
 	// First 3 requests should succeed (burst)
 	for i := 0; i < 3; i++ {
-		resp, err := http.Get("http://" + server.Addr() + "/health")
+		resp, err := http.Get("http://" + server.Addr() + "/api/v1/status")
 		if err != nil {
 			t.Fatalf("request error: %v", err)
 		}
@@ -423,7 +424,7 @@ func TestRateLimitMiddleware_Enabled(t *testing.T) {
 	}
 
 	// 4th request should be rate limited
-	resp, err := http.Get("http://" + server.Addr() + "/health")
+	resp, err := http.Get("http://" + server.Addr() + "/api/v1/status")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
@@ -449,37 +450,137 @@ func TestGetClientIP_RemoteAddr(t *testing.T) {
 	}
 }
 
-func TestGetClientIP_XForwardedFor(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	req.Header.Set("X-Forwarded-For", "203.0.113.50, 70.41.3.18, 150.172.238.178")
-
-	ip := getClientIP(req)
-	if ip != "203.0.113.50" {
-		t.Errorf("expected '203.0.113.50' (first IP), got %q", ip)
-	}
-}
-
-func TestGetClientIP_XRealIP(t *testing.T) {
-	req, _ := http.NewRequest("GET", "/", nil)
-	req.RemoteAddr = "10.0.0.1:12345"
-	req.Header.Set("X-Real-IP", "198.51.100.78")
-
-	ip := getClientIP(req)
-	if ip != "198.51.100.78" {
-		t.Errorf("expected '198.51.100.78', got %q", ip)
-	}
-}
-
-func TestGetClientIP_XForwardedForPrecedence(t *testing.T) {
+func TestGetClientIP_IgnoresProxyHeaders(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/", nil)
 	req.RemoteAddr = "10.0.0.1:12345"
 	req.Header.Set("X-Forwarded-For", "203.0.113.50")
 	req.Header.Set("X-Real-IP", "198.51.100.78")
 
-	// X-Forwarded-For should take precedence
-	ip := getClientIP(req)
-	if ip != "203.0.113.50" {
-		t.Errorf("expected '203.0.113.50' (X-Forwarded-For takes precedence), got %q", ip)
+	if ip := getClientIP(req); ip != "10.0.0.1" {
+		t.Errorf("expected the connection's IP 10.0.0.1, got %q", ip)
+	}
+}
+
+func TestRateLimitIgnoresForwardedFor(t *testing.T) {
+	srv := startServer(t, DefaultConfig().WithListenAddr("127.0.0.1:0").WithRateLimit(0.001, 1))
+	if got := get(t, srv, "/api/v1/status", "", map[string]string{"X-Forwarded-For": "203.0.113.1"}).StatusCode; got != http.StatusOK {
+		t.Fatalf("first request: status %d, want 200", got)
+	}
+	if got := get(t, srv, "/api/v1/status", "", map[string]string{"X-Forwarded-For": "203.0.113.2"}).StatusCode; got != http.StatusTooManyRequests {
+		t.Fatalf("second request with a new X-Forwarded-For: status %d, want 429", got)
+	}
+}
+
+func TestRateLimiterStopEndsCleanup(t *testing.T) {
+	rl := NewRateLimiter(1, 1)
+	rl.Stop()
+	rl.Stop()
+	select {
+	case <-rl.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup goroutine still running after Stop")
+	}
+}
+
+func TestServerStopStopsRateLimiter(t *testing.T) {
+	for _, start := range []bool{true, false} {
+		srv, err := NewServer(DefaultConfig().WithListenAddr("127.0.0.1:0").WithRateLimit(10, 20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if start {
+			if err := srv.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		srv.Stop()
+		select {
+		case <-srv.rateLimiter.stopped:
+		case <-time.After(time.Second):
+			t.Fatalf("started=%v: rate limiter cleanup still running after Stop", start)
+		}
+	}
+}
+
+func TestRateLimiterCapsClients(t *testing.T) {
+	rl := NewRateLimiter(1, 2)
+	defer rl.Stop()
+	rl.maxClients = 2
+	if !rl.Allow("a") || !rl.Allow("b") {
+		t.Fatal("first two clients refused")
+	}
+	if rl.Allow("c") {
+		t.Fatal("third client allowed past the cap")
+	}
+	if !rl.Allow("a") {
+		t.Fatal("known client refused at the cap")
+	}
+}
+
+func TestRateLimiterSweepDropsFullBuckets(t *testing.T) {
+	rl := NewRateLimiter(1, 2)
+	defer rl.Stop()
+	rl.Allow("a")
+	count := func() int {
+		rl.mu.Lock()
+		defer rl.mu.Unlock()
+		return len(rl.clients)
+	}
+	rl.sweep(time.Now().Add(time.Second))
+	if count() != 1 {
+		t.Fatal("bucket dropped before it refilled")
+	}
+	rl.sweep(time.Now().Add(3 * time.Second))
+	if count() != 0 {
+		t.Fatal("full bucket not dropped")
+	}
+}
+
+func TestRateLimitKey(t *testing.T) {
+	key := func(remote string) string {
+		req, _ := http.NewRequest("GET", "/", nil)
+		req.RemoteAddr = remote
+		return rateLimitKey(req)
+	}
+	if key("[2001:db8::1]:1") != key("[2001:db8::2]:2") {
+		t.Error("addresses in one IPv6 /64 got different keys")
+	}
+	if key("[2001:db8::1]:1") == key("[2001:db8:0:1::1]:1") {
+		t.Error("different IPv6 /64s share a key")
+	}
+	if got := key("[::ffff:192.0.2.1]:1"); got != "192.0.2.1" {
+		t.Errorf("mapped IPv4 key = %q, want 192.0.2.1", got)
+	}
+	if got := key("192.0.2.1:1"); got != "192.0.2.1" {
+		t.Errorf("IPv4 key = %q, want 192.0.2.1", got)
+	}
+}
+
+func TestRateLimitSkipsHealthAndMetrics(t *testing.T) {
+	srv := startServer(t, DefaultConfig().WithListenAddr("127.0.0.1:0").WithRateLimit(0.25, 1))
+	for i := 0; i < 3; i++ {
+		for _, path := range []string{"/health", "/metrics"} {
+			if got := get(t, srv, path, "", nil).StatusCode; got != http.StatusOK {
+				t.Fatalf("%s request %d: status %d, want 200", path, i+1, got)
+			}
+		}
+	}
+	get(t, srv, "/api/v1/status", "", nil)
+	resp := get(t, srv, "/api/v1/status", "", nil)
+	if resp.StatusCode != http.StatusTooManyRequests || resp.Header.Get("Retry-After") != "4" {
+		t.Fatalf("second status request: %d with Retry-After %q, want 429 with 4", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+}
+
+func TestConfigRejectsBadRateLimits(t *testing.T) {
+	for _, rate := range []float64{0, -1, math.NaN(), math.Inf(1), 2 * MaxRateLimit} {
+		cfg := DefaultConfig().WithRateLimit(rate, 1)
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("rate %v accepted", rate)
+		}
+	}
+	cfg := DefaultConfig().WithRateLimit(MaxRateLimit, 1)
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("rate %v refused: %v", MaxRateLimit, err)
 	}
 }

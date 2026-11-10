@@ -62,8 +62,9 @@ func NewServer(cfg Config) (*Server, error) {
 	// Register routes
 	s.registerRoutes()
 
-	// Build middleware chain (order: rate limit -> logging -> loopback Host check -> CORS -> auth)
-	middlewares := []Middleware{RateLimitMiddleware(s.rateLimiter), LoggingMiddleware}
+	// Build middleware chain (order: rate limit -> logging -> loopback Host check -> CORS -> auth).
+	// Probes and scrapers on loopback share one bucket, so /health and /metrics skip the limiter.
+	middlewares := []Middleware{RateLimitMiddleware(s.rateLimiter, "/health", "/metrics"), LoggingMiddleware}
 	if cfg.AuthToken == "" && cfg.LoopbackOnly() {
 		middlewares = append(middlewares, LoopbackHostMiddleware)
 	}
@@ -122,6 +123,9 @@ func (s *Server) Start(ctx context.Context) error {
 // ShutdownTimeout before forcefully closing them.
 func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
+		if s.rateLimiter != nil {
+			s.rateLimiter.Stop()
+		}
 		s.mu.Lock()
 		if !s.started {
 			s.mu.Unlock()
