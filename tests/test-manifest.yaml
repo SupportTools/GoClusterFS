@@ -2334,3 +2334,80 @@ scenarios:
     priority: go_only
     environments:
       go: api_test.go::TestGfsctlReadsLiveMount
+
+  - id: api-stats-live-values
+    name: API stats report live values
+    description: After writes, reads, a delete and a mkdir, /api/v1/stats/{cache,journal,lock,trim,all,cluster} and /metrics show non-zero counters, /stats/sfb answers 404, and a second node sees both nodes and the first node's blocks
+    priority: go_only
+    environments:
+      go: api_stats_test.go::TestAPIStatsReportLiveValues
+
+  - id: stats-sampler-serves-snapshot
+    name: Stats requests never call the managers
+    description: Repeated StatsProvider and Capacity calls are served from the last snapshot; sources are read only by the sampler
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestSamplerAnswersFromSnapshotWithoutCallingSources
+
+  - id: stats-sampler-refresh
+    name: Stats sampler refreshes until stopped
+    description: Counter and device samples pick up new values in the background; Stop is idempotent and no source is read after it
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestSamplerRefreshesInBackgroundUntilStopped
+
+  - id: stats-cache-hit-rates
+    name: Cache stats report hit rates as fractions
+    description: Inode, extent, negative and lock hint cache stats carry sizes and counts, with hit rates from 0 to 1
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestCacheResponseReportsHitRatesAsFractions
+
+  - id: stats-lock-journal
+    name: Lock and journal stats
+    description: Lock stats carry held and waiting counts; journal stats carry a lowercase state and the commit counters
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestLockAndJournalResponses
+
+  - id: stats-trim
+    name: TRIM stats
+    description: TRIM stats convert discarded blocks to bytes and report the last discard time, empty before any discard
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestTrimResponseCountsBytesAndLastDiscard
+
+  - id: stats-capacity
+    name: Capacity from the block bitmap
+    description: Capacity derives used blocks and bytes from total and free blocks, with 0% for an empty bitmap
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestCapacityInfo
+
+  - id: stats-cluster-slots
+    name: Cluster stats classify registry slots
+    description: Cluster stats count non-empty slots, report the local node and list peers as active, stale or dead
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestClusterResponseClassifiesSlots
+
+  - id: lock-stats-held-waiting
+    name: Lock manager counts held and waiting locks
+    description: Stats reports the holder's lock and a blocked Acquire on another node until the lock is released
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestStatsCountsHeldAndWaitingLocks
+
+  - id: trim-stats-errors
+    name: TRIM counts failed discards
+    description: A failed BLKDISCARD range counts as an error; a successful one sets the last discard time
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestStatsCountFailedDiscardsAndLastSuccess
+
+  - id: api-metrics-capacity
+    name: /metrics exports capacity
+    description: With a status provider, /metrics exports goclusterfs_fs_size_bytes and goclusterfs_fs_free_bytes
+    priority: go_only
+    environments:
+      go: internal/api/prometheus_test.go::TestMetricsEndpoint_ExportsCapacity
