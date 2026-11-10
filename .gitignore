@@ -29,3 +29,4 @@ tests/vm/runtime/
 tests/vm/results/
 /fsck
 /dist/
+/gfsctl

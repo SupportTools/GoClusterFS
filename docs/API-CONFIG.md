@@ -91,7 +91,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-token` | string | (empty) | Bearer token for `/api/v1/...` requests |
 | `-api-cors` | string | (empty) | Comma-separated CORS allowed origins, or `*` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status` and `GET /api/v1/stats/...`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` answers 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up`. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...` and `GET /api/v1/cluster/{status,nodes,locks}`. Mount does not feed statistics to the API yet, so `/api/v1/stats/...` and `/api/v1/cluster/...` answer 503, `/health` only checks the API itself, and `/metrics` only reports `goclusterfs_up` plus Go runtime and process metrics. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
 
 Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the dashboard's origin instead, for example `-api-cors http://localhost:5173`.
 

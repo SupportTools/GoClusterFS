@@ -56,6 +56,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Stats types and collector behind `/api/v1/stats` |
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
+| `cmd/gfsctl` | `gfsctl`: CLI client for the HTTP API. `snapshot` and `admin` call endpoints the server does not have yet |
+| `web/dashboard` | React dashboard for the HTTP API (`npm run dev`, proxies to `localhost:8080`). Not served by the mount |
 
 ## On-Disk Layout
 

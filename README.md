@@ -142,6 +142,8 @@ With `-broadcast` on and no `-broadcast-secret`, mount logs a `WARNING` line at 
 
 The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and `-api-token` is empty. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
 
+`cmd/gfsctl` is a CLI client for the API (`go build -o gfsctl ./cmd/gfsctl`, then `./gfsctl status`), and `web/dashboard` is a web dashboard for it. Both are unfinished: their snapshot and admin actions call endpoints the API does not have yet.
+
 ## Multi-Node Setup
 
 For clustered deployments:

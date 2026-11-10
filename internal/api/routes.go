@@ -59,6 +59,8 @@ func (s *Server) handleAPIv1(w http.ResponseWriter, r *http.Request) {
 		s.handleStatus(w, r)
 	case strings.HasPrefix(path, "/stats"):
 		s.handleStats(w, r)
+	case strings.HasPrefix(path, "/cluster"):
+		s.handleCluster(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "endpoint not found", "")
 	}
@@ -279,4 +281,82 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// Delegate to the Prometheus handler
 	s.GetMetricsHandler().ServeHTTP(w, r)
+}
+
+// handleCluster handles GET /api/v1/cluster/* requests.
+// Routes to specific cluster handlers based on the path suffix.
+func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET")
+		return
+	}
+
+	// Extract the cluster sub-path
+	path := strings.TrimPrefix(r.URL.Path, "/api/v1/cluster")
+	path = strings.TrimSuffix(path, "/")
+
+	switch path {
+	case "", "/status":
+		s.handleClusterStatus(w, r)
+	case "/nodes":
+		s.handleClusterNodes(w, r)
+	case "/locks":
+		s.handleClusterLocks(w, r)
+	default:
+		writeError(w, http.StatusNotFound, "cluster endpoint not found", "valid endpoints: status, nodes, locks")
+	}
+}
+
+// handleClusterStatus handles GET /api/v1/cluster/status requests.
+// Returns cluster membership and health overview.
+func (s *Server) handleClusterStatus(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "cluster info not available", "no stats provider configured")
+		return
+	}
+
+	stats := provider.ClusterInfo()
+	if stats == nil {
+		writeError(w, http.StatusNotFound, "cluster info not available", "running in standalone mode")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, stats)
+}
+
+// handleClusterNodes handles GET /api/v1/cluster/nodes requests.
+// Returns detailed information about all cluster nodes.
+func (s *Server) handleClusterNodes(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "cluster nodes not available", "no stats provider configured")
+		return
+	}
+
+	nodes := provider.ClusterNodes()
+	if nodes == nil {
+		writeError(w, http.StatusNotFound, "cluster nodes not available", "running in standalone mode")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nodes)
+}
+
+// handleClusterLocks handles GET /api/v1/cluster/locks requests.
+// Returns active distributed locks in the cluster.
+func (s *Server) handleClusterLocks(w http.ResponseWriter, r *http.Request) {
+	provider := s.GetStatsProvider()
+	if provider == nil {
+		writeError(w, http.StatusServiceUnavailable, "cluster locks not available", "no stats provider configured")
+		return
+	}
+
+	locks := provider.ClusterLocks()
+	if locks == nil {
+		writeError(w, http.StatusNotFound, "cluster locks not available", "running in standalone mode")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, locks)
 }
