@@ -124,3 +124,33 @@ func TestTwoNodesOnOneHost(t *testing.T) {
 	default:
 	}
 }
+
+func TestCheckPortsReleasesSockets(t *testing.T) {
+	ports := freeUDPPorts(t, 2)
+	cfg := DefaultConfig()
+	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]
+	if err := CheckPorts(cfg); err != nil {
+		t.Fatalf("CheckPorts on free ports: %v", err)
+	}
+	startTransport(t, cfg)
+}
+
+func TestCheckPortsFailsOnTakenPort(t *testing.T) {
+	ports := freeUDPPorts(t, 2)
+	held, err := net.ListenUDP("udp", &net.UDPAddr{Port: ports[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	cfg := DefaultConfig()
+	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]
+	if err := CheckPorts(cfg); err == nil {
+		t.Error("CheckPorts passed with the unicast port taken")
+	}
+
+	cfg.UnicastPort = cfg.MulticastPort
+	if err := CheckPorts(cfg); err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Errorf("CheckPorts with equal ports: %v, want an error that says they must differ", err)
+	}
+}
