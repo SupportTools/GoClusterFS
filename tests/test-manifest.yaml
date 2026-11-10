@@ -2327,3 +2327,10 @@ scenarios:
     priority: go_only
     environments:
       go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice
+
+  - id: gfsctl-reads-live-mount
+    name: gfsctl reads a live mount
+    description: gfsctl status, health and metrics work against a mounted filesystem's API
+    priority: go_only
+    environments:
+      go: api_test.go::TestGfsctlReadsLiveMount
