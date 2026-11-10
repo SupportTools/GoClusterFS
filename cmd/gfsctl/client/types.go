@@ -171,4 +171,15 @@ type AllStatsResponse struct {
 type StatsOverviewResponse struct {
 	Cache   *CacheStatsResponse   `json:"cache,omitempty"`
 	Journal *JournalStatsResponse `json:"journal,omitempty"`
+	IO      *IOStatsResponse      `json:"io,omitempty"`
+}
+
+// IOStatsResponse contains I/O operation statistics.
+type IOStatsResponse struct {
+	ReadOps       uint64  `json:"read_ops"`
+	WriteOps      uint64  `json:"write_ops"`
+	BytesRead     uint64  `json:"bytes_read"`
+	BytesWritten  uint64  `json:"bytes_written"`
+	AvgReadLatUs  float64 `json:"avg_read_latency_us"`
+	AvgWriteLatUs float64 `json:"avg_write_latency_us"`
 }
