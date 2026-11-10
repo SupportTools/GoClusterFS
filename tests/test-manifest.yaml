@@ -2328,8 +2328,7 @@ scenarios:
     environments:
       go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice
 
-  # ====================================================================
-
+  # ===========================================================================
   # HTTP API writes (one mount on one host)
   # ===========================================================================
 
@@ -2374,7 +2373,7 @@ scenarios:
     priority: go_only
     environments:
       go: api_writes_test.go::TestMountTokenSources
-=======
+
   - id: api-stats-live-values
     name: API stats report live values
     description: After writes, reads, a delete and a mkdir, /api/v1/stats/{cache,journal,lock,trim,all,cluster} and /metrics show non-zero counters, /stats/sfb answers 404, and a second node sees both nodes and the first node's blocks
