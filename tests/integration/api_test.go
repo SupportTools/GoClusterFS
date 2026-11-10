@@ -27,11 +27,8 @@ func freeLoopbackAddr(t *testing.T) string {
 
 func TestAPIServesHealthOnLoopback(t *testing.T) {
 	mfs := NewMountedFS(t, 20)
-	if err := mfs.Format(); err != nil {
-		t.Fatalf("Format failed: %v", err)
-	}
 	addr := freeLoopbackAddr(t)
-	mfs.ExtraArgs = []string{"-api-addr", addr}
+	mfs.ExtraArgs = []string{"-format", "-api-addr", addr}
 	if err := mfs.Mount(false); err != nil {
 		t.Fatalf("Mount failed: %v", err)
 	}
