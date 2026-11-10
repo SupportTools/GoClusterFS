@@ -76,6 +76,19 @@ func (p *fsStatusProvider) Capacity() *api.CapacityInfo {
 	}
 }
 
+func apiConfig(addr, token, corsList string) api.Config {
+	var origins []string
+	for _, origin := range strings.Split(corsList, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+	return api.DefaultConfig().
+		WithListenAddr(addr).
+		WithAuthToken(token).
+		WithCORSOrigins(origins...)
+}
+
 func main() {
 	var (
 		devicePath = flag.String("device", "", "Path to block device or image file")
@@ -112,8 +125,8 @@ func main() {
 
 		// API server configuration
 		apiEnabled = flag.Bool("api", true, "Enable HTTP API server for management")
-		apiAddr    = flag.String("api-addr", ":8080", "API server listen address")
-		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled)")
+		apiAddr    = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs -api-token")
+		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled, loopback only)")
 		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
 	)
 	flag.Parse()
@@ -122,6 +135,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n", os.Args[0])
 		flag.PrintDefaults()
 		os.Exit(1)
+	}
+
+	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS)
+	if *apiEnabled {
+		if err := apiCfg.CheckExposure(); err != nil {
+			log.Fatalf("Refusing to start the API: %v. Set -api-token, set -api-addr to a loopback address such as 127.0.0.1:8080, or pass -api=false", err)
+		}
 	}
 
 	// Check mount point exists
@@ -407,22 +427,6 @@ func main() {
 	// Start API server for management and monitoring
 	var apiServer *api.Server
 	if *apiEnabled {
-		// Parse CORS origins from comma-separated string
-		var corsOrigins []string
-		if *apiCORS != "" {
-			for _, origin := range strings.Split(*apiCORS, ",") {
-				origin = strings.TrimSpace(origin)
-				if origin != "" {
-					corsOrigins = append(corsOrigins, origin)
-				}
-			}
-		}
-
-		apiCfg := api.DefaultConfig().
-			WithListenAddr(*apiAddr).
-			WithAuthToken(*apiToken).
-			WithCORSOrigins(corsOrigins...)
-
 		var err error
 		apiServer, err = api.NewServer(apiCfg)
 		if err != nil {
@@ -439,7 +443,7 @@ func main() {
 				log.Printf("Warning: Failed to start API server: %v", err)
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
-					apiServer.Addr(), *apiToken != "", len(corsOrigins) > 0)
+					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
 			}
 		}
 	} else {

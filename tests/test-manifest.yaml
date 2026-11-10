@@ -2225,3 +2225,21 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles
+
+  # ===========================================================================
+  # HTTP API (one process on one host; Docker and VM would test nothing more)
+  # ===========================================================================
+
+  - id: api-health-loopback
+    name: API answers /health on loopback
+    description: A mount started with -api-addr on 127.0.0.1 serves GET /health with 200
+    priority: go_only
+    environments:
+      go: api_test.go::TestAPIServesHealthOnLoopback
+
+  - id: api-refuses-remote-without-token
+    name: Mount refuses an unauthenticated remote API
+    description: With -api-addr on all interfaces and no -api-token, mount exits non-zero naming -api-token and never writes the device
+    priority: go_only
+    environments:
+      go: api_test.go::TestMountRefusesUnauthenticatedRemoteAPI

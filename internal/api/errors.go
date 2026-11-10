@@ -19,6 +19,9 @@ var (
 	// ErrInvalidCORSOrigin is returned when a CORS origin is malformed.
 	ErrInvalidCORSOrigin = errors.New("api: invalid CORS origin")
 
+	// ErrUnauthenticatedRemote is returned when other hosts could reach the API without a token.
+	ErrUnauthenticatedRemote = errors.New("api: no auth token set for an address other hosts can reach")
+
 	// ErrShutdownTimeout is returned when graceful shutdown times out.
 	ErrShutdownTimeout = errors.New("api: shutdown timed out")
 )

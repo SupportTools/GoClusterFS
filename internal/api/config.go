@@ -10,8 +10,8 @@ import (
 
 // Config holds the configuration for the API server.
 type Config struct {
-	// ListenAddr is the address to listen on (e.g., ":8080" or "127.0.0.1:8080").
-	// Default: ":8080"
+	// ListenAddr is the address to listen on (e.g., "127.0.0.1:8080" or ":8080").
+	// Default: "127.0.0.1:8080"
 	ListenAddr string
 
 	// AuthToken is the Bearer token for API authentication.
@@ -45,7 +45,7 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:      ":8080",
+		ListenAddr:      "127.0.0.1:8080",
 		AuthToken:       "",
 		CORSOrigins:     nil,
 		ReadTimeout:     30 * time.Second,
@@ -117,6 +117,27 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// LoopbackOnly reports whether ListenAddr accepts connections only from this host.
+func (c *Config) LoopbackOnly() bool {
+	host, _, err := net.SplitHostPort(c.ListenAddr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// CheckExposure refuses a config that serves other hosts without an auth token.
+func (c *Config) CheckExposure() error {
+	if c.AuthToken == "" && !c.LoopbackOnly() {
+		return fmt.Errorf("%w: %s", ErrUnauthenticatedRemote, c.ListenAddr)
+	}
 	return nil
 }
 

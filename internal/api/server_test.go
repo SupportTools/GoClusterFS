@@ -12,8 +12,8 @@ import (
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
-	if cfg.ListenAddr != ":8080" {
-		t.Errorf("expected ListenAddr :8080, got %s", cfg.ListenAddr)
+	if cfg.ListenAddr != "127.0.0.1:8080" {
+		t.Errorf("expected ListenAddr 127.0.0.1:8080, got %s", cfg.ListenAddr)
 	}
 	if cfg.AuthToken != "" {
 		t.Errorf("expected empty AuthToken, got %s", cfg.AuthToken)
