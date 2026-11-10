@@ -42,7 +42,7 @@ The cache hit percentages are wrong today and can read far above 100%, so don't 
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Warning: Failed to start cache broadcast` | The mount runs without broadcast. Other nodes' changes show up after `-cache-ttl` instead of right away. |
 | `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
-| `lock.Acquire: ... TIMEOUT after N retries` | A lock wait gave up after 30 seconds (`DefaultTimeout`), or a background task was stopped at unmount. A file operation that was waiting fails with EIO. See [Interrupted File Operations](#interrupted-file-operations). |
+| `[WARN] lock: gave up waiting for ...` | A lock wait gave up after 30 seconds (`DefaultTimeout`), or a background task was stopped at unmount. The line names the node that holds the lock. A file operation that was waiting fails with EIO. See [Interrupted File Operations](#interrupted-file-operations). |
 
 ### Journal
 
