@@ -6,13 +6,8 @@ import (
 	"runtime"
 
 	"github.com/spf13/cobra"
-)
 
-var (
-	// Version information, set at build time via ldflags
-	Version   = "dev"
-	GitCommit = "unknown"
-	BuildTime = "unknown"
+	"github.com/supporttools/GoClusterFS/internal/version"
 )
 
 // VersionInfo contains version information for JSON output.
@@ -31,9 +26,9 @@ var versionCmd = &cobra.Command{
 	Long:  `Display version, build information, and runtime details for gfsctl.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		info := VersionInfo{
-			Version:   Version,
-			GitCommit: GitCommit,
-			BuildTime: BuildTime,
+			Version:   version.Version,
+			GitCommit: version.Commit,
+			BuildTime: version.Date,
 			GoVersion: runtime.Version(),
 			OS:        runtime.GOOS,
 			Arch:      runtime.GOARCH,
