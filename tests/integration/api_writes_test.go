@@ -42,13 +42,25 @@ type apiMount struct {
 	log   *lockedBuffer
 }
 
+func writeTokenFile(t *testing.T, token string, mode os.FileMode) string {
+	t.Helper()
+	p := t.TempDir() + "/token"
+	if err := os.WriteFile(p, []byte(token+"\n"), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, mode); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
 func startAPIMount(t *testing.T, token string, sizeMB int) *apiMount {
 	t.Helper()
 	m := &apiMount{MountedFS: NewMountedFS(t, sizeMB), addr: freeLoopbackAddr(t), token: token, log: &lockedBuffer{}}
 	m.Log = m.log
 	m.ExtraArgs = []string{"-format", "-api-addr", m.addr}
 	if token != "" {
-		m.ExtraArgs = append(m.ExtraArgs, "-api-token", token)
+		m.ExtraArgs = append(m.ExtraArgs, "-api-token-file", writeTokenFile(t, token, 0o600))
 	}
 	if err := m.Mount(false); err != nil {
 		t.Fatalf("Mount failed: %v", err)
@@ -188,7 +200,7 @@ func TestAPIWritesOffWithoutToken(t *testing.T) {
 	if err != nil || status != http.StatusForbidden || !strings.Contains(out, "-api-token") {
 		t.Fatalf("snapshot without -api-token: status %d err %v\n%s", status, err, out)
 	}
-	m.mustCall(t, http.StatusOK, "GET", "/api/v1/snapshots", nil)
+	m.mustCall(t, http.StatusForbidden, "GET", "/api/v1/snapshots", nil)
 	if !strings.Contains(m.log.String(), "endpoints are off; set -api-token") {
 		t.Error("mount did not log that writes are off")
 	}
@@ -415,4 +427,66 @@ func TestMountExitsCleanlyDuringSnapshots(t *testing.T) {
 		t.Fatalf("fsck after shutdown during snapshots exited %d:\n%s", code, out)
 	}
 	t.Logf("%d snapshots finished before shutdown", ok.Load())
+}
+
+func TestAPIAdminOnLiveMount(t *testing.T) {
+	m := startAPIMount(t, "secret", 20)
+	if err := m.WriteFile("data", bytes.Repeat([]byte("x"), 2<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Remove("data"); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range []string{"flush-journal", "force-trim", "clear-cache"} {
+		if out := m.mustCall(t, http.StatusOK, "POST", "/api/v1/admin/"+op, nil); !strings.Contains(out, `"operation":"`+op+`"`) {
+			t.Errorf("admin %s: %s", op, out)
+		}
+	}
+	if err := m.WriteFile("after", []byte("still works")); err != nil {
+		t.Fatalf("write after admin calls: %v", err)
+	}
+	if got, err := m.ReadFile("after"); err != nil || string(got) != "still works" {
+		t.Fatalf("read after admin calls: %q %v", got, err)
+	}
+}
+
+func TestMountTokenSources(t *testing.T) {
+	dir := t.TempDir()
+	missing := dir + "/missing.img"
+	out, err := runMount(t, "-device", missing, "-mount", dir, "-api-token-file", writeTokenFile(t, "secret", 0o644))
+	if err == nil || !strings.Contains(out, "chmod 600") || strings.Contains(out, "Failed to open device") {
+		t.Errorf("world-readable token file: err=%v\n%s", err, out)
+	}
+	t.Setenv("GOCLUSTERFS_API_TOKEN", "from-env")
+	out, err = runMount(t, "-device", missing, "-mount", dir, "-api-token", "from-flag")
+	if err == nil || !strings.Contains(out, "only one") {
+		t.Errorf("env and flag together: err=%v\n%s", err, out)
+	}
+
+	m := &apiMount{MountedFS: NewMountedFS(t, 20), addr: freeLoopbackAddr(t), token: "from-env", log: &lockedBuffer{}}
+	m.Log = m.log
+	m.ExtraArgs = []string{"-format", "-api-addr", m.addr}
+	if err := m.Mount(false); err != nil {
+		t.Fatalf("Mount failed: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status, _, err := m.call("GET", "/api/v1/snapshots", nil)
+		if err == nil && status == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("GET /api/v1/snapshots with the env token: %d %v", status, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if strings.Contains(m.log.String(), "WARNING: -api-token is visible") {
+		t.Error("warned about -api-token when the token came from the environment")
+	}
+	os.Unsetenv("GOCLUSTERFS_API_TOKEN")
+
+	out, _ = runMount(t, "-device", missing, "-mount", dir, "-api-token", "from-flag")
+	if !strings.Contains(out, "WARNING: -api-token is visible to every local user") {
+		t.Errorf("no warning for -api-token:\n%s", out)
+	}
 }

@@ -2360,6 +2360,20 @@ scenarios:
     priority: go_only
     environments:
       go: api_writes_test.go::TestMountExitsCleanlyDuringSnapshots
+
+  - id: api-admin-live-mount
+    name: API admin endpoints on a live mount
+    description: flush-journal, force-trim and clear-cache answer 200 on a mounted filesystem, which keeps working afterwards
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIAdminOnLiveMount
+
+  - id: api-token-sources
+    name: API token from a file or the environment
+    description: Mount refuses a group- or world-readable -api-token-file and more than one token source, accepts GOCLUSTERFS_API_TOKEN, and warns when the token comes from -api-token
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestMountTokenSources
 =======
   - id: api-stats-live-values
     name: API stats report live values
