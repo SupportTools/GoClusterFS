@@ -102,3 +102,55 @@ func TestMountRefusesUnauthenticatedRemoteAPI(t *testing.T) {
 		t.Error("refused mount still wrote a superblock")
 	}
 }
+
+func runMount(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	binary, err := findBinary()
+	if err != nil {
+		t.Fatalf("Failed to find binary: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("goclusterfs-mount %v did not exit", args)
+	}
+	return string(out), err
+}
+
+func TestMountPrintsVersion(t *testing.T) {
+	out, err := runMount(t, "-version")
+	if err != nil || !strings.HasPrefix(out, "goclusterfs-mount ") {
+		t.Fatalf("-version: err=%v output=%q", err, out)
+	}
+}
+
+func TestMountWarnsWithoutBroadcastSecret(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.img")
+	const warning = "WARNING: -broadcast is on without -broadcast-secret"
+
+	if out, _ := runMount(t, "-device", missing, "-mount", dir); !strings.Contains(out, warning) {
+		t.Errorf("no warning without a secret:\n%s", out)
+	}
+	for _, flag := range []string{"-broadcast-secret=x", "-broadcast=false"} {
+		if out, _ := runMount(t, "-device", missing, "-mount", dir, flag); strings.Contains(out, warning) {
+			t.Errorf("warning with %s:\n%s", flag, out)
+		}
+	}
+}
+
+func TestMountRejectsBadAPISettingsBeforeOpeningDevice(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.img")
+	for _, tt := range []struct{ flag, want string }{
+		{"-api-addr=127.0.0.1", "Invalid API settings"},
+		{"-api-cors=not-a-url", "Invalid API settings"},
+		{"-api-cors=*", "-api-cors"},
+	} {
+		out, err := runMount(t, "-device", missing, "-mount", dir, tt.flag)
+		if err == nil || !strings.Contains(out, tt.want) || strings.Contains(out, "Failed to open device") {
+			t.Errorf("%s: err=%v, want an error mentioning %q before the device opens:\n%s", tt.flag, err, tt.want, out)
+		}
+	}
+}

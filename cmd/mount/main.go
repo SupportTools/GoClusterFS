@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -55,7 +56,7 @@ func (p *fsStatusProvider) Capacity() *api.CapacityInfo {
 	freeBlocks := p.bitmapMgr.FreeCount()
 	usedBlocks := totalBlocks - freeBlocks
 
-	const blockSize uint64 = 1024 * 1024 // 1MB blocks
+	const blockSize uint64 = goclusterfs.BlockSize
 	totalBytes := totalBlocks * blockSize
 	usedBytes := usedBlocks * blockSize
 	freeBytes := freeBlocks * blockSize
@@ -146,8 +147,15 @@ func main() {
 
 	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS)
 	if *apiEnabled {
+		if err := apiCfg.Validate(); err != nil {
+			log.Fatalf("Invalid API settings: %v", err)
+		}
 		if err := apiCfg.CheckExposure(); err != nil {
-			log.Fatalf("Refusing to start the API: %v. Set -api-token, set -api-addr to a loopback address such as 127.0.0.1:8080, or pass -api=false", err)
+			hint := "set -api-addr to a loopback address such as 127.0.0.1:8080"
+			if errors.Is(err, api.ErrWildcardCORSWithoutToken) {
+				hint = "list the allowed origins in -api-cors"
+			}
+			log.Fatalf("Refusing to start the API: %v. Set -api-token, %s, or pass -api=false", err, hint)
 		}
 	}
 	if *broadcastEnabled && *broadcastSecret == "" {
