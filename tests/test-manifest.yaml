@@ -394,6 +394,16 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
+  # Docker and VM tests run shell tools over docker exec and ssh, which cannot keep signalling the thread inside a FUSE call.
+  - id: multinode-create-with-signals
+    name: Creates survive signals during lock waits
+    description: Two nodes create files while the creating threads keep getting signals; no create or write fails
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeCreateWithSignals
+      docker: TODO
+      vm: TODO
+
   # The Docker and VM harnesses have no per-node mount flags, so they cannot run one node with -attr-timeout=0.
   - id: multinode-attr-timeout-zero
     name: Attribute timeout 0 shows remote size changes
@@ -1542,6 +1552,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/inode_update_test.go::TestUpdateInodeLockedWaitsForOtherNode
 
+  - id: write-survives-interrupt
+    name: Write finishes after an interrupt during a lock wait
+    description: A write whose request is cancelled while it waits for another node's inode lock finishes once the lock is free
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestWriteFinishesAfterInterruptDuringLockWait
+
+  - id: write-fails-after-lock-timeout
+    name: Interrupted write fails with EIO when a lock is never freed
+    description: A write waiting for an inode lock that another node keeps holding gives up with EIO after lock.DefaultTimeout instead of hanging
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestWriteFailsWhenLockIsNotFreed
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself
@@ -2254,6 +2278,20 @@ scenarios:
   # ===========================================================================
   # HTTP API (one process on one host; Docker and VM would test nothing more)
   # ===========================================================================
+
+  - id: lock-acquire-without-deadline-gives-up
+    name: Acquire without a deadline gives up
+    description: An acquire whose context never ends returns ErrLockTimeout after DefaultTimeout instead of waiting forever
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestAcquireWithoutDeadlineGivesUp
+
+  - id: lock-timeout-logs-holder
+    name: Timed-out acquire logs the holder
+    description: An acquire that gives up logs at WARN which node holds the record and how
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTimedOutAcquireLogsHolder
 
   - id: api-health-loopback
     name: API answers /health on loopback

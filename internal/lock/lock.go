@@ -253,6 +253,29 @@ func covers(held, want LockMode) bool {
 // rewrites AcquireTime, so a record kept busy by overlapping keys never looks stale.
 var renewAfter = StaleThreshold / 3
 
+// acquireTimeout is how long Acquire waits at most; tests shorten it.
+var acquireTimeout = DefaultTimeout
+
+// describeHolder says who holds a record, for logs.
+func (m *Manager) describeHolder(recordID uint64) string {
+	record, err := m.readRecord(recordID)
+	if err != nil {
+		return fmt.Sprintf("could not be read: %v", err)
+	}
+	who := fmt.Sprintf("node slot %d (%x)", record.OwnerSlot, record.OwnerUUID[:8])
+	if record.OwnerUUID == m.nodeUUID {
+		who = "this node"
+	}
+	held := time.Since(time.Unix(record.AcquireTime, 0)).Round(time.Second)
+	switch record.Mode {
+	case LockModeExclusive:
+		return fmt.Sprintf("is write-locked by %s, taken %v ago", who, held)
+	case LockModeShared:
+		return fmt.Sprintf("is read-locked by %d readers, latest %s, first taken %v ago", record.SharedCount, who, held)
+	}
+	return "is free"
+}
+
 // Errors
 var (
 	ErrLockTimeout   = errors.New("lock acquisition timed out")
@@ -378,14 +401,12 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 
 		retryCount++
 
-		// Check context cancellation, but allow at least 3 retries
-		if retryCount >= 3 {
-			select {
-			case <-ctx.Done():
-				log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - TIMEOUT after %d retries (%v)", lockType, resourceID, retryCount, time.Since(startTime))
-				return ErrLockTimeout
-			default:
-			}
+		// Check context cancellation, but allow at least 3 retries. A caller whose
+		// context never ends still gives up after acquireTimeout.
+		if retryCount >= 3 && (ctx.Err() != nil || time.Since(startTime) > acquireTimeout) {
+			log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v (%d tries); record %d %s",
+				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), retryCount, recordID, m.describeHolder(recordID))
+			return ErrLockTimeout
 		}
 
 		// Add jitter to prevent thundering herd

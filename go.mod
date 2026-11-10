@@ -2,11 +2,12 @@ module github.com/supporttools/GoClusterFS
 
 go 1.26.0
 
+require github.com/hanwen/go-fuse/v2 v2.9.0
+
 require (
-	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/sys v0.35.0
+	golang.org/x/sys v0.50.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
