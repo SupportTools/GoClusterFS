@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/supporttools/GoClusterFS/internal/api"
 )
 
@@ -61,7 +63,14 @@ func TestOpenStaysInsideTheRoot(t *testing.T) {
 	if err := os.Symlink("f", filepath.Join(root, "inside-link")); err != nil {
 		t.Fatal(err)
 	}
+	if err := unix.Mkfifo(filepath.Join(root, "fifo"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	o := New(root, nil)
+	if _, err := o.open("/f"); !errors.Is(err, api.ErrNotMounted) {
+		t.Fatalf("open on a plain directory: %v, want ErrNotMounted", err)
+	}
+	o.checkRoot = nil
 
 	for _, p := range []string{"/f", "/dir/g"} {
 		f, err := o.open(p)
@@ -79,8 +88,10 @@ func TestOpenStaysInsideTheRoot(t *testing.T) {
 			t.Errorf("open(%q) = %v, want ErrInvalidPath", p, err)
 		}
 	}
-	if err := o.CreateSnapshot(context.Background(), "/dir", "s"); !errors.Is(err, api.ErrInvalidPath) {
-		t.Errorf("snapshot of a directory: %v, want ErrInvalidPath", err)
+	for _, p := range []string{"/dir", "/fifo"} {
+		if err := o.CreateSnapshot(context.Background(), p, "s"); !errors.Is(err, api.ErrInvalidPath) {
+			t.Errorf("snapshot of %s: %v, want ErrInvalidPath", p, err)
+		}
 	}
 	if _, err := o.ListSnapshots(context.Background(), ""); !errors.Is(err, api.ErrDisabled) {
 		t.Errorf("list without a registry: %v, want ErrDisabled", err)

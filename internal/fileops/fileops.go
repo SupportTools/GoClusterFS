@@ -22,11 +22,26 @@ import (
 type Ops struct {
 	root     string
 	registry *snapshot.Registry
+	// checkRoot refuses a root that is not the mounted filesystem.
+	checkRoot func(fd int) error
 }
 
 // New returns Ops for the mount at root. registry is nil when snapshots are off.
 func New(root string, registry *snapshot.Registry) *Ops {
-	return &Ops{root: root, registry: registry}
+	return &Ops{root: root, registry: registry, checkRoot: isFUSE}
+}
+
+// isFUSE refuses a root that is a plain directory, for example after FUSE has
+// exited: setxattr there would set a host xattr and report success.
+func isFUSE(fd int) error {
+	var st unix.Statfs_t
+	if err := unix.Fstatfs(fd, &st); err != nil {
+		return err
+	}
+	if st.Type != unix.FUSE_SUPER_MAGIC {
+		return fmt.Errorf("the filesystem is %w", api.ErrNotMounted)
+	}
+	return nil
 }
 
 var _ api.FileService = (*Ops)(nil)
@@ -139,9 +154,15 @@ func (o *Ops) open(p string) (*os.File, error) {
 		return nil, err
 	}
 	defer unix.Close(rootFD)
+	if o.checkRoot != nil {
+		if err := o.checkRoot(rootFD); err != nil {
+			return nil, err
+		}
+	}
+	// O_NONBLOCK keeps a FIFO from blocking the open.
 	fd, err := unix.Openat2(rootFD, rel, &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS,
+		Flags:   unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK | unix.O_NOCTTY,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS | unix.RESOLVE_NO_XDEV,
 	})
 	switch err {
 	case nil:
