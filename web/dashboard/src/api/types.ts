@@ -185,7 +185,7 @@ export interface StatsOverviewResponse {
 }
 
 // ============================================================
-// Snapshot and clone types (internal/api/writes.go)
+// Snapshot, clone and admin types (internal/api/writes.go)
 // ============================================================
 
 // Registry states; "deleting" lasts until the snapshot worker frees the blocks
@@ -224,4 +224,12 @@ export interface WriteResponse {
   path: string
   name?: string
   dest?: string
+}
+
+export type AdminOperation = 'flush-journal' | 'force-trim' | 'clear-cache'
+
+// POST /api/v1/admin/{operation}; acts on this node only
+export interface AdminResponse {
+  operation: string
+  message: string
 }

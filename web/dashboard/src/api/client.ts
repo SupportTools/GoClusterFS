@@ -14,6 +14,8 @@ import type {
   SnapshotRequest,
   CloneRequest,
   WriteResponse,
+  AdminOperation,
+  AdminResponse,
 } from './types'
 
 export interface ApiConfig {
@@ -188,6 +190,10 @@ export class ApiClient {
   cloneFile(request: CloneRequest): Promise<WriteResponse> {
     return this.send('POST', '/api/v1/clones', request)
   }
+
+  admin(operation: AdminOperation): Promise<AdminResponse> {
+    return this.send('POST', `/api/v1/admin/${operation}`)
+  }
 }
 
 export const apiClient = new ApiClient()
@@ -206,4 +212,5 @@ export const api = {
   deleteSnapshot: (name: string, path: string) => apiClient.deleteSnapshot(name, path),
   cloneSnapshot: (name: string, request: CloneRequest) => apiClient.cloneSnapshot(name, request),
   cloneFile: (request: CloneRequest) => apiClient.cloneFile(request),
+  admin: (operation: AdminOperation) => apiClient.admin(operation),
 }

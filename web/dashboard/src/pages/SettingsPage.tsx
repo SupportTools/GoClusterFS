@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useSettings, REFRESH_INTERVAL_OPTIONS } from '@/stores'
 import { useStatus } from '@/hooks'
-import { api } from '@/api'
+import { api, type AdminOperation } from '@/api'
 
 /**
  * Setting section wrapper
@@ -165,6 +165,54 @@ function TokenForm() {
   )
 }
 
+const ADMIN_ACTIONS: ReadonlyArray<{ operation: AdminOperation; label: string; description: string }> = [
+  { operation: 'flush-journal', label: 'Flush journal', description: 'Checkpoint the journal now' },
+  { operation: 'force-trim', label: 'Send queued TRIM', description: 'Discard the freed blocks waiting in the TRIM queue' },
+  { operation: 'clear-cache', label: 'Clear caches', description: 'Drop the inode, extent and negative caches' },
+]
+
+function AdminActions() {
+  const [busy, setBusy] = useState<AdminOperation | null>(null)
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null)
+
+  const run = async (operation: AdminOperation) => {
+    setBusy(operation)
+    setResult(null)
+    try {
+      const response = await api.admin(operation)
+      setResult({ ok: true, text: response.message || `${operation} done` })
+    } catch (err) {
+      setResult({ ok: false, text: err instanceof Error ? err.message : 'Request failed' })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      {ADMIN_ACTIONS.map(({ operation, label, description }) => (
+        <div key={operation} className="flex items-center justify-between gap-4">
+          <div>
+            <span className="text-sm font-medium text-gfs-text-primary">{label}</span>
+            <p className="text-xs text-gfs-text-muted mt-0.5">{description}</p>
+          </div>
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => run(operation)}
+            className="px-4 py-2 text-sm font-medium text-gfs-text-primary bg-gfs-bg-tertiary border border-gfs-border rounded hover:bg-gfs-bg-primary disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          >
+            {busy === operation ? 'Running...' : 'Run'}
+          </button>
+        </div>
+      ))}
+      {result && (
+        <p className={`text-sm ${result.ok ? 'text-gfs-status-ok' : 'text-gfs-status-error'}`}>{result.text}</p>
+      )}
+    </div>
+  )
+}
+
 /**
  * API status indicator
  */
@@ -290,6 +338,13 @@ export function SettingsPage() {
         description="The token stays in this browser tab (sessionStorage) and is gone when you close it."
       >
         <TokenForm />
+      </SettingSection>
+
+      <SettingSection
+        title="Maintenance"
+        description="Acts on this node only. Needs the API token, and the server must have one set."
+      >
+        <AdminActions />
       </SettingSection>
 
       {/* About */}

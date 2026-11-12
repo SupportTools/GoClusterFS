@@ -133,7 +133,7 @@ Mount logs each write at INFO with the client address, the action, its arguments
 
 ### Web Dashboard
 
-Mount serves a web dashboard at `http://<api-addr>/ui/`, unless `-dashboard=false`. It shows status, capacity, the cache, journal, TRIM and lock counters, and the nodes in the registry. It lists snapshots, and for a file you name it creates, clones and deletes them and clones the file.
+Mount serves a web dashboard at `http://<api-addr>/ui/`, unless `-dashboard=false`. It shows status, capacity, the cache, journal, TRIM and lock counters, and the nodes in the registry. It lists snapshots, and for a file you name it creates, clones and deletes them and clones the file. Its Settings page runs the admin endpoints.
 
 The dashboard's files are static and hold no data, so they need no token and skip the rate limit. The page calls `/api/v1/...` on the same origin with the same rules as any client: reads need the token when one is set, and snapshots always need it. Enter the token on the dashboard's Settings page. The browser keeps it in `sessionStorage`, so closing the tab forgets it. Responses carry a `Content-Security-Policy` that lets the page load and call only its own origin and stops other sites from framing it.
 
