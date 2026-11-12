@@ -342,16 +342,17 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 		return 0, fmt.Errorf("failed to serialize transaction: %w", err)
 	}
 
-	// Check space
+	// Check space for the sector-aligned record WriteAt writes
+	need := sectorAligned(uint32(len(data)))
 	available := j.region.AvailableSpace()
-	if uint32(len(data)) > available {
+	if need > available {
 		// Try to force checkpoint to free space
 		if err := j.forceCheckpoint(); err != nil {
 			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
 		available = j.region.AvailableSpace()
-		if uint32(len(data)) > available {
+		if need > available {
 			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
@@ -425,6 +426,10 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	}
 
 	return seq, nil
+}
+
+func sectorAligned(n uint32) uint32 {
+	return (n + storage.SectorSize - 1) / storage.SectorSize * storage.SectorSize
 }
 
 // dropIntent forgets an intent whose Commit failed, since its caller never runs the operation.
@@ -567,14 +572,14 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 	alignedData := make([]byte, alignedSize)
 	copy(alignedData, data)
 
-	// Check space
+	// Check space for the sector-aligned record WriteAt writes
 	available := j.region.AvailableSpace()
-	if uint32(alignedSize) > available {
+	if sectorAligned(uint32(alignedSize)) > available {
 		if err := j.forceCheckpoint(); err != nil {
 			return ErrJournalFull
 		}
 		available = j.region.AvailableSpace()
-		if uint32(alignedSize) > available {
+		if sectorAligned(uint32(alignedSize)) > available {
 			return ErrJournalFull
 		}
 	}

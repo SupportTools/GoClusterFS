@@ -888,7 +888,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 		txn = f.journal.Begin()
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 			InodeNum:       uint64(inodeNum),
-			Mode:           mode | uint32(inode.S_IFDIR),
+			Mode:           uint32(inode.S_IFDIR) | (mode & 0777),
 			UID:            uid,
 			GID:            gid,
 			ParentInodeNum: uint64(inode.InodeRoot),

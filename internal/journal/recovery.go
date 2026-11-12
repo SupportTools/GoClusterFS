@@ -160,7 +160,7 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 		}
 
 		// Handle wrap-around
-		if pos >= dataAreaSize {
+		if pos >= dataAreaSize && pos != tail {
 			pos = pos - dataAreaSize
 		}
 	}
@@ -238,7 +238,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 		// Skip IntentCompletion records (already processed in Phase 1)
 		if magic == IntentCompletionMagic {
 			pos += storage.SectorSize
-			if pos >= dataAreaSize {
+			if pos >= dataAreaSize && pos != tail {
 				pos = pos - dataAreaSize
 			}
 			continue
@@ -297,7 +297,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 				alignedLen := ((txnHeader.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
 				pos = pos + alignedLen
 				stats.BytesScanned += alignedLen
-				if pos >= dataAreaSize {
+				if pos >= dataAreaSize && pos != tail {
 					pos = pos - dataAreaSize
 				}
 				continue
@@ -348,7 +348,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 		stats.BytesScanned += alignedLen
 
 		// Handle wrap-around
-		if pos >= dataAreaSize {
+		if pos >= dataAreaSize && pos != tail {
 			pos = pos - dataAreaSize
 		}
 	}

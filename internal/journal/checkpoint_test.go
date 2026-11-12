@@ -1,8 +1,10 @@
 package journal
 
 import (
+	"errors"
 	"slices"
 	"testing"
+	"time"
 )
 
 // commitIntents commits one transaction per entry and completes those marked true.
@@ -90,5 +92,69 @@ func TestStopLeavesIncompleteIntentsForReplay(t *testing.T) {
 	}
 	if got := replayedAfterCrash(t, j); !slices.Equal(got, seqs) {
 		t.Errorf("replayed %v after unmounting with an incomplete intent, want %v", got, seqs)
+	}
+}
+
+// With the head pinned by a pending intent, other operations fill the ring until the journal is full, never past the intent.
+func TestPendingIntentSurvivesFullRing(t *testing.T) {
+	j := newTestJournal(t)
+	commitIntents(t, j, slices.Repeat([]bool{true}, 100)...)
+	if _, err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	pinned := commitIntents(t, j, false)[0]
+	for n := 1; ; n++ {
+		txn := j.Begin()
+		if err := txn.LogInodeCreate(testInodePayload(uint64(n))); err != nil {
+			t.Fatal(err)
+		}
+		seq, err := j.Commit(txn)
+		if errors.Is(err, ErrJournalFull) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("op %d: %v", n, err)
+		}
+		if err := j.CompleteIntent(seq); err != nil && !errors.Is(err, ErrJournalFull) {
+			t.Fatalf("op %d: %v", n, err)
+		}
+		if _, err := j.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+		if head, tail := j.region.HeadOffset(), j.region.TailOffset(); head == tail {
+			t.Fatalf("op %d: head == tail == %d with intent %d pending, which reads as an empty journal", n, head, pinned)
+		}
+	}
+	if got := replayedAfterCrash(t, j); !slices.Contains(got, pinned) {
+		t.Errorf("a full journal replayed %v, want the pending intent %d", got, pinned)
+	}
+}
+
+// A crash with the tail at the very end of the data area must not hang the next mount's scan.
+func TestRecoveryEndsWithTailAtEnd(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1024*1024)
+	t.Cleanup(cleanup)
+	j, err := Init(dev, 0, uint64(JournalDataOffset)+3*4096, [16]byte{1}, 1, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitIntents(t, j, true)
+	if _, err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	pending := commitIntents(t, j, false)
+	if tail := j.region.TailOffset(); tail != j.region.DataAreaSize() {
+		t.Fatalf("tail %d, want the end of the %d-byte data area", tail, j.region.DataAreaSize())
+	}
+
+	done := make(chan []uint64, 1)
+	go func() { done <- replayedAfterCrash(t, j) }()
+	select {
+	case got := <-done:
+		if !slices.Equal(got, pending) {
+			t.Errorf("replayed %v, want %v", got, pending)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("recovery scan still running after 10s with the tail at the end of the data area")
 	}
 }
