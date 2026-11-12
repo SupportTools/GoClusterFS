@@ -30,8 +30,8 @@ type MountedFS struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 
-	// broadcastArgs give the node its own broadcast ports; ExtraArgs come after and win.
-	broadcastArgs []string
+	// portArgs give the node its own broadcast and API ports; ExtraArgs come after and win.
+	portArgs []string
 }
 
 // freeUDPPorts returns n distinct UDP ports that were free on all interfaces.
@@ -49,11 +49,26 @@ func freeUDPPorts(t *testing.T, n int) []int {
 	return ports
 }
 
-// broadcastArgs sets the broadcast ports. Nodes of one cluster share the
-// multicast port, every node needs its own unicast port, and a mount fails
-// when it cannot bind them.
-func broadcastArgs(mcastPort, unicastPort int) []string {
-	return []string{"-mcast-port", strconv.Itoa(mcastPort), "-unicast-port", strconv.Itoa(unicastPort)}
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to find a free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	return addr
+}
+
+// portArgs sets the node's ports. Nodes of one cluster share the multicast
+// port, every node needs its own unicast port, and a mount fails when it
+// cannot bind them. The API gets a free port instead of the default 8080.
+func portArgs(t *testing.T, mcastPort, unicastPort int) []string {
+	return []string{
+		"-mcast-port", strconv.Itoa(mcastPort),
+		"-unicast-port", strconv.Itoa(unicastPort),
+		"-api-addr", freeLoopbackAddr(t),
+	}
 }
 
 // findBinary locates the goclusterfs-mount binary.
@@ -123,13 +138,13 @@ func NewMountedFS(t *testing.T, sizeMB int) *MountedFS {
 
 	ports := freeUDPPorts(t, 2)
 	mfs := &MountedFS{
-		ImagePath:     imagePath,
-		MountPoint:    mountPoint,
-		BinaryPath:    binaryPath,
-		t:             t,
-		ctx:           ctx,
-		cancel:        cancel,
-		broadcastArgs: broadcastArgs(ports[0], ports[1]),
+		ImagePath:  imagePath,
+		MountPoint: mountPoint,
+		BinaryPath: binaryPath,
+		t:          t,
+		ctx:        ctx,
+		cancel:     cancel,
+		portArgs:   portArgs(t, ports[0], ports[1]),
 	}
 
 	// Register cleanup
@@ -160,7 +175,7 @@ func (m *MountedFS) Format() error {
 		"-mount", m.MountPoint,
 		"-format",
 	}
-	args = append(args, m.broadcastArgs...)
+	args = append(args, m.portArgs...)
 
 	cmd := exec.Command(m.BinaryPath, args...)
 
@@ -232,7 +247,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	if debug {
 		args = append(args, "-debug")
 	}
-	args = append(args, m.broadcastArgs...)
+	args = append(args, m.portArgs...)
 	args = append(args, m.ExtraArgs...)
 
 	// Create a fresh context for this mount operation
@@ -267,7 +282,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	if debug {
 		args = append(args, "-debug")
 	}
-	args = append(args, m.broadcastArgs...)
+	args = append(args, m.portArgs...)
 	args = append(args, m.ExtraArgs...)
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
@@ -469,13 +484,13 @@ func NewMountedFSWithImage(t *testing.T, imagePath string) *MountedFS {
 
 	ports := freeUDPPorts(t, 2)
 	mfs := &MountedFS{
-		ImagePath:     imagePath,
-		MountPoint:    mountPoint,
-		BinaryPath:    binaryPath,
-		t:             t,
-		ctx:           ctx,
-		cancel:        cancel,
-		broadcastArgs: broadcastArgs(ports[0], ports[1]),
+		ImagePath:  imagePath,
+		MountPoint: mountPoint,
+		BinaryPath: binaryPath,
+		t:          t,
+		ctx:        ctx,
+		cancel:     cancel,
+		portArgs:   portArgs(t, ports[0], ports[1]),
 	}
 
 	// Register cleanup - only removes mount point, NOT the shared image
@@ -532,7 +547,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	if debug {
 		args = append(args, "-debug")
 	}
-	args = append(args, m.broadcastArgs...)
+	args = append(args, m.portArgs...)
 
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
 	m.MountCmd.Stdout = m.output()
@@ -562,7 +577,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	if debug {
 		args = append(args, "-debug")
 	}
-	args = append(args, m.broadcastArgs...)
+	args = append(args, m.portArgs...)
 
 	// Create a fresh context for this mount operation
 	m.ctx, m.cancel = context.WithCancel(context.Background())
