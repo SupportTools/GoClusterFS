@@ -752,13 +752,36 @@ scenarios:
       vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
 
   - id: truncate-replay-keeps-mapped-blocks
-    name: Replay of an interrupted truncate keeps blocks files still map
-    description: A truncate stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount frees no block a file maps, and fsck is clean
+    name: Replay of an interrupted truncate frees exactly the truncated blocks
+    description: A truncate stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount frees the truncated blocks and no block a file still maps, and fsck is clean
     priority: high
     environments:
       go: internal/goclusterfs/journal_crash_test.go::TestTruncateReplayKeepsMappedBlocks
       docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
       vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: unlink-replay-frees-file
+    name: Replay of an interrupted unlink frees the file
+    description: An unlink in a subdirectory stops between its journal commit and its changes, and the process dies; replay at the next mount removes the entry and frees the inode and its blocks, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestUnlinkReplayFreesFileAndBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: extent-free-replay-guard
+    name: ExtentFree replay frees only blocks still mapped where logged
+    description: Replay of an ExtentFree record unmaps and frees a logged block only while the inode maps that disk block at that file block, and is idempotent
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestApplyExtentFreeFreesOnlyStillMappedBlocks
+
+  - id: failed-write-frees-blocks
+    name: Failed writes and mkdirs give back their blocks
+    description: A write whose inode write fails frees the blocks it allocated, and a mkdir whose inode write fails frees the new directory's block; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/failure_frees_test.go::TestFailedWriteFreesItsBlocks
 
   - id: intent-completion-serialize
     name: IntentCompletion serialization
