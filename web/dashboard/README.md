@@ -21,7 +21,7 @@ npm ci
 npm run dev
 ```
 
-Open `http://localhost:5173/ui/`. Vite proxies `/api` and `/health` to the mount and keeps the `Host` header, so the API treats the dev server as its own origin. Snapshot requests still need the token, which you enter on the Settings page.
+Open `http://localhost:5173/ui/`. Vite proxies `/api` and `/health` to the mount. Writes from the dev server work, because the proxy keeps the `Host` header and the API sees a same-origin request. They still need the token, which you enter on the Settings page.
 
 ## Packages
 
