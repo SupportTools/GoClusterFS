@@ -83,11 +83,19 @@ list_dir() {
     exec_on_node "$node" ls -la "/mnt/goclusterfs/$path"
 }
 
-# Kill a node container
+# Kill a node container, as a crash would, and fail unless it stops within 10s
 kill_node() {
-    local node=$1
+    local node=$1 waited=0
     log "Killing node: $node"
-    docker kill "$node" || true
+    docker kill "$node" >/dev/null 2>&1 || true
+    while [[ "$(docker inspect -f '{{.State.Running}}' "$node" 2>/dev/null)" == true ]]; do
+        if [[ $waited -ge 50 ]]; then
+            log "ERROR: $node still running 10s after docker kill"
+            return 1
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
 }
 
 # Restart a node container
@@ -1189,7 +1197,7 @@ test_journal_recovery_multinode() {
 
     # Phase 2: Kill Node A to simulate crash
     log "Phase 2: Killing Node A to simulate crash..."
-    kill_node "$node_a"
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Phase 3: Wait for heartbeat to become stale
@@ -1272,7 +1280,10 @@ test_restart_keeps_peer_journal() {
     local since slot_before
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     slot_before=$(docker logs "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
-    docker kill "$node_a" >/dev/null 2>&1 || true
+    if ! kill_node "$node_a"; then
+        exec_on_node "$node_b" touch /tmp/peer-writer.stop
+        return 1
+    fi
     sleep 1
     docker start "$node_a" >/dev/null
     if ! wait_node_healthy "$node_a" 60; then
@@ -1357,7 +1368,7 @@ test_journal_recovery_multiple_files() {
 
     # Phase 2: Kill Node A to simulate crash
     log "Phase 2: Killing Node A to simulate crash..."
-    kill_node "$node_a"
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Phase 3: Wait for heartbeat to become stale
@@ -1447,7 +1458,7 @@ test_journal_recovery_large_file() {
 
     # Phase 2: Kill Node A to simulate crash
     log "Phase 2: Killing Node A to simulate crash..."
-    kill_node "$node_a"
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Phase 3: Wait for heartbeat to become stale
@@ -1521,7 +1532,7 @@ test_journal_recovery_idempotency() {
 
     # Phase 2: Kill Node A
     log "Phase 2: Killing Node A..."
-    kill_node "$node_a"
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Phase 3: Wait for heartbeat timeout
@@ -1547,7 +1558,7 @@ test_journal_recovery_idempotency() {
 
     # Phase 5: Stop Node B
     log "Phase 5: Stopping Node B..."
-    kill_node "$node_b"
+    kill_node "$node_b" || return 1
     sleep 2
 
     # Phase 6: Verify idempotency on Node C
@@ -1617,7 +1628,7 @@ test_journal_crash_recovery_file() {
     sleep 1
 
     log "Phase 2: Simulating crash by killing container..."
-    kill_node "$node_a"
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Phase 3: Restart (remount) - this triggers journal recovery
@@ -1684,7 +1695,7 @@ test_journal_crash_recovery_directory() {
     sleep 1
 
     log "Phase 2: Simulating crash by killing container..."
-    kill_node "$node_a"
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Phase 3: Restart (remount) - this triggers journal recovery
@@ -1764,7 +1775,7 @@ test_journal_crash_recovery_multiple_ops() {
     log "All operations complete, simulating crash..."
 
     # Kill the container to simulate crash
-    docker kill "$node_a" >/dev/null 2>&1 || true
+    kill_node "$node_a" || return 1
     sleep 2
 
     # Restart container
@@ -1855,7 +1866,7 @@ test_journal_crash_during_write() {
     log "Wrote $write_count rapid files, crashing now..."
 
     # Kill container while writes may be in progress
-    docker kill "$node_a" >/dev/null 2>&1 || true
+    kill_node "$node_a" || return 1
 
     # Wait for any background processes to terminate
     wait 2>/dev/null || true
@@ -1973,7 +1984,7 @@ test_container_kill_recovery() {
     write_file "$victim" "before_kill.txt" "Written before kill"
 
     # Kill the victim
-    kill_node "$victim"
+    kill_node "$victim" || return 1
     sleep 2
 
     # Survivor should still be able to read the file
@@ -2530,7 +2541,7 @@ test_stress_random_failures() {
         if [ $((RANDOM % 5)) -eq 0 ]; then
             local kill_idx=$((RANDOM % NODE_COUNT))
             local kill_node="${NODE_ARRAY[$kill_idx]}"
-            kill_node "$kill_node"
+            kill_node "$kill_node" || return 1
             sleep 1
             restart_node "$kill_node"
             wait_node_healthy "$kill_node" 30

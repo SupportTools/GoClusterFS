@@ -123,9 +123,6 @@ func (c *MultiNodeCluster) KillNode(idx int) error {
 		return err
 	}
 
-	// Wait briefly for process to die and unmount to propagate
-	time.Sleep(500 * time.Millisecond)
-
 	// Force unmount to clean up mount point
 	c.Nodes[idx].Unmount()
 
