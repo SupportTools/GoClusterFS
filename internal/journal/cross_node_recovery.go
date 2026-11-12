@@ -535,38 +535,41 @@ func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
 	}
 }
 
-// applyExtentFree unmaps and frees the logged blocks the inode still maps at the logged file blocks. A block the inode
-// maps elsewhere or no longer maps was freed already, or now holds another write, so it is left alone.
+// applyExtentFree unmaps and frees the logged blocks, through refcounts for shared ones, if the inode has not been written
+// since the free was logged. Otherwise the operation's inode write landed, or a peer that took the inode's lock after a
+// crash changed it, and the blocks may be free or in use again. Each block must also still be mapped where logged.
 func applyExtentFree(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
 	p, err := DeserializeExtentFree(payload)
 	if err != nil {
 		return false, err
 	}
 	return updateExtents(ctx, rctx, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
-		if ino.Magic != inode.InodeMagic {
+		if ino.Magic != inode.InodeMagic || ino.MetaGeneration != p.MetaGeneration {
 			return false, nil
 		}
 		freed := false
-		for i := uint64(0); i < uint64(p.Length); {
-			run := uint64(0)
-			for i+run < uint64(p.Length) {
-				ext, offset, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock+i+run)
-				if err != nil || ext.PhysicalBlock+offset != p.DiskBlock+i+run {
-					break
+		for _, e := range p.Extents {
+			for i := uint64(0); i < uint64(e.Length); {
+				run := uint64(0)
+				for i+run < uint64(e.Length) {
+					ext, offset, err := rctx.ExtentMgr.Lookup(ino, e.FileBlock+i+run)
+					if err != nil || ext.PhysicalBlock+offset != e.DiskBlock+i+run {
+						break
+					}
+					run++
 				}
-				run++
+				if run == 0 {
+					i++
+					continue
+				}
+				if err := rctx.ExtentMgr.RemoveExtentForRecovery(ctx, ino, uint32(e.FileBlock+i), uint32(run)); err != nil {
+					return false, fmt.Errorf("failed to free file blocks %d-%d of inode %d: %w", e.FileBlock+i, e.FileBlock+i+run-1, p.InodeNum, err)
+				}
+				log.Printf("[Recovery] ExtentFree: freed file blocks %d-%d (disk %d-%d) of inode %d",
+					e.FileBlock+i, e.FileBlock+i+run-1, e.DiskBlock+i, e.DiskBlock+i+run-1, p.InodeNum)
+				freed = true
+				i += run
 			}
-			if run == 0 {
-				i++
-				continue
-			}
-			if err := rctx.ExtentMgr.RemoveExtentForRecovery(ctx, ino, uint32(p.FileBlock+i), uint32(run)); err != nil {
-				return false, fmt.Errorf("failed to free file blocks %d-%d of inode %d: %w", p.FileBlock+i, p.FileBlock+i+run-1, p.InodeNum, err)
-			}
-			log.Printf("[Recovery] ExtentFree: freed file blocks %d-%d (disk %d-%d) of inode %d",
-				p.FileBlock+i, p.FileBlock+i+run-1, p.DiskBlock+i, p.DiskBlock+i+run-1, p.InodeNum)
-			freed = true
-			i += run
 		}
 		return freed, nil
 	})

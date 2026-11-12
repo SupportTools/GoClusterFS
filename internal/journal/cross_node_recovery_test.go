@@ -595,7 +595,7 @@ func TestReplayJournalNeverInitializedAndDamaged(t *testing.T) {
 	}
 }
 
-// Replay frees a logged block only while the inode still maps it at the logged file block.
+// Replay frees a logged block only while the inode is unwritten since the log and still maps it at the logged file block.
 func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
@@ -615,8 +615,16 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	ino, err := rctx.InodeTbl.Read(50)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	free := &ExtentFreePayload{InodeNum: 50, FileBlock: 1, DiskBlock: 2, Length: 2}
+	stale := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration - 1, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
+	if applied, err := applyExtentFree(ctx, rctx, stale.Serialize()); err != nil || applied {
+		t.Fatalf("applyExtentFree logged before a later inode write = %v, %v; want false, nil", applied, err)
+	}
+	free := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
 	if applied, err := applyExtentFree(ctx, rctx, free.Serialize()); err != nil || !applied {
 		t.Fatalf("applyExtentFree = %v, %v; want true, nil", applied, err)
 	}
@@ -624,8 +632,7 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 		t.Fatalf("second applyExtentFree = %v, %v; want false, nil", applied, err)
 	}
 
-	ino, err := rctx.InodeTbl.Read(50)
-	if err != nil {
+	if ino, err = rctx.InodeTbl.Read(50); err != nil {
 		t.Fatal(err)
 	}
 	for file, disk := range map[uint64]uint64{0: 1, 2: 9} {
@@ -640,5 +647,17 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 		if got, err := rctx.BitmapMgr.IsAllocated(disk); err != nil || got != want {
 			t.Errorf("disk block %d allocated = %v (err %v), want %v", disk, got, err, want)
 		}
+	}
+}
+
+func TestExtentFreePayloadRoundTrip(t *testing.T) {
+	p := &ExtentFreePayload{InodeNum: 7, MetaGeneration: 99, Extents: []FreedExtent{{1, 10, 3}, {8, 40, 1}}}
+	got, err := DeserializeExtentFree(p.Serialize())
+	if err != nil || got.InodeNum != 7 || got.MetaGeneration != 99 || len(got.Extents) != 2 || got.Extents[1] != p.Extents[1] {
+		t.Fatalf("round trip = %+v, %v; want %+v", got, err, p)
+	}
+	short := p.Serialize()[:40]
+	if _, err := DeserializeExtentFree(short); err == nil {
+		t.Error("DeserializeExtentFree accepted a payload shorter than its extent count")
 	}
 }

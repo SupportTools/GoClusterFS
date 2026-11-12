@@ -753,30 +753,29 @@ func injectedMkdirFailure() error {
 // maxLoggedExtentFrees caps the extents one transaction records; replay leaves any further blocks allocated.
 const maxLoggedExtentFrees = 256
 
-// logExtentFrees records each extent of ino from file block from on, so replay can free its blocks if the operation
+// logExtentFrees records the extents of ino from file block from on, so replay can free their blocks if the operation
 // never did. SFB extents point into containers, not at blocks, so they are skipped.
 func (f *FS) logExtentFrees(txn *journal.Transaction, ino *inode.Inode, from uint64) error {
 	extents, err := f.extentMgr.ListExtents(ino)
 	if err != nil {
 		return err
 	}
-	logged := 0
+	freed := &journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration}
 	for _, ext := range extents {
-		if ext.LogicalBlock+ext.Length <= from || ext.Flags&extent.FlagSFB != 0 || logged == maxLoggedExtentFrees {
+		if ext.LogicalBlock+ext.Length <= from || ext.Flags&extent.FlagSFB != 0 || len(freed.Extents) == maxLoggedExtentFrees {
 			continue
 		}
 		skip := max(from, ext.LogicalBlock) - ext.LogicalBlock
-		if err := txn.LogExtentFree(&journal.ExtentFreePayload{
-			InodeNum:  uint64(ino.InodeNum),
+		freed.Extents = append(freed.Extents, journal.FreedExtent{
 			FileBlock: ext.LogicalBlock + skip,
 			DiskBlock: ext.PhysicalBlock + skip,
 			Length:    uint32(ext.Length - skip),
-		}); err != nil {
-			return err
-		}
-		logged++
+		})
 	}
-	return nil
+	if len(freed.Extents) == 0 {
+		return nil
+	}
+	return txn.LogExtentFree(freed)
 }
 
 // afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.

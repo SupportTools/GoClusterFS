@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
@@ -105,6 +106,44 @@ func TestTruncateReplayKeepsMappedBlocks(t *testing.T) {
 	checkFile(t, lookupFile(t, remounted, "other.bin"), pattern(2, 2*BlockSize))
 	expectAllocated(t, remounted, blocks[:1], true)
 	expectAllocated(t, remounted, blocks[1:], false)
+}
+
+// A snapshot shares the file's blocks before a truncate crashes after its commit: replay drops the file's reference
+// to the truncated blocks and leaves them to the snapshot.
+func TestTruncateReplayKeepsSnapshotBlocks(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	victim := createFile(t, fsys, "victim.bin")
+	writeAt(t, victim, pattern(1, 3*BlockSize), 0)
+	setxattr(t, victim, "user.snapshot", "before")
+	var blocks []uint64
+	for i := range uint64(3) {
+		blocks = append(blocks, physicalBlock(t, fsys, victim.inodeNum, i))
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		shared := true
+		for _, b := range blocks {
+			shared = shared && refcountOf(t, fsys, b) == 2
+		}
+		if shared {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the snapshot never shared the file's blocks")
+		}
+	}
+
+	crashed := crashAfterCommit(t, fsys, "setattr")
+	go tryTruncate(victim, BlockSize)
+	<-crashed
+
+	remounted := remountAndReplay(t, path, offset, size)
+	expectCleanFsck(t, remounted)
+	expectAllocated(t, remounted, blocks, true)
+	for i, want := range []uint32{2, 1, 1} {
+		if got := refcountOf(t, remounted, blocks[i]); got != want {
+			t.Errorf("block %d refcount %d after replay, want %d", blocks[i], got, want)
+		}
+	}
 }
 
 // A crash after an unlink's commit in a subdirectory: replay removes the entry and frees the inode and its blocks.
