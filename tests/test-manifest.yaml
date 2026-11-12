@@ -1605,6 +1605,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/interrupt_test.go::TestCreateReportsStuckInodeLockAsEIO
 
+  - id: claim-errno
+    name: Inode slot failures map to the right errno
+    description: A full inode table is ENOSPC, a slot another node took is EAGAIN, and a lock timeout or unreadable lock record is EIO
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestClaimErrno
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself

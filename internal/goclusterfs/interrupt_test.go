@@ -3,6 +3,7 @@ package goclusterfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"syscall"
 	"testing"
 	"time"
@@ -136,5 +137,18 @@ func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
 	}
 	if _, _, err := nodeB.dirMgr.Lookup(context.Background(), root, "stuck"); !errors.Is(err, dir.ErrNotFound) {
 		t.Errorf("lookup after the failed create: %v, want the entry rolled back", err)
+	}
+}
+
+func TestClaimErrno(t *testing.T) {
+	for err, want := range map[error]syscall.Errno{
+		inode.ErrInodeFull:  syscall.ENOSPC,
+		inode.ErrInodeInUse: syscall.EAGAIN,
+		fmt.Errorf("failed to acquire inode lock: %w", lock.ErrLockTimeout):   syscall.EIO,
+		fmt.Errorf("failed to acquire inode lock: %w", lock.ErrInvalidRecord): syscall.EIO,
+	} {
+		if got := claimErrno(err); got != want {
+			t.Errorf("claimErrno(%v) = %v, want %v", err, got, want)
+		}
 	}
 }

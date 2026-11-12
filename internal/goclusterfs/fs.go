@@ -694,10 +694,14 @@ func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32,
 	return nil, nil, 0, syscall.EAGAIN
 }
 
-// claimErrno maps a ClaimSlot failure. Only a slot another node took first is
-// worth a retry; a lock wait that gave up or an I/O error is not a full inode table.
+// claimErrno maps a failure to find or claim an inode slot. Only a slot another
+// node took first is worth a retry; a lock wait that gave up or an I/O error is
+// not a full inode table.
 func claimErrno(err error) syscall.Errno {
-	if errors.Is(err, inode.ErrInodeInUse) {
+	switch {
+	case errors.Is(err, inode.ErrInodeFull):
+		return syscall.ENOSPC
+	case errors.Is(err, inode.ErrInodeInUse):
 		return syscall.EAGAIN
 	}
 	return syscall.EIO
@@ -3692,7 +3696,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	data, err := f.fs.claimInode(ctx)
 	if err != nil {
 		log.Printf("[snapshot] No inode for the data of a snapshot of inode %d: %v", f.inodeNum, err)
-		return syscall.ENOSPC
+		return claimErrno(err)
 	}
 	data.Mode, data.UID, data.GID = src.Mode, src.UID, src.GID
 	data.Mtime, data.Ctime = src.Mtime, src.Ctime

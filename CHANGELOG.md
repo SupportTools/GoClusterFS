@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
+  - Directory entries now fill all 4 KB chunks of a directory block. When an older binary removes the first entry of a later chunk, it grows the last entry of the chunk before it across the boundary. This version then stops listing that entry, and fsck reports the directory block.
 - Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
 - Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
 - Snapshots made by older versions captured no data. They still list and delete, but cloning one fails with `ENOTSUP`.
@@ -79,3 +80,5 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Directory operations now update caches and send broadcast invalidations.
 - Docker and VM test suites now run on fresh hosts.
 - The README quick start now uses the real binary names and flags.
+- Create, mkdir, clone and snapshot failed with "No space left on device" when the lock wait for the new inode gave up or a lock record read failed. They now fail with `EIO`. `ENOSPC` means the inode table is full.
+- Directory entries went only into the first 4 KB of each 1 MB directory block, so a block held about 250 short names or 15 long ones, and a busy directory took a new block every few creates. Entries now fill the whole block. A lookup reads each block in one I/O, and an add or remove writes only the 4 KB it changed.
