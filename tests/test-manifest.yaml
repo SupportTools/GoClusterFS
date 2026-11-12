@@ -2420,6 +2420,20 @@ scenarios:
     environments:
       go: api_writes_test.go::TestMountTokenSources
 
+  - id: dashboard-live-mount
+    name: Web dashboard on a live mount
+    description: /ui/ serves the same static shell with or without a token, with a strict Content-Security-Policy, while /api/v1/* still needs the token
+    priority: go_only
+    environments:
+      go: dashboard_test.go::TestDashboardOnLiveMount
+
+  - id: dashboard-flag-off
+    name: -dashboard=false removes /ui/
+    description: With -dashboard=false, /ui/ goes through the normal auth and answers 404
+    priority: go_only
+    environments:
+      go: dashboard_test.go::TestDashboardFlagOff
+
   - id: gfsctl-reads-live-mount
     name: gfsctl reads a live mount
     description: gfsctl status, health and metrics work against a mounted filesystem's API

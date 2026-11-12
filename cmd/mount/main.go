@@ -36,6 +36,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 	"github.com/supporttools/GoClusterFS/internal/version"
+	"github.com/supporttools/GoClusterFS/internal/webui"
 )
 
 type fsStatusProvider struct {
@@ -115,6 +116,7 @@ func main() {
 		apiToken     = flag.String("api-token", "", "API bearer token; visible to all local users in ps, prefer -api-token-file")
 		apiCORS      = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
 		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
+		dashboard    = flag.Bool("dashboard", true, "Serve the web dashboard on the API server under /ui/")
 	)
 	flag.Parse()
 
@@ -137,6 +139,9 @@ func main() {
 		log.Printf("WARNING: -api-token is visible to every local user in ps and /proc/<pid>/cmdline, and it unlocks API writes. Use -api-token-file or %s instead.", apiTokenEnv)
 	}
 	apiCfg := apiConfig(*apiAddr, token, *apiCORS, *apiRate)
+	if *dashboard {
+		apiCfg.Dashboard = webui.Handler()
+	}
 	if *apiEnabled {
 		if err := apiCfg.Validate(); err != nil {
 			log.Fatalf("Invalid API settings: %v", err)
@@ -460,6 +465,11 @@ func main() {
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
 				if !apiServer.WritesEnabled() {
 					log.Printf("API: snapshot, clone and admin endpoints are off; set -api-token-file or %s to turn them on", apiTokenEnv)
+				}
+				if apiCfg.Dashboard != nil && webui.Built() {
+					log.Printf("API: dashboard at /ui/")
+				} else if apiCfg.Dashboard != nil {
+					log.Printf("API: this binary has no dashboard build; /ui/ explains how to add it")
 				}
 			}
 		}

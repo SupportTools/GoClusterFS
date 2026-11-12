@@ -46,7 +46,7 @@ cd GoClusterFS
 make build
 ```
 
-This builds `goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` in the repo root.
+This builds `goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` in the repo root. To include the web dashboard, run `make dashboard build` instead; it needs Node 22 and npm. Release archives include it.
 
 ### Format and Mount
 
@@ -142,6 +142,7 @@ With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-b
 | `-api-token` | (empty) | The token on the command line; visible to all local users in `ps` |
 | `-api-cors` | (empty) | Comma-separated CORS allowed origins |
 | `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
+| `-dashboard` | `true` | Serve the web dashboard at `http://<api-addr>/ui/` |
 
 The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and no token is set. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
 
