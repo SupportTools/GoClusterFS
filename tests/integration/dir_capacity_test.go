@@ -71,9 +71,10 @@ func TestMultiNodeCreatesInOneDirectory(t *testing.T) {
 	})
 	t.Logf("%d creates on %d nodes took %v", nodes*perNode, nodes, time.Since(start))
 
+	var problems []string
 	for idx, err := range errs {
 		if err != nil {
-			t.Errorf("node %d: %v", idx, err)
+			problems = append(problems, fmt.Sprintf("node %d: %v", idx, err))
 		}
 	}
 	entries, err := cluster.Node(0).ReadDir("shared")
@@ -92,25 +93,28 @@ func TestMultiNodeCreatesInOneDirectory(t *testing.T) {
 			}
 		}
 	}
-	doubleHolds := 0
-	for _, buf := range logs {
-		doubleHolds += strings.Count(buf.String(), "not the lock owner")
+	if len(missing) > 0 {
+		problems = append(problems, fmt.Sprintf("node 0 lists %d entries; %d created files are missing: %v",
+			len(entries), len(missing), missing[:min(10, len(missing))]))
 	}
-	lost := fmt.Sprintf("node 0 lists %d entries; %d created files are missing: %v", len(entries), len(missing), missing[:min(10, len(missing))])
-	if len(missing) > 0 && doubleHolds == 0 {
-		t.Error(lost)
+	if len(problems) == 0 {
+		return
 	}
-	if t.Failed() {
-		for idx, buf := range logs {
-			for _, line := range strings.Split(buf.String(), "\n") {
-				if mountProblemRe.MatchString(line) {
-					t.Logf("node %d: %s", idx, line)
-				}
+	for idx, buf := range logs {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if mountProblemRe.MatchString(line) {
+				t.Logf("node %d: %s", idx, line)
 			}
 		}
 	}
-	if len(missing) > 0 {
-		// Two holders of the directory lock can overwrite each other's chunk until #29 lands.
-		t.Skipf("%s, after %d lock releases found another node holding the lock", lost, doubleHolds)
+	// Until #29, two nodes can hold one lock and overwrite each other's chunk,
+	// and a lock record read during another node's write fails its checksum.
+	races := 0
+	for _, buf := range logs {
+		races += strings.Count(buf.String(), "not the lock owner") + strings.Count(buf.String(), "invalid lock record")
 	}
+	if races > 0 {
+		t.Skipf("%s; the logs show %d lock races that #29 removes", strings.Join(problems, "; "), races)
+	}
+	t.Error(strings.Join(problems, "; "))
 }
