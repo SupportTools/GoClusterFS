@@ -2950,10 +2950,10 @@ test_concurrent_writes_power_failure() {
     return 0
 }
 
-# Print the PIDs of goclusterfs-mount on VM $1, found by the path setup_goclusterfs starts it with: the kernel cuts
-# process names to 15 characters. A zombie's command line is empty, so it counts as gone.
+# Print the PIDs of goclusterfs-mount on VM $1: processes with an argument equal to the path setup_goclusterfs starts
+# it with. On Alpine the gcompat loader runs it, so its name and argv[0] are the loader's. A zombie has no arguments.
 mount_pids() {
-    ssh_run "$1" 'for p in /proc/[0-9]*; do [ "$(head -c 32 $p/cmdline 2>/dev/null)" = /usr/local/bin/goclusterfs-mount ] && echo ${p#/proc/}; done; true'
+    ssh_run "$1" 'for p in /proc/[0-9]*; do tr "\0" "\n" 2>/dev/null <$p/cmdline | grep -qx "/usr/local/bin/goclusterfs-moun[t]" && echo ${p#/proc/}; done; true'
 }
 
 # Kill goclusterfs-mount on VM $1 with SIGKILL, as a crash would, and fail unless it is gone within 10s.
