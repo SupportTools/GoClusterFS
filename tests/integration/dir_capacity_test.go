@@ -71,10 +71,10 @@ func TestMultiNodeCreatesInOneDirectory(t *testing.T) {
 	})
 	t.Logf("%d creates on %d nodes took %v", nodes*perNode, nodes, time.Since(start))
 
-	var problems []string
+	var createErrs []string
 	for idx, err := range errs {
 		if err != nil {
-			problems = append(problems, fmt.Sprintf("node %d: %v", idx, err))
+			createErrs = append(createErrs, fmt.Sprintf("node %d: %v", idx, err))
 		}
 	}
 	entries, err := cluster.Node(0).ReadDir("shared")
@@ -93,6 +93,7 @@ func TestMultiNodeCreatesInOneDirectory(t *testing.T) {
 			}
 		}
 	}
+	problems := createErrs
 	if len(missing) > 0 {
 		problems = append(problems, fmt.Sprintf("node 0 lists %d entries; %d created files are missing: %v",
 			len(entries), len(missing), missing[:min(10, len(missing))]))
@@ -109,12 +110,13 @@ func TestMultiNodeCreatesInOneDirectory(t *testing.T) {
 	}
 	// Until #29, two nodes can hold one lock and overwrite each other's chunk,
 	// and a lock record read during another node's write fails its checksum.
-	races := 0
+	doubleHolds, tornReads := 0, 0
 	for _, buf := range logs {
-		races += strings.Count(buf.String(), "not the lock owner") + strings.Count(buf.String(), "invalid lock record")
+		doubleHolds += strings.Count(buf.String(), "not the lock owner")
+		tornReads += strings.Count(buf.String(), "invalid lock record")
 	}
-	if races > 0 {
-		t.Skipf("%s; the logs show %d lock races that #29 removes", strings.Join(problems, "; "), races)
+	if (len(missing) == 0 || doubleHolds > 0) && (len(createErrs) == 0 || tornReads > 0) {
+		t.Skipf("%s; the logs show %d double holds and %d torn lock reads, which #29 removes", strings.Join(problems, "; "), doubleHolds, tornReads)
 	}
 	t.Error(strings.Join(problems, "; "))
 }
