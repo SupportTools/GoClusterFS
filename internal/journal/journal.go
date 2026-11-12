@@ -99,6 +99,7 @@ type Journal struct {
 	// Active transaction tracking
 	activeTxns      map[uint64]*ActiveTxn
 	oldestActiveSeq uint64
+	pendingIntents  map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
 
 	// Checkpoint tracking
 	lastCheckpointSeq  uint64
@@ -143,6 +144,7 @@ func Open(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		generation:        region.Superblock().NodeGeneration,
 		config:            config,
 		activeTxns:        make(map[uint64]*ActiveTxn),
+		pendingIntents:    make(map[uint64]uint32),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: region.Superblock().LastCheckpointSeq,
 	}
@@ -164,6 +166,7 @@ func Init(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		generation:        generation,
 		config:            config,
 		activeTxns:        make(map[uint64]*ActiveTxn),
+		pendingIntents:    make(map[uint64]uint32),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: 0,
 	}
@@ -202,7 +205,7 @@ func (j *Journal) Stop() error {
 			return
 		}
 
-		if len(j.activeTxns) == 0 {
+		if len(j.activeTxns) == 0 && len(j.pendingIntents) == 0 {
 			if err := j.region.MarkClean(); err != nil {
 				stopErr = fmt.Errorf("failed to mark journal clean: %w", err)
 				return
@@ -237,26 +240,46 @@ func (j *Journal) periodicCheckpoint() {
 	_, _ = j.Checkpoint()
 }
 
-// Checkpoint advances the head past every committed transaction now instead
-// of at the next interval. It reports false when there was nothing to do or
-// a transaction is still active.
+// Checkpoint advances the head now instead of at the next interval. It reports false when the head could not move.
 func (j *Journal) Checkpoint() (bool, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	return j.advanceHead()
+}
 
-	if len(j.activeTxns) > 0 {
+// advanceHead moves the head up to the oldest transaction that is still active or whose operation has not completed.
+// It syncs the device first, so the changes of every transaction it passes outlive their records. Must hold j.mu.
+func (j *Journal) advanceHead() (bool, error) {
+	head, size := j.region.HeadOffset(), j.region.DataAreaSize()
+	after := func(pos uint32) uint32 {
+		if pos >= head {
+			return pos - head
+		}
+		return pos + size - head
+	}
+	target, seq := j.region.TailOffset(), j.region.Superblock().NextSeq-1
+	block := func(blockSeq uint64, pos uint32) {
+		if after(pos) < after(target) {
+			target = pos
+		}
+		seq = min(seq, blockSeq-1)
+	}
+	for blockSeq, active := range j.activeTxns {
+		block(blockSeq, active.tailPos)
+	}
+	for blockSeq, pos := range j.pendingIntents {
+		block(blockSeq, pos)
+	}
+	if target == head {
 		return false, nil
 	}
-
-	tail := j.region.TailOffset()
-	if tail == j.region.HeadOffset() {
-		return false, nil
-	}
-	sb := j.region.Superblock()
-	if err := j.region.Checkpoint(sb.NextSeq-1, tail); err != nil {
+	if err := j.region.Sync(); err != nil {
 		return false, err
 	}
-	j.lastCheckpointSeq = sb.NextSeq - 1
+	if err := j.region.Checkpoint(seq, target); err != nil {
+		return false, err
+	}
+	j.lastCheckpointSeq = seq
 	j.lastCheckpointTime = time.Now()
 	return true, nil
 }
@@ -319,16 +342,17 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 		return 0, fmt.Errorf("failed to serialize transaction: %w", err)
 	}
 
-	// Check space
+	// Check space for the sector-aligned record WriteAt writes
+	need := sectorAligned(uint32(len(data)))
 	available := j.region.AvailableSpace()
-	if uint32(len(data)) > available {
+	if need > available {
 		// Try to force checkpoint to free space
 		if err := j.forceCheckpoint(); err != nil {
 			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
 		available = j.region.AvailableSpace()
-		if uint32(len(data)) > available {
+		if need > available {
 			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
@@ -343,6 +367,7 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	}
 
 	// Write to ring buffer
+	start := j.region.TailOffset()
 	written, err := j.region.WriteAt(data)
 	if err != nil {
 		j.mu.Unlock()
@@ -366,8 +391,9 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	j.commitCount++
 	j.bytesWritten += uint64(written)
 
-	// Remove from active set
+	// The operation runs after Commit, so the head must not pass this transaction until CompleteIntent.
 	delete(j.activeTxns, seq)
+	j.pendingIntents[seq] = start
 
 	// Update oldest active
 	if seq == j.oldestActiveSeq {
@@ -385,12 +411,14 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	case CommitSync:
 		// Sync immediately for maximum durability
 		if err := j.region.Sync(); err != nil {
+			j.dropIntent(seq)
 			return 0, fmt.Errorf("failed to sync journal: %w", err)
 		}
 	case CommitBatch:
 		// Batch mode: wait for periodic sync, reducing fsync frequency
 		// This amortizes fsync cost across multiple commits
 		if err := j.waitForBatchSync(); err != nil {
+			j.dropIntent(seq)
 			return 0, fmt.Errorf("failed batch sync: %w", err)
 		}
 	case CommitAsync:
@@ -398,6 +426,17 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	}
 
 	return seq, nil
+}
+
+func sectorAligned(n uint32) uint32 {
+	return (n + storage.SectorSize - 1) / storage.SectorSize * storage.SectorSize
+}
+
+// dropIntent forgets an intent whose Commit failed, since its caller never runs the operation.
+func (j *Journal) dropIntent(seq uint64) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	delete(j.pendingIntents, seq)
 }
 
 // Abort abandons a transaction without committing.
@@ -513,9 +552,16 @@ func (j *Journal) flushBatch() error {
 // If the system crashes between steps 2 and 4, recovery will replay the
 // operations. The idempotent execution ensures correctness regardless of
 // how many times operations are replayed.
+//
+// It is idempotent: once an intent is complete, later calls do nothing.
 func (j *Journal) CompleteIntent(intentSeq uint64) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+
+	if _, ok := j.pendingIntents[intentSeq]; !ok {
+		return nil
+	}
+	delete(j.pendingIntents, intentSeq)
 
 	// Create completion record
 	completion := NewIntentCompletion(intentSeq)
@@ -526,14 +572,14 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 	alignedData := make([]byte, alignedSize)
 	copy(alignedData, data)
 
-	// Check space
+	// Check space for the sector-aligned record WriteAt writes
 	available := j.region.AvailableSpace()
-	if uint32(alignedSize) > available {
+	if sectorAligned(uint32(alignedSize)) > available {
 		if err := j.forceCheckpoint(); err != nil {
 			return ErrJournalFull
 		}
 		available = j.region.AvailableSpace()
-		if uint32(alignedSize) > available {
+		if sectorAligned(uint32(alignedSize)) > available {
 			return ErrJournalFull
 		}
 	}
@@ -575,28 +621,8 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 // forceCheckpoint tries to checkpoint to free journal space.
 // Must be called with lock held.
 func (j *Journal) forceCheckpoint() error {
-	// Can only checkpoint past committed transactions
-	if len(j.activeTxns) == 0 {
-		// No active txns - checkpoint everything
-		tail := j.region.TailOffset()
-		sb := j.region.Superblock()
-		return j.region.Checkpoint(sb.NextSeq-1, tail)
-	}
-
-	// Find oldest active transaction position
-	var oldestPos uint32
-	for _, active := range j.activeTxns {
-		if oldestPos == 0 || active.tailPos < oldestPos {
-			oldestPos = active.tailPos
-		}
-	}
-
-	// Can only checkpoint up to just before oldest active
-	if oldestPos > 0 && oldestPos != j.region.HeadOffset() {
-		return j.region.Checkpoint(j.oldestActiveSeq-1, oldestPos)
-	}
-
-	return nil
+	_, err := j.advanceHead()
+	return err
 }
 
 // updateOldestActive recalculates the oldest active sequence.
