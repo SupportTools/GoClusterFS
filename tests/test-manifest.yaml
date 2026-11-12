@@ -2380,6 +2380,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleasedHoldIsCachedForGrace
 
+  - id: lock-idle-hold-frees-before-turn
+    name: Idle cached hold frees before the turn ends
+    description: Another node gets a record held idle in a cache sooner than the HoldTurn a busy holder keeps it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestIdleCachedHoldFreesBeforeTurnEnds
+
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
     description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old
