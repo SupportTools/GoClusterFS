@@ -634,11 +634,13 @@ func DeserializeExtentRemove(buf []byte) (*ExtentRemovePayload, error) {
 	}, nil
 }
 
-// ExtentFreePayload lists the mapped extents a truncate or unlink frees from one inode, with the inode's MetaGeneration
-// when they were logged. Replay frees a block only if the inode has not been written since and still maps it there.
+// ExtentFreePayload lists the mapped extents a truncate or unlink frees from one inode, the size it cuts the inode to,
+// and the inode's MetaGeneration when they were logged. Replay frees a block only if the inode has not been written
+// since and still maps it there.
 type ExtentFreePayload struct {
 	InodeNum       uint64
 	MetaGeneration uint64
+	Size           uint64
 	Extents        []FreedExtent
 }
 
@@ -649,16 +651,20 @@ type FreedExtent struct {
 	Length    uint32
 }
 
-const freedExtentSize = 24
+const (
+	extentFreeHeaderSize = 32
+	freedExtentSize      = 24
+)
 
-// Serialize converts the payload to bytes: a 24-byte header, then 24 bytes per extent.
+// Serialize converts the payload to bytes: a 32-byte header, then 24 bytes per extent.
 func (p *ExtentFreePayload) Serialize() []byte {
-	buf := make([]byte, 24+freedExtentSize*len(p.Extents))
+	buf := make([]byte, extentFreeHeaderSize+freedExtentSize*len(p.Extents))
 	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
 	binary.LittleEndian.PutUint64(buf[8:16], p.MetaGeneration)
-	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(p.Extents)))
+	binary.LittleEndian.PutUint64(buf[16:24], p.Size)
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(p.Extents)))
 	for i, e := range p.Extents {
-		x := buf[24+i*freedExtentSize:]
+		x := buf[extentFreeHeaderSize+i*freedExtentSize:]
 		binary.LittleEndian.PutUint64(x[0:8], e.FileBlock)
 		binary.LittleEndian.PutUint64(x[8:16], e.DiskBlock)
 		binary.LittleEndian.PutUint32(x[16:20], e.Length)
@@ -668,20 +674,21 @@ func (p *ExtentFreePayload) Serialize() []byte {
 
 // DeserializeExtentFree parses an ExtentFreePayload from bytes.
 func DeserializeExtentFree(buf []byte) (*ExtentFreePayload, error) {
-	if len(buf) < 24 {
+	if len(buf) < extentFreeHeaderSize {
 		return nil, ErrTxnTooSmall
 	}
-	count := binary.LittleEndian.Uint32(buf[16:20])
-	if uint64(count) > uint64(len(buf)-24)/freedExtentSize {
+	count := binary.LittleEndian.Uint32(buf[24:28])
+	if uint64(count) > uint64(len(buf)-extentFreeHeaderSize)/freedExtentSize {
 		return nil, ErrTxnTooSmall
 	}
 	p := &ExtentFreePayload{
 		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
 		MetaGeneration: binary.LittleEndian.Uint64(buf[8:16]),
+		Size:           binary.LittleEndian.Uint64(buf[16:24]),
 		Extents:        make([]FreedExtent, count),
 	}
 	for i := range p.Extents {
-		x := buf[24+i*freedExtentSize:]
+		x := buf[extentFreeHeaderSize+i*freedExtentSize:]
 		p.Extents[i] = FreedExtent{
 			FileBlock: binary.LittleEndian.Uint64(x[0:8]),
 			DiskBlock: binary.LittleEndian.Uint64(x[8:16]),

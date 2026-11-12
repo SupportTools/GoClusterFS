@@ -395,8 +395,8 @@ func applyBlockAlloc(ctx context.Context, rctx *RecoveryContext, payload []byte)
 	return applied, nil
 }
 
-// applyBlockFree frees nothing: truncate and unlink log logical file blocks, and freeing those numbers as physical
-// blocks would free blocks other files map. An interrupted free leaves its blocks allocated, which fsck reports.
+// applyBlockFree frees nothing: older builds logged logical file blocks here, and freeing those numbers as physical
+// blocks would free blocks other files map. Truncate and unlink now log ExtentFree.
 func applyBlockFree(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
 	p, err := DeserializeBlockFree(payload)
 	if err != nil {
@@ -535,9 +535,10 @@ func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
 	}
 }
 
-// applyExtentFree unmaps and frees the logged blocks, through refcounts for shared ones, if the inode has not been written
-// since the free was logged. Otherwise the operation's inode write landed, or a peer that took the inode's lock after a
-// crash changed it, and the blocks may be free or in use again. Each block must also still be mapped where logged.
+// applyExtentFree cuts the inode to the logged size and unmaps and frees the logged blocks, through refcounts for shared
+// ones, if the inode has not been written since the free was logged. Otherwise the operation's inode write landed, or a
+// peer that took the inode's lock after a crash changed it, and the blocks may be free or in use again. Each block must
+// also still be mapped where logged.
 func applyExtentFree(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
 	p, err := DeserializeExtentFree(payload)
 	if err != nil {
@@ -547,7 +548,8 @@ func applyExtentFree(ctx context.Context, rctx *RecoveryContext, payload []byte)
 		if ino.Magic != inode.InodeMagic || ino.MetaGeneration != p.MetaGeneration {
 			return false, nil
 		}
-		freed := false
+		changed := ino.Size > p.Size
+		ino.Size = min(ino.Size, p.Size)
 		for _, e := range p.Extents {
 			for i := uint64(0); i < uint64(e.Length); {
 				run := uint64(0)
@@ -567,10 +569,10 @@ func applyExtentFree(ctx context.Context, rctx *RecoveryContext, payload []byte)
 				}
 				log.Printf("[Recovery] ExtentFree: freed file blocks %d-%d (disk %d-%d) of inode %d",
 					e.FileBlock+i, e.FileBlock+i+run-1, e.DiskBlock+i, e.DiskBlock+i+run-1, p.InodeNum)
-				freed = true
+				changed = true
 				i += run
 			}
 		}
-		return freed, nil
+		return changed, nil
 	})
 }

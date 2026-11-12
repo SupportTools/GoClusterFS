@@ -85,7 +85,7 @@ func TestCreateReplaysAfterCheckpointAndCrash(t *testing.T) {
 	expectCleanFsck(t, remounted)
 }
 
-// A crash after a truncate's commit: replay frees the truncated blocks and no block a file still maps.
+// A crash after a truncate's commit: replay cuts the file, frees the truncated blocks, and frees no block a file still maps.
 func TestTruncateReplayKeepsMappedBlocks(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	victim := createFile(t, fsys, "victim.bin")
@@ -103,6 +103,7 @@ func TestTruncateReplayKeepsMappedBlocks(t *testing.T) {
 
 	remounted := remountAndReplay(t, path, offset, size)
 	expectCleanFsck(t, remounted)
+	checkFile(t, lookupFile(t, remounted, "victim.bin"), pattern(1, BlockSize))
 	checkFile(t, lookupFile(t, remounted, "other.bin"), pattern(2, 2*BlockSize))
 	expectAllocated(t, remounted, blocks[:1], true)
 	expectAllocated(t, remounted, blocks[1:], false)
@@ -150,19 +151,7 @@ func TestTruncateReplayKeepsSnapshotBlocks(t *testing.T) {
 func TestUnlinkReplayFreesFileAndBlocks(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	ctx := context.Background()
-	sub := newSubdir(t, fsys, "sub")
-	f := newRegularFile(t, fsys)
-	if _, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error { ino.LinkCount = 1; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	subIno, err := fsys.inodeTbl.Read(sub.inodeNum)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fsys.dirMgr.Add(ctx, subIno, "doomed.bin", uint64(f.inodeNum), dir.DT_REG); err != nil {
-		t.Fatal(err)
-	}
-	writeAt(t, f, pattern(3, 2*BlockSize), 0)
+	sub, f := newSubdirFile(t, fsys, pattern(3, 2*BlockSize))
 	blocks := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
 
 	crashed := crashAfterCommit(t, fsys, "unlink")
@@ -171,7 +160,7 @@ func TestUnlinkReplayFreesFileAndBlocks(t *testing.T) {
 
 	remounted := remountAndReplay(t, path, offset, size)
 	expectCleanFsck(t, remounted)
-	subIno, err = remounted.inodeTbl.Read(sub.inodeNum)
+	subIno, err := remounted.inodeTbl.Read(sub.inodeNum)
 	if err != nil {
 		t.Fatal(err)
 	}

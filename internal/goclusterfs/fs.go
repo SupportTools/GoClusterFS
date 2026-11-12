@@ -701,26 +701,33 @@ func (f *FS) closeIntent(seq uint64) {
 	}
 }
 
-// freeUnmapped frees the blocks the inode on disk does not map: a failed inode write may still have landed.
-func (f *FS) freeUnmapped(ctx context.Context, num uint32, blocks []uint64) {
+// unmapped returns the blocks the inode on disk does not map: a failed inode write may still have landed.
+func (f *FS) unmapped(num uint32, blocks []uint64) []uint64 {
 	ino, err := f.inodeTbl.Read(num)
 	if err != nil {
 		log.Printf("[WARN] inode %d: not freeing %d unused blocks, inode unreadable: %v", num, len(blocks), err)
-		return
+		return nil
 	}
 	mapped, err := f.extentMgr.DataBlocks(ino)
 	if err != nil {
 		log.Printf("[WARN] inode %d: not freeing %d unused blocks, extents unreadable: %v", num, len(blocks), err)
-		return
+		return nil
 	}
 	inUse := make(map[uint64]bool, len(mapped))
 	for _, b := range mapped {
 		inUse[b] = true
 	}
+	var unused []uint64
 	for _, b := range blocks {
-		if inUse[b] {
-			continue
+		if !inUse[b] {
+			unused = append(unused, b)
 		}
+	}
+	return unused
+}
+
+func (f *FS) freeUnused(ctx context.Context, num uint32, blocks []uint64) {
+	for _, b := range blocks {
 		if err := f.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
 			log.Printf("[WARN] inode %d: freeing unused block %d failed: %v", num, b, err)
 		}
@@ -737,7 +744,7 @@ func (f *FS) dropNewInode(ctx context.Context, ino *inode.Inode) {
 		log.Printf("[WARN] inode %d: freeing the failed new inode failed: %v", ino.InodeNum, err)
 		return
 	}
-	f.freeUnmapped(ctx, ino.InodeNum, blocks)
+	f.freeUnused(ctx, ino.InodeNum, f.unmapped(ino.InodeNum, blocks))
 }
 
 // testHookBeforeMkdirInodeWrite, when set by a test, fails a mkdir's inode write with its error.
@@ -753,14 +760,15 @@ func injectedMkdirFailure() error {
 // maxLoggedExtentFrees caps the extents one transaction records; replay leaves any further blocks allocated.
 const maxLoggedExtentFrees = 256
 
-// logExtentFrees records the extents of ino from file block from on, so replay can free their blocks if the operation
-// never did. SFB extents point into containers, not at blocks, so they are skipped.
-func (f *FS) logExtentFrees(txn *journal.Transaction, ino *inode.Inode, from uint64) error {
+// logExtentFrees records the extents of ino past newSize, so replay can cut the inode and free their blocks if the
+// operation never did. SFB extents point into containers, not at blocks, so they are skipped.
+func (f *FS) logExtentFrees(txn *journal.Transaction, ino *inode.Inode, newSize uint64) error {
 	extents, err := f.extentMgr.ListExtents(ino)
 	if err != nil {
 		return err
 	}
-	freed := &journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration}
+	from := (newSize + BlockSize - 1) / BlockSize
+	freed := &journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration, Size: newSize}
 	for _, ext := range extents {
 		if ext.LogicalBlock+ext.Length <= from || ext.Flags&extent.FlagSFB != 0 || len(freed.Extents) == maxLoggedExtentFrees {
 			continue
@@ -2079,12 +2087,20 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 	childIno.LinkCount--
 	if childIno.LinkCount == 0 {
 		sfbBacked, sfbSlot := childIno.IsSFBBacked(), childIno.InlineExtents[0].PhysicalBlock
-		// Free all extents
-		d.fs.extentMgr.Delete(ctx, childIno)
-		// Free inode
-		d.fs.inodeTbl.Free(ctx, uint32(childInodeNum))
-		if sfbBacked {
-			d.fs.freeSFBSlot(ctx, sfbSlot)
+		// Free the inode first: once it is gone, replaying this unlink's ExtentFree cannot free the blocks a second time.
+		if err := d.fs.inodeTbl.Free(ctx, uint32(childInodeNum)); err != nil {
+			log.Printf("[WARN] removeEntry %q: inode %d not freed, keeping its blocks: %v", name, childInodeNum, err)
+		} else {
+			if afterCommit != nil {
+				afterCommit("unlink: inode freed")
+			}
+			d.fs.extentMgr.Delete(ctx, childIno)
+			if sfbBacked {
+				d.fs.freeSFBSlot(ctx, sfbSlot)
+			}
+			if afterCommit != nil {
+				afterCommit("unlink: blocks freed")
+			}
 		}
 	} else if updated, err := d.fs.updateInodeLocked(ctx, uint32(childInodeNum), func(ino *inode.Inode) error { ino.LinkCount--; return nil }); err != nil {
 		log.Printf("[WARN] removeEntry %q: link count of inode %d not updated: %v", name, childInodeNum, err)
@@ -2384,6 +2400,9 @@ func (f *FS) zeroBlock(physBlock uint64) error {
 // testHookBeforeInodeCommit, when set by a test, runs before writeInternal's final
 // inode write; an error it returns is handled as if that write had failed.
 var testHookBeforeInodeCommit func() error
+
+// testHookBeforeFreeingUnused, when set by a test, runs after a failed write closes its intent and before it frees blocks.
+var testHookBeforeFreeingUnused func()
 
 // allocateBlockLocked maps a new data block at blockNum and returns the inode
 // re-read under the inode lock, which stays held on success. The bitmap comes
@@ -2967,7 +2986,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}
 
-	// On a tree conflict the blocks allocated since the last mid-write persist are
+	// When the write fails, the blocks allocated since the last mid-write persist are
 	// unreferenced. Close the intent first so journal replay cannot map them again,
 	// then free them. Blocks the persist committed stay mapped on disk.
 	unusedBlocks := func() []uint64 {
@@ -2983,19 +3002,32 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		return unused
 	}
 	writeFailed := func(err error) error {
+		conflict := errors.Is(err, extent.ErrTreeConflict)
+		var unused []uint64
+		if !conflict {
+			// Read while the inode lock still keeps other nodes from changing what it maps.
+			unused = f.fs.unmapped(f.inodeNum, unusedBlocks())
+		}
 		// The bitmap lock comes before the inode lock, so free only after dropping it.
 		releaseInodeLock()
 		f.fs.extentMgr.DiscardPending(ctx, ino)
-		if !errors.Is(err, extent.ErrTreeConflict) {
-			f.fs.freeUnmapped(ctx, f.inodeNum, unusedBlocks())
-			cowDone = cowDone[:committedCoW]
-			return syscall.EIO
-		}
 		if f.fs.journal != nil && intentSeq > 0 {
 			if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
-				log.Printf("[DEBUG] Write inode %d: CompleteIntent after tree conflict failed: %v", f.inodeNum, err)
-				return errRetryWrite
+				log.Printf("[DEBUG] Write inode %d: CompleteIntent after a failed write: %v", f.inodeNum, err)
+				if conflict {
+					return errRetryWrite
+				}
+				cowDone = cowDone[:committedCoW]
+				return syscall.EIO
 			}
+		}
+		if testHookBeforeFreeingUnused != nil {
+			testHookBeforeFreeingUnused()
+		}
+		if !conflict {
+			f.fs.freeUnused(ctx, f.inodeNum, unused)
+			cowDone = cowDone[:committedCoW]
+			return syscall.EIO
 		}
 		for _, b := range unusedBlocks() {
 			if err := f.fs.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
@@ -3295,7 +3327,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 		if truncating && blocksToFree > 0 {
 			newSize, _ := in.GetSize()
-			if err := f.fs.logExtentFrees(txn, ino, (newSize+BlockSize-1)/BlockSize); err != nil {
+			if err := f.fs.logExtentFrees(txn, ino, newSize); err != nil {
 				f.fs.journal.Abort(txn)
 				return syscall.EIO, nil
 			}

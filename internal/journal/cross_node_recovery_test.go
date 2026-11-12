@@ -619,12 +619,19 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ino.Size = 3 << 20
+	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	if ino, err = rctx.InodeTbl.Read(50); err != nil {
+		t.Fatal(err)
+	}
 
 	stale := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration - 1, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
 	if applied, err := applyExtentFree(ctx, rctx, stale.Serialize()); err != nil || applied {
 		t.Fatalf("applyExtentFree logged before a later inode write = %v, %v; want false, nil", applied, err)
 	}
-	free := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
+	free := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration, Size: 1 << 20, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
 	if applied, err := applyExtentFree(ctx, rctx, free.Serialize()); err != nil || !applied {
 		t.Fatalf("applyExtentFree = %v, %v; want true, nil", applied, err)
 	}
@@ -634,6 +641,9 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 
 	if ino, err = rctx.InodeTbl.Read(50); err != nil {
 		t.Fatal(err)
+	}
+	if ino.Size != 1<<20 {
+		t.Errorf("size after the replayed free = %d, want %d", ino.Size, 1<<20)
 	}
 	for file, disk := range map[uint64]uint64{0: 1, 2: 5} {
 		if got, err := rctx.ExtentMgr.LookupPhysical(ino, file); err != nil || got != disk {
@@ -651,9 +661,9 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 }
 
 func TestExtentFreePayloadRoundTrip(t *testing.T) {
-	p := &ExtentFreePayload{InodeNum: 7, MetaGeneration: 99, Extents: []FreedExtent{{1, 10, 3}, {8, 40, 1}}}
+	p := &ExtentFreePayload{InodeNum: 7, MetaGeneration: 99, Size: 4096, Extents: []FreedExtent{{1, 10, 3}, {8, 40, 1}}}
 	got, err := DeserializeExtentFree(p.Serialize())
-	if err != nil || got.InodeNum != 7 || got.MetaGeneration != 99 || len(got.Extents) != 2 || got.Extents[1] != p.Extents[1] {
+	if err != nil || got.InodeNum != 7 || got.MetaGeneration != 99 || got.Size != 4096 || len(got.Extents) != 2 || got.Extents[1] != p.Extents[1] {
 		t.Fatalf("round trip = %+v, %v; want %+v", got, err, p)
 	}
 	short := p.Serialize()[:40]
