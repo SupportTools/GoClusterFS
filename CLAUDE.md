@@ -12,6 +12,7 @@ FUSE binding: `github.com/hanwen/go-fuse/v2`. Linux only.
 
 ```bash
 make build                 # ./goclusterfs-mount, ./goclusterfs-fsck and ./gfsctl
+make dashboard build       # same, with the web dashboard embedded (needs Node 22 and npm)
 go build ./... && go vet ./...
 ```
 
@@ -57,6 +58,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
+| `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
+| `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
 
 ## On-Disk Layout
 

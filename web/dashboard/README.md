@@ -1,73 +1,28 @@
-# React + TypeScript + Vite
+# GoClusterFS dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+The web dashboard that `goclusterfs-mount` serves at `http://<api-addr>/ui/`. What it shows and how auth works: [docs/API-CONFIG.md](../../docs/API-CONFIG.md#web-dashboard).
 
-Currently, two official plugins are available:
+## Build
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+From the repo root:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+make dashboard build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+`make dashboard` runs `npm ci`, `npm run lint` and `npm run build`, which writes to `internal/webui/build/dist`. `make build` then embeds it in `goclusterfs-mount`. Without it, `/ui/` shows a placeholder page. Use Node 22; CI pins the exact version in `.github/workflows/ci.yml`.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Develop
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+Start a mount with its API on `127.0.0.1:8080`, then:
+
+```bash
+npm ci
+npm run dev
 ```
+
+Open `http://localhost:5173/ui/`. Vite proxies `/api` and `/health` to the mount and keeps the `Host` header, so the API treats the dev server as its own origin. Snapshot requests still need the token, which you enter on the Settings page.
+
+## Packages
+
+`package-lock.json` pins every package, and CI and releases install it with `npm ci`. Company policy: a package version must be at least 48 hours old before anyone installs it. Upgrade packages in their own PR, and only to versions that old.

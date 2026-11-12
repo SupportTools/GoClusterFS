@@ -94,16 +94,17 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-token` | string | (empty) | The token on the command line. Every local user can read it with `ps`; mount logs a `WARNING` |
 | `-api-cors` | string | (empty) | Comma-separated CORS allowed origins, or `*` |
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
+| `-dashboard` | bool | `true` | Serve the [web dashboard](#web-dashboard) under `/ui/` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...` and, with `-api-token`, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health` and `/metrics` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with `-api-token`, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
 
-Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the dashboard's origin instead, for example `-api-cors http://localhost:5173`.
+Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
 
 By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token-file`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty.
 
 Give the token with `-api-token-file` or the `GOCLUSTERFS_API_TOKEN` environment variable, and set only one of them. Mount refuses a token file that group or others can read. `-api-token` still works, but `ps` and `/proc/<pid>/cmdline` show it to every local user, and with it they could change any file's snapshots through the API. The API uses plain HTTP, so a token sent to another host crosses the network unencrypted: put a TLS proxy in front of the API, or reach it over an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 node`).
 
-The rate limit counts requests per connecting IP address, and per /64 for IPv6. It ignores `X-Forwarded-For`, so behind a proxy every client shares the proxy's limit. `/health` and `/metrics` are never limited. The limiter tracks at most 65,536 clients at once; while it is full, new clients get 429 until idle clients' buckets refill and are dropped, about 2 seconds (longer below 0.5 requests per second).
+The rate limit counts requests per connecting IP address, and per /64 for IPv6. It ignores `X-Forwarded-For`, so behind a proxy every client shares the proxy's limit. `/health`, `/metrics` and `/ui/` are never limited. The limiter tracks at most 65,536 clients at once; while it is full, new clients get 429 until idle clients' buckets refill and are dropped, about 2 seconds (longer below 0.5 requests per second).
 
 Each mount on a host needs its own `-api-addr`. When the port is taken, mount logs a warning and runs without the API.
 
@@ -129,6 +130,14 @@ The snapshot and clone endpoints call `setxattr` on the file through the mount, 
 Errors answer with `{error, code, details}`: 400 for a bad path, name, destination or body; 413 for a body over 64 KB; 404 when the file or snapshot does not exist; 409 when the name exists, the file is busy, or the feature is off (`-snapshots=false`, `-journal=false`, `-trim=false`) or the file has old-style sharing that needs `goclusterfs-fsck -repair`; 507 when the device is full; 503 when the filesystem is no longer mounted; 501 when the kernel lacks `openat2` (before Linux 5.6).
 
 Mount logs each write at INFO with the client address, the action, its arguments and the result. On shutdown, mount stops taking requests, waits for writes in flight to finish, and only then unmounts.
+
+### Web Dashboard
+
+Mount serves a web dashboard at `http://<api-addr>/ui/`, unless `-dashboard=false`. It shows status, capacity, the cache, journal, TRIM and lock counters, and the nodes in the registry. It lists snapshots, and for a file you name it creates, clones and deletes them and clones the file.
+
+The dashboard's files are static and hold no data, so they need no token and skip the rate limit. The page calls `/api/v1/...` on the same origin with the same rules as any client: reads need the token when one is set, and snapshots always need it. Enter the token on the dashboard's Settings page. The browser keeps it in `sessionStorage`, so closing the tab forgets it. Responses carry a `Content-Security-Policy` that lets the page load and call only its own origin and stops other sites from framing it.
+
+Release archives include the dashboard. `go build` and `make build` alone embed a page that says to run `make dashboard build`; `make dashboard` needs Node 22 and npm, and installs the exact packages in `web/dashboard/package-lock.json` with `npm ci`.
 
 ---
 
