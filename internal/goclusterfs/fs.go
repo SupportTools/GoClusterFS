@@ -694,6 +694,13 @@ func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32,
 	return nil, nil, 0, syscall.EAGAIN
 }
 
+// closeIntent completes an intent its operation left open by returning early, so a failed operation is never replayed.
+func (f *FS) closeIntent(seq uint64) {
+	if err := f.journal.CompleteIntent(seq); err != nil {
+		log.Printf("[WARN] journal: completing intent %d failed: %v", seq, err)
+	}
+}
+
 // afterCreateCommit runs between a root create's commit and its first change; tests stop there as a crash would.
 var afterCreateCommit func()
 
@@ -748,6 +755,7 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 		if commitErr != nil {
 			return nil, nil, 0, syscall.EIO
 		}
+		defer f.closeIntent(intentSeq)
 		if afterCreateCommit != nil {
 			afterCreateCommit()
 		}
@@ -904,6 +912,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 		if commitErr != nil {
 			return nil, syscall.EIO
 		}
+		defer f.closeIntent(intentSeq)
 	}
 	// === End WAL transaction - intent is now durable ===
 
@@ -1039,6 +1048,7 @@ func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
 		if commitErr != nil {
 			return syscall.EIO
 		}
+		defer f.closeIntent(intentSeq)
 	}
 	// === End WAL transaction - intent is now durable ===
 
@@ -1132,6 +1142,7 @@ func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
 		if commitErr != nil {
 			return syscall.EIO
 		}
+		defer f.closeIntent(intentSeq)
 	}
 	// === End WAL transaction - intent is now durable ===
 
@@ -1504,6 +1515,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 			log.Printf("[DEBUG] Create %q: journal commit failed: %v", name, commitErr)
 			return nil, nil, 0, syscall.EIO
 		}
+		defer d.fs.closeIntent(intentSeq)
 	}
 
 	// Phase 3: Add directory entry FIRST (may acquire BlockBitmap lock for directory expansion)
@@ -1715,6 +1727,7 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", name, commitErr)
 			return nil, syscall.EIO
 		}
+		defer d.fs.closeIntent(intentSeq)
 	}
 
 	// Phase 3: Add directory entry in parent FIRST (may acquire BlockBitmap lock)
@@ -1971,6 +1984,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		if commitErr != nil {
 			return syscall.EIO
 		}
+		defer d.fs.closeIntent(intentSeq)
 	}
 	// === End WAL transaction ===
 
@@ -2850,6 +2864,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			log.Printf("[DEBUG] Write inode %d: journal commit failed: %v", f.inodeNum, commitErr)
 			return 0, syscall.EIO
 		}
+		defer f.fs.closeIntent(intentSeq)
 		txn = nil // Mark as committed so defer doesn't abort
 	}
 	// === End WAL transaction ===
@@ -3072,6 +3087,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
 			return commitErr
 		}
+		defer f.fs.closeIntent(intentSeq)
 	}
 
 	ino.InlineExtents[0] = inode.InlineExtent{PhysicalBlock: newBlock, Length: 1, Flags: extent.FlagAllocated}
@@ -3220,6 +3236,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		if commitErr != nil {
 			return syscall.EIO, nil
 		}
+		defer f.fs.closeIntent(intentSeq)
 	}
 	// === End WAL transaction ===
 
