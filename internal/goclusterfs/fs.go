@@ -701,6 +701,84 @@ func (f *FS) closeIntent(seq uint64) {
 	}
 }
 
+// freeUnmapped frees the blocks the inode on disk does not map: a failed inode write may still have landed.
+func (f *FS) freeUnmapped(ctx context.Context, num uint32, blocks []uint64) {
+	ino, err := f.inodeTbl.Read(num)
+	if err != nil {
+		log.Printf("[WARN] inode %d: not freeing %d unused blocks, inode unreadable: %v", num, len(blocks), err)
+		return
+	}
+	mapped, err := f.extentMgr.DataBlocks(ino)
+	if err != nil {
+		log.Printf("[WARN] inode %d: not freeing %d unused blocks, extents unreadable: %v", num, len(blocks), err)
+		return
+	}
+	inUse := make(map[uint64]bool, len(mapped))
+	for _, b := range mapped {
+		inUse[b] = true
+	}
+	for _, b := range blocks {
+		if inUse[b] {
+			continue
+		}
+		if err := f.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
+			log.Printf("[WARN] inode %d: freeing unused block %d failed: %v", num, b, err)
+		}
+	}
+}
+
+// dropNewInode undoes a new directory inode whose setup failed: it frees the inode, then the blocks it no longer maps.
+func (f *FS) dropNewInode(ctx context.Context, ino *inode.Inode) {
+	blocks, err := f.extentMgr.DataBlocks(ino)
+	if err != nil {
+		log.Printf("[WARN] inode %d: blocks of the failed new inode unknown, they may leak: %v", ino.InodeNum, err)
+	}
+	if err := f.inodeTbl.Free(ctx, ino.InodeNum); err != nil {
+		log.Printf("[WARN] inode %d: freeing the failed new inode failed: %v", ino.InodeNum, err)
+		return
+	}
+	f.freeUnmapped(ctx, ino.InodeNum, blocks)
+}
+
+// testHookBeforeMkdirInodeWrite, when set by a test, fails a mkdir's inode write with its error.
+var testHookBeforeMkdirInodeWrite func() error
+
+func injectedMkdirFailure() error {
+	if testHookBeforeMkdirInodeWrite != nil {
+		return testHookBeforeMkdirInodeWrite()
+	}
+	return nil
+}
+
+// maxLoggedExtentFrees caps the extents one transaction records; replay leaves any further blocks allocated.
+const maxLoggedExtentFrees = 256
+
+// logExtentFrees records each extent of ino from file block from on, so replay can free its blocks if the operation
+// never did. SFB extents point into containers, not at blocks, so they are skipped.
+func (f *FS) logExtentFrees(txn *journal.Transaction, ino *inode.Inode, from uint64) error {
+	extents, err := f.extentMgr.ListExtents(ino)
+	if err != nil {
+		return err
+	}
+	logged := 0
+	for _, ext := range extents {
+		if ext.LogicalBlock+ext.Length <= from || ext.Flags&extent.FlagSFB != 0 || logged == maxLoggedExtentFrees {
+			continue
+		}
+		skip := max(from, ext.LogicalBlock) - ext.LogicalBlock
+		if err := txn.LogExtentFree(&journal.ExtentFreePayload{
+			InodeNum:  uint64(ino.InodeNum),
+			FileBlock: ext.LogicalBlock + skip,
+			DiskBlock: ext.PhysicalBlock + skip,
+			Length:    uint32(ext.Length - skip),
+		}); err != nil {
+			return err
+		}
+		logged++
+	}
+	return nil
+}
+
 // afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.
 var afterCommit func(op string)
 
@@ -930,7 +1008,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 	}
 
 	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(inode.InodeRoot)); err != nil {
-		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		f.dropNewInode(ctx, childIno)
 		f.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
@@ -943,8 +1021,12 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 	childIno.Mtime = now
 	childIno.Ctime = now
 
-	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
-		f.inodeTbl.Free(ctx, childIno.InodeNum)
+	err = injectedMkdirFailure()
+	if err == nil {
+		err = f.inodeTbl.Write(ctx, childIno)
+	}
+	if err != nil {
+		f.dropNewInode(ctx, childIno)
 		f.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
@@ -1766,15 +1848,19 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 	// Note: InitDirectory() handles lock ordering internally
 	if err := d.fs.dirMgr.InitDirectory(ctx, childIno, uint64(d.inodeNum)); err != nil {
 		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", name, err)
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
+		d.fs.dropNewInode(ctx, childIno)
 		d.fs.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
 
 	// Phase 7: Write updated inode
-	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
+	err = injectedMkdirFailure()
+	if err == nil {
+		err = d.fs.inodeTbl.Write(ctx, childIno)
+	}
+	if err != nil {
 		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", name, err)
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
+		d.fs.dropNewInode(ctx, childIno)
 		d.fs.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
@@ -1934,17 +2020,9 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 		// If link count will become 0, log inode deletion and extent freeing
 		if willFreeInode {
-			// Log block/extent freeing for all extents
-			// Note: extents are freed during Truncate(0)
-			if childIno.Size > 0 {
-				if err := txn.LogBlockFree(&journal.BlockFreePayload{
-					InodeNum:   uint64(childInodeNum),
-					StartBlock: 0, // Freeing all blocks
-					Count:      uint32((childIno.Size + BlockSize - 1) / BlockSize),
-				}); err != nil {
-					d.fs.journal.Abort(txn)
-					return syscall.EIO
-				}
+			if err := d.fs.logExtentFrees(txn, childIno, 0); err != nil {
+				d.fs.journal.Abort(txn)
+				return syscall.EIO
 			}
 
 			// Log inode deletion
@@ -1985,6 +2063,9 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 			return syscall.EIO
 		}
 		defer d.fs.closeIntent(intentSeq)
+		if afterCommit != nil {
+			afterCommit("unlink")
+		}
 	}
 	// === End WAL transaction ===
 
@@ -2890,19 +2971,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	// On a tree conflict the blocks allocated since the last mid-write persist are
 	// unreferenced. Close the intent first so journal replay cannot map them again,
 	// then free them. Blocks the persist committed stay mapped on disk.
-	writeFailed := func(err error) error {
-		// The bitmap lock comes before the inode lock, so free only after dropping it.
-		releaseInodeLock()
-		f.fs.extentMgr.DiscardPending(ctx, ino)
-		if !errors.Is(err, extent.ErrTreeConflict) {
-			return syscall.EIO
-		}
-		if f.fs.journal != nil && intentSeq > 0 {
-			if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
-				log.Printf("[DEBUG] Write inode %d: CompleteIntent after tree conflict failed: %v", f.inodeNum, err)
-				return errRetryWrite
-			}
-		}
+	unusedBlocks := func() []uint64 {
 		var unused []uint64
 		for _, alloc := range allocatedExtents[committedAllocs:] {
 			for i := uint64(0); i < uint64(alloc.count); i++ {
@@ -2912,7 +2981,24 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		for _, cow := range cowDone[committedCoW:] {
 			unused = append(unused, cow.NewPhysBlock)
 		}
-		for _, b := range unused {
+		return unused
+	}
+	writeFailed := func(err error) error {
+		// The bitmap lock comes before the inode lock, so free only after dropping it.
+		releaseInodeLock()
+		f.fs.extentMgr.DiscardPending(ctx, ino)
+		if !errors.Is(err, extent.ErrTreeConflict) {
+			f.fs.freeUnmapped(ctx, f.inodeNum, unusedBlocks())
+			cowDone = cowDone[:committedCoW]
+			return syscall.EIO
+		}
+		if f.fs.journal != nil && intentSeq > 0 {
+			if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+				log.Printf("[DEBUG] Write inode %d: CompleteIntent after tree conflict failed: %v", f.inodeNum, err)
+				return errRetryWrite
+			}
+		}
+		for _, b := range unusedBlocks() {
 			if err := f.fs.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
 				log.Printf("[DEBUG] Write inode %d: freeing block %d after tree conflict failed: %v", f.inodeNum, b, err)
 			}
@@ -3208,14 +3294,9 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	if f.fs.journal != nil && mask != 0 {
 		txn = f.fs.journal.Begin()
 
-		// Log block freeing if truncating
 		if truncating && blocksToFree > 0 {
 			newSize, _ := in.GetSize()
-			if err := txn.LogBlockFree(&journal.BlockFreePayload{
-				InodeNum:   uint64(f.inodeNum),
-				StartBlock: uint64((newSize + BlockSize - 1) / BlockSize),
-				Count:      blocksToFree,
-			}); err != nil {
+			if err := f.fs.logExtentFrees(txn, ino, (newSize+BlockSize-1)/BlockSize); err != nil {
 				f.fs.journal.Abort(txn)
 				return syscall.EIO, nil
 			}
