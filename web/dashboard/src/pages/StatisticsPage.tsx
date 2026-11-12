@@ -1,8 +1,5 @@
-/**
- * Statistics page - detailed cache, journal, and I/O stats
- */
-
-import { useAllStats } from '@/hooks'
+import { useAllStats, useStatus } from '@/hooks'
+import { useRefreshInterval } from '@/stores'
 import { CacheStatsPanel } from '@/components'
 import { formatBytes, formatNumber, formatPercent } from '@/utils/format'
 
@@ -46,9 +43,9 @@ function StatsError({ error, onRetry }: { error: Error; onRetry: () => void }) {
 }
 
 export function StatisticsPage() {
-  const { data: stats, loading, error, refetch } = useAllStats({
-    refreshInterval: 10000,
-  })
+  const refreshInterval = useRefreshInterval()
+  const { data: stats, loading, error, refetch } = useAllStats({ refreshInterval })
+  const { data: status } = useStatus({ refreshInterval })
 
   if (loading && !stats) {
     return <StatsSkeleton />
@@ -61,7 +58,8 @@ export function StatisticsPage() {
   const cacheStats = stats?.cache
   const journalStats = stats?.journal
   const trimStats = stats?.trim
-  const sfbStats = stats?.sfb
+  const lockStats = stats?.lock
+  const capacity = status?.capacity
 
   return (
     <div className="space-y-6">
@@ -69,7 +67,7 @@ export function StatisticsPage() {
       <div>
         <h1 className="text-2xl font-bold text-gfs-text-primary">Statistics</h1>
         <p className="text-sm text-gfs-text-muted mt-1">
-          Detailed cache, journal, and storage statistics
+          Cache, journal, TRIM, lock and storage statistics
         </p>
       </div>
 
@@ -157,46 +155,37 @@ export function StatisticsPage() {
             </div>
           </div>
 
-          {/* SFB (Space/Free Block) Statistics */}
+          <div className="card">
+            <h3 className="card-header">Lock Statistics</h3>
+            <div className="space-y-3">
+              <StatRow label="Locks held" value={formatNumber(lockStats?.active_locks ?? 0)} />
+              <StatRow
+                label="Contended waits"
+                value={formatNumber(lockStats?.pending_locks ?? 0)}
+                highlight={(lockStats?.pending_locks ?? 0) > 0}
+              />
+              <StatRow label="Hint cache hits" value={formatNumber(lockStats?.hint_cache_hits ?? 0)} />
+              <StatRow label="Hint cache misses" value={formatNumber(lockStats?.hint_cache_misses ?? 0)} />
+              <StatRow label="Hint hit rate" value={formatPercent((lockStats?.hint_cache_hit_rate ?? 0) * 100)} />
+            </div>
+          </div>
+
           <div className="card">
             <h3 className="card-header">Storage Allocation</h3>
             <div className="space-y-3">
+              <StatRow label="Total Blocks" value={formatNumber(capacity?.total_blocks ?? 0)} />
+              <StatRow label="Used" value={formatNumber(capacity?.used_blocks ?? 0)} />
+              <StatRow label="Free" value={formatNumber(capacity?.free_blocks ?? 0)} />
               <StatRow
-                label="Total Blocks"
-                value={formatNumber(sfbStats?.total_blocks ?? 0)}
+                label="Used %"
+                value={formatPercent(capacity?.used_percent ?? 0)}
+                highlight={(capacity?.used_percent ?? 0) > 90}
               />
+              <StatRow label="Block Size" value={formatBytes(capacity?.block_size_bytes ?? 0)} />
               <StatRow
-                label="Allocated"
-                value={formatNumber(sfbStats?.allocated_blocks ?? 0)}
-              />
-              <StatRow
-                label="Free"
-                value={formatNumber(sfbStats?.free_blocks ?? 0)}
-              />
-              <StatRow
-                label="Allocation %"
-                value={formatPercent(sfbStats?.allocation_percent ?? 0)}
-                highlight={(sfbStats?.allocation_percent ?? 0) > 90}
-              />
-              {sfbStats?.fragmentation_ratio !== undefined && (
-                <StatRow
-                  label="Fragmentation"
-                  value={formatPercent(sfbStats.fragmentation_ratio * 100)}
-                />
-              )}
-              {sfbStats?.largest_free_extent !== undefined && (
-                <StatRow
-                  label="Largest Free Extent"
-                  value={formatNumber(sfbStats.largest_free_extent)}
-                />
-              )}
-              <StatRow
-                label="Total Allocations"
-                value={formatNumber(sfbStats?.allocations_total ?? 0)}
-              />
-              <StatRow
-                label="Total Deallocations"
-                value={formatNumber(sfbStats?.deallocations_total ?? 0)}
+                label="Small-file containers"
+                value={stats?.sfb ? 'Enabled' : 'Disabled'}
+                valueClass="text-gfs-text-muted"
               />
             </div>
           </div>

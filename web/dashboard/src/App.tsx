@@ -1,7 +1,3 @@
-/**
- * GoClusterFS Dashboard Application
- */
-
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { DashboardLayout } from '@/layouts'
 import { DashboardPage, ClusterPage, SnapshotsPage, StatisticsPage, SettingsPage } from '@/pages'
@@ -10,7 +6,7 @@ import { SettingsProvider } from '@/stores'
 function App() {
   return (
     <SettingsProvider>
-      <BrowserRouter>
+      <BrowserRouter basename={import.meta.env.BASE_URL.replace(/\/$/, '')}>
         <Routes>
           <Route element={<DashboardLayout />}>
             <Route path="/" element={<DashboardPage />} />

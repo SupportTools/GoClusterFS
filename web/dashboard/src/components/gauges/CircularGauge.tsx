@@ -667,7 +667,7 @@ interface JournalGaugeProps {
   availableSpace?: number
   /** Total journal size (bytesWritten + availableSpace if not provided) */
   totalSize?: number
-  /** Journal state (e.g., 'active', 'flushing', 'idle') */
+  /** Journal state: clean, dirty, recovering or corrupt */
   state?: string
   /** Number of commits */
   commitCount?: number
@@ -718,10 +718,10 @@ export function JournalGauge({
 
   // State badge color
   const stateColorMap: Record<string, string> = {
-    active: 'bg-gfs-status-ok',
-    flushing: 'bg-gfs-status-warning',
-    idle: 'bg-gfs-status-info',
-    error: 'bg-gfs-status-error',
+    clean: 'bg-gfs-status-ok',
+    dirty: 'bg-gfs-status-info',
+    recovering: 'bg-gfs-status-warning',
+    corrupt: 'bg-gfs-status-error',
     unknown: 'bg-gfs-text-muted',
   }
   const stateBgColor = stateColorMap[state.toLowerCase()] || stateColorMap.unknown

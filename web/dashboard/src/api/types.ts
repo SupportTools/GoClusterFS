@@ -1,7 +1,4 @@
-/**
- * TypeScript interfaces matching GoClusterFS API response types.
- * These types mirror the Go structs in internal/api/types.go
- */
+// Mirrors the Go structs in internal/api/types.go and internal/api/writes.go.
 
 // Health status values
 export type HealthStatus = 'ok' | 'degraded' | 'unhealthy'
@@ -82,7 +79,7 @@ export interface CacheStatsResponse {
   lock_hint_cache?: CacheHitRateInfo
 }
 
-// GET /api/v1/stats/journal response
+// GET /api/v1/stats/journal response; state is clean, dirty, recovering or corrupt
 export interface JournalStatsResponse {
   state: string
   head_offset: number
@@ -180,46 +177,6 @@ export interface AllStatsResponse {
   cluster?: ClusterInfoResponse
 }
 
-// Cluster node detailed information
-export interface ClusterNodeInfo {
-  node_id: string
-  address: string
-  role: string
-  state: string
-  last_heartbeat?: string
-  joined_at?: string
-  version?: string
-  latency_ms?: number
-  is_self: boolean
-}
-
-// GET /api/v1/cluster/nodes response
-export interface ClusterNodesResponse {
-  cluster_id?: string
-  total_nodes: number
-  healthy_nodes: number
-  leader_id?: string
-  nodes: ClusterNodeInfo[]
-}
-
-// Distributed lock information
-export interface DistributedLockInfo {
-  lock_id: string
-  resource: string
-  owner_node_id: string
-  owner_process?: string
-  acquired_at: string
-  expires_at?: string
-  lock_type: string
-}
-
-// GET /api/v1/cluster/locks response
-export interface ClusterLocksResponse {
-  active_locks: number
-  pending_locks: number
-  locks: DistributedLockInfo[]
-}
-
 // GET /api/v1/stats response (overview)
 export interface StatsOverviewResponse {
   cache?: CacheStatsResponse
@@ -228,53 +185,43 @@ export interface StatsOverviewResponse {
 }
 
 // ============================================================
-// Snapshot Types
+// Snapshot and clone types (internal/api/writes.go)
 // ============================================================
 
-// Snapshot status values
-export type SnapshotStatus = 'creating' | 'active' | 'deleting' | 'error' | 'archived'
+// Registry states; "deleting" lasts until the snapshot worker frees the blocks
+export type SnapshotState = 'creating' | 'active' | 'deleting' | 'invalid'
 
-// Individual snapshot information
 export interface SnapshotInfo {
-  snapshot_id: string
+  id: number
   name: string
-  description?: string
-  status: SnapshotStatus
-  created_at: string
-  created_by?: string
+  inode: number
+  state: SnapshotState
   size_bytes: number
-  parent_snapshot_id?: string
-  metadata?: Record<string, string>
-  // Retention info
-  retention_policy?: string
-  expires_at?: string
-  // Progress info (for creating/deleting states)
-  progress_percent?: number
-  error_message?: string
+  blocks: number
+  created_at?: string
 }
 
-// GET /api/v1/snapshots response
-export interface SnapshotsListResponse {
+// GET /api/v1/snapshots[?path=]
+export interface SnapshotListResponse {
   snapshots: SnapshotInfo[]
-  total_count: number
-  total_size_bytes: number
+  total: number
 }
 
-// POST /api/v1/snapshots request
-export interface CreateSnapshotRequest {
+// POST /api/v1/snapshots
+export interface SnapshotRequest {
+  path: string
   name: string
-  description?: string
-  metadata?: Record<string, string>
-  retention_policy?: string
 }
 
-// POST /api/v1/snapshots response
-export interface CreateSnapshotResponse {
-  snapshot: SnapshotInfo
+// POST /api/v1/clones and POST /api/v1/snapshots/{name}/clone
+export interface CloneRequest {
+  path: string
+  dest: string
 }
 
-// DELETE /api/v1/snapshots/:id response
-export interface DeleteSnapshotResponse {
-  success: boolean
-  message?: string
+export interface WriteResponse {
+  action: string
+  path: string
+  name?: string
+  dest?: string
 }

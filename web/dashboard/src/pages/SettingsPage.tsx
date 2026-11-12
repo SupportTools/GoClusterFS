@@ -1,9 +1,6 @@
-/**
- * Settings page - configuration and preferences
- */
-
 import { useState, useEffect } from 'react'
-import { useSettings, REFRESH_INTERVAL_OPTIONS, type ThemeMode } from '@/stores'
+import { useSettings, REFRESH_INTERVAL_OPTIONS } from '@/stores'
+import { useStatus } from '@/hooks'
 import { api } from '@/api'
 
 /**
@@ -114,14 +111,59 @@ function Select<T extends string | number>({
   )
 }
 
-/**
- * Theme options for the selector
- */
-const THEME_OPTIONS: readonly { value: ThemeMode; label: string }[] = [
-  { value: 'dark', label: 'Dark' },
-  { value: 'light', label: 'Light' },
-  { value: 'system', label: 'System' },
-]
+function TokenForm() {
+  const { token, setToken } = useSettings()
+  const [draft, setDraft] = useState('')
+
+  return (
+    <form
+      className="space-y-3"
+      onSubmit={(e) => {
+        e.preventDefault()
+        setToken(draft)
+        setDraft('')
+      }}
+    >
+      <div>
+        <label htmlFor="api-token" className="block text-sm font-medium text-gfs-text-primary mb-1">
+          API token
+        </label>
+        <p className="text-xs text-gfs-text-muted mb-2">
+          {token
+            ? 'A token is set for this tab.'
+            : 'No token set. Reads work on a loopback API without one; snapshots and clones always need it.'}
+        </p>
+        <input
+          id="api-token"
+          type="password"
+          autoComplete="off"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder={token ? 'Enter a new token to replace it' : 'Paste the token from -api-token-file'}
+          className="input w-full max-w-md"
+        />
+      </div>
+      <div className="flex gap-2">
+        <button
+          type="submit"
+          disabled={!draft.trim()}
+          className="px-4 py-2 text-sm font-medium bg-gfs-accent-primary text-white rounded hover:bg-gfs-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        >
+          Save token
+        </button>
+        {token && (
+          <button
+            type="button"
+            onClick={() => setToken('')}
+            className="px-4 py-2 text-sm font-medium text-gfs-text-primary bg-gfs-bg-tertiary border border-gfs-border rounded hover:bg-gfs-bg-primary transition-colors"
+          >
+            Forget token
+          </button>
+        )}
+      </div>
+    </form>
+  )
+}
 
 /**
  * API status indicator
@@ -204,6 +246,7 @@ function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
 
 export function SettingsPage() {
   const { settings, updateSettings, resetSettings } = useSettings()
+  const status = useStatus()
   const [showResetConfirm, setShowResetConfirm] = useState(false)
 
   const handleReset = () => {
@@ -217,7 +260,7 @@ export function SettingsPage() {
       <div>
         <h1 className="text-2xl font-bold text-gfs-text-primary">Settings</h1>
         <p className="text-sm text-gfs-text-muted mt-1">
-          Configure dashboard preferences and view system information
+          Dashboard preferences and API access
         </p>
       </div>
 
@@ -242,57 +285,23 @@ export function SettingsPage() {
         />
       </SettingSection>
 
-      {/* Appearance */}
       <SettingSection
-        title="Appearance"
-        description="Customize how the dashboard looks"
+        title="API Access"
+        description="The token stays in this browser tab (sessionStorage) and is gone when you close it."
       >
-        <Select
-          value={settings.theme}
-          onChange={(value) => updateSettings({ theme: value })}
-          options={THEME_OPTIONS}
-          label="Theme"
-          description="Choose your preferred color scheme"
-        />
-
-        <Toggle
-          enabled={settings.compactMode}
-          onChange={(enabled) => updateSettings({ compactMode: enabled })}
-          label="Compact Mode"
-          description="Reduce spacing and padding for denser layouts"
-        />
-      </SettingSection>
-
-      {/* Dashboard Display */}
-      <SettingSection
-        title="Dashboard Display"
-        description="Control what information is shown on dashboards"
-      >
-        <Toggle
-          enabled={settings.showNodeLatency}
-          onChange={(enabled) => updateSettings({ showNodeLatency: enabled })}
-          label="Show Node Latency"
-          description="Display latency information on cluster node cards"
-        />
-
-        <Toggle
-          enabled={settings.showLockPanel}
-          onChange={(enabled) => updateSettings({ showLockPanel: enabled })}
-          label="Show Lock Panel"
-          description="Display distributed lock information on the cluster page"
-        />
+        <TokenForm />
       </SettingSection>
 
       {/* About */}
       <SettingSection title="About">
         <dl>
-          <InfoRow label="Dashboard Version" value="0.1.0" />
+          <InfoRow label="Server Version" value={status.data?.version ?? '-'} />
           <InfoRow label="API Status" value={<ApiStatus />} />
           <InfoRow
             label="Settings Storage"
             value={
               <span className="text-xs font-mono text-gfs-text-secondary">
-                localStorage
+                localStorage, token in sessionStorage
               </span>
             }
           />
@@ -314,7 +323,7 @@ export function SettingsPage() {
         ) : (
           <div className="flex items-center gap-3">
             <span className="text-sm text-gfs-text-secondary">
-              Are you sure? This will reset all settings to defaults.
+              Reset the refresh settings to their defaults? The token stays.
             </span>
             <button
               type="button"

@@ -1,19 +1,20 @@
-/**
- * Settings store provider component
- * Uses React Context + localStorage for persistent settings
- */
-
 import { useState, useCallback, useEffect, type ReactNode } from 'react'
+import { apiClient } from '@/api'
 import { SettingsContext } from './settingsContext'
 import { type Settings, DEFAULT_SETTINGS, STORAGE_KEY } from './settingsTypes'
+import { loadToken, saveToken } from './token'
 
-// Load settings from localStorage
 function loadSettings(): Settings {
   try {
     const stored = localStorage.getItem(STORAGE_KEY)
     if (stored) {
       const parsed = JSON.parse(stored) as Partial<Settings>
-      return { ...DEFAULT_SETTINGS, ...parsed }
+      return {
+        refreshInterval: typeof parsed.refreshInterval === 'number' && parsed.refreshInterval > 0
+          ? parsed.refreshInterval
+          : DEFAULT_SETTINGS.refreshInterval,
+        autoRefresh: typeof parsed.autoRefresh === 'boolean' ? parsed.autoRefresh : DEFAULT_SETTINGS.autoRefresh,
+      }
     }
   } catch {
     console.warn('Failed to load settings from localStorage')
@@ -21,7 +22,6 @@ function loadSettings(): Settings {
   return DEFAULT_SETTINGS
 }
 
-// Save settings to localStorage
 function saveSettings(settings: Settings): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))
@@ -30,36 +30,13 @@ function saveSettings(settings: Settings): void {
   }
 }
 
-/**
- * Settings provider component
- * Wraps the app to provide settings context to all children
- */
 export function SettingsProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<Settings>(loadSettings)
+  const [token, setTokenState] = useState(loadToken)
 
-  // Save to localStorage whenever settings change
   useEffect(() => {
     saveSettings(settings)
   }, [settings])
-
-  // Apply theme class to document
-  useEffect(() => {
-    const root = document.documentElement
-
-    if (settings.theme === 'dark') {
-      root.classList.add('dark')
-    } else if (settings.theme === 'light') {
-      root.classList.remove('dark')
-    } else {
-      // System preference
-      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-      if (prefersDark) {
-        root.classList.add('dark')
-      } else {
-        root.classList.remove('dark')
-      }
-    }
-  }, [settings.theme])
 
   const updateSettings = useCallback((updates: Partial<Settings>) => {
     setSettings((prev) => ({ ...prev, ...updates }))
@@ -69,8 +46,15 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     setSettings(DEFAULT_SETTINGS)
   }, [])
 
+  const setToken = useCallback((next: string) => {
+    const trimmed = next.trim()
+    saveToken(trimmed)
+    apiClient.setAuthToken(trimmed)
+    setTokenState(trimmed)
+  }, [])
+
   return (
-    <SettingsContext.Provider value={{ settings, updateSettings, resetSettings }}>
+    <SettingsContext.Provider value={{ settings, updateSettings, resetSettings, token, setToken }}>
       {children}
     </SettingsContext.Provider>
   )

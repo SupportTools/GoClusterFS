@@ -1,7 +1,3 @@
-/**
- * Dashboard page - main overview with key metrics
- */
-
 import { useDashboardData } from '@/hooks'
 import {
   CapacityGauge,
@@ -160,8 +156,7 @@ export function DashboardPage() {
   // Journal stats
   const journalStats = statsData?.journal
 
-  // SFB (space/free block) stats for storage info
-  const sfbStats = statsData?.sfb
+  const trimStats = statsData?.trim
 
   // Calculate totals for cache
   const totalCacheHits = inodeCache.hits + extentCache.hits + lockHintCache.hits
@@ -181,9 +176,11 @@ export function DashboardPage() {
         </div>
         <div className="flex items-center gap-4">
           <StatusBadge status={healthData?.status || statusData?.status || 'unknown'} />
-          <span className="text-xs text-gfs-text-muted">
-            Last updated: {formatRelativeTime(new Date())}
-          </span>
+          {stats.lastUpdated && (
+            <span className="text-xs text-gfs-text-muted">
+              Last updated: {formatRelativeTime(stats.lastUpdated)}
+            </span>
+          )}
         </div>
       </div>
 
@@ -205,8 +202,8 @@ export function DashboardPage() {
         />
         <StatCard
           label="Blocks Allocated"
-          value={formatNumber(sfbStats?.allocated_blocks ?? capacity.used_blocks)}
-          subValue={`of ${formatNumber(sfbStats?.total_blocks ?? capacity.total_blocks)}`}
+          value={formatNumber(capacity.used_blocks)}
+          subValue={`of ${formatNumber(capacity.total_blocks)}`}
         />
       </div>
 
@@ -299,38 +296,31 @@ export function DashboardPage() {
         </div>
       </div>
 
-      {/* SFB and Journal */}
+      {/* TRIM and Journal */}
       <div className="grid gap-6 lg:grid-cols-2">
-        {/* SFB Statistics */}
         <div className="card">
-          <h2 className="card-header">Space Management</h2>
+          <h2 className="card-header">TRIM</h2>
           <div className="space-y-4">
             <div className="flex justify-between items-center">
-              <span className="text-sm text-gfs-text-muted">Allocations</span>
-              <span className="text-gfs-text-primary font-medium">
-                {formatNumber(sfbStats?.allocations_total ?? 0)}
+              <span className="text-sm text-gfs-text-muted">Status</span>
+              <span className={`font-medium ${trimStats?.trim_enabled ? 'text-gfs-status-ok' : 'text-gfs-text-muted'}`}>
+                {trimStats?.trim_enabled ? 'Enabled' : 'Off or unsupported by the device'}
               </span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-sm text-gfs-text-muted">Deallocations</span>
-              <span className="text-gfs-text-primary font-medium">
-                {formatNumber(sfbStats?.deallocations_total ?? 0)}
-              </span>
+              <span className="text-sm text-gfs-text-muted">Bytes discarded</span>
+              <span className="text-gfs-text-primary font-medium">{formatBytes(trimStats?.trim_bytes ?? 0)}</span>
             </div>
             <div className="flex justify-between items-center">
-              <span className="text-sm text-gfs-text-muted">Allocation %</span>
-              <span className={`font-medium ${(sfbStats?.allocation_percent ?? 0) > 90 ? 'text-gfs-status-error' : 'text-gfs-status-ok'}`}>
-                {formatPercent(sfbStats?.allocation_percent ?? 0)}
+              <span className="text-sm text-gfs-text-muted">Blocks waiting</span>
+              <span className="text-gfs-text-primary font-medium">{formatNumber(trimStats?.pending_trim_blocks ?? 0)}</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-sm text-gfs-text-muted">Errors</span>
+              <span className={`font-medium ${(trimStats?.trim_errors ?? 0) > 0 ? 'text-gfs-status-error' : 'text-gfs-text-primary'}`}>
+                {formatNumber(trimStats?.trim_errors ?? 0)}
               </span>
             </div>
-            {sfbStats?.fragmentation_ratio !== undefined && (
-              <div className="flex justify-between items-center">
-                <span className="text-sm text-gfs-text-muted">Fragmentation</span>
-                <span className="text-gfs-text-primary font-medium">
-                  {formatPercent(sfbStats.fragmentation_ratio * 100)}
-                </span>
-              </div>
-            )}
           </div>
         </div>
 

@@ -1,100 +1,41 @@
-/**
- * Cluster page - node status and topology
- */
-
 import { useState } from 'react'
 import { useClusterData } from '@/hooks'
-import { NodeDetailPanel } from '@/components'
-import type { ClusterNodeInfo, DistributedLockInfo } from '@/api'
-import { formatRelativeTime, formatNumber } from '@/utils/format'
+import { NodeDetailPanel, type ClusterNode } from '@/components'
+import type { ClusterInfoResponse, LockStatsResponse } from '@/api'
+import { formatRelativeTime, formatNumber, formatPercent, nodeStateColor } from '@/utils'
 
-/**
- * Node state badge colors
- */
 function NodeStateBadge({ state }: { state: string }) {
-  const stateColors: Record<string, string> = {
-    healthy: 'bg-gfs-status-ok',
-    online: 'bg-gfs-status-ok',
-    active: 'bg-gfs-status-ok',
-    leader: 'bg-gfs-accent-primary',
-    follower: 'bg-gfs-status-info',
-    degraded: 'bg-gfs-status-warning',
-    unhealthy: 'bg-gfs-status-error',
-    offline: 'bg-gfs-status-error',
-    unknown: 'bg-gfs-text-muted',
-  }
-
-  const color = stateColors[state.toLowerCase()] || 'bg-gfs-text-muted'
-
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium ${color} text-white`}>
-      <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium ${nodeStateColor(state)} text-white`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-current" />
       {state}
     </span>
   )
 }
 
-/**
- * Role badge for node role display
- */
-function RoleBadge({ role, isLeader }: { role: string; isLeader: boolean }) {
-  if (isLeader) {
-    return (
-      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gfs-accent-primary text-white">
-        Leader
-      </span>
-    )
+function clusterNodes(cluster: ClusterInfoResponse): ClusterNode[] {
+  const self: ClusterNode = {
+    nodeId: cluster.node_id,
+    host: cluster.node_address ?? '',
+    state: cluster.state,
+    lastHeartbeat: cluster.last_heartbeat_at,
+    joinedAt: cluster.joined_at,
+    isSelf: true,
   }
-
-  const roleColors: Record<string, string> = {
-    follower: 'bg-gfs-bg-tertiary text-gfs-text-primary',
-    candidate: 'bg-gfs-status-warning text-white',
-    learner: 'bg-gfs-status-info text-white',
-  }
-
-  const color = roleColors[role.toLowerCase()] || 'bg-gfs-bg-tertiary text-gfs-text-primary'
-
-  return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${color}`}>
-      {role}
-    </span>
-  )
+  const peers = (cluster.peers ?? []).map((peer) => ({
+    nodeId: peer.node_id,
+    host: peer.address,
+    state: peer.state,
+    lastHeartbeat: peer.last_seen,
+    isSelf: false,
+  }))
+  return [self, ...peers]
 }
 
-/**
- * Self node indicator
- */
-function SelfBadge() {
-  return (
-    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gfs-accent-secondary text-white">
-      This Node
-    </span>
-  )
-}
-
-/**
- * Node card component displaying node information
- */
-function NodeCard({
-  node,
-  isLeader,
-  onClick,
-}: {
-  node: ClusterNodeInfo
-  isLeader: boolean
-  onClick: () => void
-}) {
-  const lastHeartbeat = node.last_heartbeat
-    ? formatRelativeTime(new Date(node.last_heartbeat))
-    : 'Unknown'
-
-  const joinedAt = node.joined_at
-    ? formatRelativeTime(new Date(node.joined_at))
-    : 'Unknown'
-
+function NodeCard({ node, onClick }: { node: ClusterNode; onClick: () => void }) {
   return (
     <div
-      className={`card transition-all cursor-pointer hover:ring-2 hover:ring-gfs-accent-primary/50 ${node.is_self ? 'ring-2 ring-gfs-accent-secondary/50' : ''}`}
+      className={`card transition-all cursor-pointer hover:ring-2 hover:ring-gfs-accent-primary/50 ${node.isSelf ? 'ring-2 ring-gfs-accent-secondary/50' : ''}`}
       onClick={onClick}
       role="button"
       tabIndex={0}
@@ -105,44 +46,31 @@ function NodeCard({
         }
       }}
     >
-      {/* Header */}
       <div className="flex items-start justify-between mb-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
-            <h3 className="text-sm font-semibold text-gfs-text-primary truncate">
-              {node.node_id}
-            </h3>
-            {node.is_self && <SelfBadge />}
+            <h3 className="text-sm font-semibold text-gfs-text-primary truncate">{node.host || node.nodeId}</h3>
+            {node.isSelf && (
+              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gfs-accent-secondary text-white">
+                This Node
+              </span>
+            )}
           </div>
-          <p className="text-xs text-gfs-text-muted truncate">{node.address}</p>
+          <p className="text-xs font-mono text-gfs-text-muted truncate">{node.nodeId}</p>
         </div>
         <NodeStateBadge state={node.state} />
       </div>
-
-      {/* Role and version */}
-      <div className="flex items-center gap-2 mb-3">
-        <RoleBadge role={node.role} isLeader={isLeader} />
-        {node.version && (
-          <span className="text-xs text-gfs-text-muted">v{node.version}</span>
-        )}
-      </div>
-
-      {/* Stats */}
       <div className="grid grid-cols-2 gap-2 text-xs">
         <div>
           <span className="text-gfs-text-muted">Last Heartbeat</span>
-          <p className="text-gfs-text-secondary font-medium">{lastHeartbeat}</p>
+          <p className="text-gfs-text-secondary font-medium">
+            {node.lastHeartbeat ? formatRelativeTime(new Date(node.lastHeartbeat)) : 'Unknown'}
+          </p>
         </div>
-        <div>
-          <span className="text-gfs-text-muted">Joined</span>
-          <p className="text-gfs-text-secondary font-medium">{joinedAt}</p>
-        </div>
-        {node.latency_ms !== undefined && (
-          <div className="col-span-2">
-            <span className="text-gfs-text-muted">Latency</span>
-            <p className={`font-medium ${node.latency_ms > 100 ? 'text-gfs-status-warning' : 'text-gfs-status-ok'}`}>
-              {node.latency_ms}ms
-            </p>
+        {node.joinedAt && (
+          <div>
+            <span className="text-gfs-text-muted">Mounted</span>
+            <p className="text-gfs-text-secondary font-medium">{formatRelativeTime(new Date(node.joinedAt))}</p>
           </div>
         )}
       </div>
@@ -150,173 +78,79 @@ function NodeCard({
   )
 }
 
-/**
- * Cluster overview stats card
- */
-function ClusterStatsCard({
-  totalNodes,
-  healthyNodes,
-  leaderId,
-  clusterId,
-}: {
-  totalNodes: number
-  healthyNodes: number
-  leaderId?: string
-  clusterId?: string
-}) {
-  const healthPercent = totalNodes > 0 ? (healthyNodes / totalNodes) * 100 : 0
+function ClusterOverview({ cluster }: { cluster: ClusterInfoResponse }) {
+  const { cluster_size: size, healthy_nodes: healthy } = cluster
   const healthColor =
-    healthPercent >= 100
-      ? 'text-gfs-status-ok'
-      : healthPercent >= 50
-        ? 'text-gfs-status-warning'
-        : 'text-gfs-status-error'
+    healthy >= size ? 'text-gfs-status-ok' : healthy * 2 >= size ? 'text-gfs-status-warning' : 'text-gfs-status-error'
 
   return (
     <div className="card">
       <h2 className="card-header">Cluster Overview</h2>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
         <div>
-          <span className="text-sm text-gfs-text-muted">Total Nodes</span>
-          <p className="text-2xl font-bold text-gfs-text-primary">
-            {formatNumber(totalNodes)}
-          </p>
+          <span className="text-sm text-gfs-text-muted">Registered Nodes</span>
+          <p className="text-2xl font-bold text-gfs-text-primary">{formatNumber(size)}</p>
         </div>
         <div>
-          <span className="text-sm text-gfs-text-muted">Healthy</span>
-          <p className={`text-2xl font-bold ${healthColor}`}>
-            {formatNumber(healthyNodes)}
+          <span className="text-sm text-gfs-text-muted">Active</span>
+          <p className={`text-2xl font-bold ${healthColor}`}>{formatNumber(healthy)}</p>
+        </div>
+        <div>
+          <span className="text-sm text-gfs-text-muted">This Node</span>
+          <p className="mt-1">
+            <NodeStateBadge state={cluster.state} />
           </p>
         </div>
-        <div className="col-span-2 sm:col-span-1">
-          <span className="text-sm text-gfs-text-muted">Leader</span>
-          <p className="text-sm font-medium text-gfs-text-primary truncate">
-            {leaderId || 'None elected'}
-          </p>
-        </div>
-        {clusterId && (
-          <div className="col-span-2 sm:col-span-1">
-            <span className="text-sm text-gfs-text-muted">Cluster ID</span>
-            <p className="text-xs font-mono text-gfs-text-secondary truncate">
-              {clusterId}
-            </p>
-          </div>
-        )}
       </div>
+      <p className="text-xs text-gfs-text-muted mt-4">
+        Every node is a peer: GoClusterFS has no leader. Nodes coordinate through locks and heartbeats on the shared device.
+      </p>
     </div>
   )
 }
 
-/**
- * Lock info row
- */
-function LockRow({ lock }: { lock: DistributedLockInfo }) {
-  const acquiredAt = formatRelativeTime(new Date(lock.acquired_at))
-  const expiresAt = lock.expires_at
-    ? formatRelativeTime(new Date(lock.expires_at))
-    : 'Never'
-
-  return (
-    <tr className="border-b border-gfs-border last:border-0">
-      <td className="py-2 text-sm text-gfs-text-primary truncate max-w-[150px]">
-        {lock.resource}
-      </td>
-      <td className="py-2 text-sm text-gfs-text-secondary truncate max-w-[100px]">
-        {lock.owner_node_id}
-      </td>
-      <td className="py-2 text-xs text-gfs-text-muted">{lock.lock_type}</td>
-      <td className="py-2 text-xs text-gfs-text-muted">{acquiredAt}</td>
-      <td className="py-2 text-xs text-gfs-text-muted">{expiresAt}</td>
-    </tr>
-  )
-}
-
-/**
- * Locks panel showing active distributed locks
- */
-function LocksPanel({
-  activeLocks,
-  pendingLocks,
-  locks,
-}: {
-  activeLocks: number
-  pendingLocks: number
-  locks: DistributedLockInfo[]
-}) {
+function LockCounters({ locks }: { locks: LockStatsResponse }) {
+  const rows: Array<[string, string]> = [
+    ['Locks held by this node', formatNumber(locks.active_locks ?? 0)],
+    ['Waiting on contended locks', formatNumber(locks.pending_locks ?? 0)],
+    ['Lock hint cache hits', formatNumber(locks.hint_cache_hits)],
+    ['Lock hint cache misses', formatNumber(locks.hint_cache_misses)],
+    ['Lock hint hit rate', formatPercent(locks.hint_cache_hit_rate * 100)],
+  ]
   return (
     <div className="card">
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="card-header mb-0">Distributed Locks</h2>
-        <div className="flex gap-4 text-sm">
-          <span className="text-gfs-text-muted">
-            Active: <span className="text-gfs-status-ok font-medium">{activeLocks}</span>
-          </span>
-          <span className="text-gfs-text-muted">
-            Pending: <span className="text-gfs-status-warning font-medium">{pendingLocks}</span>
-          </span>
-        </div>
-      </div>
-
-      {locks.length === 0 ? (
-        <p className="text-sm text-gfs-text-muted text-center py-4">
-          No active locks
-        </p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead>
-              <tr className="text-left text-xs text-gfs-text-muted border-b border-gfs-border">
-                <th className="pb-2 font-medium">Resource</th>
-                <th className="pb-2 font-medium">Owner</th>
-                <th className="pb-2 font-medium">Type</th>
-                <th className="pb-2 font-medium">Acquired</th>
-                <th className="pb-2 font-medium">Expires</th>
-              </tr>
-            </thead>
-            <tbody>
-              {locks.slice(0, 10).map((lock) => (
-                <LockRow key={lock.lock_id} lock={lock} />
-              ))}
-            </tbody>
-          </table>
-          {locks.length > 10 && (
-            <p className="text-xs text-gfs-text-muted text-center mt-2">
-              Showing 10 of {locks.length} locks
-            </p>
-          )}
-        </div>
-      )}
+      <h2 className="card-header">Distributed Locks</h2>
+      <dl className="space-y-3">
+        {rows.map(([label, value]) => (
+          <div key={label} className="flex justify-between items-center">
+            <dt className="text-sm text-gfs-text-muted">{label}</dt>
+            <dd className="text-gfs-text-primary font-medium">{value}</dd>
+          </div>
+        ))}
+      </dl>
     </div>
   )
 }
 
-/**
- * Loading skeleton
- */
 function ClusterSkeleton() {
   return (
     <div className="space-y-6 animate-pulse">
       <div className="h-8 bg-gfs-bg-tertiary rounded w-48" />
       <div className="card h-32" />
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {[...Array(6)].map((_, i) => (
-          <div key={i} className="card h-40" />
+        {[...Array(3)].map((_, i) => (
+          <div key={i} className="card h-32" />
         ))}
       </div>
     </div>
   )
 }
 
-/**
- * Error display
- */
 function ClusterError({ error, onRetry }: { error: Error; onRetry: () => void }) {
   return (
     <div className="card border-gfs-status-error">
       <div className="text-center py-8">
-        <div className="text-gfs-status-error text-lg font-medium mb-2">
-          Failed to load cluster data
-        </div>
+        <div className="text-gfs-status-error text-lg font-medium mb-2">Failed to load cluster data</div>
         <div className="text-gfs-text-muted text-sm mb-4">{error.message}</div>
         <button
           onClick={onRetry}
@@ -329,146 +163,54 @@ function ClusterError({ error, onRetry }: { error: Error; onRetry: () => void })
   )
 }
 
-/**
- * Empty state when no cluster configured
- */
-function EmptyCluster() {
-  return (
-    <div className="card">
-      <div className="text-center py-12">
-        <div className="text-4xl mb-4">🔗</div>
-        <h3 className="text-lg font-medium text-gfs-text-primary mb-2">
-          No Cluster Configured
-        </h3>
-        <p className="text-sm text-gfs-text-muted max-w-md mx-auto">
-          This node is running in standalone mode. Configure cluster settings
-          to enable multi-node functionality.
-        </p>
-      </div>
-    </div>
-  )
-}
-
 export function ClusterPage() {
-  const { nodes, locks, stats, loading, error } = useClusterData()
+  const { cluster, locks, loading, error } = useClusterData()
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
 
-  // Selected node for detail panel
-  const [selectedNode, setSelectedNode] = useState<ClusterNodeInfo | null>(null)
-
-  // Combined refetch
-  const refresh = () => {
-    nodes.refetch()
-    locks.refetch()
-    stats.refetch()
-  }
-
-  if (loading && !nodes.data) {
+  if (loading && !cluster.data) {
     return <ClusterSkeleton />
   }
-
-  if (error && !nodes.data) {
-    return <ClusterError error={error} onRetry={refresh} />
+  if (!cluster.data) {
+    return (
+      <ClusterError
+        error={error ?? new Error('No cluster data')}
+        onRetry={() => {
+          cluster.refetch()
+          locks.refetch()
+        }}
+      />
+    )
   }
 
-  const nodesData = nodes.data
-  const locksData = locks.data
-  const statsData = stats.data
-
-  // Check if cluster is configured
-  const hasCluster = nodesData && nodesData.nodes && nodesData.nodes.length > 0
+  const nodes = clusterNodes(cluster.data)
+  const selectedNode = nodes.find((node) => node.nodeId === selectedNodeId) ?? null
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gfs-text-primary">Cluster</h1>
-          <p className="text-sm text-gfs-text-muted mt-1">
-            Node status and topology information
-          </p>
+          <p className="text-sm text-gfs-text-muted mt-1">Nodes in the shared device's registry</p>
         </div>
         <span className="text-xs text-gfs-text-muted">
-          {nodes.lastUpdated && `Last updated: ${formatRelativeTime(nodes.lastUpdated)}`}
+          {cluster.lastUpdated && `Last updated: ${formatRelativeTime(cluster.lastUpdated)}`}
         </span>
       </div>
 
-      {!hasCluster ? (
-        <EmptyCluster />
-      ) : (
-        <>
-          {/* Cluster overview stats */}
-          <ClusterStatsCard
-            totalNodes={nodesData.total_nodes}
-            healthyNodes={nodesData.healthy_nodes}
-            leaderId={nodesData.leader_id}
-            clusterId={nodesData.cluster_id}
-          />
+      <ClusterOverview cluster={cluster.data} />
 
-          {/* Node grid */}
-          <div>
-            <h2 className="text-lg font-semibold text-gfs-text-primary mb-4">
-              Nodes ({nodesData.nodes.length})
-            </h2>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {nodesData.nodes.map((node) => (
-                <NodeCard
-                  key={node.node_id}
-                  node={node}
-                  isLeader={node.node_id === nodesData.leader_id}
-                  onClick={() => setSelectedNode(node)}
-                />
-              ))}
-            </div>
-          </div>
+      <div>
+        <h2 className="text-lg font-semibold text-gfs-text-primary mb-4">Nodes ({nodes.length})</h2>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {nodes.map((node) => (
+            <NodeCard key={node.nodeId} node={node} onClick={() => setSelectedNodeId(node.nodeId)} />
+          ))}
+        </div>
+      </div>
 
-          {/* Distributed locks */}
-          {locksData && (
-            <LocksPanel
-              activeLocks={locksData.active_locks}
-              pendingLocks={locksData.pending_locks}
-              locks={locksData.locks}
-            />
-          )}
+      {locks.data && <LockCounters locks={locks.data} />}
 
-          {/* Cluster stats from stats endpoint (additional info) */}
-          {statsData && (
-            <div className="card">
-              <h2 className="card-header">This Node Stats</h2>
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-                <div>
-                  <span className="text-gfs-text-muted">Node ID</span>
-                  <p className="font-mono text-xs text-gfs-text-primary truncate">
-                    {statsData.node_id}
-                  </p>
-                </div>
-                <div>
-                  <span className="text-gfs-text-muted">Role</span>
-                  <p className="text-gfs-text-primary font-medium">{statsData.role}</p>
-                </div>
-                <div>
-                  <span className="text-gfs-text-muted">State</span>
-                  <p className="text-gfs-text-primary font-medium">{statsData.state}</p>
-                </div>
-                {statsData.last_heartbeat_at && (
-                  <div>
-                    <span className="text-gfs-text-muted">Last Heartbeat</span>
-                    <p className="text-gfs-text-primary font-medium">
-                      {formatRelativeTime(new Date(statsData.last_heartbeat_at))}
-                    </p>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Node Detail Panel */}
-      <NodeDetailPanel
-        node={selectedNode}
-        isLeader={selectedNode?.node_id === nodesData?.leader_id}
-        onClose={() => setSelectedNode(null)}
-      />
+      <NodeDetailPanel node={selectedNode} onClose={() => setSelectedNodeId(null)} />
     </div>
   )
 }

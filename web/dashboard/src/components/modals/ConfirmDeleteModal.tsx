@@ -23,6 +23,8 @@ export interface ConfirmDeleteModalProps {
   warning?: string
   /** Whether to require typing the name to confirm */
   requireTypeToConfirm?: boolean
+  /** Shown once onConfirm resolves */
+  successMessage?: string
 }
 
 type ModalState = 'confirm' | 'deleting' | 'success' | 'error'
@@ -43,6 +45,7 @@ export function ConfirmDeleteModal({
   itemType = 'item',
   warning,
   requireTypeToConfirm = true,
+  successMessage = 'Deleted successfully',
 }: ConfirmDeleteModalProps) {
   const [state, setState] = useState<ModalState>('confirm')
   const [confirmText, setConfirmText] = useState('')
@@ -92,7 +95,7 @@ export function ConfirmDeleteModal({
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
               </svg>
             </div>
-            <p className="text-gfs-text-primary font-medium">Deleted successfully</p>
+            <p className="text-gfs-text-primary font-medium">{successMessage}</p>
           </div>
         )
 

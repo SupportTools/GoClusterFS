@@ -2,8 +2,9 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
-// https://vite.dev/config/
+// The Go server embeds the build from internal/webui and serves it under /ui/.
 export default defineConfig({
+  base: '/ui/',
   plugins: [react()],
   resolve: {
     alias: {
@@ -12,26 +13,14 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    // Proxy API requests to Go backend during development
     proxy: {
-      '/api': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
-      },
-      '/health': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
-      },
-      '/metrics': {
-        target: 'http://localhost:8080',
-        changeOrigin: true,
-      },
+      '/api': 'http://127.0.0.1:8080',
+      '/health': 'http://127.0.0.1:8080',
     },
   },
   build: {
-    outDir: 'dist',
-    sourcemap: true,
-    // Generate assets that can be embedded in Go binary
-    assetsDir: 'assets',
+    outDir: '../../internal/webui/build/dist',
+    emptyOutDir: true,
+    sourcemap: false,
   },
 })

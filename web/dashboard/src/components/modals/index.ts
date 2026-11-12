@@ -1,9 +1,5 @@
-/**
- * Modal components exports
- */
-
-export { CreateSnapshotModal } from './CreateSnapshotModal'
-export type { CreateSnapshotModalProps } from './CreateSnapshotModal'
+export { TextFieldModal } from './TextFieldModal'
+export type { TextFieldModalProps } from './TextFieldModal'
 
 export { ConfirmDeleteModal } from './ConfirmDeleteModal'
 export type { ConfirmDeleteModalProps } from './ConfirmDeleteModal'

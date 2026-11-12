@@ -1,6 +1,2 @@
-/**
- * Panel components exports
- */
-
 export { NodeDetailPanel } from './NodeDetailPanel'
-export type { NodeDetailPanelProps } from './NodeDetailPanel'
+export type { NodeDetailPanelProps, ClusterNode } from './NodeDetailPanel'

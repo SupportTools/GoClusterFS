@@ -1,5 +1,2 @@
-/**
- * Utils module exports
- */
-
 export * from './format'
+export * from './nodeState'
