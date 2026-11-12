@@ -158,3 +158,38 @@ func TestRecoveryEndsWithTailAtEnd(t *testing.T) {
 		t.Fatal("recovery scan still running after 10s with the tail at the end of the data area")
 	}
 }
+
+// A tail that no record boundary reaches, from a corrupt pointer, must not keep the scan reading the ring forever.
+func TestScanStopsAtUnreachableTail(t *testing.T) {
+	j := newTestJournal(t)
+	for j.region.Superblock().WrapCount == 0 {
+		commitIntents(t, j, true)
+		if _, err := j.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := commitIntents(t, j, false, false)
+	region, err := OpenRegionForRecovery(j.region.dev, j.region.regionOffset, j.region.regionSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	region.superblock.TailOffset += 512
+
+	done := make(chan []uint64, 1)
+	go func() {
+		var replayed []uint64
+		_ = scanJournal(region, func(txn *RecoveredTxn) error {
+			replayed = append(replayed, txn.Header.Seq)
+			return nil
+		}, &RecoveryStats{}, nil, nil)
+		done <- replayed
+	}()
+	select {
+	case got := <-done:
+		if !slices.Equal(got, pending) {
+			t.Errorf("replayed %v, want each pending intent once: %v", got, pending)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("scan still running after 10s with an unreachable tail")
+	}
+}

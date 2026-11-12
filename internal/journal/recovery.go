@@ -106,20 +106,11 @@ func RecoverChecked(region *Region, handler RecoveryHandler, check func() error)
 // This is Phase 1 of the two-phase recovery protocol.
 // Records are identified by IntentCompletionMagic (0x43544E49 "INTC").
 func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, completed map[uint64]bool, stats *RecoveryStats) error {
+	span := ringSpan(head, tail, dataAreaSize)
 	pos := head
-	for pos != tail {
-		// Handle wrap-around
-		if pos >= dataAreaSize {
-			pos = 0
-		}
-
-		// Calculate bytes remaining to scan
-		var remaining uint32
-		if tail > pos {
-			remaining = tail - pos
-		} else {
-			remaining = dataAreaSize - pos + tail
-		}
+	for scanned := uint32(0); scanned < span; {
+		pos %= dataAreaSize
+		remaining := span - scanned
 
 		if remaining < 4 {
 			// Not enough data for even a magic number
@@ -144,7 +135,7 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 				stats.IntentCompletions++
 			}
 			// Advance by one aligned sector (IntentCompletion is padded to 512 bytes)
-			pos += storage.SectorSize
+			pos, scanned = pos+storage.SectorSize, scanned+storage.SectorSize
 		} else if magic == TxnMagic {
 			// This is a transaction - skip it (we'll process in phase 2)
 			header, err := DeserializeTxnHeader(sectorBuf[:TxnHeaderSize])
@@ -153,19 +144,22 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 			}
 			// Advance by aligned transaction length
 			alignedLen := ((header.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
-			pos += alignedLen
+			pos, scanned = pos+alignedLen, scanned+alignedLen
 		} else {
 			// Unknown record type - corruption or end of valid data
 			break
 		}
-
-		// Handle wrap-around
-		if pos >= dataAreaSize && pos != tail {
-			pos = pos - dataAreaSize
-		}
 	}
 
 	return nil
+}
+
+// ringSpan returns the bytes from head to tail; a tail at the end of the data area is the end, not 0.
+func ringSpan(head, tail, dataAreaSize uint32) uint32 {
+	if tail >= head {
+		return tail - head
+	}
+	return dataAreaSize - head + tail
 }
 
 // scanJournal scans the journal from head to tail, recovering transactions.
@@ -194,20 +188,11 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 	}
 
 	// Phase 2: Replay transactions that are not completed
+	span := ringSpan(head, tail, dataAreaSize)
 	pos := head
-	for pos != tail {
-		// Handle wrap-around
-		if pos >= dataAreaSize {
-			pos = 0
-		}
-
-		// Calculate bytes remaining to scan
-		var remaining uint32
-		if tail > pos {
-			remaining = tail - pos
-		} else {
-			remaining = dataAreaSize - pos + tail
-		}
+	for scanned := uint32(0); scanned < span; {
+		pos %= dataAreaSize
+		remaining := span - scanned
 
 		if remaining < TxnHeaderSize {
 			// Not enough data for a transaction header
@@ -237,10 +222,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 
 		// Skip IntentCompletion records (already processed in Phase 1)
 		if magic == IntentCompletionMagic {
-			pos += storage.SectorSize
-			if pos >= dataAreaSize && pos != tail {
-				pos = pos - dataAreaSize
-			}
+			pos, scanned = pos+storage.SectorSize, scanned+storage.SectorSize
 			continue
 		}
 
@@ -295,11 +277,8 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 				stats.IntentsSkipped++
 				// Skip to next record without replaying
 				alignedLen := ((txnHeader.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
-				pos = pos + alignedLen
+				pos, scanned = pos+alignedLen, scanned+alignedLen
 				stats.BytesScanned += alignedLen
-				if pos >= dataAreaSize && pos != tail {
-					pos = pos - dataAreaSize
-				}
 				continue
 			}
 
@@ -344,13 +323,8 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 
 		// Advance position (account for sector alignment)
 		alignedLen := ((txnHeader.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
-		pos = pos + alignedLen
+		pos, scanned = pos+alignedLen, scanned+alignedLen
 		stats.BytesScanned += alignedLen
-
-		// Handle wrap-around
-		if pos >= dataAreaSize && pos != tail {
-			pos = pos - dataAreaSize
-		}
 	}
 
 	return nil
