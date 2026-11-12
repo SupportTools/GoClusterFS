@@ -707,6 +707,22 @@ scenarios:
     environments:
       go: internal/journal/journal_test.go::TestBatchCommitReturnsSyncError
 
+  - id: checkpoint-keeps-incomplete-intents
+    name: Checkpoints never pass an intent that has not completed
+    description: A transaction committed but not yet applied stays in the journal through a checkpoint and an unmount, and the next mount replays it; completed intents are checkpointed away
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestCheckpointKeepsIncompleteIntents
+
+  - id: create-replays-after-checkpoint-crash
+    name: A create cut off after a checkpoint is replayed
+    description: A create stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount creates the file and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestCreateReplaysAfterCheckpointAndCrash
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
   - id: intent-completion-serialize
     name: IntentCompletion serialization
     description: IntentCompletion record serializes and deserializes correctly
