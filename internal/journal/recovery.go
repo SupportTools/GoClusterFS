@@ -312,7 +312,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 			}
 			if advance != nil {
 				next := pos + ((txnHeader.TotalLength+storage.SectorSize-1)/storage.SectorSize)*storage.SectorSize
-				if next >= dataAreaSize {
+				if next > dataAreaSize {
 					next -= dataAreaSize
 				}
 				if err := advance(txnHeader.Seq, next); err != nil {
