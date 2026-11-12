@@ -640,8 +640,8 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 			t.Errorf("file block %d maps %d (err %v), want disk block %d", file, got, err, disk)
 		}
 	}
-	if _, err := rctx.ExtentMgr.LookupPhysical(ino, 1); err == nil {
-		t.Error("file block 1 still mapped after its free was replayed")
+	if got, err := rctx.ExtentMgr.LookupPhysical(ino, 1); err != nil || got != extent.Hole {
+		t.Errorf("file block 1 maps %d (err %v) after its free was replayed, want a hole", got, err)
 	}
 	for disk, want := range map[uint64]bool{1: true, 2: false, 3: true, 5: true} {
 		if got, err := rctx.BitmapMgr.IsAllocated(disk); err != nil || got != want {
