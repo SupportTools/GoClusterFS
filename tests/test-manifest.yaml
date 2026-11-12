@@ -714,6 +714,20 @@ scenarios:
     environments:
       go: internal/journal/checkpoint_test.go::TestCheckpointKeepsIncompleteIntents
 
+  - id: pending-intent-survives-full-ring
+    name: A full journal never overwrites a pending intent
+    description: While one intent pins the head, other operations fill the ring until Commit returns ErrJournalFull; the ring never ends at the head, where it would read as empty, and a crash still replays the pending intent
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestPendingIntentSurvivesFullRing
+
+  - id: recovery-ends-with-tail-at-end
+    name: Recovery ends when the tail is at the end of the data area
+    description: A crash with the journal tail exactly at the end of the data area replays the pending transaction and returns, instead of scanning forever
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestRecoveryEndsWithTailAtEnd
+
   - id: create-replays-after-checkpoint-crash
     name: A create cut off after a checkpoint is replayed
     description: A create stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount creates the file and fsck is clean
