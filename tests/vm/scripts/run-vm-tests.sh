@@ -2961,9 +2961,9 @@ unmount_goclusterfs() {
     done
 }
 
-# A power failure while files are written leaves blocks that no file maps.
-# With every node unmounted, fsck -repair frees them and the check after it is
-# clean. A file written before the failure stays intact.
+# A power failure while files are written may leave blocks that no file maps.
+# With every node unmounted, fsck -repair frees any it finds, the check after
+# it is clean, and no file changes.
 test_fsck_repair_after_power_failure() {
     log_info "Testing fsck -repair after a power failure..."
     ensure_cluster_healthy 2
@@ -3035,7 +3035,7 @@ test_fsck_repair_after_power_failure() {
             return 1
         fi
     done
-    log_info "fsck -repair reclaimed what the power failure leaked"
+    log_info "fsck -repair left a clean volume and every file unchanged"
     return 0
 }
 
