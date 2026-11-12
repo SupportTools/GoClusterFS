@@ -2950,9 +2950,10 @@ test_concurrent_writes_power_failure() {
     return 0
 }
 
-# Print the PIDs of goclusterfs-mount on VM $1, found by executable path: the kernel cuts process names to 15 characters.
+# Print the PIDs of goclusterfs-mount on VM $1, found by the path setup_goclusterfs starts it with: the kernel cuts
+# process names to 15 characters. A zombie's command line is empty, so it counts as gone.
 mount_pids() {
-    ssh_run "$1" 'for p in /proc/[0-9]*; do [ "$(readlink $p/exe 2>/dev/null)" = /usr/local/bin/goclusterfs-mount ] && echo ${p#/proc/}; done; true'
+    ssh_run "$1" 'for p in /proc/[0-9]*; do [ "$(head -c 32 $p/cmdline 2>/dev/null)" = /usr/local/bin/goclusterfs-mount ] && echo ${p#/proc/}; done; true'
 }
 
 # Kill goclusterfs-mount on VM $1 with SIGKILL, as a crash would, and fail unless it is gone within 10s.
