@@ -54,11 +54,11 @@ func writeTokenFile(t *testing.T, token string, mode os.FileMode) string {
 	return p
 }
 
-func startAPIMount(t *testing.T, token string, sizeMB int) *apiMount {
+func startAPIMount(t *testing.T, token string, sizeMB int, extraArgs ...string) *apiMount {
 	t.Helper()
 	m := &apiMount{MountedFS: NewMountedFS(t, sizeMB), addr: freeLoopbackAddr(t), token: token, log: &lockedBuffer{}}
 	m.Log = m.log
-	m.ExtraArgs = []string{"-format", "-api-addr", m.addr}
+	m.ExtraArgs = append([]string{"-format", "-api-addr", m.addr}, extraArgs...)
 	if token != "" {
 		m.ExtraArgs = append(m.ExtraArgs, "-api-token-file", writeTokenFile(t, token, 0o600))
 	}

@@ -6,7 +6,7 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"slices"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -57,9 +57,20 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// exempt reports whether p is one of paths, or lies under a path that ends in "/".
+func exempt(p string, paths []string) bool {
+	under := path.Clean(p) + "/"
+	for _, e := range paths {
+		if p == e || strings.HasSuffix(e, "/") && strings.HasPrefix(under, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // AuthMiddleware returns a middleware that validates Bearer tokens.
 // If token is empty, authentication is disabled.
-// Paths in skipPaths are not authenticated (e.g., /health, /metrics).
+// Paths in skipPaths are not authenticated (e.g., /health, /metrics); see exempt.
 func AuthMiddleware(token string, skipPaths ...string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,12 +80,9 @@ func AuthMiddleware(token string, skipPaths ...string) Middleware {
 				return
 			}
 
-			// Check if path should skip auth
-			for _, path := range skipPaths {
-				if r.URL.Path == path {
-					next.ServeHTTP(w, r)
-					return
-				}
+			if exempt(r.URL.Path, skipPaths) {
+				next.ServeHTTP(w, r)
+				return
 			}
 
 			// Extract Bearer token from Authorization header
@@ -275,11 +283,11 @@ func (rl *RateLimiter) retryAfter() string {
 }
 
 // RateLimitMiddleware returns a middleware that enforces rate limiting per client.
-// If limiter is nil, no rate limiting is applied. Paths in skipPaths are never limited.
+// If limiter is nil, no rate limiting is applied. Paths in skipPaths are never limited; see exempt.
 func RateLimitMiddleware(limiter *RateLimiter, skipPaths ...string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if limiter == nil || slices.Contains(skipPaths, r.URL.Path) {
+			if limiter == nil || exempt(r.URL.Path, skipPaths) {
 				next.ServeHTTP(w, r)
 				return
 			}

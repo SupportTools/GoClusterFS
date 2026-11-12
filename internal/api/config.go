@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
@@ -56,6 +57,9 @@ type Config struct {
 	// RateLimitBurst is the maximum burst size (token bucket capacity).
 	// Default: 200
 	RateLimitBurst int
+
+	// Dashboard, if set, serves the web dashboard under /ui/ without auth or rate limiting.
+	Dashboard http.Handler
 }
 
 // DefaultConfig returns a Config with sensible defaults.
