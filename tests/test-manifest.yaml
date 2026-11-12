@@ -965,10 +965,17 @@ scenarios:
 
   - id: fsck-reclaim-interrupted-truncate
     name: fsck -repair frees blocks an interrupted truncate leaves
-    description: A node crashes after a truncate writes the shorter inode but before it frees the cut blocks; replay frees nothing, check reports the blocks as leaked, repair frees them, and both files keep their data
+    description: A node crashes after a truncate writes the shorter inode but before it frees the cut blocks; check reports whatever cut blocks replay leaves allocated, repair frees exactly those, and both files keep their data. Passes too if replay frees them itself
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsInterruptedTruncate
+
+  - id: fsck-reclaim-interrupted-subdirectory-unlink
+    name: fsck -repair frees blocks an interrupted subdirectory unlink leaves
+    description: A node crashes while unlinking a file in a subdirectory, after the entry is gone but before the blocks are freed; replay deletes the inode, check reports whatever of its blocks replay leaves allocated, repair frees exactly those, and other files keep their data. Passes too if replay frees them itself
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsInterruptedSubdirectoryUnlink
 
   - id: fsck-reclaim-empty-sfb-containers
     name: fsck -repair frees SFB containers no file uses
