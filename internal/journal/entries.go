@@ -31,6 +31,7 @@ const (
 	TxnOpExtentAdd    TxnOpType = 0x0500
 	TxnOpExtentRemove TxnOpType = 0x0501
 	TxnOpExtentUpdate TxnOpType = 0x0502
+	TxnOpExtentFree   TxnOpType = 0x0503
 
 	// Snapshot Operations (0x06xx)
 	TxnOpSnapshotCreate TxnOpType = 0x0600
@@ -69,6 +70,8 @@ func (op TxnOpType) String() string {
 		return "ExtentRemove"
 	case TxnOpExtentUpdate:
 		return "ExtentUpdate"
+	case TxnOpExtentFree:
+		return "ExtentFree"
 	case TxnOpSnapshotCreate:
 		return "SnapshotCreate"
 	case TxnOpSnapshotDelete:
@@ -631,6 +634,40 @@ func DeserializeExtentRemove(buf []byte) (*ExtentRemovePayload, error) {
 	}, nil
 }
 
+// ExtentFreePayload is logged for each mapped extent a truncate or unlink frees: Length file blocks from FileBlock,
+// mapped to the disk blocks from DiskBlock. Replay frees only blocks the inode still maps there.
+// Size: 32 bytes
+type ExtentFreePayload struct {
+	InodeNum  uint64
+	FileBlock uint64
+	DiskBlock uint64
+	Length    uint32
+	Reserved  uint32
+}
+
+// Serialize converts the payload to bytes.
+func (p *ExtentFreePayload) Serialize() []byte {
+	buf := make([]byte, 32)
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.FileBlock)
+	binary.LittleEndian.PutUint64(buf[16:24], p.DiskBlock)
+	binary.LittleEndian.PutUint32(buf[24:28], p.Length)
+	return buf
+}
+
+// DeserializeExtentFree parses an ExtentFreePayload from bytes.
+func DeserializeExtentFree(buf []byte) (*ExtentFreePayload, error) {
+	if len(buf) < 32 {
+		return nil, ErrTxnTooSmall
+	}
+	return &ExtentFreePayload{
+		InodeNum:  binary.LittleEndian.Uint64(buf[0:8]),
+		FileBlock: binary.LittleEndian.Uint64(buf[8:16]),
+		DiskBlock: binary.LittleEndian.Uint64(buf[16:24]),
+		Length:    binary.LittleEndian.Uint32(buf[24:28]),
+	}, nil
+}
+
 // ============================================================================
 // Snapshot Operation Payloads
 // ============================================================================
@@ -771,6 +808,11 @@ func (txn *Transaction) LogExtentAdd(payload *ExtentAddPayload) error {
 // LogExtentRemove adds an extent removal to the transaction.
 func (txn *Transaction) LogExtentRemove(payload *ExtentRemovePayload) error {
 	return txn.addEntry(TxnOpExtentRemove, payload.Serialize())
+}
+
+// LogExtentFree adds a freed extent to the transaction.
+func (txn *Transaction) LogExtentFree(payload *ExtentFreePayload) error {
+	return txn.addEntry(TxnOpExtentFree, payload.Serialize())
 }
 
 // LogSnapshotCreate adds a snapshot creation to the transaction.

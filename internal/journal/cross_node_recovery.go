@@ -164,6 +164,8 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, entry *RecoveredEntr
 		return applyExtentAdd(ctx, rctx, entry.Payload)
 	case TxnOpExtentRemove:
 		return applyExtentRemove(ctx, rctx, entry.Payload)
+	case TxnOpExtentFree:
+		return applyExtentFree(ctx, rctx, entry.Payload)
 	default:
 		// Unhandled operation types are logged but not an error
 		log.Printf("[Recovery] Skipping unhandled operation type: %s", entry.Entry.OpType)
@@ -531,4 +533,41 @@ func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
 			txn.Header.Seq, result.applied, result.skipped)
 		return nil
 	}
+}
+
+// applyExtentFree unmaps and frees the logged blocks the inode still maps at the logged file blocks. A block the inode
+// maps elsewhere or no longer maps was freed already, or now holds another write, so it is left alone.
+func applyExtentFree(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
+	p, err := DeserializeExtentFree(payload)
+	if err != nil {
+		return false, err
+	}
+	return updateExtents(ctx, rctx, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+		if ino.Magic != inode.InodeMagic {
+			return false, nil
+		}
+		freed := false
+		for i := uint64(0); i < uint64(p.Length); {
+			run := uint64(0)
+			for i+run < uint64(p.Length) {
+				ext, offset, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock+i+run)
+				if err != nil || ext.PhysicalBlock+offset != p.DiskBlock+i+run {
+					break
+				}
+				run++
+			}
+			if run == 0 {
+				i++
+				continue
+			}
+			if err := rctx.ExtentMgr.RemoveExtentForRecovery(ctx, ino, uint32(p.FileBlock+i), uint32(run)); err != nil {
+				return false, fmt.Errorf("failed to free file blocks %d-%d of inode %d: %w", p.FileBlock+i, p.FileBlock+i+run-1, p.InodeNum, err)
+			}
+			log.Printf("[Recovery] ExtentFree: freed file blocks %d-%d (disk %d-%d) of inode %d",
+				p.FileBlock+i, p.FileBlock+i+run-1, p.DiskBlock+i, p.DiskBlock+i+run-1, p.InodeNum)
+			freed = true
+			i += run
+		}
+		return freed, nil
+	})
 }

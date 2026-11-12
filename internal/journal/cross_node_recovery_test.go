@@ -594,3 +594,51 @@ func TestReplayJournalNeverInitializedAndDamaged(t *testing.T) {
 		t.Errorf("ReplayJournal on a slot with a damaged header: error %v, want %v", err, ErrInvalidJournalMagic)
 	}
 }
+
+// Replay frees a logged block only while the inode still maps it at the logged file block.
+func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
+	rctx, cleanup := testRecoveryContext(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := applyInodeCreate(ctx, rctx, (&InodeCreatePayload{InodeNum: 50, Mode: 0644}).Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []uint64{1, 2, 3, 9} {
+		if _, err := applyBlockAlloc(ctx, rctx, (&BlockAllocPayload{InodeNum: 50, StartBlock: b, Count: 1, Purpose: BlockPurposeData}).Serialize()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// File blocks 0-2 map disk blocks 1-3, but block 2 was rewritten elsewhere after the free was logged.
+	for _, e := range []*ExtentAddPayload{{InodeNum: 50, FileBlock: 0, DiskBlock: 1, Length: 2}, {InodeNum: 50, FileBlock: 2, DiskBlock: 9, Length: 1}} {
+		if _, err := applyExtentAdd(ctx, rctx, e.Serialize()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	free := &ExtentFreePayload{InodeNum: 50, FileBlock: 1, DiskBlock: 2, Length: 2}
+	if applied, err := applyExtentFree(ctx, rctx, free.Serialize()); err != nil || !applied {
+		t.Fatalf("applyExtentFree = %v, %v; want true, nil", applied, err)
+	}
+	if applied, err := applyExtentFree(ctx, rctx, free.Serialize()); err != nil || applied {
+		t.Fatalf("second applyExtentFree = %v, %v; want false, nil", applied, err)
+	}
+
+	ino, err := rctx.InodeTbl.Read(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for file, disk := range map[uint64]uint64{0: 1, 2: 9} {
+		if got, err := rctx.ExtentMgr.LookupPhysical(ino, file); err != nil || got != disk {
+			t.Errorf("file block %d maps %d (err %v), want disk block %d", file, got, err, disk)
+		}
+	}
+	if _, err := rctx.ExtentMgr.LookupPhysical(ino, 1); err == nil {
+		t.Error("file block 1 still mapped after its free was replayed")
+	}
+	for disk, want := range map[uint64]bool{1: true, 2: false, 3: true, 9: true} {
+		if got, err := rctx.BitmapMgr.IsAllocated(disk); err != nil || got != want {
+			t.Errorf("disk block %d allocated = %v (err %v), want %v", disk, got, err, want)
+		}
+	}
+}
