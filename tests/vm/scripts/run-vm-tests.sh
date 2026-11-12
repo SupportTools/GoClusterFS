@@ -2990,6 +2990,9 @@ test_fsck_repair_after_power_failure() {
     start_vm "$victim" false
     wait_vm_healthy "$victim"
     setup_goclusterfs "$victim" false
+    # Whatever the victim's writes left, repair must not change it.
+    local before
+    before=$(ssh_run "$victim" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
 
     local vm_id
     for vm_id in "$survivor" "$victim"; do
@@ -3019,11 +3022,16 @@ test_fsck_repair_after_power_failure() {
     for vm_id in "$survivor" "$victim"; do
         setup_goclusterfs "$vm_id" false || return 1
     done
+    if [[ "$before" != *"$keep_md5  keep.bin"* ]]; then
+        log_error "keep.bin changed before repair"
+        return 1
+    fi
     for vm_id in "$survivor" "$victim"; do
-        local md5
-        md5=$(ssh_run "$vm_id" "md5sum ${GOCLUSTERFS_MOUNT}/keep.bin | cut -d' ' -f1")
-        if [[ "$md5" != "$keep_md5" ]]; then
-            log_error "VM $vm_id: keep.bin changed after repair"
+        local after
+        after=$(ssh_run "$vm_id" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
+        if [[ "$after" != "$before" ]]; then
+            log_error "VM $vm_id: files changed by repair"
+            diff <(echo "$before") <(echo "$after") >&2 || true
             return 1
         fi
     done

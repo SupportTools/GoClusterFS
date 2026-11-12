@@ -933,10 +933,17 @@ scenarios:
 
   - id: fsck-reclaim-keeps-unplaced-leaks
     name: fsck -repair keeps leaked blocks it cannot place
-    description: An unreadable inode, a damaged extent tree, a mounted node, or a dirty journal under -force makes repair keep leaked blocks and say why
+    description: An unreadable inode, a damaged extent tree, a skipped bitmap or inode phase, a bad bitmap sector, a mounted node, or a dirty journal under -force makes repair keep leaked blocks and their refcounts and say why
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairKeepsLeaksItCannotPlace
+
+  - id: fsck-reclaim-odd-extents
+    name: fsck -repair keeps blocks of extents the runtime still maps
+    description: Repair keeps the block of an extent without the allocated flag and the in-range block of an extent that runs past the device end
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairKeepsBlocksOfOddExtents
 
   - id: fsck-repair-after-power-failure
     name: fsck -repair after a power failure

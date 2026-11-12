@@ -293,8 +293,9 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 		}
 	}
 
+	// The runtime maps every extent with a length, whatever its flags.
 	for _, ext := range c.inodeExtents(inodeNum, inode) {
-		if ext.Length == 0 || (ext.Flags&ExtentFlagAllocated) == 0 {
+		if ext.Length == 0 {
 			continue
 		}
 		uncounted := ext.Flags&ExtentFlagShared != 0 && ext.Flags&ExtentFlagCounted == 0
@@ -308,11 +309,11 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 			continue
 		}
 
-		// Phase 4 reports extents outside the device.
-		if ext.PhysicalBlock >= c.sbData.TotalBlocks || ext.Length > c.sbData.TotalBlocks-ext.PhysicalBlock {
+		// Phase 4 reports the part of an extent past the device end; the rest is still mapped.
+		if ext.PhysicalBlock >= c.sbData.TotalBlocks {
 			continue
 		}
-		for j := uint64(0); j < ext.Length; j++ {
+		for j := uint64(0); j < min(ext.Length, c.sbData.TotalBlocks-ext.PhysicalBlock); j++ {
 			blockNum := ext.PhysicalBlock + j
 			c.inodeBlocks[blockNum]++
 			if uncounted {

@@ -1,6 +1,7 @@
 package goclusterfs
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -176,10 +177,16 @@ func TestFsckRepairReclaimsLeakedBlocks(t *testing.T) {
 }
 
 // Repair frees a leaked block only when it can see every reference that may
-// map it, and never while a node may be using the filesystem.
+// map it, and never while a node may be using the filesystem. When it keeps the
+// leaks it writes neither the bitmap nor their refcounts.
 func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 	repair := fsck.DefaultOptions()
 	repair.Mode = fsck.Repair
+	skip := func(p fsck.Phase) fsck.Options {
+		opts := repair
+		opts.SkipPhases = map[fsck.Phase]bool{p: true}
+		return opts
+	}
 
 	for _, tc := range []struct {
 		name   string
@@ -204,6 +211,17 @@ func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 			flipByte(t, fsys, extent.TreeNodeOffset(fsys.dataOffset, ino.ExtentTreeRoot, ino.ExtentTreeGen)+100)
 			return repair
 		}, "extent tree"},
+		{"SkippedInodePhase", func(t *testing.T, fsys *FS, sb *superblock.Superblock) fsck.Options {
+			return skip(fsck.PhaseInodes)
+		}, "Phase 3 (Inodes) did not finish"},
+		{"SkippedBitmapPhase", func(t *testing.T, fsys *FS, sb *superblock.Superblock) fsck.Options {
+			return skip(fsck.PhaseBitmap)
+		}, "Phase 2 (Bitmap) did not finish"},
+		{"BadBitmapSector", func(t *testing.T, fsys *FS, sb *superblock.Superblock) fsck.Options {
+			// Past the bits of the image's blocks, so only the checksum breaks.
+			flipByte(t, fsys, int64(sb.BlockBitmapOffset)+4000)
+			return repair
+		}, "their bitmap sectors have a bad checksum"},
 		{"MountedNode", func(t *testing.T, fsys *FS, sb *superblock.Superblock) fsck.Options {
 			reg := node.NewRegistry(fsys.dev, sb.NodeRegistryOffset)
 			if _, err := reg.Register(context.Background(), "mounted"); err != nil {
@@ -251,23 +269,96 @@ func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// One leaked block with no count, and one a cloned pair left with a count of 2.
 			f := createFile(t, fsys, "f.bin")
-			opts := tc.damage(t, fsys, sb)
-			free := fsys.bitmapMgr.FreeCount()
 			failWrite(t, f, pattern(8, 4096), 0)
+			pair := createFile(t, fsys, "pair-a.bin")
+			writeAt(t, pair, pattern(9, 100), 0)
+			setxattr(t, pair, "user.clone", "/pair-b.bin")
+			deleteWithTimedOutFree(t, fsys, "pair-a.bin")
+			deleteWithTimedOutFree(t, fsys, "pair-b.bin")
+			opts := tc.damage(t, fsys, sb)
+			bitmap := readRegion(t, fsys, sb.BlockBitmapOffset, sb.BlockBitmapSize)
+			refcounts := readRegion(t, fsys, sb.RefCountTableOffset, sb.RefCountTableSize)
 
-			if r := runFsck(t, fsys, fsck.DefaultOptions()); !strings.Contains(problemList(r), "leaked: allocated in the bitmap") {
-				t.Fatalf("check did not report the leaked block:%s", problemList(r))
+			if r := runFsck(t, fsys, fsck.DefaultOptions()); !strings.Contains(problemList(r), "leaked") {
+				t.Fatalf("check did not report the leaked blocks:%s", problemList(r))
 			}
 			r := runFsck(t, fsys, opts)
 			if text := r.AbortReason + problemList(r); !strings.Contains(text, tc.reason) {
 				t.Fatalf("repair did not say %q:%s", tc.reason, text)
 			}
-			if got := freeBlocksOnDisk(t, path); got != free-1 {
-				t.Fatalf("%d free blocks after repair, want the leaked block kept (%d)", got, free-1)
+			if !bytes.Equal(readRegion(t, fsys, sb.BlockBitmapOffset, sb.BlockBitmapSize), bitmap) {
+				t.Fatal("repair changed the bitmap although it had to keep the leaked blocks")
+			}
+			if !bytes.Equal(readRegion(t, fsys, sb.RefCountTableOffset, sb.RefCountTableSize), refcounts) {
+				t.Fatal("repair changed refcounts although it had to keep the leaked blocks")
 			}
 		})
 	}
+}
+
+// The runtime maps every extent with a length: one without the allocated flag,
+// and the part of one that runs past the device end. Repair must keep them.
+func TestFsckRepairKeepsBlocksOfOddExtents(t *testing.T) {
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	ctx := context.Background()
+
+	t.Run("WithoutAllocatedFlag", func(t *testing.T) {
+		path := newFormattedImage(t)
+		fsys := openFormattedFS(t, path)
+		f := createFile(t, fsys, "noflag.bin")
+		writeAt(t, f, pattern(4, 4096), 0)
+		block := physicalBlock(t, fsys, f.inodeNum, 0)
+		if _, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error {
+			ino.InlineExtents[0].Flags = 0
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if got := physicalBlock(t, fsys, f.inodeNum, 0); got != block {
+			t.Fatalf("runtime maps logical 0 to %d, want %d", got, block)
+		}
+		runFsck(t, fsys, repair)
+		if allocated, _ := openFormattedFS(t, path).bitmapMgr.IsAllocated(block); !allocated {
+			t.Fatalf("repair freed block %d, which the runtime still reads for noflag.bin", block)
+		}
+	})
+
+	t.Run("PastDeviceEnd", func(t *testing.T) {
+		path := newFormattedImage(t)
+		fsys := openFormattedFS(t, path)
+		sb, err := superblock.Read(fsys.dev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := sb.TotalBlocks - 1
+		if err := fsys.bitmapMgr.MarkAllocated(ctx, last); err != nil {
+			t.Fatal(err)
+		}
+		f := createFile(t, fsys, "edge.bin")
+		if _, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error {
+			ino.InlineExtents[0] = inode.InlineExtent{PhysicalBlock: last, Length: 2, Flags: extent.FlagAllocated}
+			ino.ExtentCount, ino.Size, ino.AllocatedBlocks, ino.WrittenBlocks = 1, 4096, 2, 2
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		runFsck(t, fsys, repair)
+		if allocated, _ := openFormattedFS(t, path).bitmapMgr.IsAllocated(last); !allocated {
+			t.Fatalf("repair freed block %d, which edge.bin still maps at logical 0", last)
+		}
+	})
+}
+
+func readRegion(t *testing.T, fsys *FS, off, size uint64) []byte {
+	t.Helper()
+	buf := storage.NewAlignedBuffer(int(size))
+	if _, err := fsys.dev.ReadAt(buf.Bytes(), int64(off)); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }
 
 func flipByte(t *testing.T, fsys *FS, off int64) {
