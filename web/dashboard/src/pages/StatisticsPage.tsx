@@ -1,6 +1,6 @@
 import { useAllStats, useStatus } from '@/hooks'
 import { useRefreshInterval } from '@/stores'
-import { CacheStatsPanel } from '@/components'
+import { CacheStatsPanel, TokenHint } from '@/components'
 import { formatBytes, formatNumber, formatPercent } from '@/utils/format'
 
 /**
@@ -31,6 +31,7 @@ function StatsError({ error, onRetry }: { error: Error; onRetry: () => void }) {
           Failed to load statistics
         </div>
         <div className="text-gfs-text-muted text-sm mb-4">{error.message}</div>
+        <TokenHint error={error} />
         <button
           onClick={onRetry}
           className="px-4 py-2 bg-gfs-accent-primary text-white rounded hover:bg-gfs-accent-hover transition-colors"

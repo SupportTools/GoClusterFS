@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { api, ApiError } from '@/api'
-import { useRefreshInterval } from '@/stores'
+import { useRefreshInterval, useSettings } from '@/stores'
 import type {
   HealthResponse,
   StatusResponse,
@@ -21,7 +21,7 @@ export interface UseApiResult<T> {
 export interface UseApiOptions {
   /** Auto-refresh interval in milliseconds (0 = disabled) */
   refreshInterval?: number
-  /** Refetches from scratch whenever this changes */
+  /** Refetches from scratch whenever this changes, as the API token does */
   key?: string
 }
 
@@ -30,6 +30,7 @@ function useApiData<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   { refreshInterval = 0, key = '' }: UseApiOptions = {}
 ): UseApiResult<T> {
+  const { token } = useSettings()
   const [data, setData] = useState<T | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<ApiError | null>(null)
@@ -77,7 +78,7 @@ function useApiData<T>(
       mountedRef.current = false
       abortControllerRef.current?.abort()
     }
-  }, [fetchData, key])
+  }, [fetchData, key, token])
 
   useEffect(() => {
     if (refreshInterval > 0) {

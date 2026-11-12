@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useClusterData } from '@/hooks'
-import { NodeDetailPanel, type ClusterNode } from '@/components'
+import { NodeDetailPanel, TokenHint, type ClusterNode } from '@/components'
 import type { ClusterInfoResponse, LockStatsResponse } from '@/api'
 import { formatRelativeTime, formatNumber, formatPercent, nodeStateColor } from '@/utils'
 
@@ -152,6 +152,7 @@ function ClusterError({ error, onRetry }: { error: Error; onRetry: () => void })
       <div className="text-center py-8">
         <div className="text-gfs-status-error text-lg font-medium mb-2">Failed to load cluster data</div>
         <div className="text-gfs-text-muted text-sm mb-4">{error.message}</div>
+        <TokenHint error={error} />
         <button
           onClick={onRetry}
           className="px-4 py-2 bg-gfs-accent-primary text-white rounded hover:bg-gfs-accent-hover transition-colors"

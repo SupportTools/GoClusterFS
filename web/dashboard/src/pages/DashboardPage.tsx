@@ -5,6 +5,7 @@ import {
   HitRateGauge as CircularHitRateGauge,
   MiniGauge,
   JournalGauge,
+  TokenHint,
 } from '@/components'
 import {
   formatBytes,
@@ -101,6 +102,7 @@ function DashboardError({ error, onRetry }: { error: Error; onRetry: () => void 
           Failed to load dashboard data
         </div>
         <div className="text-gfs-text-muted text-sm mb-4">{error.message}</div>
+        <TokenHint error={error} />
         <button
           onClick={onRetry}
           className="px-4 py-2 bg-gfs-accent-primary text-white rounded hover:bg-gfs-accent-hover transition-colors"

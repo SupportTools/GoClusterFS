@@ -7,3 +7,5 @@ export type { ModalProps } from './Modal'
 
 export { SlidePanel } from './SlidePanel'
 export type { SlidePanelProps } from './SlidePanel'
+
+export { TokenHint } from './TokenHint'
