@@ -266,8 +266,12 @@ func TestJournalCleanOnStop(t *testing.T) {
 	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := j1.Commit(txn); err != nil {
+	seq, err := j1.Commit(txn)
+	if err != nil {
 		t.Fatalf("Commit failed: %v", err)
+	}
+	if err := j1.CompleteIntent(seq); err != nil {
+		t.Fatal(err)
 	}
 
 	// Stop should mark clean
@@ -712,12 +716,19 @@ func TestCheckpointAdvancesHeadNow(t *testing.T) {
 	if done, err := j.Checkpoint(); err != nil || done {
 		t.Fatalf("active transaction: Checkpoint() = %v, %v; want false, nil", done, err)
 	}
-	if _, err := j.Commit(txn); err != nil {
+	seq, err := j.Commit(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done, err := j.Checkpoint(); err != nil || done {
+		t.Fatalf("committed, not completed: Checkpoint() = %v, %v; want false, nil", done, err)
+	}
+	if err := j.CompleteIntent(seq); err != nil {
 		t.Fatal(err)
 	}
 
 	if done, err := j.Checkpoint(); err != nil || !done {
-		t.Fatalf("after commit: Checkpoint() = %v, %v; want true, nil", done, err)
+		t.Fatalf("after completion: Checkpoint() = %v, %v; want true, nil", done, err)
 	}
 	if head, tail := j.Region().HeadOffset(), j.Region().TailOffset(); head != tail {
 		t.Fatalf("head %d != tail %d after Checkpoint", head, tail)

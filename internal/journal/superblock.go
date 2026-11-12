@@ -281,17 +281,13 @@ func (sb *JournalSuperblock) IsEmpty() bool {
 	return sb.HeadOffset == sb.TailOffset && sb.WrapCount == 0
 }
 
-// AvailableSpace returns the number of bytes available for new transactions.
+// AvailableSpace returns the bytes new records may use. One sector stays free, because a full ring would end at the head and read as empty.
 func (sb *JournalSuperblock) AvailableSpace() uint32 {
+	free := sb.HeadOffset - sb.TailOffset
 	if sb.TailOffset >= sb.HeadOffset {
-		// Normal case: head is before tail
-		// Available = total - (tail - head)
-		used := sb.TailOffset - sb.HeadOffset
-		return sb.DataAreaSize - used
+		free = sb.DataAreaSize - (sb.TailOffset - sb.HeadOffset)
 	}
-	// Wrapped case: tail is before head
-	// Available = head - tail
-	return sb.HeadOffset - sb.TailOffset
+	return free - min(free, storage.SectorSize)
 }
 
 // NeedsRecovery returns true if the journal needs to be replayed.

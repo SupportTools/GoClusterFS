@@ -393,44 +393,16 @@ func applyBlockAlloc(ctx context.Context, rctx *RecoveryContext, payload []byte)
 	return applied, nil
 }
 
-// applyBlockFree marks blocks as free if currently allocated.
+// applyBlockFree frees nothing: truncate and unlink log logical file blocks, and freeing those numbers as physical
+// blocks would free blocks other files map. An interrupted free leaves its blocks allocated, which fsck reports.
 func applyBlockFree(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
 	p, err := DeserializeBlockFree(payload)
 	if err != nil {
 		return false, err
 	}
-
-	applied := false
-	for i := uint32(0); i < p.Count; i++ {
-		blockNum := p.StartBlock + uint64(i)
-
-		// Check if allocated
-		isAllocated, err := rctx.BitmapMgr.IsAllocated(blockNum)
-		if err != nil {
-			return applied, fmt.Errorf("failed to check block %d: %w", blockNum, err)
-		}
-
-		if !isAllocated {
-			// Already free - idempotent skip for this block
-			continue
-		}
-
-		// Free the block
-		if err := rctx.BitmapMgr.Free(ctx, blockNum); err != nil {
-			return applied, fmt.Errorf("failed to free block %d: %w", blockNum, err)
-		}
-		applied = true
-	}
-
-	if applied {
-		log.Printf("[Recovery] BlockFree: freed blocks %d-%d for inode %d",
-			p.StartBlock, p.StartBlock+uint64(p.Count)-1, p.InodeNum)
-	} else {
-		log.Printf("[Recovery] BlockFree: blocks %d-%d already free, skipping",
-			p.StartBlock, p.StartBlock+uint64(p.Count)-1)
-	}
-
-	return applied, nil
+	log.Printf("[Recovery] BlockFree: leaving file blocks %d-%d of inode %d allocated",
+		p.StartBlock, p.StartBlock+uint64(p.Count)-1, p.InodeNum)
+	return false, nil
 }
 
 // applyExtentAdd adds an extent to an inode if not already present.

@@ -707,6 +707,52 @@ scenarios:
     environments:
       go: internal/journal/journal_test.go::TestBatchCommitReturnsSyncError
 
+  - id: checkpoint-keeps-incomplete-intents
+    name: Checkpoints never pass an intent that has not completed
+    description: A transaction committed but not yet applied stays in the journal through a checkpoint and an unmount, and the next mount replays it; completed intents are checkpointed away
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestCheckpointKeepsIncompleteIntents
+
+  - id: pending-intent-survives-full-ring
+    name: A full journal never overwrites a pending intent
+    description: While one intent pins the head, other operations fill the ring until Commit returns ErrJournalFull; the ring never ends at the head, where it would read as empty, and a crash still replays the pending intent
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestPendingIntentSurvivesFullRing
+
+  - id: recovery-ends-with-tail-at-end
+    name: Recovery ends when the tail is at the end of the data area
+    description: A crash with the journal tail exactly at the end of the data area replays the pending transaction and returns, instead of scanning forever
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestRecoveryEndsWithTailAtEnd
+
+  - id: recovery-scan-bounded
+    name: Recovery scans stop after the bytes between head and tail
+    description: With a tail no record boundary reaches and stale records around the ring, both recovery scans end and replay each pending transaction once
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestScanStopsAtUnreachableTail
+
+  - id: create-replays-after-checkpoint-crash
+    name: A create cut off after a checkpoint is replayed
+    description: A create stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount creates the file and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestCreateReplaysAfterCheckpointAndCrash
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: truncate-replay-keeps-mapped-blocks
+    name: Replay of an interrupted truncate keeps blocks files still map
+    description: A truncate stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount frees no block a file maps, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestTruncateReplayKeepsMappedBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
   - id: intent-completion-serialize
     name: IntentCompletion serialization
     description: IntentCompletion record serializes and deserializes correctly
@@ -923,6 +969,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
+
+  - id: fsck-reclaim-interrupted-truncate
+    name: fsck -repair frees blocks an interrupted truncate leaves
+    description: A node crashes after a truncate writes the shorter inode but before it frees the cut blocks; check reports whatever cut blocks replay leaves allocated, repair frees exactly those, and both files keep their data. Passes too if replay frees them itself
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsInterruptedTruncate
+
+  - id: fsck-reclaim-interrupted-subdirectory-unlink
+    name: fsck -repair frees blocks an interrupted subdirectory unlink leaves
+    description: A node crashes while unlinking a file in a subdirectory, after the entry is gone but before the blocks are freed; replay deletes the inode, check reports whatever of its blocks replay leaves allocated, repair frees exactly those, and other files keep their data. Passes too if replay frees them itself
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsInterruptedSubdirectoryUnlink
 
   - id: fsck-reclaim-empty-sfb-containers
     name: fsck -repair frees SFB containers no file uses
