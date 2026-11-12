@@ -694,6 +694,9 @@ func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32,
 	return nil, nil, 0, syscall.EAGAIN
 }
 
+// afterCreateCommit runs between a root create's commit and its first change; tests stop there as a crash would.
+var afterCreateCommit func()
+
 // createFileInternal implements file creation for the root directory.
 func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	inodeNum, err := f.inodeTbl.FindFreeSlot()
@@ -744,6 +747,9 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 		intentSeq, commitErr = f.journal.Commit(txn)
 		if commitErr != nil {
 			return nil, nil, 0, syscall.EIO
+		}
+		if afterCreateCommit != nil {
+			afterCreateCommit()
 		}
 	}
 	// === End WAL transaction - intent is now durable ===
