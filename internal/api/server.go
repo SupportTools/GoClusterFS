@@ -29,6 +29,20 @@ type Server struct {
 	// Stats provider for statistics collection (optional)
 	statsProvider StatsProvider
 
+	// Rate limiter (optional)
+	rateLimiter *RateLimiter
+
+	// Prometheus metrics handler (lazily initialized)
+	metricsHandler http.Handler
+
+	// Services behind the write endpoints (optional)
+	fileService  FileService
+	adminService AdminService
+
+	// Write requests in flight; Stop waits for them so the mount outlives them.
+	writes   sync.WaitGroup
+	stopping bool
+
 	// Lifecycle state
 	started   bool
 	startTime time.Time
@@ -48,11 +62,17 @@ func NewServer(cfg Config) (*Server, error) {
 		router: http.NewServeMux(),
 	}
 
+	// Create rate limiter if enabled
+	if cfg.RateLimitEnabled {
+		s.rateLimiter = NewRateLimiter(cfg.RateLimitRequestsPerSecond, cfg.RateLimitBurst)
+	}
+
 	// Register routes
 	s.registerRoutes()
 
-	// Build middleware chain (order: logging -> loopback Host check -> CORS -> auth)
-	middlewares := []Middleware{LoggingMiddleware}
+	// Build middleware chain (order: rate limit -> logging -> loopback Host check -> CORS -> auth).
+	// Probes and scrapers on loopback share one bucket, so /health and /metrics skip the limiter.
+	middlewares := []Middleware{RateLimitMiddleware(s.rateLimiter, "/health", "/metrics"), LoggingMiddleware}
 	if cfg.AuthToken == "" && cfg.LoopbackOnly() {
 		middlewares = append(middlewares, LoopbackHostMiddleware)
 	}
@@ -111,7 +131,11 @@ func (s *Server) Start(ctx context.Context) error {
 // ShutdownTimeout before forcefully closing them.
 func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
+		if s.rateLimiter != nil {
+			s.rateLimiter.Stop()
+		}
 		s.mu.Lock()
+		s.stopping = true
 		if !s.started {
 			s.mu.Unlock()
 			s.stopErr = ErrServerNotStarted
@@ -133,13 +157,29 @@ func (s *Server) Stop() error {
 			} else {
 				s.stopErr = fmt.Errorf("shutdown error: %w", err)
 			}
-			return
 		}
+		s.waitForWrites()
 
 		log.Printf("api: server stopped")
 	})
 
 	return s.stopErr
+}
+
+// waitForWrites waits for snapshot, clone and admin requests that are still
+// running. They cannot be cancelled once the filesystem has started them.
+func (s *Server) waitForWrites() {
+	done := make(chan struct{})
+	go func() {
+		s.writes.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		log.Printf("api: waiting for write requests in flight to finish")
+		<-done
+	}
 }
 
 // Addr returns the address the server is listening on.
@@ -255,4 +295,15 @@ func (s *Server) GetStatsProvider() StatsProvider {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.statsProvider
+}
+
+// GetMetricsHandler returns the Prometheus metrics HTTP handler.
+// The handler is lazily initialized on first call.
+func (s *Server) GetMetricsHandler() http.Handler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.metricsHandler == nil {
+		s.metricsHandler = s.MetricsHandler()
+	}
+	return s.metricsHandler
 }

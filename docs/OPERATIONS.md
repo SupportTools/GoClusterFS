@@ -42,7 +42,7 @@ The cache hit percentages are wrong today and can read far above 100%, so don't 
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Warning: Failed to start cache broadcast` | The mount runs without broadcast. Other nodes' changes show up after `-cache-ttl` instead of right away. |
 | `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
-| `lock.Acquire: ... TIMEOUT after N retries` | A lock wait ended because its request was cancelled, for example the program was interrupted. Lock waits have no time limit otherwise. |
+| `[WARN] lock: gave up waiting for ...` | A lock wait gave up after 30 seconds (`DefaultTimeout`), or a background task was stopped at unmount. The line names the node that holds the lock. A file operation that was waiting fails with EIO. See [Interrupted File Operations](#interrupted-file-operations). |
 
 ### Journal
 
@@ -156,7 +156,7 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 
 - **Clocks:** Nodes judge each other's heartbeats by wall clock. A node that mounts with its clock more than about 10 seconds ahead treats live peers as failed, and can take a live peer's registry slot and replay that peer's journal. Run NTP on every node.
 - **Restarts:** A restarted mount takes back the registry slot of a mount that exited on the same host (same hostname and kernel boot ID) and replays its journal before serving. In the same PID namespace it checks the old process ID; across PID namespaces it waits for the old slot's heartbeat to go stale.
-- **Crashed node's locks:** Once a node is proven dead, the node replaying its journal takes over its exclusive locks and frees them after the replay, so no other node uses them mid-replay. Proven dead means its mount process is gone (same host and PID namespace), or its heartbeat is more than 20 seconds old and has not changed for 15 seconds by the observing node's own clock. A node paused for more than about 20 seconds therefore counts as dead; it exits on its next heartbeat. A dead node's shared locks, and the locks of a node not proven dead, are freed once they are 15 seconds old.
+- **Crashed node's locks:** Once a node is proven dead, the node replaying its journal takes over its exclusive locks and frees them after the replay, so no other node uses them mid-replay. Proven dead means its mount process is gone (same host and PID namespace), or its heartbeat is more than 20 seconds old and has not changed for 15 seconds by the observing node's own clock. A node paused for more than about 20 seconds therefore counts as dead; it exits on its next heartbeat. The dead node's read locks are freed at once. The locks of a node not proven dead are freed once they are 15 seconds old.
 - **Node count:** The device has 64 registry slots, each with its own 4 MB journal. A crashed node's slot frees once another node replays its journal, or when the same host mounts again.
 
 ### Known Gaps in Slot Ownership
@@ -224,13 +224,21 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
    iscsiadm -m node -T <iqn> -p <ip> --logout
    ```
 
+### Interrupted File Operations
+
+GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait that cannot finish fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock and the node that holds it.
+
 ### Distributed Lock Limits
 
 Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, SFB containers, snapshots) through lock records on the shared device. Read this before you run more than one node.
 
-**How a lock goes stale.** A lock record stores the wall-clock time it was taken. Any other node may take over a lock that is older than 15 seconds (`StaleThreshold`), judged by that node's own clock. This is how locks held by a crashed node get freed. A node renews an exclusive hold only when another operation on the same node joins it after 5 seconds; a single long operation is not renewed.
+**How a node takes a lock.** Each of the 256 lock records has one 4 KB claim slot per registry slot, and a node writes only its own slot. To take a lock, a node writes its claim into its slot, then reads all 64 slots of the record in one read. It holds the lock if no other slot conflicts: for a write lock, any other claim; for a read lock, another node's write claim. Of two nodes that claim at the same time, the one whose write finished second reads the record after the other's write finished, so it sees that claim and does not take the lock. This holds however slow the writes are. It relies on the shared device showing a finished write to every later read, from any node.
 
-**The hazard: a stalled node keeps writing.** If a node stops for more than 15 seconds while it holds a lock, another node takes the lock. When the stalled node resumes, it finishes its writes. No write path checks that the lock is still held, and there is no fencing token. The node only learns it lost the lock when it next joins or releases it (`ErrLockLost`, `ErrNotLockOwner`), and most callers ignore the release error. Two nodes then write the same metadata, which can double-allocate blocks or lose directory entries.
+**When claims collide.** The node in the lower registry slot keeps its claim and waits for the other claims to go. A node that sees a claim in a lower slot clears its own and waits, reading the record without writing until that claim is gone. Waits only point from lower to higher slots, so two nodes never wait on each other. A slot that fails its checksum, such as one torn by a crash in the middle of a write, counts as a claim.
+
+**How a lock goes stale.** A claim stores the wall-clock time its node wrote it. Other nodes ignore a claim older than 15 seconds (`StaleThreshold`), judged by their own clocks. This is how locks held by a crashed node get freed. A node writes its claim again when another operation on the same node joins a hold more than 5 seconds old, and before it reuses a kept lock that old; a single long operation is not renewed. A torn slot has no readable time, so it blocks its record until its node is proven dead and the node that replays its journal clears it.
+
+**The hazard: a stalled node keeps writing.** If a node stops for more than 15 seconds while it holds a lock, another node takes the lock. When the stalled node resumes, it finishes its writes. No write path checks that the lock is still held, and there is no fencing token. The stalled node is not told it lost the lock; it holds it in memory until it releases it. Two nodes then write the same metadata, which can double-allocate blocks or lose directory entries.
 
 Common causes of a stall:
 
@@ -239,21 +247,9 @@ Common causes of a stall:
 - Heavy swapping or a long GC pause
 - Storage I/O that queues instead of failing, for example a multipath or iSCSI path failover
 
-**Lock takeover relies on an I/O time limit.** Taking a lock is a read followed by a write, not an atomic compare-and-swap, so two nodes that read a free record at the same moment both write a claim. After writing a claim, a node waits 20 ms (`ClaimSettleDelay`), reads the record again, and keeps the lock only if its claim is still there. A write claim is still there if the record still names this node at the same sequence number. A read claim is still there if the record is still read-locked and still has this node's reader bit set (below).
+Lock slot reads and writes do not take the device's per-region I/O lock, so a node's own data and journal writes to the same region cannot delay them. The lock manager serializes each record's I/O itself. A release whose write fails leaves the claim to go stale.
 
-Why at most one of two racing claims survives: say node A reads the record at time t and its claim lands at most 20 ms later. Node B's claim landed after t, or A would have seen it and waited. B reads the record again at least 20 ms after its claim landed, so after A's claim landed. B then sees A's claim and backs off. If instead B's claim landed after A's, the same argument with the two swapped makes A back off. This needs every node's write of a lock record to land within 20 ms of its read of that record, queue time included. It also assumes the nodes' monotonic clocks run at about the same rate, since each node times the 20 ms itself; the wall clocks do not have to agree for this.
-
-Each node enforces the limit on itself. It skips a write that cannot start within 5 ms of its read, and tries again. Time the write then spends queued in the kernel or the storage cannot be checked in advance, so the node also times the whole write. If the write finishes more than 20 ms after the read, the node does not take the lock and leaves that record alone until the record is 15 seconds old, because the write may have replaced another node's claim. Slow lock writes can therefore stall a lock, but cannot give it to two writers. The node logs `lock: claim on type=T res=R ... finished ... after its read` when this happens, and counts these as late claims in its unmount statistics. One late claim, even with no other node waiting, freezes that lock on every node for up to 15 seconds. For the block bitmap or refcount lock, which all nodes share, that stops every block allocation or copy-on-write in the cluster for that long. **Storage whose write latency sometimes exceeds about 20 ms will see occasional 15-second lock stalls.** On GitHub's CI runners about 1 in 2,000 lock record writes took more than 10 ms, and on some runners a few took up to 70 ms.
-
-**Read locks name their nodes.** A lock record held for reading has one bit per registry slot, set for each node that holds it. A node's read claim sets its own bit and is confirmed like a write claim, so a reader whose bit another node's racing update dropped claims again before it reads. Releasing a read lock clears the node's bit. Another node's update based on an older read can put the bit back, so the releasing node checks again 20 ms later and clears it again if needed; this check runs in the background. A node killed while it holds a read lock leaves its bit set, and writers wait until the node is proven dead. The node that then takes over the dead node's locks also clears its reader bits. On one host that takes at most one 5-second failure check; across hosts it takes about 20 seconds.
-
-Releases, renewals and dead-node takeovers retry a skipped write about 10 times over a third of a second, then give up. A release that gives up leaves the record to go stale. A renewal that gives up fails the operation that needed it; a renewal whose write finishes late still counts, which matters only if the lock was already stale. On slow storage an unmount can spend that third of a second on each kept lock, eight locks at a time, so with all 256 records kept it takes about 10 seconds.
-
-Lock record reads and writes do not take the device's per-region I/O lock, so a node's own data and journal writes to the same region cannot delay them. The lock manager serializes each record's I/O itself.
-
-**Reads beside a writer.** A read and another node's write can still overlap in two cases. First, a lock write that lands more than 20 ms after its read can replace another node's confirmed claim (see slow storage above). When this is a read claim landing on a new write lock, the node then rewrites the record as its own write lock, so no more readers join. The rewrite waits up to 7.5 seconds for slow storage, and is skipped once the lock is stale, so it never lands on another node's later claim. Second, a read lock held for more than 15 seconds can be taken over (below). Two writers still cannot both hold a lock.
-
-**Nodes keep released locks briefly.** After its last user releases a lock, a node keeps it for 250 ms (`CacheGrace`), so repeated work on the same node does not pay the 20 ms wait again. A node that has held a lock for longer than that releases it the next time it is idle and waits 50 ms (`YieldGap`) before taking it again, so another node gets a turn. Another node that wants the lock waits up to about 300 ms plus the 20 ms check. A clean unmount releases kept locks at once. A lock wait ends only when the caller's deadline passes or after 30 seconds (`DefaultTimeout`). A signal to the waiting process does not end it, because FUSE turns signals into request cancellations.
+**Nodes keep released locks briefly.** After its last user releases a lock, a node keeps it for 250 ms (`CacheGrace`), so repeated work on the same node does not write and read the record again. A node that has held a lock for longer than that releases it the next time it is idle and waits 50 ms (`YieldGap`) before taking it again, so another node gets a turn. Another node that wants the lock waits up to about 300 ms. A clean unmount releases kept locks at once. A lock wait gives up after 30 seconds (`DefaultTimeout`).
 
 **Writes to one region from two nodes interleave by sector.** A node writes whole 4 KB sectors of an existing, unshared block without taking that block's lock. If two nodes write overlapping ranges of a file at the same time, the result can mix both writes, one sector at a time. Applications that write the same region from several nodes must coordinate those writes themselves.
 
@@ -267,7 +263,6 @@ Lock record reads and writes do not take the device's per-region I/O lock, so a 
 |-------|-----|
 | Keep node clocks within 1 second (chrony or NTP) | Clock skew S shortens the stale threshold to 15s − S |
 | No node may stall for 10 seconds or more while mounted | Leaves margin below the 15s threshold |
-| A 4KB read followed by a 4KB write of a lock record should finish within 20 ms, including queue time | Lock takeover check (see above). Slower lock writes stall that lock for up to 15 seconds |
 | Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
 | Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |
 
@@ -537,7 +532,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
-**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
+**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default, unicast on `31338`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
 
 - With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.
@@ -545,15 +540,15 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. It only answers `GET` requests and changes nothing.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`) it also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
 
-- To expose it, set `-api-addr` and `-api-token`. Mount refuses a non-loopback address without a token.
+- To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
 - `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
 - Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
-- The API uses plain HTTP. Put a TLS proxy in front of it if the token crosses an untrusted network.
-- The token is a command-line flag, so local users can read it with `ps`.
+- The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
+- Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 
-**Network listeners.** Each node listens on UDP port 31337 on all interfaces, plus the multicast group, and on TCP `-api-addr`. Limit the UDP port, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
+**Network listeners.** Each node listens on UDP port 31337 (multicast group) and UDP port 31338 (unicast) on all interfaces, and on TCP `-api-addr`. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 
 ---
 

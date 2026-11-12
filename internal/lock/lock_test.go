@@ -10,82 +10,6 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-func TestRecordSerializeDeserialize(t *testing.T) {
-	record := &Record{
-		Magic:       RecordMagic,
-		Type:        LockTypeInode,
-		Mode:        LockModeExclusive,
-		ResourceID:  12345,
-		OwnerSlot:   5,
-		AcquireTime: time.Now().Unix(),
-		Sequence:    42,
-		SharedCount: 0,
-	}
-	copy(record.OwnerUUID[:], []byte("0123456789abcdef"))
-
-	// Serialize
-	data := serializeRecord(record)
-
-	if len(data) != RecordSize {
-		t.Fatalf("serialized size = %d, want %d", len(data), RecordSize)
-	}
-
-	// Deserialize
-	restored, err := deserializeRecord(data)
-	if err != nil {
-		t.Fatalf("deserializeRecord failed: %v", err)
-	}
-
-	// Verify fields
-	if restored.Magic != record.Magic {
-		t.Errorf("Magic = %x, want %x", restored.Magic, record.Magic)
-	}
-	if restored.Type != record.Type {
-		t.Errorf("Type = %d, want %d", restored.Type, record.Type)
-	}
-	if restored.Mode != record.Mode {
-		t.Errorf("Mode = %d, want %d", restored.Mode, record.Mode)
-	}
-	if restored.ResourceID != record.ResourceID {
-		t.Errorf("ResourceID = %d, want %d", restored.ResourceID, record.ResourceID)
-	}
-	if restored.Sequence != record.Sequence {
-		t.Errorf("Sequence = %d, want %d", restored.Sequence, record.Sequence)
-	}
-	if restored.OwnerUUID != record.OwnerUUID {
-		t.Error("OwnerUUID mismatch")
-	}
-}
-
-func TestRecordDeserializeEmpty(t *testing.T) {
-	// Empty (zero) record should deserialize as Mode=None
-	data := make([]byte, RecordSize)
-	record, err := deserializeRecord(data)
-	if err != nil {
-		t.Fatalf("deserializeRecord empty failed: %v", err)
-	}
-	if record.Mode != LockModeNone {
-		t.Errorf("empty record Mode = %d, want %d", record.Mode, LockModeNone)
-	}
-}
-
-func TestRecordDeserializeInvalid(t *testing.T) {
-	// Buffer too small
-	_, err := deserializeRecord(make([]byte, 100))
-	if err == nil {
-		t.Error("expected error for small buffer")
-	}
-
-	// Corrupted checksum (non-zero magic)
-	record := &Record{Magic: RecordMagic, Type: LockTypeInode, Mode: LockModeExclusive}
-	data := serializeRecord(record)
-	data[100] ^= 0xFF // Corrupt data
-	_, err = deserializeRecord(data)
-	if err == nil {
-		t.Error("expected error for corrupted checksum")
-	}
-}
-
 func TestLockTypes(t *testing.T) {
 	// Verify lock types are in hierarchy order
 	types := []LockType{
@@ -118,23 +42,6 @@ func TestLockModes(t *testing.T) {
 	if LockModeExclusive != 2 {
 		t.Error("LockModeExclusive should be 2")
 	}
-}
-
-func TestRecordSize(t *testing.T) {
-	// RecordSize should match SectorSize for O_DIRECT alignment
-	if RecordSize != storage.SectorSize {
-		t.Errorf("RecordSize = %d, should match storage.SectorSize = %d", RecordSize, storage.SectorSize)
-	}
-}
-
-// createTestDevice creates a test file for O_DIRECT testing.
-// Uses testing.TB interface to support both tests and benchmarks.
-// TestMain relaxes the record write window: these tests run on whatever disk
-// holds the checkout, which can take longer than 10ms per write. Tests of the
-// window itself set it back with useWrites.
-func TestMain(m *testing.M) {
-	claimWriteWindow = time.Minute
-	os.Exit(m.Run())
 }
 
 func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
@@ -387,41 +294,9 @@ func TestHashToRecord(t *testing.T) {
 	}
 
 	// Hash should be within bounds
-	maxRecords := mgr.size / RecordSize
+	maxRecords := mgr.size / RowSize
 	if hash1 >= maxRecords {
 		t.Errorf("hash %d >= maxRecords %d", hash1, maxRecords)
-	}
-}
-
-func TestIsLockStale(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-
-	var uuid [16]byte
-	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
-
-	// Free lock - not stale
-	freeRecord := &Record{Mode: LockModeNone}
-	if mgr.isLockStale(freeRecord) {
-		t.Error("free lock should not be stale")
-	}
-
-	// Fresh lock - not stale
-	freshRecord := &Record{
-		Mode:        LockModeExclusive,
-		AcquireTime: time.Now().Unix(),
-	}
-	if mgr.isLockStale(freshRecord) {
-		t.Error("fresh lock should not be stale")
-	}
-
-	// Old lock - stale
-	staleRecord := &Record{
-		Mode:        LockModeExclusive,
-		AcquireTime: time.Now().Add(-StaleThreshold - time.Second).Unix(),
-	}
-	if !mgr.isLockStale(staleRecord) {
-		t.Error("old lock should be stale")
 	}
 }
 
@@ -462,39 +337,6 @@ func TestHeldLocks(t *testing.T) {
 	}
 }
 
-func BenchmarkRecordSerialize(b *testing.B) {
-	record := &Record{
-		Magic:       RecordMagic,
-		Type:        LockTypeInode,
-		Mode:        LockModeExclusive,
-		ResourceID:  12345,
-		AcquireTime: time.Now().Unix(),
-		Sequence:    42,
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_ = serializeRecord(record)
-	}
-}
-
-func BenchmarkRecordDeserialize(b *testing.B) {
-	record := &Record{
-		Magic:       RecordMagic,
-		Type:        LockTypeInode,
-		Mode:        LockModeExclusive,
-		ResourceID:  12345,
-		AcquireTime: time.Now().Unix(),
-		Sequence:    42,
-	}
-	data := serializeRecord(record)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = deserializeRecord(data)
-	}
-}
-
 func BenchmarkHashToRecord(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 10<<20)
 	defer cleanup()
@@ -508,75 +350,7 @@ func BenchmarkHashToRecord(b *testing.B) {
 	}
 }
 
-// TestHintCacheOptimisticAcquire tests that the hint cache enables
-// optimistic lock acquisition after release.
-func TestHintCacheOptimisticAcquire(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-
-	var uuid [16]byte
-	copy(uuid[:], "test-node-uuid00")
-
-	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Initially, no hint cache hits (cache is empty)
-	hits, misses, _ := mgr.HintStats()
-	if hits != 0 || misses != 0 {
-		t.Errorf("initial stats should be zero: hits=%d, misses=%d", hits, misses)
-	}
-
-	// Acquire and release a lock - this populates the hint cache
-	err := mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
-	if err != nil {
-		t.Fatalf("first Acquire failed: %v", err)
-	}
-	err = mgr.Release(LockTypeInode, 100)
-	if err != nil {
-		t.Fatalf("first Release failed: %v", err)
-	}
-	mgr.ReleaseCached()
-
-	// Second acquire should use the hint cache (optimistic path)
-	err = mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
-	if err != nil {
-		t.Fatalf("second Acquire failed: %v", err)
-	}
-	err = mgr.Release(LockTypeInode, 100)
-	if err != nil {
-		t.Fatalf("second Release failed: %v", err)
-	}
-
-	// Check that we had at least one hint hit
-	hits, misses, hitRate := mgr.HintStats()
-	t.Logf("Hint cache stats: hits=%d, misses=%d, hitRate=%.2f", hits, misses, hitRate)
-
-	// The second acquire should have hit the cache (sequence was correct)
-	if hits == 0 {
-		t.Error("expected at least one hint cache hit after release and re-acquire")
-	}
-}
-
-// TestHintCacheStats tests the HintStats method.
-func TestHintCacheStats(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-
-	var uuid [16]byte
-	copy(uuid[:], "test-node-uuid00")
-
-	mgr := NewManager(dev, 0, 10<<20, uuid, 0)
-
-	// Test initial stats
-	hits, misses, hitRate := mgr.HintStats()
-	if hits != 0 || misses != 0 || hitRate != 0 {
-		t.Errorf("initial: hits=%d, misses=%d, rate=%.2f, want all zero", hits, misses, hitRate)
-	}
-}
-
-// BenchmarkLockAcquireRelease measures lock cycle time with hint cache.
+// BenchmarkLockAcquireRelease measures lock cycles over 1000 resources.
 func BenchmarkLockAcquireRelease(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 10<<20)
 	defer cleanup()
@@ -593,13 +367,9 @@ func BenchmarkLockAcquireRelease(b *testing.B) {
 		mgr.Acquire(ctx, LockTypeInode, uint64(i%1000), LockModeExclusive)
 		mgr.Release(LockTypeInode, uint64(i%1000))
 	}
-	b.StopTimer()
-
-	hits, misses, hitRate := mgr.HintStats()
-	b.Logf("Hint cache: hits=%d, misses=%d, hitRate=%.2f", hits, misses, hitRate)
 }
 
-// BenchmarkLockRepeatedAcquire measures repeated access to same lock (hint cache hot path).
+// BenchmarkLockRepeatedAcquire measures repeated cycles of one lock, which stays cached.
 func BenchmarkLockRepeatedAcquire(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 10<<20)
 	defer cleanup()
@@ -620,8 +390,4 @@ func BenchmarkLockRepeatedAcquire(b *testing.B) {
 		mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
 		mgr.Release(LockTypeInode, 100)
 	}
-	b.StopTimer()
-
-	hits, misses, hitRate := mgr.HintStats()
-	b.Logf("Hint cache (repeated lock 100): hits=%d, misses=%d, hitRate=%.2f", hits, misses, hitRate)
 }

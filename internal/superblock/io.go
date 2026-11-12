@@ -32,8 +32,14 @@ const (
 	bitmapBlocksPerSector   = (storage.SectorSize - 4) * 8
 	refcountBlocksPerSector = (storage.SectorSize - 4) / 8
 
+	// lockSlotSize is one node's claim slot in a lock record.
+	lockSlotSize = storage.SectorSize
+
+	// LockRegionSize holds 256 lock records of one claim slot per node.
+	LockRegionSize = 256 * MaxNodes * lockSlotSize
+
 	// MinDeviceSize holds all metadata regions and one data block.
-	MinDeviceSize = 7*regionSize + MaxNodes*NodeJournalSize + storage.DefaultBlockSize
+	MinDeviceSize = 6*regionSize + LockRegionSize + MaxNodes*NodeJournalSize + storage.DefaultBlockSize
 
 	legacyRootInodeOffset = 2*regionSize + 2*inodeSize
 	legacyInodeMagic      = 0x494E4F44
@@ -117,7 +123,7 @@ type region struct {
 func (sb *Superblock) layout() []region {
 	return []region{
 		{"node registry", sb.NodeRegistryOffset, sb.NodeRegistrySize, regionSize, true},
-		{"lock records", sb.LockBitmapOffset, sb.LockBitmapSize, regionSize, true},
+		{"lock records", sb.LockBitmapOffset, sb.LockBitmapSize, LockRegionSize, true},
 		{"snapshot registry", sb.SnapshotRegOffset, sb.SnapshotRegSize, regionSize, true},
 		{"journals", sb.JournalRegionOffset, sb.JournalRegionSize, MaxNodes * NodeJournalSize, true},
 		{"block bitmap", sb.BlockBitmapOffset, sb.BlockBitmapSize, BlockBitmapBytes(sb.TotalBlocks), false},
@@ -134,6 +140,11 @@ func (sb *Superblock) CheckLayout(deviceSize int64) error {
 		sb.InodeTableSize != sb.InodeCount*inodeSize {
 		return fmt.Errorf("%w: block size %d, metadata block %d, inode size %d, %d node slots, %d inodes in %d bytes",
 			ErrUnsupportedLayout, sb.BlockSize, sb.MetaBlockSize, sb.InodeSize, sb.MaxNodes, sb.InodeCount, sb.InodeTableSize)
+	}
+	if sb.LockSlotSize != lockSlotSize {
+		return fmt.Errorf("%w: lock records have %d-byte claim slots, this version needs %d. The volume was formatted "+
+			"before per-node lock slots: copy the data off with the version that formatted it, then reformat with -format",
+			ErrUnsupportedLayout, sb.LockSlotSize, lockSlotSize)
 	}
 	if sb.TotalBlocks == 0 || sb.TotalBlocks > size/uint64(sb.BlockSize) {
 		return fmt.Errorf("%w: %d data blocks do not fit the %d-byte device", ErrUnsupportedLayout, sb.TotalBlocks, deviceSize)
@@ -294,7 +305,8 @@ func calculateLayout(sb *Superblock, deviceSize int64, bytesPerInode uint64) {
 	}
 
 	sb.NodeRegistryOffset, sb.NodeRegistrySize = next(regionSize)
-	sb.LockBitmapOffset, sb.LockBitmapSize = next(regionSize)
+	sb.LockSlotSize = lockSlotSize
+	sb.LockBitmapOffset, sb.LockBitmapSize = next(LockRegionSize)
 	sb.SnapshotRegOffset, sb.SnapshotRegSize = next(regionSize)
 	sb.JournalRegionOffset, sb.JournalRegionSize = next(MaxNodes * NodeJournalSize)
 	sb.BlockBitmapOffset, sb.BlockBitmapSize = next(BlockBitmapBytes(maxBlocks))

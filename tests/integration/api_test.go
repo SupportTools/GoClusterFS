@@ -3,6 +3,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -144,10 +145,67 @@ func TestMountRejectsBadAPISettingsBeforeOpeningDevice(t *testing.T) {
 		{"-api-addr=127.0.0.1", "Invalid API settings"},
 		{"-api-cors=not-a-url", "Invalid API settings"},
 		{"-api-cors=*", "-api-cors"},
+		{"-api-rate-limit=-1", "Invalid API settings"},
+		{"-api-rate-limit=NaN", "Invalid API settings"},
+		{"-api-rate-limit=+Inf", "Invalid API settings"},
+		{"-api-rate-limit=1e19", "Invalid API settings"},
 	} {
 		out, err := runMount(t, "-device", missing, "-mount", dir, tt.flag)
 		if err == nil || !strings.Contains(out, tt.want) || strings.Contains(out, "Failed to open device") {
 			t.Errorf("%s: err=%v, want an error mentioning %q before the device opens:\n%s", tt.flag, err, tt.want, out)
 		}
+	}
+}
+
+func TestGfsctlReadsLiveMount(t *testing.T) {
+	mountBinary, err := findBinary()
+	if err != nil {
+		t.Fatalf("Failed to find binary: %v", err)
+	}
+	gfsctl := filepath.Join(filepath.Dir(mountBinary), "gfsctl")
+	if _, err := os.Stat(gfsctl); err != nil {
+		t.Fatalf("gfsctl not found next to %s; run 'make build' first", mountBinary)
+	}
+
+	mfs := NewMountedFS(t, 20)
+	addr := freeLoopbackAddr(t)
+	mfs.ExtraArgs = []string{"-format", "-api-addr", addr}
+	if err := mfs.Mount(false); err != nil {
+		t.Fatalf("Mount failed: %v", err)
+	}
+	host, port, _ := net.SplitHostPort(addr)
+
+	ctl := func(args ...string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, gfsctl, append([]string{"--host", host, "--port", port}, args...)...)
+		cmd.Env = append(os.Environ(), "XDG_CONFIG_HOME="+t.TempDir())
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	var out string
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if out, err = ctl("status", "-o", "json"); err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("gfsctl status: %v\n%s", err, out)
+	}
+	var status struct {
+		MountState string `json:"mount_state"`
+		MountPath  string `json:"mount_path"`
+	}
+	if err := json.Unmarshal([]byte(out), &status); err != nil || status.MountState != "mounted" || status.MountPath != mfs.MountPoint {
+		t.Fatalf("gfsctl status -o json: %v\n%s", err, out)
+	}
+	if out, err := ctl("health"); err != nil || !strings.Contains(out, "ok") {
+		t.Errorf("gfsctl health: %v\n%s", err, out)
+	}
+	if out, err := ctl("metrics"); err != nil || !strings.Contains(out, "goclusterfs_up 1") {
+		t.Errorf("gfsctl metrics: %v\n%s", err, out)
 	}
 }

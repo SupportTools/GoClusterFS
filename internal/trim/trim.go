@@ -12,6 +12,7 @@ package trim
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sort"
 	"sync"
@@ -105,6 +106,9 @@ type Manager struct {
 	blocksQueued    uint64
 	blocksDiscarded uint64
 	discardCalls    uint64
+	discardErrors   uint64
+	lastDiscard     time.Time
+	unsupported     bool
 	coalesceRatio   float64 // Average blocks per ioctl
 }
 
@@ -233,9 +237,16 @@ func (m *Manager) checkAndFlush() {
 	}
 }
 
+// Flush hands every queued block to the discard path now instead of waiting
+// for the batch size or age, and returns how many it took. The free guard can
+// still skip blocks that were reallocated since they were queued.
+func (m *Manager) Flush() int {
+	return m.flush("requested")
+}
+
 // flush discards the pending blocks. The guard runs without m.mu held, because
 // Free takes the bitmap lock before m.mu.
-func (m *Manager) flush(reason string) {
+func (m *Manager) flush(reason string) int {
 	m.mu.Lock()
 	blocks := make([]uint64, len(m.pending))
 	for i, p := range m.pending {
@@ -246,30 +257,42 @@ func (m *Manager) flush(reason string) {
 	m.mu.Unlock()
 
 	if len(blocks) == 0 {
-		return
+		return 0
 	}
 	log.Printf("[trim] %s: flushing %d blocks", reason, len(blocks))
 
 	if guard == nil {
 		m.discardBlocks(blocks)
-		return
+		return len(blocks)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), guardTimeout)
 	defer cancel()
 	if err := guard(ctx, blocks, m.discardBlocks); err != nil {
 		log.Printf("[trim] skipping discard of %d blocks: %v", len(blocks), err)
+		m.mu.Lock()
+		m.discardErrors++
+		m.mu.Unlock()
 	}
+	return len(blocks)
 }
 
 // discardBlocks issues one discard per contiguous range of blocks.
 func (m *Manager) discardBlocks(blocks []uint64) {
 	ranges := coalesceBlocks(blocks)
 
-	var discarded, calls uint64
+	var discarded, calls, failed uint64
+	unsupported := false
 	for _, r := range ranges {
-		if err := m.issueDiscard(r); err != nil {
+		err := m.issueDiscard(r)
+		if errors.Is(err, errDiscardUnsupported) {
+			log.Printf("[trim] device does not support BLKDISCARD (normal for files)")
+			unsupported = true
+			break
+		}
+		if err != nil {
 			log.Printf("[trim] discard failed for range [%d, %d): %v",
 				r.startBlock, r.startBlock+r.count, err)
+			failed++
 			continue
 		}
 		discarded += r.count
@@ -280,6 +303,11 @@ func (m *Manager) discardBlocks(blocks []uint64) {
 	defer m.mu.Unlock()
 	m.blocksDiscarded += discarded
 	m.discardCalls += calls
+	m.discardErrors += failed
+	m.unsupported = m.unsupported || unsupported
+	if calls > 0 {
+		m.lastDiscard = time.Now()
+	}
 	if len(ranges) > 0 {
 		m.coalesceRatio = float64(discarded) / float64(len(ranges))
 	}
@@ -324,6 +352,8 @@ func coalesceBlocks(blocks []uint64) []blockRange {
 	return ranges
 }
 
+var errDiscardUnsupported = errors.New("device does not support BLKDISCARD")
+
 // issueDiscard issues BLKDISCARD ioctl for a block range.
 func (m *Manager) issueDiscard(r blockRange) error {
 	if !m.config.Enabled {
@@ -356,8 +386,7 @@ func (m *Manager) issueDiscard(r blockRange) error {
 	if errno != 0 {
 		// EOPNOTSUPP is common for file-backed devices - treat as warning, not error
 		if errno == syscall.EOPNOTSUPP || errno == syscall.ENOTTY {
-			log.Printf("[trim] device does not support BLKDISCARD (normal for files)")
-			return nil // Not an error - just unsupported
+			return errDiscardUnsupported
 		}
 		return errno
 	}
@@ -374,16 +403,24 @@ func (m *Manager) Stats() Stats {
 		BlocksQueued:    m.blocksQueued,
 		BlocksDiscarded: m.blocksDiscarded,
 		DiscardCalls:    m.discardCalls,
+		DiscardErrors:   m.discardErrors,
+		LastDiscard:     m.lastDiscard,
+		Unsupported:     m.unsupported,
 		PendingBlocks:   uint64(len(m.pending)),
 		CoalesceRatio:   m.coalesceRatio,
+		BatchSize:       m.config.BatchSize,
 	}
 }
 
 // Stats holds TRIM manager statistics.
 type Stats struct {
-	BlocksQueued    uint64  // Total blocks queued for TRIM
-	BlocksDiscarded uint64  // Total blocks successfully discarded
-	DiscardCalls    uint64  // Number of BLKDISCARD ioctls issued
-	PendingBlocks   uint64  // Blocks currently waiting
-	CoalesceRatio   float64 // Average blocks per ioctl call
+	BlocksQueued    uint64    // Total blocks queued for TRIM
+	BlocksDiscarded uint64    // Total blocks successfully discarded
+	DiscardCalls    uint64    // Number of BLKDISCARD ioctls issued
+	DiscardErrors   uint64    // Failed BLKDISCARD ranges, plus flushes the bitmap guard refused
+	LastDiscard     time.Time // When a BLKDISCARD last succeeded
+	Unsupported     bool      // The device answered BLKDISCARD with EOPNOTSUPP or ENOTTY
+	PendingBlocks   uint64    // Blocks currently waiting
+	CoalesceRatio   float64   // Average blocks per ioctl call
+	BatchSize       int
 }

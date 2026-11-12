@@ -422,6 +422,16 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
+  # Docker and VM tests run shell tools over docker exec and ssh, which cannot keep signalling the thread inside a FUSE call.
+  - id: multinode-create-with-signals
+    name: Creates survive signals during lock waits
+    description: Two nodes create files while the creating threads keep getting signals; no create or write fails
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeCreateWithSignals
+      docker: TODO
+      vm: TODO
+
   # The Docker and VM harnesses have no per-node mount flags, so they cannot run one node with -attr-timeout=0.
   - id: multinode-attr-timeout-zero
     name: Attribute timeout 0 shows remote size changes
@@ -1570,6 +1580,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/inode_update_test.go::TestUpdateInodeLockedWaitsForOtherNode
 
+  - id: write-survives-interrupt
+    name: Write finishes after an interrupt during a lock wait
+    description: A write whose request is cancelled while it waits for another node's inode lock finishes once the lock is free
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestWriteFinishesAfterInterruptDuringLockWait
+
+  - id: write-fails-after-lock-timeout
+    name: Interrupted write fails with EIO when a lock is never freed
+    description: A write waiting for an inode lock that another node keeps holding gives up with EIO after lock.DefaultTimeout instead of hanging
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestWriteFailsWhenLockIsNotFreed
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself
@@ -1618,6 +1642,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestConfigDefaults
+
+  - id: broadcast-default-layout-starts
+    name: Broadcast starts with the default ports
+    description: The default multicast and unicast ports differ and Start succeeds
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestDefaultLayoutStarts
+
+  - id: broadcast-shared-port-rejected
+    name: Broadcast rejects one port for both sockets
+    description: Start refuses a unicast port equal to the multicast port with a clear error
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestSharedPortRejected
+
+  - id: broadcast-two-nodes-one-host
+    name: Broadcast between two nodes on one host
+    description: Two transports sharing a host and multicast port exchange messages over multicast and unicast
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestTwoNodesOnOneHost
+
+  - id: broadcast-send-socket-options
+    name: Broadcast send socket options
+    description: The send socket loops multicast back to this host and uses the configured TTL
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/sockopt_linux_test.go::TestSendSocketMulticastOptions
+
+  - id: broadcast-explicit-interface
+    name: Broadcast on an explicit interface
+    description: With -broadcast-iface, two nodes exchange multicast through that interface
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/sockopt_linux_test.go::TestTwoNodesOnExplicitInterface
 
   - id: broadcast-dedup-per-sender
     name: Broadcast dedup per sender
@@ -1693,6 +1752,15 @@ scenarios:
       go: broadcast_test.go::TestBroadcastBidirectional
       docker: run-tests.sh::test_broadcast_bidirectional
       vm: run-vm-tests.sh::test_broadcast_bidirectional
+
+  - id: broadcast-invalidates-peer-cache
+    name: Broadcast invalidates a peer's cached inode
+    description: With a 1h cache TTL on node 1, only a broadcast lets its open file read data node 0 appended
+    priority: medium
+    environments:
+      go: broadcast_test.go::TestBroadcastInvalidatesPeerCache
+      docker: TODO  # needs a per-node -cache-ttl in the compose file
+      vm: TODO  # VMs use QEMU user networking, so they cannot reach each other
 
   # ===========================================================================
   # SNAPSHOT TESTS (Phase 7: Snapshots)
@@ -2162,7 +2230,7 @@ scenarios:
   # Docker/VM TODO: a shell test would have to freeze a node (docker pause, or
   # SIGSTOP on the QEMU process) inside a lock-held section that lasts
   # milliseconds, then resume it after StaleThreshold. Shell tests cannot target
-  # that window, so the Go test simulates the pause by aging the on-disk record.
+  # that window, so the Go test simulates the pause by aging the holder's claim slot.
   - id: lock-stale-reclaim-paused-holder
     name: Stale lock reclaimed from paused holder
     description: A holder stalled past StaleThreshold loses its lock to another node without being told
@@ -2228,16 +2296,9 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReadersOnTwoNodesCannotBothWrite
 
-  - id: lock-join-fails-after-takeover
-    name: Join fails after takeover
-    description: A key joining an exclusive hold that another node took over as stale gets ErrLockLost instead of joining
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestJoinFailsAfterRecordTakenOver
-
   - id: lock-busy-record-renewed
     name: Busy record renewed on join
-    description: A key joining an exclusive record this node has held past renewAfter rewrites its AcquireTime, so a busy node does not lose the record as stale
+    description: A key joining an exclusive record this node has held past renewAfter writes its claim slot again, so a busy node does not lose the record as stale
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestJoiningKeyRenewsBusyRecord
@@ -2249,26 +2310,12 @@ scenarios:
     environments:
       go: internal/inode/lock_test.go::TestWriteDoesNotHangBehindSameNodeReader
 
-  - id: lock-stale-shared-reclaim
-    name: Stale shared lock reclaim drops dead readers
-    description: Reclaiming a stale shared record resets the reader count so it can be fully released
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestStaleSharedLockReclaimResetsReaderCount
-
   - id: write-failure-keeps-committed-blocks
     name: Failed write keeps blocks committed mid-write
     description: When the final inode write fails after a mid-write persist committed a new block, the retry finds that block still allocated and mapped
     priority: go_only
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestFailedWriteKeepsBlocksCommittedMidWrite
-
-  - id: lock-claim-overwritten-during-settle
-    name: Claim overwritten during settle wait
-    description: A node whose claim another node overwrites during the settle wait does not keep the lock
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestClaimOverwrittenDuringSettleIsNotHeld
 
   - id: lock-released-hold-cached
     name: Released hold cached for grace
@@ -2277,12 +2324,103 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleasedHoldIsCachedForGrace
 
-  - id: lock-cached-rejoin-skips-settle
-    name: Cached rejoin skips settle wait
-    description: Re-acquiring a cached hold on the same node needs no disk I/O and no settle wait
+  - id: lock-leaked-shared-count-goes-stale
+    name: Leaked read claim goes stale
+    description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestCachedHoldRejoinSkipsSettleWait
+      go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
+
+  - id: lock-slot-claims-exclude-under-slow-writes
+    name: Slot claims exclude under slow writes
+    description: Six nodes take one lock for writing and reading while every slot write takes up to 30ms; a writer never holds beside another holder
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlotClaimsExcludeUnderSlowWrites
+
+  - id: lock-torn-slot-counts-as-claim
+    name: Torn slot counts as a claim
+    description: A claim slot that fails its checksum blocks the record until it is cleared
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTornSlotCountsAsClaim
+
+  - id: lock-slot-readers-share-writers-wait
+    name: Readers share, writers wait
+    description: Read claims on two nodes hold one record together; a write claim waits until both release
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlotReadersShareWritersWait
+
+  - id: lock-contended-claims-all-finish
+    name: Contended claims all finish
+    description: Four nodes take one write lock 25 times each with no delays; every acquire finishes
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestContendedSlotClaimsAllFinish
+
+  - id: lock-racing-claims-lower-slot-wins
+    name: Racing claims, lower slot wins
+    description: One node writes its claim and stalls before reading the row while another claims; the node in the lower slot gets the lock and the other waits for its release
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestRacingClaimsLowerSlotWins
+
+  - id: lock-dead-claimant-blocks-until-stale
+    name: Dead claimant blocks only until stale
+    description: A claim left by a node that stopped mid-claim, in a lower or a higher slot, keeps a live node waiting only until the claim is 15 seconds old
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestDeadClaimantBlocksOnlyUntilStale
+
+  - id: lock-abandoned-claim-cleared
+    name: Abandoned claim is cleared
+    description: A lower-slot node that gives up waiting clears the claim it kept, so a higher-slot node gets the lock as soon as the holder releases
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestAbandonedClaimIsCleared
+
+  - id: lock-slow-slot-writes-no-freeze
+    name: Slow slot writes cause no freeze
+    description: With every slot write taking 333ms, two nodes still hand one lock back and forth four times without a stall
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlowSlotWritesCauseNoFreeze
+
+  - id: lock-adopt-owner-renews-old-claim
+    name: Takeover renews a dead node's old claim
+    description: AdoptOwner writes a dead node's write claim again, so peers stay off the record until the replay ends even if the claim was already stale
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerRenewsDeadNodesOldClaim
+
+  - id: lock-adopt-owner-clears-torn-slot
+    name: Takeover clears a dead node's torn slot
+    description: A torn slot in a dead node's registry slot never goes stale; AdoptOwner keeps it for the replay and ReleaseAdopted clears it
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerClearsDeadNodesTornSlot
+
+  - id: lock-adopt-owner-own-slot
+    name: Restarted node takes over its predecessor's claims
+    description: A node restarted into its own registry slot keeps its predecessor's claims during the replay, then clears those it does not use itself
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerOfOwnSlotPredecessor
+
+  - id: superblock-refuses-layout-without-lock-slots
+    name: Mount refuses layout without lock slots
+    description: A v3 image formatted before per-node lock slots, with a 1 MB lock region and no slot size, is refused with a message to reformat
+    priority: go_only
+    environments:
+      go: internal/superblock/io_test.go::TestReadRejectsLayoutWithoutLockSlots
+
+  - id: lock-cached-rejoin-no-disk-io
+    name: Cached rejoin needs no disk I/O
+    description: Re-acquiring a cached hold on the same node writes no slot and reads no row
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCachedHoldRejoinNeedsNoDiskIO
 
   - id: lock-paused-node-drops-cached-hold
     name: Paused node drops a cached hold taken over
@@ -2319,68 +2457,19 @@ scenarios:
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestConcurrentRefcountReadsDoNotDelaySnapshots
 
-  - id: lock-slow-claim-write-skipped
-    name: Slow claim write is skipped
-    description: A claim write that cannot start within a quarter of the settle delay of its read writes nothing, and the node gets the lock once the holder releases
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestSlowClaimWriteIsSkipped
-
-  - id: lock-late-claim-write-not-held
-    name: Late claim write is not held
-    description: A claim write that lands more than the settle delay after its read, over another node's confirmed claim, is not held, so two nodes cannot both hold the lock
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestLateClaimWriteIsNotHeld
-
-  - id: lock-claim-write-within-settle-held
-    name: Claim write finishing within the settle delay is held
-    description: A claim write that starts within a quarter of ClaimSettleDelay and finishes within ClaimSettleDelay of its read is held, not given up
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestClaimWriteFinishingWithinSettleDelayIsHeld
-
-  - id: lock-racing-read-claims-both-hold
-    name: Racing read claims both hold
-    description: When two nodes' read claims race and one overwrites the other's reader bit, the loser claims again, so a writer waits for both readers
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestRacingReadClaimsBothHold
-
-  - id: lock-lost-read-release-cleared-again
-    name: Lost read release is cleared again
-    description: A reader bit put back by another node's older update is cleared again after a settle delay, so writers do not wait until the record is stale
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestLostReadReleaseIsClearedAgain
-
-  - id: lock-read-claim-replaced-by-writer
-    name: Read claim replaced by a writer is not held
-    description: A read claim that a racing write claim replaces fails its confirm, so the reader does not read beside the writer
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestReadClaimReplacedByWriterIsNotHeld
-
   - id: lock-adopt-owner-clears-dead-reader
     name: Dead node's reader bit cleared on takeover
-    description: AdoptOwner clears a proven-dead node's reader bit, so a writer gets a record the dead node kept for reading
+    description: AdoptOwner clears a proven-dead node's read slot, so a writer gets a record the dead node kept for reading
     priority: go_only
     environments:
       go: internal/lock/reclaim_test.go::TestAdoptOwnerClearsDeadReader
 
-  - id: lock-late-read-claim-admits-no-readers
-    name: Late read claim admits no more readers
-    description: A read claim that lands late on another node's write claim is turned into a write claim, with no write deadline, so no reader joins beside the writer after that
+  - id: lock-acquire-without-deadline-gives-up
+    name: Acquire without a deadline gives up
+    description: An acquire whose context never ends returns ErrLockTimeout after DefaultTimeout instead of waiting forever
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestLateReadClaimAdmitsNoMoreReaders
-
-  - id: lock-late-fence-leaves-stale-takeover
-    name: Late fence leaves a stale takeover alone
-    description: A fence write that cannot start within fenceWindow of its read writes nothing, so it cannot overwrite a claim another node made after the record went stale
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestLateFenceLeavesStaleTakeoverAlone
+      go: internal/lock/safety_test.go::TestAcquireWithoutDeadlineGivesUp
 
   - id: lock-timeout-logs-holder
     name: Timed-out acquire logs the holder
@@ -2396,34 +2485,6 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedWithSlowWritesRunsInParallel
 
-  - id: lock-slow-release-gives-up
-    name: Release with slow writes gives up
-    description: A release whose writes keep missing their deadline stops after a bounded number of tries and leaves the record to go stale
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestReleaseWithSlowWritesGivesUp
-
-  - id: lock-slow-renewal-gives-up
-    name: Renewal with slow writes gives up
-    description: A renewal whose writes keep missing their deadline stops after a bounded number of tries and fails the joining acquire
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestRenewalWithSlowWritesGivesUp
-
-  - id: storage-write-deadline-after-shard-wait
-    name: Deadline write skipped after shard wait
-    description: A write that waits for its I/O shard past its deadline writes nothing
-    priority: go_only
-    environments:
-      go: internal/storage/device_test.go::TestWriteAtBeforeSkipsWriteAfterShardWait
-
-  - id: lock-cancelled-context-waits
-    name: Cancelled context keeps waiting
-    description: A cancelled context (FUSE interrupt) does not end a lock wait; only a deadline or DefaultTimeout does
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestCancelledContextStillWaitsForLock
-
   - id: lock-region-bounded
     name: Lock region stays bounded
     description: Many acquire/release cycles across resources and two nodes reuse the fixed region, leave no record held, and write nothing outside it
@@ -2438,9 +2499,11 @@ scenarios:
   - id: api-health-loopback
     name: API answers /health on loopback
     description: A mount started with -api-addr on 127.0.0.1 serves GET /health with 200
-    priority: go_only
+    priority: high
     environments:
       go: api_test.go::TestAPIServesHealthOnLoopback
+      docker: TODO - the shell suites never query the HTTP API; needs curl in the test image and per-node -api-addr
+      vm: TODO - same reason as docker; the Alpine VMs also need curl
 
   - id: api-refuses-remote-without-token
     name: Mount refuses an unauthenticated remote API
@@ -2465,7 +2528,160 @@ scenarios:
 
   - id: api-settings-checked-before-device
     name: Mount rejects bad API settings early
-    description: An -api-addr without a port, an invalid -api-cors, or -api-cors * without a token stop mount before it opens the device
+    description: An -api-addr without a port, an invalid -api-cors, -api-cors * without a token, or an -api-rate-limit that is negative, NaN, infinite or too large stop mount before it opens the device
     priority: go_only
     environments:
       go: api_test.go::TestMountRejectsBadAPISettingsBeforeOpeningDevice
+
+  # ===========================================================================
+  # HTTP API writes (one mount on one host)
+  # ===========================================================================
+
+  - id: api-snapshot-lifecycle
+    name: API snapshot, clone and delete
+    description: The API creates, lists, clones and deletes snapshots and clones files through setxattr on the mount, the same path as setfattr; bad paths, names and destinations are refused
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPISnapshotLifecycle
+
+  - id: api-writes-off-without-token
+    name: API writes need a token
+    description: Without -api-token, write endpoints answer 403 and mount logs that writes are off; reads still work
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIWritesOffWithoutToken
+
+  - id: api-writes-during-file-io
+    name: API writes while files are written
+    description: Snapshot, clone and delete requests run while other goroutines write and read the same files, with no deadlock, whole 4 KB chunks in every clone, and a clean fsck
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIWritesDuringFileIO
+
+  - id: api-shutdown-during-snapshots
+    name: Mount exits cleanly during API snapshots
+    description: SIGTERM while snapshot requests run makes mount wait for them, unmount and exit 0, and fsck stays clean
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestMountExitsCleanlyDuringSnapshots
+
+  - id: api-admin-live-mount
+    name: API admin endpoints on a live mount
+    description: flush-journal, force-trim and clear-cache answer 200 on a mounted filesystem, which keeps working afterwards
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIAdminOnLiveMount
+
+  - id: api-token-sources
+    name: API token from a file or the environment
+    description: Mount refuses a group- or world-readable -api-token-file and more than one token source, accepts GOCLUSTERFS_API_TOKEN, and warns when the token comes from -api-token
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestMountTokenSources
+
+  - id: gfsctl-reads-live-mount
+    name: gfsctl reads a live mount
+    description: gfsctl status, health and metrics work against a mounted filesystem's API
+    priority: go_only
+    environments:
+      go: api_test.go::TestGfsctlReadsLiveMount
+
+  - id: api-stats-live-values
+    name: API stats report live values
+    description: After writes, reads, a delete and a mkdir, /api/v1/stats/{cache,journal,lock,all,cluster} and /metrics show non-zero counters, TRIM reports itself disabled on an image file, /stats/sfb answers 404, and a second node sees both nodes and the first node's blocks
+    priority: high
+    environments:
+      go: api_stats_test.go::TestAPIStatsReportLiveValues
+      docker: TODO - same reason as api-health-loopback
+      vm: TODO - same reason as api-health-loopback; a VM test could also check TRIM counts on a real virtio disk
+
+  - id: stats-sampler-serves-snapshot
+    name: Stats requests never call the managers
+    description: Repeated StatsProvider and Capacity calls are served from the last snapshot; sources are read only by the sampler
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestSamplerAnswersFromSnapshotWithoutCallingSources
+
+  - id: stats-sampler-refresh
+    name: Stats sampler refreshes until stopped
+    description: Counter and device samples pick up new values in the background; Stop is idempotent and no source is read after it
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestSamplerRefreshesInBackgroundUntilStopped
+
+  - id: stats-sampler-idle
+    name: Idle stats sampler leaves the device alone
+    description: Without requests for capacity or cluster data, device ticks skip the bitmap and registry reads; the first such request starts a read at once
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestSamplerReadsDeviceOnlyWhenAsked
+
+  - id: stats-cache-hit-rates
+    name: Cache stats report hit rates as fractions
+    description: Inode, extent, negative and lock hint cache stats carry sizes and counts, with hit rates from 0 to 1
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestCacheResponseReportsHitRatesAsFractions
+
+  - id: stats-lock-journal
+    name: Lock and journal stats
+    description: Lock stats carry held and waiting counts; journal stats carry a lowercase state and the commit counters
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestLockAndJournalResponses
+
+  - id: stats-trim
+    name: TRIM stats
+    description: TRIM stats convert discarded blocks to bytes and report the last discard time, empty before any discard
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestTrimResponseCountsBytesAndLastDiscard
+
+  - id: stats-capacity
+    name: Capacity from the block bitmap
+    description: Capacity derives used blocks and bytes from total and free blocks, with 0% for an empty bitmap
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestCapacityInfo
+
+  - id: stats-cluster-slots
+    name: Cluster stats classify registry slots
+    description: Cluster stats count non-empty slots, report the local node and list peers as active, stale or dead
+    priority: go_only
+    environments:
+      go: internal/stats/sampler_test.go::TestClusterResponseClassifiesSlots
+
+  - id: lock-stats-held-waiting
+    name: Lock manager counts held and waiting locks
+    description: Stats reports the holder's lock and a blocked Acquire on another node until the lock is released; an uncontended Acquire never counts as waiting
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestStatsCountsHeldAndWaitingLocks
+
+  - id: trim-stats-errors
+    name: TRIM counts failed discards
+    description: A failed BLKDISCARD range counts as an error; a successful one sets the last discard time
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestStatsCountFailedDiscardsAndLastSuccess
+
+  - id: trim-unsupported-not-counted
+    name: TRIM on a device that cannot discard
+    description: EOPNOTSUPP or ENOTTY marks the device unsupported, stops the flush and counts nothing as discarded or failed
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestUnsupportedDeviceIsNotCountedAsDiscarded
+
+  - id: trim-refused-flush-error
+    name: TRIM counts a flush the bitmap guard refused
+    description: When the free-block guard fails, the flush discards nothing and DiscardErrors goes up by one
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestRefusedFlushCountsAsError
+
+  - id: api-metrics-capacity
+    name: /metrics exports capacity
+    description: With a status provider, /metrics exports goclusterfs_fs_size_bytes and goclusterfs_fs_free_bytes
+    priority: go_only
+    environments:
+      go: internal/api/prometheus_test.go::TestMetricsEndpoint_ExportsCapacity

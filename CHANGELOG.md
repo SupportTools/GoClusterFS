@@ -9,7 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Upgrade notes
 
 - The on-disk format is now version 3. Mount refuses devices formatted by earlier builds. Version 1 kept one journal for all nodes. Version 2 had room for 4096 inodes, and on devices over 128 GB its refcounts overwrote the snapshot registry and then data blocks. Copy the data off with the old build, reformat with `-format`, and copy it back.
-- Devices must be at least 264 MB: the layout reserves 256 MB for 64 node journals of 4 MB.
+- Devices must be at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
+- Mount also refuses version 3 devices formatted before lock records had one claim slot per node. Copy the data off with the build that formatted them and reformat.
 - Node clocks must agree within a few seconds. See the node requirements in `docs/OPERATIONS.md`.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
@@ -24,7 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `goclusterfs-mount`: a FUSE filesystem that several Linux nodes can mount from one shared block device.
 - `-format` sizes the block bitmap, refcount table and inode table from the device. `-bytes-per-inode` sets the inode count (default one per MB of device, 4096 to 16,777,216).
 - `O_DIRECT` device I/O, split into shards so requests can run in parallel.
-- Distributed compare-and-swap locks on the shared device for block allocation, inode updates, and directory changes. File writes do not take these locks yet, so two nodes extending the same file can lose each other's data.
+- Distributed locks on the shared device for block allocation, inode updates, and directory changes. Each node writes its claim into its own slot of a lock record and then reads the record, so two nodes cannot both take a write lock however slow the storage is. File writes do not take these locks yet, so two nodes extending the same file can lose each other's data.
 - Write-ahead journal with batch commits and a recovery check on mount.
 - Intent logging for multi-step operations.
 - Inode cache with generation-based coherency checks, and an extent cache.
@@ -39,7 +40,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CI gates: unit tests with the race detector and coverage, golangci-lint (`make lint`), govulncheck (`make vuln`), and a `go mod tidy` check.
 - Release workflow: pushing a `v*` tag publishes a GitHub Release with `linux/amd64` and `linux/arm64` archives, checksums, and the matching `CHANGELOG.md` section. `scripts/dist.sh` builds the same archives locally.
 - `goclusterfs-fsck -version` prints the release version, commit, and commit date.
-- HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` or `-api-cors '*'` without `-api-token`, and checks the API flags before it opens the device.
+- HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` or `-api-cors '*'` without `-api-token`, and checks the API flags before it opens the device. `/metrics` uses the Prometheus client library and adds Go runtime and process metrics. `-api-rate-limit` limits requests per client IP (off by default).
+- `-api-token-file` (mode 0600 or stricter) and `GOCLUSTERFS_API_TOKEN` for the API token. Mount warns when it comes from `-api-token`, which `ps` shows to every local user.
+- HTTP API write endpoints, only with a token: create, list, clone and delete snapshots, clone files, and flush the journal, flush TRIM or clear caches on this node. Snapshot and clone requests call `setxattr` through the mount, like `setfattr`.
+- `gfsctl`, a read-only CLI for the HTTP API: `status`, `health`, `stats`, `metrics`, with watch mode and JSON output. Release archives include it.
 - `goclusterfs-mount -version`, which prints the same version string as `goclusterfs-fsck -version`. `/api/v1/status` reports it too.
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
@@ -52,7 +56,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.
 - `go.mod` now requires Go 1.26.
 - `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
-- Reads use the inode cache, lock acquisition reuses cached lock sequence numbers, and the inode and extent caches are split into 16 shards.
+- Reads use the inode cache, a node keeps a released lock for 250 ms so it can take it again without disk I/O, and the inode and extent caches are split into 16 shards.
 
 ### Removed
 

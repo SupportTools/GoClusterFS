@@ -27,4 +27,7 @@ var (
 
 	// ErrShutdownTimeout is returned when graceful shutdown times out.
 	ErrShutdownTimeout = errors.New("api: shutdown timed out")
+
+	// ErrInvalidRateLimit is returned when rate limit configuration is invalid.
+	ErrInvalidRateLimit = errors.New("api: invalid rate limit configuration")
 )

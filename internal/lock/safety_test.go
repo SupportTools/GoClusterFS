@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,35 +48,61 @@ func requireAcquired(t *testing.T, m *Manager, lt LockType, id uint64, mode Lock
 	}
 }
 
-func writeTestRecord(t *testing.T, m *Manager, recordID uint64, rec *Record) {
-	t.Helper()
-	buf := storage.GetBuffer(RecordSize)
-	defer storage.PutBuffer(buf)
-	copy(buf.Bytes(), serializeRecord(rec))
-	if _, err := m.dev.WriteAt(buf.Bytes(), int64(m.offset)+int64(recordID)*RecordSize); err != nil {
-		t.Fatalf("write record: %v", err)
-	}
-}
+const pastStale = StaleThreshold + 2*time.Second
 
-// ageRecord rewrites the lock's record as if it was taken age ago and never renewed.
-func ageRecord(t *testing.T, m *Manager, lt LockType, id uint64, age time.Duration) {
+// ageSlot rewrites m's slot for the lock as if m wrote it age ago, as a paused
+// node's slot looks to other nodes.
+func ageSlot(t *testing.T, m *Manager, lt LockType, id uint64, age time.Duration) {
 	t.Helper()
 	recordID := m.hashToRecord(lt, id)
-	rec, err := m.readRecord(recordID)
+	row, err := m.readRow(recordID)
 	if err != nil {
-		t.Fatalf("readRecord: %v", err)
+		t.Fatalf("readRow: %v", err)
 	}
-	rec.AcquireTime = time.Now().Add(-age).Unix()
-	writeTestRecord(t, m, recordID, rec)
+	s, err := decodeSlot(rowSlot(row, m.nodeSlot))
+	if err != nil || s == nil {
+		t.Fatalf("node %d has no slot for type=%d id=%d: %v", m.nodeSlot, lt, id, err)
+	}
+	s.acquireTime = time.Now().Add(-age).UnixNano()
+	if err := m.writeSlot(recordID, m.nodeSlot, s); err != nil {
+		t.Fatalf("writeSlot: %v", err)
+	}
 }
 
-const pastStale = StaleThreshold + 2*time.Second
+// tearSlot writes slot of the lock's record with a failing checksum, as a crash mid-write leaves it.
+func tearSlot(t *testing.T, m *Manager, lt LockType, id uint64, slot int) {
+	t.Helper()
+	buf := storage.NewAlignedBuffer(SlotSize)
+	copy(buf.Bytes(), encodeSlot(&claimSlot{mode: LockModeShared, acquireTime: time.Now().UnixNano()}))
+	buf.Bytes()[100] ^= 0xFF
+	if _, err := m.dev.WriteAt(buf.Bytes(), m.slotOffset(m.hashToRecord(lt, id), slot)); err != nil {
+		t.Fatalf("write torn slot: %v", err)
+	}
+}
+
+// writeClaim writes slot of the lock's record as a claim in mode, as a node that
+// stopped mid-claim leaves it.
+func writeClaim(t *testing.T, m *Manager, lt LockType, id uint64, slot int, mode LockMode) {
+	t.Helper()
+	claim := &claimSlot{mode: mode, lockType: lt, resourceID: id, owner: [16]byte{byte(slot)}, acquireTime: time.Now().UnixNano()}
+	if err := m.writeSlot(m.hashToRecord(lt, id), slot, claim); err != nil {
+		t.Fatalf("writeSlot: %v", err)
+	}
+}
+
+// delaySlotWrites makes each of m's slot writes take delay(), as a slow device would.
+func delaySlotWrites(m *Manager, delay func() time.Duration) {
+	m.slotWrite = func(buf []byte, offset int64) (int, error) {
+		time.Sleep(delay())
+		return m.dev.WriteAt(buf, offset)
+	}
+}
 
 func TestCollidingResourceIsBlockedWhileOtherNodeHoldsRecord(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	a := newTestNode(dev, 0, RecordSize, 1)
-	b := newTestNode(dev, 0, RecordSize, 2)
+	a := newTestNode(dev, 0, RowSize, 1)
+	b := newTestNode(dev, 0, RowSize, 2)
 
 	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
 	requireBlocked(t, b, LockTypeInode, 2, LockModeExclusive)
@@ -83,8 +111,8 @@ func TestCollidingResourceIsBlockedWhileOtherNodeHoldsRecord(t *testing.T) {
 func TestNodeHoldsCollidingResourcesUntilLastRelease(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	a := newTestNode(dev, 0, RecordSize, 1)
-	b := newTestNode(dev, 0, RecordSize, 2)
+	a := newTestNode(dev, 0, RowSize, 1)
+	b := newTestNode(dev, 0, RowSize, 2)
 
 	requireAcquired(t, a, LockTypeBlockBitmap, 0, LockModeExclusive)
 	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
@@ -232,13 +260,13 @@ func TestReadersOnTwoNodesCannotBothWrite(t *testing.T) {
 func TestJoiningKeyRenewsBusyRecord(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	a := newTestNode(dev, 0, RecordSize, 1)
-	b := newTestNode(dev, 0, RecordSize, 2)
+	a := newTestNode(dev, 0, RowSize, 1)
+	b := newTestNode(dev, 0, RowSize, 2)
 	defer func(d time.Duration) { renewAfter = d }(renewAfter)
 	renewAfter = 0
 
 	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
-	ageRecord(t, a, LockTypeInode, 1, pastStale)
+	ageSlot(t, a, LockTypeInode, 1, pastStale)
 	requireAcquired(t, a, LockTypeInode, 2, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 1); err != nil {
 		t.Fatalf("Release: %v", err)
@@ -254,7 +282,7 @@ func TestStaleLockIsReclaimedFromPausedHolder(t *testing.T) {
 	b := newTestNode(dev, 0, 1<<20, 2)
 
 	requireAcquired(t, a, LockTypeBlockBitmap, 0, LockModeExclusive)
-	ageRecord(t, a, LockTypeBlockBitmap, 0, pastStale)
+	ageSlot(t, a, LockTypeBlockBitmap, 0, pastStale)
 
 	requireAcquired(t, b, LockTypeBlockBitmap, 0, LockModeExclusive)
 	if held := a.HeldLocks(); len(held) != 1 {
@@ -270,7 +298,7 @@ func TestPausedHolderReleaseKeepsReclaimedLock(t *testing.T) {
 	c := newTestNode(dev, 0, 1<<20, 3)
 
 	requireAcquired(t, a, LockTypeInode, 3, LockModeExclusive)
-	ageRecord(t, a, LockTypeInode, 3, pastStale)
+	ageSlot(t, a, LockTypeInode, 3, pastStale)
 	requireAcquired(t, b, LockTypeInode, 3, LockModeExclusive)
 
 	a.Release(LockTypeInode, 3)
@@ -278,33 +306,17 @@ func TestPausedHolderReleaseKeepsReclaimedLock(t *testing.T) {
 	requireBlocked(t, c, LockTypeInode, 3, LockModeExclusive)
 }
 
-func TestStaleSharedLockReclaimResetsReaderCount(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	dead := newTestNode(dev, 0, 1<<20, 2)
-	c := newTestNode(dev, 0, 1<<20, 3)
-
-	requireAcquired(t, dead, LockTypeInode, 4, LockModeShared)
-	ageRecord(t, dead, LockTypeInode, 4, pastStale)
-	requireAcquired(t, a, LockTypeInode, 4, LockModeShared)
-	if err := a.Release(LockTypeInode, 4); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	requireAcquired(t, c, LockTypeInode, 4, LockModeExclusive)
-}
-
 func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 	const (
-		guard      = 4 * RecordSize
-		regionSize = 16 * RecordSize
+		guard      = 4 * SlotSize
+		regionSize = 16 * RowSize
 		resources  = 1000
 		cycles     = 1500
 	)
 	dev, cleanup := createTestDevice(t, guard+regionSize+guard)
 	defer cleanup()
-	defer func(d, g time.Duration) { claimSettleDelay, cacheGrace = d, g }(claimSettleDelay, cacheGrace)
-	claimSettleDelay, cacheGrace = time.Millisecond, time.Millisecond
+	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
+	cacheGrace = time.Millisecond
 
 	sentinel := storage.NewAlignedBuffer(guard)
 	for i := range sentinel.Bytes() {
@@ -367,49 +379,6 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 	}
 }
 
-func TestJoinFailsAfterRecordTakenOver(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, RecordSize, 1)
-	b := newTestNode(dev, 0, RecordSize, 2)
-	defer func(d time.Duration) { renewAfter = d }(renewAfter)
-	renewAfter = 0
-
-	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
-	ageRecord(t, a, LockTypeInode, 1, pastStale)
-	requireAcquired(t, b, LockTypeInode, 2, LockModeExclusive)
-
-	if err := acquireWithin(a, time.Second, LockTypeInode, 3, LockModeExclusive); !errors.Is(err, ErrLockLost) {
-		t.Fatalf("joining a record another node took over: got %v, want ErrLockLost", err)
-	}
-}
-
-func TestClaimOverwrittenDuringSettleIsNotHeld(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
-	claimSettleDelay = 100 * time.Millisecond
-
-	errc := make(chan error, 1)
-	go func() { errc <- acquireWithin(a, 50*time.Millisecond, LockTypeInode, 5, LockModeExclusive) }()
-	time.Sleep(20 * time.Millisecond)
-
-	// B read the record as free before A's claim landed, so B's claim lands on top of it.
-	recordID := a.hashToRecord(LockTypeInode, 5)
-	rec, err := a.readRecord(recordID)
-	if err != nil {
-		t.Fatalf("readRecord: %v", err)
-	}
-	rec.OwnerUUID, rec.OwnerSlot, rec.AcquireTime = b.nodeUUID, uint32(b.nodeSlot), time.Now().Unix()
-	writeTestRecord(t, a, recordID, rec)
-
-	if err := <-errc; err == nil {
-		t.Fatal("node A kept a claim that node B overwrote during the settle wait")
-	}
-}
-
 func TestReleasedHoldIsCachedForGrace(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
@@ -424,26 +393,8 @@ func TestReleasedHoldIsCachedForGrace(t *testing.T) {
 
 	start := time.Now()
 	requireAcquired(t, b, LockTypeInode, 6, LockModeExclusive)
-	if waited := time.Since(start); waited > cacheGrace+claimSettleDelay+2*RetryMaxDelay {
-		t.Fatalf("other node waited %v for a cached hold, want at most about grace+settle", waited)
-	}
-}
-
-func TestCachedHoldRejoinSkipsSettleWait(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	defer func(d time.Duration) { claimSettleDelay = d }(claimSettleDelay)
-	claimSettleDelay = 200 * time.Millisecond
-
-	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
-	if err := a.Release(LockTypeInode, 7); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	start := time.Now()
-	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
-	if took := time.Since(start); took >= claimSettleDelay/2 {
-		t.Fatalf("re-acquiring a cached hold took %v, want well under the %v settle wait", took, claimSettleDelay)
+	if waited := time.Since(start); waited > cacheGrace+4*RetryMaxDelay {
+		t.Fatalf("other node waited %v for a cached hold, want at most about the %v grace", waited, cacheGrace)
 	}
 }
 
@@ -459,7 +410,7 @@ func TestPausedNodeDropsCachedHoldTakenOver(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 	// A pauses past StaleThreshold with the write hold cached, and B takes the record over.
-	ageRecord(t, a, LockTypeInode, 8, pastStale)
+	ageSlot(t, a, LockTypeInode, 8, pastStale)
 	requireAcquired(t, b, LockTypeInode, 8, LockModeExclusive)
 	renewAfter = 0
 
@@ -482,31 +433,8 @@ func TestReleaseCachedFreesHoldsAtOnce(t *testing.T) {
 	}
 }
 
-// FUSE cancels a request's context whenever the calling process gets a signal,
-// which happens all the time, so cancellation alone must not end the wait.
-func TestCancelledContextStillWaitsForLock(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-
-	requireAcquired(t, a, LockTypeInode, 10, LockModeExclusive)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	errc := make(chan error, 1)
-	go func() { errc <- b.Acquire(ctx, LockTypeInode, 10, LockModeExclusive) }()
-
-	time.Sleep(300 * time.Millisecond)
-	if err := a.Release(LockTypeInode, 10); err != nil {
-		t.Fatalf("Release: %v", err)
-	}
-	if err := <-errc; err != nil {
-		t.Fatalf("Acquire with a cancelled context: got %v, want the lock once node A let it go", err)
-	}
-}
-
 // BenchmarkFreshAcquireRelease measures an acquire that cannot reuse a cached
-// hold, so it pays the claim settle wait.
+// hold, so it writes its slot, reads the row, and clears the slot on release.
 func BenchmarkFreshAcquireRelease(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 1<<20)
 	defer cleanup()
@@ -556,228 +484,13 @@ func TestBusyNodeYieldsCachedRecord(t *testing.T) {
 	other.Release(LockTypeInode, 12)
 }
 
-// slowWrite is a record write on slow storage. It waits stall before its
-// deadline check, as a stopped process would, queued between the check and the
-// write landing, and after between the landing and its return, as a busy device would.
-func slowWrite(m *Manager, stall, queued, after time.Duration) func([]byte, int64, time.Time) (int, error) {
-	return func(buf []byte, offset int64, deadline time.Time) (int, error) {
-		time.Sleep(stall)
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			return 0, storage.ErrWriteDeadline
-		}
-		time.Sleep(queued)
-		n, err := m.dev.WriteAt(buf, offset)
-		time.Sleep(after)
-		return n, err
-	}
-}
-
-// useWrites sends m's record writes through write and holds them to the real
-// write window, which TestMain relaxes for tests that are not about it.
-func useWrites(m *Manager, write func([]byte, int64, time.Time) (int, error)) {
-	m.writeWindow = ClaimSettleDelay
-	m.casWrite = write
-}
-
-// slowFirstWrite makes m's first record write go through first, closing started
-// as it begins, and every later one through then.
-func slowFirstWrite(m *Manager, first, then func([]byte, int64, time.Time) (int, error), started chan<- struct{}) {
-	var once sync.Once
-	useWrites(m, func(buf []byte, offset int64, deadline time.Time) (int, error) {
-		write := then
-		once.Do(func() {
-			write = first
-			close(started)
-		})
-		return write(buf, offset, deadline)
-	})
-}
-
-// A node whose claim write cannot start within half the settle delay of its
-// read, after a stall or a wait for the device's I/O shard, writes nothing: it
-// neither takes the lock beside another node nor gets stuck behind its own claim.
-func TestSlowClaimWriteIsSkipped(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-	bWriting := make(chan struct{})
-	slowFirstWrite(b, slowWrite(b, 3*ClaimSettleDelay/2, 0, 0), b.dev.WriteAtBefore, bWriting)
-
-	errb := make(chan error, 1)
-	go func() { errb <- acquireWithin(b, 2*time.Second, LockTypeInode, 21, LockModeExclusive) }()
-	<-bWriting
-	requireAcquired(t, a, LockTypeInode, 21, LockModeExclusive)
-	time.Sleep(100 * time.Millisecond)
-	select {
-	case err := <-errb:
-		t.Fatalf("node B finished (%v) while node A held the lock", err)
-	default:
-	}
-	if err := a.Release(LockTypeInode, 21); err != nil {
-		t.Fatalf("node A Release: %v", err)
-	}
-	a.ReleaseCached()
-	if err := <-errb; err != nil {
-		t.Fatalf("node B after node A released: %v", err)
-	}
-}
-
-// A claim write that lands long after its read can replace a claim another node
-// confirmed in the meantime, so the late node does not take the lock.
-func TestLateClaimWriteIsNotHeld(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-	bWriting := make(chan struct{})
-	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay, 0), b.dev.WriteAtBefore, bWriting)
-
-	errb := make(chan error, 1)
-	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 22, LockModeExclusive) }()
-	<-bWriting
-	requireAcquired(t, a, LockTypeInode, 22, LockModeExclusive)
-	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("node B with a late write: got %v, want ErrLockTimeout while node A holds the lock", err)
-	}
-}
-
-// A late read claim that lands on another node's write claim lets in only the
-// readers that join before its node fences the record, none after, even when
-// the storage is still slow for the fence.
-func TestLateReadClaimAdmitsNoMoreReaders(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-	c := newTestNode(dev, 0, 1<<20, 3)
-	d := newTestNode(dev, 0, 1<<20, 4)
-	bWriting := make(chan struct{})
-	lands, returns := 3*ClaimSettleDelay, 7*ClaimSettleDelay
-	slowFirstWrite(b, slowWrite(b, 0, lands, returns-lands), slowWrite(b, 3*ClaimSettleDelay/4, 0, 0), bWriting)
-
-	errb := make(chan error, 1)
-	go func() { errb <- acquireWithin(b, 500*time.Millisecond, LockTypeInode, 26, LockModeShared) }()
-	<-bWriting
-	start := time.Now()
-	requireAcquired(t, a, LockTypeInode, 26, LockModeExclusive)
-	time.Sleep(lands + (returns-lands)/3 - time.Since(start))
-	if err := acquireWithin(c, 10*time.Millisecond, LockTypeInode, 26, LockModeShared); err != nil {
-		t.Fatalf("node C could not join node B's late read claim before the fence (test timing): %v", err)
-	}
-	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("node B with a late read claim: got %v, want ErrLockTimeout", err)
-	}
-	requireBlocked(t, d, LockTypeInode, 26, LockModeShared)
-}
-
-// A fence write that cannot start within fenceWindow of its read writes nothing,
-// so it cannot land on a claim another node made after the record went stale.
-func TestLateFenceLeavesStaleTakeoverAlone(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	b := newTestNode(dev, 0, 1<<20, 2)
-	z := newTestNode(dev, 0, 1<<20, 3)
-	defer func(w time.Duration) { fenceWindow = w }(fenceWindow)
-	fenceWindow = ClaimSettleDelay
-	fencing, takenOver := make(chan struct{}), make(chan struct{})
-	fenceWrite := func(buf []byte, offset int64, deadline time.Time) (int, error) {
-		close(fencing)
-		<-takenOver
-		if !time.Now().Before(deadline) {
-			return 0, storage.ErrWriteDeadline
-		}
-		return b.dev.WriteAt(buf, offset)
-	}
-	var once sync.Once
-	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay, 0), func(buf []byte, offset int64, deadline time.Time) (int, error) {
-		write := b.dev.WriteAtBefore
-		once.Do(func() { write = fenceWrite })
-		return write(buf, offset, deadline)
-	}, make(chan struct{}))
-
-	errb := make(chan error, 1)
-	go func() { errb <- acquireWithin(b, 300*time.Millisecond, LockTypeInode, 27, LockModeShared) }()
-	<-fencing
-	ageRecord(t, z, LockTypeInode, 27, pastStale)
-	requireAcquired(t, z, LockTypeInode, 27, LockModeExclusive)
-	close(takenOver)
-	if err := <-errb; !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("node B with a late read claim: got %v, want ErrLockTimeout", err)
-	}
-	rec, err := z.readRecord(z.hashToRecord(LockTypeInode, 27))
-	if err != nil {
-		t.Fatalf("readRecord: %v", err)
-	}
-	if rec.Mode != LockModeExclusive || rec.OwnerUUID != z.nodeUUID {
-		t.Fatalf("record after node B's late fence: mode=%d owner=%x, want node Z's write claim", rec.Mode, rec.OwnerUUID[:8])
-	}
-}
-
-// A claim write that started in time and finished within ClaimSettleDelay of
-// its read landed before any other claimant's confirm re-read, so it is held.
-func TestClaimWriteFinishingWithinSettleDelayIsHeld(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	b := newTestNode(dev, 0, 1<<20, 2)
-	slowFirstWrite(b, slowWrite(b, 0, 3*ClaimSettleDelay/4, 0), b.dev.WriteAtBefore, make(chan struct{}))
-
-	requireAcquired(t, b, LockTypeInode, 29, LockModeExclusive)
-}
-
-// returnsWithin fails the test if fn has not returned after 3s.
-func returnsWithin(t *testing.T, what string, fn func()) {
-	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		fn()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatalf("%s still retrying after 3s", what)
-	}
-}
-
-// On storage too slow for any write to start within its deadline, a release
-// gives up after a few tries and leaves the record to go stale.
-func TestReleaseWithSlowWritesGivesUp(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	requireAcquired(t, a, LockTypeInode, 23, LockModeExclusive)
-	useWrites(a, slowWrite(a, ClaimSettleDelay, 0, 0))
-
-	returnsWithin(t, "release", func() {
-		a.Release(LockTypeInode, 23)
-		a.ReleaseCached()
-	})
-}
-
-// On storage that slow, a renewal gives up too, and the acquire that needed it fails.
-func TestRenewalWithSlowWritesGivesUp(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, RecordSize, 1)
-	defer func(d time.Duration) { renewAfter = d }(renewAfter)
-	renewAfter = 0
-	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
-	useWrites(a, slowWrite(a, ClaimSettleDelay, 0, 0))
-
-	var err error
-	returnsWithin(t, "renewal", func() { err = acquireWithin(a, time.Minute, LockTypeInode, 2, LockModeExclusive) })
-	if !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("Acquire joining a record whose renewal cannot write: got %v, want ErrLockTimeout", err)
-	}
-}
-
 // On slow storage an unmount frees its kept records in parallel, so it takes
-// about as long as one record's retries, not the sum of them.
+// about as long as a few slot writes, not the sum of them.
 func TestReleaseCachedWithSlowWritesRunsInParallel(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
+	const region = 32 * RowSize
+	dev, cleanup := createTestDevice(t, region)
 	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
+	a := newTestNode(dev, 0, region, 1)
 	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
 	cacheGrace = time.Minute
 
@@ -792,7 +505,7 @@ func TestReleaseCachedWithSlowWritesRunsInParallel(t *testing.T) {
 			t.Fatalf("Release: %v", err)
 		}
 	}
-	useWrites(a, slowWrite(a, ClaimSettleDelay, 0, 0))
+	delaySlotWrites(a, func() time.Duration { return 200 * time.Millisecond })
 
 	start := time.Now()
 	a.ReleaseCached()
@@ -813,129 +526,340 @@ func TestTimedOutAcquireLogsHolder(t *testing.T) {
 	log.SetOutput(&logs)
 	requireBlocked(t, b, LockTypeInode, 28, LockModeExclusive)
 	log.SetOutput(os.Stderr)
-	if got := logs.String(); !strings.Contains(got, "gave up waiting") || !strings.Contains(got, "write-locked by node slot 1") {
+	if got := logs.String(); !strings.Contains(got, "gave up waiting") || !strings.Contains(got, "slot 1 node") {
 		t.Fatalf("timeout log does not name the holder:\n%s", got)
 	}
 }
 
-// writeAfter returns a record write that waits for proceed before writing,
-// ignoring its deadline, so a test can order two nodes' writes.
-func writeAfter(m *Manager, reached chan<- struct{}, proceed <-chan struct{}) func([]byte, int64, time.Time) (int, error) {
-	var once sync.Once
-	return func(buf []byte, offset int64, deadline time.Time) (int, error) {
-		first := false
-		once.Do(func() { first = true })
-		if !first {
-			return m.dev.WriteAtBefore(buf, offset, deadline)
-		}
-		close(reached)
-		<-proceed
-		return m.dev.WriteAt(buf, offset)
-	}
-}
-
-// writeThenSignal returns a record write that signals done after its first write lands.
-func writeThenSignal(m *Manager, done chan<- struct{}) func([]byte, int64, time.Time) (int, error) {
-	var once sync.Once
-	return func(buf []byte, offset int64, deadline time.Time) (int, error) {
-		n, err := m.dev.WriteAtBefore(buf, offset, deadline)
-		once.Do(func() { close(done) })
-		return n, err
-	}
-}
-
-// Two nodes' read claims race and one overwrites the other's reader bit. The
-// node that lost its bit sees that on its confirm and claims again, so both
-// hold the record and a writer waits for both.
-func TestRacingReadClaimsBothHold(t *testing.T) {
+// A caller whose context never ends, as FUSE handlers that detach theirs, still
+// gives up once acquireTimeout passes.
+func TestAcquireWithoutDeadlineGivesUp(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	w := newTestNode(dev, 0, 1<<20, 3)
-	aRead, bLanded := make(chan struct{}), make(chan struct{})
-	a.casWrite = writeAfter(a, aRead, bLanded)
-	b.casWrite = writeThenSignal(b, bLanded)
+	defer func(d time.Duration) { acquireTimeout = d }(acquireTimeout)
+	acquireTimeout = 200 * time.Millisecond
+	requireAcquired(t, a, LockTypeInode, 40, LockModeExclusive)
 
-	errA := make(chan error, 1)
-	go func() { errA <- acquireWithin(a, 2*time.Second, LockTypeInode, 30, LockModeShared) }()
-	<-aRead
-	requireAcquired(t, b, LockTypeInode, 30, LockModeShared)
-	if err := <-errA; err != nil {
-		t.Fatalf("node A read claim: %v", err)
-	}
-
-	requireBlocked(t, w, LockTypeInode, 30, LockModeExclusive)
-	if err := a.Release(LockTypeInode, 30); err != nil {
-		t.Fatalf("node A Release: %v", err)
-	}
-	a.ReleaseCached()
-	requireBlocked(t, w, LockTypeInode, 30, LockModeExclusive)
-	if err := b.Release(LockTypeInode, 30); err != nil {
-		t.Fatalf("node B Release: %v", err)
-	}
-	b.ReleaseCached()
-	requireAcquired(t, w, LockTypeInode, 30, LockModeExclusive)
-}
-
-// A node clears its reader bit while another node's update, based on an older
-// read, puts it back. The releasing node checks again later and clears it, so a
-// writer waits a settle delay or two, not until the record is stale.
-func TestLostReadReleaseIsClearedAgain(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
-	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
-	w := newTestNode(dev, 0, 1<<20, 3)
-	requireAcquired(t, a, LockTypeInode, 31, LockModeShared)
-	requireAcquired(t, b, LockTypeInode, 31, LockModeShared)
-
-	bRead, aReleased := make(chan struct{}), make(chan struct{})
-	b.casWrite = writeAfter(b, bRead, aReleased)
-	done := make(chan error, 1)
+	errc := make(chan error, 1)
 	go func() {
-		if err := b.Release(LockTypeInode, 31); err != nil {
-			done <- err
-			return
-		}
-		b.ReleaseCached()
-		done <- nil
+		errc <- b.Acquire(context.WithoutCancel(context.Background()), LockTypeInode, 40, LockModeExclusive)
 	}()
-	<-bRead
-	if err := a.Release(LockTypeInode, 31); err != nil {
-		t.Fatalf("node A Release: %v", err)
-	}
-	a.casWrite = writeThenSignal(a, aReleased)
-	a.ReleaseCached()
-	if err := <-done; err != nil {
-		t.Fatalf("node B release: %v", err)
-	}
-
-	start := time.Now()
-	requireAcquired(t, w, LockTypeInode, 31, LockModeExclusive)
-	if took := time.Since(start); took > time.Second {
-		t.Fatalf("writer waited %v for a reader bit that was put back", took)
+	select {
+	case err := <-errc:
+		if !errors.Is(err, ErrLockTimeout) {
+			t.Fatalf("Acquire: got %v, want ErrLockTimeout", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Acquire with a context that never ends was still waiting after 5s")
 	}
 }
 
-// A read claim lands, then a writer's claim, based on an older read, replaces
-// it. The reader sees that on its confirm and does not read beside the writer.
-func TestReadClaimReplacedByWriterIsNotHeld(t *testing.T) {
+func TestNewReadersDoNotKeepLeakedSharedLockFresh(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	r := newTestNode(dev, 0, 1<<20, 1)
-	w := newTestNode(dev, 0, 1<<20, 2)
-	wRead, rLanded := make(chan struct{}), make(chan struct{})
-	w.casWrite = writeAfter(w, wRead, rLanded)
-	r.casWrite = writeThenSignal(r, rLanded)
+	leaked := newTestNode(dev, 0, 1<<20, 1)
+	reader := newTestNode(dev, 0, 1<<20, 2)
+	writer := newTestNode(dev, 0, 1<<20, 3)
 
-	errW := make(chan error, 1)
-	go func() { errW <- acquireWithin(w, 2*time.Second, LockTypeInode, 32, LockModeExclusive) }()
-	<-wRead
-	if err := acquireWithin(r, 300*time.Millisecond, LockTypeInode, 32, LockModeShared); !errors.Is(err, ErrLockTimeout) {
-		t.Fatalf("read claim replaced by a write claim: got %v, want ErrLockTimeout while the writer holds", err)
+	requireAcquired(t, leaked, LockTypeInode, 2, LockModeShared)
+	ageSlot(t, leaked, LockTypeInode, 2, StaleThreshold-2*time.Second)
+
+	requireAcquired(t, reader, LockTypeInode, 2, LockModeShared)
+	if err := reader.Release(LockTypeInode, 2); err != nil {
+		t.Fatalf("reader Release: %v", err)
 	}
-	if err := <-errW; err != nil {
-		t.Fatalf("writer: %v", err)
+	reader.ReleaseCached()
+	time.Sleep(3 * time.Second)
+
+	requireAcquired(t, writer, LockTypeInode, 2, LockModeExclusive)
+}
+
+func TestStatsCountsHeldAndWaitingLocks(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, RowSize, 1)
+	b := newTestNode(dev, 0, RowSize, 2)
+
+	waitingDuringUncontended := -1
+	a.SetOnAcquire(func(LockType, uint64, LockMode) { waitingDuringUncontended = a.Stats().Waiting })
+	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
+	if waitingDuringUncontended != 0 {
+		t.Errorf("an uncontended Acquire counted as waiting: Waiting = %d inside it", waitingDuringUncontended)
+	}
+	if got := a.Stats(); got.Held != 1 || got.Waiting != 0 {
+		t.Fatalf("holder Stats = %+v, want Held 1, Waiting 0", got)
+	}
+
+	granted := make(chan error, 1)
+	go func() { granted <- acquireWithin(b, 10*time.Second, LockTypeInode, 1, LockModeExclusive) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for b.Stats().Waiting != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("waiter Stats = %+v, want Waiting 1", b.Stats())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := a.Release(LockTypeInode, 1); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if err := <-granted; err != nil {
+		t.Fatalf("waiter Acquire: %v", err)
+	}
+	if got := b.Stats(); got.Held != 1 || got.Waiting != 0 {
+		t.Errorf("waiter Stats after grant = %+v, want Held 1, Waiting 0", got)
+	}
+	if got := a.Stats(); got.Held != 0 {
+		t.Errorf("holder Stats after release = %+v, want Held 0", got)
+	}
+	b.Release(LockTypeInode, 1)
+}
+
+// Six nodes take one lock over and over, mostly for writing, while every slot
+// write takes up to 30ms. A writer next to any other holder shows up in the counts.
+func TestSlotClaimsExcludeUnderSlowWrites(t *testing.T) {
+	const region = 8 * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	var writers, readers, worst, acquired atomic.Int64
+	stop := time.Now().Add(3 * time.Second)
+	var wg sync.WaitGroup
+	for n := 1; n <= 6; n++ {
+		m := newTestNode(dev, 0, region, n)
+		delaySlotWrites(m, func() time.Duration { return time.Duration(rand.Int63n(int64(30 * time.Millisecond))) })
+		wg.Go(func() {
+			for i := 0; time.Now().Before(stop); i++ {
+				mode := LockModeExclusive
+				if i%3 == 2 {
+					mode = LockModeShared
+				}
+				if err := acquireWithin(m, 20*time.Second, LockTypeInode, 50, mode); err != nil {
+					t.Errorf("node %d Acquire: %v", n, err)
+					return
+				}
+				mine, others := &writers, &readers
+				if mode == LockModeShared {
+					mine, others = &readers, &writers
+				}
+				now := mine.Add(1)
+				if mode == LockModeExclusive && (now > 1 || others.Load() > 0) || mode == LockModeShared && others.Load() > 0 {
+					worst.Add(1)
+				}
+				acquired.Add(1)
+				time.Sleep(time.Millisecond)
+				mine.Add(-1)
+				if err := m.Release(LockTypeInode, 50); err != nil {
+					t.Errorf("node %d Release: %v", n, err)
+				}
+				m.ReleaseCached()
+			}
+		})
+	}
+	wg.Wait()
+	if worst.Load() > 0 {
+		t.Fatalf("a writer shared the lock with another holder %d times in %d acquires", worst.Load(), acquired.Load())
+	}
+	t.Logf("%d acquires by 6 nodes", acquired.Load())
+}
+
+// A slot that fails its checksum, such as one torn by a crash mid-write,
+// counts as a claim, so no node takes the lock past it.
+func TestTornSlotCountsAsClaim(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	tearSlot(t, a, LockTypeInode, 51, 2)
+	requireBlocked(t, a, LockTypeInode, 51, LockModeShared)
+
+	if err := a.writeSlot(a.hashToRecord(LockTypeInode, 51), 2, nil); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, a, LockTypeInode, 51, LockModeShared)
+}
+
+// Readers on two nodes hold one record together; a writer waits for both.
+func TestSlotReadersShareWritersWait(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+	w := newTestNode(dev, 0, 1<<20, 3)
+	requireAcquired(t, a, LockTypeInode, 52, LockModeShared)
+	requireAcquired(t, b, LockTypeInode, 52, LockModeShared)
+	requireBlocked(t, w, LockTypeInode, 52, LockModeExclusive)
+	for _, m := range []*Manager{a, b} {
+		if err := m.Release(LockTypeInode, 52); err != nil {
+			t.Fatal(err)
+		}
+		m.ReleaseCached()
+	}
+	requireAcquired(t, w, LockTypeInode, 52, LockModeExclusive)
+}
+
+// Four nodes contend for one write lock with no delays. The lower slot wins
+// each collision, so every node finishes its acquires.
+func TestContendedSlotClaimsAllFinish(t *testing.T) {
+	const region = 8 * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	start := time.Now()
+	var conflicts, waits, deferred atomic.Uint64
+	var wg sync.WaitGroup
+	for n := 1; n <= 4; n++ {
+		m := newTestNode(dev, 0, region, n)
+		wg.Go(func() {
+			defer func() {
+				conflicts.Add(m.conflicts.Load())
+				waits.Add(m.waits.Load())
+				deferred.Add(m.deferred.Load())
+			}()
+			for range 25 {
+				if err := acquireWithin(m, 10*time.Second, LockTypeInode, 53, LockModeExclusive); err != nil {
+					t.Errorf("node %d: %v", n, err)
+					return
+				}
+				if err := m.Release(LockTypeInode, 53); err != nil {
+					t.Errorf("node %d Release: %v", n, err)
+				}
+				m.ReleaseCached()
+			}
+		})
+	}
+	wg.Wait()
+	t.Logf("100 contended acquires by 4 nodes took %v: %d claims cleared, %d kept to wait, %d tries waited for a lower slot",
+		time.Since(start).Round(time.Millisecond), conflicts.Load(), waits.Load(), deferred.Load())
+}
+
+// Two claims race: the first node's slot write completes, then it stalls before
+// reading the row while the second node claims. Whichever slot is lower wins,
+// and the other never holds beside it.
+func TestRacingClaimsLowerSlotWins(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		firstSlot, another int
+	}{
+		{"first claimant in the lower slot", 1, 2},
+		{"first claimant in the higher slot", 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, 1<<20)
+			defer cleanup()
+			first := newTestNode(dev, 0, 1<<20, tc.firstSlot)
+			second := newTestNode(dev, 0, 1<<20, tc.another)
+			written, proceed := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			first.slotWrite = func(buf []byte, offset int64) (int, error) {
+				n, err := first.dev.WriteAt(buf, offset)
+				once.Do(func() { close(written); <-proceed })
+				return n, err
+			}
+
+			firstErr := make(chan error, 1)
+			go func() { firstErr <- acquireWithin(first, 2*time.Second, LockTypeInode, 54, LockModeExclusive) }()
+			<-written
+			secondErr := make(chan error, 1)
+			go func() { secondErr <- acquireWithin(second, 2*time.Second, LockTypeInode, 54, LockModeExclusive) }()
+			time.Sleep(100 * time.Millisecond)
+			close(proceed)
+
+			winner, loser, winErr, loseErr := first, second, firstErr, secondErr
+			if second.nodeSlot < first.nodeSlot {
+				winner, loser, winErr, loseErr = second, first, secondErr, firstErr
+			}
+			if err := <-winErr; err != nil {
+				t.Fatalf("node in slot %d: %v", winner.nodeSlot, err)
+			}
+			select {
+			case err := <-loseErr:
+				t.Fatalf("node in slot %d returned %v while slot %d held the lock", loser.nodeSlot, err, winner.nodeSlot)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if err := winner.Release(LockTypeInode, 54); err != nil {
+				t.Fatal(err)
+			}
+			winner.ReleaseCached()
+			if err := <-loseErr; err != nil {
+				t.Fatalf("node in slot %d after the winner released: %v", loser.nodeSlot, err)
+			}
+		})
+	}
+}
+
+// A node that stops mid-claim leaves its slot. Whether that slot is below or
+// above a live claimant's, the live one gets the lock once the slot is stale.
+func TestDeadClaimantBlocksOnlyUntilStale(t *testing.T) {
+	for _, deadSlot := range []int{1, 5} {
+		t.Run(fmt.Sprintf("dead claimant in slot %d", deadSlot), func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, 1<<20)
+			defer cleanup()
+			live := newTestNode(dev, 0, 1<<20, 3)
+			writeClaim(t, live, LockTypeInode, 55, deadSlot, LockModeExclusive)
+			requireBlocked(t, live, LockTypeInode, 55, LockModeExclusive)
+
+			dead := newTestNode(dev, 0, 1<<20, deadSlot)
+			ageSlot(t, dead, LockTypeInode, 55, pastStale)
+			requireAcquired(t, live, LockTypeInode, 55, LockModeExclusive)
+		})
+	}
+}
+
+// A lower-slot node gives up waiting for a holder. It clears the claim it kept,
+// so a higher-slot node gets the lock as soon as the holder lets go.
+func TestAbandonedClaimIsCleared(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	low := newTestNode(dev, 0, 1<<20, 1)
+	holder := newTestNode(dev, 0, 1<<20, 2)
+	high := newTestNode(dev, 0, 1<<20, 3)
+	requireAcquired(t, holder, LockTypeInode, 56, LockModeExclusive)
+	requireBlocked(t, low, LockTypeInode, 56, LockModeExclusive)
+	if err := holder.Release(LockTypeInode, 56); err != nil {
+		t.Fatal(err)
+	}
+	holder.ReleaseCached()
+	requireAcquired(t, high, LockTypeInode, 56, LockModeExclusive)
+}
+
+// Slot writes as slow as the slowest seen on CI, 333ms, make claims slow but
+// never keep a record from other nodes once its holder lets go.
+func TestSlowSlotWritesCauseNoFreeze(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	nodes := []*Manager{newTestNode(dev, 0, 1<<20, 1), newTestNode(dev, 0, 1<<20, 2)}
+	for _, m := range nodes {
+		delaySlotWrites(m, func() time.Duration { return 333 * time.Millisecond })
+	}
+	start := time.Now()
+	for round := range 4 {
+		m := nodes[round%2]
+		if err := acquireWithin(m, 5*time.Second, LockTypeInode, 57, LockModeExclusive); err != nil {
+			t.Fatalf("round %d, node %d: %v", round, m.nodeSlot, err)
+		}
+		if err := m.Release(LockTypeInode, 57); err != nil {
+			t.Fatal(err)
+		}
+		m.ReleaseCached()
+	}
+	if took := time.Since(start); took > 8*time.Second {
+		t.Fatalf("4 hand-offs with 333ms slot writes took %v", took.Round(time.Millisecond))
+	}
+}
+
+// A cached hold is taken again from memory, with no slot write or row read.
+func TestCachedHoldRejoinNeedsNoDiskIO(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 7); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	writes, reads := a.slotWrites.Load(), a.rowReads.Load()
+	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
+	if a.slotWrites.Load() != writes || a.rowReads.Load() != reads {
+		t.Fatalf("re-acquiring a cached hold did %d slot writes and %d row reads, want none",
+			a.slotWrites.Load()-writes, a.rowReads.Load()-reads)
 	}
 }

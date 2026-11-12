@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// MaxRateLimit is the highest per-client rate limit, in requests per second.
+const MaxRateLimit = 1e6
+
 // Config holds the configuration for the API server.
 type Config struct {
 	// ListenAddr is the address to listen on (e.g., "127.0.0.1:8080" or ":8080").
@@ -41,18 +44,33 @@ type Config struct {
 	// ShutdownTimeout is the maximum duration to wait for graceful shutdown.
 	// Default: 10s
 	ShutdownTimeout time.Duration
+
+	// RateLimitEnabled enables rate limiting middleware.
+	// Default: false
+	RateLimitEnabled bool
+
+	// RateLimitRequestsPerSecond is the sustained rate limit per client.
+	// Default: 100
+	RateLimitRequestsPerSecond float64
+
+	// RateLimitBurst is the maximum burst size (token bucket capacity).
+	// Default: 200
+	RateLimitBurst int
 }
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		ListenAddr:      "127.0.0.1:8080",
-		AuthToken:       "",
-		CORSOrigins:     nil,
-		ReadTimeout:     30 * time.Second,
-		WriteTimeout:    30 * time.Second,
-		IdleTimeout:     60 * time.Second,
-		ShutdownTimeout: 10 * time.Second,
+		ListenAddr:                 "127.0.0.1:8080",
+		AuthToken:                  "",
+		CORSOrigins:                nil,
+		ReadTimeout:                30 * time.Second,
+		WriteTimeout:               30 * time.Second,
+		IdleTimeout:                60 * time.Second,
+		ShutdownTimeout:            10 * time.Second,
+		RateLimitEnabled:           false,
+		RateLimitRequestsPerSecond: 100,
+		RateLimitBurst:             200,
 	}
 }
 
@@ -118,6 +136,16 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate rate limit configuration
+	if c.RateLimitEnabled {
+		if !(c.RateLimitRequestsPerSecond > 0) || c.RateLimitRequestsPerSecond > MaxRateLimit {
+			return fmt.Errorf("%w: requests per second must be more than 0 and at most %g", ErrInvalidRateLimit, MaxRateLimit)
+		}
+		if c.RateLimitBurst <= 0 {
+			return fmt.Errorf("%w: burst must be > 0", ErrInvalidRateLimit)
+		}
+	}
+
 	return nil
 }
 
@@ -163,5 +191,13 @@ func (c Config) WithAuthToken(token string) Config {
 // WithCORSOrigins returns a copy of the config with new CORS origins.
 func (c Config) WithCORSOrigins(origins ...string) Config {
 	c.CORSOrigins = origins
+	return c
+}
+
+// WithRateLimit returns a copy of the config with rate limiting enabled.
+func (c Config) WithRateLimit(requestsPerSecond float64, burst int) Config {
+	c.RateLimitEnabled = true
+	c.RateLimitRequestsPerSecond = requestsPerSecond
+	c.RateLimitBurst = burst
 	return c
 }

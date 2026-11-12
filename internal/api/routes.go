@@ -59,6 +59,12 @@ func (s *Server) handleAPIv1(w http.ResponseWriter, r *http.Request) {
 		s.handleStatus(w, r)
 	case strings.HasPrefix(path, "/stats"):
 		s.handleStats(w, r)
+	case path == "/snapshots" || strings.HasPrefix(path, "/snapshots/"):
+		s.handleSnapshots(w, r)
+	case path == "/clones":
+		s.handleClones(w, r)
+	case strings.HasPrefix(path, "/admin/"):
+		s.handleAdmin(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "endpoint not found", "")
 	}
@@ -226,7 +232,7 @@ func (s *Server) handleStatsSFB(w http.ResponseWriter, r *http.Request) {
 
 	stats := provider.SFBStats()
 	if stats == nil {
-		writeError(w, http.StatusNotFound, "sfb stats not available", "block allocator not initialized")
+		writeError(w, http.StatusNotFound, "sfb stats not available", "SFB containers are disabled")
 		return
 	}
 
@@ -270,15 +276,13 @@ func (s *Server) handleStatsAll(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleMetrics handles GET /metrics requests for Prometheus scraping.
+// Delegates to the Prometheus metrics handler for proper metric exposition.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET")
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("# HELP goclusterfs_up Indicates if GoClusterFS is up\n"))
-	w.Write([]byte("# TYPE goclusterfs_up gauge\n"))
-	w.Write([]byte("goclusterfs_up 1\n"))
+	// Delegate to the Prometheus handler
+	s.GetMetricsHandler().ServeHTTP(w, r)
 }

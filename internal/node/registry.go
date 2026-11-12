@@ -609,11 +609,8 @@ func (r *Registry) GetActiveNodes() ([]*Slot, error) {
 }
 
 // Slots returns every node slot, with nil for empty or unreadable ones. The
-// error names the unreadable ones.
+// error names the unreadable ones. It holds no lock, so it never delays a heartbeat.
 func (r *Registry) Slots() ([]*Slot, error) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	slots := make([]*Slot, MaxNodes)
 	var errs []error
 	for i := range slots {
@@ -844,7 +841,7 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		JournalOffset: slot.JournalOffset,
 		JournalSize:   slot.JournalSize,
 		LastHeartbeat: time.Unix(slot.HeartbeatTime, 0),
-		Hostname:      hostnameOf(slot),
+		Hostname:      slot.Host(),
 		CheckLease:    r.leaseCheck(slotIdx, slot.UUID),
 	}, nil
 }

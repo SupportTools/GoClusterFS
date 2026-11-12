@@ -63,7 +63,7 @@ newgrp fuse
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
 | Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
-| Ports | UDP 31337 (configurable). TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
+| Ports | UDP 31337 (multicast) and UDP 31338 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
 | Latency | < 10ms between nodes recommended |
 
 ---
@@ -77,11 +77,11 @@ newgrp fuse
 git clone https://github.com/supporttools/GoClusterFS.git
 cd GoClusterFS
 
-# Build goclusterfs-mount and goclusterfs-fsck
+# Build goclusterfs-mount, goclusterfs-fsck and gfsctl
 make build
 
 # Optional: Install to system path
-sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
+sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ```
 
 ### Verify Build
@@ -89,6 +89,7 @@ sudo cp goclusterfs-mount goclusterfs-fsck /usr/local/bin/
 ```bash
 ./goclusterfs-mount -version
 ./goclusterfs-fsck -version
+./gfsctl version
 ```
 
 Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the GitHub Releases page.
@@ -97,7 +98,7 @@ Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the
 
 ## Block Device Setup
 
-GoClusterFS can use any O_DIRECT-capable block device of at least 264 MB. The layout reserves 256 MB for 64 node journals of 4 MB.
+GoClusterFS can use any O_DIRECT-capable block device of at least 327 MB. The layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
 
 ### Option 1: File-Backed Device (Development/Testing)
 
@@ -289,7 +290,7 @@ Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock 
 
 ### Step 4: Verify Cluster Communication
 
-Each mount logs `Broadcast: enabled on 239.192.74.75:31337` at startup, or a warning if broadcast could not start. It logs `Broadcast stats` when it unmounts.
+Each mount logs `Broadcast: enabled on 239.192.74.75:31337, unicast port 31338` at startup. If broadcast cannot start, for example because a port is taken, the mount fails; pass `-broadcast=false` to run without it. It logs `Broadcast stats` when it unmounts.
 
 ```bash
 # Verify multicast is working
@@ -421,23 +422,25 @@ Mount logs a `WARNING` line at startup when broadcast is on without a secret.
 
 ### HTTP API Access
 
-The API listens on `127.0.0.1:8080` by default. To scrape `/metrics` or call the API from another host, set a token and a reachable address:
+The API listens on `127.0.0.1:8080` by default. A token turns on the snapshot, clone and admin endpoints and is required for any address other hosts can reach. Keep it in a file only the mount's user can read:
 
 ```bash
-./goclusterfs-mount ... -api-addr :8080 -api-token "$(openssl rand -hex 32)"
+install -m 600 /dev/null /etc/goclusterfs/api-token
+openssl rand -hex 32 > /etc/goclusterfs/api-token
+./goclusterfs-mount ... -api-addr :8080 -api-token-file /etc/goclusterfs/api-token
 ```
 
-Mount refuses a non-loopback `-api-addr` without `-api-token`. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
+Mount refuses a non-loopback `-api-addr` without a token, and a token file that group or others can read. Don't use `-api-token`: every local user can read it in `ps`. The API speaks plain HTTP, so for remote access put a TLS proxy in front of it or use an SSH tunnel. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
 
 ### Firewall Rules
 
 ```bash
 # Allow multicast traffic between cluster nodes
-iptables -A INPUT -p udp --dport 31337 -j ACCEPT
-iptables -A OUTPUT -p udp --dport 31337 -j ACCEPT
+iptables -A INPUT -p udp -m multiport --dports 31337,31338 -j ACCEPT
+iptables -A OUTPUT -p udp -m multiport --dports 31337,31338 -j ACCEPT
 
 # Or with firewalld
-firewall-cmd --permanent --add-port=31337/udp
+firewall-cmd --permanent --add-port=31337-31338/udp
 firewall-cmd --reload
 ```
 

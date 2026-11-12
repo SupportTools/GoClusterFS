@@ -7,18 +7,13 @@
 package storage
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 	"syscall"
-	"time"
 	"unsafe"
 )
-
-// ErrWriteDeadline means WriteAtBefore reached its deadline before it started the write, so nothing was written.
-var ErrWriteDeadline = errors.New("write deadline passed before the write started")
 
 const (
 	// SectorSize is the minimum alignment for O_DIRECT I/O.
@@ -172,40 +167,27 @@ func (d *Device) Path() string {
 	return d.path
 }
 
-// IOTiming splits the time of one I/O call into waiting for this device's
-// locks, which other I/O of this process can hold, and the system call itself.
-type IOTiming struct {
-	Wait, Syscall time.Duration
-}
-
 // ReadAt reads data from the device at the specified offset.
 // Both offset and len(buf) MUST be aligned to SectorSize.
 // Concurrent reads to different 1MB regions proceed in parallel.
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
-	n, _, err := d.ReadAtTimed(buf, offset)
-	return n, err
-}
-
-// ReadAtTimed is ReadAt that also reports where the call's time went.
-func (d *Device) ReadAtTimed(buf []byte, offset int64) (int, IOTiming, error) {
 	return d.readAt(buf, offset, true)
 }
 
-// ReadAtUnshardedTimed is ReadAtTimed without the shard lock, so other I/O to
-// the same 1MB region cannot delay it. Callers must serialize their own I/O to the range.
-func (d *Device) ReadAtUnshardedTimed(buf []byte, offset int64) (int, IOTiming, error) {
+// ReadAtUnsharded is ReadAt without the shard lock, so other I/O to the same
+// 1MB region cannot delay it. Callers must serialize their own I/O to the range.
+func (d *Device) ReadAtUnsharded(buf []byte, offset int64) (int, error) {
 	return d.readAt(buf, offset, false)
 }
 
-func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, IOTiming, error) {
+func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
-		return 0, IOTiming{}, err
+		return 0, err
 	}
 	if len(buf) == 0 {
-		return 0, IOTiming{}, nil
+		return 0, nil
 	}
 
-	start := time.Now()
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
@@ -215,46 +197,30 @@ func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, IOTiming, 
 		defer d.unlockIORange(startShard, endShard)
 	}
 
-	issued := time.Now()
-	n, err := d.file.ReadAt(buf, offset)
-	return n, IOTiming{Wait: issued.Sub(start), Syscall: time.Since(issued)}, err
+	return d.file.ReadAt(buf, offset)
 }
 
 // WriteAt writes data to the device at the specified offset.
 // Both offset and len(buf) MUST be aligned to SectorSize.
 // Concurrent writes to different 1MB regions proceed in parallel.
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
-	return d.WriteAtBefore(buf, offset, time.Time{})
+	return d.writeAt(buf, offset, true)
 }
 
-// WriteAtBefore is WriteAt, except that it writes nothing and returns
-// ErrWriteDeadline if deadline has passed once it holds the I/O shard and is
-// about to start the write. A zero deadline never passes.
-func (d *Device) WriteAtBefore(buf []byte, offset int64, deadline time.Time) (int, error) {
-	n, _, err := d.WriteAtBeforeTimed(buf, offset, deadline)
-	return n, err
+// WriteAtUnsharded is WriteAt without the shard lock, so other I/O to the same
+// 1MB region cannot delay it. Callers must serialize their own I/O to the range.
+func (d *Device) WriteAtUnsharded(buf []byte, offset int64) (int, error) {
+	return d.writeAt(buf, offset, false)
 }
 
-// WriteAtBeforeTimed is WriteAtBefore that also reports where the call's time went.
-func (d *Device) WriteAtBeforeTimed(buf []byte, offset int64, deadline time.Time) (int, IOTiming, error) {
-	return d.writeAtBefore(buf, offset, deadline, true)
-}
-
-// WriteAtBeforeUnshardedTimed is WriteAtBeforeTimed without the shard lock, so
-// other I/O to the same 1MB region cannot delay it. Callers must serialize their own I/O to the range.
-func (d *Device) WriteAtBeforeUnshardedTimed(buf []byte, offset int64, deadline time.Time) (int, IOTiming, error) {
-	return d.writeAtBefore(buf, offset, deadline, false)
-}
-
-func (d *Device) writeAtBefore(buf []byte, offset int64, deadline time.Time, sharded bool) (int, IOTiming, error) {
+func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
-		return 0, IOTiming{}, err
+		return 0, err
 	}
 	if len(buf) == 0 {
-		return 0, IOTiming{}, nil
+		return 0, nil
 	}
 
-	start := time.Now()
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
@@ -264,12 +230,7 @@ func (d *Device) writeAtBefore(buf []byte, offset int64, deadline time.Time, sha
 		defer d.unlockIORange(startShard, endShard)
 	}
 
-	issued := time.Now()
-	if !deadline.IsZero() && !issued.Before(deadline) {
-		return 0, IOTiming{Wait: issued.Sub(start)}, ErrWriteDeadline
-	}
-	n, err := d.file.WriteAt(buf, offset)
-	return n, IOTiming{Wait: issued.Sub(start), Syscall: time.Since(issued)}, err
+	return d.file.WriteAt(buf, offset)
 }
 
 // Sync ensures all written data is persisted to the device.

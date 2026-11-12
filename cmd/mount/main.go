@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,6 +23,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
+	"github.com/supporttools/GoClusterFS/internal/fileops"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
@@ -29,66 +31,43 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
+	"github.com/supporttools/GoClusterFS/internal/stats"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 	"github.com/supporttools/GoClusterFS/internal/version"
 )
 
-// fsStatusProvider implements api.StatusProvider by wrapping the filesystem.
 type fsStatusProvider struct {
 	mountPath  string
 	devicePath string
-	dev        *storage.Device
-	bitmapMgr  *bitmap.Region
+	sampler    *stats.Sampler
 }
 
-func (p *fsStatusProvider) MountPath() string  { return p.mountPath }
-func (p *fsStatusProvider) DevicePath() string { return p.devicePath }
+func (p *fsStatusProvider) MountPath() string           { return p.mountPath }
+func (p *fsStatusProvider) DevicePath() string          { return p.devicePath }
+func (p *fsStatusProvider) MountState() api.MountState  { return api.MountStateMounted }
+func (p *fsStatusProvider) Capacity() *api.CapacityInfo { return p.sampler.Capacity() }
 
-func (p *fsStatusProvider) MountState() api.MountState {
-	// If we get here, the filesystem is mounted and running
-	return api.MountStateMounted
-}
-
-func (p *fsStatusProvider) Capacity() *api.CapacityInfo {
-	totalBlocks := p.bitmapMgr.TotalBlocks()
-	freeBlocks := p.bitmapMgr.FreeCount()
-	usedBlocks := totalBlocks - freeBlocks
-
-	const blockSize uint64 = goclusterfs.BlockSize
-	totalBytes := totalBlocks * blockSize
-	usedBytes := usedBlocks * blockSize
-	freeBytes := freeBlocks * blockSize
-
-	var usedPercent float64
-	if totalBlocks > 0 {
-		usedPercent = float64(usedBlocks) / float64(totalBlocks) * 100
-	}
-
-	return &api.CapacityInfo{
-		TotalBytes:     totalBytes,
-		UsedBytes:      usedBytes,
-		FreeBytes:      freeBytes,
-		UsedPercent:    usedPercent,
-		TotalBlocks:    totalBlocks,
-		UsedBlocks:     usedBlocks,
-		FreeBlocks:     freeBlocks,
-		BlockSizeBytes: blockSize,
-	}
-}
-
-func apiConfig(addr, token, corsList string) api.Config {
+func apiConfig(addr, token, corsList string, rateLimit float64) api.Config {
 	var origins []string
 	for _, origin := range strings.Split(corsList, ",") {
 		if origin = strings.TrimSpace(origin); origin != "" {
 			origins = append(origins, origin)
 		}
 	}
-	return api.DefaultConfig().
+	cfg := api.DefaultConfig().
 		WithListenAddr(addr).
 		WithAuthToken(token).
 		WithCORSOrigins(origins...)
+	if rateLimit != 0 {
+		burst := 1
+		if rateLimit > 0 && rateLimit <= api.MaxRateLimit {
+			burst = int(math.Ceil(2 * rateLimit))
+		}
+		cfg = cfg.WithRateLimit(rateLimit, burst)
+	}
+	return cfg
 }
 
 func main() {
@@ -113,7 +92,8 @@ func main() {
 		// Network broadcast configuration
 		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
 		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group address")
-		multicastPort    = flag.Int("mcast-port", 31337, "Multicast/unicast port")
+		multicastPort    = flag.Int("mcast-port", 31337, "UDP port for multicast messages")
+		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
 
@@ -129,10 +109,12 @@ func main() {
 		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
 
 		// API server configuration
-		apiEnabled = flag.Bool("api", true, "Enable HTTP API server for management")
-		apiAddr    = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs -api-token")
-		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled, loopback only)")
-		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
+		apiEnabled   = flag.Bool("api", true, "Enable HTTP API server for management")
+		apiAddr      = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs a token")
+		apiTokenFile = flag.String("api-token-file", "", "File (mode 0600) holding the API bearer token; a token also turns on API writes. Or set "+apiTokenEnv)
+		apiToken     = flag.String("api-token", "", "API bearer token; visible to all local users in ps, prefer -api-token-file")
+		apiCORS      = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
+		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
 	)
 	flag.Parse()
 
@@ -147,7 +129,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS)
+	token, tokenSrc, err := loadAPIToken(*apiTokenFile, *apiToken)
+	if err != nil {
+		log.Fatalf("Invalid API settings: %v", err)
+	}
+	if tokenSrc == tokenFromFlag {
+		log.Printf("WARNING: -api-token is visible to every local user in ps and /proc/<pid>/cmdline, and it unlocks API writes. Use -api-token-file or %s instead.", apiTokenEnv)
+	}
+	apiCfg := apiConfig(*apiAddr, token, *apiCORS, *apiRate)
 	if *apiEnabled {
 		if err := apiCfg.Validate(); err != nil {
 			log.Fatalf("Invalid API settings: %v", err)
@@ -157,11 +146,11 @@ func main() {
 			if errors.Is(err, api.ErrWildcardCORSWithoutToken) {
 				hint = "list the allowed origins in -api-cors"
 			}
-			log.Fatalf("Refusing to start the API: %v. Set -api-token, %s, or pass -api=false", err, hint)
+			log.Fatalf("Refusing to start the API: %v. Set -api-token-file (or %s), %s, or pass -api=false", err, apiTokenEnv, hint)
 		}
 	}
 	if *broadcastEnabled && *broadcastSecret == "" {
-		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to port %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort)
+		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to ports %d and %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort, *unicastPort)
 	}
 
 	// Check mount point exists
@@ -303,7 +292,7 @@ func main() {
 		Enabled:              *broadcastEnabled,
 		MulticastGroup:       *multicastGroup,
 		MulticastPort:        *multicastPort,
-		UnicastPort:          *multicastPort,
+		UnicastPort:          *unicastPort,
 		MulticastTTL:         1, // Same subnet
 		MaxMulticastFailures: 3,
 		HeartbeatInterval:    30 * time.Second,
@@ -331,12 +320,13 @@ func main() {
 
 	// Start network broadcast for cross-node cache invalidation
 	if *broadcastEnabled {
+		// Without broadcast, peers see this node's changes only after -cache-ttl,
+		// so a mount that asked for broadcast does not continue without it.
 		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
-			log.Printf("Warning: Failed to start cache broadcast: %v (continuing without broadcast)", err)
-		} else if cacheMgr.BroadcastEnabled() {
-			log.Printf("Broadcast: enabled on %s:%d (secret=%v)",
-				*multicastGroup, *multicastPort, *broadcastSecret != "")
+			log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
 		}
+		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
+			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
 	} else {
 		log.Println("Broadcast: disabled (using storage-only cache validation)")
 	}
@@ -442,25 +432,35 @@ func main() {
 
 	// Start API server for management and monitoring
 	var apiServer *api.Server
+	var sampler *stats.Sampler
 	if *apiEnabled {
 		var err error
 		apiServer, err = api.NewServer(apiCfg)
 		if err != nil {
 			log.Printf("Warning: Failed to create API server: %v", err)
 		} else {
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, j, trimMgr, bm, nodeReg))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
-				dev:        dev,
-				bitmapMgr:  bm,
+				sampler:    sampler,
 			})
+			apiServer.SetStatsProvider(sampler)
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
+			apiServer.SetFileService(fileops.New(*mountPoint, gfs.SnapshotRegistry()))
+			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start API server: %v", err)
+				apiServer.Stop()
 				apiServer = nil
+				sampler.Stop()
+				sampler = nil
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
+				if !apiServer.WritesEnabled() {
+					log.Printf("API: snapshot, clone and admin endpoints are off; set -api-token-file or %s to turn them on", apiTokenEnv)
+				}
 			}
 		}
 	} else {
@@ -479,6 +479,7 @@ func main() {
 			if err := apiServer.Stop(); err != nil {
 				log.Printf("Warning: Failed to stop API server: %v", err)
 			}
+			sampler.Stop()
 		}
 
 		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
@@ -506,6 +507,7 @@ func main() {
 		if err := apiServer.Stop(); err != nil {
 			log.Printf("Warning: Failed to stop API server on exit: %v", err)
 		}
+		sampler.Stop()
 	}
 
 	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
@@ -541,14 +543,25 @@ func main() {
 	}
 
 	// Print final cache stats
-	stats := cacheMgr.Stats()
-	log.Printf("Cache stats: %s", stats)
-	if stats.BroadcastEnabled {
+	cacheStats := cacheMgr.Stats()
+	log.Printf("Cache stats: %s", cacheStats)
+	if cacheStats.BroadcastEnabled {
 		log.Printf("Broadcast stats: sent=%d, received=%d, duplicates=%d",
-			stats.InvalidationsSent, stats.InvalidationsReceived, stats.BroadcastDuplicates)
+			cacheStats.InvalidationsSent, cacheStats.InvalidationsReceived, cacheStats.BroadcastDuplicates)
 	}
 
 	log.Println("Filesystem unmounted.")
+}
+
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry) stats.Sources {
+	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
+	if j != nil {
+		src.Journal = j
+	}
+	if trimMgr != nil {
+		src.Trim = trimMgr
+	}
+	return src
 }
 
 // adoptLocks takes over a dead node's exclusive locks and clears its read holds
