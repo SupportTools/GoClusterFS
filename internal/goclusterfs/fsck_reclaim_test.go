@@ -4,17 +4,20 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -278,4 +281,53 @@ func flipByte(t *testing.T, fsys *FS, off int64) {
 	if _, err := fsys.dev.WriteAt(buf.Bytes(), sector); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// A file that grows out of its SFB slot moves to a full block and leaves its
+// container empty. SFB allocation is disabled, so the empty container is
+// leaked. Repair frees it and keeps a container that another file still uses.
+func TestFsckRepairFreesEmptySFBContainers(t *testing.T) {
+	path := newFormattedImage(t)
+	fsys := openFormattedFS(t, path)
+	ctx := context.Background()
+	root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := func(f *File, name string) {
+		if err := fsys.dirMgr.Add(ctx, root, name, uint64(f.inodeNum), dir.DT_REG); err != nil {
+			t.Fatalf("add %s: %v", name, err)
+		}
+	}
+	kept, emptied := newSFBContainer(t, fsys, sfb.Tier16KB), newSFBContainer(t, fsys, sfb.Tier16KB)
+	small := newSFBFile(t, fsys, kept, sfb.Tier16KB, 1, pattern(1, 5000))
+	link(small, "small.txt")
+	moved := newSFBFile(t, fsys, emptied, sfb.Tier16KB, 1, pattern(2, 10000))
+	link(moved, "moved.txt")
+	writeAt(t, moved, pattern(3, 10000), 10000)
+	if sfbSlotUsed(t, fsys, emptied, 1) {
+		t.Fatal("growing moved.txt past its slot did not free the slot")
+	}
+	free := fsys.bitmapMgr.FreeCount()
+
+	check := runFsck(t, fsys, fsck.DefaultOptions())
+	if problems := problemList(check); !strings.Contains(problems, fmt.Sprintf("block %d: leaked", emptied)) ||
+		strings.Contains(problems, fmt.Sprintf("block %d: leaked", kept)) {
+		t.Fatalf("check should report container %d as leaked and keep %d:%s", emptied, kept, problems)
+	}
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitCorrected {
+		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), fsck.ExitCorrected, problemList(r))
+	}
+	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
+		t.Fatalf("problems left after repair:%s", problemList(r))
+	}
+
+	fsys = openFormattedFS(t, path)
+	if got := fsys.bitmapMgr.FreeCount(); got != free+1 {
+		t.Fatalf("%d free blocks after repair, want %d", got, free+1)
+	}
+	checkFile(t, lookupFile(t, fsys, "small.txt"), pattern(1, 5000))
+	checkFile(t, lookupFile(t, fsys, "moved.txt"), append(pattern(2, 10000), pattern(3, 10000)...))
 }

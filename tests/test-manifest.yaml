@@ -924,6 +924,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
 
+  - id: fsck-reclaim-empty-sfb-containers
+    name: fsck -repair frees SFB containers no file uses
+    description: A file that grows out of its SFB slot leaves its container empty; check reports it as leaked, repair frees it and keeps a container another file still uses, and both files keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairFreesEmptySFBContainers
+
   - id: fsck-reclaim-keeps-unplaced-leaks
     name: fsck -repair keeps leaked blocks it cannot place
     description: An unreadable inode, a damaged extent tree, a mounted node, or a dirty journal under -force makes repair keep leaked blocks and say why
