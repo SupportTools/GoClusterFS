@@ -604,13 +604,13 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 	if _, err := applyInodeCreate(ctx, rctx, (&InodeCreatePayload{InodeNum: 50, Mode: 0644}).Serialize()); err != nil {
 		t.Fatal(err)
 	}
-	for _, b := range []uint64{1, 2, 3, 9} {
+	for _, b := range []uint64{1, 2, 3, 5} {
 		if _, err := applyBlockAlloc(ctx, rctx, (&BlockAllocPayload{InodeNum: 50, StartBlock: b, Count: 1, Purpose: BlockPurposeData}).Serialize()); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// File blocks 0-2 map disk blocks 1-3, but block 2 was rewritten elsewhere after the free was logged.
-	for _, e := range []*ExtentAddPayload{{InodeNum: 50, FileBlock: 0, DiskBlock: 1, Length: 2}, {InodeNum: 50, FileBlock: 2, DiskBlock: 9, Length: 1}} {
+	for _, e := range []*ExtentAddPayload{{InodeNum: 50, FileBlock: 0, DiskBlock: 1, Length: 2}, {InodeNum: 50, FileBlock: 2, DiskBlock: 5, Length: 1}} {
 		if _, err := applyExtentAdd(ctx, rctx, e.Serialize()); err != nil {
 			t.Fatal(err)
 		}
@@ -635,7 +635,7 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 	if ino, err = rctx.InodeTbl.Read(50); err != nil {
 		t.Fatal(err)
 	}
-	for file, disk := range map[uint64]uint64{0: 1, 2: 9} {
+	for file, disk := range map[uint64]uint64{0: 1, 2: 5} {
 		if got, err := rctx.ExtentMgr.LookupPhysical(ino, file); err != nil || got != disk {
 			t.Errorf("file block %d maps %d (err %v), want disk block %d", file, got, err, disk)
 		}
@@ -643,7 +643,7 @@ func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
 	if _, err := rctx.ExtentMgr.LookupPhysical(ino, 1); err == nil {
 		t.Error("file block 1 still mapped after its free was replayed")
 	}
-	for disk, want := range map[uint64]bool{1: true, 2: false, 3: true, 9: true} {
+	for disk, want := range map[uint64]bool{1: true, 2: false, 3: true, 5: true} {
 		if got, err := rctx.BitmapMgr.IsAllocated(disk); err != nil || got != want {
 			t.Errorf("disk block %d allocated = %v (err %v), want %v", disk, got, err, want)
 		}
