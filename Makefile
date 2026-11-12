@@ -139,14 +139,14 @@ check-qemu:
 	@echo "QEMU is available"
 
 # Run multi-node tests in QEMU VMs
-test-multinode-vm: check-qemu build-mount
+test-multinode-vm: check-qemu build-mount build-fsck
 	@echo "Running multi-node VM tests..."
 	@mkdir -p tests/vm/results
 	$(VM_TEST_HARNESS) --run-tests --nodes=2
 	@echo "VM tests completed"
 
 # Run VM tests with more nodes
-test-multinode-vm-3: check-qemu build-mount
+test-multinode-vm-3: check-qemu build-mount build-fsck
 	@echo "Running multi-node VM tests (3 nodes)..."
 	@mkdir -p tests/vm/results
 	$(VM_TEST_HARNESS) --run-tests --nodes=3

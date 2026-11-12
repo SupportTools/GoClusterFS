@@ -389,7 +389,7 @@ goclusterfs-fsck -repair /dev/device
 goclusterfs-mount -device /dev/device -mount /mnt/cluster
 ```
 
-`-repair` fixes refcounts and the superblock checksum. It never frees blocks, deletes inodes, or edits directories, and there is no `lost+found`. Restore anything else from backup. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide).
+`-repair` fixes refcounts and the superblock checksum, and frees leaked blocks. It never deletes inodes or edits directories, and there is no `lost+found`. Restore anything else from backup. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide).
 
 ---
 
