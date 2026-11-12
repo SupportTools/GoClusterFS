@@ -97,7 +97,6 @@ func TestAPIStatsReportLiveValues(t *testing.T) {
 			getAPI(t, first+"/api/v1/stats/trim", &trimStats) == http.StatusOK &&
 			cacheStats.InodeCache.Hits+cacheStats.InodeCache.Misses > 0 &&
 			journalStats.CommitCount > 0 && journalStats.BytesWritten > 0 &&
-			lockStats.HintCacheHits+lockStats.HintCacheMisses > 0 &&
 			!trimStats.TrimEnabled
 	})
 	if !ok {

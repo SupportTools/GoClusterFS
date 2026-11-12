@@ -344,8 +344,14 @@ func damageJournalHeader(t *testing.T, imagePath, offset string) {
 
 func verifyFiles(t *testing.T, node *MountedFS, names []string) {
 	t.Helper()
+	// The kernel can keep a size it looked up mid-write for -attr-timeout (1s).
+	deadline := time.Now().Add(2 * time.Second)
 	for _, name := range names {
 		got, err := node.ReadFile(name)
+		for err == nil && !bytes.Equal(got, []byte(name)) && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+			got, err = node.ReadFile(name)
+		}
 		if err != nil {
 			t.Errorf("read %s: %v", name, err)
 			continue
