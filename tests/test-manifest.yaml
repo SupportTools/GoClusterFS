@@ -735,6 +735,13 @@ scenarios:
     environments:
       go: internal/journal/checkpoint_test.go::TestScanStopsAtUnreachableTail
 
+  - id: stopped-replay-at-end-reads-empty
+    name: A replay stopped after the last record leaves an empty journal
+    description: Replay stops before its reset after replaying a record that ends at the end of the data area; the head stays at the end, so the next recovery replays nothing again
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestStoppedReplayAtEndLeavesJournalEmpty
+
   - id: create-replays-after-checkpoint-crash
     name: A create cut off after a checkpoint is replayed
     description: A create stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount creates the file and fsck is clean

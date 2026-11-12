@@ -193,3 +193,46 @@ func TestScanStopsAtUnreachableTail(t *testing.T) {
 		t.Fatal("scan still running after 10s with an unreachable tail")
 	}
 }
+
+// Replay that stops after the last record, which ends at the end of the data area, leaves head == tail, which reads as
+// empty: a head of 0 would read as a full ring and replay the previous lap's records again.
+func TestStoppedReplayAtEndLeavesJournalEmpty(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1024*1024)
+	t.Cleanup(cleanup)
+	j, err := Init(dev, 0, uint64(JournalDataOffset)+3*4096, [16]byte{1}, 1, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitIntents(t, j, true)
+	if _, err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	pending := commitIntents(t, j, false)
+	if tail := j.region.TailOffset(); tail != j.region.DataAreaSize() {
+		t.Fatalf("tail %d, want the end of the %d-byte data area", tail, j.region.DataAreaSize())
+	}
+
+	region, err := OpenRegionForRecovery(dev, 0, j.region.regionSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replayed []uint64
+	checks := 0
+	lostLease := errors.New("lost the recovery lease")
+	_, err = RecoverChecked(region, func(txn *RecoveredTxn) error {
+		replayed = append(replayed, txn.Header.Seq)
+		return nil
+	}, func() error {
+		if checks++; checks == 3 {
+			return lostLease
+		}
+		return nil
+	})
+	if !errors.Is(err, lostLease) || !slices.Equal(replayed, pending) {
+		t.Fatalf("first replay = %v, %v; want %v, then the lost lease", replayed, err, pending)
+	}
+
+	if again := replayedAfterCrash(t, j); len(again) > 0 {
+		t.Errorf("replay after the stopped one replayed %v again", again)
+	}
+}
