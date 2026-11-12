@@ -731,7 +731,7 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 		txn = f.journal.Begin()
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 			InodeNum:       uint64(inodeNum),
-			Mode:           mode,
+			Mode:           uint32(inode.S_IFREG) | (mode & 0777),
 			UID:            uid,
 			GID:            gid,
 			ParentInodeNum: uint64(inode.InodeRoot),
@@ -1485,7 +1485,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 		// Log inode creation intent
 		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 			InodeNum:       uint64(inodeNum),
-			Mode:           mode,
+			Mode:           uint32(inode.S_IFREG) | (mode & 0777),
 			UID:            uid,
 			GID:            gid,
 			ParentInodeNum: uint64(d.inodeNum),
