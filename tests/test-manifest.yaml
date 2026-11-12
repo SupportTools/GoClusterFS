@@ -752,13 +752,95 @@ scenarios:
       vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
 
   - id: truncate-replay-keeps-mapped-blocks
-    name: Replay of an interrupted truncate keeps blocks files still map
-    description: A truncate stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount frees no block a file maps, and fsck is clean
+    name: Replay of an interrupted truncate cuts the file and frees exactly the truncated blocks
+    description: A truncate stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount cuts the file to the new size, frees the truncated blocks and no block a file still maps, and fsck is clean
     priority: high
     environments:
       go: internal/goclusterfs/journal_crash_test.go::TestTruncateReplayKeepsMappedBlocks
       docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
       vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: unlink-replay-frees-file
+    name: Replay of an interrupted unlink frees the file
+    description: An unlink in a subdirectory stops between its journal commit and its changes, and the process dies; replay at the next mount removes the entry and frees the inode and its blocks, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestUnlinkReplayFreesFileAndBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: truncate-replay-keeps-snapshot-blocks
+    name: Replay of an interrupted truncate leaves snapshot blocks allocated
+    description: A snapshot shares a file's blocks, then a truncate stops after its commit and the process dies; replay drops only the file's references to the truncated blocks, which stay allocated for the snapshot
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestTruncateReplayKeepsSnapshotBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: unlink-crash-before-inode-free
+    name: Replay of an unlink stuck before its inode free keeps clone blocks
+    description: A clone shares a file's blocks; an unlink waits for the file's inode lock, which another node holds, and the node dies; replay drops the file's references, the clone keeps its blocks and data, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/crash_frees_test.go::TestUnlinkCrashBeforeInodeFreeKeepsCloneBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: unlink-crash-after-inode-free
+    name: Replay after an unlink freed its inode does not free clone blocks
+    description: A clone shares a file's blocks; an unlink frees the inode and the process dies before it frees the blocks; replay frees nothing the clone maps, and fsck -repair leaves a clean volume
+    priority: high
+    environments:
+      go: internal/goclusterfs/crash_frees_test.go::TestUnlinkCrashAfterInodeFreeKeepsCloneBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: unlink-crash-after-block-free
+    name: Replay after an unlink freed its blocks does not free reused blocks
+    description: An unlink frees its inode and blocks, another file reuses a block, and the process dies before closing the intent; replay leaves the reused block allocated, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/crash_frees_test.go::TestUnlinkCrashAfterBlockFreeKeepsReusedBlock
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: failed-write-crash-keeps-reused-block
+    name: Replay after a failed write does not map its freed block again
+    description: A write fails after allocating a block, closes its intent, and frees the block; another file reuses it and the process dies; replay does not map the block into the failed file, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/crash_frees_test.go::TestFailedWriteCrashKeepsReusedBlock
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: extent-free-replay-guard
+    name: ExtentFree replay frees only blocks still mapped where logged
+    description: Replay of an ExtentFree record cuts the size and unmaps and frees a logged block only while the inode is unwritten since the log and maps that disk block at that file block, and is idempotent
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestApplyExtentFreeFreesOnlyStillMappedBlocks
+
+  - id: extent-free-payload-round-trip
+    name: ExtentFree record serialization
+    description: An ExtentFree record serializes and deserializes, and a payload shorter than its extent count is rejected
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestExtentFreePayloadRoundTrip
+
+  - id: failed-write-frees-blocks
+    name: Failed writes give back their blocks
+    description: A write whose inode write fails frees the blocks it allocated; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/failure_frees_test.go::TestFailedWriteFreesItsBlocks
+
+  - id: failed-mkdir-frees-block
+    name: Failed mkdirs give back their block
+    description: A mkdir whose inode write fails removes its entry and frees the new directory's block; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/failure_frees_test.go::TestFailedMkdirFreesItsBlock
 
   - id: intent-completion-serialize
     name: IntentCompletion serialization

@@ -9,7 +9,6 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -25,15 +24,11 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
-// failWrite writes data at off and makes the final inode commit fail, as a
-// failing device would. A write persists the inode each time it allocates, so
-// only the block it allocated last leaks; a one-block write leaks that block.
-func failWrite(t *testing.T, f *File, data []byte, off int64) {
+// leakBlock allocates a block that no inode maps, as a crash between an allocation and its inode write leaves.
+func leakBlock(t *testing.T, fsys *FS) {
 	t.Helper()
-	testHookBeforeInodeCommit = func() error { return errors.New("injected inode write failure") }
-	defer func() { testHookBeforeInodeCommit = nil }()
-	if _, errno := f.Write(context.Background(), nil, data, off); errno != syscall.EIO {
-		t.Fatalf("write with a failing inode commit: errno %v, want EIO", errno)
+	if _, err := fsys.bitmapMgr.Alloc(context.Background(), 1); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -112,9 +107,9 @@ func TestFsckRepairReclaimsLeakedBlocks(t *testing.T) {
 	pairBlock := physicalBlock(t, fsys, pair.inodeNum, 0)
 	free := fsys.bitmapMgr.FreeCount()
 
-	failWrite(t, grow, pattern(4, 4096), BlockSize)
+	leakBlock(t, fsys)
 	if got := fsys.bitmapMgr.FreeCount(); got != free-1 {
-		t.Fatalf("the failed write leaked %d blocks, want 1", free-got)
+		t.Fatalf("leaked %d blocks, want 1", free-got)
 	}
 	deleteWithTimedOutFree(t, fsys, "victim.bin")
 	deleteWithTimedOutFree(t, fsys, "clone.bin")
@@ -272,8 +267,8 @@ func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 				t.Fatal(err)
 			}
 			// One leaked block with no count, and one a cloned pair left with a count of 2.
-			f := createFile(t, fsys, "f.bin")
-			failWrite(t, f, pattern(8, 4096), 0)
+			createFile(t, fsys, "f.bin")
+			leakBlock(t, fsys)
 			pair := createFile(t, fsys, "pair-a.bin")
 			writeAt(t, pair, pattern(9, 100), 0)
 			setxattr(t, pair, "user.clone", "/pair-b.bin")

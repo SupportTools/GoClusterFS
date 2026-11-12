@@ -594,3 +594,80 @@ func TestReplayJournalNeverInitializedAndDamaged(t *testing.T) {
 		t.Errorf("ReplayJournal on a slot with a damaged header: error %v, want %v", err, ErrInvalidJournalMagic)
 	}
 }
+
+// Replay frees a logged block only while the inode is unwritten since the log and still maps it at the logged file block.
+func TestApplyExtentFreeFreesOnlyStillMappedBlocks(t *testing.T) {
+	rctx, cleanup := testRecoveryContext(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := applyInodeCreate(ctx, rctx, (&InodeCreatePayload{InodeNum: 50, Mode: 0644}).Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []uint64{1, 2, 3, 5} {
+		if _, err := applyBlockAlloc(ctx, rctx, (&BlockAllocPayload{InodeNum: 50, StartBlock: b, Count: 1, Purpose: BlockPurposeData}).Serialize()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// File blocks 0-2 map disk blocks 1-3, but block 2 was rewritten elsewhere after the free was logged.
+	for _, e := range []*ExtentAddPayload{{InodeNum: 50, FileBlock: 0, DiskBlock: 1, Length: 2}, {InodeNum: 50, FileBlock: 2, DiskBlock: 5, Length: 1}} {
+		if _, err := applyExtentAdd(ctx, rctx, e.Serialize()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ino, err := rctx.InodeTbl.Read(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino.Size = 3 << 20
+	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	if ino, err = rctx.InodeTbl.Read(50); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration - 1, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
+	if applied, err := applyExtentFree(ctx, rctx, stale.Serialize()); err != nil || applied {
+		t.Fatalf("applyExtentFree logged before a later inode write = %v, %v; want false, nil", applied, err)
+	}
+	free := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration, Size: 1 << 20, Extents: []FreedExtent{{FileBlock: 1, DiskBlock: 2, Length: 2}}}
+	if applied, err := applyExtentFree(ctx, rctx, free.Serialize()); err != nil || !applied {
+		t.Fatalf("applyExtentFree = %v, %v; want true, nil", applied, err)
+	}
+	if applied, err := applyExtentFree(ctx, rctx, free.Serialize()); err != nil || applied {
+		t.Fatalf("second applyExtentFree = %v, %v; want false, nil", applied, err)
+	}
+
+	if ino, err = rctx.InodeTbl.Read(50); err != nil {
+		t.Fatal(err)
+	}
+	if ino.Size != 1<<20 {
+		t.Errorf("size after the replayed free = %d, want %d", ino.Size, 1<<20)
+	}
+	for file, disk := range map[uint64]uint64{0: 1, 2: 5} {
+		if got, err := rctx.ExtentMgr.LookupPhysical(ino, file); err != nil || got != disk {
+			t.Errorf("file block %d maps %d (err %v), want disk block %d", file, got, err, disk)
+		}
+	}
+	if got, err := rctx.ExtentMgr.LookupPhysical(ino, 1); err != nil || got != extent.Hole {
+		t.Errorf("file block 1 maps %d (err %v) after its free was replayed, want a hole", got, err)
+	}
+	for disk, want := range map[uint64]bool{1: true, 2: false, 3: true, 5: true} {
+		if got, err := rctx.BitmapMgr.IsAllocated(disk); err != nil || got != want {
+			t.Errorf("disk block %d allocated = %v (err %v), want %v", disk, got, err, want)
+		}
+	}
+}
+
+func TestExtentFreePayloadRoundTrip(t *testing.T) {
+	p := &ExtentFreePayload{InodeNum: 7, MetaGeneration: 99, Size: 4096, Extents: []FreedExtent{{1, 10, 3}, {8, 40, 1}}}
+	got, err := DeserializeExtentFree(p.Serialize())
+	if err != nil || got.InodeNum != 7 || got.MetaGeneration != 99 || got.Size != 4096 || len(got.Extents) != 2 || got.Extents[1] != p.Extents[1] {
+		t.Fatalf("round trip = %+v, %v; want %+v", got, err, p)
+	}
+	short := p.Serialize()[:40]
+	if _, err := DeserializeExtentFree(short); err == nil {
+		t.Error("DeserializeExtentFree accepted a payload shorter than its extent count")
+	}
+}
