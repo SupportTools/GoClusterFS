@@ -701,8 +701,8 @@ func (f *FS) closeIntent(seq uint64) {
 	}
 }
 
-// afterCreateCommit runs between a root create's commit and its first change; tests stop there as a crash would.
-var afterCreateCommit func()
+// afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.
+var afterCommit func(op string)
 
 // createFileInternal implements file creation for the root directory.
 func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
@@ -756,8 +756,8 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 			return nil, nil, 0, syscall.EIO
 		}
 		defer f.closeIntent(intentSeq)
-		if afterCreateCommit != nil {
-			afterCreateCommit()
+		if afterCommit != nil {
+			afterCommit("create")
 		}
 	}
 	// === End WAL transaction - intent is now durable ===
@@ -3237,6 +3237,9 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 			return syscall.EIO, nil
 		}
 		defer f.fs.closeIntent(intentSeq)
+		if afterCommit != nil {
+			afterCommit("setattr")
+		}
 	}
 	// === End WAL transaction ===
 
