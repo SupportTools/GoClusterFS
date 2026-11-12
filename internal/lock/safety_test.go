@@ -384,6 +384,8 @@ func TestReleasedHoldIsCachedForGrace(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
+	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
+	cacheGrace = 200 * time.Millisecond
 
 	requireAcquired(t, a, LockTypeInode, 6, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 6); err != nil {
@@ -398,12 +400,31 @@ func TestReleasedHoldIsCachedForGrace(t *testing.T) {
 	}
 }
 
+func TestIdleCachedHoldFreesBeforeTurnEnds(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	a := newTestNode(dev, 0, 1<<20, 1)
+	b := newTestNode(dev, 0, 1<<20, 2)
+
+	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
+	if err := a.Release(LockTypeInode, 7); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	start := time.Now()
+	requireAcquired(t, b, LockTypeInode, 7, LockModeExclusive)
+	if waited := time.Since(start); waited >= holdTurn {
+		t.Fatalf("other node waited %v for an idle hold, want less than the %v turn a busy holder gets", waited, holdTurn)
+	}
+}
+
 func TestPausedNodeDropsCachedHoldTakenOver(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
 	defer func(d time.Duration) { renewAfter = d }(renewAfter)
+	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
+	cacheGrace = time.Minute
 
 	requireAcquired(t, a, LockTypeInode, 8, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 8); err != nil {
@@ -422,13 +443,15 @@ func TestReleaseCachedFreesHoldsAtOnce(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
+	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
+	cacheGrace = time.Minute
 
 	requireAcquired(t, a, LockTypeInode, 9, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 9); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	a.ReleaseCached()
-	if err := acquireWithin(b, cacheGrace/4, LockTypeInode, 9, LockModeExclusive); err != nil {
+	if err := acquireWithin(b, time.Second, LockTypeInode, 9, LockModeExclusive); err != nil {
 		t.Fatalf("Acquire right after ReleaseCached: %v", err)
 	}
 }
@@ -852,6 +875,8 @@ func TestCachedHoldRejoinNeedsNoDiskIO(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
+	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
+	cacheGrace = time.Minute
 	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 7); err != nil {
 		t.Fatalf("Release: %v", err)

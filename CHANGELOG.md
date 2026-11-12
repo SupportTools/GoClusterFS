@@ -57,7 +57,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.
 - `go.mod` now requires Go 1.26.
 - `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
-- Reads use the inode cache, a node keeps a released lock for 250 ms so it can take it again without disk I/O, and the inode and extent caches are split into 16 shards.
+- Reads use the inode cache, a node keeps a released lock for 10 ms so back-to-back operations take it again without disk I/O and yields a lock it has reused for 250 ms, and the inode and extent caches are split into 16 shards.
 
 ### Removed
 

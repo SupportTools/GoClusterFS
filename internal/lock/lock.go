@@ -67,9 +67,13 @@ const (
 	RetryMaxDelay = 25 * time.Millisecond
 
 	// CacheGrace is how long a node keeps a record after its last local holder
-	// releases it, so the next local acquire needs no disk I/O.
-	// A record held from disk for longer than this is released and yielded instead.
-	CacheGrace = 250 * time.Millisecond
+	// releases it, so the next local acquire needs no disk I/O. It is short
+	// because an idle hold makes other nodes wait.
+	CacheGrace = 10 * time.Millisecond
+
+	// HoldTurn is how long a node keeps reusing a record it claimed from disk.
+	// After that it releases and yields the record when its last holder lets go.
+	HoldTurn = 250 * time.Millisecond
 
 	// YieldGap is how long a node waits before claiming a record it yielded, so
 	// another node polling for it gets a turn.
@@ -200,6 +204,7 @@ var acquireTimeout = DefaultTimeout
 
 var (
 	cacheGrace = CacheGrace
+	holdTurn   = HoldTurn
 	yieldGap   = YieldGap
 )
 
@@ -575,7 +580,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if age(rec.since) > cacheGrace {
+	if age(rec.since) > holdTurn {
 		// Held long enough: give other nodes a turn instead of keeping it.
 		delete(m.records, recordID)
 		m.yieldUntil[recordID] = time.Now().Add(yieldGap)
