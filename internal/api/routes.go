@@ -10,6 +10,7 @@ import (
 //   - /health        - Health check (no auth required)
 //   - /api/v1/*      - Versioned API endpoints (auth required when configured)
 //   - /metrics       - Prometheus metrics (no auth required)
+//   - /ui/           - Web dashboard, if configured (no auth required)
 func (s *Server) registerRoutes() {
 	// Health check endpoint - always accessible, no auth required
 	s.router.HandleFunc("/health", s.handleHealth)
@@ -19,6 +20,10 @@ func (s *Server) registerRoutes() {
 
 	// Metrics endpoint for Prometheus scraping
 	s.router.HandleFunc("/metrics", s.handleMetrics)
+
+	if s.config.Dashboard != nil {
+		s.router.Handle("/ui/", http.StripPrefix("/ui", s.config.Dashboard))
+	}
 }
 
 // handleHealth handles GET /health requests.

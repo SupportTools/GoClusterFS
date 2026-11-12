@@ -128,62 +128,18 @@ func (t *Transport) Start(ctx context.Context, handler func(*Message, *net.UDPAd
 		return nil
 	}
 
-	if t.config.UnicastPort == t.config.MulticastPort {
-		return fmt.Errorf("unicast port %d is also the multicast port; the multicast socket holds it, so the unicast port must differ", t.config.UnicastPort)
-	}
-
 	if t.running.Swap(true) {
 		return fmt.Errorf("transport already running")
 	}
 
-	// Set up multicast listener
-	var ifi *net.Interface
-	if t.config.Interface != "" {
-		var err error
-		ifi, err = net.InterfaceByName(t.config.Interface)
-		if err != nil {
-			return fmt.Errorf("interface %s not found: %w", t.config.Interface, err)
-		}
-	}
-
-	multicastConn, err := net.ListenMulticastUDP("udp", ifi, t.multicastAddr)
+	multicastConn, unicastConn, mcastErr, err := listen(t.config, t.multicastAddr)
 	if err != nil {
-		// Multicast might not be available, try unicast only
-		log.Printf("[broadcast] multicast unavailable: %v, using unicast only", err)
-	} else {
-		t.multicastConn = multicastConn
-		// Set read buffer size
-		if err := multicastConn.SetReadBuffer(1 << 20); err != nil { // 1MB
-			log.Printf("[broadcast] failed to set read buffer: %v", err)
-		}
+		return err
 	}
-
-	// Set up unicast listener
-	unicastAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", t.config.UnicastPort))
-	if err != nil {
-		return fmt.Errorf("invalid unicast address: %w", err)
+	if mcastErr != nil {
+		log.Printf("[broadcast] multicast unavailable: %v, using unicast only", mcastErr)
 	}
-
-	unicastConn, err := net.ListenUDP("udp", unicastAddr)
-	if err != nil {
-		if t.multicastConn != nil {
-			t.multicastConn.Close()
-		}
-		return fmt.Errorf("failed to bind unicast port: %w", err)
-	}
-	t.unicastConn = unicastConn
-
-	if t.multicastConn != nil {
-		ttl := t.config.MulticastTTL
-		if ttl <= 0 {
-			ttl = 1
-		}
-		if err := setMulticastSendOptions(unicastConn, ifi, ttl); err != nil {
-			t.multicastConn.Close()
-			unicastConn.Close()
-			return fmt.Errorf("failed to set multicast options on the send socket: %w", err)
-		}
-	}
+	t.multicastConn, t.unicastConn = multicastConn, unicastConn
 
 	// Start receiver goroutines
 	if t.multicastConn != nil {
@@ -195,6 +151,69 @@ func (t *Transport) Start(ctx context.Context, handler func(*Message, *net.UDPAd
 	go t.receiveLoop(t.unicastConn, handler, false)
 
 	return nil
+}
+
+// CheckPorts opens and releases the sockets Start would, so a mount can fail
+// on a taken port before it changes anything on disk.
+func CheckPorts(cfg Config) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	group, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", cfg.MulticastGroup, cfg.MulticastPort))
+	if err != nil {
+		return fmt.Errorf("invalid multicast address: %w", err)
+	}
+	multicastConn, unicastConn, _, err := listen(cfg, group)
+	if err != nil {
+		return err
+	}
+	if multicastConn != nil {
+		multicastConn.Close()
+	}
+	return unicastConn.Close()
+}
+
+// listen opens the multicast and unicast sockets. If multicast is unavailable,
+// multicastConn is nil and mcastErr says why; the unicast socket must bind.
+func listen(cfg Config, group *net.UDPAddr) (multicastConn, unicastConn *net.UDPConn, mcastErr, err error) {
+	if cfg.UnicastPort == cfg.MulticastPort {
+		return nil, nil, nil, fmt.Errorf("unicast port %d is also the multicast port; the multicast socket holds it, so the unicast port must differ", cfg.UnicastPort)
+	}
+
+	var ifi *net.Interface
+	if cfg.Interface != "" {
+		if ifi, err = net.InterfaceByName(cfg.Interface); err != nil {
+			return nil, nil, nil, fmt.Errorf("interface %s not found: %w", cfg.Interface, err)
+		}
+	}
+
+	multicastConn, mcastErr = net.ListenMulticastUDP("udp", ifi, group)
+	if mcastErr != nil {
+		multicastConn = nil
+	} else if err := multicastConn.SetReadBuffer(1 << 20); err != nil {
+		log.Printf("[broadcast] failed to set read buffer: %v", err)
+	}
+
+	unicastConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: cfg.UnicastPort})
+	if err != nil {
+		if multicastConn != nil {
+			multicastConn.Close()
+		}
+		return nil, nil, nil, fmt.Errorf("failed to bind unicast port: %w", err)
+	}
+
+	if multicastConn != nil {
+		ttl := cfg.MulticastTTL
+		if ttl <= 0 {
+			ttl = 1
+		}
+		if err := setMulticastSendOptions(unicastConn, ifi, ttl); err != nil {
+			multicastConn.Close()
+			unicastConn.Close()
+			return nil, nil, nil, fmt.Errorf("failed to set multicast options on the send socket: %w", err)
+		}
+	}
+	return multicastConn, unicastConn, mcastErr, nil
 }
 
 // receiveLoop reads messages from a UDP connection.

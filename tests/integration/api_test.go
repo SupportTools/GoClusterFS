@@ -15,17 +15,6 @@ import (
 	"time"
 )
 
-func freeLoopbackAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to find a free port: %v", err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-	return addr
-}
-
 func TestAPIServesHealthOnLoopback(t *testing.T) {
 	mfs := NewMountedFS(t, 20)
 	addr := freeLoopbackAddr(t)

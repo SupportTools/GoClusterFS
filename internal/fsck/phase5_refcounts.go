@@ -61,10 +61,12 @@ type refcountFix struct {
 //   - No refcount overflow (0xFFFFFFFF)
 //   - No block past the table, which has no count for it, is mapped by
 //     several inodes that count their sharing
+//   - Leaked blocks, which phase 8 frees, have a count of 0
 //
-// In repair mode, and only when every inode's extents were read, the counts
-// are rebuilt from those references, and extents an older version shared
-// without counting are marked counted.
+// In repair mode, and only when the bitmap and inode phases read every inode's
+// extents, the counts are rebuilt from those references, and extents an older
+// version shared without counting are marked counted. Leaked blocks' counts are
+// cleared only when phase 8 will free them.
 func (c *Checker) checkRefcounts() error {
 	if c.sbData == nil {
 		return fmt.Errorf("superblock not validated")
@@ -83,7 +85,9 @@ func (c *Checker) checkRefcounts() error {
 
 	sectorBuf := storage.NewAlignedBuffer(RefcountSectorSize).Bytes()
 	sharedBlocks := uint64(0)
-	var fixes []refcountFix
+	var fixes, leaks []refcountFix
+	var leakCounts []uint32
+	reclaim := len(c.referenceGaps()) == 0 && len(c.unclean) == 0
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		if err := c.readSector(sectorBuf, sb.RefCountTableOffset+sectorIdx*RefcountSectorSize); err != nil {
@@ -111,9 +115,14 @@ func (c *Checker) checkRefcounts() error {
 			}
 			if want, ok := c.checkRefcount(blockNum, entry.RefCount); ok {
 				fixes = append(fixes, refcountFix{sector: sectorIdx, entry: true, block: blockNum, count: want, problem: c.lastProblem()})
+			} else if reclaim && entry.RefCount != 0 && c.isLeaked(blockNum) && !c.badBitmap[blockNum/BitmapBitsPerSector] {
+				// Cleared before phase 8 frees the block, so a reuse starts with no stale owners.
+				leaks = append(leaks, refcountFix{sector: sectorIdx, entry: true, block: blockNum})
+				leakCounts = append(leakCounts, entry.RefCount)
 			}
 		}
 	}
+	fixes = append(fixes, c.reportLeakCounts(leaks, leakCounts)...)
 	if covered := c.refcountCoverage(); sb.TotalBlocks > covered {
 		c.addProblem(PhaseRefcounts, Error, "refcount table",
 			fmt.Sprintf("has entries for blocks 0-%d of %d, so mount refuses the volume", covered-1, sb.TotalBlocks), false)
@@ -126,18 +135,13 @@ func (c *Checker) checkRefcounts() error {
 	if c.opts.Mode != Repair || len(fixes) == 0 && len(c.uncounted) == 0 {
 		return nil
 	}
-	if len(c.refsIncomplete) > 0 {
+	if gaps := c.referenceGaps(); len(gaps) > 0 {
 		c.addProblem(PhaseRefcounts, Error, "refcount table",
-			"not rebuilt, because some references could not be read: "+strings.Join(c.refsIncomplete, "; "), false)
+			"not rebuilt, because fsck may not know every reference: "+strings.Join(gaps, "; "), false)
 		return nil
 	}
-	if !c.opts.DryRun {
-		if beforeRepairWrites != nil {
-			beforeRepairWrites()
-		}
-		if err := c.registryUnchanged(); err != nil {
-			return err
-		}
+	if err := c.beforeWrites(); err != nil {
+		return err
 	}
 	if err := c.writeRefcounts(fixes); err != nil {
 		return err
@@ -175,6 +179,22 @@ func (c *Checker) checkSharingPastTable(covered uint64) {
 		c.addProblem(PhaseRefcounts, Critical, "blocks",
 			fmt.Sprintf("%d more blocks past the refcount table are mapped by several inodes", len(blocks)-10), false)
 	}
+}
+
+// reportLeakCounts reports the leaked blocks whose counts repair clears, the
+// first ones by name, and ties each fix to the problem that reports it.
+func (c *Checker) reportLeakCounts(leaks []refcountFix, counts []uint32) []refcountFix {
+	for i := range leaks {
+		if i == reportedLeaks {
+			c.addProblem(PhaseRefcounts, Warning, "blocks",
+				fmt.Sprintf("%d more leaked blocks have a refcount", len(leaks)-reportedLeaks), true)
+		} else if i < reportedLeaks {
+			c.addProblem(PhaseRefcounts, Warning, fmt.Sprintf("block %d", leaks[i].block),
+				fmt.Sprintf("leaked: no inode maps it but refcount is %d", counts[i]), true)
+		}
+		leaks[i].problem = c.lastProblem()
+	}
+	return leaks
 }
 
 // checkRefcount compares one block's count with the inodes that map it. It

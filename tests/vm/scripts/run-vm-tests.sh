@@ -2946,6 +2946,99 @@ test_concurrent_writes_power_failure() {
     return 0
 }
 
+# Unmount GoClusterFS on VM $1 and wait for the mount process to exit, which
+# marks its journal clean.
+unmount_goclusterfs() {
+    local vm_id=$1
+    ssh_run "$vm_id" "fusermount3 -u ${GOCLUSTERFS_MOUNT}" || return 1
+    local waited=0
+    while ssh_run "$vm_id" "pidof goclusterfs-mount > /dev/null"; do
+        if [[ $waited -ge 30 ]]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# A power failure while files are written may leave blocks that no file maps.
+# With every node unmounted, fsck -repair frees any it finds, the check after
+# it is clean, and no file changes.
+test_fsck_repair_after_power_failure() {
+    log_info "Testing fsck -repair after a power failure..."
+    ensure_cluster_healthy 2
+    local survivor=1
+    local victim=2
+    local fsck=/usr/local/bin/goclusterfs-fsck
+
+    if ! ssh_run "$survivor" "test -x $fsck"; then
+        log_error "goclusterfs-fsck is not on the VMs: build it with make build"
+        return 1
+    fi
+
+    ssh_run "$survivor" "dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/keep.bin bs=1M count=4 2>/dev/null && sync"
+    local keep_md5
+    keep_md5=$(ssh_run "$survivor" "md5sum ${GOCLUSTERFS_MOUNT}/keep.bin | cut -d' ' -f1")
+
+    ssh_run "$victim" "for i in 1 2 3 4 5 6 7 8; do dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/victim_\$i.bin bs=1M count=8 2>/dev/null; done" &
+    local writer=$!
+    sleep 2
+    log_info "Simulating power failure on VM $victim mid-write..."
+    kill_vm "$victim"
+    wait "$writer" 2>/dev/null || true
+
+    start_vm "$victim" false
+    wait_vm_healthy "$victim"
+    setup_goclusterfs "$victim" false
+    # Whatever the victim's writes left, repair must not change it.
+    local before
+    before=$(ssh_run "$victim" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
+
+    local vm_id
+    for vm_id in "$survivor" "$victim"; do
+        if ! unmount_goclusterfs "$vm_id"; then
+            log_error "VM $vm_id: GoClusterFS did not unmount"
+            return 1
+        fi
+    done
+
+    local out rc
+    out=$(ssh_run "$survivor" "$fsck -repair /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    echo "$out" | grep '^\[' | head -20
+    log_info "fsck -repair exit $rc, $(echo "$out" | grep -c 'leaked') leaked-block lines"
+    if [[ "$rc" != 0 && "$rc" != 1 ]]; then
+        log_error "fsck -repair exited $rc"
+        return 1
+    fi
+    out=$(ssh_run "$survivor" "$fsck /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    if [[ "$rc" != 0 ]] || echo "$out" | grep -q 'leaked'; then
+        echo "$out" | grep '^\[' | head -20
+        log_error "fsck after repair: exit $rc"
+        return 1
+    fi
+
+    for vm_id in "$survivor" "$victim"; do
+        setup_goclusterfs "$vm_id" false || return 1
+    done
+    if [[ "$before" != *"$keep_md5  keep.bin"* ]]; then
+        log_error "keep.bin changed before repair"
+        return 1
+    fi
+    for vm_id in "$survivor" "$victim"; do
+        local after
+        after=$(ssh_run "$vm_id" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
+        if [[ "$after" != "$before" ]]; then
+            log_error "VM $vm_id: files changed by repair"
+            diff <(echo "$before") <(echo "$after") >&2 || true
+            return 1
+        fi
+    done
+    log_info "fsck -repair left a clean volume and every file unchanged"
+    return 0
+}
+
 # =============================================================================
 # Main Test Execution
 # =============================================================================
@@ -3414,6 +3507,7 @@ main() {
     run_test "Concurrent Write Stress" test_concurrent_write_stress
     run_test "Reversed Write Order" test_reversed_write_order
     run_test "Concurrent Writes Power Failure" test_concurrent_writes_power_failure
+    run_test "fsck Repair After Power Failure" test_fsck_repair_after_power_failure
 
     # Summary
     log_info "=========================================="

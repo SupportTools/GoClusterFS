@@ -4,7 +4,15 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -267,4 +275,60 @@ func TestBroadcastInvalidatesPeerCache(t *testing.T) {
 		t.Fatalf("node 1 never read node 0's appended data through its open file within %v: no broadcast invalidated its cached inode", propagationTimeout)
 	}
 	t.Logf("Node 1 read the appended data after %v", took)
+}
+
+// TestMountFailsOnTakenBroadcastPortBeforeFormat checks that a taken broadcast
+// port stops the mount before it writes anything, even with -format.
+func TestMountFailsOnTakenBroadcastPortBeforeFormat(t *testing.T) {
+	binary, err := findBinary()
+	if err != nil {
+		t.Fatalf("Failed to find binary: %v", err)
+	}
+	dir := t.TempDir()
+	mountPoint := filepath.Join(dir, "mnt")
+	image := filepath.Join(dir, "disk.img")
+	if err := os.Mkdir(mountPoint, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(image, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := allocateImage(image, 20); err != nil {
+		t.Fatal(err)
+	}
+
+	ports := freeUDPPorts(t, 2)
+	held, err := net.ListenUDP("udp", &net.UDPAddr{Port: ports[1]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, "-device", image, "-mount", mountPoint, "-format",
+		"-mcast-port", strconv.Itoa(ports[0]), "-unicast-port", strconv.Itoa(ports[1])).CombinedOutput()
+	if ctx.Err() != nil {
+		exec.Command("fusermount", "-u", mountPoint).Run()
+		t.Fatal("mount kept running with its unicast port taken")
+	}
+	if err == nil {
+		t.Fatalf("mount exited 0 with its unicast port taken:\n%s", out)
+	}
+	if !strings.Contains(string(out), "Failed to start cache broadcast") {
+		t.Errorf("mount output does not report the broadcast failure:\n%s", out)
+	}
+
+	f, err := os.Open(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	head := make([]byte, 4096)
+	if _, err := io.ReadFull(f, head); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(head, make([]byte, len(head))) {
+		t.Error("mount wrote the superblock before failing on the broadcast port")
+	}
 }

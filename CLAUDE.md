@@ -12,6 +12,7 @@ FUSE binding: `github.com/hanwen/go-fuse/v2`. Linux only.
 
 ```bash
 make build                 # ./goclusterfs-mount, ./goclusterfs-fsck and ./gfsctl
+make dashboard build       # same, with the web dashboard embedded (needs Node 22 and npm)
 go build ./... && go vet ./...
 ```
 
@@ -57,6 +58,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
+| `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
+| `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
 
 ## On-Disk Layout
 
@@ -92,7 +95,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
 - At most 64 nodes mount a volume at once, one per registry slot. Heartbeats compare wall clocks, so node clocks must agree within a few seconds.
-- `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, and the superblock checksum. It reports every other problem without fixing it.
+- `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. Every `statfs` (`df`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - No rename, symlinks, or hard links.

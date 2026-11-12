@@ -945,6 +945,41 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckRebuildsCorruptRefcountSector
 
+  - id: fsck-reclaim-leaked-blocks
+    name: fsck -repair frees leaked blocks
+    description: A failed write and frees that gave up on a lock leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
+
+  - id: fsck-reclaim-empty-sfb-containers
+    name: fsck -repair frees SFB containers no file uses
+    description: A file that grows out of its SFB slot leaves its container empty; check reports it as leaked, repair frees it and keeps a container another file still uses, and both files keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairFreesEmptySFBContainers
+
+  - id: fsck-reclaim-keeps-unplaced-leaks
+    name: fsck -repair keeps leaked blocks it cannot place
+    description: An unreadable inode, a damaged extent tree, a skipped bitmap or inode phase, a bad bitmap sector, a mounted node, or a dirty journal under -force makes repair keep leaked blocks and their refcounts and say why
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairKeepsLeaksItCannotPlace
+
+  - id: fsck-reclaim-odd-extents
+    name: fsck -repair keeps blocks of extents the runtime still maps
+    description: Repair keeps the block of an extent without the allocated flag and the in-range block of an extent that runs past the device end
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairKeepsBlocksOfOddExtents
+
+  - id: fsck-repair-after-power-failure
+    name: fsck -repair after a power failure
+    description: A VM killed while writing files, then every node unmounted; fsck -repair exits 0 or 1, the check after it reports no leaked blocks, and a file written before the failure is unchanged on both nodes
+    priority: vm_only  # needs a real power failure and goclusterfs-fsck inside the VMs
+    environments:
+      vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
@@ -1664,6 +1699,20 @@ scenarios:
     environments:
       go: internal/cache/broadcast/transport_test.go::TestTwoNodesOnOneHost
 
+  - id: broadcast-check-ports-releases
+    name: Broadcast port check releases its sockets
+    description: CheckPorts binds the broadcast sockets and releases them so Start can bind them
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestCheckPortsReleasesSockets
+
+  - id: broadcast-check-ports-taken
+    name: Broadcast port check fails on a taken port
+    description: CheckPorts fails when the unicast port is taken or equals the multicast port
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestCheckPortsFailsOnTakenPort
+
   - id: broadcast-send-socket-options
     name: Broadcast send socket options
     description: The send socket loops multicast back to this host and uses the configured TTL
@@ -1761,6 +1810,13 @@ scenarios:
       go: broadcast_test.go::TestBroadcastInvalidatesPeerCache
       docker: TODO  # needs a per-node -cache-ttl in the compose file
       vm: TODO  # VMs use QEMU user networking, so they cannot reach each other
+
+  - id: broadcast-port-taken-before-format
+    name: Mount fails on a taken broadcast port before writing
+    description: With the unicast port taken, mount -format exits with the broadcast error and leaves the image untouched
+    priority: go_only
+    environments:
+      go: broadcast_test.go::TestMountFailsOnTakenBroadcastPortBeforeFormat
 
   # ===========================================================================
   # SNAPSHOT TESTS (Phase 7: Snapshots)
@@ -2578,6 +2634,20 @@ scenarios:
     priority: go_only
     environments:
       go: api_writes_test.go::TestMountTokenSources
+
+  - id: dashboard-live-mount
+    name: Web dashboard on a live mount
+    description: /ui/ serves the same static shell with or without a token, with a strict Content-Security-Policy, while /api/v1/* still needs the token
+    priority: go_only
+    environments:
+      go: dashboard_test.go::TestDashboardOnLiveMount
+
+  - id: dashboard-flag-off
+    name: -dashboard=false removes /ui/
+    description: With -dashboard=false, /ui/ goes through the normal auth and answers 404
+    priority: go_only
+    environments:
+      go: dashboard_test.go::TestDashboardFlagOff
 
   - id: gfsctl-reads-live-mount
     name: gfsctl reads a live mount
