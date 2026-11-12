@@ -728,6 +728,13 @@ scenarios:
     environments:
       go: internal/journal/checkpoint_test.go::TestRecoveryEndsWithTailAtEnd
 
+  - id: recovery-scan-bounded
+    name: Recovery scans stop after the bytes between head and tail
+    description: With a tail no record boundary reaches and stale records around the ring, both recovery scans end and replay each pending transaction once
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestScanStopsAtUnreachableTail
+
   - id: create-replays-after-checkpoint-crash
     name: A create cut off after a checkpoint is replayed
     description: A create stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount creates the file and fsck is clean
