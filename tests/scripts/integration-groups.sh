@@ -12,7 +12,9 @@ timings=tests/scripts/integration-timings.txt
 default_seconds=3
 
 list_tests() {
-	go test -list "${1:-.}" "$pkg" | grep '^Test' || true
+	local out
+	out=$(go test -list "${1:-.}" "$pkg")
+	grep '^Test' <<<"$out" || true
 }
 
 # Longest test first, each into the group with the least time so far.
@@ -30,6 +32,10 @@ regex() {
 check() {
 	local all got
 	all=$(list_tests | sort)
+	if [[ -z "$all" ]]; then
+		echo "found no integration tests"
+		exit 1
+	fi
 	got=$(for g in $(seq 1 "$1"); do list_tests "$(regex "$1" "$g")"; done | sort)
 	if [[ "$all" != "$got" ]]; then
 		echo "integration test groups miss or repeat tests (< missing, > repeated):"
