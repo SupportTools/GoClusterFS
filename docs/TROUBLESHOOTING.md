@@ -182,7 +182,7 @@ A crashed node's locks free up on their own: other nodes take them over once the
 
 **Causes**:
 1. Out of 1 MB blocks. Every file with data uses at least one full block, so many small files fill the device fast.
-2. Out of inodes. A volume has 4096.
+2. Out of inodes. Format gives the volume one inode per `-bytes-per-inode` bytes of device (default 1 MB).
 3. The underlying thin-provisioned storage is full.
 
 **Solutions**:
@@ -203,6 +203,7 @@ lsof +D /mnt/fs | grep deleted
 1. Underlying storage failure
 2. Network issue (for remote storage)
 3. Filesystem corruption
+4. A lock wait gave up after 30 seconds because other nodes kept the lock busy. The mount log shows `[WARN] lock: gave up waiting` and names the holder.
 
 **Solutions**:
 ```bash
