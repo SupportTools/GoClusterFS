@@ -252,53 +252,22 @@ func TestApplyBlockAlloc(t *testing.T) {
 	}
 }
 
-// TestApplyBlockFree tests freeing a block during recovery.
-func TestApplyBlockFree(t *testing.T) {
+// Replay of a free leaves the block allocated: the payload names a file block, and that number may be another file's.
+func TestApplyBlockFreeLeavesBlocksAllocated(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
 
-	// First allocate a block
-	allocPayload := &BlockAllocPayload{
-		InodeNum:   100,
-		StartBlock: 6,
-		Count:      1,
-		Purpose:    BlockPurposeData,
-	}
+	allocPayload := &BlockAllocPayload{InodeNum: 100, StartBlock: 6, Count: 1, Purpose: BlockPurposeData}
 	if _, err := applyBlockAlloc(ctx, rctx, allocPayload.Serialize()); err != nil {
 		t.Fatalf("Setup: applyBlockAlloc failed: %v", err)
 	}
-
-	// Free the block
-	freePayload := &BlockFreePayload{
-		InodeNum:   100,
-		StartBlock: 6,
-		Count:      1,
+	freePayload := &BlockFreePayload{InodeNum: 100, StartBlock: 6, Count: 1}
+	if applied, err := applyBlockFree(ctx, rctx, freePayload.Serialize()); err != nil || applied {
+		t.Fatalf("applyBlockFree = %v, %v; want false, nil", applied, err)
 	}
-	applied, err := applyBlockFree(ctx, rctx, freePayload.Serialize())
-	if err != nil {
-		t.Fatalf("applyBlockFree failed: %v", err)
-	}
-	if !applied {
-		t.Error("applyBlockFree returned false, expected true")
-	}
-
-	// Verify the block is free
-	isAlloc, err := rctx.BitmapMgr.IsAllocated(freePayload.StartBlock)
-	if err != nil {
-		t.Fatalf("Failed to check block allocation: %v", err)
-	}
-	if isAlloc {
-		t.Error("Block should be marked as free")
-	}
-
-	// Test idempotency - freeing again should skip
-	applied, err = applyBlockFree(ctx, rctx, freePayload.Serialize())
-	if err != nil {
-		t.Fatalf("applyBlockFree (idempotent) failed: %v", err)
-	}
-	if applied {
-		t.Error("applyBlockFree returned true on second call, expected false (idempotent)")
+	if isAlloc, err := rctx.BitmapMgr.IsAllocated(6); err != nil || !isAlloc {
+		t.Errorf("block 6 allocated = %v, %v; want it left allocated", isAlloc, err)
 	}
 }
 

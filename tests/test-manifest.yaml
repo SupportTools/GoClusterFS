@@ -723,6 +723,15 @@ scenarios:
       docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
       vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
 
+  - id: truncate-replay-keeps-mapped-blocks
+    name: Replay of an interrupted truncate keeps blocks files still map
+    description: A truncate stops between its journal commit and its changes, a checkpoint runs, and the process dies; replay at the next mount frees no block a file maps, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/journal_crash_test.go::TestTruncateReplayKeepsMappedBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
   - id: intent-completion-serialize
     name: IntentCompletion serialization
     description: IntentCompletion record serializes and deserializes correctly
