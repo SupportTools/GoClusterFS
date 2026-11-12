@@ -490,8 +490,9 @@ If a node mounts the device while `-repair` runs, repair stops before its next w
 - It marks the blocks that older versions shared without counting as counted, so this version can snapshot, clone and free those files.
 - It rewrites refcount sectors that fail their checksum from the same references.
 - It fixes the superblock checksum, but only when every other superblock field passed its checks.
+- It frees leaked blocks: blocks the bitmap marks allocated that no inode, extent tree or older small-file container maps. Writes and mkdirs that fail, interrupted truncates and unlinks, frees that gave up waiting for a lock, and small-file migrations leave them behind. It sets their refcounts to 0 first. It keeps all of them when it could not read an inode or extent tree, or when a node's journal still needs replay (even with `-force`), and it keeps those in bitmap sectors with a bad checksum.
 
-It never frees blocks, deletes inodes, or edits directories. Problems not marked `[FIXABLE]` stay as they are.
+It never deletes inodes or edits directories. Problems not marked `[FIXABLE]` stay as they are.
 
 ### Exit Codes
 

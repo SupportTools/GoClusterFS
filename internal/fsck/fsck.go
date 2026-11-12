@@ -385,6 +385,7 @@ type Checker struct {
 
 	// Collected data for cross-validation
 	bitmapAllocated map[uint64]bool // blocks marked allocated in bitmap
+	badBitmap       map[uint64]bool // bitmap sectors with a bad checksum
 	inodeBlocks     map[uint64]int  // block -> reference count from inodes
 	inodeUsed       map[uint32]bool // inode numbers that are in use
 	dirEntryRefs    map[uint32]int  // inode -> reference count from dir entries
@@ -399,6 +400,8 @@ type Checker struct {
 	superblockFix   func() error    // runs once repair knows no node uses the filesystem
 	layoutErr       error           // why mount refuses the superblock's layout
 	registry        []byte          // node registry as startRepair last saw it
+	unclean         []string        // nodes whose journal may hold changes fsck cannot see
+	finished        map[Phase]bool  // phases that ran to the end
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
@@ -460,6 +463,8 @@ func New(dev *storage.Device, opts Options) *Checker {
 		opts:            opts,
 		result:          &Result{Mode: opts.Mode},
 		bitmapAllocated: make(map[uint64]bool),
+		badBitmap:       make(map[uint64]bool),
+		finished:        make(map[Phase]bool),
 		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
 		dirEntryRefs:    make(map[uint32]int),
@@ -513,6 +518,8 @@ func (c *Checker) Check() *Result {
 				c.result.AbortReason = fmt.Sprintf("%s failed: %v", p.phase, err)
 				break
 			}
+		} else {
+			c.finished[p.phase] = true
 		}
 
 		c.result.CompletedPhase = p.phase

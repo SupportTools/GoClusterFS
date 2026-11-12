@@ -131,13 +131,8 @@ func (c *Checker) checkRefcounts() error {
 			"not rebuilt, because some references could not be read: "+strings.Join(c.refsIncomplete, "; "), false)
 		return nil
 	}
-	if !c.opts.DryRun {
-		if beforeRepairWrites != nil {
-			beforeRepairWrites()
-		}
-		if err := c.registryUnchanged(); err != nil {
-			return err
-		}
+	if err := c.beforeWrites(); err != nil {
+		return err
 	}
 	if err := c.writeRefcounts(fixes); err != nil {
 		return err
@@ -197,6 +192,11 @@ func (c *Checker) checkRefcount(block uint64, count uint32) (uint32, bool) {
 	case refs == 0 && count != 0 && !c.bitmapAllocated[block]:
 		c.addProblem(PhaseRefcounts, Error, loc,
 			fmt.Sprintf("free in the bitmap but refcount is %d", count), true)
+		return 0, true
+	// Cleared before phase 8 frees the block, so a reuse starts with no stale owners.
+	case refs == 0 && count != 0 && !c.sfbContainers[block]:
+		c.addProblem(PhaseRefcounts, Warning, loc,
+			fmt.Sprintf("leaked: no inode maps it but refcount is %d", count), true)
 		return 0, true
 	}
 	return 0, false

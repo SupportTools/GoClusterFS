@@ -132,6 +132,7 @@ func (c *Checker) startRepair() error {
 	}
 	const badLayout = "mount refuses this layout, so the regions repair writes may hold other data"
 	live, unclean := c.nodes()
+	c.unclean = unclean
 	if c.opts.DryRun {
 		for _, why := range append(live, unclean...) {
 			c.addProblem(PhaseSuperblock, Warning, "node registry", "repair would refuse: "+why, false)
@@ -270,6 +271,18 @@ func (c *Checker) watchRegistry(slots []*node.Slot) (map[int]bool, error) {
 
 // beforeRepairWrites lets tests change the registry after the watch.
 var beforeRepairWrites func()
+
+// beforeWrites runs before each batch of repair writes. It stops repair if a
+// node may have mounted the filesystem since startRepair watched the registry.
+func (c *Checker) beforeWrites() error {
+	if c.opts.DryRun {
+		return nil
+	}
+	if beforeRepairWrites != nil {
+		beforeRepairWrites()
+	}
+	return c.registryUnchanged()
+}
 
 // registryUnchanged fails when a node wrote its slot since startRepair
 // watched the registry: a node may have mounted the filesystem.
