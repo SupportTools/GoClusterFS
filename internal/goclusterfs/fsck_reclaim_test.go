@@ -422,3 +422,70 @@ func TestFsckRepairFreesEmptySFBContainers(t *testing.T) {
 	checkFile(t, lookupFile(t, fsys, "small.txt"), pattern(1, 5000))
 	checkFile(t, lookupFile(t, fsys, "moved.txt"), append(pattern(2, 10000), pattern(3, 10000)...))
 }
+
+// holdRefcountLock makes another node hold the refcount lock until the test
+// ends, so frees on fsys wait for it.
+func holdRefcountLock(t *testing.T, fsys *FS) {
+	t.Helper()
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := int(snapFSNodes.Add(1)-1) % 64
+	var otherUUID [16]byte
+	copy(otherUUID[:], "lockholder123456")
+	otherUUID[15] = byte(slot)
+	other := lock.NewManager(fsys.dev, sb.LockBitmapOffset, sb.LockBitmapSize, otherUUID, slot)
+	if err := other.Acquire(context.Background(), lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A crash after a truncate wrote the shorter inode, but before it freed the
+// blocks it cut, leaves them allocated: replay frees nothing for an
+// interrupted truncate. Repair frees them.
+func TestFsckRepairReclaimsInterruptedTruncate(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	victim := createFile(t, fsys, "victim.bin")
+	writeAt(t, victim, pattern(1, 3*BlockSize), 0)
+	other := createFile(t, fsys, "other.bin")
+	writeAt(t, other, pattern(2, 2*BlockSize), 0)
+	free := fsys.bitmapMgr.FreeCount()
+
+	// The truncate's free waits for the lock; the node crashes while it waits.
+	holdRefcountLock(t, fsys)
+	go tryTruncate(victim, BlockSize)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ino, err := fsys.inodeTbl.Read(victim.inodeNum)
+		if err == nil && ino.Size == BlockSize {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("truncate did not write the inode: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fsys.dev.Close()
+
+	remounted := remountAndReplay(t, path, offset, size)
+	if got := remounted.bitmapMgr.FreeCount(); got != free {
+		t.Fatalf("%d free blocks after replay, want the 2 cut blocks still allocated (%d)", got, free)
+	}
+	if r := runFsck(t, remounted, fsck.DefaultOptions()); !strings.Contains(problemList(r), "leaked") {
+		t.Fatalf("check did not report the cut blocks:%s", problemList(r))
+	}
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	if r := runFsck(t, remounted, repair); r.ExitCode() != fsck.ExitCorrected {
+		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), fsck.ExitCorrected, problemList(r))
+	}
+	expectCleanFsck(t, remounted)
+
+	remounted = openFormattedFS(t, path)
+	if got := remounted.bitmapMgr.FreeCount(); got != free+2 {
+		t.Fatalf("%d free blocks after repair, want %d", got, free+2)
+	}
+	checkFile(t, lookupFile(t, remounted, "victim.bin"), pattern(1, BlockSize))
+	checkFile(t, lookupFile(t, remounted, "other.bin"), pattern(2, 2*BlockSize))
+}

@@ -963,6 +963,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
 
+  - id: fsck-reclaim-interrupted-truncate
+    name: fsck -repair frees blocks an interrupted truncate leaves
+    description: A node crashes after a truncate writes the shorter inode but before it frees the cut blocks; replay frees nothing, check reports the blocks as leaked, repair frees them, and both files keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsInterruptedTruncate
+
   - id: fsck-reclaim-empty-sfb-containers
     name: fsck -repair frees SFB containers no file uses
     description: A file that grows out of its SFB slot leaves its container empty; check reports it as leaked, repair frees it and keeps a container another file still uses, and both files keep their data
