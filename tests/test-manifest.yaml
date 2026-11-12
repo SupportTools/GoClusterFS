@@ -1636,6 +1636,20 @@ scenarios:
     environments:
       go: internal/cache/broadcast/transport_test.go::TestTwoNodesOnOneHost
 
+  - id: broadcast-check-ports-releases
+    name: Broadcast port check releases its sockets
+    description: CheckPorts binds the broadcast sockets and releases them so Start can bind them
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestCheckPortsReleasesSockets
+
+  - id: broadcast-check-ports-taken
+    name: Broadcast port check fails on a taken port
+    description: CheckPorts fails when the unicast port is taken or equals the multicast port
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/transport_test.go::TestCheckPortsFailsOnTakenPort
+
   - id: broadcast-send-socket-options
     name: Broadcast send socket options
     description: The send socket loops multicast back to this host and uses the configured TTL
@@ -1733,6 +1747,13 @@ scenarios:
       go: broadcast_test.go::TestBroadcastInvalidatesPeerCache
       docker: TODO  # needs a per-node -cache-ttl in the compose file
       vm: TODO  # VMs use QEMU user networking, so they cannot reach each other
+
+  - id: broadcast-port-taken-before-format
+    name: Mount fails on a taken broadcast port before writing
+    description: With the unicast port taken, mount -format exits with the broadcast error and leaves the image untouched
+    priority: go_only
+    environments:
+      go: broadcast_test.go::TestMountFailsOnTakenBroadcastPortBeforeFormat
 
   # ===========================================================================
   # SNAPSHOT TESTS (Phase 7: Snapshots)

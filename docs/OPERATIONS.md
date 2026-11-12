@@ -540,7 +540,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 
-**Network listeners.** Each node listens on UDP port 31337 (multicast group) and UDP port 31338 (unicast) on all interfaces, and on TCP `-api-addr`. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
+**Network listeners.** Each node listens on UDP port 31337 (multicast group) and UDP port 31338 (unicast) on all interfaces, and on TCP `-api-addr`. A second mount on the same host needs its own `-unicast-port` and `-api-addr`; the mount fails at startup if a port is taken. Clusters that share a LAN need their own `-mcast-group` or a `-broadcast-secret`, or they receive each other's invalidations. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 
 ---
 

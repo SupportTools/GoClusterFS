@@ -158,6 +158,26 @@ func main() {
 		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to ports %d and %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort, *unicastPort)
 	}
 
+	networkCfg := broadcast.Config{
+		Enabled:              *broadcastEnabled,
+		MulticastGroup:       *multicastGroup,
+		MulticastPort:        *multicastPort,
+		UnicastPort:          *unicastPort,
+		MulticastTTL:         1, // Same subnet
+		MaxMulticastFailures: 3,
+		HeartbeatInterval:    30 * time.Second,
+		Secret:               *broadcastSecret,
+		Interface:            *broadcastIface,
+	}
+	broadcastFailed := func(err error) {
+		log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
+	}
+	// Bind and release the ports before registering or formatting, so a taken
+	// port fails the mount before it changes anything on disk.
+	if err := broadcast.CheckPorts(networkCfg); err != nil {
+		broadcastFailed(err)
+	}
+
 	// Check mount point exists
 	if _, err := os.Stat(*mountPoint); os.IsNotExist(err) {
 		log.Fatalf("Mount point does not exist: %s", *mountPoint)
@@ -293,17 +313,7 @@ func main() {
 	cacheCfg := cache.DefaultConfig()
 	cacheCfg.StrictMode = *cacheStrict
 	cacheCfg.InodeTTL = *cacheTTL
-	cacheCfg.Network = broadcast.Config{
-		Enabled:              *broadcastEnabled,
-		MulticastGroup:       *multicastGroup,
-		MulticastPort:        *multicastPort,
-		UnicastPort:          *unicastPort,
-		MulticastTTL:         1, // Same subnet
-		MaxMulticastFailures: 3,
-		HeartbeatInterval:    30 * time.Second,
-		Secret:               *broadcastSecret,
-		Interface:            *broadcastIface,
-	}
+	cacheCfg.Network = networkCfg
 
 	// Create cache manager for read optimization
 	cacheMgr, err := cache.NewManager(cacheCfg, inodeTbl, lockMgr)
@@ -328,7 +338,7 @@ func main() {
 		// Without broadcast, peers see this node's changes only after -cache-ttl,
 		// so a mount that asked for broadcast does not continue without it.
 		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
-			log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
+			broadcastFailed(err)
 		}
 		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
 			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
