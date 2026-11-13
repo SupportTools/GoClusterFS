@@ -1424,6 +1424,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringSnapshotDelete
 
+  - id: clone-power-failure-go
+    name: Power failure at each write of a clone
+    description: Power fails at each device write of a clone; the source keeps its data and the clone is either gone or a full copy, and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringClone
+
   - id: trim-reuse-power-failure
     name: Power failure between freeing blocks and discarding them
     description: Power fails at each device write of an unlink whose blocks TRIM has queued; after replay a new file reuses the blocks and TRIM flushes with discards that punch holes, and no file loses data. The VM test, with discard passed to the shared disk, removes and rewrites files until a power failure and checks every acknowledged file
