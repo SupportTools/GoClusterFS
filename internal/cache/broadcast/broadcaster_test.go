@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -345,30 +346,67 @@ func TestTransportDisabled(t *testing.T) {
 }
 
 func TestTransportPeerManagement(t *testing.T) {
-	cfg := DisabledConfig()
-
-	transport, err := NewTransport(cfg)
+	transport, err := NewTransport(DisabledConfig())
 	if err != nil {
 		t.Fatalf("NewTransport failed: %v", err)
 	}
-
 	if transport.PeerCount() != 0 {
 		t.Errorf("Expected 0 peers initially, got %d", transport.PeerCount())
 	}
 
-	// Add peers
-	transport.AddPeer("peer1", nil)
-	transport.AddPeer("peer2", nil)
+	a := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 31338}
+	transport.AddPeer(a)
+	transport.AddPeer(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 31338})
+	transport.AddPeer(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 31338})
+	transport.AddPeer(nil)
 
 	if transport.PeerCount() != 2 {
-		t.Errorf("Expected 2 peers, got %d", transport.PeerCount())
+		t.Errorf("PeerCount = %d, want 2: a peer heard again at the same address is one peer", transport.PeerCount())
 	}
+}
 
-	// Remove peer
-	transport.RemovePeer("peer1")
+// TestPeerTableBounded floods the peer table with ten times MaxPeers addresses,
+// as forged heartbeats or many remounts would, and checks it keeps the most
+// recently heard MaxPeers.
+func TestPeerTableBounded(t *testing.T) {
+	cfg := DisabledConfig()
+	cfg.MaxPeers = 32
+	transport, err := NewTransport(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := func(i int) *net.UDPAddr { return &net.UDPAddr{IP: net.IPv4(10, 0, byte(i>>8), byte(i)), Port: 31338} }
 
-	if transport.PeerCount() != 1 {
-		t.Errorf("Expected 1 peer after removal, got %d", transport.PeerCount())
+	for i := 0; i < 10*cfg.MaxPeers; i++ {
+		transport.AddPeer(addr(i))
+		if got := transport.PeerCount(); got > cfg.MaxPeers {
+			t.Fatalf("after %d peers, PeerCount = %d, want at most %d", i+1, got, cfg.MaxPeers)
+		}
+	}
+	for i := 9 * cfg.MaxPeers; i < 10*cfg.MaxPeers; i++ {
+		if _, ok := transport.peers[addr(i).String()]; !ok {
+			t.Errorf("recently heard peer %v was dropped", addr(i))
+		}
+	}
+}
+
+func TestTrackedSendersBounded(t *testing.T) {
+	cfg := DisabledConfig()
+	cfg.MaxPeers = 32
+	b, err := NewBroadcaster(cfg, [16]byte{1}, 0, newMockHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := func(i int) [16]byte { return [16]byte{2, byte(i >> 8), byte(i)} }
+
+	for i := 0; i < 10*cfg.MaxPeers; i++ {
+		b.track(sender(i), 1)
+		if got := b.Stats().TrackedSenders; got > cfg.MaxPeers {
+			t.Fatalf("after %d senders, TrackedSenders = %d, want at most %d", i+1, got, cfg.MaxPeers)
+		}
+	}
+	if _, ok := b.senders[sender(10*cfg.MaxPeers-1)]; !ok {
+		t.Error("the most recently heard sender was dropped")
 	}
 }
 

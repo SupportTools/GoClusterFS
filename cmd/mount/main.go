@@ -81,9 +81,12 @@ func main() {
 		showVer = flag.Bool("version", false, "Print version and exit")
 
 		// Cache configuration
-		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
-		cacheTTL    = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
-		attrTimeout = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries")
+		cacheStrict   = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
+		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
+		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries")
+		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
+		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
+		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")
 
 		// Journal configuration
 		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
@@ -96,6 +99,7 @@ func main() {
 		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
+		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
 
 		// TRIM configuration
 		trimEnabled   = flag.Bool("trim", true, "Enable batched TRIM for freed blocks")
@@ -167,6 +171,20 @@ func main() {
 		HeartbeatInterval:    30 * time.Second,
 		Secret:               *broadcastSecret,
 		Interface:            *broadcastIface,
+		MaxPeers:             *broadcastPeers,
+	}
+	if *broadcastPeers < 1 {
+		log.Fatalf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
+	}
+	cacheCfg := cache.DefaultConfig()
+	cacheCfg.StrictMode = *cacheStrict
+	cacheCfg.InodeTTL = *cacheTTL
+	cacheCfg.InodeCacheSize = *cacheInodes
+	cacheCfg.ExtentCacheSize = *cacheExtents
+	cacheCfg.NegativeCacheSize = *cacheNegative
+	cacheCfg.Network = networkCfg
+	if err := cacheCfg.Validate(); err != nil {
+		log.Fatalf("Invalid cache flags: %v", err)
 	}
 	broadcastFailed := func(err error) {
 		log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
@@ -322,19 +340,14 @@ func main() {
 		log.Println("Journal: disabled (no crash consistency guarantees)")
 	}
 
-	// Build cache configuration from flags
-	cacheCfg := cache.DefaultConfig()
-	cacheCfg.StrictMode = *cacheStrict
-	cacheCfg.InodeTTL = *cacheTTL
-	cacheCfg.Network = networkCfg
-
 	// Create cache manager for read optimization
 	cacheMgr, err := cache.NewManager(cacheCfg, inodeTbl, lockMgr)
 	if err != nil {
 		log.Fatalf("Failed to create cache manager: %v", err)
 	}
-	log.Printf("Cache: %d inodes, %d negative entries, TTL=%v, strict=%v",
+	log.Printf("Cache: %d inodes, %d extents, %d negative entries, TTL=%v, strict=%v",
 		cacheMgr.Config().InodeCacheSize,
+		cacheMgr.Config().ExtentCacheSize,
 		cacheMgr.Config().NegativeCacheSize,
 		cacheMgr.Config().InodeTTL,
 		cacheMgr.Config().StrictMode)

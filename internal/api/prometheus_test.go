@@ -59,10 +59,11 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 	server.SetStatsProvider(&mockStatsProvider{
 		cache: &CacheStatsResponse{
 			InodeCache: CacheHitRateInfo{
-				Size:    1000,
-				Hits:    800,
-				Misses:  200,
-				HitRate: 0.8,
+				Size:     1000,
+				Capacity: 10000,
+				Hits:     800,
+				Misses:   200,
+				HitRate:  0.8,
 			},
 			ExtentCache: CacheHitRateInfo{
 				Size:    500,
@@ -82,6 +83,7 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 				Misses:  20,
 				HitRate: 0.9,
 			},
+			Broadcast: &BroadcastTables{Peers: 3, Senders: 4, MaxPeers: 256},
 		},
 		journal: &JournalStatsResponse{
 			State:             "dirty",
@@ -155,6 +157,10 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 	// Cache metrics
 	expectedMetrics := []string{
 		"goclusterfs_cache_inode_size 1000",
+		"goclusterfs_cache_inode_capacity 10000",
+		"goclusterfs_broadcast_peers 3",
+		"goclusterfs_broadcast_senders 4",
+		"goclusterfs_broadcast_max_peers 256",
 		"goclusterfs_cache_inode_hits_total 800",
 		"goclusterfs_cache_inode_misses_total 200",
 		"goclusterfs_cache_inode_hit_rate 0.8",

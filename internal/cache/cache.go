@@ -129,17 +129,20 @@ func (m *Manager) Stats() Stats {
 	negHits, negMisses := m.negatives.Stats()
 
 	stats := Stats{
-		InodeCacheSize:    m.inodes.Len(),
-		InodeCacheHits:    inodeHits,
-		InodeCacheMisses:  inodeMisses,
-		InodeHitRate:      m.inodes.HitRate(),
-		ExtentCacheSize:   m.extents.Len(),
-		ExtentCacheHits:   extentHits,
-		ExtentCacheMisses: extentMisses,
-		ExtentHitRate:     m.extents.HitRate(),
-		NegativeCacheSize: m.negatives.Len(),
-		NegativeHits:      negHits,
-		NegativeMisses:    negMisses,
+		InodeCacheCapacity:    m.inodes.Capacity(),
+		ExtentCacheCapacity:   m.extents.Capacity(),
+		NegativeCacheCapacity: m.negatives.Capacity(),
+		InodeCacheSize:        m.inodes.Len(),
+		InodeCacheHits:        inodeHits,
+		InodeCacheMisses:      inodeMisses,
+		InodeHitRate:          m.inodes.HitRate(),
+		ExtentCacheSize:       m.extents.Len(),
+		ExtentCacheHits:       extentHits,
+		ExtentCacheMisses:     extentMisses,
+		ExtentHitRate:         m.extents.HitRate(),
+		NegativeCacheSize:     m.negatives.Len(),
+		NegativeHits:          negHits,
+		NegativeMisses:        negMisses,
 	}
 
 	// Include broadcast stats if enabled
@@ -152,6 +155,8 @@ func (m *Manager) Stats() Stats {
 		stats.BroadcastLost = bstats.MessagesLost
 		stats.MulticastEnabled = bstats.Transport.MulticastEnabled
 		stats.PeerCount = bstats.Transport.PeerCount
+		stats.BroadcastSenders = bstats.TrackedSenders
+		stats.BroadcastMaxPeers = bstats.MaxPeers
 	}
 
 	return stats
@@ -165,6 +170,11 @@ func (s Stats) String() string {
 
 // Stats holds cache statistics for monitoring and debugging.
 type Stats struct {
+	// Cache limits, in entries
+	InodeCacheCapacity    int
+	ExtentCacheCapacity   int
+	NegativeCacheCapacity int
+
 	// Inode cache stats
 	InodeCacheSize   int
 	InodeCacheHits   uint64
@@ -190,6 +200,8 @@ type Stats struct {
 	BroadcastLost         uint64
 	MulticastEnabled      bool
 	PeerCount             int
+	BroadcastSenders      int
+	BroadcastMaxPeers     int
 }
 
 // Clear removes all entries from all caches.

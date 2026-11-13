@@ -271,7 +271,7 @@ fusermount3 -u /mnt/fs
 
 **Diagnosis**: `gfsctl stats cache` shows this node's cache hits and misses while it runs, and the mount logs `Cache stats: inodes=... (hit=...%), extents=... (hit=...%)` when it unmounts.
 
-**Solutions**: Cache sizes are fixed in code (10,000 inodes, 50,000 extents). A longer `-cache-ttl` or `-attr-timeout` avoids some disk reads, but other nodes' changes then show up later. See [Cache Tuning](OPERATIONS.md#cache-tuning).
+**Solutions**: If `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity`, a larger `-cache-inodes` (or `-cache-extents` for the extent pair) keeps more in memory. A longer `-cache-ttl` or `-attr-timeout` avoids some disk reads, but other nodes' changes then show up later. See [Cache Tuning](OPERATIONS.md#cache-tuning).
 
 ### High Lock Contention
 
