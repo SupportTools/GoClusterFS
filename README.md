@@ -275,7 +275,7 @@ mkdir -p ~/gcfs-tmp
 TMPDIR=~/gcfs-tmp go test -v -timeout 30m ./tests/integration/...
 ```
 
-The full suite took about 15 minutes on one test host, and the tests that `-short` skips about 4 of them. `TestLargeVolume` creates a 200 GB sparse image. `make test-integration` runs the full suite with a 5-minute timeout, which is too short.
+The full suite took about 15 minutes on one test host, and the tests that `-short` skips about 4 of them. `TestLargeVolume` creates a 200 GB sparse image. `make test-integration` runs the full suite with a 30-minute timeout.
 
 VM tests need an x86_64 Linux host with `/dev/kvm`, `qemu-system-x86_64`, OpenBSD `nc` (Debian's `netcat-openbsd`) and `setpriv` from util-linux. VM N listens for SSH on `127.0.0.1:2222+N-1`; set `VM_SSH_BASE_PORT` to run two suites on one host. Each VM's console, QEMU and mount logs are written to `tests/vm/results/`, including logs from before a VM was killed. QEMU 10+ uses io_uring, which counts against the locked-memory limit. With the common 8 MB default, QEMU fails with `Failed to initialize io_uring: Cannot allocate memory`. Raise the limit for the test user, then log in again:
 

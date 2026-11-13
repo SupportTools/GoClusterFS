@@ -1,27 +1,33 @@
 // Package api provides the HTTP JSON API server for GoClusterFS.
 //
-// The API server runs embedded within the mount process and exposes
-// read-only endpoints for health checks, status queries and statistics.
+// The API server runs embedded within the mount process. It serves health
+// checks, status and statistics, and, when a token is set, endpoints that
+// create, clone and delete snapshots, clone files and run admin tasks.
 //
 // # Endpoints
 //
 // The following endpoints are available:
 //
-//   - GET /health         - Health check (503 when a checker reports unhealthy)
-//   - GET /api/v1/status  - Filesystem status overview
-//   - GET /api/v1/stats/* - Detailed component statistics
-//   - GET /metrics        - Prometheus metrics export
+//   - GET /health              - Health check (503 when a checker reports unhealthy)
+//   - GET /api/v1/status       - Filesystem status overview
+//   - GET /api/v1/stats/*      - Detailed component statistics
+//   - GET /metrics             - Prometheus metrics export
+//   - /api/v1/snapshots/*      - List, create, clone and delete snapshots
+//   - POST /api/v1/clones      - Clone a file
+//   - POST /api/v1/admin/*     - Flush the journal, force TRIM, clear caches
+//   - GET /ui/                 - Web dashboard
 //
 // # Authentication
 //
 // Authentication is via Bearer token when configured. Set the AuthToken
 // in Config to enable authentication. When enabled, all endpoints except
-// /health and /metrics require a valid Authorization header:
+// /health, /metrics and /ui/ require a valid Authorization header:
 //
 //	Authorization: Bearer <token>
 //
 // Without a token, Config.CheckExposure refuses non-loopback addresses and
-// CORS "*", and the server rejects requests whose Host is not a loopback name.
+// CORS "*", the server rejects requests whose Host is not a loopback name,
+// and the snapshot, clone and admin endpoints answer 403.
 //
 // # Configuration
 //

@@ -154,3 +154,51 @@ func TestCheckPortsFailsOnTakenPort(t *testing.T) {
 		t.Errorf("CheckPorts with equal ports: %v, want an error that says they must differ", err)
 	}
 }
+
+func TestMulticastPausesThenRetries(t *testing.T) {
+	var h multicastHealth
+	now := time.Now()
+	for i := 1; i < 3; i++ {
+		if h.failed(now, 3) {
+			t.Fatalf("paused after %d failures, want 3", i)
+		}
+	}
+	if !h.failed(now, 3) {
+		t.Fatal("not paused after 3 failures in a row")
+	}
+	if h.usable(now.Add(multicastRetry-time.Second), 3) {
+		t.Error("multicast tried while paused")
+	}
+	if !h.usable(now.Add(multicastRetry), 3) {
+		t.Fatal("multicast not retried after the pause")
+	}
+	if !h.succeeded(3) {
+		t.Error("a success after the pause was not reported as a recovery")
+	}
+	if !h.usable(now, 3) {
+		t.Error("multicast still paused after a success")
+	}
+}
+
+// TestMulticastSuccessResetsFailures checks that failures only count in a row:
+// the counter used to grow for the whole mount, so a few scattered failures
+// turned multicast off until unmount.
+func TestMulticastSuccessResetsFailures(t *testing.T) {
+	var h multicastHealth
+	now := time.Now()
+	for range 10 {
+		h.failed(now, 3)
+		h.failed(now, 3)
+		h.succeeded(3)
+	}
+	if !h.usable(now, 3) {
+		t.Error("multicast paused by failures that successes separated")
+	}
+}
+
+func TestMulticastLimitZeroNeverMulticasts(t *testing.T) {
+	var h multicastHealth
+	if h.usable(time.Now(), 0) {
+		t.Error("multicast used with MaxMulticastFailures 0")
+	}
+}

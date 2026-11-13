@@ -29,10 +29,6 @@ type Config struct {
 	// CheckpointInterval is how often to checkpoint completed transactions.
 	// Default: 5 seconds
 	CheckpointInterval time.Duration
-
-	// FullThreshold triggers forced checkpoint when journal is this % full.
-	// Default: 75%
-	FullThreshold int
 }
 
 // CommitMode controls journal sync behavior.
@@ -81,7 +77,6 @@ func DefaultConfig() Config {
 		CommitMode:         CommitSync,
 		BatchConfig:        DefaultBatchConfig(),
 		CheckpointInterval: 5 * time.Second,
-		FullThreshold:      75,
 	}
 }
 

@@ -440,9 +440,6 @@ func TestJournalConfigDefaults(t *testing.T) {
 	if config.CheckpointInterval != 5*time.Second {
 		t.Errorf("CheckpointInterval = %v, want 5s", config.CheckpointInterval)
 	}
-	if config.FullThreshold != 75 {
-		t.Errorf("FullThreshold = %d, want 75", config.FullThreshold)
-	}
 }
 
 func TestJournalOpen(t *testing.T) {

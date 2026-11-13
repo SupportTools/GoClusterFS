@@ -58,15 +58,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.
 - `go.mod` now requires Go 1.26.
 - `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
+- `make test-integration` now allows 30 minutes, since the full suite takes about 15.
+- Mount no longer creates an SFB manager, which nothing used, and logs that SFB is disabled instead of `SFB: enabled`.
 - Reads use the inode cache, a node keeps a released lock for 10 ms so back-to-back operations take it again without disk I/O and yields a lock it has reused for 250 ms, and the inode and extent caches are split into 16 shards.
 
 ### Removed
 
 - The legacy single-block prototype in the repository root (`main.go`).
+- The journal's `FullThreshold` setting, which nothing read. A checkpoint still runs every 5 seconds and when a transaction does not fit.
 
 ### Fixed
 
 - `chmod`, `chown` and `touch` could undo another node's concurrent change to the same inode: on a directory, a create's link count or mtime; on a file, the size an append inside an allocated block set. Directory attribute changes now hold the inode lock from read to write, and file attribute changes retry when the inode changed since they read it.
+- After 3 failed multicast sends in total, counted over the whole mount, a node sent cache invalidations only to unicast peers until it unmounted. Now only failures in a row count: a successful send resets them, and after 3 in a row the node tries multicast again 30 seconds later.
 - `chmod` cleared a file's type bits, so the file could no longer be opened ("Is a directory") and fsck reported an invalid file type. `chmod`, `chown` and `touch` now also work on directories and the mount root, which returned "Operation not supported".
 - The cache summary logged at unmount showed hit rates 100 times too high.
 - All nodes wrote the same journal region. A restarting node replayed and then reset the journal of nodes still writing, and no node could replay a crashed node's journal. Each node registry slot now owns a 4 MB journal, and a crashed node's journal is replayed through its slot.
