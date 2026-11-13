@@ -2090,6 +2090,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/interrupt_test.go::TestClaimErrno
 
+  - id: alloc-stuck-bitmap-lock-eio
+    name: Block allocation fails with EIO when the bitmap lock is never freed
+    description: A write and a fallocate that need new blocks while the bitmap lock stays held on another node past lock.DefaultTimeout fail with EIO, not ENOSPC
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestAllocationReportsStuckBitmapLockAsEIO
+
+  - id: alloc-errno
+    name: Block allocation failures map to the right errno
+    description: An empty bitmap or full backing storage is ENOSPC; a bitmap lock timeout, checksum or read error is EIO
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestAllocErrno
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself

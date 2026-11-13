@@ -691,6 +691,16 @@ func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32,
 	return f.createFile(detach(ctx), &f.Inode, inode.InodeRoot, name, mode, out)
 }
 
+// allocErrno maps a failure to allocate data or extent-tree blocks. Only an
+// empty bitmap or full backing storage means no space; a lock wait that gave
+// up or another I/O error does not.
+func allocErrno(err error) syscall.Errno {
+	if errors.Is(err, bitmap.ErrNoFreeBlocks) || errors.Is(err, syscall.ENOSPC) {
+		return syscall.ENOSPC
+	}
+	return syscall.EIO
+}
+
 // claimErrno maps a failure to find or claim an inode slot. Only a slot another
 // node took first is worth a retry; a lock wait that gave up or an I/O error is
 // not a full inode table.
@@ -1778,13 +1788,15 @@ var testHookBeforeFreeingUnused func()
 func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockNum uint64) (*inode.Inode, *extent.Extent, func(), error) {
 	blocks, err := f.fs.bitmapMgr.Alloc(ctx, 1)
 	if err != nil {
-		return nil, nil, nil, syscall.ENOSPC
+		log.Printf("[DEBUG] Write inode %d: allocating block %d failed: %v", f.inodeNum, blockNum, err)
+		return nil, nil, nil, allocErrno(err)
 	}
 	ext := &extent.Extent{LogicalBlock: blockNum, PhysicalBlock: blocks[0], Length: 1, Flags: extent.FlagAllocated}
 	treeCtx, releaseTree, err := f.fs.extentMgr.ReserveTreeBlocks(ctx, ino)
 	if err != nil {
+		log.Printf("[DEBUG] Write inode %d: reserving extent-tree blocks failed: %v", f.inodeNum, err)
 		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
-		return nil, nil, nil, syscall.ENOSPC
+		return nil, nil, nil, allocErrno(err)
 	}
 
 	if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
@@ -2008,7 +2020,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					case errors.Is(err, extent.ErrCorruptTree):
 						return 0, syscall.EIO
 					default:
-						return 0, syscall.ENOSPC
+						return 0, allocErrno(err)
 					}
 				}
 			}
@@ -2924,7 +2936,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 			if errors.Is(allocErr, extent.ErrExtentTreeFull) {
 				return syscall.EFBIG, nil
 			}
-			return syscall.ENOSPC, nil
+			return allocErrno(allocErr), nil
 		}
 		for b := rangeStart; b < rangeEnd; b++ {
 			if ext, inExt, err := f.fs.extentMgr.Lookup(ino, b); err == nil {
