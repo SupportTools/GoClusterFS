@@ -573,13 +573,13 @@ func (t *Table) lockSector(inodeNum uint32) (func(), error) {
 	return func() { t.unlock(lock.LockTypeInodeSector, sector) }, nil
 }
 
-// unlock releases a lock taken for an inode table update. Losing the lock
-// before release means another node may have updated the inode table meanwhile.
+// unlock releases a lock taken for an inode table update. ErrNotLockOwner means
+// a double release: the extra one may have dropped another holder's lock early.
 func (t *Table) unlock(lt lock.LockType, id uint64) {
 	err := t.lockMgr.Release(lt, id)
 	switch {
 	case errors.Is(err, lock.ErrNotLockOwner):
-		log.Printf("[ERROR] inode table: lock type %d id %d was taken over before release; another node may have updated the inode table at the same time", lt, id)
+		log.Printf("[ERROR] inode table: released lock type %d id %d that this node does not hold (double release or lock bookkeeping bug)", lt, id)
 	case err != nil:
 		log.Printf("[WARN] inode table: releasing lock type %d id %d failed: %v", lt, id, err)
 	}
