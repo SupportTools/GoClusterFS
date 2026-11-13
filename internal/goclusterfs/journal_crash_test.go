@@ -52,16 +52,30 @@ func crashAfterCommit(t *testing.T, fsys *FS, op string) <-chan struct{} {
 	return crashed
 }
 
-// remountAndReplay opens the image as the next mount would and replays the journal.
+// remountAndReplay opens the image as a new node and replays the crashed node's
+// journal, keeping that node's locks through the replay as mount does.
 func remountAndReplay(t *testing.T, path string, offset, size uint64) *FS {
 	t.Helper()
 	fsys := openFormattedFS(t, path)
+	region, err := journal.OpenRegionForRecovery(fsys.dev, offset, size)
+	if err != nil {
+		t.Fatalf("open the crashed node's journal: %v", err)
+	}
+	crashed := region.Superblock().NodeUUID
+	// openFormattedFS puts each node's slot in the last byte of its UUID.
+	adopted, err := fsys.lockMgr.AdoptOwner(crashed, int(crashed[15]))
+	if err != nil {
+		t.Fatalf("take over the crashed node's locks: %v", err)
+	}
 	replay := journal.CreateTxnRecoveryHandler(&journal.RecoveryContext{
 		Dev: fsys.dev, InodeTbl: fsys.inodeTbl, BitmapMgr: fsys.bitmapMgr,
 		DirMgr: fsys.dirMgr, ExtentMgr: fsys.extentMgr,
 	})
 	if _, err := journal.ScanAndRecover(fsys.dev, offset, size, replay); err != nil {
 		t.Fatalf("replay: %v", err)
+	}
+	if err := fsys.lockMgr.ReleaseAdopted(adopted); err != nil {
+		t.Fatalf("release the crashed node's locks: %v", err)
 	}
 	return fsys
 }
