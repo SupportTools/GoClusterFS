@@ -5,16 +5,35 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func captureLog(t *testing.T) *bytes.Buffer {
+// logBuffer is a log destination a test can read while other goroutines log.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func captureLog(t *testing.T) *logBuffer {
 	t.Helper()
-	var buf bytes.Buffer
-	log.SetOutput(&buf)
+	buf := &logBuffer{}
+	log.SetOutput(buf)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-	return &buf
+	return buf
 }
 
 func TestOnlySlowShutdownStepsAreLogged(t *testing.T) {
