@@ -843,18 +843,117 @@ scenarios:
       vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
 
   - id: extent-free-replay-guard
-    name: ExtentFree replay frees only blocks still mapped where logged
-    description: Replay of an ExtentFree record cuts the size and unmaps and frees a logged block only while the inode is unwritten since the log and maps that disk block at that file block, and is idempotent
+    name: ExtentFree replay cuts only an unchanged inode
+    description: Replay of an ExtentFree record cuts the inode to the logged size and frees its blocks past it only while the inode is unwritten since the log, and is idempotent
     priority: go_only
     environments:
-      go: internal/journal/cross_node_recovery_test.go::TestApplyExtentFreeFreesOnlyStillMappedBlocks
+      go: internal/journal/cross_node_recovery_test.go::TestApplyExtentFreeCutsUnchangedInode
 
   - id: extent-free-payload-round-trip
     name: ExtentFree record serialization
-    description: An ExtentFree record serializes and deserializes, and a payload shorter than its extent count is rejected
+    description: An ExtentFree record serializes and deserializes, and a record from the previous build that also lists extents still reads
     priority: go_only
     environments:
       go: internal/journal/cross_node_recovery_test.go::TestExtentFreePayloadRoundTrip
+
+  - id: journal-payloads-without-generations
+    name: Journal records from older builds read without generations
+    description: InodeCreate, InodeDelete, DirRemoveEntry and ExtentAdd records round-trip their generations, and records written before them read as generation 0
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestPayloadsWithoutGenerations
+
+  - id: replayed-unlink-keeps-reused-inode
+    name: Replayed unlink keeps a file that reused its inode
+    description: Another node finishes an unlink and creates a file in the same inode slot before replay; replay of the unlink's records frees neither that file nor its blocks and keeps its entry
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayedUnlinkKeepsReusedInode
+
+  - id: replayed-unlink-frees-unchanged-inode
+    name: Replayed unlink frees an unchanged inode
+    description: All records of an interrupted unlink apply in one replay, each accepting the inode generation the replay wrote
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayedUnlinkFreesUnchangedInode
+
+  - id: dir-remove-replay-keeps-reused-name
+    name: DirRemoveEntry replay keeps a reused name
+    description: A removed name now names another inode, or the same inode number reused since; replay leaves the entry
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestApplyDirRemoveEntryKeepsReusedName
+
+  - id: replayed-create-skips-used-slot
+    name: Replayed create skips a slot used since
+    description: Another node takes, or takes and frees, the slot an interrupted create logged; replay creates no inode and adds no entry
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayedCreateSkipsUsedSlot
+
+  - id: replayed-create-finishes-unclaimed-slot
+    name: Replayed create finishes in an untouched slot
+    description: A create interrupted before claiming its slot replays its inode and entry, once
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayedCreateFinishesUnclaimedSlot
+
+  - id: extent-add-replay-skips-changed-inode
+    name: ExtentAdd replay skips an inode written since
+    description: Another node truncates a file after a write committed its intent; replay does not map the write's blocks again
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestApplyExtentAddSkipsChangedInode
+
+  - id: dir-entry-replay-skips-removed-parent
+    name: Directory entry replay skips a removed parent
+    description: DirAddEntry and DirRemoveEntry replay into a parent slot that is no longer a directory skip the record instead of failing the replay
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestApplyDirEntrySkipsRemovedParent
+
+  - id: unlink-crash-keeps-file-in-reused-slot
+    name: Replay after an unlink keeps a file that reused its inode slot
+    description: An unlink frees its inode and blocks, a new file takes the inode slot, and the process dies before closing the intent; replay keeps the new file, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_guard_test.go::TestUnlinkCrashKeepsFileInReusedSlot
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: root-unlink-replay-frees-file
+    name: Replay of an interrupted root-directory unlink frees the file
+    description: A root-directory unlink stops after its commit and the process dies; replay removes the entry and frees the inode and its blocks, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_guard_test.go::TestRootUnlinkReplayFreesFileAndBlocks
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: write-replay-maps-blocks-and-size
+    name: Replay of an interrupted write maps its blocks and size
+    description: A write stops after its commit and the process dies; replay maps the write's new blocks and gives the file the write's size
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_guard_test.go::TestWriteReplayMapsBlocksAndSize
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: write-replay-keeps-later-truncate
+    name: Replay of an interrupted write keeps a later truncate
+    description: A write stops after its commit, and another node truncates the file before replay; replay keeps the truncate and fsck -repair frees the write's blocks
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_guard_test.go::TestWriteReplayKeepsLaterTruncate
+      docker: TODO  # needs a pause between commit and completion, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the millisecond window between commit and completion without that hook
+
+  - id: rmdir-frees-directory-inode
+    name: Rmdir frees the directory inode
+    description: Removing an empty directory, in the root or in a subdirectory, frees its inode; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/replay_guard_test.go::TestRmdirFreesDirectoryInode
 
   - id: failed-write-frees-blocks
     name: Failed writes give back their blocks
