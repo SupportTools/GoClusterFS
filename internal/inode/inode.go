@@ -209,14 +209,24 @@ func (t *Table) Read(inodeNum uint32) (*Inode, error) {
 // Write writes an inode to disk.
 // The inode must have a valid InodeNum set.
 func (t *Table) Write(ctx context.Context, inode *Inode) error {
-	committed, err := t.lockedWrite(ctx, inode)
+	committed, err := t.lockedWrite(ctx, inode, nil)
 	if committed != nil {
 		committed()
 	}
 	return err
 }
 
-func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
+// WriteIfUnchanged is Write for an inode read at MetaGeneration gen. If another
+// write landed since, it writes nothing and returns ErrTreeConflict.
+func (t *Table) WriteIfUnchanged(ctx context.Context, inode *Inode, gen uint64) error {
+	committed, err := t.lockedWrite(ctx, inode, &gen)
+	if committed != nil {
+		committed()
+	}
+	return err
+}
+
+func (t *Table) lockedWrite(ctx context.Context, inode *Inode, wantGen *uint64) (func(), error) {
 	if uint64(inode.InodeNum) >= t.totalInodes {
 		return nil, ErrInodeOutOfRange
 	}
@@ -237,6 +247,15 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if wantGen != nil {
+		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
+		if err != nil {
+			return nil, err
+		}
+		if onDisk.MetaGeneration != *wantGen {
+			return nil, fmt.Errorf("%w: inode %d was written since it was read", ErrTreeConflict, inode.InodeNum)
+		}
+	}
 	return t.writeWithTree(inode)
 }
 
