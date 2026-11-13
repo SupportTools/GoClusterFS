@@ -1002,6 +1002,20 @@ scenarios:
       docker: TODO  # needs a pause between one node's lookup and its removal, which only the Go test hook gives
       vm: TODO  # the race window is too short to hit on purpose without that hook
 
+  - id: unlink-succeeds-while-peer-writes
+    name: Unlink succeeds while another node writes the file
+    description: Another node writes the file every time unlink looks it up; the unlink succeeds, every block is freed, and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestUnlinkSucceedsWhilePeerWrites
+
+  - id: rmdir-races-peer-adding-entry
+    name: Rmdir keeps a directory another node adds an entry to
+    description: Another node adds an entry to the directory between rmdir's emptiness check and its removal; rmdir returns ENOTEMPTY and the directory keeps its name
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestRmdirRacesPeerAddingEntry
+
   - id: unlink-frees-blocks-written-after-name-removed
     name: Unlink frees blocks written after its name was removed
     description: An open handle writes a new block between unlink removing the name and freeing the inode; the free gives back every block, and fsck is clean

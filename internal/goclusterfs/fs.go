@@ -1318,6 +1318,14 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 	return retryRace("Remove", name, func() syscall.Errno { return d.removeEntryOnce(ctx, name, isDir) })
 }
 
+// sameForRemoval reports whether cur still matches the removal's checks: a file's writes don't count, a directory's new entries do.
+func sameForRemoval(was, cur *inode.Inode) bool {
+	if cur.Magic != inode.InodeMagic || cur.Mode&inode.S_IFMT != was.Mode&inode.S_IFMT || cur.LinkCount != was.LinkCount {
+		return false
+	}
+	return !was.IsDir() || cur.MetaGeneration == was.MetaGeneration
+}
+
 // removeEntryOnce returns EAGAIN when another node changes the child between the lookup and the removal.
 func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) syscall.Errno {
 	// Invalidate parent directory cache before modifying
@@ -1454,7 +1462,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 		}
 		cur, err := d.fs.inodeTbl.Read(uint32(child))
 		readFailed = err != nil
-		changed = err == nil && cur.MetaGeneration != childIno.MetaGeneration
+		changed = err == nil && !sameForRemoval(childIno, cur)
 		return err == nil && !changed
 	})
 	switch {

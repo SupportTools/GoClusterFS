@@ -191,6 +191,57 @@ func TestRemoveRacesPeerRecreate(t *testing.T) {
 	}
 }
 
+// Another node writes the file each time unlink looks it up: the unlink still succeeds and frees every block.
+func TestUnlinkSucceedsWhilePeerWrites(t *testing.T) {
+	a, path, _, _ := journaledFS(t)
+	b := openFormattedFS(t, path)
+	victim := createFile(t, a, "victim")
+	writer := &File{fs: b, inodeNum: victim.inodeNum}
+	writes := 0
+	afterCommit = func(op string) {
+		if op == "unlink" {
+			writes++
+			writeAt(t, writer, pattern(byte(writes), BlockSize), int64(writes)*BlockSize)
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+
+	if errno := a.RootDir().Unlink(context.Background(), "victim"); errno != 0 {
+		t.Fatalf("unlink while another node writes: %v", errno)
+	}
+	expectCleanFsck(t, b)
+}
+
+// Another node adds a file to a directory between rmdir's emptiness check and its removal: rmdir reports ENOTEMPTY.
+func TestRmdirRacesPeerAddingEntry(t *testing.T) {
+	a, path, _, _ := journaledFS(t)
+	b := openFormattedFS(t, path)
+	sub := newSubdir(t, a, "sub")
+	afterCommit = func(op string) {
+		if op != "unlink" {
+			return
+		}
+		afterCommit = nil
+		subIno, err := b.inodeTbl.Read(sub.inodeNum)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner := newRegularFile(t, b)
+		if err := b.dirMgr.Add(context.Background(), subIno, "inner", uint64(inner.inodeNum), dir.DT_REG); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+
+	if errno := a.RootDir().Rmdir(context.Background(), "sub"); errno != syscall.ENOTEMPTY {
+		t.Errorf("rmdir = %v, want %v", errno, syscall.ENOTEMPTY)
+	}
+	if _, ok := expectOneNamePerInode(t, b)["sub"]; !ok {
+		t.Error("the directory lost its name")
+	}
+	expectCleanFsck(t, b)
+}
+
 // An open handle writes the file after unlink removes its name: the free gives back what the inode maps then.
 func TestUnlinkFreesBlocksWrittenAfterNameRemoved(t *testing.T) {
 	fsys, _, _, _ := journaledFS(t)
