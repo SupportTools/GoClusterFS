@@ -37,7 +37,7 @@ func newNodes(t *testing.T, n int) ([]*Manager, *inode.Inode) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { dev.Close() })
+		t.Cleanup(func() { _ = dev.Close() })
 		var nodeUUID [16]byte
 		copy(nodeUUID[:], fmt.Sprintf("index-node-%04d", slot))
 		lockMgr := lock.NewManager(dev, 0, 1<<20, nodeUUID, slot)
