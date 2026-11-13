@@ -367,6 +367,9 @@ func (m *Manager) issueDiscard(r blockRange) error {
 	// startBlock is relative to data region, add DataOffset
 	byteOffset := m.config.DataOffset + r.startBlock*BlockSize
 	byteLength := r.count * BlockSize
+	if err := m.dev.CheckWrite(int64(byteOffset)); err != nil {
+		return err
+	}
 	if m.config.Discard != nil {
 		return m.config.Discard(byteOffset, byteLength)
 	}
