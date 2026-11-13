@@ -2867,6 +2867,20 @@ scenarios:
     environments:
       go: internal/lock/owner_test.go::TestReplaysSharingRecordTakeTurns
 
+  - id: lock-replay-keeps-live-replay-claims
+    name: A replay does not pass over a live node's replay claims
+    description: A node replaying a dead node in a lower slot stays out of a record that a live node, remounted into its own slot, holds as adopted while it replays its predecessor
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestReplayDoesNotPassOverLiveNodesReplayClaims
+
+  - id: lock-clear-foreign-claims
+    name: A mount clears an earlier occupant's claims in its slot
+    description: After its replay, a node clears claims in its own slot that an earlier occupant left or that are torn, and keeps its own holds
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestClearForeignClaimsKeepsOwnHolds
+
   - id: lock-nested-wait-yields-to-replay
     name: Nested wait on a replaying node yields to the replay
     description: A peer that holds inode Y and waits for a dead node's adopted extent row gives up after the timeout, and the replay, which waits without a limit, takes Y and finishes

@@ -460,7 +460,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
 				"the journal replay of node %x (slot %d), which holds record %d, failed or was abandoned", by.occupant[:8], by.slot, recordID))
 		}
-		if by.state == OwnerFailing && time.Since(lastFailingLog) >= acquireTimeout {
+		if by.failing() && time.Since(lastFailingLog) >= acquireTimeout {
 			lastFailingLog = time.Now()
 			log.Printf("[WARN] lock: type=%d res=%d mode=%d has waited %v for node %x (slot %d), which holds it and is failing or being recovered; waiting until its journal replay ends",
 				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), by.occupant[:8], by.slot)
@@ -470,7 +470,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		// up after acquireTimeout of waiting for live holders, or for failing ones
 		// while this goroutine holds other locks; a replay's wait never does.
 		if retryCount >= 3 && (ctx.Err() != nil || !replay && liveWait > acquireTimeout) {
-			if by.state == OwnerFailing {
+			if by.failing() && nested {
 				return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
 					"this goroutine holds other locks, and record %d is held by node %x (slot %d), which is failing or being recovered and whose replay may need one of them",
 					recordID, by.occupant[:8], by.slot))
@@ -481,7 +481,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		// Add jitter to prevent thundering herd
 		jitter := time.Duration(rand.Int63n(int64(delay / 2)))
 		time.Sleep(delay + jitter)
-		if by.state != OwnerFailing || nested {
+		if !by.failing() || nested {
 			liveWait += time.Since(tryStart)
 		}
 

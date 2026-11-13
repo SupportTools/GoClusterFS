@@ -149,8 +149,8 @@ func (m *Manager) readRow(recordID uint64) ([]byte, error) {
 // than StaleThreshold, or for a torn slot, until it stays torn for tornExpiry.
 //
 // ignore is the slot of a dead node whose claim this node adopted for a replay.
-// Another replay's adopted claim then counts as lower only in a lower slot and
-// not at all in a higher one, so two replays sharing a record take turns.
+// Another dead node's adopted claim then counts as lower only in a lower slot
+// and not at all in a higher one, so two replays sharing a record take turns.
 func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignore int) (conflict, lower bool, by blocker) {
 	m.mu.Lock()
 	view := m.ownerView
@@ -169,16 +169,18 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 			continue
 		}
 		adopted := s != nil && s.adopted
-		if adopted && ignore >= 0 && slot > ignore {
-			continue
-		}
+		takesTurns := adopted && ignore >= 0 && slot > ignore
 		b := blocker{slot: slot}
 		if view == nil {
-			if tornTooLong || (s != nil && s.stale()) {
+			if takesTurns || tornTooLong || (s != nil && s.stale()) {
 				continue
 			}
-		} else if b = m.slotState(view, slot, s); b.state == OwnerReleased {
-			continue
+		} else {
+			// Only a dead node's replay takes turns: a live node's own-slot
+			// replay claims are its holds.
+			if b = m.slotState(view, slot, s); b.state == OwnerReleased || takesTurns && b.state == OwnerRecovering {
+				continue
+			}
 		}
 		if conflict {
 			b = worse(by, b)
