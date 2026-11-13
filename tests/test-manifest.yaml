@@ -288,6 +288,7 @@ scenarios:
     name: Concurrent directory operations
     description: Multiple nodes create directories simultaneously
     priority: high
+    # Skipped in all three suites until #29: two nodes can both hold the root directory lock and lose an entry.
     environments:
       go: multinode_test.go::TestMultiNodeConcurrentDirectoryOps
       docker: run-tests.sh::test_concurrent_directory_ops
