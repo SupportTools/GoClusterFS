@@ -39,9 +39,20 @@ var (
 type claimSlot struct {
 	mode        LockMode
 	lockType    LockType
+	adopted     bool // kept by AdoptOwner for a journal replay; every claimant defers to it
 	resourceID  uint64
 	owner       [16]byte
 	acquireTime int64 // Unix nanoseconds
+}
+
+type adoptedSlot struct {
+	slot  int
+	owner [16]byte
+}
+
+type slotRef struct {
+	record uint64
+	slot   int
 }
 
 func encodeSlot(s *claimSlot) []byte {
@@ -52,6 +63,9 @@ func encodeSlot(s *claimSlot) []byte {
 	binary.LittleEndian.PutUint32(buf[0:4], slotMagic)
 	buf[4] = byte(s.mode)
 	buf[5] = byte(s.lockType)
+	if s.adopted {
+		buf[6] = 1
+	}
 	binary.LittleEndian.PutUint64(buf[8:16], s.resourceID)
 	copy(buf[16:32], s.owner[:])
 	binary.LittleEndian.PutUint64(buf[32:40], uint64(s.acquireTime))
@@ -72,6 +86,7 @@ func decodeSlot(buf []byte) (*claimSlot, error) {
 	s := &claimSlot{
 		mode:        LockMode(buf[4]),
 		lockType:    LockType(buf[5]),
+		adopted:     buf[6] == 1,
 		resourceID:  binary.LittleEndian.Uint64(buf[8:16]),
 		acquireTime: int64(binary.LittleEndian.Uint64(buf[32:40])),
 	}
@@ -120,24 +135,68 @@ func (m *Manager) readRow(recordID uint64) ([]byte, error) {
 }
 
 // rowConflicts reports whether a slot other than this node's and ignore
-// conflicts with a claim in mode, and whether one of those is in a lower slot.
-// A write claim conflicts with every live slot, a read claim with live write
-// slots. Torn slots conflict; slots older than StaleThreshold do not.
-func (m *Manager) rowConflicts(row []byte, mode LockMode, ignore int) (conflict, lower bool) {
+// conflicts with a claim in mode, and whether one of those is in a lower slot
+// or adopted, which this node must defer to. A write claim conflicts with every
+// live slot, a read claim with live write slots. Slots older than StaleThreshold
+// do not conflict, and torn slots conflict until they stay torn for tornExpiry.
+func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignore int) (conflict, lower bool) {
 	for slot := range SlotsPerRecord {
 		if slot == m.nodeSlot || slot == ignore {
 			continue
 		}
 		s, err := decodeSlot(rowSlot(row, slot))
+		if m.tornTooLong(slotRef{recordID, slot}, err != nil) {
+			continue
+		}
 		if err == nil && (s == nil || s.stale() || (mode != LockModeExclusive && s.mode != LockModeExclusive)) {
 			continue
 		}
 		conflict = true
-		if slot < m.nodeSlot {
+		if slot < m.nodeSlot || (s != nil && s.adopted) {
 			return true, true
 		}
 	}
 	return conflict, false
+}
+
+// tornTooLong records when this node first read ref torn and reports whether it
+// has stayed torn for tornExpiry. A slot that reads whole again is forgotten.
+func (m *Manager) tornTooLong(ref slotRef, torn bool) bool {
+	if !torn && m.tornCount.Load() == 0 {
+		return false
+	}
+	m.tornMu.Lock()
+	defer m.tornMu.Unlock()
+	defer func() { m.tornCount.Store(int32(len(m.tornSince))) }()
+	if !torn {
+		delete(m.tornSince, ref)
+		return false
+	}
+	first, ok := m.tornSince[ref]
+	if !ok {
+		m.tornSince[ref] = time.Now()
+		return false
+	}
+	return age(first) > tornExpiry
+}
+
+// ownAdoptedLocked reports whether AdoptOwner kept recordID in this node's own
+// slot, for the predecessor that last used it.
+func (m *Manager) ownAdoptedLocked(recordID uint64) bool {
+	a, ok := m.adopted[recordID]
+	return ok && a.slot == m.nodeSlot
+}
+
+// ownClaim is what this node writes in its slot to claim recordID in mode. A
+// record adopted in this slot stays an adopted write claim until ReleaseAdopted.
+func (m *Manager) ownClaim(recordID uint64, key lockKey, mode LockMode, at time.Time) *claimSlot {
+	s := &claimSlot{mode: mode, lockType: key.Type, resourceID: key.ResourceID, owner: m.nodeUUID, acquireTime: at.UnixNano()}
+	m.mu.Lock()
+	if m.ownAdoptedLocked(recordID) {
+		s.mode, s.adopted = LockModeExclusive, true
+	}
+	m.mu.Unlock()
+	return s
 }
 
 func (m *Manager) addClaimWaiterLocked(recordID uint64) {
@@ -178,7 +237,7 @@ func (m *Manager) dropClaimWaiter(recordID uint64) {
 	delete(m.claims, recordID)
 	m.mu.Unlock()
 	if !c.written.IsZero() {
-		_ = m.writeSlot(recordID, m.nodeSlot, nil)
+		_ = m.releaseRecord(recordID)
 	}
 }
 
@@ -189,19 +248,19 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 	m.mu.Lock()
 	c := m.claims[recordID]
 	rewrite := c.written.IsZero() || c.mode != mode || age(c.written) > renewAfter
-	ignore, adopted := m.adopted[recordID]
+	ignore := -1
+	if a, ok := m.adopted[recordID]; ok {
+		ignore = a.slot
+	}
 	behindLower := c.behindLower
 	m.mu.Unlock()
-	if !adopted {
-		ignore = -1
-	}
 
 	if behindLower {
 		row, err := m.readRow(recordID)
 		if err != nil {
 			return time.Time{}, false, err
 		}
-		if _, lower := m.rowConflicts(row, mode, ignore); lower {
+		if _, lower := m.rowConflicts(recordID, row, mode, ignore); lower {
 			m.deferred.Add(1)
 			return time.Time{}, false, nil
 		}
@@ -212,8 +271,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 
 	start := time.Now()
 	if rewrite {
-		mine := &claimSlot{mode: mode, lockType: key.Type, resourceID: key.ResourceID, owner: m.nodeUUID, acquireTime: start.UnixNano()}
-		err := m.writeSlot(recordID, m.nodeSlot, mine)
+		err := m.writeSlot(recordID, m.nodeSlot, m.ownClaim(recordID, key, mode, start))
 		m.mu.Lock()
 		c.written, c.mode = start, mode
 		m.mu.Unlock()
@@ -229,7 +287,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 		m.recordClaimTime(time.Since(start))
 	}
 
-	conflict, lower := m.rowConflicts(row, mode, ignore)
+	conflict, lower := m.rowConflicts(recordID, row, mode, ignore)
 	switch {
 	case !conflict:
 		m.mu.Lock()
@@ -239,7 +297,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 		return written, true, nil
 	case lower:
 		m.conflicts.Add(1)
-		if err := m.writeSlot(recordID, m.nodeSlot, nil); err != nil {
+		if err := m.releaseRecord(recordID); err != nil {
 			return time.Time{}, false, err
 		}
 		m.mu.Lock()
@@ -256,8 +314,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 // do not see it as stale. It runs under the record gate.
 func (m *Manager) renewRecord(recordID uint64, key lockKey, rec *heldRecord) error {
 	now := time.Now()
-	mine := &claimSlot{mode: rec.mode, lockType: key.Type, resourceID: key.ResourceID, owner: m.nodeUUID, acquireTime: now.UnixNano()}
-	if err := m.writeSlot(recordID, m.nodeSlot, mine); err != nil {
+	if err := m.writeSlot(recordID, m.nodeSlot, m.ownClaim(recordID, key, rec.mode, now)); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -266,8 +323,15 @@ func (m *Manager) renewRecord(recordID uint64, key lockKey, rec *heldRecord) err
 	return nil
 }
 
-// releaseRecord clears this node's slot of a record it held. It runs under the record gate.
+// releaseRecord clears this node's slot of a record it held or claimed, or
+// keeps an adoption there until ReleaseAdopted. It runs under the record gate.
 func (m *Manager) releaseRecord(recordID uint64) error {
+	m.mu.Lock()
+	keep := m.ownAdoptedLocked(recordID)
+	m.mu.Unlock()
+	if keep {
+		return m.writeSlot(recordID, m.nodeSlot, m.ownClaim(recordID, lockKey{}, LockModeExclusive, time.Now()))
+	}
 	return m.writeSlot(recordID, m.nodeSlot, nil)
 }
 
@@ -284,8 +348,12 @@ func (m *Manager) describeHolder(recordID uint64) string {
 		case err != nil:
 			holders = append(holders, fmt.Sprintf("slot %d (torn)", slot))
 		case s != nil:
-			holders = append(holders, fmt.Sprintf("slot %d node %x mode %d type %d res %d, written %v ago",
-				slot, s.owner[:8], s.mode, s.lockType, s.resourceID, time.Since(time.Unix(0, s.acquireTime)).Round(time.Millisecond)))
+			adopted := ""
+			if s.adopted {
+				adopted = " (adopted)"
+			}
+			holders = append(holders, fmt.Sprintf("slot %d node %x mode %d type %d res %d%s, written %v ago",
+				slot, s.owner[:8], s.mode, s.lockType, s.resourceID, adopted, time.Since(time.Unix(0, s.acquireTime)).Round(time.Millisecond)))
 		}
 	}
 	if len(holders) == 0 {

@@ -135,6 +135,95 @@ func TestAdoptOwnerOfOwnSlotPredecessor(t *testing.T) {
 	requireBlocked(t, peer, LockTypeInode, 5, LockModeExclusive)
 }
 
+// The replay's own acquires write the adopted slot of a node restarted into
+// its own registry slot. Releasing them must keep peers off until ReleaseAdopted.
+func TestOwnSlotAdoptionOutlivesReplayAcquire(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+
+	before := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	after := NewManager(dev, 0, reclaimRegion, [16]byte{5}, 1)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	requireAcquired(t, before, LockTypeInode, 2, LockModeExclusive)
+
+	adopted, err := after.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(adopted) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v; want the predecessor's record", adopted, err)
+	}
+	requireAcquired(t, after, LockTypeInode, 2, LockModeShared)
+	if err := after.Release(LockTypeInode, 2); err != nil {
+		t.Fatal(err)
+	}
+	after.ReleaseCached()
+	requireBlocked(t, peer, LockTypeInode, 2, LockModeShared)
+
+	if err := after.ReleaseAdopted(adopted); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, peer, LockTypeInode, 2, LockModeExclusive)
+}
+
+// A waiter in a lower slot than the replayer is blocked by the adopted slot.
+// It must defer to it, or the replay waits behind a waiter that waits for the
+// replay.
+func TestReplayerWinsAdoptedRecordOverLowerWaiter(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{9}, 9)
+	waiter := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	requireAcquired(t, dead, LockTypeInode, 2, LockModeExclusive)
+	adopted, err := replayer.AdoptOwner([16]byte{9}, 9)
+	if err != nil || len(adopted) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v; want the dead node's record", adopted, err)
+	}
+
+	waited := make(chan error, 1)
+	go func() {
+		err := acquireWithin(waiter, 10*time.Second, LockTypeInode, 2, LockModeExclusive)
+		if err == nil {
+			waiter.Release(LockTypeInode, 2)
+		}
+		waited <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	requireAcquired(t, replayer, LockTypeInode, 2, LockModeExclusive)
+	if err := replayer.Release(LockTypeInode, 2); err != nil {
+		t.Fatal(err)
+	}
+	replayer.ReleaseCached()
+	if err := replayer.ReleaseAdopted(adopted); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatalf("waiter never got the record after the replay: %v", err)
+	}
+}
+
+// A new node can register into the dead node's slot before ReleaseAdopted.
+// What it writes there is its own claim and must stay.
+func TestReleaseAdoptedKeepsNewOwnersClaim(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	requireAcquired(t, dead, LockTypeInode, 2, LockModeExclusive)
+	adopted, err := replayer.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(adopted) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v; want the dead node's record", adopted, err)
+	}
+
+	newcomer := NewManager(dev, 0, reclaimRegion, [16]byte{7}, 1)
+	requireAcquired(t, newcomer, LockTypeInode, 2, LockModeExclusive)
+	if err := replayer.ReleaseAdopted(adopted); err != nil {
+		t.Fatal(err)
+	}
+	requireBlocked(t, peer, LockTypeInode, 2, LockModeExclusive)
+}
+
 func TestAdoptOwnerLeavesSharedRecordOfReleasedReader(t *testing.T) {
 	dev, cleanup := createTestDevice(t, reclaimRegion)
 	defer cleanup()

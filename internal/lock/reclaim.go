@@ -36,7 +36,7 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (b
 	gate.Lock()
 	defer gate.Unlock()
 
-	if ownerSlot == m.nodeSlot && m.usesOwnSlot(recordID) {
+	if _, inUse := m.ownSlotUse(recordID); ownerSlot == m.nodeSlot && inUse {
 		return false, nil
 	}
 	buf := storage.GetBuffer(SlotSize)
@@ -53,28 +53,34 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (b
 	case err != nil:
 		dead = &claimSlot{owner: owner}
 	}
-	dead.mode = LockModeExclusive
+	dead.mode, dead.adopted = LockModeExclusive, true
 	dead.acquireTime = time.Now().UnixNano()
 	if err := m.writeSlot(recordID, ownerSlot, dead); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
-	m.adopted[recordID] = ownerSlot
+	m.adopted[recordID] = adoptedSlot{slot: ownerSlot, owner: owner}
 	m.mu.Unlock()
 	return true, nil
 }
 
-// usesOwnSlot reports whether this node holds recordID or has a claim written for it.
-func (m *Manager) usesOwnSlot(recordID uint64) bool {
+// ownSlotUse reports whether this node holds recordID or has a claim written
+// for it, and in which mode.
+func (m *Manager) ownSlotUse(recordID uint64) (LockMode, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_, held := m.records[recordID]
-	c, claiming := m.claims[recordID]
-	return held || (claiming && !c.written.IsZero())
+	if rec, ok := m.records[recordID]; ok {
+		return rec.mode, true
+	}
+	if c, ok := m.claims[recordID]; ok && !c.written.IsZero() {
+		return c.mode, true
+	}
+	return 0, false
 }
 
 // ReleaseAdopted clears the dead node's slots that AdoptOwner kept. A slot
-// that is this node's own and in use again is left to its own release.
+// that is this node's own and in use again is left to its own release, and a
+// slot a new node has written since is left alone.
 func (m *Manager) ReleaseAdopted(records []uint64) error {
 	for _, recordID := range records {
 		if err := m.releaseAdopted(recordID); err != nil {
@@ -90,11 +96,25 @@ func (m *Manager) releaseAdopted(recordID uint64) error {
 	defer gate.Unlock()
 
 	m.mu.Lock()
-	slot, ok := m.adopted[recordID]
+	a, ok := m.adopted[recordID]
 	delete(m.adopted, recordID)
 	m.mu.Unlock()
-	if !ok || (slot == m.nodeSlot && m.usesOwnSlot(recordID)) {
+	if !ok {
 		return nil
 	}
-	return m.writeSlot(recordID, slot, nil)
+	if a.slot == m.nodeSlot {
+		if mode, inUse := m.ownSlotUse(recordID); inUse {
+			return m.writeSlot(recordID, a.slot, m.ownClaim(recordID, lockKey{}, mode, time.Now()))
+		}
+		return m.writeSlot(recordID, a.slot, nil)
+	}
+	buf := storage.GetBuffer(SlotSize)
+	defer storage.PutBuffer(buf)
+	if _, err := m.dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, a.slot)); err != nil {
+		return err
+	}
+	if s, err := decodeSlot(buf.Bytes()); err != nil || s == nil || !s.adopted || s.owner != a.owner {
+		return nil
+	}
+	return m.writeSlot(recordID, a.slot, nil)
 }

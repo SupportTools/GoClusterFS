@@ -134,7 +134,11 @@ type Manager struct {
 	// claims tracks the Acquire calls waiting for a record this node does not hold.
 	claims map[uint64]*pendingClaim
 	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
-	adopted map[uint64]int
+	adopted map[uint64]adoptedSlot
+	// tornSince is when this node first read each slot that fails its checksum.
+	tornMu    sync.Mutex
+	tornSince map[slotRef]time.Time
+	tornCount atomic.Int32
 	// slotWrite, when a test sets it, replaces the device write of a slot.
 	slotWrite func(buf []byte, offset int64) (int, error)
 
@@ -202,6 +206,10 @@ var renewAfter = StaleThreshold / 3
 // acquireTimeout is how long Acquire waits at most; tests shorten it.
 var acquireTimeout = DefaultTimeout
 
+// tornExpiry is how long a slot must keep failing its checksum before other
+// nodes ignore it. A live node rewrites its slot within renewAfter.
+var tornExpiry = StaleThreshold
+
 var (
 	cacheGrace = CacheGrace
 	holdTurn   = HoldTurn
@@ -238,7 +246,8 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		gates:      make(map[uint64]*sync.Mutex),
 		yieldUntil: make(map[uint64]time.Time),
 		claims:     make(map[uint64]*pendingClaim),
-		adopted:    make(map[uint64]int),
+		adopted:    make(map[uint64]adoptedSlot),
+		tornSince:  make(map[slotRef]time.Time),
 	}
 }
 
@@ -362,7 +371,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 	for {
 		// Always attempt acquire first, then check context after failure
 		// This ensures we try at least once even if context is nearly expired
-		held, added, err := m.attemptAcquire(key, recordID, mode, gid)
+		held, added, err := m.attemptAcquire(key, recordID, mode, gid, time.Since(startTime))
 		if err != nil {
 			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - attempt error: %v", lockType, resourceID, err)
 			return err
@@ -414,9 +423,12 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 // call registered the key rather than joining another goroutine's hold.
 //
 // A key joins this node's hold on its record when the hold's mode covers the
-// request. An exclusive request waits for this node's own readers, so callers
-// must not hold a local mutex across Acquire that those readers may need.
-func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gid uint64) (held, added bool, err error) {
+// request. An exclusive request waits for this node's own readers, and once a
+// hold's turn is over a new request waits for this node's holders to drain, so
+// callers must not hold a local mutex across Acquire that those holders may
+// need. A request from a goroutine that holds other locks stops waiting for the
+// drain after another turn, so two goroutines cannot wait on each other's records.
+func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gid uint64, waited time.Duration) (held, added bool, err error) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
@@ -435,6 +447,17 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 				return false, false, fmt.Errorf("%w: cannot upgrade a shared lock to exclusive", ErrDeadlockRisk)
 			}
 			return false, false, nil
+		}
+		if age(rec.since) > holdTurn && !m.goroutineHoldsRecordLocked(recordID, gid) &&
+			(waited < holdTurn || !m.goroutineHoldsAnyLocked(gid)) {
+			if rec.keys > 0 {
+				m.mu.Unlock()
+				return false, false, nil
+			}
+			delete(m.records, recordID)
+			m.yieldUntil[recordID] = time.Now().Add(yieldGap)
+			m.mu.Unlock()
+			return false, false, m.releaseRecord(recordID)
 		}
 		renew := age(rec.renewed) > renewAfter
 		m.mu.Unlock()
@@ -492,6 +515,9 @@ func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) boo
 	if !covers(rec.mode, mode) || age(rec.renewed) > renewAfter {
 		return false
 	}
+	if age(rec.since) > holdTurn && !m.goroutineHoldsRecordLocked(held.RecordID, gid) {
+		return false
+	}
 	held.refCount++
 	held.goroutines[gid]++
 	return true
@@ -504,6 +530,15 @@ func (m *Manager) addHeldKeyLocked(key lockKey, recordID uint64, mode LockMode, 
 		refCount:   1,
 		goroutines: map[uint64]int{gid: 1},
 	}
+}
+
+func (m *Manager) goroutineHoldsAnyLocked(gid uint64) bool {
+	for _, held := range m.heldLocks {
+		if held.goroutines[gid] > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) goroutineHoldsRecordLocked(recordID uint64, gid uint64) bool {

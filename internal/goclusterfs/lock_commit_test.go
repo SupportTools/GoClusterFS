@@ -1,10 +1,14 @@
 package goclusterfs
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -284,4 +288,64 @@ func TestConcurrentRefcountReadsDoNotDelaySnapshots(t *testing.T) {
 		waitSnapshotGone(t, fsA, "snap")
 		return nil
 	})
+}
+
+// A whole-sector write must not land between another node's read and write
+// back of the same sector, or that write-back erases it.
+func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
+	path := newTreeFSImage(t)
+	lockPath := newLockImage(t)
+	fsA := openLockedTreeFSNode(t, path, lockPath, 1)
+	fsB := openLockedTreeFSNode(t, path, lockPath, 2)
+	fileA := newRegularFile(t, fsA)
+	fileB := &File{fs: fsB, inodeNum: fileA.inodeNum}
+	writeAt(t, fileA, make([]byte, BlockSize), 0)
+	ino, err := fsA.inodeTbl.Read(fileA.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext, off, err := fsA.extentMgr.Lookup(ino, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sector0 := int64(fsA.dataOffset + (ext.PhysicalBlock+off)*BlockSize)
+
+	var gate chan struct{}
+	var arrived atomic.Int32
+	duringInPlaceWrite = func() {
+		if arrived.Add(1) == 2 {
+			close(gate)
+		}
+		select {
+		case <-gate:
+		case <-time.After(30 * time.Millisecond):
+		}
+	}
+	t.Cleanup(func() { duringInPlaceWrite = nil })
+
+	buf := storage.NewAlignedBuffer(storage.SectorSize)
+	whole := bytes.Repeat([]byte{'A'}, storage.SectorSize)
+	for round := uint64(1); round <= 20; round++ {
+		fsA.lockMgr.ReleaseCached()
+		fsB.lockMgr.ReleaseCached()
+		gate = make(chan struct{})
+		arrived.Store(0)
+		binary.LittleEndian.PutUint64(whole, round)
+
+		errs := make(chan syscall.Errno, 2)
+		go func() { _, errno := fileA.Write(context.Background(), nil, whole, 0); errs <- errno }()
+		go func() { _, errno := fileB.Write(context.Background(), nil, []byte{'b'}, 100); errs <- errno }()
+		for range 2 {
+			if errno := <-errs; errno != 0 {
+				t.Fatalf("round %d: write: %v", round, errno)
+			}
+		}
+
+		if _, err := fsA.dev.ReadAt(buf.Bytes(), sector0); err != nil {
+			t.Fatal(err)
+		}
+		if got := binary.LittleEndian.Uint64(buf.Bytes()); got != round {
+			t.Fatalf("round %d: node A's whole-sector write was lost; the sector holds round %d", round, got)
+		}
+	}
 }

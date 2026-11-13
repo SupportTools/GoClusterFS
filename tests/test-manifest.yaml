@@ -354,12 +354,12 @@ scenarios:
   # real mount binary for both nodes.
   - id: multinode-sub-block-writes
     name: Sub-block writes to one block from two nodes
-    description: Two nodes write whole sectors (no extent lock) and halves of the same sectors (extent lock) of one block at once; every write survives
+    description: Two nodes write whole sectors and halves of the same sectors of one block at once; every write survives
     priority: high
     environments:
       go: multinode_test.go::TestMultiNodeSubBlockWritesToOneBlock
-      docker: TODO
-      vm: TODO
+      docker: TODO  # needs two nodes writing one block at the same moment and a byte-exact check after a remount
+      vm: TODO  # same as docker
 
   - id: multinode-fallocated-block-writes
     name: Writes to one fallocated block from two nodes
@@ -367,8 +367,8 @@ scenarios:
     priority: high
     environments:
       go: multinode_test.go::TestMultiNodeWritesToOneFallocatedBlock
-      docker: TODO
-      vm: TODO
+      docker: TODO  # needs two nodes writing one fallocated block at the same moment and a byte-exact check after a remount
+      vm: TODO  # same as docker
 
   - id: multinode-reader-sees-no-uncommitted-blocks
     name: Reader never sees uncommitted blocks
@@ -2535,6 +2535,48 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestIdleCachedHoldFreesBeforeTurnEnds
+
+  - id: lock-overlapping-holds-yield
+    name: Overlapping local holds still yield
+    description: A node whose local holds of one record keep overlapping stops taking new ones after its turn, so another node gets the record
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestOverlappingLocalHoldsStillYield
+
+  - id: lock-torn-slot-expires
+    name: Torn slot expires
+    description: A slot that keeps failing its checksum stops blocking other nodes after tornExpiry
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTornSlotExpires
+
+  - id: lock-own-slot-adoption-outlives-replay-acquire
+    name: Own-slot adoption outlives the replay's acquires
+    description: A node restarted into its own slot keeps the adopted claim there after its replay acquires and releases the record, until ReleaseAdopted
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestOwnSlotAdoptionOutlivesReplayAcquire
+
+  - id: lock-replayer-wins-adopted-record
+    name: Replayer wins an adopted record over a lower-slot waiter
+    description: A waiter in a lower slot defers to an adopted slot, so the replayer gets the record instead of waiting behind the waiter
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestReplayerWinsAdoptedRecordOverLowerWaiter
+
+  - id: lock-release-adopted-keeps-new-owner
+    name: ReleaseAdopted keeps a new owner's claim
+    description: A claim written by a node that registered into the dead node's slot survives ReleaseAdopted
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestReleaseAdoptedKeepsNewOwnersClaim
+
+  - id: whole-sector-write-survives-peer-partial-write
+    name: Whole-sector write survives a peer's partial write
+    description: Node A's whole-sector write and node B's 1-byte write to the same sector at once; A's write is never lost to B's read-modify-write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestWholeSectorWriteSurvivesPeerPartialWrite
 
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale

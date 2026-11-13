@@ -474,6 +474,55 @@ func BenchmarkFreshAcquireRelease(b *testing.B) {
 	}
 }
 
+// Local holds that keep overlapping never let the key count reach zero, so the
+// node must stop taking new ones once its turn is over, however long they last.
+func TestOverlappingLocalHoldsStillYield(t *testing.T) {
+	cases := []struct {
+		busySlot, otherSlot int
+		every, hold         time.Duration
+	}{
+		{1, 2, 3 * time.Millisecond, 6 * time.Millisecond},
+		{2, 1, 3 * time.Millisecond, 6 * time.Millisecond},
+		{1, 2, 100 * time.Millisecond, 300 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		slots := [2]int{tc.busySlot, tc.otherSlot}
+		t.Run(fmt.Sprintf("busy slot %d holds %v every %v", slots[0], tc.hold, tc.every), func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, 1<<20)
+			defer cleanup()
+			busy := newTestNode(dev, 0, 1<<20, slots[0])
+			other := newTestNode(dev, 0, 1<<20, slots[1])
+
+			stop := make(chan struct{})
+			var holders sync.WaitGroup
+			defer func() { close(stop); holders.Wait() }()
+			holders.Go(func() {
+				tick := time.NewTicker(tc.every)
+				defer tick.Stop()
+				for {
+					select {
+					case <-stop:
+						return
+					case <-tick.C:
+					}
+					holders.Go(func() {
+						if acquireWithin(busy, 5*time.Second, LockTypeInode, 12, LockModeExclusive) == nil {
+							time.Sleep(tc.hold)
+							busy.Release(LockTypeInode, 12)
+						}
+					})
+				}
+			})
+
+			time.Sleep(50 * time.Millisecond)
+			if err := acquireWithin(other, 3*time.Second, LockTypeInode, 12, LockModeExclusive); err != nil {
+				t.Fatalf("other node never got a record whose local holds keep overlapping: %v", err)
+			}
+			other.Release(LockTypeInode, 12)
+		})
+	}
+}
+
 // A node that keeps using a record must still let it go soon enough for another
 // node that wants it.
 func TestBusyNodeYieldsCachedRecord(t *testing.T) {
@@ -700,6 +749,21 @@ func TestTornSlotCountsAsClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireAcquired(t, a, LockTypeInode, 51, LockModeShared)
+}
+
+// A slot left torn by a node that never writes it again stops blocking others
+// once it has read torn for tornExpiry.
+func TestTornSlotExpires(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	defer func(d time.Duration) { tornExpiry = d }(tornExpiry)
+	tornExpiry = 200 * time.Millisecond
+	a := newTestNode(dev, 0, 1<<20, 1)
+	tearSlot(t, a, LockTypeInode, 51, 2)
+	requireBlocked(t, a, LockTypeInode, 51, LockModeExclusive)
+
+	time.Sleep(tornExpiry)
+	requireAcquired(t, a, LockTypeInode, 51, LockModeExclusive)
 }
 
 // Readers on two nodes hold one record together; a writer waits for both.

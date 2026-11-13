@@ -1767,9 +1767,8 @@ func TestMultiNodeConcurrentFirstWriteToSameBlock(t *testing.T) {
 }
 
 // TestMultiNodeSubBlockWritesToOneBlock has two nodes write into one allocated
-// block at once: whole 4KB sectors, which need no extent lock, and each node's
-// half of the same 64 sectors, which need it for their read-modify-write.
-// Every write survives.
+// block at once: whole 4KB sectors, and each node's half of the same 64 sectors,
+// which read, modify and write them. Every write survives.
 func TestMultiNodeSubBlockWritesToOneBlock(t *testing.T) {
 	cluster := NewMultiNodeCluster(t, 2, 100)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
