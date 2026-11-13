@@ -35,7 +35,8 @@ func printSlots(out io.Writer, checker *fsck.Checker) error {
 		return err
 	}
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SLOT\tSTATE\tHOST\tNODE\tLEASE\tJOURNAL")
+	p := &printer{w: w}
+	p.printf("SLOT\tSTATE\tHOST\tNODE\tLEASE\tJOURNAL\n")
 	shown := 0
 	for _, s := range slots {
 		if !s.InUse() && s.JournalFresh {
@@ -47,14 +48,17 @@ func printSlots(out io.Writer, checker *fsck.Checker) error {
 			host = strings.TrimRight(string(s.Slot.Hostname[:]), "\x00")
 			uuid = fmt.Sprintf("%x", s.Slot.UUID[:8])
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\n", s.Index, state, host, uuid, lease(s), s.Journal)
+		p.printf("%d\t%s\t%s\t%s\t%s\t%s\n", s.Index, state, host, uuid, lease(s), s.Journal)
 		shown++
+	}
+	if p.err != nil {
+		return p.err
 	}
 	if err := w.Flush(); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "\n%d of %d slots shown; the others are free, with a journal that is clean or was never used.\n", shown, len(slots))
-	return nil
+	_, err = fmt.Fprintf(out, "\n%d of %d slots shown; the others are free, with a journal that is clean or was never used.\n", shown, len(slots))
+	return err
 }
 
 // releaseSlot checks slot i and prints what releasing it discards. With
@@ -65,18 +69,35 @@ func releaseSlot(out io.Writer, checker *fsck.Checker, i int, discard, force boo
 		return err
 	}
 	s := plan.Slot
-	fmt.Fprintf(out, "Slot %d: %s, %s, lease %s\n", s.Index, s.Name(), s.Slot.State, lease(s))
-	fmt.Fprintf(out, "Journal: %s\n", s.Journal)
-	fmt.Fprintf(out, "Releasing discards %s.\n", plan.Discards)
+	p := &printer{w: out}
+	p.printf("Slot %d: %s, %s, lease %s\n", s.Index, s.Name(), s.Slot.State, lease(s))
+	p.printf("Journal: %s\n", s.Journal)
+	p.printf("Releasing discards %s.\n", plan.Discards)
 	if !discard {
-		fmt.Fprintln(out, "Nothing was written. Run again with -discard-journal to reset the journal and free the slot.")
-		return nil
+		p.printf("Nothing was written. Run again with -discard-journal to reset the journal and free the slot.\n")
+		return p.err
+	}
+	// Discard nothing the user could not be shown.
+	if p.err != nil {
+		return p.err
 	}
 	if err := checker.Release(plan); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "Released slot %d: its journal is reset and a node can register in it.\n", i)
-	return nil
+	p.printf("Released slot %d: its journal is reset and a node can register in it.\n", i)
+	return p.err
+}
+
+// printer keeps the first write error and skips writes after it.
+type printer struct {
+	w   io.Writer
+	err error
+}
+
+func (p *printer) printf(format string, args ...any) {
+	if p.err == nil {
+		_, p.err = fmt.Fprintf(p.w, format, args...)
+	}
 }
 
 func lease(s fsck.SlotStatus) string {
