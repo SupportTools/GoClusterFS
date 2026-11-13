@@ -525,15 +525,6 @@ func addToChunk(chunk []byte, newEntry *DirEntry) bool {
 	return added
 }
 
-func childInChunk(chunk []byte, name string) (child uint64, found bool) {
-	walkChunk(chunk, func(_ int, entry *DirEntry) bool {
-		found = entry.InodeNum != 0 && entry.Name == name
-		child = entry.InodeNum
-		return found
-	})
-	return child, found
-}
-
 // removeFromChunk deletes the entry called name and gives its space to the
 // entry before it in the chunk.
 func removeFromChunk(chunk []byte, name string) bool {

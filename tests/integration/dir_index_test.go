@@ -23,7 +23,7 @@ func TestMultiNodeDirIndexWithoutBroadcast(t *testing.T) {
 		t.Fatalf("mkdir d: %v", err)
 	}
 	for i := range 200 {
-		writeOrFail(t, writer, fmt.Sprintf("d/f%d", i), []byte("x"), 0)
+		writeOrFail(t, writer, fmt.Sprintf("d/f%d", i), nil, 0)
 	}
 	for i := range 200 {
 		if _, err := reader.Stat(fmt.Sprintf("d/f%d", i)); err != nil {
