@@ -282,32 +282,7 @@ func TestApplyDirAddEntry(t *testing.T) {
 	ctx := context.Background()
 	r := newTxnReplay([16]byte{})
 
-	// Create a parent directory inode
-	parentPayload := &InodeCreatePayload{
-		InodeNum: uint64(inode.InodeRoot),
-		Mode:     uint32(inode.S_IFDIR | 0755),
-		UID:      0,
-		GID:      0,
-	}
-	if _, err := applyInodeCreate(ctx, rctx, r, parentPayload.Serialize()); err != nil {
-		t.Fatalf("Setup: failed to create parent inode: %v", err)
-	}
-
-	// Update link count for parent
-	parentIno, err := rctx.InodeTbl.Read(inode.InodeRoot)
-	if err != nil {
-		t.Fatalf("Setup: failed to read parent inode: %v", err)
-	}
-	parentIno.LinkCount = 2
-	if err := rctx.InodeTbl.Write(ctx, parentIno); err != nil {
-		t.Fatalf("Setup: failed to write parent inode: %v", err)
-	}
-
-	// Initialize the directory structure
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
-	if err := rctx.DirMgr.InitDirectory(ctx, parentIno, uint64(inode.InodeRoot)); err != nil {
-		t.Fatalf("Setup: failed to init directory: %v", err)
-	}
+	newRootDir(t, rctx)
 
 	// Create a child inode
 	childPayload := &InodeCreatePayload{
@@ -337,7 +312,7 @@ func TestApplyDirAddEntry(t *testing.T) {
 	}
 
 	// Verify the entry was added
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
+	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	childNum, _, err := rctx.DirMgr.Lookup(ctx, parentIno, "testfile.txt")
 	if err != nil {
 		t.Fatalf("Failed to lookup added entry: %v", err)
@@ -363,23 +338,7 @@ func TestApplyDirRemoveEntry(t *testing.T) {
 	ctx := context.Background()
 	r := newTxnReplay([16]byte{})
 
-	// Setup: Create parent dir, child inode, and add entry
-	parentPayload := &InodeCreatePayload{
-		InodeNum: uint64(inode.InodeRoot),
-		Mode:     uint32(inode.S_IFDIR | 0755),
-	}
-	if _, err := applyInodeCreate(ctx, rctx, r, parentPayload.Serialize()); err != nil {
-		t.Fatalf("Setup: failed to create parent inode: %v", err)
-	}
-	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
-	parentIno.LinkCount = 2
-	if err := rctx.InodeTbl.Write(ctx, parentIno); err != nil {
-		t.Fatal(err)
-	}
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
-	if err := rctx.DirMgr.InitDirectory(ctx, parentIno, uint64(inode.InodeRoot)); err != nil {
-		t.Fatalf("Setup: failed to init directory: %v", err)
-	}
+	newRootDir(t, rctx)
 
 	childPayload := &InodeCreatePayload{InodeNum: 20, Mode: 0644}
 	if _, err := applyInodeCreate(ctx, rctx, r, childPayload.Serialize()); err != nil {
@@ -417,7 +376,7 @@ func TestApplyDirRemoveEntry(t *testing.T) {
 	}
 
 	// Verify the entry was removed
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
+	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	_, _, err = rctx.DirMgr.Lookup(ctx, parentIno, "toremove.txt")
 	if err != dir.ErrNotFound {
 		t.Errorf("Entry should be removed, but Lookup returned err=%v", err)
