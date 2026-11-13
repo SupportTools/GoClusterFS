@@ -87,10 +87,11 @@ type StatusResponse struct {
 
 // CacheHitRateInfo contains hit rate metrics for a cache type.
 type CacheHitRateInfo struct {
-	Size    int     `json:"size"`
-	Hits    uint64  `json:"hits"`
-	Misses  uint64  `json:"misses"`
-	HitRate float64 `json:"hit_rate"`
+	Size     int     `json:"size"`
+	Capacity int     `json:"capacity,omitempty"`
+	Hits     uint64  `json:"hits"`
+	Misses   uint64  `json:"misses"`
+	HitRate  float64 `json:"hit_rate"`
 }
 
 // CacheStatsResponse is returned by GET /api/v1/stats/cache.
@@ -100,6 +101,14 @@ type CacheStatsResponse struct {
 	ExtentCache   CacheHitRateInfo `json:"extent_cache"`
 	NegativeCache CacheHitRateInfo `json:"negative_cache"`
 	LockHintCache CacheHitRateInfo `json:"lock_hint_cache,omitempty"`
+	Broadcast     *BroadcastTables `json:"broadcast,omitempty"`
+}
+
+// BroadcastTables reports how full the broadcast peer tables are.
+type BroadcastTables struct {
+	Peers    int `json:"peers"`
+	Senders  int `json:"senders"`
+	MaxPeers int `json:"max_peers"`
 }
 
 // JournalStatsResponse is returned by GET /api/v1/stats/journal.
