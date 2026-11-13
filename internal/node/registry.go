@@ -436,18 +436,29 @@ func (r *Registry) StartHeartbeat() error {
 	return nil
 }
 
+// testHeartbeatHold, from GOCLUSTERFS_TEST_HEARTBEAT_HOLD and for tests only,
+// is how long the heartbeat waits once it finds it missed beats, as after a
+// pause, so a write that was stalled with it reaches the write gate first.
+var testHeartbeatHold, _ = time.ParseDuration(os.Getenv("GOCLUSTERFS_TEST_HEARTBEAT_HOLD"))
+
 // heartbeatLoop periodically updates the node's heartbeat.
 func (r *Registry) heartbeatLoop(slotIdx int) {
 	defer r.heartbeatWg.Done()
 
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
+	if testHeartbeatHold > 0 {
+		log.Printf("[WARN] node: GOCLUSTERFS_TEST_HEARTBEAT_HOLD is set: after a pause the heartbeat waits %v; use it only in tests", testHeartbeatHold)
+	}
 
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
+			if testHeartbeatHold > 0 && r.sinceLastBeat() > HeartbeatTimeout/2 {
+				time.Sleep(testHeartbeatHold)
+			}
 			_ = r.beat(slotIdx)
 		}
 	}
