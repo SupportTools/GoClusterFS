@@ -1830,7 +1830,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		}
 	}
 
-	// An empty directory has no other links: its count includes its own "." entry.
+	// Rmdir removes only empty directories, whose link count also counts their own "." entry.
 	willFreeInode := isDir || childIno.LinkCount == 1
 
 	// === WAL: Begin transaction and log intent ===
