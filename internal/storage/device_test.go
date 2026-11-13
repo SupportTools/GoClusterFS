@@ -3,10 +3,12 @@ package storage
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -408,5 +410,40 @@ func TestWriteGateRefusesWrites(t *testing.T) {
 	}
 	if !bytes.Equal(buf.Bytes(), make([]byte, SectorSize)) {
 		t.Error("a refused write reached the device")
+	}
+}
+
+func TestLastErrorHoldsTheLatestFailureUntilASuccess(t *testing.T) {
+	var d Device
+	if d.LastError() != nil {
+		t.Fatal("a new device reports an error")
+	}
+	d.record(syscall.EIO)
+	d.record(io.EOF)
+	if !errors.Is(d.LastError(), syscall.EIO) {
+		t.Fatalf("LastError = %v, want EIO; EOF is not a device failure", d.LastError())
+	}
+	d.record(nil)
+	if d.LastError() != nil {
+		t.Errorf("LastError after a successful I/O = %v, want nil", d.LastError())
+	}
+}
+
+func TestFailedReadIsRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	buf := NewAlignedBuffer(SectorSize).Bytes()
+	if _, err := dev.ReadAt(buf, 0); err != nil || dev.LastError() != nil {
+		t.Fatalf("ReadAt = %v, LastError = %v", err, dev.LastError())
+	}
+	_ = dev.file.Close()
+	if _, err := dev.ReadAt(buf, 0); err == nil || dev.LastError() == nil {
+		t.Errorf("ReadAt on a closed file = %v, LastError = %v, want both set", err, dev.LastError())
 	}
 }

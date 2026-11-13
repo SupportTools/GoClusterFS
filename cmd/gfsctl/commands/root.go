@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/supporttools/GoClusterFS/cmd/gfsctl/client"
+	"github.com/supporttools/GoClusterFS/internal/logging"
 )
 
 var (
@@ -19,6 +20,10 @@ var (
 	cfgToken   string
 	cfgTimeout time.Duration
 	cfgOutput  string
+	cfgDebug   bool
+
+	// started is set once the flags and settings are valid; earlier errors are usage errors.
+	started bool
 
 	// API client (initialized in PersistentPreRunE)
 	apiClient *client.Client
@@ -36,6 +41,9 @@ GoClusterFS mount through its HTTP API. It changes nothing.
 Settings come from flags, then GFSCTL_HOST, GFSCTL_PORT, GFSCTL_TOKEN,
 GFSCTL_OUTPUT and GFSCTL_TIMEOUT, then the config file (gfsctl config path).
 
+Exit codes: 0 success, 1 health degraded, 4 health unhealthy, 8 no answer
+or an error from the API, 16 usage error.
+
 Examples:
   gfsctl status                    # Show filesystem status
   gfsctl health                    # Check health status
@@ -45,9 +53,11 @@ Examples:
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		logging.SetDebug(cfgDebug)
 		if err := resolveSettings(cmd); err != nil {
-			return err
+			return usageError{err}
 		}
+		started = true
 		apiClient = client.New(
 			client.WithHost(cfgHost),
 			client.WithPort(cfgPort),
@@ -58,12 +68,22 @@ Examples:
 	},
 }
 
-// Execute runs the root command and prints any error to stderr.
+// Execute runs the root command and prints any error, with what to do about
+// it, to stderr. ExitCode maps the error to the exit code.
 func Execute() error {
-	err := rootCmd.Execute()
-	if err != nil {
-		fmt.Fprintln(rootCmd.ErrOrStderr(), "Error:", err)
+	started = false
+	cmd, err := rootCmd.ExecuteC()
+	if err == nil {
+		return nil
 	}
+	if !started {
+		err = usageError{err}
+	}
+	msg := err.Error()
+	if h := hint(err, cmd); h != "" {
+		msg += "; " + h
+	}
+	fmt.Fprintln(rootCmd.ErrOrStderr(), "Error:", msg)
 	return err
 }
 
@@ -73,6 +93,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgToken, "token", "", "Bearer token for authentication (visible in ps; prefer GFSCTL_TOKEN or the config file)")
 	rootCmd.PersistentFlags().DurationVar(&cfgTimeout, "timeout", 30*time.Second, "Request timeout")
 	rootCmd.PersistentFlags().StringVarP(&cfgOutput, "output", "o", "text", "Output format (text, json)")
+	rootCmd.PersistentFlags().BoolVar(&cfgDebug, "debug", false, "Print [DEBUG] lines for each API request")
 }
 
 // resolveSettings fills every setting whose flag was not given from the
