@@ -19,6 +19,10 @@
 //	Level 9: Extent (by block)
 //	Level 10: InodeSector (by inode table sector), a leaf: held only around
 //	one sector's read-modify-write, with no other lock taken while held
+//
+// Each type has its own records, laid out in type order, and locks of one type
+// are taken in record order. A goroutine's records then only go up, so waits
+// between nodes cannot form a cycle.
 package lock
 
 import (
@@ -277,6 +281,31 @@ func (m *Manager) Stats() Stats {
 
 const numLockTypes = int(LockTypeInodeSector) + 1
 
+// layoutRows is how many records a volume's lock region has; typeRows divides them among the types.
+const layoutRows = 256
+
+// typeRows is each type's share of the records, by how many keys of the type nodes hold at once.
+var typeRows = [numLockTypes]uint64{
+	LockTypeVolume:       1,
+	LockTypeSnapshotReg:  1,
+	LockTypeSnapshot:     1,
+	LockTypeJournal:      1,
+	LockTypeRefCount:     1,
+	LockTypeLockRegion:   1,
+	LockTypeBlockBitmap:  1,
+	LockTypeSFBContainer: 8,
+	LockTypeInode:        128,
+	LockTypeExtent:       97,
+	LockTypeInodeSector:  16,
+}
+
+var typeFirstRow = func() (first [numLockTypes]uint64) {
+	for t := 1; t < numLockTypes; t++ {
+		first[t] = first[t-1] + typeRows[t-1]
+	}
+	return first
+}()
+
 // acquireCounts says how one lock type's acquires on this node were served:
 // a key this node already held, a join of a held record, a cached record, a
 // claim won on disk, and tries that had to wait.
@@ -359,7 +388,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.held })
 		return nil
 	}
-	if err := m.checkLockOrder(lockType); err != nil {
+	if err := m.checkLockOrder(key, recordID, gid); err != nil {
 		m.mu.Unlock()
 		return err
 	}
@@ -684,18 +713,19 @@ func (m *Manager) ReleaseCached() {
 	wg.Wait()
 }
 
-// checkLockOrder ensures we're acquiring locks in hierarchy order.
-// Only checks against locks held by the CURRENT goroutine to avoid
-// false positives when different goroutines hold different locks concurrently.
-func (m *Manager) checkLockOrder(newType LockType) error {
-	gid := getGoroutineID()
-	for key, held := range m.heldLocks {
-		// Only check order for locks held by THIS goroutine
-		if held.goroutines != nil && held.goroutines[gid] > 0 {
-			if key.Type > newType {
-				return fmt.Errorf("%w: cannot acquire %v while holding %v",
-					ErrDeadlockRisk, newType, key.Type)
-			}
+// checkLockOrder refuses a lock below one this goroutine holds: a lower type, or a lower record of the same type.
+func (m *Manager) checkLockOrder(key lockKey, recordID, gid uint64) error {
+	for heldKey, held := range m.heldLocks {
+		if heldKey == key || held.goroutines[gid] == 0 {
+			continue
+		}
+		if heldKey.Type > key.Type {
+			return fmt.Errorf("%w: cannot acquire %v while holding %v",
+				ErrDeadlockRisk, key.Type, heldKey.Type)
+		}
+		if heldKey.Type == key.Type && held.RecordID > recordID {
+			return fmt.Errorf("%w: cannot acquire type %v in record %d while holding its record %d; take locks of one type in record order",
+				ErrDeadlockRisk, key.Type, recordID, held.RecordID)
 		}
 	}
 	return nil
@@ -710,18 +740,11 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 	hash *= 0xFF51AFD7ED558CCD
 	hash ^= hash >> 33
 
-	// Inode table sector locks get their own records. A sector lock is a leaf,
-	// so its holder never waits on another lock, and no cycle of waits between
-	// nodes can pass through a record only sector locks use.
 	records := m.size / RowSize
-	leaf := records / 16
-	if leaf == 0 {
+	if records < layoutRows || int(lockType) >= numLockTypes {
 		return hash % records
 	}
-	if lockType == LockTypeInodeSector {
-		return records - leaf + hash%leaf
-	}
-	return hash % (records - leaf)
+	return typeFirstRow[lockType] + hash%typeRows[lockType]
 }
 
 // SameRecord reports whether two locks map to one record, so one goroutine holding both holds the record in the stronger mode.

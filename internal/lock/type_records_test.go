@@ -1,10 +1,15 @@
 package lock
 
 import (
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // crossedKeys finds inodes a, c and extents b, d with b in c's record and d in a's: a wait cycle between two nodes.
@@ -80,4 +85,89 @@ func TestInodeAndExtentLocksDoNotWaitInACycle(t *testing.T) {
 			t.Errorf("node %d: %v", i+1, err)
 		}
 	}
+}
+
+func TestLockTypesHaveTheirOwnRecords(t *testing.T) {
+	var rows uint64
+	for _, n := range typeRows {
+		rows += n
+	}
+	if rows != layoutRows || layoutRows*RowSize != superblock.LockRegionSize {
+		t.Fatalf("types share %d rows of %d bytes, a volume has %d bytes of lock records", rows, RowSize, superblock.LockRegionSize)
+	}
+
+	m := &Manager{size: layoutRows * RowSize}
+	owner := map[uint64]LockType{}
+	for lt := LockType(0); int(lt) < numLockTypes; lt++ {
+		for id := uint64(0); id < 1<<12; id++ {
+			r := m.hashToRecord(lt, id)
+			if other, ok := owner[r]; ok && other != lt {
+				t.Fatalf("type %d resource %d maps to record %d, which type %d also uses", lt, id, r, other)
+			}
+			owner[r] = lt
+		}
+	}
+}
+
+// Node B holds a lock in every inode record; node A's locks of other types must not wait on any of them.
+func TestLocksDoNotWaitOnRecordsOfOtherTypes(t *testing.T) {
+	const region = layoutRows * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	a := newTestNode(dev, 0, region, 1)
+	b := newTestNode(dev, 0, region, 2)
+
+	inodeIn := map[uint64]uint64{}
+	for id := uint64(0); len(inodeIn) < int(typeRows[LockTypeInode]); id++ {
+		r := b.hashToRecord(LockTypeInode, id)
+		if _, ok := inodeIn[r]; !ok {
+			inodeIn[r] = id
+		}
+	}
+	rows := slices.Sorted(maps.Keys(inodeIn))
+	for _, r := range rows {
+		requireAcquired(t, b, LockTypeInode, inodeIn[r], LockModeExclusive)
+	}
+	defer func() {
+		for _, r := range rows {
+			b.Release(LockTypeInode, inodeIn[r])
+		}
+	}()
+
+	for lt := LockType(0); int(lt) < numLockTypes; lt++ {
+		if lt == LockTypeInode {
+			continue
+		}
+		for id := uint64(0); id < 64; id++ {
+			if err := acquireWithin(a, 200*time.Millisecond, lt, id, LockModeExclusive); err != nil {
+				t.Fatalf("type %d resource %d waited on a record node B holds for inode locks: %v", lt, id, err)
+			}
+			a.Release(lt, id)
+		}
+	}
+}
+
+func TestLocksOfOneTypeAreTakenInRecordOrder(t *testing.T) {
+	const region = layoutRows * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	m := newTestNode(dev, 0, region, 1)
+
+	low, high := uint64(1), uint64(2)
+	for m.hashToRecord(LockTypeInode, high) == m.hashToRecord(LockTypeInode, low) {
+		high++
+	}
+	if m.hashToRecord(LockTypeInode, low) > m.hashToRecord(LockTypeInode, high) {
+		low, high = high, low
+	}
+	requireAcquired(t, m, LockTypeInode, high, LockModeExclusive)
+	if err := acquireWithin(m, time.Second, LockTypeInode, low, LockModeExclusive); !errors.Is(err, ErrDeadlockRisk) {
+		t.Fatalf("inode %d below held inode %d: err = %v, want ErrDeadlockRisk", low, high, err)
+	}
+	m.Release(LockTypeInode, high)
+
+	requireAcquired(t, m, LockTypeInode, low, LockModeExclusive)
+	requireAcquired(t, m, LockTypeInode, high, LockModeExclusive)
+	m.Release(LockTypeInode, high)
+	m.Release(LockTypeInode, low)
 }
