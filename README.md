@@ -33,7 +33,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **The inode count is set at format time.** `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB, so one per data block), between 4096 and 16,777,216. It cannot change later.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
-- **fsck repairs little.** `-repair` rebuilds refcounts, frees leaked blocks and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
+- **fsck repairs little.** `-repair` rebuilds refcounts, frees leaked blocks and inodes no directory names, and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
 - **Cluster safety limits.** Node clocks, node stalls, and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
 
 ## Quick Start

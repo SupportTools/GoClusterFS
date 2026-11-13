@@ -285,15 +285,14 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 	if inode.Flags&FlagHasExtentTree != 0 {
 		tree := c.walkExtentTree(inodeNum, inode)
 		c.extentTrees[inodeNum] = tree
-		for _, block := range tree.nodes {
-			c.inodeBlocks[block]++
-		}
 		if tree.err != nil {
 			c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode %d extent tree", inodeNum))
 		}
 	}
+	for _, block := range c.mappedBlocks(inodeNum, inode) {
+		c.inodeBlocks[block]++
+	}
 
-	// The runtime maps every extent with a length, whatever its flags.
 	for _, ext := range c.inodeExtents(inodeNum, inode) {
 		if ext.Length == 0 {
 			continue
@@ -302,28 +301,45 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 		if uncounted {
 			c.uncounted[inodeNum] = -1
 		}
-
-		// SFB containers hold many files and carry no refcounts.
-		if (ext.Flags & ExtentFlagSFB) != 0 {
+		if ext.Flags&ExtentFlagSFB != 0 {
 			c.sfbContainers[ext.PhysicalBlock>>16] = true
-			continue
-		}
-
-		// Phase 4 reports the part of an extent past the device end; the rest is still mapped.
-		if ext.PhysicalBlock >= c.sbData.TotalBlocks {
-			continue
-		}
-		for j := uint64(0); j < min(ext.Length, c.sbData.TotalBlocks-ext.PhysicalBlock); j++ {
-			blockNum := ext.PhysicalBlock + j
-			c.inodeBlocks[blockNum]++
-			if uncounted {
-				c.uncountedRefs[blockNum]++
+		} else if uncounted {
+			for j := range c.onDevice(ext) {
+				c.uncountedRefs[ext.PhysicalBlock+j]++
+			}
+			if ext.PhysicalBlock+ext.Length > c.refcountCoverage() {
+				c.uncountedPast[inodeNum] = true
 			}
 		}
-		if uncounted && ext.PhysicalBlock+ext.Length > c.refcountCoverage() {
-			c.uncountedPast[inodeNum] = true
+	}
+}
+
+// mappedBlocks returns the blocks an inode maps as extent-tree nodes or as
+// data, once per mapping. The runtime maps every extent with a length, whatever
+// its flags. SFB containers hold many files and carry no refcounts.
+func (c *Checker) mappedBlocks(inodeNum uint32, inode *InodeData) []uint64 {
+	var blocks []uint64
+	if t := c.extentTrees[inodeNum]; t != nil && inode.Flags&FlagHasExtentTree != 0 {
+		blocks = append(blocks, t.nodes...)
+	}
+	for _, ext := range c.inodeExtents(inodeNum, inode) {
+		if ext.Flags&ExtentFlagSFB != 0 {
+			continue
+		}
+		for j := range c.onDevice(ext) {
+			blocks = append(blocks, ext.PhysicalBlock+j)
 		}
 	}
+	return blocks
+}
+
+// onDevice returns how many of ext's blocks lie on the device. Phase 4 reports
+// the part past the device end; the rest is still mapped.
+func (c *Checker) onDevice(ext ExtentData) uint64 {
+	if ext.PhysicalBlock >= c.sbData.TotalBlocks {
+		return 0
+	}
+	return min(ext.Length, c.sbData.TotalBlocks-ext.PhysicalBlock)
 }
 
 // checkReservedInodes validates the reserved inode entries.

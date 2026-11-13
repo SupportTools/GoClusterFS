@@ -388,9 +388,13 @@ type Checker struct {
 	badBitmap       map[uint64]bool // bitmap sectors with a bad checksum
 	inodeBlocks     map[uint64]int  // block -> reference count from inodes
 	inodeUsed       map[uint32]bool // inode numbers that are in use
-	dirEntryRefs    map[uint32]int  // inode -> reference count from dir entries
+	dirEntryRefs    map[uint32]int  // inode -> names in directories, not counting "." and ".."
+	dirNames        map[uint32]int  // directory inode -> names it holds
+	namesIncomplete []string        // why dirEntryRefs may miss names
+	unnamed         []uint32        // inodes other than root that no directory names
 	snapshotInodes  map[uint32]bool // inodes referenced by snapshots
 	snapshotData    map[uint32]bool // inodes holding a snapshot's captured extents
+	snapsIncomplete []string        // why snapshotInodes may miss references
 	sfbContainers   map[uint64]bool // blocks holding small files of older versions
 	extentTrees     map[uint32]*extentTree
 	uncounted       map[uint32]int  // inodes an older version shared -> problem index
@@ -469,6 +473,7 @@ func New(dev *storage.Device, opts Options) *Checker {
 		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
 		dirEntryRefs:    make(map[uint32]int),
+		dirNames:        make(map[uint32]int),
 		snapshotInodes:  make(map[uint32]bool),
 		snapshotData:    make(map[uint32]bool),
 		sfbContainers:   make(map[uint64]bool),

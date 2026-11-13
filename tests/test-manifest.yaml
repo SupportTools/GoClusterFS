@@ -1273,6 +1273,34 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsInterruptedSubdirectoryUnlink
 
+  - id: fsck-repair-frees-unnamed-inode
+    name: fsck -repair frees an inode replay leaves unnamed
+    description: An unlink removes the name and crashes while another node, which has the file open, holds the inode lock; that node then writes the inode, so replay skips the unlink's ExtentFree and InodeDelete. Check reports the unnamed inode, a dry run changes nothing, repair frees it with its data and extent-tree blocks without calling them leaked, and other files keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_unnamed_test.go::TestFsckRepairFreesInodeReplayLeftUnnamed
+
+  - id: fsck-repair-unnamed-keeps-clone-blocks
+    name: fsck -repair frees an unnamed inode and leaves its blocks to a clone
+    description: Replay leaves a cloned file unnamed; repair frees the inode, the shared blocks stay allocated with a refcount of 1, and the clone keeps its data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_unnamed_test.go::TestFsckRepairFreesUnnamedInodeKeepsCloneBlocks
+
+  - id: fsck-repair-keeps-unnamed-snapshot-target
+    name: fsck -repair keeps an unnamed inode a snapshot refers to
+    description: Replay leaves a file with a snapshot unnamed; repair reports why it keeps the inode and leaves the bitmap, refcounts and inode table unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_unnamed_test.go::TestFsckRepairKeepsUnnamedSnapshotTarget
+
+  - id: fsck-repair-keeps-unnamed-it-cannot-place
+    name: fsck -repair keeps unnamed inodes it must not free
+    description: Repair frees an unnamed file, an unnamed empty directory and a snapshot data inode no snapshot refers to, keeps a reserved inode and a directory that is not empty, and keeps every unnamed inode when a phase is skipped or a directory or snapshot descriptor is damaged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_unnamed_test.go::TestFsckRepairKeepsUnnamedInodesItCannotPlace
+
   - id: fsck-reclaim-empty-sfb-containers
     name: fsck -repair frees SFB containers no file uses
     description: A file that grows out of its SFB slot leaves its container empty; check reports it as leaked, repair frees it and keeps a container another file still uses, and both files keep their data
