@@ -704,6 +704,19 @@ func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32,
 	return nil, nil, 0, syscall.EAGAIN
 }
 
+// claimErrno maps a failure to find or claim an inode slot. Only a slot another
+// node took first is worth a retry; a lock wait that gave up or an I/O error is
+// not a full inode table.
+func claimErrno(err error) syscall.Errno {
+	switch {
+	case errors.Is(err, inode.ErrInodeFull):
+		return syscall.ENOSPC
+	case errors.Is(err, inode.ErrInodeInUse):
+		return syscall.EAGAIN
+	}
+	return syscall.EIO
+}
+
 // closeIntent completes an intent its operation left open by returning early, so a failed operation is never replayed.
 func (f *FS) closeIntent(seq uint64) {
 	if err := f.journal.CompleteIntent(seq); err != nil {
@@ -851,10 +864,7 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		f.dirMgr.Remove(ctx, dirIno, name)
-		if err == inode.ErrInodeInUse {
-			return nil, nil, 0, syscall.EAGAIN
-		}
-		return nil, nil, 0, syscall.ENOSPC
+		return nil, nil, 0, claimErrno(err)
 	}
 
 	now := time.Now().UnixNano()
@@ -1006,10 +1016,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		f.dirMgr.Remove(ctx, dirIno, name)
-		if err == inode.ErrInodeInUse {
-			return nil, syscall.EAGAIN
-		}
-		return nil, syscall.ENOSPC
+		return nil, claimErrno(err)
 	}
 
 	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(inode.InodeRoot)); err != nil {
@@ -1464,10 +1471,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", name, removeErr)
 		}
 		// If slot was taken by another node, signal retry with a different slot
-		if err == inode.ErrInodeInUse {
-			return nil, nil, 0, syscall.EAGAIN
-		}
-		return nil, nil, 0, syscall.ENOSPC
+		return nil, nil, 0, claimErrno(err)
 	}
 
 	// Phase 5: Initialize file inode attributes
@@ -1676,10 +1680,7 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", name, removeErr)
 		}
 		// If slot was taken by another node, signal retry with a different slot
-		if err == inode.ErrInodeInUse {
-			return nil, syscall.EAGAIN
-		}
-		return nil, syscall.ENOSPC
+		return nil, claimErrno(err)
 	}
 
 	// Phase 5: Initialize directory inode attributes
@@ -3695,7 +3696,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	data, err := f.fs.claimInode(ctx)
 	if err != nil {
 		log.Printf("[snapshot] No inode for the data of a snapshot of inode %d: %v", f.inodeNum, err)
-		return syscall.ENOSPC
+		return claimErrno(err)
 	}
 	data.Mode, data.UID, data.GID = src.Mode, src.UID, src.GID
 	data.Mtime, data.Ctime = src.Mtime, src.Ctime
@@ -3831,12 +3832,8 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 	cloneIno, err := f.fs.inodeTbl.ClaimSlot(ctx, cloneInodeNum)
 	if err != nil {
 		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
-		if err == inode.ErrInodeInUse {
-			log.Printf("[clone] Inode slot collision, retry needed")
-			return syscall.EAGAIN
-		}
 		log.Printf("[clone] Failed to claim inode slot: %v", err)
-		return syscall.ENOSPC
+		return claimErrno(err)
 	}
 
 	now := time.Now().UnixNano()

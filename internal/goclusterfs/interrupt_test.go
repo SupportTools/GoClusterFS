@@ -2,10 +2,16 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/supporttools/GoClusterFS/internal/dir"
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 )
 
@@ -54,11 +60,30 @@ func TestWriteFailsWhenLockIsNotFreed(t *testing.T) {
 	fileA := newRegularFile(t, nodeA)
 	fileB := &File{fs: nodeB, inodeNum: fileA.inodeNum}
 
-	held, release, released := make(chan error, 1), make(chan struct{}), make(chan struct{})
+	release := holdInodeLock(t, nodeA, uint64(fileA.inodeNum))
+	ctx, interrupt := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, interrupt)
+	start := time.Now()
+	_, errno := fileB.Write(ctx, nil, []byte("never written"), 0)
+	elapsed := time.Since(start)
+	release()
+	if errno != syscall.EIO {
+		t.Fatalf("Write with the lock held elsewhere = %v, want EIO", errno)
+	}
+	if elapsed < lock.DefaultTimeout {
+		t.Errorf("Write gave up after %v, before lock.DefaultTimeout (%v)", elapsed, lock.DefaultTimeout)
+	}
+}
+
+// holdInodeLock takes an inode lock on fsys and keeps it until release is
+// called. Like a busy holder, it rejoins the lock every second, which keeps the
+// record from going stale.
+func holdInodeLock(t *testing.T, fsys *FS, res uint64) (release func()) {
+	t.Helper()
+	held, stop, stopped := make(chan error, 1), make(chan struct{}), make(chan struct{})
 	go func() {
-		defer close(released)
-		res := uint64(fileA.inodeNum)
-		err := nodeA.lockMgr.Acquire(context.Background(), lock.LockTypeInode, res, lock.LockModeExclusive)
+		defer close(stopped)
+		err := fsys.lockMgr.Acquire(context.Background(), lock.LockTypeInode, res, lock.LockModeExclusive)
 		held <- err
 		if err != nil {
 			return
@@ -67,32 +92,63 @@ func TestWriteFailsWhenLockIsNotFreed(t *testing.T) {
 		defer tick.Stop()
 		for {
 			select {
-			case <-release:
-				nodeA.lockMgr.Release(lock.LockTypeInode, res)
+			case <-stop:
+				fsys.lockMgr.Release(lock.LockTypeInode, res)
 				return
 			case <-tick.C:
-				// A busy holder keeps rejoining its lock, which keeps the record from going stale.
-				if nodeA.lockMgr.Acquire(context.Background(), lock.LockTypeInode, res, lock.LockModeExclusive) == nil {
-					nodeA.lockMgr.Release(lock.LockTypeInode, res)
+				if fsys.lockMgr.Acquire(context.Background(), lock.LockTypeInode, res, lock.LockModeExclusive) == nil {
+					fsys.lockMgr.Release(lock.LockTypeInode, res)
 				}
 			}
 		}
 	}()
 	if err := <-held; err != nil {
-		t.Fatalf("node A lock: %v", err)
+		t.Fatalf("hold inode lock %d: %v", res, err)
 	}
+	return func() {
+		close(stop)
+		<-stopped
+	}
+}
 
-	ctx, interrupt := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, interrupt)
-	start := time.Now()
-	_, errno := fileB.Write(ctx, nil, []byte("never written"), 0)
-	elapsed := time.Since(start)
-	close(release)
-	<-released
-	if errno != syscall.EIO {
-		t.Fatalf("Write with the lock held elsewhere = %v, want EIO", errno)
+// TestCreateReportsStuckInodeLockAsEIO keeps the lock on the inode slot a
+// create will claim held on another node past lock.DefaultTimeout. The create
+// must fail with EIO, as for any lock wait that gives up, not ENOSPC: the
+// inode table is not full.
+func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits lock.DefaultTimeout")
 	}
-	if elapsed < lock.DefaultTimeout {
-		t.Errorf("Write gave up after %v, before lock.DefaultTimeout (%v)", elapsed, lock.DefaultTimeout)
+	path := newFormattedImage(t)
+	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
+	slot, err := nodeB.inodeTbl.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := holdInodeLock(t, nodeA, uint64(slot))
+	_, _, _, errno := nodeB.createFileInternal(context.Background(), "stuck", 0, 0o644, &fuse.EntryOut{})
+	release()
+	if errno != syscall.EIO {
+		t.Fatalf("create while inode %d stays locked = %v, want EIO", slot, errno)
+	}
+	root, err := nodeB.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := nodeB.dirMgr.Lookup(context.Background(), root, "stuck"); !errors.Is(err, dir.ErrNotFound) {
+		t.Errorf("lookup after the failed create: %v, want the entry rolled back", err)
+	}
+}
+
+func TestClaimErrno(t *testing.T) {
+	for err, want := range map[error]syscall.Errno{
+		inode.ErrInodeFull:  syscall.ENOSPC,
+		inode.ErrInodeInUse: syscall.EAGAIN,
+		fmt.Errorf("failed to acquire inode lock: %w", lock.ErrLockTimeout): syscall.EIO,
+		fmt.Errorf("failed to read inode slot: %w", syscall.EIO):            syscall.EIO,
+	} {
+		if got := claimErrno(err); got != want {
+			t.Errorf("claimErrno(%v) = %v, want %v", err, got, want)
+		}
 	}
 }

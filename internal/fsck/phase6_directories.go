@@ -208,47 +208,59 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 	return entries, errors
 }
 
-// parseDirBlock parses the entries of one directory block. The runtime keeps
-// them in the first chunk, and their record lengths add up to exactly the
-// chunk, so a chain that stops short or runs past it hides or invents entries.
+// parseDirBlock parses the entries of every 4 KB chunk of a directory block.
+// A chunk is unused (RecLen 0 at its start) or its record lengths add up to
+// exactly the chunk, so a chain that stops short or runs past it hides or invents entries.
 func parseDirBlock(buf []byte) ([]*DirEntryData, []string) {
 	var entries []*DirEntryData
 	var errors []string
-	end := min(len(buf), DirChunkSize)
+	for start := 0; start+DirEntryHeaderSize <= len(buf); start += DirChunkSize {
+		chunkEntries, chunkErrs := parseDirChunk(buf[start:min(len(buf), start+DirChunkSize)], start)
+		entries = append(entries, chunkEntries...)
+		errors = append(errors, chunkErrs...)
+	}
+	return entries, errors
+}
+
+func parseDirChunk(chunk []byte, base int) ([]*DirEntryData, []string) {
+	var entries []*DirEntryData
+	var errors []string
+	end := len(chunk)
 	pos := 0
 	for pos < end {
+		at := base + pos
 		if pos+DirEntryHeaderSize > end {
-			errors = append(errors, fmt.Sprintf("entry at offset %d runs past the %d-byte chunk", pos, DirChunkSize))
+			errors = append(errors, fmt.Sprintf("entry at offset %d runs past the %d-byte chunk", at, DirChunkSize))
 			break
 		}
-		entryInodeNum := binary.LittleEndian.Uint64(buf[pos : pos+8])
-		recLen := int(binary.LittleEndian.Uint16(buf[pos+8 : pos+10]))
-		nameLen := buf[pos+10]
-		fileType := buf[pos+11]
+		entryInodeNum := binary.LittleEndian.Uint64(chunk[pos : pos+8])
+		recLen := int(binary.LittleEndian.Uint16(chunk[pos+8 : pos+10]))
+		nameLen := chunk[pos+10]
+		fileType := chunk[pos+11]
 
 		if recLen == 0 {
 			if pos > 0 {
-				errors = append(errors, fmt.Sprintf("entries end at offset %d, before the end of the %d-byte chunk", pos, DirChunkSize))
+				errors = append(errors, fmt.Sprintf("entries end at offset %d, before the end of the %d-byte chunk", at, DirChunkSize))
 			}
 			break
 		}
 		if recLen < MinDirEntrySize {
-			errors = append(errors, fmt.Sprintf("invalid RecLen %d at offset %d", recLen, pos))
+			errors = append(errors, fmt.Sprintf("invalid RecLen %d at offset %d", recLen, at))
 			break
 		}
 		if pos+recLen > end {
-			errors = append(errors, fmt.Sprintf("RecLen %d at offset %d runs past the %d-byte chunk", recLen, pos, DirChunkSize))
+			errors = append(errors, fmt.Sprintf("RecLen %d at offset %d runs past the %d-byte chunk", recLen, at, DirChunkSize))
 			break
 		}
 		if DirEntryHeaderSize+int(nameLen) > recLen {
-			errors = append(errors, fmt.Sprintf("NameLen %d does not fit RecLen %d at offset %d", nameLen, recLen, pos))
+			errors = append(errors, fmt.Sprintf("NameLen %d does not fit RecLen %d at offset %d", nameLen, recLen, at))
 			break
 		}
 
-		nameBytes := buf[pos+DirEntryHeaderSize : pos+DirEntryHeaderSize+int(nameLen)]
+		nameBytes := chunk[pos+DirEntryHeaderSize : pos+DirEntryHeaderSize+int(nameLen)]
 		for _, b := range nameBytes {
 			if b == 0 {
-				errors = append(errors, fmt.Sprintf("null byte in name at offset %d", pos))
+				errors = append(errors, fmt.Sprintf("null byte in name at offset %d", at))
 				break
 			}
 		}

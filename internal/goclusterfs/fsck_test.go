@@ -153,8 +153,14 @@ func TestFsckAcceptsRuntimeImage(t *testing.T) {
 		t.Fatalf("delete snapshot: %v", errno)
 	}
 	waitSnapshotGone(t, fsys, "s2")
-	if errno := fsys.Unlink(ctx, "small.txt"); errno != 0 {
-		t.Fatalf("unlink: %v", errno)
+	// 40 long names fill three of the root directory's chunks.
+	for i := 0; i < 40; i++ {
+		createFile(t, fsys, fmt.Sprintf("%0200d", i))
+	}
+	for _, name := range []string{"small.txt", fmt.Sprintf("%0200d", 20)} {
+		if errno := fsys.Unlink(ctx, name); errno != 0 {
+			t.Fatalf("unlink %s: %v", name, errno)
+		}
 	}
 	if ino, err := fsys.inodeTbl.Read(sparse.inodeNum); err != nil || !ino.HasExtentTree() {
 		t.Fatalf("sparse.bin should use an extent tree (err=%v)", err)

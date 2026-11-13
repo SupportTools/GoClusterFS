@@ -2,6 +2,7 @@ package dir
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -795,5 +796,137 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 		if err != nil || num != uint64(50+i) {
 			t.Fatalf("lookup entry-%d: inode %d, %v", i, num, err)
 		}
+	}
+}
+
+func longName(i int) string {
+	return fmt.Sprintf("%0255d", i)
+}
+
+// checkChunks fails the test unless every chunk of the block is unused or holds
+// records that add up to exactly DirChunkSize.
+func checkChunks(t *testing.T, data []byte) (used int) {
+	t.Helper()
+	for start := 0; start < len(data); start += DirChunkSize {
+		chunk := data[start : start+DirChunkSize]
+		if chunkUnused(chunk) {
+			continue
+		}
+		used++
+		end := 0
+		walkChunk(chunk, func(offset int, entry *DirEntry) bool {
+			end = offset + int(entry.RecLen)
+			return false
+		})
+		if end != DirChunkSize {
+			t.Fatalf("chunk %d: records end at %d, want %d", start/DirChunkSize, end, DirChunkSize)
+		}
+	}
+	return used
+}
+
+func firstBlock(t *testing.T, dirMgr *Manager, dirIno *inode.Inode) []byte {
+	t.Helper()
+	ext, off, err := dirMgr.extentMgr.Lookup(dirIno, 0)
+	if err != nil {
+		t.Fatalf("lookup block 0: %v", err)
+	}
+	data, err := dirMgr.readBlock(ext.PhysicalBlock + off)
+	if err != nil {
+		t.Fatalf("read block: %v", err)
+	}
+	return data
+}
+
+// TestBlockUsesEveryChunk fills many chunks of one block with long names
+// before the directory takes a second block.
+func TestBlockUsesEveryChunk(t *testing.T) {
+	ctx, dirMgr, inodeTbl, cleanup := testSetup(t)
+	defer cleanup()
+	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno.Mode = inode.S_IFDIR | 0755
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 600
+	for i := 0; i < n; i++ {
+		if err := dirMgr.Add(ctx, dirIno, longName(i), uint64(100+i), DT_REG); err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	if dirIno.Size != BlockSize {
+		t.Errorf("directory size = %d after %d long names, want one block (%d)", dirIno.Size, n, BlockSize)
+	}
+	if used := checkChunks(t, firstBlock(t, dirMgr, dirIno)); used < n/16 {
+		t.Errorf("%d chunks in use, want at least %d", used, n/16)
+	}
+	entries, err := dirMgr.List(ctx, dirIno)
+	if err != nil || len(entries) != n+2 {
+		t.Fatalf("List: %d entries, %v; want %d", len(entries), err, n+2)
+	}
+	if num, _, err := dirMgr.Lookup(ctx, dirIno, longName(n-1)); err != nil || num != 100+n-1 {
+		t.Errorf("lookup of the last entry: inode %d, %v", num, err)
+	}
+}
+
+// TestRemoveFirstEntryOfChunk removes the first record of a later chunk; its
+// space must stay in that chunk instead of extending the previous chunk's last record.
+func TestRemoveFirstEntryOfChunk(t *testing.T) {
+	ctx, dirMgr, inodeTbl, cleanup := testSetup(t)
+	defer cleanup()
+	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno.Mode = inode.S_IFDIR | 0755
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 40
+	for i := 0; i < n; i++ {
+		if err := dirMgr.Add(ctx, dirIno, longName(i), uint64(100+i), DT_REG); err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	var firstOfChunk1 string
+	walkChunk(firstBlock(t, dirMgr, dirIno)[DirChunkSize:], func(_ int, entry *DirEntry) bool {
+		firstOfChunk1 = entry.Name
+		return true
+	})
+	if firstOfChunk1 == "" {
+		t.Fatal("chunk 1 is unused")
+	}
+	if err := dirMgr.Remove(ctx, dirIno, firstOfChunk1); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	checkChunks(t, firstBlock(t, dirMgr, dirIno))
+	if err := dirMgr.Add(ctx, dirIno, "reused", 999, DT_REG); err != nil {
+		t.Fatalf("add after remove: %v", err)
+	}
+	entries, err := dirMgr.List(ctx, dirIno)
+	if err != nil || len(entries) != n+2 {
+		t.Fatalf("List: %d entries, %v; want %d", len(entries), err, n+2)
+	}
+	if _, _, err := dirMgr.Lookup(ctx, dirIno, firstOfChunk1); !errors.Is(err, ErrNotFound) {
+		t.Errorf("lookup of the removed entry: %v, want ErrNotFound", err)
+	}
+}
+
+// TestAddToChunkIgnoresStaleRecLen covers an entry whose RecLen a failed
+// addToNewBlock left at DirChunkSize; it must still fit in a partly used chunk.
+func TestAddToChunkIgnoresStaleRecLen(t *testing.T) {
+	chunk := make([]byte, DirChunkSize)
+	first := &DirEntry{InodeNum: 5, NameLen: 1, Name: "a", RecLen: DirChunkSize}
+	serializeEntry(first, chunk)
+	entry := &DirEntry{InodeNum: 6, NameLen: 1, Name: "b", RecLen: DirChunkSize}
+	if !addToChunk(chunk, entry) {
+		t.Fatal("entry did not fit in a chunk with one short record")
+	}
+	var names []string
+	walkChunk(chunk, func(_ int, e *DirEntry) bool {
+		names = append(names, e.Name)
+		return false
+	})
+	if fmt.Sprint(names) != "[a b]" {
+		t.Errorf("chunk holds %v, want [a b]", names)
 	}
 }

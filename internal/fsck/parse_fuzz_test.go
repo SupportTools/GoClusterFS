@@ -2,6 +2,7 @@ package fsck
 
 import (
 	"encoding/binary"
+	"slices"
 	"strings"
 	"testing"
 
@@ -20,15 +21,18 @@ func dirEntry(inodeNum uint64, recLen int, name string) []byte {
 
 func TestParseDirBlockChunkBoundary(t *testing.T) {
 	head := append(dirEntry(2, 16, "."), dirEntry(2, 16, "..")...)
+	fullChunk := append(slices.Clone(head), dirEntry(5, DirChunkSize-32, "a.txt")...)
 	for name, tc := range map[string]struct {
 		block   []byte
 		entries int
 		errText string
 	}{
-		"fills the chunk":     {append(head, dirEntry(5, DirChunkSize-32, "a.txt")...), 3, ""},
-		"empty block":         {nil, 0, ""},
-		"stops short":         {append(head, dirEntry(5, 32, "a.txt")...), 3, "entries end at offset 64"},
-		"runs past the chunk": {append(dirEntry(2, DirChunkSize+16, "."), make([]byte, 16)...), 0, "runs past the 4096-byte chunk"},
+		"fills the chunk":          {fullChunk, 3, ""},
+		"empty block":              {nil, 0, ""},
+		"stops short":              {append(slices.Clone(head), dirEntry(5, 32, "a.txt")...), 3, "entries end at offset 64"},
+		"runs past the chunk":      {append(dirEntry(2, DirChunkSize+16, "."), make([]byte, 16)...), 0, "runs past the 4096-byte chunk"},
+		"second chunk fills":       {append(slices.Clone(fullChunk), dirEntry(6, DirChunkSize, "b.txt")...), 4, ""},
+		"second chunk stops short": {append(slices.Clone(fullChunk), dirEntry(6, 32, "b.txt")...), 4, "entries end at offset 4128"},
 	} {
 		buf := make([]byte, DirBlockSize)
 		copy(buf, tc.block)

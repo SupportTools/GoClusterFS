@@ -357,48 +357,15 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 		}
 		physBlock := ext.PhysicalBlock + extOffset
 
-		// Read the block
 		data, err := m.readBlock(physBlock)
 		if err != nil {
 			return err
 		}
-
-		// Scan for the entry
-		offset := uint32(0)
-		prevOffset := uint32(0)
-
-		for offset < uint32(len(data)) {
-			entry, err := parseEntry(data[offset:])
-			if err != nil {
-				break
+		for start := 0; start < len(data); start += DirChunkSize {
+			chunk := data[start : start+DirChunkSize]
+			if removeFromChunk(chunk, name) {
+				return m.writeChunk(physBlock, start, chunk)
 			}
-
-			if entry.RecLen == 0 {
-				break
-			}
-
-			if entry.InodeNum != 0 && entry.Name == name {
-				// Found it - mark as deleted
-				// Option 1: Zero the inode number (simple deletion)
-				binary.LittleEndian.PutUint64(data[offset:], 0)
-
-				// Option 2: Merge with previous entry if possible
-				if prevOffset < offset {
-					prevRecLen := binary.LittleEndian.Uint16(data[prevOffset+8:])
-					newRecLen := prevRecLen + entry.RecLen
-					binary.LittleEndian.PutUint16(data[prevOffset+8:], newRecLen)
-				}
-
-				// Write the block back
-				if err := m.writeBlock(physBlock, data); err != nil {
-					return err
-				}
-
-				return nil
-			}
-
-			prevOffset = offset
-			offset += uint32(entry.RecLen)
 		}
 	}
 
@@ -576,29 +543,17 @@ func (m *Manager) readEntriesOf(ctx context.Context, dirIno *inode.Inode) ([]Dir
 	return entries, nil
 }
 
-// parseBlockEntries parses all directory entries from a block.
+// parseBlockEntries parses the live entries of every chunk in a block.
 func (m *Manager) parseBlockEntries(data []byte) ([]DirEntry, error) {
 	var entries []DirEntry
-	offset := uint32(0)
-
-	for offset < uint32(len(data)) {
-		entry, err := parseEntry(data[offset:])
-		if err != nil {
-			return entries, nil // End of valid entries
-		}
-
-		if entry.RecLen == 0 {
-			break
-		}
-
-		// Only include non-deleted entries
-		if entry.InodeNum != 0 {
-			entries = append(entries, *entry)
-		}
-
-		offset += uint32(entry.RecLen)
+	for start := 0; start < len(data); start += DirChunkSize {
+		walkChunk(data[start:start+DirChunkSize], func(_ int, entry *DirEntry) bool {
+			if entry.InodeNum != 0 {
+				entries = append(entries, *entry)
+			}
+			return false
+		})
 	}
-
 	return entries, nil
 }
 
@@ -607,10 +562,8 @@ func (m *Manager) addToExistingBlock(ctx context.Context, dirIno *inode.Inode, n
 	numBlocks := extent.BlocksForSize(dirIno.Size)
 
 	for block := uint64(0); block < numBlocks; block++ {
-		// Look up the extent for this logical block
 		ext, extOffset, err := m.extentMgr.Lookup(dirIno, block)
 		if err == extent.ErrExtentNotFound {
-			// No extent for this block - it's a hole
 			continue
 		}
 		if err != nil {
@@ -622,50 +575,84 @@ func (m *Manager) addToExistingBlock(ctx context.Context, dirIno *inode.Inode, n
 		if err != nil {
 			return false, err
 		}
-
-		// Try to find space
-		offset := uint32(0)
-		for offset < uint32(len(data)) {
-			entry, err := parseEntry(data[offset:])
-			if err != nil {
-				break
+		for start := 0; start < len(data); start += DirChunkSize {
+			chunk := data[start : start+DirChunkSize]
+			if addToChunk(chunk, newEntry) {
+				return true, m.writeChunk(physBlock, start, chunk)
 			}
-
-			if entry.RecLen == 0 {
-				break
-			}
-
-			// Check if this entry has extra space we can use
-			actualSize := entrySize(entry)
-			if entry.InodeNum == 0 {
-				// Deleted entry - can we reuse it?
-				if entry.RecLen >= newEntry.RecLen {
-					// Reuse this slot
-					newEntry.RecLen = entry.RecLen // Keep the same record length
-					serializeEntry(newEntry, data[offset:])
-					return true, m.writeBlock(physBlock, data)
-				}
-			} else if entry.RecLen > actualSize {
-				// Entry has trailing space
-				freeSpace := entry.RecLen - actualSize
-				if freeSpace >= newEntry.RecLen {
-					// Shrink existing entry and add new one
-					entry.RecLen = actualSize
-					serializeEntry(entry, data[offset:])
-
-					// Add new entry after
-					newEntry.RecLen = freeSpace
-					serializeEntry(newEntry, data[offset+uint32(actualSize):])
-
-					return true, m.writeBlock(physBlock, data)
-				}
-			}
-
-			offset += uint32(entry.RecLen)
 		}
 	}
 
 	return false, nil
+}
+
+// walkChunk calls fn with each entry of a 4 KB chunk and its offset until fn
+// returns true. An unused chunk starts with RecLen 0 and has no entries.
+func walkChunk(chunk []byte, fn func(offset int, entry *DirEntry) bool) {
+	for offset := 0; offset < len(chunk); {
+		entry, err := parseEntry(chunk[offset:])
+		if err != nil || offset+int(entry.RecLen) > len(chunk) {
+			return
+		}
+		if fn(offset, entry) {
+			return
+		}
+		offset += int(entry.RecLen)
+	}
+}
+
+func chunkUnused(chunk []byte) bool {
+	return binary.LittleEndian.Uint16(chunk[8:10]) == 0
+}
+
+// addToChunk puts newEntry in a deleted entry, in the space after a live one,
+// or at the start of an unused chunk. Records never cross a chunk boundary.
+func addToChunk(chunk []byte, newEntry *DirEntry) bool {
+	need := entrySize(newEntry)
+	if chunkUnused(chunk) {
+		newEntry.RecLen = DirChunkSize
+		serializeEntry(newEntry, chunk)
+		return true
+	}
+	added := false
+	walkChunk(chunk, func(offset int, entry *DirEntry) bool {
+		used := entrySize(entry)
+		switch {
+		case entry.InodeNum == 0 && entry.RecLen >= need:
+			newEntry.RecLen = entry.RecLen
+			serializeEntry(newEntry, chunk[offset:])
+			added = true
+		case entry.InodeNum != 0 && entry.RecLen >= used+need:
+			newEntry.RecLen = entry.RecLen - used
+			entry.RecLen = used
+			serializeEntry(entry, chunk[offset:])
+			serializeEntry(newEntry, chunk[offset+int(used):])
+			added = true
+		}
+		return added
+	})
+	return added
+}
+
+// removeFromChunk deletes the entry called name and gives its space to the
+// entry before it in the chunk.
+func removeFromChunk(chunk []byte, name string) bool {
+	prev := -1
+	removed := false
+	walkChunk(chunk, func(offset int, entry *DirEntry) bool {
+		if entry.InodeNum == 0 || entry.Name != name {
+			prev = offset
+			return false
+		}
+		binary.LittleEndian.PutUint64(chunk[offset:], 0)
+		if prev >= 0 {
+			prevRecLen := binary.LittleEndian.Uint16(chunk[prev+8:])
+			binary.LittleEndian.PutUint16(chunk[prev+8:], prevRecLen+entry.RecLen)
+		}
+		removed = true
+		return true
+	})
+	return removed
 }
 
 // addToNewBlock allocates a new block and adds the entry.
@@ -839,40 +826,37 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	return nil
 }
 
-// readBlock reads a physical block.
-func (m *Manager) readBlock(physBlock uint64) ([]byte, error) {
-	buf := storage.GetBuffer(storage.SectorSize)
-	defer storage.PutBuffer(buf)
-
-	// Read in 4K chunks for O_DIRECT compatibility
-	// physBlock is a block index; actual disk offset is dataOffset + physBlock*BlockSize
-	data := make([]byte, BlockSize)
-	for i := uint64(0); i < BlockSize/storage.SectorSize; i++ {
-		offset := m.dataOffset + physBlock*BlockSize + i*storage.SectorSize
-		if _, err := m.dev.ReadAt(buf.Bytes(), int64(offset)); err != nil {
-			return nil, fmt.Errorf("read block %d: %w", physBlock, err)
-		}
-		copy(data[i*storage.SectorSize:], buf.Bytes())
-	}
-
-	return data, nil
+func (m *Manager) blockOffset(physBlock uint64) int64 {
+	return int64(m.dataOffset + physBlock*BlockSize)
 }
 
-// writeBlock writes a physical block.
-func (m *Manager) writeBlock(physBlock uint64, data []byte) error {
-	buf := storage.GetBuffer(storage.SectorSize)
+func (m *Manager) readBlock(physBlock uint64) ([]byte, error) {
+	buf := storage.GetBuffer(BlockSize)
 	defer storage.PutBuffer(buf)
-
-	// Write in 4K chunks for O_DIRECT compatibility
-	// physBlock is a block index; actual disk offset is dataOffset + physBlock*BlockSize
-	for i := uint64(0); i < BlockSize/storage.SectorSize; i++ {
-		copy(buf.Bytes(), data[i*storage.SectorSize:])
-		offset := m.dataOffset + physBlock*BlockSize + i*storage.SectorSize
-		if _, err := m.dev.WriteAt(buf.Bytes(), int64(offset)); err != nil {
-			return fmt.Errorf("write block %d: %w", physBlock, err)
-		}
+	if _, err := m.dev.ReadAt(buf.Bytes()[:BlockSize], m.blockOffset(physBlock)); err != nil {
+		return nil, fmt.Errorf("read block %d: %w", physBlock, err)
 	}
+	return append([]byte(nil), buf.Bytes()[:BlockSize]...), nil
+}
 
+func (m *Manager) writeBlock(physBlock uint64, data []byte) error {
+	buf := storage.GetBuffer(BlockSize)
+	defer storage.PutBuffer(buf)
+	copy(buf.Bytes(), data)
+	if _, err := m.dev.WriteAt(buf.Bytes()[:BlockSize], m.blockOffset(physBlock)); err != nil {
+		return fmt.Errorf("write block %d: %w", physBlock, err)
+	}
+	return nil
+}
+
+// writeChunk writes only the chunk that changed, so the rest of the block is never rewritten from a stale copy.
+func (m *Manager) writeChunk(physBlock uint64, start int, chunk []byte) error {
+	buf := storage.GetBuffer(DirChunkSize)
+	defer storage.PutBuffer(buf)
+	copy(buf.Bytes(), chunk)
+	if _, err := m.dev.WriteAt(buf.Bytes()[:DirChunkSize], m.blockOffset(physBlock)+int64(start)); err != nil {
+		return fmt.Errorf("write block %d chunk %d: %w", physBlock, start/DirChunkSize, err)
+	}
 	return nil
 }
 

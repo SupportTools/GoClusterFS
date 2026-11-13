@@ -528,6 +528,16 @@ scenarios:
       docker: run-tests.sh::test_more_than_4096_files
       vm: run-vm-tests.sh::test_more_than_4096_files
 
+  - id: multinode-creates-one-directory
+    name: Four nodes create 4200 files in one directory
+    description: Four nodes each create 1050 empty files in one shared directory at the same time; every create succeeds and one node lists all 4200
+    priority: medium
+    # Docker/VM: test_more_than_4096_files already runs 4200 concurrent creates on 4 nodes, spread over 42 directories.
+    environments:
+      go: dir_capacity_test.go::TestMultiNodeCreatesInOneDirectory
+      docker: TODO
+      vm: TODO
+
   - id: large-volume-high-block-snapshot
     name: 200 GB volume with snapshots of data past 128 GB
     description: On a 200 GB sparse image, a snapshot, copy on write and clone of data past block 130816, where layout v2's refcount table ended, survive a remount next to 4200 files, and fsck is clean
@@ -1124,6 +1134,27 @@ scenarios:
     environments:
       go: internal/dir/dir_test.go::TestDirectoryGrowsPastInlineExtentsUnderLocks
 
+  - id: dir-block-uses-every-chunk
+    name: Directory block uses every 4KB chunk
+    description: 600 entries with 255-byte names fill many chunks of the first 1MB directory block instead of taking a new block every 15 entries, and every chunk's records add up to 4KB
+    priority: go_only
+    environments:
+      go: internal/dir/dir_test.go::TestBlockUsesEveryChunk
+
+  - id: dir-remove-first-entry-of-chunk
+    name: Removing a chunk's first entry keeps records inside the chunk
+    description: Removing the first entry of a later chunk does not extend the previous chunk's last record across the boundary, and the space is reused
+    priority: go_only
+    environments:
+      go: internal/dir/dir_test.go::TestRemoveFirstEntryOfChunk
+
+  - id: dir-add-stale-reclen
+    name: Directory add ignores a stale record length
+    description: An entry whose RecLen a failed new-block attempt left at 4KB still fits in a partly used chunk
+    priority: go_only
+    environments:
+      go: internal/dir/dir_test.go::TestAddToChunkIgnoresStaleRecLen
+
   - id: extent-tree-fsck
     name: fsck validates extent trees
     description: fsck accepts a valid extent tree and reports a corrupted node
@@ -1316,8 +1347,8 @@ scenarios:
       go: internal/fsck/layout_test.go::TestFsckRepairNoticesNodeMounting
 
   - id: fsck-directory-chunk
-    name: fsck checks directory entries fill one chunk
-    description: Directory entries whose record lengths stop short of or run past the 4KB chunk are reported
+    name: fsck checks every directory chunk
+    description: In each 4KB chunk of a directory block, entries whose record lengths stop short of or run past the chunk are reported; unused chunks are skipped
     priority: go_only
     environments:
       go: internal/fsck/parse_fuzz_test.go::TestParseDirBlockChunkBoundary
@@ -1900,6 +1931,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/sector_test.go::TestSectorLocksDoNotWaitOnOtherLocks
+
+  - id: create-stuck-inode-lock-eio
+    name: Create fails with EIO when the new inode's lock is never freed
+    description: A create whose inode slot stays locked on another node past lock.DefaultTimeout fails with EIO, not ENOSPC, and its directory entry is rolled back
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestCreateReportsStuckInodeLockAsEIO
+
+  - id: claim-errno
+    name: Inode slot failures map to the right errno
+    description: A full inode table is ENOSPC, a slot another node took is EAGAIN, and a lock timeout or read error is EIO
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestClaimErrno
 
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
