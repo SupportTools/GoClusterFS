@@ -637,6 +637,15 @@ scenarios:
       docker: TODO  # needs a lock record written as the stopped node at a known moment; Go-only harness
       vm: TODO  # same as docker
 
+  - id: stalled-node-writes-stop-at-write-gate
+    name: Stalled node's write stops at the write gate
+    description: Node A is stopped while a writer writes through it; after node B replays A and writes the file, A resumes with its heartbeat held, so its queued write reaches the write gate first, which refuses it and stops A, and the file keeps B's data byte for byte
+    priority: high
+    environments:
+      go: lock_reclaim_test.go::TestStalledNodesWritesStopAtWriteGate
+      docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
+      vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
+
   - id: lock-adopt-owner
     name: Replaying node takes over a dead node's exclusive locks
     description: AdoptOwner holds the dead node's exclusive records through the replay and ReleaseAdopted frees them; shared records and other nodes' records stay
@@ -2012,6 +2021,27 @@ scenarios:
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterDuplication
 
+  - id: cache-size-bounded
+    name: Caches stay within their limits
+    description: Forty times each cache's capacity goes through the inode, extent and negative caches; each keeps at most its capacity and the heap stops growing once it is full
+    priority: go_only
+    environments:
+      go: internal/cache/bounded_test.go::TestCachesStayBounded
+
+  - id: broadcast-peer-table-bounded
+    name: Broadcast peer table stays within its limit
+    description: Ten times MaxPeers peer addresses are added; the table keeps the MaxPeers heard most recently
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestPeerTableBounded
+
+  - id: broadcast-senders-bounded
+    name: Broadcast sequence tracking stays within its limit
+    description: Ten times MaxPeers senders are tracked; at most MaxPeers are kept, including the most recent
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestTrackedSendersBounded
+
   - id: broadcast-loss-drops-caches
     name: Broadcast loss drops caches
     description: A gap in a peer's sequence numbers clears the inode and extent caches once; a late message does not clear them again
@@ -2787,6 +2817,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/snapshot_test.go::TestSnapshotMarkKeepsConcurrentAppend
+
+  - id: deep-clone-chain-two-node-deletes
+    name: Deep clone chain deleted from two nodes
+    description: A chain of 9 files, each a clone of the one before and written at every level, is deleted in random order from two nodes, first one at a time with writes to survivors, then concurrently; every file keeps its content until deleted, every block is freed, no refcount stays above 0, and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/clone_chain_test.go::TestDeepCloneChainDeletedFromTwoNodes
 
   - id: failed-write-frees-unused-copy
     name: A failed write gives back its unused copy
@@ -3608,6 +3645,99 @@ scenarios:
     environments:
       go: internal/api/prometheus_test.go::TestMetricsEndpoint_ExportsCapacity
 
+  - id: api-health-signal-shutdown
+    name: /health checks and SIGTERM shutdown
+    description: A live mount reports device, journal, recovery and broadcast checks on /health. SIGTERM with a file open under the mount stops the API, reports the busy unmount and keeps the mount; a second SIGTERM after the file is closed unmounts, exits 0 and leaves a clean fsck
+    priority: high
+    environments:
+      go: shutdown_test.go::TestHealthAndSignalShutdown
+      docker: TODO - same reason as api-health-loopback
+      vm: TODO - same reason as api-health-loopback
+
+  - id: commands-share-exit-codes
+    name: mount, fsck and gfsctl share exit codes
+    description: The three binaries exit 0 after -h, 16 on a bad flag or missing argument, and 8 when the device, mount point or API cannot be reached, and say what to do next
+    priority: go_only
+    environments:
+      go: shutdown_test.go::TestCommandsShareExitCodes
+
+  - id: api-stop-waits-for-requests
+    name: API Stop lets requests in flight finish
+    description: Stop closes the listener at once, waits for a request in flight, and leaves no server goroutines
+    priority: go_only
+    environments:
+      go: internal/api/lifecycle_test.go::TestStopLetsRequestsInFlightFinish
+
+  - id: api-stop-cancels-after-timeout
+    name: API Stop cancels requests after the shutdown timeout
+    description: A request that outlasts ShutdownTimeout has its context cancelled, Stop returns ErrShutdownTimeout only after the handler returns, and no server goroutines are left
+    priority: go_only
+    environments:
+      go: internal/api/lifecycle_test.go::TestStopCancelsRequestsThatOutlastTheTimeout
+
+  - id: api-stop-idle
+    name: API Stop on an idle server
+    description: Stop is idempotent, refuses new connections and leaves no server goroutines
+    priority: go_only
+    environments:
+      go: internal/api/lifecycle_test.go::TestStopIdleServer
+
+  - id: mount-health-degraded-vs-down
+    name: /health separates degraded from down
+    description: A peer journal replay or broadcast trouble reports degraded with 200; a failing device or corrupt journal reports unhealthy with 503; -journal=false and -broadcast=false stay ok
+    priority: go_only
+    environments:
+      go: cmd/mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+
+  - id: storage-last-error
+    name: Device remembers its last I/O failure
+    description: LastError holds the latest failed read, write or sync until one succeeds, and ignores EOF
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestLastErrorHoldsTheLatestFailureUntilASuccess
+
+  - id: node-replaying-slots
+    name: Registry lists the journals it replays
+    description: Replaying lists a slot while its recovery handler runs and drops it afterwards, even when the replay fails
+    priority: go_only
+    environments:
+      go: internal/node/replaying_test.go::TestReplayingListsSlotsWhileTheirHandlerRuns
+
+  - id: broadcast-problem
+    name: Broadcast reports why peers miss invalidations
+    description: Problem names a stopped transport, a failed send, and missing multicast without unicast peers, and is empty when broadcast is off or working
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/problem_test.go::TestProblemSaysWhyPeersMissInvalidations
+
+  - id: cli-parse-flags
+    name: Shared flag parsing exit codes
+    description: -h exits 0 and a bad flag or value exits 16; -debug and --debug both parse
+    priority: go_only
+    environments:
+      go: internal/cli/cli_test.go::TestParseFlagsExitCodes
+
+  - id: logging-debug-switch
+    name: Debug lines only with -debug
+    description: Debugf prints [DEBUG] lines only after SetDebug(true)
+    priority: go_only
+    environments:
+      go: internal/logging/logging_test.go::TestDebugfPrintsOnlyWhenOn
+
+  - id: gfsctl-exit-codes
+    name: gfsctl exit codes and hints
+    description: health exits 0, 1 or 4 for ok, degraded and unhealthy (decoding the 503 body), API and connection errors exit 8 with a hint, usage errors exit 16 with a --help hint
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/errors_test.go::TestExitCodesAndHints
+
+  - id: gfsctl-debug
+    name: gfsctl --debug logs requests
+    description: --debug logs each API request with its status; without it nothing is logged
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/errors_test.go::TestDebugLogsEachRequest
+
   - id: dir-setattr-keeps-mkdir
     name: Directory chmod keeps another node's mkdir
     description: Node A changes a directory's mode while node B makes a directory in it; the link count and mtime from node B survive
@@ -3621,3 +3751,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/setattr_race_test.go::TestFileSetattrKeepsOtherNodesSize
+
+  - id: logging-no-ungated-debug
+    name: No [DEBUG] line bypasses -debug
+    description: No non-test Go file calls log.Printf or log.Println with a [DEBUG] prefix; they go through logging.Debugf
+    priority: go_only
+    environments:
+      go: internal/logging/guard_test.go::TestDebugLinesGoThroughDebugf

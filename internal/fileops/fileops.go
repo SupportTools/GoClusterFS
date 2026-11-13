@@ -161,6 +161,7 @@ func relative(p string) (string, error) {
 }
 
 // open opens p read-only without following symlinks or leaving the mount.
+// Closing a read-only descriptor reports nothing a caller could act on.
 // The root is opened per call: a descriptor held open would make unmount fail with EBUSY.
 func (o *Ops) open(p string) (*os.File, error) {
 	rel, err := relative(p)
@@ -171,7 +172,7 @@ func (o *Ops) open(p string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer unix.Close(rootFD)
+	defer func() { _ = unix.Close(rootFD) }()
 	if o.checkRoot != nil {
 		if err := o.checkRoot(rootFD); err != nil {
 			return nil, err
@@ -198,7 +199,7 @@ func (o *Ops) stat(p string) (unix.Stat_t, error) {
 	if err != nil {
 		return st, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	err = unix.Fstat(int(f.Fd()), &st)
 	return st, err
 }
@@ -208,7 +209,7 @@ func (o *Ops) setxattr(p, attr, value string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var st unix.Stat_t
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return err

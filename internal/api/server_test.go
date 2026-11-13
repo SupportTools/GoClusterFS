@@ -218,7 +218,7 @@ func TestServer_HealthEndpoint(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	// Give it a moment to start listening
 	time.Sleep(10 * time.Millisecond)
@@ -228,7 +228,7 @@ func TestServer_HealthEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("health check request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	// Check status code
 	if resp.StatusCode != http.StatusOK {
@@ -257,7 +257,7 @@ func TestServer_DoubleStart(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("first Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	// Second start should return error
 	if err := server.Start(ctx); !errors.Is(err, ErrServerAlreadyStarted) {
@@ -294,7 +294,7 @@ func TestServer_Uptime(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	// Wait a bit
 	time.Sleep(50 * time.Millisecond)
@@ -348,7 +348,7 @@ func TestServer_StatsEndpoints_NoProvider(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -369,7 +369,7 @@ func TestServer_StatsEndpoints_NoProvider(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request error: %v", err)
 			}
-			defer resp.Body.Close()
+			defer closeBody(resp)
 
 			// Should return 503 when no provider is configured
 			if resp.StatusCode != http.StatusServiceUnavailable {
@@ -415,7 +415,7 @@ func TestServer_StatsCache_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -423,7 +423,7 @@ func TestServer_StatsCache_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -457,7 +457,7 @@ func TestServer_StatsCache_NotAvailable(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -465,7 +465,7 @@ func TestServer_StatsCache_NotAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	// Should return 404 when cache stats are nil
 	if resp.StatusCode != http.StatusNotFound {
@@ -498,7 +498,7 @@ func TestServer_StatsJournal_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -506,7 +506,7 @@ func TestServer_StatsJournal_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -547,7 +547,7 @@ func TestServer_StatsTrim_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -555,7 +555,7 @@ func TestServer_StatsTrim_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -596,7 +596,7 @@ func TestServer_StatsLock_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -604,7 +604,7 @@ func TestServer_StatsLock_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -643,7 +643,7 @@ func TestServer_StatsSFB_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -651,7 +651,7 @@ func TestServer_StatsSFB_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -694,7 +694,7 @@ func TestServer_StatsCluster_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -702,7 +702,7 @@ func TestServer_StatsCluster_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -745,7 +745,7 @@ func TestServer_StatsAll_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -753,7 +753,7 @@ func TestServer_StatsAll_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -796,7 +796,7 @@ func TestServer_StatsOverview_Success(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -804,7 +804,7 @@ func TestServer_StatsOverview_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", resp.StatusCode)
@@ -837,7 +837,7 @@ func TestServer_StatsUnknownEndpoint(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -845,7 +845,7 @@ func TestServer_StatsUnknownEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected status 404, got %d", resp.StatusCode)
@@ -863,7 +863,7 @@ func TestServer_StatsMethodNotAllowed(t *testing.T) {
 	if err := server.Start(ctx); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	time.Sleep(10 * time.Millisecond)
 
@@ -872,9 +872,21 @@ func TestServer_StatsMethodNotAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected status 405, got %d", resp.StatusCode)
 	}
+}
+
+func stopServer(t testing.TB, s *Server) {
+	t.Helper()
+	if err := s.Stop(); err != nil {
+		t.Errorf("Stop: %v", err)
+	}
+}
+
+// closeBody closes a response body; its error says nothing about the server.
+func closeBody(resp *http.Response) {
+	_ = resp.Body.Close()
 }

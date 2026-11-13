@@ -24,9 +24,9 @@ type Transport struct {
 	// Unicast connection (fallback when multicast fails)
 	unicastConn *net.UDPConn
 
-	// Peer tracking for unicast fallback
+	// Unicast peers by address, so a remount on the same address replaces its entry.
 	peersMu sync.RWMutex
-	peers   map[string]*net.UDPAddr // UUID string -> address
+	peers   map[string]*peer
 
 	// Statistics
 	multicastSent     uint64
@@ -35,6 +35,7 @@ type Transport struct {
 	unicastRecv       uint64
 	multicastFailures uint64 // total over the transport's life
 	multicast         multicastHealth
+	lastSendErr       atomic.Pointer[error]
 
 	// State
 	running   atomic.Bool
@@ -81,6 +82,40 @@ type Config struct {
 	// Interface is the network interface for multicast.
 	// Empty string uses the default interface.
 	Interface string
+
+	// MaxPeers bounds the unicast peer table and the number of senders whose
+	// sequence numbers a node tracks. When either is full, the entry heard
+	// from longest ago is dropped.
+	// Default: 256
+	MaxPeers int
+}
+
+// DefaultMaxPeers is MaxPeers when the config leaves it unset.
+const DefaultMaxPeers = 256
+
+type peer struct {
+	addr  *net.UDPAddr
+	heard time.Time
+}
+
+func (c Config) maxPeers() int {
+	if c.MaxPeers > 0 {
+		return c.MaxPeers
+	}
+	return DefaultMaxPeers
+}
+
+// oldest returns the key of the entry heard from longest ago.
+func oldest[K comparable, V any](m map[K]V, heard func(V) time.Time) K {
+	var key K
+	var at time.Time
+	first := true
+	for k, v := range m {
+		if h := heard(v); first || h.Before(at) {
+			key, at, first = k, h, false
+		}
+	}
+	return key
 }
 
 // DefaultConfig returns sensible defaults for network broadcast.
@@ -93,6 +128,7 @@ func DefaultConfig() Config {
 		MulticastTTL:         1,
 		MaxMulticastFailures: 3,
 		HeartbeatInterval:    30 * time.Second,
+		MaxPeers:             DefaultMaxPeers,
 	}
 }
 
@@ -107,7 +143,7 @@ func NewTransport(cfg Config) (*Transport, error) {
 		return &Transport{
 			config:    cfg,
 			closeChan: make(chan struct{}),
-			peers:     make(map[string]*net.UDPAddr),
+			peers:     make(map[string]*peer),
 		}, nil
 	}
 
@@ -121,7 +157,7 @@ func NewTransport(cfg Config) (*Transport, error) {
 		config:        cfg,
 		multicastAddr: multicastAddr,
 		closeChan:     make(chan struct{}),
-		peers:         make(map[string]*net.UDPAddr),
+		peers:         make(map[string]*peer),
 	}
 
 	return t, nil
@@ -298,6 +334,16 @@ func (t *Transport) Send(msg *Message) error {
 		return fmt.Errorf("marshal error: %w", err)
 	}
 
+	err = t.deliver(data)
+	if err != nil {
+		t.lastSendErr.Store(&err)
+	} else if t.lastSendErr.Load() != nil {
+		t.lastSendErr.Store(nil)
+	}
+	return err
+}
+
+func (t *Transport) deliver(data []byte) error {
 	// Try multicast first. It goes out on the unicast socket: ListenMulticastUDP
 	// turns off multicast loopback on its socket, so other nodes on this host
 	// would not receive what that socket sends.
@@ -331,8 +377,8 @@ func (t *Transport) sendUnicast(data []byte) error {
 
 	t.peersMu.RLock()
 	peers := make([]*net.UDPAddr, 0, len(t.peers))
-	for _, addr := range t.peers {
-		peers = append(peers, addr)
+	for _, p := range t.peers {
+		peers = append(peers, p.addr)
 	}
 	t.peersMu.RUnlock()
 
@@ -348,18 +394,22 @@ func (t *Transport) sendUnicast(data []byte) error {
 	return lastErr
 }
 
-// AddPeer registers a peer for unicast fallback.
-func (t *Transport) AddPeer(uuid string, addr *net.UDPAddr) {
+// AddPeer records that a peer was heard from at addr, for unicast fallback.
+func (t *Transport) AddPeer(addr *net.UDPAddr) {
+	if addr == nil {
+		return
+	}
+	key := addr.String()
 	t.peersMu.Lock()
-	t.peers[uuid] = addr
-	t.peersMu.Unlock()
-}
-
-// RemovePeer unregisters a peer.
-func (t *Transport) RemovePeer(uuid string) {
-	t.peersMu.Lock()
-	delete(t.peers, uuid)
-	t.peersMu.Unlock()
+	defer t.peersMu.Unlock()
+	if p, ok := t.peers[key]; ok {
+		p.heard = time.Now()
+		return
+	}
+	if len(t.peers) >= t.config.maxPeers() {
+		delete(t.peers, oldest(t.peers, func(p *peer) time.Time { return p.heard }))
+	}
+	t.peers[key] = &peer{addr: addr, heard: time.Now()}
 }
 
 // PeerCount returns the number of known peers.
@@ -418,6 +468,25 @@ func (h *multicastHealth) reset() {
 	defer h.mu.Unlock()
 	h.streak = 0
 	h.retryAt = time.Time{}
+}
+
+// Problem says why peers may miss this node's invalidations, or returns ""
+// when they should get them.
+func (t *Transport) Problem() string {
+	if !t.config.Enabled {
+		return ""
+	}
+	if !t.running.Load() {
+		return "broadcast is not running"
+	}
+	if err := t.lastSendErr.Load(); err != nil {
+		return "the last invalidation send failed: " + (*err).Error()
+	}
+	multicast := t.multicastConn != nil && t.multicast.usable(time.Now(), t.config.MaxMulticastFailures)
+	if !multicast && t.PeerCount() == 0 {
+		return "multicast is unavailable and no unicast peers are known"
+	}
+	return ""
 }
 
 // Stats returns transport statistics.

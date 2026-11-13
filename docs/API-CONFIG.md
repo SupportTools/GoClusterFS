@@ -6,9 +6,10 @@ This document provides a comprehensive reference for all configuration options i
 
 1. [Command-Line Flags](#command-line-flags)
 2. [HTTP API Statistics](#http-api-statistics)
-3. [Code-Level Settings](#code-level-settings)
-4. [Tuning Recommendations](#tuning-recommendations)
-5. [Environment Variables](#environment-variables)
+3. [HTTP API Health and Shutdown](#http-api-health-and-shutdown)
+4. [Code-Level Settings](#code-level-settings)
+5. [Tuning Recommendations](#tuning-recommendations)
+6. [Environment Variables](#environment-variables)
 
 ---
 
@@ -33,7 +34,8 @@ These are the `goclusterfs-mount` flags:
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Format the device (destroys all data) |
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
-| `-debug` | bool | `false` | Log every FUSE request and reply. Mount logs its own `[DEBUG]` lines either way |
+| `-debug` | bool | `false` | Print `[DEBUG]` log lines |
+| `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 
 ### Cache Flags
@@ -43,6 +45,11 @@ These are the `goclusterfs-mount` flags:
 | `-cache-strict` | bool | `false` | Enable strict cache mode (always validate against disk) |
 | `-cache-ttl` | duration | `5s` | Cache entry TTL before revalidation required |
 | `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries |
+| `-cache-inodes` | int | `10000` | Most inodes the inode cache holds, about 480 bytes each (5 MB). `0` turns it off |
+| `-cache-extents` | int | `50000` | Most block mappings the extent cache holds, about 120 bytes each (6 MB). `0` turns it off |
+| `-cache-negative` | int | `1000` | Most not-found inode lookups the negative cache holds, about 40 bytes each. `0` turns it off |
+
+Each cache splits its limit evenly over 16 shards, so it holds a multiple of 16 entries: `-cache-negative 1000` holds 992, and a limit from 1 to 15 holds 16. A full cache drops the entry used longest ago.
 
 The kernel caches file attributes and directory entries for `-attr-timeout`. For that long after another node changes a file, `stat` and path lookups on this node can return the old size. Opening a file reads its inode from disk and makes the kernel fetch its size again, so a read after `open` sees the other node's completed writes. Reads through a file that is already open use the inode cache and can use the old size and block mappings for up to `-cache-ttl`, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
 
@@ -65,6 +72,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-unicast-port` | int | `31338` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | string | (empty) | HMAC secret for message authentication |
 | `-broadcast-iface` | string | (auto) | Network interface for multicast |
+| `-broadcast-max-peers` | int | `256` | Most nodes the unicast peer table and the lost-message tracking hold. When either is full, the node heard from longest ago is dropped |
 
 ### TRIM Flags
 
@@ -93,7 +101,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
 | `-dashboard` | bool | `true` | Serve the [web dashboard](#web-dashboard) under `/ui/` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` checks the device, journal, journal recovery and broadcast; see [HTTP API Health and Shutdown](#http-api-health-and-shutdown). With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
 
 Without a token, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
 
@@ -146,7 +154,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 |----------|---------|
 | `/api/v1/status` | Version, uptime, mount and device paths, and `capacity`: total, used and free blocks and bytes of the data region, for the whole volume |
 | `/api/v1/stats` | `cache` and `journal`, as below |
-| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache |
+| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks) and `max_peers` |
 | `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
 | `/api/v1/stats/trim` | `trim_enabled`, false with `-trim=false` or after the device refused a discard as unsupported (image files always do). With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges, plus flushes skipped because the freed blocks could not be reserved), `last_trim_at` and `batch_size` |
 | `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate`, which are always 0 |
@@ -154,9 +162,26 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
 | `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |
 
-`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*`, `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
+`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
+
+## HTTP API Health and Shutdown
+
+`GET /health` runs four checks and reports the worst of them:
+
+| Check | `ok` | `degraded` | `unhealthy` |
+|-------|------|------------|-------------|
+| `device` | The last device read, write or sync worked | | The last device read, write or sync failed |
+| `journal` | Clean or dirty, or off with `-journal=false` | This node's journal is being replayed | This node's journal is corrupt |
+| `recovery` | No replay is running | This node replays the journal of a crashed node | |
+| `broadcast` | Working, or off with `-broadcast=false` | The last invalidation send failed, or multicast is unavailable and no unicast peers are known | |
+
+`ok` and `degraded` answer 200; `unhealthy` answers 503. Degraded means the mount works with a problem: during a replay, files the crashed node had locked wait until it ends, and with broadcast down, peers see this node's changes only after `-cache-ttl`. Unhealthy means file operations fail. A mount that is not running refuses the connection. A check that is not `ok` has a `message` that says what to do. `gfsctl health` exits 0, 1 or 4 for the three states.
+
+The API starts after the mount has replayed its own journal, so a mount that is still starting refuses the connection too.
+
+On SIGINT or SIGTERM, the mount stops the API before it unmounts, because snapshot and clone requests go through the mount. The API stops accepting connections and gives requests in flight 10 seconds to finish. After that it cancels them and closes their connections; snapshot, clone and admin requests that have started still run to the end, and the API waits for them. After `fusermount3 -u`, the API stops the same way once the unmount is done.
 
 ## Code-Level Settings
 

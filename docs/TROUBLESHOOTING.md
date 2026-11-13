@@ -271,7 +271,7 @@ fusermount3 -u /mnt/fs
 
 **Diagnosis**: `gfsctl stats cache` shows this node's cache hits and misses while it runs, and the mount logs `Cache stats: inodes=... (hit=...%), extents=... (hit=...%)` when it unmounts.
 
-**Solutions**: Cache sizes are fixed in code (10,000 inodes, 50,000 extents). A longer `-cache-ttl` or `-attr-timeout` avoids some disk reads, but other nodes' changes then show up later. See [Cache Tuning](OPERATIONS.md#cache-tuning).
+**Solutions**: If `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity`, a larger `-cache-inodes` (or `-cache-extents` for the extent pair) keeps more in memory. A longer `-cache-ttl` or `-attr-timeout` avoids some disk reads, but other nodes' changes then show up later. See [Cache Tuning](OPERATIONS.md#cache-tuning).
 
 ### High Lock Contention
 
@@ -479,10 +479,10 @@ fusermount3 -u /mnt/cluster
 
 ### Log Output
 
-The mount always logs `[DEBUG]` lines for file operations, lock acquire and release, journal recovery, and broadcast. Capture stderr and filter it:
+With `-debug`, the mount logs `[DEBUG]` lines for file operations, lock acquire and release, and block allocation. Journal recovery and broadcast lines are always logged. Capture stderr and filter it:
 
 ```bash
-./goclusterfs-mount -device /dev/device -mount /mnt/fs 2>&1 | tee mount.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee mount.log
 
 grep "lock.Acquire" mount.log
 grep "\[broadcast\]" mount.log
@@ -491,10 +491,10 @@ grep "\[Recovery\]" mount.log
 
 ### FUSE Request Tracing (Very Verbose)
 
-`-debug` adds a log line for every FUSE request and reply:
+`-fuse-debug` adds a log line for every FUSE request and reply:
 
 ```bash
-./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee fuse.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -fuse-debug 2>&1 | tee fuse.log
 ```
 
 ---

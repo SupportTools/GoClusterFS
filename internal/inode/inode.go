@@ -508,24 +508,6 @@ func (t *Table) newInodeInSlot(num uint32, free *Inode) *Inode {
 	}
 }
 
-// Alloc allocates a new inode.
-// Returns the allocated inode with InodeNum set, ready for initialization.
-//
-// Deprecated: Use FindFreeSlot() + ClaimSlot() for operations that need to allocate
-// blocks before claiming the inode (to respect lock ordering: BlockBitmap before Inode).
-func (t *Table) Alloc(ctx context.Context) (*Inode, error) {
-	for {
-		num, err := t.FindFreeSlot()
-		if err != nil {
-			return nil, err
-		}
-		ino, err := t.ClaimSlot(ctx, num)
-		if !errors.Is(err, ErrInodeInUse) {
-			return ino, err
-		}
-	}
-}
-
 // Free marks an inode as free.
 func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 	_, err := t.FreeIf(ctx, inodeNum, func(*Inode) bool { return true })

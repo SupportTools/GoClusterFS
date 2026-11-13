@@ -1,10 +1,12 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -147,6 +149,94 @@ func TestWaiterOutlastsLockTimeoutThroughFailover(t *testing.T) {
 	}
 }
 
+// TestStalledNodesWritesStopAtWriteGate stops node A while a writer keeps
+// writing a file through it, waits until node B has proven A dead and replayed
+// it, then writes the file from B and resumes A. A's heartbeat is held back after
+// the pause, so A's queued write reaches the device first, where the write gate
+// must refuse it: A exits, and B's data stays.
+func TestStalledNodesWritesStopAtWriteGate(t *testing.T) {
+	cluster, nodeA, _ := startPairForLockTestWithEnv(t, []string{"GOCLUSTERFS_TEST_HEARTBEAT_HOLD=30s"})
+	a, b := cluster.Node(0), cluster.Node(1)
+	logA := a.Log.(*syncBuffer)
+	pid := a.PID()
+	if err := b.WriteFile("fenced", bytes.Repeat([]byte{'0'}, 4096)); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if a.WriteFileAt("fenced", bytes.Repeat([]byte{'A'}, 4096), 0) != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(time.Second)
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop node A: %v", err)
+	}
+	defer cluster.KillNode(0)
+
+	waitSlotEmpty(t, cluster.ImagePath, nodeA.slot, 90*time.Second)
+	if err := b.WriteFileAt("fenced", bytes.Repeat([]byte{'B'}, 4096), 0); err != nil {
+		t.Fatalf("node B writes after taking over: %v", err)
+	}
+	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+		t.Fatalf("resume node A: %v", err)
+	}
+
+	// The held heartbeat stops A after 30s whatever the gate does; by then a write the gate let through has landed.
+	lost := regexp.MustCompile(fmt.Sprintf(`Node registry slot %d is no longer this node's`, nodeA.slot))
+	deadline := time.Now().Add(45 * time.Second)
+	for !lost.MatchString(logA.String()) && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	got, err := b.ReadFile("fenced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, bytes.Repeat([]byte{'B'}, 4096)) {
+		t.Fatalf("file reads %q... after node A resumed, want node B's data", got[:16])
+	}
+	if !lost.MatchString(logA.String()) {
+		t.Fatal("node A did not stop after resuming from its takeover")
+	}
+	if !strings.Contains(logA.String(), "checking the slot before a write") {
+		t.Error("node A stopped without its write gate checking the slot")
+	}
+}
+
+// waitSlotEmpty waits until registry slot slot is empty: a peer replayed its node.
+func waitSlotEmpty(t *testing.T, imagePath string, slot int, timeout time.Duration) {
+	t.Helper()
+	dev, err := storage.Open(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, state := reg.Occupant(slot, true); state == node.Unoccupied {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("registry slot %d still occupied after %v", slot, timeout)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 type registeredNode struct {
 	uuid [16]byte
 	slot int
@@ -154,7 +244,14 @@ type registeredNode struct {
 
 func startPairForLockTest(t *testing.T) (*MultiNodeCluster, registeredNode, *syncBuffer) {
 	t.Helper()
+	return startPairForLockTestWithEnv(t, nil)
+}
+
+// startPairForLockTestWithEnv is startPairForLockTest with envA added to node A's environment.
+func startPairForLockTestWithEnv(t *testing.T, envA []string) (*MultiNodeCluster, registeredNode, *syncBuffer) {
+	t.Helper()
 	cluster := NewMultiNodeCluster(t, 2, 50)
+	cluster.Node(0).Env = envA
 	logA, logB := &syncBuffer{}, &syncBuffer{}
 	cluster.Node(0).Log, cluster.Node(1).Log = logA, logB
 	if err := cluster.FormatAndStartFirst(false); err != nil {

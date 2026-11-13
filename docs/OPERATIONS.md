@@ -16,9 +16,9 @@ This guide covers day-to-day operations for managing GoClusterFS deployments.
 
 ## Monitoring
 
-Each mount serves its counters over the HTTP API on `127.0.0.1:8080`: Prometheus metrics at `/metrics`, and JSON under `/api/v1/status` and `/api/v1/stats/...`. [HTTP API Statistics](API-CONFIG.md#http-api-statistics) lists them. `gfsctl status`, `gfsctl stats` and the web dashboard at `/ui/` read the same data. The counters cover this node only and start at zero when it mounts.
+Each mount serves its counters over the HTTP API on `127.0.0.1:8080`: Prometheus metrics at `/metrics`, and JSON under `/api/v1/status` and `/api/v1/stats/...`. [HTTP API Statistics](API-CONFIG.md#http-api-statistics) lists them. `gfsctl status`, `gfsctl stats` and the web dashboard at `/ui/` read the same data. The counters cover this node only and start at zero when it mounts. `/health` says whether the mount is ok, degraded or unhealthy; see [HTTP API Health and Shutdown](API-CONFIG.md#http-api-health-and-shutdown).
 
-`goclusterfs-mount` also writes a log to stderr, so capture it (see [Background Mount](#background-mount-with-logging) or the systemd unit in the [Deployment Guide](DEPLOYMENT.md#systemd-service-single-node)). The log has many `[DEBUG]` lines, which are always on.
+`goclusterfs-mount` also writes a log to stderr, so capture it (see [Background Mount](#background-mount-with-logging) or the systemd unit in the [Deployment Guide](DEPLOYMENT.md#systemd-service-single-node)). With `-debug`, the log also has `[DEBUG]` lines.
 
 ### Totals at Unmount
 
@@ -31,7 +31,7 @@ Cache stats: inodes=... (hit=...%), extents=... (hit=...%)
 Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 ```
 
-Cache sizes are fixed in code (10,000 inodes, 50,000 extents). Only the TTL and strict mode have flags; see [Cache Tuning](#cache-tuning).
+`-cache-inodes` (10,000), `-cache-extents` (50,000) and `-cache-negative` (1,000) set the cache sizes; see [Cache Tuning](#cache-tuning).
 
 ### Log Lines to Watch
 
@@ -117,16 +117,16 @@ A mount that was killed leaves its journal for the next mount on the same host t
 
 `fusermount3 -u`, `SIGINT` (Ctrl+C) and `SIGTERM` (`kill`, or `systemctl stop` without an `ExecStop`) all shut down cleanly. On a signal the mount:
 
-1. Logs `Received signal, unmounting...` and stops the HTTP API, after API writes in flight finish.
-2. Stops its heartbeat and failure detection, after a replay of another node's journal in progress ends.
-3. Stops the snapshot worker, flushes queued TRIM, stops the journal (marking it clean only if nothing is pending), and releases the lock records it keeps.
-4. Stops broadcast and unmounts.
+1. Logs `Received signal, unmounting...` and stops the HTTP API. Requests in flight get 10 seconds, then are cancelled; snapshot, clone and admin requests that have started run to the end.
+2. Unmounts. If the mount point is busy, the unmount fails, the log says so, and the process keeps running without its API. Close the open files, then send the signal again or run `fusermount3 -u`.
+3. Stops its heartbeat and failure detection, after a replay of another node's journal in progress ends.
+4. Stops the snapshot worker, flushes queued TRIM, stops the journal (marking it clean only if nothing is pending), and releases the lock records it keeps.
+5. Stops broadcast.
 
-It then logs the totals and `Filesystem unmounted.`, and exits 0. After `fusermount3 -u`, the same steps run after the unmount.
+It then logs the totals and `Filesystem unmounted.`, and exits 0, or 8 when closing the filesystem failed. After `fusermount3 -u`, steps 1, 3, 4 and 5 run once the unmount is done.
 
-- On a signal, the mount closes the device before it unmounts, so a file operation still running fails. Stop applications first.
-- If the mount point is busy, the unmount fails and the process keeps running with the device closed. Close the open files, then run `fusermount3 -u`.
-- A second Ctrl+C does nothing. `kill -9` stops the process at once and leaves its journal for the next mount to replay.
+- An open file or a file operation still running makes the unmount fail, so stop applications first.
+- A signal after a failed unmount tries again; once the unmount is done, further signals are ignored. `kill -9` stops the process at once and leaves its journal for the next mount to replay.
 - The node's registry slot stays marked active after a clean unmount. A remount on the same host takes it back at once. Otherwise a running node clears it about 20 seconds later, and `goclusterfs-fsck -repair` waits up to 11 seconds before it trusts that no node is mounted.
 
 ### Running fsck
@@ -527,13 +527,18 @@ tcpdump -i eth0 -c 10 udp port 31337 or udp port 31338
 
 ### Cache Tuning
 
-Cache sizes are fixed in code (10,000 inodes, 50,000 extents). The flags set how long cached data may be used:
+The flags set how many entries each cache holds and how long cached data may be used:
 
 | Flag | Default | Effect |
 |------|---------|--------|
 | `-attr-timeout` | `1s` | How long the kernel caches attributes and directory entries. `stat` and `ls` can show another node's change up to this late. `0` makes every `stat` and path step read the directory under a cluster lock, which is much slower. |
 | `-cache-ttl` | `5s` | How long the mount trusts a cached inode before it checks the disk. Open files can lag another node's change by up to this long. |
 | `-cache-strict` | `false` | Check the disk on every cache hit |
+| `-cache-inodes` | `10000` | Inodes kept in memory, about 480 bytes each |
+| `-cache-extents` | `50000` | Block mappings kept in memory, about 120 bytes each |
+| `-cache-negative` | `1000` | Not-found inode lookups kept in memory |
+
+When `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity` (or the extent pair does), the cache is full and drops entries it may need again; a larger limit trades memory for fewer disk reads.
 
 ```bash
 # Read-heavy, changes from other nodes may show up later

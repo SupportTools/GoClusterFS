@@ -16,7 +16,7 @@ func freeUDPPorts(t *testing.T, n int) []int {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
 	}
 	return ports
@@ -109,7 +109,7 @@ func TestTwoNodesOnOneHost(t *testing.T) {
 
 	t.Run("unicast", func(t *testing.T) {
 		a.config.MaxMulticastFailures = 0
-		a.AddPeer("b", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ports[2]})
+		a.AddPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ports[2]})
 		if err := a.Send(builder.InvalidateExtent(7, 1)); err != nil {
 			t.Fatal(err)
 		}
@@ -141,7 +141,7 @@ func TestCheckPortsFailsOnTakenPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	cfg := DefaultConfig()
 	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]

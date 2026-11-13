@@ -27,7 +27,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 ./goclusterfs-fsck ./disk.img                                 # device is a positional argument
 ```
 
-`goclusterfs-mount` stays in the foreground until the filesystem is unmounted. `-format` formats and then mounts. It logs a lot of `[DEBUG]` lines even without `-debug`, which only turns on go-fuse request tracing. Flags and defaults: `./goclusterfs-mount -h`, `./goclusterfs-fsck -h`, [docs/API-CONFIG.md](docs/API-CONFIG.md).
+`goclusterfs-mount` stays in the foreground until the filesystem is unmounted. `-format` formats and then mounts. `-debug` turns on `[DEBUG]` log lines and `-fuse-debug` go-fuse request tracing. The three commands share exit codes (`internal/cli`), listed in the README. Flags and defaults: `./goclusterfs-mount -h`, `./goclusterfs-fsck -h`, [docs/API-CONFIG.md](docs/API-CONFIG.md).
 
 ## Code Map
 
@@ -35,7 +35,6 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 |------|--------------|
 | `cmd/mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
 | `cmd/fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
-| `cmd/crctest` | Prints CRC32C test values |
 | `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics) |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
@@ -57,6 +56,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
 | `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
+| `internal/cli` | Exit codes, flag parsing and error hints shared by the three commands |
+| `internal/logging` | The `-debug` switch: `logging.Debugf` prints only with `-debug` |
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
 | `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
 | `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
@@ -77,7 +78,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | next | 256 bytes per inode | Inode table: one inode per `-bytes-per-inode` bytes of device (default 1 MB), 4096 to 16M inodes; root is inode 2 |
 | next | rest | Data blocks |
 
-The last three metadata regions are sized at format time, each at least 1 MB and rounded up to whole MB. On devices up to 4 GB the data blocks start at 326 MB. The smallest device is 327 MB. Registry slot `i` owns the journal at `67 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes) and version 2 images (1 MB bitmap, refcount and inode regions: 4096 inodes, refcounts overflow past 128 GB). It also refuses version 3 images formatted before per-node lock slots, which have no lock slot size in the superblock and a 1 MB lock region. Copy the data off with the old build and reformat.
+The last three metadata regions are sized at format time, each at least 1 MB and rounded up to whole MB. On devices up to 4 GB the data blocks start at 326 MB. The smallest device is 327 MB. Registry slot `i` owns the journal at `67 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes) and version 2 images (1 MB bitmap, refcount and inode regions: 4096 inodes, refcounts overflow past 128 GB). It also refuses version 3 images formatted before per-node lock slots, which have no lock slot size in the superblock and a 1 MB lock region, and version 3 images formatted before each lock type had its own records, which lack the `RequiredTypedLockRecords` flag. Copy the data off with the old build and reformat. Builds from before that flag refuse newer images with `unknown required flags 0x10`.
 
 ## Snapshots and Clones
 

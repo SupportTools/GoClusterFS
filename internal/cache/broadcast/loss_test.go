@@ -30,13 +30,13 @@ func unicastTo(t *testing.T) (*Broadcaster, *net.UDPConn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { raw.Close() })
+	t.Cleanup(func() { _ = raw.Close() })
 	ports := freeUDPPorts(t, 2)
 	cfg := DefaultConfig()
 	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]
 	cfg.MaxMulticastFailures = 0
 	b := startBroadcaster(t, cfg, [16]byte{1}, nil)
-	b.transport.AddPeer("raw", raw.LocalAddr().(*net.UDPAddr))
+	b.transport.AddPeer(raw.LocalAddr().(*net.UDPAddr))
 	return b, raw
 }
 
@@ -300,7 +300,7 @@ func invalidationBurst(t *testing.T, unicast bool, delay time.Duration) {
 	receiver := startBroadcaster(t, cfgB, receiverID, h)
 	sender := startBroadcaster(t, cfgA, senderID, nil)
 	if unicast {
-		sender.transport.AddPeer(fmt.Sprintf("%x", receiverID), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ports[2]})
+		sender.transport.AddPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ports[2]})
 	} else if sender.transport.multicastConn == nil {
 		t.Skip("multicast is not available on this host")
 	}

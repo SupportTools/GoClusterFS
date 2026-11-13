@@ -91,14 +91,14 @@ func TestHealthEndpoint_WithCheckers(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/health")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	// Degraded returns 200 (only unhealthy returns 503)
 	if resp.StatusCode != http.StatusOK {
@@ -133,14 +133,14 @@ func TestHealthEndpoint_Unhealthy_Returns503(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/health")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	// Unhealthy returns 503
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -178,14 +178,14 @@ func TestHealthEndpoint_MultipleCheckers(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/health")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)

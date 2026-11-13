@@ -28,13 +28,13 @@ func startTestServer(t *testing.T) *Server {
 
 func TestRoutes_Status(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/status")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -55,13 +55,13 @@ func TestRoutes_Status(t *testing.T) {
 
 func TestRoutes_StatusWithTrailingSlash(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/status/")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -70,13 +70,13 @@ func TestRoutes_StatusWithTrailingSlash(t *testing.T) {
 
 func TestRoutes_Metrics(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -90,14 +90,14 @@ func TestRoutes_Metrics(t *testing.T) {
 
 func TestRoutes_Stats_NoProvider(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	// Without a StatsProvider configured, stats endpoints return 503
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/stats/cache")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("expected status 503, got %d", resp.StatusCode)
@@ -106,13 +106,13 @@ func TestRoutes_Stats_NoProvider(t *testing.T) {
 
 func TestRoutes_APIv1_NotFound(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/unknown")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("expected status 404, got %d", resp.StatusCode)
@@ -121,7 +121,7 @@ func TestRoutes_APIv1_NotFound(t *testing.T) {
 
 func TestRoutes_MethodNotAllowed(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	tests := []struct {
 		name   string
@@ -145,7 +145,7 @@ func TestRoutes_MethodNotAllowed(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request error: %v", err)
 			}
-			defer resp.Body.Close()
+			defer closeBody(resp)
 
 			if resp.StatusCode != http.StatusMethodNotAllowed {
 				t.Errorf("expected status 405, got %d", resp.StatusCode)
@@ -156,7 +156,7 @@ func TestRoutes_MethodNotAllowed(t *testing.T) {
 
 func TestRoutes_HealthHEAD(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	client := &http.Client{}
 	req, err := http.NewRequest(http.MethodHead, "http://"+server.Addr()+"/health", nil)
@@ -168,7 +168,7 @@ func TestRoutes_HealthHEAD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -177,13 +177,13 @@ func TestRoutes_HealthHEAD(t *testing.T) {
 
 func TestRoutes_Status_WithBuildInfo(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/status")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	var status StatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
@@ -243,14 +243,14 @@ func TestRoutes_Status_WithStatusProvider(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/status")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	var status StatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {

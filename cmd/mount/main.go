@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/cache"
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
+	"github.com/supporttools/GoClusterFS/internal/cli"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/fileops"
@@ -28,6 +30,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/stats"
@@ -77,13 +80,17 @@ func main() {
 		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
 		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
 			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes)", superblock.MinInodes, superblock.MaxInodes))
-		debug   = flag.Bool("debug", false, "Enable FUSE debug output")
-		showVer = flag.Bool("version", false, "Print version and exit")
+		debug     = flag.Bool("debug", false, "Print [DEBUG] log lines")
+		fuseDebug = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
+		showVer   = flag.Bool("version", false, "Print version and exit")
 
 		// Cache configuration
-		cacheStrict = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
-		cacheTTL    = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
-		attrTimeout = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries")
+		cacheStrict   = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
+		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
+		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries")
+		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
+		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
+		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")
 
 		// Journal configuration
 		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
@@ -96,6 +103,7 @@ func main() {
 		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
+		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
 
 		// TRIM configuration
 		trimEnabled   = flag.Bool("trim", true, "Enable batched TRIM for freed blocks")
@@ -117,22 +125,31 @@ func main() {
 		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
 		dashboard    = flag.Bool("dashboard", true, "Serve the web dashboard on the API server under /ui/")
 	)
-	flag.Parse()
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n\n", os.Args[0])
+		flag.PrintDefaults()
+		fmt.Fprint(os.Stderr, exitCodesHelp)
+	}
+	if code, ok := cli.ParseFlags(flag.CommandLine, os.Args[1:]); !ok {
+		os.Exit(code)
+	}
+	logging.SetDebug(*debug)
 
 	if *showVer {
 		fmt.Println("goclusterfs-mount", version.String())
-		os.Exit(0)
+		os.Exit(cli.ExitOK)
 	}
 
 	if *devicePath == "" || *mountPoint == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n", os.Args[0])
-		flag.PrintDefaults()
-		os.Exit(1)
+		usageFailf("-device and -mount are required")
+	}
+	if flag.NArg() > 0 {
+		usageFailf("unexpected argument %q; give the device with -device and the mount point with -mount", flag.Arg(0))
 	}
 
 	token, tokenSrc, err := loadAPIToken(*apiTokenFile, *apiToken)
 	if err != nil {
-		log.Fatalf("Invalid API settings: %v", err)
+		usageFailf("Invalid API settings: %v", err)
 	}
 	if tokenSrc == tokenFromFlag {
 		log.Printf("WARNING: -api-token is visible to every local user in ps and /proc/<pid>/cmdline, and it unlocks API writes. Use -api-token-file or %s instead.", apiTokenEnv)
@@ -143,14 +160,14 @@ func main() {
 	}
 	if *apiEnabled {
 		if err := apiCfg.Validate(); err != nil {
-			log.Fatalf("Invalid API settings: %v", err)
+			usageFailf("Invalid API settings: %v", err)
 		}
 		if err := apiCfg.CheckExposure(); err != nil {
 			hint := "set -api-addr to a loopback address such as 127.0.0.1:8080"
 			if errors.Is(err, api.ErrWildcardCORSWithoutToken) {
 				hint = "list the allowed origins in -api-cors"
 			}
-			log.Fatalf("Refusing to start the API: %v. Set -api-token-file (or %s), %s, or pass -api=false", err, apiTokenEnv, hint)
+			usageFailf("Refusing to start the API: %v. Set -api-token-file (or %s), %s, or pass -api=false", err, apiTokenEnv, hint)
 		}
 	}
 	if *broadcastEnabled && *broadcastSecret == "" {
@@ -167,9 +184,23 @@ func main() {
 		HeartbeatInterval:    30 * time.Second,
 		Secret:               *broadcastSecret,
 		Interface:            *broadcastIface,
+		MaxPeers:             *broadcastPeers,
+	}
+	if *broadcastPeers < 1 {
+		log.Fatalf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
+	}
+	cacheCfg := cache.DefaultConfig()
+	cacheCfg.StrictMode = *cacheStrict
+	cacheCfg.InodeTTL = *cacheTTL
+	cacheCfg.InodeCacheSize = *cacheInodes
+	cacheCfg.ExtentCacheSize = *cacheExtents
+	cacheCfg.NegativeCacheSize = *cacheNegative
+	cacheCfg.Network = networkCfg
+	if err := cacheCfg.Validate(); err != nil {
+		log.Fatalf("Invalid cache flags: %v", err)
 	}
 	broadcastFailed := func(err error) {
-		log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
+		failf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
 	}
 	// Bind and release the ports before registering or formatting, so a taken
 	// port fails the mount before it changes anything on disk.
@@ -177,17 +208,14 @@ func main() {
 		broadcastFailed(err)
 	}
 
-	// Check mount point exists
 	if _, err := os.Stat(*mountPoint); os.IsNotExist(err) {
-		log.Fatalf("Mount point does not exist: %s", *mountPoint)
+		failf("Mount point %s does not exist; create it with mkdir -p %s", *mountPoint, *mountPoint)
 	}
 
-	// Open device
 	dev, err := storage.Open(*devicePath)
 	if err != nil {
-		log.Fatalf("Failed to open device: %v", err)
+		failf("Failed to open device: %v; %s", err, cli.OpenHint(err))
 	}
-	defer dev.Close()
 
 	// Get device size (returns int64, no error)
 	devSize := dev.Size()
@@ -200,8 +228,11 @@ func main() {
 	} else {
 		sb, err = superblock.Read(dev)
 	}
+	if errors.Is(err, superblock.ErrChecksumMismatch) {
+		failf("Cannot use %s: %v; check it with goclusterfs-fsck %s", *devicePath, err, *devicePath)
+	}
 	if err != nil {
-		log.Fatalf("Cannot use %s: %v", *devicePath, err)
+		failf("Cannot use %s: %v", *devicePath, err)
 	}
 
 	bitmapOffset := sb.BlockBitmapOffset
@@ -224,14 +255,18 @@ func main() {
 	nodeReg.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
 	hostname, _ := os.Hostname()
 	slotIdx, err := nodeReg.Register(ctx, hostname)
+	if errors.Is(err, node.ErrNoFreeSlots) {
+		failf("Cannot join the cluster: all %d node slots are taken. List them with goclusterfs-fsck -list-slots %s, and free the slot of a node that will not come back with -release-slot", node.MaxNodes, *devicePath)
+	}
 	if err != nil {
-		log.Fatalf("Failed to register node: %v", err)
+		failf("Cannot join the cluster: %v; check the device, then mount again", err)
 	}
 	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
-		log.Fatalf("Node registry slot %d is no longer this node's (owner %x); stopping so two nodes never share a journal", slot, owner[:8])
+		failf("Node registry slot %d is no longer this node's (owner %x); stopping so two nodes never share a journal. "+
+			"Check that the device is reachable and that node clocks agree within a few seconds, then mount again", slot, owner[:8])
 	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
-		log.Fatalf("Failed to start node heartbeat: %v", err)
+		failf("Failed to start node heartbeat: %v", err)
 	}
 	dev.SetWriteGate(nodeReg.WriteGate)
 	nodeUUID := nodeReg.LocalUUID()
@@ -288,7 +323,7 @@ func main() {
 		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, slotIdx)
 		if err != nil {
-			log.Fatalf("Journal recovery for slot %d failed: %v (to discard this journal, mount with -skip-recovery=%d)", slotIdx, err, slotIdx)
+			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}
 		if result != nil && result.WasNeeded {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
@@ -312,7 +347,7 @@ func main() {
 		// Recovery (if needed) has already been performed above
 		j, err = journal.Init(dev, journalOffset, journalSize, nodeUUID, generation, jConfig)
 		if err != nil {
-			log.Fatalf("Failed to initialize journal: %v", err)
+			failf("Failed to initialize the journal: %v; check the device, then run goclusterfs-fsck %s", err, *devicePath)
 		}
 		log.Printf("Journal: initialized at offset %d (%d MB)", journalOffset, journalSize/(1024*1024))
 
@@ -322,19 +357,14 @@ func main() {
 		log.Println("Journal: disabled (no crash consistency guarantees)")
 	}
 
-	// Build cache configuration from flags
-	cacheCfg := cache.DefaultConfig()
-	cacheCfg.StrictMode = *cacheStrict
-	cacheCfg.InodeTTL = *cacheTTL
-	cacheCfg.Network = networkCfg
-
 	// Create cache manager for read optimization
 	cacheMgr, err := cache.NewManager(cacheCfg, inodeTbl, lockMgr)
 	if err != nil {
-		log.Fatalf("Failed to create cache manager: %v", err)
+		failf("Failed to create the cache: %v; check -cache-ttl", err)
 	}
-	log.Printf("Cache: %d inodes, %d negative entries, TTL=%v, strict=%v",
+	log.Printf("Cache: %d inodes, %d extents, %d negative entries, TTL=%v, strict=%v",
 		cacheMgr.Config().InodeCacheSize,
+		cacheMgr.Config().ExtentCacheSize,
 		cacheMgr.Config().NegativeCacheSize,
 		cacheMgr.Config().InodeTTL,
 		cacheMgr.Config().StrictMode)
@@ -403,7 +433,7 @@ func main() {
 	if *format {
 		log.Println("Formatting filesystem...")
 		if err := gfs.InitRoot(ctx); err != nil {
-			log.Fatalf("Failed to initialize root: %v", err)
+			failf("Failed to create the root directory: %v; check the device, then format again", err)
 		}
 		log.Println("Filesystem formatted successfully")
 	}
@@ -411,13 +441,13 @@ func main() {
 	// Verify root exists
 	rootIno, err := inodeTbl.Read(inode.InodeRoot)
 	if err != nil || rootIno.Magic != inode.InodeMagic {
-		log.Fatalf("Filesystem not formatted. Use -format to initialize.")
+		failf("The root directory of %s is missing or damaged. Check it with goclusterfs-fsck %s; -format creates a new, empty filesystem and erases this one", *devicePath, *devicePath)
 	}
 
 	// Initialize snapshot subsystem after verifying filesystem is valid
 	if *snapshotsEnabled {
 		if err := gfs.InitSnapshots(ctx, snapshotOffset, snapshotSize, lockMgr, slotIdx); err != nil {
-			log.Fatalf("Failed to initialize snapshots: %v", err)
+			failf("Failed to load snapshots: %v; check the device with goclusterfs-fsck %s, or mount with -snapshots=false", err, *devicePath)
 		}
 		log.Printf("Snapshots: enabled (registry at %dMB, %dMB capacity)",
 			snapshotOffset/(1024*1024), snapshotSize/(1024*1024))
@@ -431,7 +461,7 @@ func main() {
 		MountOptions: fuse.MountOptions{
 			FsName:        "goclusterfs",
 			Name:          "goclusterfs",
-			Debug:         *debug,
+			Debug:         *fuseDebug,
 			MaxReadAhead:  128 * 1024, // 128KB readahead
 			DisableXAttrs: false,
 			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
@@ -444,7 +474,7 @@ func main() {
 	log.Printf("Mounting at %s...", *mountPoint)
 	server, err := fs.Mount(*mountPoint, gfs, mountOpts)
 	if err != nil {
-		log.Fatalf("Failed to mount: %v", err)
+		failf("Failed to mount at %s: %v. Check that /dev/fuse exists, fusermount3 is installed, and nothing else is mounted there (fusermount3 -u %s)", *mountPoint, err, *mountPoint)
 	}
 
 	// Start API server for management and monitoring
@@ -454,7 +484,7 @@ func main() {
 		var err error
 		apiServer, err = api.NewServer(apiCfg)
 		if err != nil {
-			log.Printf("Warning: Failed to create API server: %v", err)
+			log.Printf("Warning: Failed to create the API server: %v; the mount continues without it", err)
 		} else {
 			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, j, trimMgr, bm, nodeReg))
 			apiServer.SetStatusProvider(&fsStatusProvider{
@@ -463,11 +493,17 @@ func main() {
 				sampler:    sampler,
 			})
 			apiServer.SetStatsProvider(sampler)
-			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
+			registerHealthChecks(apiServer, healthSources{
+				deviceError:      dev.LastError,
+				journal:          sampler.JournalStats,
+				replaying:        nodeReg.Replaying,
+				broadcastOn:      cacheMgr.BroadcastEnabled(),
+				broadcastProblem: cacheMgr.BroadcastProblem,
+			})
 			apiServer.SetFileService(fileops.New(*mountPoint, gfs.SnapshotRegistry()))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
-				log.Printf("Warning: Failed to start API server: %v", err)
+				log.Printf("Warning: Failed to start the API server: %v; the mount continues without it. Choose a free -api-addr, or pass -api=false", err)
 				apiServer.Stop()
 				apiServer = nil
 				sampler.Stop()
@@ -489,57 +525,48 @@ func main() {
 		log.Println("API server: disabled")
 	}
 
-	// Handle signals for clean unmount
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		log.Println("Received signal, unmounting...")
-
-		// Stop API server first
-		if apiServer != nil {
-			if err := apiServer.Stop(); err != nil {
-				log.Printf("Warning: Failed to stop API server: %v", err)
-			}
-			sampler.Stop()
+	stopAPI := func() {
+		if apiServer == nil {
+			return
 		}
-
-		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
-		nodeReg.Stop()
-		if err := gfs.Close(); err != nil {
-			log.Printf("Warning: Failed to close filesystem: %v", err)
-		}
-
-		// Stop broadcaster to notify peers
-		if err := cacheMgr.StopBroadcast(); err != nil {
-			log.Printf("Warning: Failed to stop broadcast: %v", err)
-		}
-
-		// Unmount using go-fuse server method
-		server.Unmount()
-	}()
-
-	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
-
-	// Wait for filesystem to be unmounted - this blocks until unmount
-	server.Wait()
-
-	// Stop API server
-	if apiServer != nil {
 		if err := apiServer.Stop(); err != nil {
-			log.Printf("Warning: Failed to stop API server on exit: %v", err)
+			log.Printf("Warning: Failed to stop the API server: %v", err)
 		}
 		sampler.Stop()
 	}
 
-	// Clean shutdown - close filesystem (handles snapshot worker, TRIM, journal)
+	// The API stops before the unmount: its snapshot and clone requests go
+	// through the mount, and the unmount fails while they hold files open.
+	var unmounted atomic.Bool
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for range sigChan {
+			if unmounted.Load() {
+				log.Println("Received signal; already unmounted, finishing the shutdown")
+				continue
+			}
+			log.Println("Received signal, unmounting...")
+			stopAPI()
+			if err := server.Unmount(); err != nil {
+				log.Printf("Unmount of %s failed: %v. Close the files and shells that use it, then send the signal again or run fusermount3 -u %s", *mountPoint, err, *mountPoint)
+			}
+		}
+	}()
+
+	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
+	server.Wait()
+	unmounted.Store(true)
+	stopAPI()
+
+	exit := cli.ExitOK
 	nodeReg.Stop()
 	if err := gfs.Close(); err != nil {
-		log.Printf("Warning: Failed to close filesystem on exit: %v", err)
+		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)
+		exit = cli.ExitFailure
 	}
-
 	if err := cacheMgr.StopBroadcast(); err != nil {
-		log.Printf("Warning: Failed to stop broadcast on exit: %v", err)
+		log.Printf("Warning: Failed to stop broadcast: %v", err)
 	}
 
 	// Print final TRIM stats
@@ -566,6 +593,28 @@ func main() {
 	}
 
 	log.Println("Filesystem unmounted.")
+	_ = dev.Close()
+	os.Exit(exit)
+}
+
+const exitCodesHelp = `
+Exit codes:
+  0: The filesystem was mounted and later unmounted cleanly
+  8: The mount failed, or stopped on an error
+  16: Usage error; nothing was changed
+`
+
+// failf logs why the mount cannot go on and exits with cli.ExitFailure.
+func failf(format string, args ...any) {
+	log.Printf(format, args...)
+	os.Exit(cli.ExitFailure)
+}
+
+// usageFailf reports a bad flag or setting and exits with cli.ExitUsage.
+func usageFailf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "Run %s -h to see the flags.\n", os.Args[0])
+	os.Exit(cli.ExitUsage)
 }
 
 func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry) stats.Sources {

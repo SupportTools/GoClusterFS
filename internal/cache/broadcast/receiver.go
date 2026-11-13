@@ -230,9 +230,7 @@ func (b *Broadcaster) handleInvalidateAll(msg *Message) {
 
 // handleHeartbeat processes a heartbeat message.
 func (b *Broadcaster) handleHeartbeat(msg *Message, addr *net.UDPAddr) {
-	// Update peer list for unicast fallback
-	uuidStr := fmt.Sprintf("%x", msg.SenderUUID)
-	b.transport.AddPeer(uuidStr, addr)
+	b.transport.AddPeer(addr)
 }
 
 // handlePeerAnnounce processes a peer announcement message.
@@ -254,7 +252,7 @@ func (b *Broadcaster) handlePeerAnnounce(msg *Message, addr *net.UDPAddr) {
 		peerAddr = addr
 	}
 
-	b.transport.AddPeer(uuidStr, peerAddr)
+	b.transport.AddPeer(peerAddr)
 
 	log.Printf("[broadcast] peer announced: slot=%d uuid=%s addr=%s",
 		payload.NodeSlot, uuidStr[:16], peerAddr)
@@ -270,6 +268,9 @@ func (b *Broadcaster) track(sender [16]byte, seq uint64) (dup bool, missed uint6
 
 	s, ok := b.senders[sender]
 	if !ok {
+		if len(b.senders) >= b.transport.config.maxPeers() {
+			delete(b.senders, oldest(b.senders, func(s *senderSeq) time.Time { return s.heard }))
+		}
 		b.senders[sender] = &senderSeq{highest: seq, heard: time.Now()}
 		return false, 0
 	}
@@ -466,7 +467,12 @@ func (b *Broadcaster) BroadcastInvalidateAll() {
 
 // Stats returns broadcaster statistics.
 func (b *Broadcaster) Stats() BroadcasterStats {
+	b.sendersMu.Lock()
+	senders := len(b.senders)
+	b.sendersMu.Unlock()
 	return BroadcasterStats{
+		TrackedSenders:        senders,
+		MaxPeers:              b.transport.config.maxPeers(),
 		InvalidationsReceived: atomic.LoadUint64(&b.invalidationsReceived),
 		InvalidationsSent:     atomic.LoadUint64(&b.invalidationsSent),
 		DuplicatesDropped:     atomic.LoadUint64(&b.duplicatesDropped),
@@ -483,6 +489,8 @@ type BroadcasterStats struct {
 	DuplicatesDropped     uint64
 	MessagesIgnored       uint64
 	MessagesLost          uint64
+	TrackedSenders        int
+	MaxPeers              int
 	Transport             TransportStats
 }
 
@@ -493,6 +501,12 @@ func (b *Broadcaster) ResetStats() {
 	atomic.StoreUint64(&b.duplicatesDropped, 0)
 	atomic.StoreUint64(&b.messagesIgnored, 0)
 	atomic.StoreUint64(&b.messagesLost, 0)
+}
+
+// Problem says why peers may miss this node's invalidations, or returns ""
+// when they should get them.
+func (b *Broadcaster) Problem() string {
+	return b.transport.Problem()
 }
 
 // IsEnabled returns whether broadcasting is enabled.

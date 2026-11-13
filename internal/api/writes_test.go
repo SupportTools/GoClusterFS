@@ -90,7 +90,7 @@ func call(t *testing.T, srv *Server, method, path, token, body string) (int, str
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	data, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(data)
 }
@@ -224,7 +224,7 @@ func TestStopWaitsForWritesInFlight(t *testing.T) {
 		req, _ := http.NewRequest("POST", "http://"+srv.Addr()+"/api/v1/snapshots", strings.NewReader(`{"path":"/f","name":"s"}`))
 		req.Header.Set("Authorization", "Bearer secret")
 		if resp, err := http.DefaultClient.Do(req); err == nil {
-			resp.Body.Close()
+			closeBody(resp)
 		}
 	}()
 	for files.lastCall() == "" {
@@ -259,7 +259,7 @@ func TestWritesRefuseOtherOrigins(t *testing.T) {
 	if err := srv.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { srv.Stop() })
+	t.Cleanup(func() { stopServer(t, srv) })
 
 	send := func(method, origin string, header map[string]string) *http.Response {
 		req, _ := http.NewRequest(method, "http://"+srv.Addr()+"/api/v1/clones", strings.NewReader(`{"path":"/f","dest":"/c"}`))
@@ -274,7 +274,7 @@ func TestWritesRefuseOtherOrigins(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		closeBody(resp)
 		return resp
 	}
 

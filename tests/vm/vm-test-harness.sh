@@ -512,6 +512,8 @@ report_boot_failure() {
 setup_goclusterfs() {
     local vm_id="$1"
     local format_disk="${2:-false}"
+    # Extra environment for the mount process, such as a test failpoint
+    local mount_env="${3:-}"
     local ssh_port=$(get_vm_ssh_port "$vm_id")
 
     log_info "Setting up GoClusterFS on VM $vm_id (format=$format_disk)..."
@@ -535,7 +537,7 @@ setup_goclusterfs() {
     # /var/log/goclusterfs.log is lost when the VM dies; the log device keeps a copy on the host
     log_info "Mounting GoClusterFS..."
     ssh_run "$vm_id" \
-        "nohup /usr/local/bin/goclusterfs-mount $mount_args < /dev/null 2>&1 | tee /var/log/goclusterfs.log > /dev/goclusterfs-log 2>/dev/null &"
+        "nohup env $mount_env /usr/local/bin/goclusterfs-mount $mount_args < /dev/null 2>&1 | tee /var/log/goclusterfs.log > /dev/goclusterfs-log 2>/dev/null &"
 
     # Wait for mount to be ready
     wait_for_goclusterfs_mount "$vm_id"
