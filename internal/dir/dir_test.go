@@ -29,10 +29,12 @@ func testSetup(t *testing.T) (context.Context, *Manager, *inode.Table, func()) {
 	// Size: 1GB for testing
 	size := int64(1024 * 1024 * 1024)
 	if err := f.Truncate(size); err != nil {
-		f.Close()
+		_ = f.Close()
 		t.Fatalf("Failed to truncate: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// Open as device
 	dev, err := storage.Open(tmpFile)
@@ -63,7 +65,7 @@ func testSetup(t *testing.T) (context.Context, *Manager, *inode.Table, func()) {
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
 	cleanup := func() {
-		dev.Close()
+		_ = dev.Close()
 	}
 
 	return context.Background(), dirMgr, inodeTbl, cleanup
@@ -377,7 +379,9 @@ func TestLookupErrors(t *testing.T) {
 	// Create directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Empty name
 	_, _, err = dirMgr.Lookup(ctx, dirIno, "")
@@ -400,7 +404,9 @@ func TestAddEntry(t *testing.T) {
 	// Create and initialize directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add a file entry
 	fileInode := uint64(100)
@@ -448,7 +454,9 @@ func TestAddDuplicate(t *testing.T) {
 	// Create and initialize directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add a file
 	if err := dirMgr.Add(ctx, dirIno, "test", 100, DT_REG); err != nil {
@@ -479,7 +487,9 @@ func TestAddErrors(t *testing.T) {
 	// Create directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Empty name
 	err = dirMgr.Add(ctx, dirIno, "", 100, DT_REG)
@@ -502,12 +512,20 @@ func TestRemoveEntry(t *testing.T) {
 	// Create and initialize directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add entries
-	dirMgr.Add(ctx, dirIno, "file1", 100, DT_REG)
-	dirMgr.Add(ctx, dirIno, "file2", 101, DT_REG)
-	dirMgr.Add(ctx, dirIno, "file3", 102, DT_REG)
+	if err := dirMgr.Add(ctx, dirIno, "file1", 100, DT_REG); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirMgr.Add(ctx, dirIno, "file2", 101, DT_REG); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirMgr.Add(ctx, dirIno, "file3", 102, DT_REG); err != nil {
+		t.Fatal(err)
+	}
 
 	// Remove file2
 	if err := dirMgr.Remove(ctx, dirIno, "file2"); err != nil {
@@ -538,7 +556,9 @@ func TestRemoveErrors(t *testing.T) {
 	// Create and initialize directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Remove non-existent
 	err := dirMgr.Remove(ctx, dirIno, "nonexistent")
@@ -566,7 +586,9 @@ func TestIsEmpty(t *testing.T) {
 	// Create and initialize directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Should be empty (only . and ..)
 	empty, err := dirMgr.IsEmpty(ctx, dirIno)
@@ -578,7 +600,9 @@ func TestIsEmpty(t *testing.T) {
 	}
 
 	// Add a file
-	dirMgr.Add(ctx, dirIno, "test", 100, DT_REG)
+	if err := dirMgr.Add(ctx, dirIno, "test", 100, DT_REG); err != nil {
+		t.Fatal(err)
+	}
 
 	// Should not be empty now
 	empty, err = dirMgr.IsEmpty(ctx, dirIno)
@@ -597,7 +621,9 @@ func TestManyEntries(t *testing.T) {
 	// Create and initialize directory
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		t.Fatal(err)
+	}
 
 	// Add many entries (enough to potentially need multiple blocks)
 	numEntries := 50
@@ -634,11 +660,15 @@ func BenchmarkLookup(b *testing.B) {
 	// Create temp file
 	tmpFile := filepath.Join(b.TempDir(), "bench.img")
 	f, _ := os.Create(tmpFile)
-	f.Truncate(1024 * 1024 * 1024)
-	f.Close()
+	if err := f.Truncate(1024 * 1024 * 1024); err != nil {
+		b.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal(err)
+	}
 
 	dev, _ := storage.Open(tmpFile)
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], "bench-node-uuid0")
@@ -655,14 +685,18 @@ func BenchmarkLookup(b *testing.B) {
 	// Create directory with entries
 	dirIno, _ := inodeTbl.Alloc(ctx)
 	dirIno.Mode = inode.S_IFDIR | 0755
-	dirMgr.InitDirectory(ctx, dirIno, 2)
+	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+		b.Fatal(err)
+	}
 
 	for i := 0; i < 20; i++ {
 		name := make([]byte, 50)
 		for j := range name {
 			name[j] = 'a' + byte((i+j)%26)
 		}
-		dirMgr.Add(ctx, dirIno, string(name), uint64(100+i), DT_REG)
+		if err := dirMgr.Add(ctx, dirIno, string(name), uint64(100+i), DT_REG); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	// Find middle entry to search for
@@ -673,7 +707,9 @@ func BenchmarkLookup(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		dirMgr.Lookup(ctx, dirIno, string(searchName))
+		if _, _, err := dirMgr.Lookup(ctx, dirIno, string(searchName)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -681,11 +717,15 @@ func BenchmarkAdd(b *testing.B) {
 	// Create temp file
 	tmpFile := filepath.Join(b.TempDir(), "bench.img")
 	f, _ := os.Create(tmpFile)
-	f.Truncate(1024 * 1024 * 1024)
-	f.Close()
+	if err := f.Truncate(1024 * 1024 * 1024); err != nil {
+		b.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal(err)
+	}
 
 	dev, _ := storage.Open(tmpFile)
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], "bench-node-uuid0")
@@ -705,10 +745,14 @@ func BenchmarkAdd(b *testing.B) {
 		// Create fresh directory for each iteration
 		dirIno, _ := inodeTbl.Alloc(ctx)
 		dirIno.Mode = inode.S_IFDIR | 0755
-		dirMgr.InitDirectory(ctx, dirIno, 2)
+		if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
+			b.Fatal(err)
+		}
 		b.StartTimer()
 
-		dirMgr.Add(ctx, dirIno, "testfile", uint64(100+i), DT_REG)
+		if err := dirMgr.Add(ctx, dirIno, "testfile", uint64(100+i), DT_REG); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -727,7 +771,7 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open device: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], "test-node-uuid00")

@@ -138,7 +138,7 @@ func (m *Manager) Lookup(ctx context.Context, dirIno *inode.Inode, name string) 
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeShared); err != nil {
 			return 0, 0, fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
-		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+		defer m.unlock(dirIno.InodeNum)
 	}
 
 	// Read directory data and scan for entry
@@ -221,6 +221,19 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	return fmt.Errorf("concurrent modification detected after %d retries for entry %q", MaxAddRetries, name)
 }
 
+// unlock releases a directory's inode lock. ErrNotLockOwner means a double release:
+// the extra one may have dropped another holder's lock early, letting two writers
+// rewrite the same directory block.
+func (m *Manager) unlock(dirInode uint32) {
+	err := m.lockMgr.Release(lock.LockTypeInode, uint64(dirInode))
+	switch {
+	case errors.Is(err, lock.ErrNotLockOwner):
+		log.Printf("[ERROR] dir: released the lock on directory inode %d that this node does not hold (double release or lock bookkeeping bug)", dirInode)
+	case err != nil:
+		log.Printf("[WARN] dir: releasing the lock on directory inode %d failed: %v", dirInode, err)
+	}
+}
+
 // addInternal performs the actual add operation.
 // Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
 func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
@@ -240,7 +253,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 	freshIno, err := m.liveDirLocked(dirIno.InodeNum)
 	if err != nil {
 		if lockHeld {
-			m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+			m.unlock(dirIno.InodeNum)
 		}
 		return err
 	}
@@ -249,13 +262,13 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 	_, _, err = m.lookupUnlocked(ctx, freshIno, entry.Name)
 	if err == nil {
 		if lockHeld {
-			m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+			m.unlock(dirIno.InodeNum)
 		}
 		return ErrExists
 	}
 	if err != ErrNotFound {
 		if lockHeld {
-			m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+			m.unlock(dirIno.InodeNum)
 		}
 		return err
 	}
@@ -265,7 +278,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 		added, err := m.addToExistingBlock(ctx, freshIno, entry)
 		if err != nil {
 			if lockHeld {
-				m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+				m.unlock(dirIno.InodeNum)
 			}
 			return err
 		}
@@ -274,7 +287,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 			freshIno.MetaGeneration++
 			if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
 				if lockHeld {
-					m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+					m.unlock(dirIno.InodeNum)
 				}
 				if errors.Is(err, extent.ErrTreeConflict) {
 					return errRetryAdd
@@ -282,7 +295,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 				return fmt.Errorf("failed to write directory inode: %w", err)
 			}
 			if lockHeld {
-				m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+				m.unlock(dirIno.InodeNum)
 			}
 			// Copy the fresh state back to caller's inode
 			dirIno.Size = freshIno.Size
@@ -294,7 +307,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 	// Release inode lock before bitmap allocation to respect lock ordering
 	// (bitmap lock level 6 < inode lock level 8)
 	if lockHeld {
-		m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+		m.unlock(dirIno.InodeNum)
 	}
 
 	// Allocate block without holding inode lock
@@ -340,7 +353,7 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
 			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
-		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+		defer m.unlock(dirIno.InodeNum)
 	}
 
 	dirIno, err := m.liveDirLocked(dirIno.InodeNum)
@@ -406,7 +419,7 @@ func (m *Manager) List(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, er
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeShared); err != nil {
 			return nil, fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
-		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+		defer m.unlock(dirIno.InodeNum)
 	}
 
 	// Re-read inode from disk to get current state (extents may have changed)
@@ -457,7 +470,7 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 			return fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
 		log.Printf("[DEBUG] dir.InitDirectory: acquired inode lock for inode %d", dirIno.InodeNum)
-		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+		defer m.unlock(dirIno.InodeNum)
 	}
 
 	// Create "." entry
@@ -705,11 +718,11 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	blockUsed := false
 	defer func() {
 		if !blockUsed {
-			// Free the allocated block since we didn't use it.
-			// Ignore errors - best effort cleanup.
 			log.Printf("[DEBUG] dir.addToNewBlock: freeing unused block %d for inode %d",
 				physBlock, dirIno.InodeNum)
-			m.extentMgr.FreePhysicalBlock(ctx, physBlock)
+			if err := m.extentMgr.FreePhysicalBlock(ctx, physBlock); err != nil {
+				log.Printf("[WARN] dir.addToNewBlock: block %d stays allocated with no owner: %v", physBlock, err)
+			}
 		}
 	}()
 
@@ -737,7 +750,7 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
-		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
+		defer m.unlock(dirIno.InodeNum)
 	}
 
 	freshIno, err := m.liveDirLocked(dirIno.InodeNum)

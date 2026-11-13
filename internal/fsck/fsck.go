@@ -549,7 +549,7 @@ func (c *Checker) Check() *Result {
 // logf writes to output if verbose mode is enabled.
 func (c *Checker) logf(format string, args ...interface{}) {
 	if c.opts.Verbose {
-		fmt.Fprintf(c.opts.Output, format, args...)
+		_, _ = fmt.Fprintf(c.opts.Output, format, args...)
 	}
 }
 

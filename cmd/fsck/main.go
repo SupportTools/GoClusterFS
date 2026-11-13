@@ -132,7 +132,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: Failed to open device: %v\n", err)
 		os.Exit(fsck.ExitOperational)
 	}
-	defer dev.Close()
+	defer func() {
+		if err := dev.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: closing device: %v\n", err)
+		}
+	}()
 
 	if *listSlots || releasing {
 		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose})
