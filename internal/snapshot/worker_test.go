@@ -41,26 +41,28 @@ func setupTestDevice(t *testing.T) (*storage.Device, string, func()) {
 	devPath := filepath.Join(tmpDir, "test.img")
 	f, err := os.Create(devPath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create device file: %v", err)
 	}
 
 	if err := f.Truncate(testDeviceSize); err != nil {
-		f.Close()
-		os.RemoveAll(tmpDir)
+		_ = f.Close()
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to truncate device: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	dev, err := storage.Open(devPath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to open device: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.RemoveAll(tmpDir)
+		_ = dev.Close()
+		_ = os.RemoveAll(tmpDir)
 	}
 
 	return dev, devPath, cleanup
