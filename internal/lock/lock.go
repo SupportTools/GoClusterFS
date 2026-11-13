@@ -43,6 +43,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -430,11 +431,11 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		tryStart := time.Now()
 		held, added, by, err := m.attemptAcquire(key, recordID, mode, gid, time.Since(startTime))
 		if err != nil {
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - attempt error: %v", lockType, resourceID, err)
+			logging.Debugf("lock.Acquire: type=%d res=%d - attempt error: %v", lockType, resourceID, err)
 			return err
 		}
 		if held {
-			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - acquired (retries=%d, dur=%v, gid=%d)", lockType, resourceID, retryCount, time.Since(startTime), gid)
+			logging.Debugf("lock.Acquire: type=%d res=%d - acquired (retries=%d, dur=%v, gid=%d)", lockType, resourceID, retryCount, time.Since(startTime), gid)
 
 			// Trigger cache invalidation callback for exclusive locks.
 			// We do this before returning so the caller reads fresh data.
@@ -659,7 +660,7 @@ func (m *Manager) Release(lockType LockType, resourceID uint64) error {
 	m.mu.Lock()
 	held, ok := m.heldLocks[key]
 	if !ok {
-		log.Printf("[DEBUG] lock.Release: type=%d res=%d gid=%d - NOT FOUND in heldLocks!", lockType, resourceID, gid)
+		logging.Debugf("lock.Release: type=%d res=%d gid=%d - NOT FOUND in heldLocks!", lockType, resourceID, gid)
 		m.mu.Unlock()
 		return ErrNotLockOwner
 	}
@@ -682,7 +683,7 @@ func (m *Manager) Release(lockType LockType, resourceID uint64) error {
 
 	err := m.dropRecordKey(recordID)
 	if err != nil {
-		log.Printf("[DEBUG] lock.Release: type=%d res=%d - release error: %v", lockType, resourceID, err)
+		logging.Debugf("lock.Release: type=%d res=%d - release error: %v", lockType, resourceID, err)
 	}
 	return err
 }
@@ -734,7 +735,7 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 	m.mu.Unlock()
 
 	if err := m.releaseRecord(recordID); err != nil {
-		log.Printf("[DEBUG] lock: releasing cached record %d: %v", recordID, err)
+		logging.Debugf("lock: releasing cached record %d: %v", recordID, err)
 	}
 }
 

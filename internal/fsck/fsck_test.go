@@ -32,22 +32,24 @@ func testDevice(t testing.TB, dataMB int) (*storage.Device, func()) {
 
 	f, err := os.Create(filePath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("failed to create temp file: %v", err)
 	}
 
 	// Size the file
 	sizeBytes := superblock.MinDeviceSize + int64(dataMB)<<20
 	if err := f.Truncate(sizeBytes); err != nil {
-		f.Close()
-		os.RemoveAll(tmpDir)
+		_ = f.Close()
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("failed to truncate: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	dev, err := storage.Open(filePath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		// If O_DIRECT is not supported, skip the test
 		if os.IsNotExist(err) || os.IsPermission(err) {
 			t.Skip("O_DIRECT not supported on this filesystem")
@@ -56,8 +58,8 @@ func testDevice(t testing.TB, dataMB int) (*storage.Device, func()) {
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.RemoveAll(tmpDir)
+		_ = dev.Close()
+		_ = os.RemoveAll(tmpDir)
 	}
 
 	return dev, cleanup

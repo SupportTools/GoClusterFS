@@ -479,10 +479,10 @@ fusermount3 -u /mnt/cluster
 
 ### Log Output
 
-The mount always logs `[DEBUG]` lines for file operations, lock acquire and release, journal recovery, and broadcast. Capture stderr and filter it:
+With `-debug`, the mount logs `[DEBUG]` lines for file operations, lock acquire and release, and block allocation. Journal recovery and broadcast lines are always logged. Capture stderr and filter it:
 
 ```bash
-./goclusterfs-mount -device /dev/device -mount /mnt/fs 2>&1 | tee mount.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee mount.log
 
 grep "lock.Acquire" mount.log
 grep "\[broadcast\]" mount.log
@@ -491,10 +491,10 @@ grep "\[Recovery\]" mount.log
 
 ### FUSE Request Tracing (Very Verbose)
 
-`-debug` adds a log line for every FUSE request and reply:
+`-fuse-debug` adds a log line for every FUSE request and reply:
 
 ```bash
-./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee fuse.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -fuse-debug 2>&1 | tee fuse.log
 ```
 
 ---

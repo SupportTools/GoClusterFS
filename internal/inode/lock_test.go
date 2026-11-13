@@ -18,9 +18,9 @@ func TestWriteDoesNotHangBehindSameNodeReader(t *testing.T) {
 	lm := lock.NewManager(dev, 8<<20, 1<<20, uuid, 1)
 	table := NewTable(dev, 0, 4<<20, lm, uuid)
 	ctx := context.Background()
-	dir, err := table.Alloc(ctx)
+	dir, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Alloc: %v", err)
+		t.Fatalf("claim: %v", err)
 	}
 	key := uint64(dir.InodeNum)
 

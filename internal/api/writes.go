@@ -128,25 +128,24 @@ func (s *Server) requireToken(w http.ResponseWriter) bool {
 	return true
 }
 
-// beginWrite refuses writes without a token or from another origin, and
-// counts the request so Stop can wait for it.
-func (s *Server) beginWrite(w http.ResponseWriter, r *http.Request) (func(), bool) {
+// beginWrite refuses writes without a token, from another origin, or once
+// the server is stopping.
+func (s *Server) beginWrite(w http.ResponseWriter, r *http.Request) bool {
 	if !s.requireToken(w) {
-		return nil, false
+		return false
 	}
 	if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
 		writeError(w, http.StatusForbidden, "cross-origin writes are refused", "")
-		return nil, false
+		return false
 	}
-	s.mu.Lock()
-	if s.stopping {
-		s.mu.Unlock()
+	s.mu.RLock()
+	stopping := s.stopping
+	s.mu.RUnlock()
+	if stopping {
 		writeError(w, http.StatusServiceUnavailable, "server is shutting down", "")
-		return nil, false
+		return false
 	}
-	s.writes.Add(1)
-	s.mu.Unlock()
-	return s.writes.Done, true
+	return true
 }
 
 func sameOrigin(origin, host string) bool {
@@ -236,11 +235,9 @@ func (s *Server) listSnapshots(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createSnapshot(w http.ResponseWriter, r *http.Request) {
-	done, ok := s.beginWrite(w, r)
-	if !ok {
+	if !s.beginWrite(w, r) {
 		return
 	}
-	defer done()
 	fs := s.fileServiceOrError(w)
 	if fs == nil {
 		return
@@ -260,11 +257,9 @@ func (s *Server) createSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteSnapshot(w http.ResponseWriter, r *http.Request, name string) {
-	done, ok := s.beginWrite(w, r)
-	if !ok {
+	if !s.beginWrite(w, r) {
 		return
 	}
-	defer done()
 	fs := s.fileServiceOrError(w)
 	if fs == nil {
 		return
@@ -281,11 +276,9 @@ func (s *Server) deleteSnapshot(w http.ResponseWriter, r *http.Request, name str
 }
 
 func (s *Server) cloneSnapshot(w http.ResponseWriter, r *http.Request, name string) {
-	done, ok := s.beginWrite(w, r)
-	if !ok {
+	if !s.beginWrite(w, r) {
 		return
 	}
-	defer done()
 	fs := s.fileServiceOrError(w)
 	if fs == nil {
 		return
@@ -314,11 +307,9 @@ func (s *Server) handleClones(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use POST")
 		return
 	}
-	done, ok := s.beginWrite(w, r)
-	if !ok {
+	if !s.beginWrite(w, r) {
 		return
 	}
-	defer done()
 	fs := s.fileServiceOrError(w)
 	if fs == nil {
 		return
@@ -348,11 +339,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use POST")
 		return
 	}
-	done, ok := s.beginWrite(w, r)
-	if !ok {
+	if !s.beginWrite(w, r) {
 		return
 	}
-	defer done()
 	_, as := s.services()
 	if as == nil {
 		writeError(w, http.StatusServiceUnavailable, "admin not available", "no admin service configured")

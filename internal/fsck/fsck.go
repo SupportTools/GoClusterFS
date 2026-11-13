@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/cli"
+	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -246,11 +248,11 @@ func (r *Result) unrepairedErrors() int {
 // Exit codes of goclusterfs-fsck. As with fsck(8), they are bits: a repair
 // that fixed some errors and left others exits 5.
 const (
-	ExitClean       = 0  // no errors (warnings may remain)
-	ExitCorrected   = 1  // errors were repaired
-	ExitUncorrected = 4  // errors remain on disk
-	ExitOperational = 8  // I/O failure, or the check could not finish or was refused
-	ExitUsage       = 16 // usage error
+	ExitClean       = 0               // no errors (warnings may remain)
+	ExitCorrected   = 1               // errors were repaired
+	ExitUncorrected = 4               // errors remain on disk
+	ExitOperational = cli.ExitFailure // I/O failure, or the check could not finish or was refused
+	ExitUsage       = cli.ExitUsage   // usage error
 )
 
 func (r *Result) ExitCode() int {
@@ -509,8 +511,11 @@ func (c *Checker) Check() *Result {
 		}
 
 		c.logf("%s: Starting...\n", p.phase)
+		started, problems := time.Now(), len(c.result.Problems)
+		err := p.fn()
+		logging.Debugf("fsck: %s took %v and found %d problems", p.phase, time.Since(started).Round(time.Millisecond), len(c.result.Problems)-problems)
 
-		if err := p.fn(); err != nil {
+		if err != nil {
 			c.result.AddProblem(Problem{
 				Phase:    p.phase,
 				Severity: Fatal,
@@ -549,7 +554,7 @@ func (c *Checker) Check() *Result {
 // logf writes to output if verbose mode is enabled.
 func (c *Checker) logf(format string, args ...interface{}) {
 	if c.opts.Verbose {
-		fmt.Fprintf(c.opts.Output, format, args...)
+		_, _ = fmt.Fprintf(c.opts.Output, format, args...)
 	}
 }
 
