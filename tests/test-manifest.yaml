@@ -442,6 +442,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  # The Docker and VM harnesses have no per-node mount flags, so they cannot give one node a long -attr-timeout to hold the stale size.
+  - id: multinode-open-refreshes-size
+    name: Open refreshes a size cached during another node's write
+    description: A node stats a file while another node is still writing it; after the write, opening the file on the first node reads all of it
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOpenRefreshesCachedSize
+      docker: TODO
+      vm: TODO
+
   # The Docker and VM harnesses have no per-node mount flags, so they cannot run one node with -attr-timeout=0.
   - id: multinode-attr-timeout-zero
     name: Attribute timeout 0 shows remote size changes

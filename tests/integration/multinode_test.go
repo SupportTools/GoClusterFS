@@ -1256,6 +1256,30 @@ func TestMultiNodeAttrTimeoutZero(t *testing.T) {
 	expectSize(t, reader, name, 20)
 }
 
+// TestMultiNodeOpenRefreshesCachedSize checks close-to-open consistency: a node
+// whose kernel cached a file's size while another node was still writing it
+// reads the whole file when it opens it after the write. A long -attr-timeout
+// keeps the stale size cached until the read.
+func TestMultiNodeOpenRefreshesCachedSize(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false", "-attr-timeout=1m"}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	const name = "growing.bin"
+	want := bytes.Repeat([]byte("n"), 300<<10)
+	writeOrFail(t, writer, name, want[:256<<10], 0)
+	expectSize(t, reader, name, 256<<10)
+	writeOrFail(t, writer, name, want[256<<10:], 256<<10)
+
+	expectContent(t, reader, name, want)
+}
+
 func expectSize(t *testing.T, m *MountedFS, name string, want int64) {
 	t.Helper()
 	fi, err := m.Stat(name)
