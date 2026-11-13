@@ -22,7 +22,9 @@
 //
 // Each type has its own records, laid out in type order, and locks of one type
 // are taken in record order. A goroutine's records then only go up, so waits
-// between nodes cannot form a cycle.
+// between nodes cannot form a cycle, except through records a node adopts to
+// replay a failed node's journal: the replay holds them until it ends and takes
+// its own locks in journal order.
 package lock
 
 import (
@@ -378,6 +380,9 @@ func (m *Manager) LogStats() {
 // Resources that hash to the same record share it: a node holding the record
 // for one resource excludes other nodes from every resource in that record.
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
+	if int(lockType) >= numLockTypes {
+		return fmt.Errorf("lock: unknown lock type %d", lockType)
+	}
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 	recordID := m.hashToRecord(lockType, resourceID)
 	gid := getGoroutineID()

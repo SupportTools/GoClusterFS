@@ -255,7 +255,7 @@ Lock slot reads and writes do not take the device's per-region I/O lock, so a no
 
 **Read locks are not renewed.** A node whose overlapping lookups keep a directory read-locked for more than 15 seconds can lose that lock to another node's writer. Its readers may then see a half-written directory. Two writers still cannot overlap.
 
-**Locks of one type share records.** Each lock type has its own records of the 256: 128 for inodes, 97 for block extents, 16 for inode table sectors, 8 for SFB containers, and one for each other type. Two files' inode locks can map to one record, and a node holding one of them blocks other nodes from both. A lock never waits on a record another type uses. A node takes locks in type order and, within a type, in record order, so two nodes cannot each wait for a record the other holds.
+**Locks of one type share records.** Each lock type has its own records of the 256: 128 for inodes, 97 for block extents, 16 for inode table sectors, 8 for SFB containers, and one for each other type. Two files' inode locks can map to one record, and a node holding one of them blocks other nodes from both. A lock never waits on a record another type uses. A node takes locks in type order and, within a type, in record order, so two nodes cannot each wait for a record the other holds. The exception is a replay of a failed node's journal: the replaying node keeps the failed node's records until the replay ends, so a node that holds a lock the replay needs and waits on one of those records waits until one side gives up after 30 seconds.
 
 **Safe operating limits:**
 
