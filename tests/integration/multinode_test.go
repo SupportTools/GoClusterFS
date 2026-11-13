@@ -4,6 +4,7 @@ package integration
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -1289,7 +1290,74 @@ func expectContent(t *testing.T, m *MountedFS, name string, want []byte) {
 	for i < len(got) && i < len(want) && got[i] == want[i] {
 		i++
 	}
-	t.Errorf("%s: %d bytes, want %d; first difference at offset %d", name, len(got), len(want), i)
+	t.Errorf("%s: %d bytes, want %d; first difference at offset %d%s", name, len(got), len(want), i, byteDiff(got, want, i))
+}
+
+func byteDiff(got, want []byte, i int) string {
+	if i >= len(got) || i >= len(want) {
+		return ""
+	}
+	return fmt.Sprintf(" (got %q, want %q)", got[i], want[i])
+}
+
+// TestMultiNodeNeighborInodeWrites has two nodes write, all at once, files whose
+// inodes share inode table sectors. A file's first write maps its first block in
+// its inode, and every inode write rewrites the whole sector, so no node may put
+// back an older copy of a neighbor's inode and unmap the neighbor's data.
+func TestMultiNodeNeighborInodeWrites(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 300)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+
+	// Each round is 32 chances for a stale sector write to land.
+	const rounds, files, size = 8, 32, 40000
+	name := func(r, i int) string { return fmt.Sprintf("neighbor-%d-%02d", r, i) }
+	data := func(i int) []byte { return bytes.Repeat([]byte{byte('a' + i%26)}, size) }
+	for r := 0; r < rounds; r++ {
+		for i := 0; i < files; i++ {
+			writeOrFail(t, cluster.Node(0), name(r, i), nil, 0)
+		}
+		for i := 1; i < files; i++ {
+			if got, prev := inodeNumber(t, cluster.Node(0), name(r, i)), inodeNumber(t, cluster.Node(0), name(r, i-1)); got != prev+1 {
+				t.Fatalf("%s has inode %d, want %d right after %s", name(r, i), got, prev+1, name(r, i-1))
+			}
+		}
+
+		// Each node writes every other file, all of them at once.
+		errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+			var wg sync.WaitGroup
+			errs := make([]error, files)
+			for i := idx; i < files; i += 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					errs[i] = node.WriteFile(name(r, i), data(i))
+				}()
+			}
+			wg.Wait()
+			return errors.Join(errs...)
+		})
+		for idx, err := range errs {
+			if err != nil {
+				t.Fatalf("Node %d: %v", idx, err)
+			}
+		}
+	}
+
+	// Wait out the 5s inode cache, so each node reads inodes from disk; a writer
+	// that kept its own newer copy cached would hide a lost update.
+	time.Sleep(6 * time.Second)
+	for idx := 0; idx < 2; idx++ {
+		for r := 0; r < rounds; r++ {
+			for i := 0; i < files; i++ {
+				expectContent(t, cluster.Node(idx), name(r, i), data(i))
+			}
+		}
+	}
 }
 
 // TestNetworkPartition simulates network partition handling by testing node isolation
