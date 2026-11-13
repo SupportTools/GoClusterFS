@@ -29,10 +29,6 @@ type Config struct {
 	// CheckpointInterval is how often to checkpoint completed transactions.
 	// Default: 5 seconds
 	CheckpointInterval time.Duration
-
-	// FullThreshold triggers forced checkpoint when journal is this % full.
-	// Default: 75%
-	FullThreshold int
 }
 
 // CommitMode controls journal sync behavior.
@@ -81,7 +77,6 @@ func DefaultConfig() Config {
 		CommitMode:         CommitSync,
 		BatchConfig:        DefaultBatchConfig(),
 		CheckpointInterval: 5 * time.Second,
-		FullThreshold:      75,
 	}
 }
 
@@ -195,24 +190,21 @@ func (j *Journal) Stop() error {
 		close(j.checkpointStop)
 		j.checkpointWg.Wait()
 
-		// Mark journal clean on orderly shutdown
 		j.mu.Lock()
 		defer j.mu.Unlock()
 
-		// Leave the journal dirty so the next mount replays what may not have synced.
-		if flushErr != nil {
-			stopErr = fmt.Errorf("failed to flush batched commits: %w", flushErr)
-			return
-		}
-
-		if len(j.activeTxns) == 0 && len(j.pendingIntents) == 0 {
+		var cleanErr error
+		switch {
+		case flushErr != nil:
+			// Leave the journal dirty so the next mount replays what may not have synced.
+			cleanErr = fmt.Errorf("failed to flush batched commits: %w", flushErr)
+		case len(j.activeTxns) == 0 && len(j.pendingIntents) == 0:
+			// Mark journal clean on orderly shutdown
 			if err := j.region.MarkClean(); err != nil {
-				stopErr = fmt.Errorf("failed to mark journal clean: %w", err)
-				return
+				cleanErr = fmt.Errorf("failed to mark journal clean: %w", err)
 			}
 		}
-
-		stopErr = j.region.Close()
+		stopErr = errors.Join(cleanErr, j.region.Close())
 	})
 	return stopErr
 }

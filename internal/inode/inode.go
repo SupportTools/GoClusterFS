@@ -209,14 +209,24 @@ func (t *Table) Read(inodeNum uint32) (*Inode, error) {
 // Write writes an inode to disk.
 // The inode must have a valid InodeNum set.
 func (t *Table) Write(ctx context.Context, inode *Inode) error {
-	committed, err := t.lockedWrite(ctx, inode)
+	committed, err := t.lockedWrite(ctx, inode, nil)
 	if committed != nil {
 		committed()
 	}
 	return err
 }
 
-func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
+// WriteIfUnchanged is Write for an inode read at MetaGeneration gen. If another
+// write landed since, it writes nothing and returns ErrTreeConflict.
+func (t *Table) WriteIfUnchanged(ctx context.Context, inode *Inode, gen uint64) error {
+	committed, err := t.lockedWrite(ctx, inode, &gen)
+	if committed != nil {
+		committed()
+	}
+	return err
+}
+
+func (t *Table) lockedWrite(ctx context.Context, inode *Inode, wantGen *uint64) (func(), error) {
 	if uint64(inode.InodeNum) >= t.totalInodes {
 		return nil, ErrInodeOutOfRange
 	}
@@ -237,6 +247,15 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if wantGen != nil {
+		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
+		if err != nil {
+			return nil, err
+		}
+		if onDisk.MetaGeneration != *wantGen {
+			return nil, fmt.Errorf("%w: inode %d was written since it was read", ErrTreeConflict, inode.InodeNum)
+		}
+	}
 	return t.writeWithTree(inode)
 }
 
@@ -547,6 +566,47 @@ func (t *Table) FreeIf(ctx context.Context, inodeNum uint32, ok func(*Inode) boo
 		return false, err
 	}
 	return true, nil
+}
+
+// UpdateIf reads an inode under its lock and, if update accepts it, writes back
+// the changes update made before the lock is released. It returns the inode as
+// update left it and whether it was written. Blocks the write releases are
+// freed after the lock is dropped.
+func (t *Table) UpdateIf(ctx context.Context, inodeNum uint32, update func(*Inode) (bool, error)) (*Inode, bool, error) {
+	if uint64(inodeNum) >= t.totalInodes {
+		return nil, false, ErrInodeOutOfRange
+	}
+	committed, inode, written, err := t.updateIfLocked(ctx, inodeNum, update)
+	if committed != nil {
+		committed()
+	}
+	return inode, written, err
+}
+
+func (t *Table) updateIfLocked(ctx context.Context, inodeNum uint32, update func(*Inode) (bool, error)) (func(), *Inode, bool, error) {
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inodeNum), lock.LockModeExclusive); err != nil {
+			return nil, nil, false, fmt.Errorf("failed to acquire inode lock: %w", err)
+		}
+		defer t.unlock(lock.LockTypeInode, uint64(inodeNum))
+	}
+	inode, err := t.Read(inodeNum)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if ok, err := update(inode); err != nil || !ok {
+		return nil, inode, false, err
+	}
+	unlockSector, err := t.lockSector(inodeNum)
+	if err != nil {
+		return nil, inode, false, err
+	}
+	defer unlockSector()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	committed, err := t.writeWithTree(inode)
+	return committed, inode, err == nil, err
 }
 
 // TotalInodes returns the total number of inodes in the table.

@@ -442,6 +442,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  # The Docker and VM harnesses have no per-node mount flags, so they cannot give one node a long -attr-timeout to hold the stale size.
+  - id: multinode-open-refreshes-size
+    name: Open refreshes a size cached during another node's write
+    description: A node stats a file while another node is still writing it; after the write, opening the file on the first node reads all of it
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOpenRefreshesCachedSize
+      docker: TODO
+      vm: TODO
+
   # The Docker and VM harnesses have no per-node mount flags, so they cannot run one node with -attr-timeout=0.
   - id: multinode-attr-timeout-zero
     name: Attribute timeout 0 shows remote size changes
@@ -763,6 +773,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/journal_test.go::TestBatchCommitReturnsSyncError
+
+  - id: journal-stop-failed-flush
+    name: Stop reports a failed final flush
+    description: Journal Stop returns the error of a final batch flush that failed, the waiting commit gets it too, and a second Stop does nothing
+    priority: go_only
+    environments:
+      go: internal/journal/journal_test.go::TestStopReportsFailedBatchFlush
 
   - id: checkpoint-keeps-incomplete-intents
     name: Checkpoints never pass an intent that has not completed
@@ -2143,6 +2160,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/interrupt_test.go::TestClaimErrno
 
+  - id: alloc-stuck-bitmap-lock-eio
+    name: Block allocation fails with EIO when the bitmap lock is never freed
+    description: A write and a fallocate that need new blocks while the bitmap lock stays held on another node past lock.DefaultTimeout fail with EIO, not ENOSPC
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestAllocationReportsStuckBitmapLockAsEIO
+
+  - id: alloc-errno
+    name: Block allocation failures map to the right errno
+    description: An empty bitmap or full backing storage is ENOSPC; a bitmap lock timeout, checksum or read error is EIO
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/interrupt_test.go::TestAllocErrno
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself
@@ -2502,6 +2533,13 @@ scenarios:
     environments:
       go: internal/snapshot/worker_test.go::TestDeleteJobRequiresDeletingState
 
+  - id: snapshot-second-delete-job-reused-inode
+    name: A second delete job leaves a reused data inode alone
+    description: Two delete jobs run for one snapshot; the first frees the data inode and a new file or snapshot takes the slot before the second releases data. The second job leaves the new inode and its block counts intact and succeeds
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestSecondDeleteJobLeavesReusedDataInode
+
   - id: snapshot-failed-write-releases-once
     name: Failed write after a mid-write copy commit
     description: When the final inode write fails after a mid-write persist committed one copied block, each old block loses the file's ownership once across the retry, and uncounted blocks from an older version lose none
@@ -2694,6 +2732,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsConcurrentInPlaceWrite
+
+  - id: snapshot-mark-keeps-concurrent-append
+    name: Snapshot mark keeps another node's append
+    description: Node A appends in place while node B's snapshot marks the file shared; the mark holds the inode lock from its read to its write, so A's new size survives and the snapshot keeps the file from before the append
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotMarkKeepsConcurrentAppend
+
+  - id: deep-clone-chain-two-node-deletes
+    name: Deep clone chain deleted from two nodes
+    description: A chain of 9 files, each a clone of the one before and written at every level, is deleted in random order from two nodes, first one at a time with writes to survivors, then concurrently; every file keeps its content until deleted, every block is freed, no refcount stays above 0, and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/clone_chain_test.go::TestDeepCloneChainDeletedFromTwoNodes
 
   - id: failed-write-frees-unused-copy
     name: A failed write gives back its unused copy
@@ -3104,6 +3156,41 @@ scenarios:
     environments:
       go: internal/node/registry_test.go::TestRegisterReportsPreviousOwnerOfAnyTakenSlot
 
+  - id: storage-write-gate-refuses-writes
+    name: Device write gate refuses writes
+    description: A write the gate refuses fails with the gate's error and does not reach the device
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestWriteGateRefusesWrites
+
+  - id: trim-discard-refused-by-write-gate
+    name: Discard refused by the write gate
+    description: A queued discard does not run when the device's write gate refuses it
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestDiscardRefusedByWriteGate
+
+  - id: registry-check-ownership-after-pause
+    name: Ownership check after a pause writes a heartbeat
+    description: When the last heartbeat is old, CheckOwnership writes a heartbeat and passes while the slot is still the node's
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestCheckOwnershipWritesHeartbeatAfterPause
+
+  - id: registry-check-ownership-after-takeover
+    name: Ownership check fails once the slot is taken over
+    description: Once peers marked the slot dead, CheckOwnership returns ErrSlotLost and calls the slot-lost handler once
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestCheckOwnershipFailsOnceSlotIsTakenOver
+
+  - id: registry-write-gate-after-takeover
+    name: Write gate refuses data writes once the slot is lost
+    description: With the registry's write gate on the device, a node whose slot was marked dead while it was paused cannot write outside the registry, and the write does not reach the device
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestWriteGateRefusesWritesOnceSlotIsLost
+
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
     description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old
@@ -3479,6 +3566,120 @@ scenarios:
     priority: go_only
     environments:
       go: internal/api/prometheus_test.go::TestMetricsEndpoint_ExportsCapacity
+
+  - id: api-health-signal-shutdown
+    name: /health checks and SIGTERM shutdown
+    description: A live mount reports device, journal, recovery and broadcast checks on /health. SIGTERM with a file open under the mount stops the API, reports the busy unmount and keeps the mount; a second SIGTERM after the file is closed unmounts, exits 0 and leaves a clean fsck
+    priority: high
+    environments:
+      go: shutdown_test.go::TestHealthAndSignalShutdown
+      docker: TODO - same reason as api-health-loopback
+      vm: TODO - same reason as api-health-loopback
+
+  - id: commands-share-exit-codes
+    name: mount, fsck and gfsctl share exit codes
+    description: The three binaries exit 0 after -h, 16 on a bad flag or missing argument, and 8 when the device, mount point or API cannot be reached, and say what to do next
+    priority: go_only
+    environments:
+      go: shutdown_test.go::TestCommandsShareExitCodes
+
+  - id: api-stop-waits-for-requests
+    name: API Stop lets requests in flight finish
+    description: Stop closes the listener at once, waits for a request in flight, and leaves no server goroutines
+    priority: go_only
+    environments:
+      go: internal/api/lifecycle_test.go::TestStopLetsRequestsInFlightFinish
+
+  - id: api-stop-cancels-after-timeout
+    name: API Stop cancels requests after the shutdown timeout
+    description: A request that outlasts ShutdownTimeout has its context cancelled, Stop returns ErrShutdownTimeout only after the handler returns, and no server goroutines are left
+    priority: go_only
+    environments:
+      go: internal/api/lifecycle_test.go::TestStopCancelsRequestsThatOutlastTheTimeout
+
+  - id: api-stop-idle
+    name: API Stop on an idle server
+    description: Stop is idempotent, refuses new connections and leaves no server goroutines
+    priority: go_only
+    environments:
+      go: internal/api/lifecycle_test.go::TestStopIdleServer
+
+  - id: mount-health-degraded-vs-down
+    name: /health separates degraded from down
+    description: A peer journal replay or broadcast trouble reports degraded with 200; a failing device or corrupt journal reports unhealthy with 503; -journal=false and -broadcast=false stay ok
+    priority: go_only
+    environments:
+      go: cmd/mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+
+  - id: storage-last-error
+    name: Device remembers its last I/O failure
+    description: LastError holds the latest failed read, write or sync until one succeeds, and ignores EOF
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestLastErrorHoldsTheLatestFailureUntilASuccess
+
+  - id: node-replaying-slots
+    name: Registry lists the journals it replays
+    description: Replaying lists a slot while its recovery handler runs and drops it afterwards, even when the replay fails
+    priority: go_only
+    environments:
+      go: internal/node/replaying_test.go::TestReplayingListsSlotsWhileTheirHandlerRuns
+
+  - id: broadcast-problem
+    name: Broadcast reports why peers miss invalidations
+    description: Problem names a stopped transport, a failed send, and missing multicast without unicast peers, and is empty when broadcast is off or working
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/problem_test.go::TestProblemSaysWhyPeersMissInvalidations
+
+  - id: cli-parse-flags
+    name: Shared flag parsing exit codes
+    description: -h exits 0 and a bad flag or value exits 16; -debug and --debug both parse
+    priority: go_only
+    environments:
+      go: internal/cli/cli_test.go::TestParseFlagsExitCodes
+
+  - id: logging-debug-switch
+    name: Debug lines only with -debug
+    description: Debugf prints [DEBUG] lines only after SetDebug(true)
+    priority: go_only
+    environments:
+      go: internal/logging/logging_test.go::TestDebugfPrintsOnlyWhenOn
+
+  - id: gfsctl-exit-codes
+    name: gfsctl exit codes and hints
+    description: health exits 0, 1 or 4 for ok, degraded and unhealthy (decoding the 503 body), API and connection errors exit 8 with a hint, usage errors exit 16 with a --help hint
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/errors_test.go::TestExitCodesAndHints
+
+  - id: gfsctl-debug
+    name: gfsctl --debug logs requests
+    description: --debug logs each API request with its status; without it nothing is logged
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/errors_test.go::TestDebugLogsEachRequest
+
+  - id: dir-setattr-keeps-mkdir
+    name: Directory chmod keeps another node's mkdir
+    description: Node A changes a directory's mode while node B makes a directory in it; the link count and mtime from node B survive
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/setattr_race_test.go::TestDirSetattrKeepsOtherNodesMkdir
+
+  - id: file-setattr-keeps-size
+    name: File chmod keeps another node's size
+    description: Node A changes a file's mode while node B appends inside the file's allocated block; node B's size and data survive
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/setattr_race_test.go::TestFileSetattrKeepsOtherNodesSize
+
+  - id: logging-no-ungated-debug
+    name: No [DEBUG] line bypasses -debug
+    description: No non-test Go file calls log.Printf or log.Println with a [DEBUG] prefix; they go through logging.Debugf
+    priority: go_only
+    environments:
+      go: internal/logging/guard_test.go::TestDebugLinesGoThroughDebugf
 
   - id: shutdown-slow-step-logged
     name: Slow shutdown step is logged

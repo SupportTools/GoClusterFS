@@ -1,12 +1,15 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -727,6 +730,7 @@ func TestRegisterYieldsSlotToRacingWriter(t *testing.T) {
 	defer cleanup()
 
 	reg := NewRegistry(dev, 0)
+	own := reg.localUUID
 	result := make(chan int, 1)
 	go func() {
 		slot, err := reg.Register(context.Background(), "slow")
@@ -736,7 +740,16 @@ func TestRegisterYieldsSlotToRacingWriter(t *testing.T) {
 		result <- slot
 	}()
 
-	time.Sleep(claimSettle / 3)
+	// Overwrite only once Register's claim is on disk, inside its settle window, as a racing node's write would land.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if slot, err := reg.readSlot(0); err == nil && slot.UUID == own {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Register never claimed slot 0")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	racer := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}
 	if err := reg.writeSlot(0, racer); err != nil {
 		t.Fatal(err)
@@ -1321,5 +1334,103 @@ func TestFailedReplayKeepsDeadNodesLocks(t *testing.T) {
 	}
 	if slot.State != NodeStateDead || slot.UUID != ([16]byte{3}) {
 		t.Errorf("after a failed replay slot 2 is %s with node %x; want it still dead with the failed node", slot.State, slot.UUID[:1])
+	}
+}
+
+func TestCheckOwnershipWritesHeartbeatAfterPause(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.CheckOwnership(); err != nil {
+		t.Fatalf("right after Register: %v", err)
+	}
+
+	paused := time.Now().Add(-HeartbeatTimeout)
+	reg.lastBeat.Store(&paused)
+	before, err := reg.readSlot(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	err = reg.CheckOwnership()
+	log.SetOutput(os.Stderr)
+	if err != nil {
+		t.Fatalf("slot still ours after a pause: %v", err)
+	}
+	if !strings.Contains(logs.String(), "checking the slot before a write") {
+		t.Errorf("the check after a pause logged nothing:\n%s", logs.String())
+	}
+	after, err := reg.readSlot(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.HeartbeatSeq <= before.HeartbeatSeq {
+		t.Errorf("heartbeat %d after the check, want it past %d", after.HeartbeatSeq, before.HeartbeatSeq)
+	}
+}
+
+func TestCheckOwnershipFailsOnceSlotIsTakenOver(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lost []string
+	reg.SetSlotLostHandler(func(slot int, owner [16]byte) { lost = append(lost, fmt.Sprintf("%d %x", slot, owner[:1])) })
+
+	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: reg.LocalUUID(), RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.CheckOwnership(); err != nil {
+		t.Fatalf("with a recent heartbeat the check needs no read: %v", err)
+	}
+	paused := time.Now().Add(-HeartbeatTimeout)
+	reg.lastBeat.Store(&paused)
+	for range 2 {
+		if err := reg.CheckOwnership(); !errors.Is(err, ErrSlotLost) {
+			t.Fatalf("after peers marked the slot dead: %v, want ErrSlotLost", err)
+		}
+	}
+	uuid := reg.LocalUUID()
+	if want := []string{fmt.Sprintf("%d %x", slot, uuid[:1])}; fmt.Sprint(lost) != fmt.Sprint(want) {
+		t.Errorf("slot-lost handler calls %v, want %v", lost, want)
+	}
+}
+
+func TestWriteGateRefusesWritesOnceSlotIsLost(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	slot, err := reg.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev.SetWriteGate(reg.WriteGate)
+	data := storage.NewAlignedBuffer(storage.SectorSize)
+	copy(data.Bytes(), bytes.Repeat([]byte{'x'}, storage.SectorSize))
+	if _, err := dev.WriteAt(data.Bytes(), 1<<20); err != nil {
+		t.Fatalf("write while the slot is ours: %v", err)
+	}
+
+	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: reg.LocalUUID(), RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Unix()}); err != nil {
+		t.Fatalf("a registry write must pass the gate: %v", err)
+	}
+	paused := time.Now().Add(-HeartbeatTimeout)
+	reg.lastBeat.Store(&paused)
+	if _, err := dev.WriteAt(data.Bytes(), 2<<20); !errors.Is(err, ErrSlotLost) {
+		t.Fatalf("write after peers marked the slot dead: %v, want ErrSlotLost", err)
+	}
+	if _, err := dev.ReadAt(data.Bytes(), 2<<20); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data.Bytes(), make([]byte, storage.SectorSize)) {
+		t.Error("the refused write reached the device")
 	}
 }

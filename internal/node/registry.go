@@ -14,8 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"math/bits"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -116,10 +119,18 @@ type Registry struct {
 	seenMu sync.Mutex
 	seen   map[int]*Slot
 
+	// lastBeat is when this node last wrote its own slot; beatSeq is its last heartbeat number.
+	lastBeat atomic.Pointer[time.Time]
+	beatSeq  uint64
+	// lost is set once this node's slot was taken over or its heartbeats failed.
+	lost  atomic.Bool
+	ownMu sync.Mutex
+
 	// Cross-node recovery
 	recoveryHandler      RecoveryHandler
 	failureCheckInterval time.Duration // How often to scan for failed nodes
 	recoveryInProgress   map[int]bool  // Slots currently being recovered
+	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 }
 
 // Errors
@@ -130,6 +141,7 @@ var (
 	ErrInvalidSlot        = errors.New("invalid slot data")
 	ErrRecoveryInProgress = errors.New("recovery already in progress for this node")
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
+	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
 )
 
 // FailedNodeInfo contains information about a failed node for recovery.
@@ -307,6 +319,9 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 			return -1, err
 		}
 		r.localSlot = i
+		r.beatSeq = 1
+		now := time.Now()
+		r.lastBeat.Store(&now)
 		if slot.State != NodeStateEmpty {
 			r.previousOwner = &slot.UUID
 		}
@@ -428,49 +443,101 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 	ticker := time.NewTicker(HeartbeatInterval)
 	defer ticker.Stop()
 
-	seq := uint64(1)
-	lost := false
-	lastBeat := time.Now()
-
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		case <-ticker.C:
-			r.mu.Lock()
-			slot, err := r.readSlot(slotIdx)
-			ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
-			takenOver := err == nil && !ours
-			if ours {
-				slot.HeartbeatSeq = seq
-				slot.HeartbeatTime = time.Now().Unix()
-				if r.writeSlot(slotIdx, slot) == nil {
-					lastBeat = time.Now()
-				}
-				seq++
-			}
-			onSlotLost := r.onSlotLost
-			r.mu.Unlock()
-
-			// Peers prove a silent node dead and take its locks; a node that cannot heartbeat must stop.
-			failing := time.Since(lastBeat) > HeartbeatTimeout/2
-			if (takenOver || failing) && !lost {
-				lost = true
-				owner := r.localUUID
-				if takenOver {
-					owner = slot.UUID
-				} else {
-					log.Printf("ERROR: heartbeats to node registry slot %d have failed for %v", slotIdx, time.Since(lastBeat))
-				}
-				if onSlotLost != nil {
-					onSlotLost(slotIdx, owner)
-				} else {
-					log.Printf("ERROR: node registry slot %d is no longer this node's (owner %x); "+
-						"this node no longer owns its journal region", slotIdx, owner[:8])
-				}
-			}
+			_ = r.beat(slotIdx)
 		}
 	}
+}
+
+// beat writes a heartbeat while slotIdx is still this node's. Peers prove a
+// silent node dead and take its locks, so a node whose slot was taken over, or
+// whose heartbeats have failed for HeartbeatTimeout/2, must stop: beat tells the
+// slot-lost handler once and returns ErrSlotLost.
+func (r *Registry) beat(slotIdx int) error {
+	r.mu.Lock()
+	slot, err := r.readSlot(slotIdx)
+	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
+	takenOver := err == nil && !ours
+	if ours {
+		r.beatSeq++
+		slot.HeartbeatSeq = r.beatSeq
+		slot.HeartbeatTime = time.Now().Unix()
+		if r.writeSlot(slotIdx, slot) == nil {
+			now := time.Now()
+			r.lastBeat.Store(&now)
+		}
+	}
+	onSlotLost := r.onSlotLost
+	r.mu.Unlock()
+
+	sinceBeat := r.sinceLastBeat()
+	if !takenOver && sinceBeat <= HeartbeatTimeout/2 {
+		return nil
+	}
+	if r.lost.CompareAndSwap(false, true) {
+		owner := r.localUUID
+		if takenOver {
+			owner = slot.UUID
+		} else {
+			log.Printf("ERROR: heartbeats to node registry slot %d have failed for %v", slotIdx, sinceBeat.Round(time.Millisecond))
+		}
+		if onSlotLost != nil {
+			onSlotLost(slotIdx, owner)
+		} else {
+			log.Printf("ERROR: node registry slot %d is no longer this node's (owner %x); "+
+				"this node no longer owns its journal region", slotIdx, owner[:8])
+		}
+	}
+	return ErrSlotLost
+}
+
+// CheckOwnership returns nil while this node still owns its registry slot and
+// ErrSlotLost once it may not, so a node that stalled past its failover stops
+// writing. A heartbeat written within HeartbeatTimeout/2 proves ownership
+// without I/O, because peers declare a node dead only after 2*HeartbeatTimeout
+// of silence. Otherwise it writes a heartbeat first, as the heartbeat loop would.
+func (r *Registry) CheckOwnership() error {
+	if r.lost.Load() {
+		return ErrSlotLost
+	}
+	if r.sinceLastBeat() < HeartbeatTimeout/2 {
+		return nil
+	}
+	r.ownMu.Lock()
+	defer r.ownMu.Unlock()
+	if r.sinceLastBeat() < HeartbeatTimeout/2 {
+		return nil
+	}
+	r.mu.RLock()
+	slotIdx := r.localSlot
+	r.mu.RUnlock()
+	if slotIdx < 0 {
+		return ErrNotRegistered
+	}
+	log.Printf("[WARN] node: the last heartbeat to registry slot %d was %v ago; checking the slot before a write",
+		slotIdx, r.sinceLastBeat().Round(time.Millisecond))
+	return r.beat(slotIdx)
+}
+
+// WriteGate is a device write gate: it passes writes to the registry, which
+// the heartbeat itself must make, and checks ownership before any other write.
+func (r *Registry) WriteGate(offset int64) error {
+	if offset >= int64(r.offset) && offset < int64(r.offset)+MaxNodes*SlotSize {
+		return nil
+	}
+	return r.CheckOwnership()
+}
+
+func (r *Registry) sinceLastBeat() time.Duration {
+	t := r.lastBeat.Load()
+	if t == nil {
+		return math.MaxInt64
+	}
+	return max(time.Since(*t), time.Now().Round(0).Sub(t.Round(0)))
 }
 
 // claimSlot replaces the slot bytes Register judged claimable with this node's
@@ -794,7 +861,7 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			continue // Another node beat us to it
 		}
 		done := r.ownerDead(info.UUID, i)
-		err = handler(info)
+		err = r.replay(handler, i, info)
 		done(err == nil)
 		if err != nil {
 			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v",
@@ -992,6 +1059,22 @@ func (r *Registry) GetFailedNodes() ([]*FailedNodeInfo, error) {
 	return failed, nil
 }
 
+func (r *Registry) replay(handler RecoveryHandler, slotIdx int, info *FailedNodeInfo) error {
+	bit := uint64(1) << slotIdx
+	r.replaying.Or(bit)
+	defer r.replaying.And(^bit)
+	return handler(info)
+}
+
+// Replaying returns the slots whose journal this node is replaying now.
+func (r *Registry) Replaying() []int {
+	var slots []int
+	for mask := r.replaying.Load(); mask != 0; mask &= mask - 1 {
+		slots = append(slots, bits.TrailingZeros64(mask))
+	}
+	return slots
+}
+
 // RecoverFailedNode manually triggers recovery for a specific node.
 // Returns error if the node is not in a failed state or recovery fails.
 func (r *Registry) RecoverFailedNode(slotIdx int) error {
@@ -1033,7 +1116,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 		return err
 	}
 
-	if err := handler(info); err != nil {
+	if err := r.replay(handler, slotIdx, info); err != nil {
 		return fmt.Errorf("recovery handler failed: %w", err)
 	}
 

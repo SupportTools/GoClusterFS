@@ -16,7 +16,9 @@ This guide covers day-to-day operations for managing GoClusterFS deployments.
 
 ## Monitoring
 
-GoClusterFS has no metrics endpoint. `goclusterfs-mount` writes its log to stderr, so capture it (see [Background Mount](#background-mount-with-logging) or the systemd unit in the [Deployment Guide](DEPLOYMENT.md#systemd-service-single-node)). The log also has many `[DEBUG]` lines, which are always on.
+Each mount serves its counters over the HTTP API on `127.0.0.1:8080`: Prometheus metrics at `/metrics`, and JSON under `/api/v1/status` and `/api/v1/stats/...`. [HTTP API Statistics](API-CONFIG.md#http-api-statistics) lists them. `gfsctl status`, `gfsctl stats` and the web dashboard at `/ui/` read the same data. The counters cover this node only and start at zero when it mounts. `/health` says whether the mount is ok, degraded or unhealthy; see [HTTP API Health and Shutdown](API-CONFIG.md#http-api-health-and-shutdown).
+
+`goclusterfs-mount` also writes a log to stderr, so capture it (see [Background Mount](#background-mount-with-logging) or the systemd unit in the [Deployment Guide](DEPLOYMENT.md#systemd-service-single-node)). With `-debug`, the log also has `[DEBUG]` lines.
 
 ### Totals at Unmount
 
@@ -29,21 +31,28 @@ Cache stats: inodes=... (hit=...%), extents=... (hit=...%)
 Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 ```
 
-The cache hit percentages are wrong today and can read far above 100%, so don't tune by them. Cache sizes are fixed in code (10,000 inodes, 50,000 extents). Only the TTL and strict mode have flags; see [Cache Tuning](#cache-tuning).
+Cache sizes are fixed in code (10,000 inodes, 50,000 extents). Only the TTL and strict mode have flags; see [Cache Tuning](#cache-tuning).
 
 ### Log Lines to Watch
 
 | Log line | Meaning |
 |----------|---------|
-| `Journal recovery: replayed N committed transactions` | This node replayed a journal left in its slot by a crashed mount. Normal after a crash. |
+| `Journal recovery: replayed N committed transactions` | This node replayed a journal left in its slot by a crashed mount. Normal after a crash. When the slot's journal was clean there is no recovery line, only `Journal: initialized` and `Journal: started`. |
+| `[WARN] Journal recovery for slot N is waiting for another node's lock` | The replay waits for a lock another node holds and retries every 1 to 30 seconds, with no limit. The line names the holder. |
 | `Journal recovery for slot N failed` | The mount stops. See [Damaged Journal Slot](#damaged-journal-slot). |
+| `Journal: WARNING - discarding the journal of slot N (-skip-recovery)` | `-skip-recovery=N` threw away this slot's journal. Run fsck after unmounting every node. |
+| `Journal: ignoring -skip-recovery=N` | The mount took a different slot, so it replayed that slot's journal and discarded nothing. |
+| `Journal: disabled (no crash consistency guarantees)` | `-journal=false`. This node also skipped replaying its slot's journal. |
 | `[Recovery] Replaying slot N (node ...) failed` | Another node's journal cannot be replayed. See [Damaged Journal Slot](#damaged-journal-slot). |
 | `ERROR: heartbeats to node registry slot N have failed` | This node cannot write the device. It stops. |
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
-| `Warning: Failed to start cache broadcast` | The mount runs without broadcast. Other nodes' changes show up after `-cache-ttl` instead of right away. |
+| `Failed to start cache broadcast: ...` | The mount stops before it touches the device. See [Mount Fails: "Failed to start cache broadcast"](TROUBLESHOOTING.md#mount-fails-failed-to-start-cache-broadcast). |
+| `Warning: Failed to start API server` | The API port is taken. The mount runs without the API, `/metrics`, `gfsctl` and the dashboard. |
 | `[broadcast] missed N messages from ...` | This node lost broadcast messages, usually because its receive buffer filled during a burst of changes on another node. It dropped all cached inodes and extents and rereads them from the device. Logged at most every 10 seconds. If it repeats, raise `net.core.rmem_max` to at least 1 MB (`sysctl -w net.core.rmem_max=1048576`) and remount. |
 | `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
-| `[WARN] lock: gave up waiting for ...` | A lock wait gave up after 30 seconds (`DefaultTimeout`), or a background task was stopped at unmount. The line names the node that holds the lock. A file operation that was waiting fails with EIO. See [Interrupted File Operations](#interrupted-file-operations). |
+| `[WARN] lock: ... which holds it and is failing or being recovered` | A lock wait for a failed node. It repeats every 30 seconds and ends when that node's journal replay ends. |
+| `[WARN] lock: gave up waiting for ...` | A lock wait gave up: after 30 seconds (`DefaultTimeout`) on a live holder, after 30 seconds on a failed holder while the operation held another lock, at once when the holder's replay failed, or because a background task stopped at unmount. The line names the holder. A file operation that was waiting fails with EIO; during block allocation it fails with ENOSPC. See [Distributed Lock Limits](#distributed-lock-limits). |
+| `[WARN] lock: this node has held record N for ...` | This node has held a lock for over 60 seconds. Other nodes wait for it until it is released. |
 
 ### Journal
 
@@ -104,6 +113,22 @@ fusermount3 -u /mnt/fs
 
 A mount that was killed leaves its journal for the next mount on the same host to replay.
 
+#### What Happens at Shutdown
+
+`fusermount3 -u`, `SIGINT` (Ctrl+C) and `SIGTERM` (`kill`, or `systemctl stop` without an `ExecStop`) all shut down cleanly. On a signal the mount:
+
+1. Logs `Received signal, unmounting...` and stops the HTTP API. Requests in flight get 10 seconds, then are cancelled; snapshot, clone and admin requests that have started run to the end.
+2. Unmounts. If the mount point is busy, the unmount fails, the log says so, and the process keeps running without its API. Close the open files, then send the signal again or run `fusermount3 -u`.
+3. Stops its heartbeat and failure detection, after a replay of another node's journal in progress ends.
+4. Stops the snapshot worker, flushes queued TRIM, stops the journal (marking it clean only if nothing is pending), and releases the lock records it keeps.
+5. Stops broadcast.
+
+It then logs the totals and `Filesystem unmounted.`, and exits 0, or 8 when closing the filesystem failed. After `fusermount3 -u`, steps 1, 3, 4 and 5 run once the unmount is done.
+
+- An open file or a file operation still running makes the unmount fail, so stop applications first.
+- A signal after a failed unmount tries again; once the unmount is done, further signals are ignored. `kill -9` stops the process at once and leaves its journal for the next mount to replay.
+- The node's registry slot stays marked active after a clean unmount. A remount on the same host takes it back at once. Otherwise a running node clears it about 20 seconds later, and `goclusterfs-fsck -repair` waits up to 11 seconds before it trusts that no node is mounted.
+
 ### Running fsck
 
 #### When to Run fsck
@@ -163,7 +188,7 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 ### Known Gaps in Slot Ownership
 
 - Slot claims use a read-compare-write on the device, then re-read the slot after 100 ms. Two nodes can still both keep a slot if one node's write lands more than 100 ms after its read, for example during a storage stall.
-- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to a new mount, which can take its slot and replay and reset its journal. Running nodes wait until it is proven dead (about 20 seconds, see above). The paused node exits on its next heartbeat after it resumes, up to 1 second later, and can write to the journal region in that second.
+- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to a new mount, which can take its slot and replay and reset its journal. Running nodes wait until it is proven dead (about 20 seconds, see above). When the paused node resumes, it refuses further writes and exits, but writes it started before the pause can still land.
 - A restarted container comes back in a new PID namespace, so its mount cannot prove by PID that the previous incarnation exited. It waits up to about 12 seconds for the old slot's heartbeat to go stale, then replays that journal before serving.
 
 ### Adding a New Node
@@ -174,7 +199,9 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
    apt-get install fuse3
 
    # Copy the binaries; use the same version as the other nodes
-   scp goclusterfs-mount goclusterfs-fsck node3:/usr/local/bin/
+   scp goclusterfs-mount goclusterfs-fsck gfsctl node3:/usr/local/bin/
+
+   # Open UDP 31337 and 31338 to the other nodes (see the Deployment Guide's firewall rules)
    ```
 
 2. **Configure shared storage**:
@@ -196,7 +223,10 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 4. **Verify cluster membership**:
    ```bash
    # Check broadcast communication
-   tcpdump -i eth0 udp port 31337
+   tcpdump -i eth0 udp port 31337 or udp port 31338
+
+   # Check that the node registered
+   gfsctl stats cluster
 
    # Test cross-node file access
    echo "test from new node" > /mnt/cluster/node3_test.txt
@@ -227,7 +257,7 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 
 ### Interrupted File Operations
 
-GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait that cannot finish fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock and the node that holds it.
+GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait for a live holder fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock and the node that holds it. A wait for a failed node lasts until its journal replay ends, about 35 seconds after a crash on another host; see [Distributed Lock Limits](#distributed-lock-limits).
 
 ### Distributed Lock Limits
 
@@ -239,7 +269,12 @@ Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, 
 
 **When another node's claim stops counting.** A claim counts until the registry slot with the same number is empty: its node unmounted cleanly, or another node replayed its journal and freed the slot. A node checks this by reading the registry slot from the device after it reads the record, so it cannot miss a node that registered in the meantime. A torn slot follows the same rule. After its replay, a mount clears the claims in its own slot that an earlier occupant left. How old a claim is does not matter, so a lock that a node never releases, for example after a bug, stays held until that node unmounts. The node logs a warning for each lock it has held for more than 60 seconds. A replay that fails or gets stuck keeps the dead node's locks held until a later replay succeeds; waits for them fail with `EIO` once its recovery lease lapses, about a minute after the replay last made progress. A mount whose own journal replay gives up waiting for another node's lock retries every 1 to 30 seconds and logs who holds the lock each time. Any other replay failure, such as a record that does not decode or an I/O error, fails the mount at once with the `-skip-recovery` hint.
 
-**The hazard: a stalled node keeps writing.** If a node stops for about 20 seconds while it holds a lock, other nodes prove it dead, replay its journal and take its locks. When the stalled node resumes, it exits on its next heartbeat, up to 1 second later, but it can finish the writes it had started. No write path checks that the lock is still held, and there is no fencing token. Two nodes then write the same metadata, which can double-allocate blocks or lose directory entries.
+**The hazard: a stalled node's last writes.** If a node stops for about 20 seconds while it holds a lock, other nodes prove it dead, replay its journal and take its locks. Before every device write, a node checks that it wrote its heartbeat less than 5 seconds ago. If not, it writes a heartbeat first, and if its registry slot is no longer its own, it refuses the write and exits. Some writes still land after the takeover:
+
+- a write that passed the check just before the stall, and I/O the kernel or the storage queued during it;
+- writes in the second after the takeover, if the stalled node resumed while the other node was marking its slot dead.
+
+Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap, for example SCSI-3 persistent reservations (or NVMe reservations), with which surviving nodes revoke a dead node's access to the device. GoClusterFS does not use them.
 
 Common causes of a stall:
 
@@ -289,6 +324,8 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 
 - **Storage or replay errors** (an I/O error, or `journal recovery failed: ...`): the journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery=N`, with the slot number N from the error, which discards slot N's journal.
+
+`-skip-recovery` is for emergencies only: it throws away changes the node had committed, which may have been only partly applied. Never put it in a unit file or script. `goclusterfs-fsck -list-slots` shows each slot's journal state first.
 
 `-skip-recovery=N` discards a journal only when the mount takes slot N. If it takes another slot, it logs `ignoring -skip-recovery=N` and replays that slot's journal as usual, so it never discards a journal you did not name. A mount takes another slot while a running node is replaying slot N: about 20 seconds after the failed mount, a running node tries to replay the damaged slot, holds it for 60 seconds, and tries again every minute. To discard slot N's journal:
 
@@ -402,6 +439,8 @@ goclusterfs-mount -device /dev/device -mount /mnt/cluster
 
 ## Health Checks
 
+`gfsctl health` and `GET /health` only show that the mount's API answers; they check nothing else yet. Use the script below to check the filesystem itself.
+
 ### Quick Health Check Script
 
 ```bash
@@ -465,10 +504,12 @@ done
 
 Nodes prove they are alive by writing a heartbeat to their registry slot on the device every second. That is what failure detection uses.
 
-Separately, each node sends a broadcast heartbeat over UDP every 30 seconds, an invalidation message for each metadata change, and a heartbeat every 50 ms for 500 ms after its last invalidation:
+`gfsctl stats cluster` shows how many nodes are registered and healthy, and when each peer was last seen.
+
+Separately, each node sends a broadcast heartbeat over UDP every 30 seconds, an invalidation message for each metadata change, and a heartbeat every 50 ms for 500 ms after its last invalidation. Nodes send from the unicast port (31338) to the multicast port (31337):
 
 ```bash
-tcpdump -i eth0 -c 10 udp port 31337
+tcpdump -i eth0 -c 10 udp port 31337 or udp port 31338
 ```
 
 ---
@@ -480,7 +521,7 @@ tcpdump -i eth0 -c 10 udp port 31337
 | Symptom | Likely Cause | Where to Look |
 |---------|-------------|---------------|
 | Slow `ls -l` or `stat` | Each name lookup reads the whole directory from disk | Keep directories small; see [README limits](../README.md#limits-and-status) |
-| Slow reads | Cache misses | `Cache stats` at unmount |
+| Slow reads | Cache misses | `gfsctl stats cache`, or `Cache stats` at unmount |
 | Slow metadata | Lock contention | `lock.Acquire` lines with high `retries` |
 | Slow writes | Synchronous journal commits and per-block extent locks | Storage latency |
 

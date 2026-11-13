@@ -25,6 +25,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -314,7 +315,7 @@ func (m *Manager) FreePhysicalBlock(ctx context.Context, physBlock uint64) error
 
 // Truncate removes all extents beyond the given size.
 func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64) error {
-	log.Printf("[DEBUG] extent.Truncate: inode %d, newSize=%d, extentCount=%d", ino.InodeNum, newSize, ino.ExtentCount)
+	logging.Debugf("extent.Truncate: inode %d, newSize=%d, extentCount=%d", ino.InodeNum, newSize, ino.ExtentCount)
 	if err := m.unmap(ctx, ino, BlocksForSize(newSize), math.MaxUint64); err != nil {
 		return err
 	}

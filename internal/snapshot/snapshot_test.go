@@ -29,21 +29,23 @@ func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		tb.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		tb.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -310,8 +312,12 @@ func TestRegistryGetByName(t *testing.T) {
 	ctx := context.Background()
 
 	// Create snapshots
-	registry.Create(ctx, "snap1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
-	registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly)
+	if _, err := registry.Create(ctx, "snap1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
 
 	// Get by name
 	desc, err := registry.GetByName(ctx, "snap2")
@@ -364,9 +370,15 @@ func TestRegistryList(t *testing.T) {
 	ctx := context.Background()
 
 	// Create several snapshots
-	registry.Create(ctx, "snap1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
-	registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly)
-	registry.Create(ctx, "hidden", 300, InvalidSnapshotID, 3000, 150, 3072, FlagHidden)
+	if _, err := registry.Create(ctx, "snap1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "hidden", 300, InvalidSnapshotID, 3000, 150, 3072, FlagHidden); err != nil {
+		t.Fatal(err)
+	}
 
 	// List should not include hidden
 	snapshots, err := registry.List(ctx)
@@ -386,9 +398,15 @@ func TestRegistryListForInode(t *testing.T) {
 	ctx := context.Background()
 
 	// Create snapshots for different inodes
-	registry.Create(ctx, "snap1-a", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
-	registry.Create(ctx, "snap1-b", 100, InvalidSnapshotID, 1001, 51, 1025, FlagReadOnly)
-	registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly)
+	if _, err := registry.Create(ctx, "snap1-a", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "snap1-b", 100, InvalidSnapshotID, 1001, 51, 1025, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
 
 	// List for inode 100
 	snapshots, err := registry.ListForInode(ctx, 100)
@@ -449,7 +467,9 @@ func TestRegistryDelete(t *testing.T) {
 	// Create and activate a snapshot
 	desc, _ := registry.Create(ctx, "snap1", 100, InvalidSnapshotID,
 		1000, 50, 1024, FlagReadOnly)
-	registry.UpdateState(ctx, desc.SnapshotID, StateActive)
+	if err := registry.UpdateState(ctx, desc.SnapshotID, StateActive); err != nil {
+		t.Fatal(err)
+	}
 
 	// Delete (mark for deletion)
 	err := registry.Delete(ctx, desc.SnapshotID)
@@ -480,8 +500,12 @@ func TestRegistryRemove(t *testing.T) {
 	// Create, activate, and delete a snapshot
 	desc, _ := registry.Create(ctx, "snap1", 100, InvalidSnapshotID,
 		1000, 50, 1024, FlagReadOnly)
-	registry.UpdateState(ctx, desc.SnapshotID, StateActive)
-	registry.Delete(ctx, desc.SnapshotID)
+	if err := registry.UpdateState(ctx, desc.SnapshotID, StateActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Delete(ctx, desc.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Remove permanently
 	err := registry.Remove(ctx, desc.SnapshotID)
@@ -510,7 +534,9 @@ func TestRegistryRemoveNotDeleting(t *testing.T) {
 	// Create an active snapshot
 	desc, _ := registry.Create(ctx, "snap1", 100, InvalidSnapshotID,
 		1000, 50, 1024, FlagReadOnly)
-	registry.UpdateState(ctx, desc.SnapshotID, StateActive)
+	if err := registry.UpdateState(ctx, desc.SnapshotID, StateActive); err != nil {
+		t.Fatal(err)
+	}
 
 	// Try to remove without deleting first
 	err := registry.Remove(ctx, desc.SnapshotID)
@@ -551,8 +577,12 @@ func TestRegistryInitialize(t *testing.T) {
 	ctx := context.Background()
 
 	// Create some snapshots
-	registry.Create(ctx, "snap1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
-	registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly)
+	if _, err := registry.Create(ctx, "snap1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Create(ctx, "snap2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
 
 	// Initialize should clear everything
 	err := registry.Initialize(ctx)
@@ -580,17 +610,25 @@ func TestRegistryScan(t *testing.T) {
 
 	// Create snapshots in various states
 	desc1, _ := registry.Create(ctx, "active1", 100, InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
-	registry.UpdateState(ctx, desc1.SnapshotID, StateActive)
+	if err := registry.UpdateState(ctx, desc1.SnapshotID, StateActive); err != nil {
+		t.Fatal(err)
+	}
 
 	desc2, _ := registry.Create(ctx, "active2", 200, InvalidSnapshotID, 2000, 100, 2048, FlagReadOnly)
-	registry.UpdateState(ctx, desc2.SnapshotID, StateActive)
+	if err := registry.UpdateState(ctx, desc2.SnapshotID, StateActive); err != nil {
+		t.Fatal(err)
+	}
 
 	_, _ = registry.Create(ctx, "creating", 300, InvalidSnapshotID, 3000, 75, 1536, FlagReadOnly)
 	// Leave in creating state
 
 	desc4, _ := registry.Create(ctx, "deleting", 400, InvalidSnapshotID, 4000, 25, 512, FlagReadOnly)
-	registry.UpdateState(ctx, desc4.SnapshotID, StateActive)
-	registry.Delete(ctx, desc4.SnapshotID)
+	if err := registry.UpdateState(ctx, desc4.SnapshotID, StateActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Delete(ctx, desc4.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Scan
 	stats, err := registry.Scan(ctx)
@@ -613,6 +651,62 @@ func TestRegistryScan(t *testing.T) {
 	}
 }
 
+type countingDevice struct {
+	device
+	reads int
+}
+
+func (d *countingDevice) ReadAt(buf []byte, offset int64) (int, error) {
+	d.reads++
+	return d.device.ReadAt(buf, offset)
+}
+
+// Mount scans the registry, and reading a sector per descriptor made that 31 times slower.
+func TestRegistryReadsEachSectorOnce(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	const sectors, snapshots = 16, 40
+	registry := NewRegistry(dev, 0, sectors*SectorSize, nil)
+	for i := range snapshots {
+		if _, err := registry.Create(ctx, fmt.Sprintf("snap-%d", i), 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counter := &countingDevice{device: dev}
+	registry.dev = counter
+
+	const missing = 1
+	walks := map[string]func() error{
+		"Scan": func() error {
+			stats, err := registry.Scan(ctx)
+			if err == nil && stats.CreatingCount != snapshots {
+				err = fmt.Errorf("found %d snapshots, want %d", stats.CreatingCount, snapshots)
+			}
+			return err
+		},
+		"Get":              func() error { _, err := registry.Get(ctx, missing); return err },
+		"GetByName":        func() error { _, err := registry.GetByName(ctx, "missing"); return err },
+		"List":             func() error { _, err := registry.List(ctx); return err },
+		"ListForInode":     func() error { _, err := registry.ListForInode(ctx, 999); return err },
+		"GetChildren":      func() error { _, err := registry.GetChildren(ctx, missing); return err },
+		"UpdateParentID":   func() error { return registry.UpdateParentID(ctx, missing, 0) },
+		"UpdateState":      func() error { return registry.UpdateState(ctx, missing, StateActive) },
+		"SetRefCountJobID": func() error { return registry.SetRefCountJobID(ctx, missing, 7) },
+		"Remove":           func() error { return registry.Remove(ctx, missing) },
+	}
+	for name, walk := range walks {
+		counter.reads = 0
+		if err := walk(); err != nil && !errors.Is(err, ErrSnapshotNotFound) {
+			t.Errorf("%s: %v", name, err)
+		}
+		if counter.reads != sectors {
+			t.Errorf("%s read %d sectors, want %d", name, counter.reads, sectors)
+		}
+	}
+}
+
 func TestRegistryPersistence(t *testing.T) {
 	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
 	if tmpDir == "" {
@@ -620,7 +714,7 @@ func TestRegistryPersistence(t *testing.T) {
 	}
 
 	testFile := filepath.Join(tmpDir, "test_snapshot_persist.bin")
-	defer os.Remove(testFile)
+	defer func() { _ = os.Remove(testFile) }()
 
 	var snapshotID uint64
 
@@ -631,16 +725,18 @@ func TestRegistryPersistence(t *testing.T) {
 			t.Skipf("Cannot create test file: %v", err)
 		}
 		if err := f.Truncate(10 << 20); err != nil {
-			f.Close()
+			_ = f.Close()
 			t.Skipf("Cannot truncate: %v", err)
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
 
 		dev, err := storage.Open(testFile)
 		if err != nil {
 			t.Skipf("O_DIRECT not supported: %v", err)
 		}
-		defer dev.Close()
+		defer func() { _ = dev.Close() }()
 
 		registry := NewRegistry(dev, 0, 10*SectorSize, nil)
 		ctx := context.Background()
@@ -652,7 +748,9 @@ func TestRegistryPersistence(t *testing.T) {
 		}
 		snapshotID = desc.SnapshotID
 
-		registry.UpdateState(ctx, snapshotID, StateActive)
+		if err := registry.UpdateState(ctx, snapshotID, StateActive); err != nil {
+			t.Fatal(err)
+		}
 	}()
 
 	// Reopen and verify
@@ -660,13 +758,15 @@ func TestRegistryPersistence(t *testing.T) {
 	if err != nil {
 		t.Skipf("Cannot reopen: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	registry := NewRegistry(dev, 0, 10*SectorSize, nil)
 	ctx := context.Background()
 
 	// Scan to rebuild state
-	registry.Scan(ctx)
+	if _, err := registry.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	// Retrieve
 	desc, err := registry.Get(ctx, snapshotID)
@@ -808,8 +908,10 @@ func BenchmarkCreate(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		registry.Create(ctx, fmt.Sprintf("snap%d", i), uint32(100+i),
-			InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
+		if _, err := registry.Create(ctx, fmt.Sprintf("snap%d", i), uint32(100+i),
+			InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -830,7 +932,9 @@ func BenchmarkGet(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		registry.Get(ctx, ids[i%100])
+		if _, err := registry.Get(ctx, ids[i%100]); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -843,13 +947,17 @@ func BenchmarkList(b *testing.B) {
 
 	// Pre-create snapshots
 	for i := 0; i < 100; i++ {
-		registry.Create(ctx, fmt.Sprintf("snap%d", i), uint32(100+i),
-			InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly)
+		if _, err := registry.Create(ctx, fmt.Sprintf("snap%d", i), uint32(100+i),
+			InvalidSnapshotID, 1000, 50, 1024, FlagReadOnly); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		registry.List(ctx)
+		if _, err := registry.List(ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -990,13 +1098,14 @@ func TestRegistryIDsAfterOlderImagesAndSlotReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for slot := uint64(0); slot < old.maxDescriptors; slot++ {
-		d, err := old.readDescriptor(slot)
-		if err != nil || d.IsFree() {
+	for slot, d := range old.descriptors() {
+		if d.IsFree() {
 			continue
 		}
 		var n int
-		fmt.Sscanf(d.GetName(), "old-%d", &n)
+		if _, err := fmt.Sscanf(d.GetName(), "old-%d", &n); err != nil {
+			t.Fatal(err)
+		}
 		d.SnapshotID = uint64(n + 1)
 		if err := old.writeDescriptor(slot, d); err != nil {
 			t.Fatal(err)

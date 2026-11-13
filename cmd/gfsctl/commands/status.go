@@ -36,7 +36,7 @@ func init() {
 func runStatus(cmd *cobra.Command, args []string) error {
 	// Watch mode not compatible with JSON output
 	if statusWatch && GetOutputFormat() == "json" {
-		return fmt.Errorf("watch mode is not compatible with JSON output")
+		return usageErrorf("--watch does not work with -o json; drop one of them")
 	}
 
 	// Create the display function

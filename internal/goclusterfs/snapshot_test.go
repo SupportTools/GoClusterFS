@@ -219,14 +219,37 @@ func TestSnapshotKeepsDataThroughWrites(t *testing.T) {
 
 func waitSnapshotGone(t *testing.T, fsys *FS, name string) {
 	t.Helper()
+	var dataInode uint32
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		_, err := fsys.snapshotReg.GetByName(context.Background(), name)
+		desc, err := fsys.snapshotReg.GetByName(context.Background(), name)
 		if errors.Is(err, snapshot.ErrSnapshotNotFound) {
-			return
+			break
+		}
+		if err == nil && desc.HasData() {
+			dataInode = desc.DataInode
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("snapshot %q still listed after 10s: %v", name, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dataInode != 0 {
+		waitInodeFree(t, fsys, dataInode)
+	}
+}
+
+// The delete job frees a snapshot's data inode after it removes the descriptor.
+func waitInodeFree(t *testing.T, fsys *FS, num uint32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ino, err := fsys.inodeTbl.Read(num)
+		if err == nil && ino.Magic == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("data inode %d still in use 10s after its snapshot was removed (err=%v)", num, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -378,7 +401,7 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 	if err := fsys.snapshotReg.Delete(ctx, deleting.SnapshotID); err != nil {
 		t.Fatal(err)
 	}
-	if err := fsys.snapshotWkr.ReleaseData(ctx, deleting.DataInode); err != nil {
+	if err := fsys.snapshotWkr.ReleaseData(ctx, deleting.SnapshotID, deleting.DataInode); err != nil {
 		t.Fatal(err)
 	}
 
@@ -386,9 +409,7 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 	waitSnapshotGone(t, remounted, "half-created")
 	waitSnapshotGone(t, remounted, "half-deleted")
 	for _, num := range []uint32{data.InodeNum, deleting.DataInode} {
-		if ino, err := remounted.inodeTbl.Read(num); err != nil || ino.Magic != 0 {
-			t.Errorf("data inode %d still in use after recovery (err=%v)", num, err)
-		}
+		waitInodeFree(t, remounted, num)
 	}
 	for _, b := range blocks {
 		if got := refcountOf(t, remounted, b); got > 1 {
@@ -493,6 +514,51 @@ func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
 			checkFile(t, lookupFile(t, nodeB, "mid-clone"), original)
 		})
 	}
+}
+
+// Node A appends to a file in place while node B's snapshot marks the file
+// shared. B's inode write must not put back the size it read before A's
+// append committed, and the snapshot keeps the file from before the append.
+func TestSnapshotMarkKeepsConcurrentAppend(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	nodeA := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := nodeA.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, 4096)
+	appended := pattern(2, 4096)
+	f := newRegularFile(t, nodeA)
+	writeAt(t, f, original, 0)
+
+	nodeB := openSnapshotFS(t, path)
+	appendDone := make(chan syscall.Errno, 1)
+	t.Cleanup(func() { duringShareMark = nil })
+	duringShareMark = func() {
+		duringShareMark = nil
+		// Only a lock the mark holds may make node A wait.
+		nodeB.lockMgr.ReleaseCached()
+		go func() {
+			_, errno := f.Write(ctx, nil, appended, int64(len(original)))
+			appendDone <- errno
+		}()
+		for nodeA.lockMgr.Stats().Waiting == 0 {
+			select {
+			case errno := <-appendDone:
+				appendDone <- errno
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "snap")
+	if errno := <-appendDone; errno != 0 {
+		t.Fatalf("append on node A: %v", errno)
+	}
+
+	checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, append(slices.Clone(original), appended...))
+	setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "snap:/snap-clone")
+	checkFile(t, lookupFile(t, nodeB, "snap-clone"), original)
 }
 
 // Node A has checked a block and is writing it in place when node B's snapshot

@@ -59,14 +59,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.
 - `go.mod` now requires Go 1.26.
 - `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
+- `make test-integration` now allows 30 minutes, since the full suite takes about 15.
+- Mount no longer creates an SFB manager, which nothing used, and logs that SFB is disabled instead of `SFB: enabled`.
 - Reads use the inode cache, a node keeps a released lock for 10 ms so back-to-back operations take it again without disk I/O and yields a lock it has reused for 250 ms, and the inode and extent caches are split into 16 shards.
 
 ### Removed
 
+- `cmd/crctest`, a development tool that printed two CRC32C values. `internal/storage`'s `TestCRC32C` already checks both, and releases never shipped it.
 - The legacy single-block prototype in the repository root (`main.go`).
+- The journal's `FullThreshold` setting, which nothing read. A checkpoint still runs every 5 seconds and when a transaction does not fit.
 
 ### Fixed
 
+- `chmod`, `chown` and `touch` could undo another node's concurrent change to the same inode: on a directory, a create's link count or mtime; on a file, the size an append inside an allocated block set. Directory attribute changes now hold the inode lock from read to write, and file attribute changes retry when the inode changed since they read it.
+- After 3 failed multicast sends in total, counted over the whole mount, a node sent cache invalidations only to unicast peers until it unmounted. Now only failures in a row count: a successful send resets them, and after 3 in a row the node tries multicast again 30 seconds later.
 - `chmod` cleared a file's type bits, so the file could no longer be opened ("Is a directory") and fsck reported an invalid file type. `chmod`, `chown` and `touch` now also work on directories and the mount root, which returned "Operation not supported".
 - The cache summary logged at unmount showed hit rates 100 times too high.
 - All nodes wrote the same journal region. A restarting node replayed and then reset the journal of nodes still writing, and no node could replay a crashed node's journal. Each node registry slot now owns a 4 MB journal, and a crashed node's journal is replayed through its slot.
@@ -74,6 +80,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - After a partial write into a fallocated range, reads of the other fallocated blocks, and of the rest of the written block, returned old disk contents. They now return zeros.
 - Snapshots and clones never copied on write: block refcounts stopped at 1, so a snapshot kept nothing and a write to a clone changed its source. Each snapshot now keeps the blocks it captured in a hidden inode, a write to a shared block copies it first, and a block is freed only when its last owner lets go.
 - Deleting a snapshot after its file changed failed with a refcount underflow and left the snapshot deleting forever, because the delete used the file's current blocks.
+- A snapshot or clone could undo another node's change to the source file made while the file was being marked shared, such as the new size after an append, a chmod, or new times. The mark now holds the inode lock from its read to its write.
+- Two delete jobs for one snapshot, from a double delete or a node mounting while another node deleted it, could empty the data of a new snapshot that took the freed inode slot. A delete job now empties a data inode only while the snapshot still names it, and a job that finds the snapshot already deleted succeeds.
 - Writes failed with `EAGAIN` once a file needed a third extent, so most files over 2 MB could not be written. Extents past the first two now go in an on-disk extent tree, and adjacent extents merge.
 - `goclusterfs-fsck` phase 4 never checked file extents, because it read inodes into unaligned buffers that `O_DIRECT` rejects.
 - A node could serve a stale cached inode after another node freed and reused its inode number. Inode generations now survive free and reuse, and opening a file reloads its inode from disk.
@@ -82,12 +90,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Two nodes could each hold a lock and wait for the other's, then fail with `EIO` after 30 seconds, when a write's inode and block locks mapped to records the other node held. Each lock type now has its own lock records.
 - Inode allocation races between nodes; allocation now retries with jittered backoff.
 - Directory operations now update caches and send broadcast invalidations.
+- A read right after `open` could stop early when this node's kernel had cached the file's size during another node's write, for example from a desktop volume monitor or `ls -l` scanning the mount. Opening a file now makes the kernel fetch its size again.
 - A node that lost broadcast invalidations, for example when its receive buffer filled during a burst of writes on another node, kept stale inodes until `-cache-ttl` and logged nothing. It now sees the gap in the sender's sequence numbers, drops its inode and extent caches, and logs it at most every 10 seconds. The unmount stats line reports `lost=N`.
 - Broadcast deduplication kept every message for 5 minutes: about 224 MB per 2.4 million messages, and cleaning it up held up message handling for up to 200 ms. It now keeps a 64-message window per sender.
 - Docker and VM test suites now run on fresh hosts.
 - The README quick start now uses the real binary names and flags.
 - Create, mkdir, clone and snapshot failed with "No space left on device" when the lock wait for the new inode gave up or its slot could not be read. They now fail with `EIO`. `ENOSPC` means the inode table is full.
+- Writes and fallocate failed with "No space left on device" when the lock wait for the block bitmap gave up or a bitmap sector could not be read. They now fail with `EIO`. `ENOSPC` means no free blocks are left or the backing storage is full.
 - Directory entries went only into the first 4 KB of each 1 MB directory block, so a block held about 250 short names or 15 long ones, and a busy directory took a new block every few creates. Entries now fill the whole block. A lookup reads each block in one I/O, and an add or remove writes only the 4 KB it changed.
+- A node that other nodes declared dead while it was stalled, for example a paused VM, kept writing when it resumed. A node now checks before every device write that it still owns its registry slot, and refuses the write and exits if it does not. A write it started before the stall can still land.
 - A node stalled for 15 seconds while it held a lock, for example a paused VM, lost the lock to other nodes, which could then write the same metadata. Other nodes now wait for a failed node's locks until it is proven dead and its journal is replayed, with no time limit, and give up only if the replay fails or is abandoned, or after 30 seconds if the waiting operation already holds another lock the replay may need. An overwrite of existing file data instead lets go of its locks and retries, so it does not fail. Failure detection now replays only nodes proven dead.
 - A mount that took the registry slot of a failed node on another host did not keep that node's locks while it replayed the node's journal.
 - Two nodes replaying dead nodes whose locks shared a record waited on each other until the lock timeout.

@@ -1,10 +1,14 @@
 package storage
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -367,5 +371,79 @@ func TestMultiShardIO(t *testing.T) {
 				i, readBuf.Bytes()[i], buf.Bytes()[i])
 			break
 		}
+	}
+}
+
+func TestWriteGateRefusesWrites(t *testing.T) {
+	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
+	if tmpDir == "" {
+		tmpDir = t.TempDir()
+	}
+	path := filepath.Join(tmpDir, "test_gate.bin")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(path) }()
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	refused := errors.New("refused")
+	dev.SetWriteGate(func(offset int64) error {
+		if offset >= SectorSize {
+			return refused
+		}
+		return nil
+	})
+	buf := NewAlignedBuffer(SectorSize)
+	copy(buf.Bytes(), bytes.Repeat([]byte{'x'}, SectorSize))
+	if _, err := dev.WriteAt(buf.Bytes(), 0); err != nil {
+		t.Fatalf("write the gate allows: %v", err)
+	}
+	if _, err := dev.WriteAtUnsharded(buf.Bytes(), SectorSize); !errors.Is(err, refused) {
+		t.Fatalf("write the gate refuses = %v, want %v", err, refused)
+	}
+	if _, err := dev.ReadAt(buf.Bytes(), SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.Bytes(), make([]byte, SectorSize)) {
+		t.Error("a refused write reached the device")
+	}
+}
+
+func TestLastErrorHoldsTheLatestFailureUntilASuccess(t *testing.T) {
+	var d Device
+	if d.LastError() != nil {
+		t.Fatal("a new device reports an error")
+	}
+	d.record(syscall.EIO)
+	d.record(io.EOF)
+	if !errors.Is(d.LastError(), syscall.EIO) {
+		t.Fatalf("LastError = %v, want EIO; EOF is not a device failure", d.LastError())
+	}
+	d.record(nil)
+	if d.LastError() != nil {
+		t.Errorf("LastError after a successful I/O = %v, want nil", d.LastError())
+	}
+}
+
+func TestFailedReadIsRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	buf := NewAlignedBuffer(SectorSize).Bytes()
+	if _, err := dev.ReadAt(buf, 0); err != nil || dev.LastError() != nil {
+		t.Fatalf("ReadAt = %v, LastError = %v", err, dev.LastError())
+	}
+	_ = dev.file.Close()
+	if _, err := dev.ReadAt(buf, 0); err == nil || dev.LastError() == nil {
+		t.Errorf("ReadAt on a closed file = %v, LastError = %v, want both set", err, dev.LastError())
 	}
 }

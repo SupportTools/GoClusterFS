@@ -445,3 +445,23 @@ func TestRefusedFlushCountsAsError(t *testing.T) {
 		t.Errorf("Stats = %+v, want 1 error and nothing discarded", got)
 	}
 }
+
+func TestDiscardRefusedByWriteGate(t *testing.T) {
+	dev, cleanup := createTestDevice(t)
+	defer cleanup()
+	dev.SetWriteGate(func(int64) error { return errors.New("node lost its registry slot") })
+
+	discarded := false
+	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+		discarded = true
+		return nil
+	}})
+	m.Start()
+	m.Queue(5)
+	if err := m.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if discarded {
+		t.Error("a discard ran though the write gate refused it")
+	}
+}

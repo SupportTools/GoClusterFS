@@ -121,6 +121,25 @@ head -c 16 /dev/device | hexdump -C
 - Pre-v2 device: copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
 - Version 2 device: do not run an old build on it; it would read the wrong layout. There is no tool to rebuild the superblock, so restore from backup.
 
+### "superblock version too old" or "formatted before each lock type had its own lock records"
+
+**Symptom**: Mount exits with one of:
+
+- `Cannot use <device>: superblock version too old: volume is v2, this version mounts v3. ...`
+- `Cannot use <device>: superblock layout is not supported by this version: the volume was formatted before each lock type had its own lock records, so its nodes would not exclude this version's. ...`
+
+**Cause**: An older build formatted the volume. Version 2 has fixed 1 MB regions. A version 3 volume formatted before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) uses lock records that this version's nodes would not exclude.
+
+**Solution**: Copy the data off with the build that formatted the volume, reformat with `goclusterfs-mount -format`, and copy the data back. For a version 2 volume over 128 GB, run that build's `goclusterfs-fsck` first. There is no in-place migration.
+
+### "unknown required flags 0x10"
+
+**Symptom**: Mount exits with `Cannot use <device>: superblock requires features this version doesn't support: unknown required flags 0x10`.
+
+**Cause**: This build is older than [#85](https://github.com/SupportTools/GoClusterFS/pull/85), and a newer build formatted the volume.
+
+**Solution**: Upgrade this node. Every node must run the same version.
+
 ### "device has GoClusterFS node slots but no superblock"
 
 **Symptom**: Mount exits with `Cannot use <device>: device has GoClusterFS node slots but no superblock: its superblock was overwritten. ...`
@@ -135,7 +154,10 @@ head -c 16 /dev/device | hexdump -C
 
 ### Operations Hang Waiting for a Lock
 
-**Symptom**: File operations hang for up to 30 seconds, then fail with EIO. The mount log shows many `lock.Acquire` lines for the same lock, then a `[WARN] lock: gave up waiting` line that names the node holding it. A signal to the waiting program does not end the wait; `SIGKILL` does.
+**Symptom**: File operations hang. A signal to the waiting program does not end the wait; `SIGKILL` does. The mount log shows one of:
+
+- `[WARN] lock: gave up waiting ...` naming the holder: a live node held the lock for 30 seconds. The operation fails with EIO, or with ENOSPC if it was allocating blocks.
+- `[WARN] lock: ... which holds it and is failing or being recovered; waiting until its journal replay ends`, every 30 seconds: the holder failed. The wait has no time limit and ends when another node has replayed the failed node's journal. An operation that already held another lock gives up after 30 seconds with EIO instead, except an overwrite of existing file data: it lets go of its locks at once, waits, and retries, so it does not fail.
 
 **Causes**:
 1. Another node holds the lock for a long operation, or is stalled
@@ -151,7 +173,7 @@ grep "lock.Acquire" /var/log/goclusterfs.log | tail -20
 ps aux | grep goclusterfs-mount
 ```
 
-A crashed node's locks free up on their own once another node proves it dead and replays its journal: in about 3 to 6 seconds when a surviving mount shares its host and PID namespace, and up to about 35 seconds otherwise. Waits for them log `which holds it and is failing or being recovered`. A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
+A crashed node's locks free up on their own once another node proves it dead and replays its journal: in about 3 to 6 seconds when a surviving mount shares its host and PID namespace, and up to about 35 seconds otherwise. If that replay fails, waits give up with `the journal replay of node ... failed or was abandoned`; see [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot). A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
 
 ### Unmount Takes Long
 
@@ -190,6 +212,7 @@ A crashed node's locks free up on their own once another node proves it dead and
 1. Out of 1 MB blocks. Every file with data uses at least one full block, so many small files fill the device fast.
 2. Out of inodes. Format gives the volume one inode per `-bytes-per-inode` bytes of device (default 1 MB).
 3. The underlying thin-provisioned storage is full.
+4. A lock wait for the block bitmap gave up while a write allocated blocks. The mount log shows `[WARN] lock: gave up waiting for type=6`. See [Operations Hang Waiting for a Lock](#operations-hang-waiting-for-a-lock).
 
 **Solutions**:
 ```bash
@@ -252,7 +275,7 @@ fusermount3 -u /mnt/fs
 
 **Symptom**: Operations slower than expected.
 
-**Diagnosis**: The mount logs `Cache stats: inodes=... (hit=...%), extents=... (hit=...%)` when it unmounts. There is no live view, and the hit percentages are wrong today (they can read far above 100%).
+**Diagnosis**: `gfsctl stats cache` shows this node's cache hits and misses while it runs, and the mount logs `Cache stats: inodes=... (hit=...%), extents=... (hit=...%)` when it unmounts.
 
 **Solutions**: Cache sizes are fixed in code (10,000 inodes, 50,000 extents). A longer `-cache-ttl` or `-attr-timeout` avoids some disk reads, but other nodes' changes then show up later. See [Cache Tuning](OPERATIONS.md#cache-tuning).
 
@@ -305,6 +328,9 @@ Journal commits are synchronous, and each block write takes a cluster lock. Batc
 
 # Monitor memory over time
 watch -n 60 'ps aux | grep goclusterfs-mount'
+
+# Go runtime and process memory from the API
+curl -s http://127.0.0.1:8080/metrics | grep -E '^(go_memstats_heap_alloc_bytes|process_resident_memory_bytes) '
 ```
 
 There is no profiling endpoint.
@@ -330,6 +356,22 @@ ss -ulpn | grep -E ':3133[78]'
 # Or run without broadcast; peers then see changes after -cache-ttl
 ./goclusterfs-mount ... -broadcast=false
 ```
+
+### HTTP API, gfsctl and Dashboard
+
+| What you see | Cause and fix |
+|--------------|---------------|
+| Mount exits with `Refusing to start the API: ...` | `-api-addr` can be reached from other hosts, or `-api-cors` is `*`, and no token is set. Set `-api-token-file` or `GOCLUSTERFS_API_TOKEN`, use a loopback address, or pass `-api=false` |
+| Mount exits with `Invalid API settings: -api-token-file ... readable by group or others` | `chmod 600` the token file. It must also belong to the mount's user or root, be a regular file, and hold 1 to 4096 bytes |
+| Mount exits with `Invalid API settings: set only one of -api-token-file, GOCLUSTERFS_API_TOKEN and -api-token` | Give the token one way only |
+| Mount logs `Warning: Failed to start API server` | The API port is taken, often by another mount on the same host. Give each mount its own `-api-addr`. The mount runs without the API until restarted |
+| `gfsctl`: connection refused | The API is off (`-api=false`), failed to start, or listens on another address. Check `--host` and `--port` against `-api-addr` |
+| 401 `missing authorization header` or `invalid token` | The mount has a token and the request's is missing or wrong. Set `GFSCTL_TOKEN`, or enter it on the dashboard's Settings page |
+| 403 `host not allowed` | No token is set, and the request used a host name other than `localhost`, `127.0.0.1` or `[::1]` |
+| 403 `snapshot and admin endpoints are disabled` | Write endpoints need a token, even on loopback |
+| 429 | `-api-rate-limit` is set and this client sent too many requests. Wait for `Retry-After` |
+| 503 from the stats endpoints | The mount has not fed statistics to the API yet. Try again in a second |
+| `/ui/` says `Dashboard not built` | The binary came from `make build`. Rebuild with `make dashboard build`, or use a release archive |
 
 ### Nodes Not Seeing Updates
 
@@ -443,10 +485,10 @@ fusermount3 -u /mnt/cluster
 
 ### Log Output
 
-The mount always logs `[DEBUG]` lines for file operations, lock acquire and release, journal recovery, and broadcast. Capture stderr and filter it:
+With `-debug`, the mount logs `[DEBUG]` lines for file operations, lock acquire and release, and block allocation. Journal recovery and broadcast lines are always logged. Capture stderr and filter it:
 
 ```bash
-./goclusterfs-mount -device /dev/device -mount /mnt/fs 2>&1 | tee mount.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee mount.log
 
 grep "lock.Acquire" mount.log
 grep "\[broadcast\]" mount.log
@@ -455,10 +497,10 @@ grep "\[Recovery\]" mount.log
 
 ### FUSE Request Tracing (Very Verbose)
 
-`-debug` adds a log line for every FUSE request and reply:
+`-fuse-debug` adds a log line for every FUSE request and reply:
 
 ```bash
-./goclusterfs-mount -device /dev/device -mount /mnt/fs -debug 2>&1 | tee fuse.log
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -fuse-debug 2>&1 | tee fuse.log
 ```
 
 ---
@@ -573,6 +615,10 @@ If this guide doesn't resolve your issue:
 
    # GoClusterFS version
    ./goclusterfs-mount -version
+
+   # Mount state and counters, if the API is on
+   gfsctl status -o json
+   gfsctl stats all -o json
 
    # Recent mount log
    tail -1000 /var/log/goclusterfs.log > mount.log
