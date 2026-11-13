@@ -386,7 +386,7 @@ func TestWriteGateRefusesWrites(t *testing.T) {
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	refused := errors.New("refused")
 	dev.SetWriteGate(func(offset int64) error {
