@@ -394,6 +394,16 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
+  # A stale sector write lands in about 1 of 3 Go runs; shell loops over docker exec and ssh would almost never hit it. The unit test below is the reliable check.
+  - id: multinode-neighbor-inode-writes
+    name: Neighbor inode writes from two nodes
+    description: Two nodes write files whose inodes share inode table sectors; every file keeps its data
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeNeighborInodeWrites
+      docker: TODO
+      vm: TODO
+
   # Docker and VM tests run shell tools over docker exec and ssh, which cannot keep signalling the thread inside a FUSE call.
   - id: multinode-create-with-signals
     name: Creates survive signals during lock waits
@@ -1749,6 +1759,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/interrupt_test.go::TestWriteFailsWhenLockIsNotFreed
+
+  - id: inode-sector-neighbor-writes
+    name: Neighbor inode writes keep both inodes
+    description: Two nodes increment two inodes in one inode table sector; neither loses an update
+    priority: go_only
+    environments:
+      go: internal/inode/sector_lock_test.go::TestNeighborInodeWritesFromTwoNodes
 
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
