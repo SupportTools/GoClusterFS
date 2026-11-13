@@ -504,7 +504,9 @@ func main() {
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start the API server: %v; the mount continues without it. Choose a free -api-addr, or pass -api=false", err)
-				apiServer.Stop()
+				if err := apiServer.Stop(); err != nil && !errors.Is(err, api.ErrServerNotStarted) {
+					log.Printf("Warning: Failed to stop the API server: %v", err)
+				}
 				apiServer = nil
 				sampler.Stop()
 				sampler = nil

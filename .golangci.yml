@@ -32,9 +32,6 @@ linters:
       - path: ^cmd/gfsctl/
         linters: [errcheck]
 
-      - path: ^cmd/mount/
-        linters: [errcheck]
-
       - path: ^tests/benchmark/
         linters: [errcheck]
 
