@@ -516,6 +516,51 @@ func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
 	}
 }
 
+// Node A appends to a file in place while node B's snapshot marks the file
+// shared. B's inode write must not put back the size it read before A's
+// append committed, and the snapshot keeps the file from before the append.
+func TestSnapshotMarkKeepsConcurrentAppend(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	nodeA := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := nodeA.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, 4096)
+	appended := pattern(2, 4096)
+	f := newRegularFile(t, nodeA)
+	writeAt(t, f, original, 0)
+
+	nodeB := openSnapshotFS(t, path)
+	appendDone := make(chan syscall.Errno, 1)
+	t.Cleanup(func() { duringShareMark = nil })
+	duringShareMark = func() {
+		duringShareMark = nil
+		// Only a lock the mark holds may make node A wait.
+		nodeB.lockMgr.ReleaseCached()
+		go func() {
+			_, errno := f.Write(ctx, nil, appended, int64(len(original)))
+			appendDone <- errno
+		}()
+		for nodeA.lockMgr.Stats().Waiting == 0 {
+			select {
+			case errno := <-appendDone:
+				appendDone <- errno
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "snap")
+	if errno := <-appendDone; errno != 0 {
+		t.Fatalf("append on node A: %v", errno)
+	}
+
+	checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, append(slices.Clone(original), appended...))
+	setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "snap:/snap-clone")
+	checkFile(t, lookupFile(t, nodeB, "snap-clone"), original)
+}
+
 // Node A has checked a block and is writing it in place when node B's snapshot
 // counts the block and node C starts a write that must copy it. C copies the
 // block only after A's data lands, so neither acknowledged write is lost, even
