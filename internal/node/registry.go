@@ -516,6 +516,8 @@ func (r *Registry) CheckOwnership() error {
 	if slotIdx < 0 {
 		return ErrNotRegistered
 	}
+	log.Printf("[WARN] node: the last heartbeat to registry slot %d was %v ago; checking the slot before a write",
+		slotIdx, r.sinceLastBeat().Round(time.Millisecond))
 	return r.beat(slotIdx)
 }
 

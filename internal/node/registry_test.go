@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1343,8 +1345,15 @@ func TestCheckOwnershipWritesHeartbeatAfterPause(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := reg.CheckOwnership(); err != nil {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	err = reg.CheckOwnership()
+	log.SetOutput(os.Stderr)
+	if err != nil {
 		t.Fatalf("slot still ours after a pause: %v", err)
+	}
+	if !strings.Contains(logs.String(), "checking the slot before a write") {
+		t.Errorf("the check after a pause logged nothing:\n%s", logs.String())
 	}
 	after, err := reg.readSlot(slot)
 	if err != nil {
