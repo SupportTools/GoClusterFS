@@ -976,13 +976,45 @@ scenarios:
       go: internal/goclusterfs/replay_guard_test.go::TestRmdirFreesDirectoryInode
 
   - id: crash-between-claim-and-name
-    name: A crash between claiming a new inode and naming it leaves no shared name
-    description: A create or mkdir stops after claiming its inode and before adding the name, and a peer creates a file before replay; the peer's file gets its own inode, no two names share an inode, and fsck finds no errors
+    name: Replay names an inode whose create crashed between the claim and the name
+    description: A create or mkdir stops after claiming its inode and before adding the name, and a peer creates a file before replay; replay names the claimed inode, a directory gets "." and "..", the peer's file keeps its own inode, and fsck is clean
     priority: high
     environments:
-      go: internal/goclusterfs/name_order_test.go::TestCrashBetweenClaimAndNameLeavesNoSharedName
+      go: internal/goclusterfs/name_order_test.go::TestCrashBetweenClaimAndNameReplaysTheName
       docker: TODO  # needs a pause between the claim and the name, which only the Go test hook gives
       vm: TODO  # a power failure cannot be timed into the window between the claim and the name without that hook
+
+  - id: mkdir-replays-after-crash
+    name: Replay of an interrupted mkdir makes a complete directory
+    description: A mkdir stops after its commit and the process dies; replay makes the directory with "." and "..", raises the parent's link count, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestMkdirReplaysAfterCrash
+      docker: TODO  # needs a pause between commit and the claim, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the window between commit and the claim without that hook
+
+  - id: remove-races-peer-recreate
+    name: Unlink and rmdir do not remove a name another node made since their lookup
+    description: Node B removes a name and makes a new one between node A's lookup and its removal; A returns ENOENT when the new name has another inode, removes the new file whole when it reuses the slot, and fsck is clean
+    priority: high
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestRemoveRacesPeerRecreate
+      docker: TODO  # needs a pause between one node's lookup and its removal, which only the Go test hook gives
+      vm: TODO  # the race window is too short to hit on purpose without that hook
+
+  - id: create-name-errors
+    name: A failed name add reports EEXIST or ENOENT
+    description: Create and mkdir into a taken name return EEXIST, into a removed directory ENOENT, and give back the claimed inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestCreateNameErrors
+
+  - id: replayed-create-finishes-own-claim
+    name: Replay names a create's own claim only while nothing wrote it since
+    description: The logging node claimed the slot and wrote it at most as often as a create does; replay adds the name, and leaves a slot another node wrote, or wrote more often, alone
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayedCreateFinishesOwnClaim
 
   - id: remove-if-holds-directory-lock
     name: RemoveIf checks an entry under the directory lock
