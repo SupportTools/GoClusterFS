@@ -171,3 +171,13 @@ func TestLocksOfOneTypeAreTakenInRecordOrder(t *testing.T) {
 	m.Release(LockTypeInode, high)
 	m.Release(LockTypeInode, low)
 }
+
+func TestAcquireRefusesUnknownLockType(t *testing.T) {
+	const region = layoutRows * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	m := newTestNode(dev, 0, region, 1)
+	if err := acquireWithin(m, time.Second, LockType(numLockTypes), 1, LockModeExclusive); err == nil {
+		t.Fatal("Acquire of a lock type outside the record layout succeeded")
+	}
+}

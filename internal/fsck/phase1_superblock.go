@@ -56,13 +56,9 @@ func (c *Checker) checkSuperblock() error {
 	}
 	c.logf("  Version: %d (OK)\n", sb.Version)
 
-	// Check required flags
-	unknownFlags := sb.RequiredFlags &^ superblock.FlagsWeSupport
-	if unknownFlags != 0 {
-		c.addProblem(PhaseSuperblock, Fatal, "offset 40",
-			fmt.Sprintf("unknown required flags: 0x%X", unknownFlags),
-			false)
-		return fmt.Errorf("unknown required flags")
+	if err := superblock.CheckRequiredFlags(sb.RequiredFlags); err != nil {
+		c.addProblem(PhaseSuperblock, Fatal, "offset 40", err.Error(), false)
+		return fmt.Errorf("unsupported required flags")
 	}
 	c.logf("  Required Flags: 0x%X (OK)\n", sb.RequiredFlags)
 

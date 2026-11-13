@@ -1953,6 +1953,27 @@ scenarios:
     environments:
       go: internal/lock/type_records_test.go::TestLocksOfOneTypeAreTakenInRecordOrder
 
+  - id: lock-unknown-type
+    name: Acquire refuses a lock type outside the record layout
+    description: A lock type with no records of its own is refused instead of hashed over all records
+    priority: go_only
+    environments:
+      go: internal/lock/type_records_test.go::TestAcquireRefusesUnknownLockType
+
+  - id: mount-refuses-hashed-lock-records
+    name: Mount refuses volumes without per-type lock records
+    description: A superblock without RequiredTypedLockRecords fails CanMount with advice to reformat
+    priority: go_only
+    environments:
+      go: internal/superblock/superblock_test.go::TestCanMountRefusesHashedLockRecords
+
+  - id: fsck-refuses-hashed-lock-records
+    name: fsck refuses volumes without per-type lock records
+    description: fsck phase 1 reports a missing RequiredTypedLockRecords flag as fatal, with advice to reformat
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckRefusesHashedLockRecords
+
   - id: create-stuck-inode-lock-eio
     name: Create fails with EIO when the new inode's lock is never freed
     description: A create whose inode slot stays locked on another node past lock.DefaultTimeout fails with EIO, not ENOSPC, and its directory entry is rolled back

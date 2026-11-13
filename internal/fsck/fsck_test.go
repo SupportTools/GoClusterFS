@@ -565,3 +565,26 @@ func TestFsckExtentTree(t *testing.T) {
 		t.Fatal("data extent pointing at another inode's tree node not reported")
 	}
 }
+
+func TestFsckRefusesHashedLockRecords(t *testing.T) {
+	dev, cleanup := testDevice(t, 20)
+	defer cleanup()
+	sb := superblock.New(dev.Size(), 0)
+	sb.TotalBlocks, sb.FreeBlocks = 9, 9
+	sb.RequiredFlags &^= superblock.RequiredTypedLockRecords
+	if _, err := dev.WriteAt(sb.Serialize(), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := fsck.DefaultOptions()
+	opts.Output = &bytes.Buffer{}
+	result := fsck.New(dev, opts).Check()
+	found := false
+	for _, p := range result.Problems {
+		found = found || p.Phase == fsck.PhaseSuperblock && p.Severity == fsck.Fatal && strings.Contains(p.Message, "reformat with -format")
+	}
+	if !result.Aborted || !found {
+		t.Fatalf("fsck of a volume without per-type lock records: aborted=%v, problems %v; want a fatal superblock problem saying to reformat",
+			result.Aborted, result.Problems)
+	}
+}
