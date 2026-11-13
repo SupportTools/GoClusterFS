@@ -401,7 +401,7 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 	if err := fsys.snapshotReg.Delete(ctx, deleting.SnapshotID); err != nil {
 		t.Fatal(err)
 	}
-	if err := fsys.snapshotWkr.ReleaseData(ctx, deleting.DataInode); err != nil {
+	if err := fsys.snapshotWkr.ReleaseData(ctx, deleting.SnapshotID, deleting.DataInode); err != nil {
 		t.Fatal(err)
 	}
 
