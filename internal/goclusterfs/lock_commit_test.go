@@ -26,7 +26,7 @@ func openLockedTreeFS(t *testing.T, path string) *FS {
 	return openLockedTreeFSNode(t, path, newLockImage(t), 1)
 }
 
-const testLockRegion = 1 << 20
+const testLockRegion = superblock.LockRegionSize
 
 func newLockImage(t *testing.T) string {
 	t.Helper()
@@ -68,6 +68,7 @@ func openLockedTreeFSNodeWithRegion(t *testing.T, path, lockPath string, slot in
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], fmt.Sprintf("testnode%08d", slot))
 	lm := lock.NewManager(lockDev, 0, region, nodeUUID, slot)
+	t.Cleanup(lm.ReleaseCached)
 	bm := bitmap.NewRegion(dev, treeFSBitmapOffset, treeFSDataBlocks, lm, nodeUUID)
 	inodeTbl := inode.NewTable(dev, treeFSInodeOffset, 4096*inode.InodeSize, lm, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, lm, treeFSDataOffset)
@@ -305,7 +306,9 @@ func TestConcurrentRefcountReadsDoNotDelaySnapshots(t *testing.T) {
 // A write into an existing block holds the inode lock while it takes the block's
 // extent lock, so it must still succeed when the two locks share a record.
 func TestWriteWhenInodeAndBlockShareLockRecord(t *testing.T) {
-	fsys := openLockedTreeFS(t, newTreeFSImage(t))
+	// Few records, so some file's inode and first block land in one.
+	const region = 4 * lock.RowSize
+	fsys := openLockedTreeFSNodeWithRegion(t, newTreeFSImage(t), newLockImageOfSize(t, region), 1, region)
 	data := bytes.Repeat([]byte{'w'}, storage.SectorSize)
 	for range 32 {
 		f := newRegularFile(t, fsys)
@@ -336,11 +339,10 @@ func TestWriteWhenInodeAndBlockShareLockRecord(t *testing.T) {
 // A whole-sector write must not land between another node's read and write
 // back of the same sector, or that write-back erases it.
 func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
-	// A full-size lock region, so the two writes' other locks do not share a record and serialize them.
 	path := newTreeFSImage(t)
-	lockPath := newLockImageOfSize(t, int64(superblock.LockRegionSize))
-	fsA := openLockedTreeFSNodeWithRegion(t, path, lockPath, 1, superblock.LockRegionSize)
-	fsB := openLockedTreeFSNodeWithRegion(t, path, lockPath, 2, superblock.LockRegionSize)
+	lockPath := newLockImage(t)
+	fsA := openLockedTreeFSNode(t, path, lockPath, 1)
+	fsB := openLockedTreeFSNode(t, path, lockPath, 2)
 	fileA := newRegularFile(t, fsA)
 	fileB := &File{fs: fsB, inodeNum: fileA.inodeNum}
 	writeAt(t, fileA, make([]byte, BlockSize), 0)

@@ -24,6 +24,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 const (
@@ -32,10 +33,9 @@ const (
 	snapFSRefcountOffset = 3 << 20
 	snapFSRegistryOffset = 3<<20 + 64<<10
 	snapFSRegistrySize   = 64 << 10
-	snapFSLockOffset     = 3<<20 + 256<<10
-	snapFSLockSize       = 512 << 10
 	snapFSDataOffset     = 4 << 20
 	snapFSDataBlocks     = 60
+	snapFSLockOffset     = snapFSDataOffset + snapFSDataBlocks*BlockSize
 )
 
 // snapFSNodes hands each opened FS its own node slot, so instances on one
@@ -48,7 +48,7 @@ func newSnapshotFSImage(t *testing.T) string {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(path, snapFSDataOffset+snapFSDataBlocks*BlockSize); err != nil {
+	if err := os.Truncate(path, snapFSLockOffset+superblock.LockRegionSize); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -68,7 +68,8 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], "testnode12345678")
 	nodeUUID[15] = byte(slot)
-	locks := lock.NewManager(dev, snapFSLockOffset, snapFSLockSize, nodeUUID, slot)
+	locks := lock.NewManager(dev, snapFSLockOffset, superblock.LockRegionSize, nodeUUID, slot)
+	t.Cleanup(locks.ReleaseCached)
 	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
