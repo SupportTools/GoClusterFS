@@ -73,6 +73,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - After a partial write into a fallocated range, reads of the other fallocated blocks, and of the rest of the written block, returned old disk contents. They now return zeros.
 - Snapshots and clones never copied on write: block refcounts stopped at 1, so a snapshot kept nothing and a write to a clone changed its source. Each snapshot now keeps the blocks it captured in a hidden inode, a write to a shared block copies it first, and a block is freed only when its last owner lets go.
 - Deleting a snapshot after its file changed failed with a refcount underflow and left the snapshot deleting forever, because the delete used the file's current blocks.
+- A snapshot or clone could undo another node's change to the source file made while the file was being marked shared, such as the new size after an append, a chmod, or new times. The mark now holds the inode lock from its read to its write.
 - Writes failed with `EAGAIN` once a file needed a third extent, so most files over 2 MB could not be written. Extents past the first two now go in an on-disk extent tree, and adjacent extents merge.
 - `goclusterfs-fsck` phase 4 never checked file extents, because it read inodes into unaligned buffers that `O_DIRECT` rejects.
 - A node could serve a stale cached inode after another node freed and reused its inode number. Inode generations now survive free and reuse, and opening a file reloads its inode from disk.

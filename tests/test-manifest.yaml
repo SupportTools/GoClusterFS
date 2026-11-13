@@ -2572,6 +2572,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsConcurrentInPlaceWrite
 
+  - id: snapshot-mark-keeps-concurrent-append
+    name: Snapshot mark keeps another node's append
+    description: Node A appends in place while node B's snapshot marks the file shared; the mark holds the inode lock from its read to its write, so A's new size survives and the snapshot keeps the file from before the append
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestSnapshotMarkKeepsConcurrentAppend
+
   - id: failed-write-frees-unused-copy
     name: A failed write gives back its unused copy
     description: A write that copied a shared block and fails before any inode write frees the copy, and the file keeps its old block and data

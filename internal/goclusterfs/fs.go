@@ -68,6 +68,10 @@ var beforeSizeUpdate func(*File)
 // its blocks, before it marks the file shared.
 var beforeShareMark func()
 
+// duringShareMark lets tests act on other nodes after the mark read the
+// file's inode, before it writes the inode back.
+var duringShareMark func()
+
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected. Back-to-back snapshots on another
 // node can force a retry each time; with conflictBackoff, 10 tries span up to 5s.
@@ -370,11 +374,18 @@ func (f *FS) updateInode(ctx context.Context, num uint32, update func(*inode.Ino
 	}
 }
 
-// updateInodeLocked is updateInode for changes that touch no extents or blocks,
-// such as times and link counts. It holds the inode's lock from the read to the
-// write, so it cannot write back an inode that another node changed in between.
+// updateInodeLocked is updateInode for changes that allocate and free no
+// blocks, such as times, link counts and extent flags. It holds the inode's
+// lock from the read to the write, so it cannot write back an inode that
+// another node changed in between.
 func (f *FS) updateInodeLocked(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
 	defer f.lockInode(num)()
+	return f.updateUnderInodeLock(ctx, num, update)
+}
+
+// updateUnderInodeLock is updateInodeLocked for a caller that already holds
+// lockInode(num).
+func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
 	if f.lockMgr != nil {
 		if err := f.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
@@ -3068,7 +3079,13 @@ func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []ui
 		if beforeShareMark != nil {
 			beforeShareMark()
 		}
-		marked, err := f.updateInode(ctx, srcNum, f.markShared)
+		// Setxattr holds lockInode(srcNum).
+		marked, err := f.updateUnderInodeLock(ctx, srcNum, func(ino *inode.Inode) error {
+			if duringShareMark != nil {
+				duringShareMark()
+			}
+			return f.markShared(ino)
+		})
 		var now []uint64
 		if err == nil {
 			now, err = f.extentMgr.DataBlocks(marked)
