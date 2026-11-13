@@ -2740,6 +2740,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_test.go::TestSnapshotMarkKeepsConcurrentAppend
 
+  - id: deep-clone-chain-two-node-deletes
+    name: Deep clone chain deleted from two nodes
+    description: A chain of 9 files, each a clone of the one before and written at every level, is deleted in random order from two nodes, first one at a time with writes to survivors, then concurrently; every file keeps its content until deleted, every block is freed, no refcount stays above 0, and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/clone_chain_test.go::TestDeepCloneChainDeletedFromTwoNodes
+
   - id: failed-write-frees-unused-copy
     name: A failed write gives back its unused copy
     description: A write that copied a shared block and fails before any inode write frees the copy, and the file keeps its old block and data
