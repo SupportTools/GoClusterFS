@@ -2502,6 +2502,13 @@ scenarios:
     environments:
       go: internal/snapshot/worker_test.go::TestDeleteJobRequiresDeletingState
 
+  - id: snapshot-second-delete-job-reused-inode
+    name: A second delete job leaves a reused data inode alone
+    description: Two delete jobs run for one snapshot; the first frees the data inode and a new file or snapshot takes the slot before the second releases data. The second job leaves the new inode and its block counts intact and succeeds
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestSecondDeleteJobLeavesReusedDataInode
+
   - id: snapshot-failed-write-releases-once
     name: Failed write after a mid-write copy commit
     description: When the final inode write fails after a mid-write persist committed one copied block, each old block loses the file's ownership once across the retry, and uncounted blocks from an older version lose none

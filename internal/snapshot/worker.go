@@ -42,6 +42,9 @@ type Worker struct {
 	registry   *Registry
 	extentMgr  *extent.Manager
 	inodeTable *inode.Table
+	// deleteMu runs this node's delete jobs one at a time. The cluster inode
+	// lock does not keep two goroutines of one node apart.
+	deleteMu sync.Mutex
 
 	jobQueue    chan *Job
 	resultChan  chan *JobResult
@@ -189,9 +192,15 @@ func (w *Worker) processJob(job *Job) *JobResult {
 	}
 }
 
+// afterDeleteJobGet lets tests run another delete job of the same snapshot
+// after this one read the descriptor.
+var afterDeleteJobGet func(snapshotID uint64)
+
 // processDeleteJob re-parents the snapshot's children to its parent, gives
 // back the blocks it captured, and removes its descriptor.
 func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
+	w.deleteMu.Lock()
+	defer w.deleteMu.Unlock()
 	snap, err := w.registry.Get(ctx, job.SnapshotID)
 	if errors.Is(err, ErrSnapshotNotFound) {
 		return nil
@@ -201,6 +210,9 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 	}
 	if snap.State != StateDeleting {
 		return fmt.Errorf("snapshot %d is %s, not deleting: %w", job.SnapshotID, snap.State, ErrSnapshotInvalidState)
+	}
+	if afterDeleteJobGet != nil {
+		afterDeleteJobGet(job.SnapshotID)
 	}
 
 	children, err := w.registry.GetChildren(ctx, job.SnapshotID)
@@ -216,12 +228,17 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 	}
 
 	if snap.HasData() {
-		if err := w.ReleaseData(ctx, snap.DataInode); err != nil {
+		if err := w.ReleaseData(ctx, snap.SnapshotID, snap.DataInode); err != nil {
 			return fmt.Errorf("failed to release data of snapshot %d: %w", job.SnapshotID, err)
 		}
 	}
 
-	if err := w.registry.Remove(ctx, job.SnapshotID); err != nil {
+	err = w.registry.Remove(ctx, job.SnapshotID)
+	if errors.Is(err, ErrSnapshotNotFound) {
+		log.Printf("[snapshot/worker] Snapshot %d was deleted by another job meanwhile", job.SnapshotID)
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("failed to remove snapshot: %w", err)
 	}
 
@@ -237,32 +254,39 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 	return nil
 }
 
-// ReleaseData gives back the blocks held by a snapshot's data inode. The empty
-// extent map is committed before any block is released, so a crash leaks
-// blocks at worst and calling it again is safe.
-func (w *Worker) ReleaseData(ctx context.Context, num uint32) error {
-	const attempts = 5
-	for attempt := 1; ; attempt++ {
-		ino, err := w.inodeTable.Read(num)
+// ReleaseData gives back the blocks held by snapshot snapshotID's data inode
+// num. It empties the inode under its lock, and only while the snapshot's
+// descriptor still names it: the descriptor goes before the inode is freed, so
+// the slot has not been reused. The empty extent map is committed before any
+// block is released, so a crash leaks blocks at worst and calling it again is
+// safe.
+func (w *Worker) ReleaseData(ctx context.Context, snapshotID uint64, num uint32) error {
+	ino, released, err := w.inodeTable.UpdateIf(ctx, num, func(ino *inode.Inode) (bool, error) {
+		desc, err := w.registry.Get(ctx, snapshotID)
+		if errors.Is(err, ErrSnapshotNotFound) {
+			return false, nil
+		}
 		if err != nil {
-			return err
+			return false, err
 		}
-		if ino.Magic == 0 || ino.Flags&inode.FlagSnapshotData == 0 {
-			return nil
+		if desc.DataInode != num || ino.Magic == 0 || ino.Flags&inode.FlagSnapshotData == 0 {
+			return false, nil
 		}
-		if err := w.extentMgr.Truncate(ctx, ino, 0); err != nil {
+		if ino.ExtentCount == 0 && !ino.HasExtentTree() {
+			return false, nil
+		}
+		return true, w.extentMgr.Truncate(ctx, ino, 0)
+	})
+	if err != nil {
+		if ino != nil {
 			w.extentMgr.DiscardPending(ctx, ino)
-			return err
 		}
-		err = w.inodeTable.Write(ctx, ino)
-		if err == nil {
-			return nil
-		}
-		w.extentMgr.DiscardPending(ctx, ino)
-		if !errors.Is(err, inode.ErrTreeConflict) || attempt == attempts {
-			return err
-		}
+		return err
 	}
+	if !released {
+		log.Printf("[snapshot/worker] Nothing to release in inode %d for snapshot %d: already released or no longer its data", num, snapshotID)
+	}
+	return nil
 }
 
 // resultHandler processes completed job results.
