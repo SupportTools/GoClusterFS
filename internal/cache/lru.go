@@ -18,6 +18,7 @@ type LRU[K comparable, V any] struct {
 	capacity int
 	items    map[K]*list.Element
 	order    *list.List // Front = most recent, Back = least recent
+	removed  int        // deletes from items since it was last rebuilt
 
 	// Stats for monitoring
 	hits   uint64
@@ -78,7 +79,7 @@ func (l *LRU[K, V]) GetIf(key K, valid func(V) bool) (V, bool) {
 			return entry.value, true
 		}
 		l.order.Remove(elem)
-		delete(l.items, key)
+		l.removeKey(key)
 	}
 
 	var zero V
@@ -140,7 +141,7 @@ func (l *LRU[K, V]) putLocked(key K, value V) (evictedKey K, evictedValue V, evi
 		oldest := l.order.Back()
 		if oldest != nil {
 			entry := l.order.Remove(oldest).(*lruEntry[K, V])
-			delete(l.items, entry.key)
+			l.removeKey(entry.key)
 			evictedKey = entry.key
 			evictedValue = entry.value
 			evicted = true
@@ -163,7 +164,7 @@ func (l *LRU[K, V]) Delete(key K) (V, bool) {
 
 	if elem, exists := l.items[key]; exists {
 		entry := l.order.Remove(elem).(*lruEntry[K, V])
-		delete(l.items, key)
+		l.removeKey(key)
 		return entry.value, true
 	}
 
@@ -178,6 +179,23 @@ func (l *LRU[K, V]) Clear() {
 
 	l.items = make(map[K]*list.Element, l.capacity)
 	l.order.Init()
+	l.removed = 0
+}
+
+// removeKey deletes key from items. A Go map keeps the room of deleted keys,
+// so items grows while entries churn through it; rebuilding it once it has
+// lost as many keys as the cache holds keeps it at the cache's size.
+func (l *LRU[K, V]) removeKey(key K) {
+	delete(l.items, key)
+	l.removed++
+	if l.removed < l.capacity {
+		return
+	}
+	items := make(map[K]*list.Element, l.capacity)
+	for elem := l.order.Front(); elem != nil; elem = elem.Next() {
+		items[elem.Value.(*lruEntry[K, V]).key] = elem
+	}
+	l.items, l.removed = items, 0
 }
 
 // Len returns the current number of entries in the cache.

@@ -39,22 +39,28 @@ type fsCollector struct {
 	upDesc *prometheus.Desc
 
 	// Cache metrics
-	cacheInodeSizeDesc       *prometheus.Desc
-	cacheInodeHitsDesc       *prometheus.Desc
-	cacheInodeMissesDesc     *prometheus.Desc
-	cacheInodeHitRateDesc    *prometheus.Desc
-	cacheExtentSizeDesc      *prometheus.Desc
-	cacheExtentHitsDesc      *prometheus.Desc
-	cacheExtentMissesDesc    *prometheus.Desc
-	cacheExtentHitRateDesc   *prometheus.Desc
-	cacheNegativeSizeDesc    *prometheus.Desc
-	cacheNegativeHitsDesc    *prometheus.Desc
-	cacheNegativeMissesDesc  *prometheus.Desc
-	cacheNegativeHitRateDesc *prometheus.Desc
-	cacheLockHintSizeDesc    *prometheus.Desc
-	cacheLockHintHitsDesc    *prometheus.Desc
-	cacheLockHintMissesDesc  *prometheus.Desc
-	cacheLockHintHitRateDesc *prometheus.Desc
+	cacheInodeCapacityDesc    *prometheus.Desc
+	cacheExtentCapacityDesc   *prometheus.Desc
+	cacheNegativeCapacityDesc *prometheus.Desc
+	broadcastPeersDesc        *prometheus.Desc
+	broadcastSendersDesc      *prometheus.Desc
+	broadcastMaxPeersDesc     *prometheus.Desc
+	cacheInodeSizeDesc        *prometheus.Desc
+	cacheInodeHitsDesc        *prometheus.Desc
+	cacheInodeMissesDesc      *prometheus.Desc
+	cacheInodeHitRateDesc     *prometheus.Desc
+	cacheExtentSizeDesc       *prometheus.Desc
+	cacheExtentHitsDesc       *prometheus.Desc
+	cacheExtentMissesDesc     *prometheus.Desc
+	cacheExtentHitRateDesc    *prometheus.Desc
+	cacheNegativeSizeDesc     *prometheus.Desc
+	cacheNegativeHitsDesc     *prometheus.Desc
+	cacheNegativeMissesDesc   *prometheus.Desc
+	cacheNegativeHitRateDesc  *prometheus.Desc
+	cacheLockHintSizeDesc     *prometheus.Desc
+	cacheLockHintHitsDesc     *prometheus.Desc
+	cacheLockHintMissesDesc   *prometheus.Desc
+	cacheLockHintHitRateDesc  *prometheus.Desc
 
 	// Journal metrics
 	journalStateDesc          *prometheus.Desc
@@ -112,6 +118,37 @@ func newFSCollector(s *Server) *fsCollector {
 		upDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "up"),
 			"Whether GoClusterFS is up and running",
+			nil, nil,
+		),
+
+		cacheInodeCapacityDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "cache", "inode_capacity"),
+			"Most entries the inode cache holds (-cache-inodes)",
+			nil, nil,
+		),
+		cacheExtentCapacityDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "cache", "extent_capacity"),
+			"Most entries the extent cache holds (-cache-extents)",
+			nil, nil,
+		),
+		cacheNegativeCapacityDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "cache", "negative_capacity"),
+			"Most entries the negative cache holds (-cache-negative)",
+			nil, nil,
+		),
+		broadcastPeersDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "broadcast", "peers"),
+			"Unicast peers this node knows",
+			nil, nil,
+		),
+		broadcastSendersDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "broadcast", "senders"),
+			"Nodes whose broadcast sequence numbers this node tracks",
+			nil, nil,
+		),
+		broadcastMaxPeersDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "broadcast", "max_peers"),
+			"Most entries each broadcast table holds (-broadcast-max-peers)",
 			nil, nil,
 		),
 
@@ -392,6 +429,12 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.upDesc
 
 	// Cache
+	ch <- c.cacheInodeCapacityDesc
+	ch <- c.cacheExtentCapacityDesc
+	ch <- c.cacheNegativeCapacityDesc
+	ch <- c.broadcastPeersDesc
+	ch <- c.broadcastSendersDesc
+	ch <- c.broadcastMaxPeersDesc
 	ch <- c.cacheInodeSizeDesc
 	ch <- c.cacheInodeHitsDesc
 	ch <- c.cacheInodeMissesDesc
@@ -506,6 +549,15 @@ func (c *fsCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c *fsCollector) collectCacheStats(ch chan<- prometheus.Metric, stats *CacheStatsResponse) {
+	ch <- prometheus.MustNewConstMetric(c.cacheInodeCapacityDesc, prometheus.GaugeValue, float64(stats.InodeCache.Capacity))
+	ch <- prometheus.MustNewConstMetric(c.cacheExtentCapacityDesc, prometheus.GaugeValue, float64(stats.ExtentCache.Capacity))
+	ch <- prometheus.MustNewConstMetric(c.cacheNegativeCapacityDesc, prometheus.GaugeValue, float64(stats.NegativeCache.Capacity))
+	if b := stats.Broadcast; b != nil {
+		ch <- prometheus.MustNewConstMetric(c.broadcastPeersDesc, prometheus.GaugeValue, float64(b.Peers))
+		ch <- prometheus.MustNewConstMetric(c.broadcastSendersDesc, prometheus.GaugeValue, float64(b.Senders))
+		ch <- prometheus.MustNewConstMetric(c.broadcastMaxPeersDesc, prometheus.GaugeValue, float64(b.MaxPeers))
+	}
+
 	// Inode cache
 	ch <- prometheus.MustNewConstMetric(c.cacheInodeSizeDesc, prometheus.GaugeValue, float64(stats.InodeCache.Size))
 	ch <- prometheus.MustNewConstMetric(c.cacheInodeHitsDesc, prometheus.CounterValue, float64(stats.InodeCache.Hits))

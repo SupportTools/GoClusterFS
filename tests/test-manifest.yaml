@@ -1973,6 +1973,27 @@ scenarios:
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterDuplication
 
+  - id: cache-size-bounded
+    name: Caches stay within their limits
+    description: Forty times each cache's capacity goes through the inode, extent and negative caches; each keeps at most its capacity and the heap stops growing once it is full
+    priority: go_only
+    environments:
+      go: internal/cache/bounded_test.go::TestCachesStayBounded
+
+  - id: broadcast-peer-table-bounded
+    name: Broadcast peer table stays within its limit
+    description: Ten times MaxPeers peer addresses are added; the table keeps the MaxPeers heard most recently
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestPeerTableBounded
+
+  - id: broadcast-senders-bounded
+    name: Broadcast sequence tracking stays within its limit
+    description: Ten times MaxPeers senders are tracked; at most MaxPeers are kept, including the most recent
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/broadcaster_test.go::TestTrackedSendersBounded
+
   - id: broadcast-loss-drops-caches
     name: Broadcast loss drops caches
     description: A gap in a peer's sequence numbers clears the inode and extent caches once; a late message does not clear them again
