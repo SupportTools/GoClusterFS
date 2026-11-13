@@ -57,10 +57,10 @@ test-unit:
 	@echo "Running unit tests with race detector..."
 	$(GOTEST) -v -race -covermode=atomic -coverprofile=$(COVER_PROFILE) ./internal/...
 
-# Integration tests (requires FUSE and built binary)
+# Full integration suite, including what CI's -short skips (requires FUSE and built binary)
 test-integration: check-fuse build
 	@echo "Running integration tests..."
-	$(GOTEST) -v -timeout 5m ./tests/integration/...
+	$(GOTEST) -v -timeout 30m ./tests/integration/...
 
 # All tests
 test-all: test-unit test-integration
@@ -216,7 +216,7 @@ help:
 	@echo "  Test:"
 	@echo "    test           - Run unit tests (alias for test-unit)"
 	@echo "    test-unit      - Run unit tests with race detector and coverage (no FUSE needed)"
-	@echo "    test-integration - Run integration tests (requires FUSE)"
+	@echo "    test-integration - Run the full integration suite without -short (requires FUSE; about 15 min, 30 min timeout)"
 	@echo "    test-all       - Run all tests (unit + integration)"
 	@echo "    test-parity    - Validate test coverage across environments"
 	@echo "    test-parity-report - Detailed test coverage report"
