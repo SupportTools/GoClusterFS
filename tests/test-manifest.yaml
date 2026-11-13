@@ -422,7 +422,7 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
-  # A stale sector write lands in about 1 of 3 Go runs; shell loops over docker exec and ssh would almost never hit it. The unit test below is the reliable check.
+  # Since #29 this test passes on main too; the inode-sector-neighbor-writes unit test is the regression check, and shell loops over docker exec and ssh would not hit the race either.
   - id: multinode-neighbor-inode-writes
     name: Neighbor inode writes from two nodes
     description: Two nodes write files whose inodes share inode table sectors; every file keeps its data
