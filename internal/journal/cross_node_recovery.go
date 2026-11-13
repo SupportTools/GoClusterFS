@@ -291,19 +291,6 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		return false, err
 	}
 
-	// Check if entry already exists
-	_, _, err = rctx.DirMgr.Lookup(ctx, parentIno, p.Name)
-	if err == nil {
-		// Entry already exists - idempotent skip
-		log.Printf("[Recovery] DirAddEntry: entry %q already exists in parent %d, skipping",
-			p.Name, p.ParentInodeNum)
-		return false, nil
-	}
-	if err != dir.ErrNotFound {
-		return false, fmt.Errorf("lookup failed: %w", err)
-	}
-
-	// Convert entry type
 	var fileType uint8
 	switch p.EntryType {
 	case DirEntryRegular:
@@ -316,13 +303,16 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		fileType = dir.DT_UNKNOWN
 	}
 
-	// Add the entry
-	if err := rctx.DirMgr.Add(ctx, parentIno, p.Name, p.ChildInodeNum, fileType); err != nil {
-		// Check if it's a race condition where another recovery added it
-		if err == dir.ErrExists {
-			log.Printf("[Recovery] DirAddEntry: entry %q added by concurrent recovery, skipping", p.Name)
-			return false, nil
-		}
+	// Add checks that the parent is live and the name is free under the directory lock.
+	err = rctx.DirMgr.Add(ctx, parentIno, p.Name, p.ChildInodeNum, fileType)
+	switch {
+	case errors.Is(err, dir.ErrExists):
+		log.Printf("[Recovery] DirAddEntry: entry %q already exists in parent %d, skipping", p.Name, p.ParentInodeNum)
+		return false, nil
+	case errors.Is(err, dir.ErrRemoved):
+		log.Printf("[Recovery] DirAddEntry: parent %d of %q was removed, skipping", p.ParentInodeNum, p.Name)
+		return false, nil
+	case err != nil:
 		return false, fmt.Errorf("failed to add entry %q: %w", p.Name, err)
 	}
 
@@ -357,37 +347,33 @@ func applyDirRemoveEntry(ctx context.Context, rctx *RecoveryContext, payload []b
 		return false, err
 	}
 
-	childNum, _, err := rctx.DirMgr.Lookup(ctx, parentIno, p.Name)
-	if err == dir.ErrNotFound {
-		// Already removed - idempotent skip
-		log.Printf("[Recovery] DirRemoveEntry: entry %q already removed from parent %d, skipping",
-			p.Name, p.ParentInodeNum)
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("lookup failed: %w", err)
-	}
-	if childNum != p.ChildInodeNum {
-		log.Printf("[Recovery] DirRemoveEntry: %q now names inode %d, not %d, skipping", p.Name, childNum, p.ChildInodeNum)
-		return false, nil
-	}
-	child, err := rctx.InodeTbl.Read(uint32(childNum))
-	if err != nil {
-		return false, fmt.Errorf("child inode %d not found: %w", childNum, err)
-	}
-	if child.MetaGeneration != p.ChildMetaGeneration {
-		log.Printf("[Recovery] DirRemoveEntry: inode %d of %q changed since the unlink was logged, skipping", childNum, p.Name)
-		return false, nil
-	}
-
-	// Remove the entry
-	if err := rctx.DirMgr.Remove(ctx, parentIno, p.Name); err != nil {
-		// Entry may have been removed by concurrent recovery
-		if err == dir.ErrNotFound {
-			log.Printf("[Recovery] DirRemoveEntry: entry %q removed by concurrent recovery, skipping", p.Name)
-			return false, nil
+	var readErr error
+	removed, err := rctx.DirMgr.RemoveIf(ctx, parentIno, p.Name, func(childNum uint64) bool {
+		if childNum != p.ChildInodeNum {
+			log.Printf("[Recovery] DirRemoveEntry: %q now names inode %d, not %d, skipping", p.Name, childNum, p.ChildInodeNum)
+			return false
 		}
+		child, err := rctx.InodeTbl.Read(uint32(childNum))
+		if err != nil {
+			readErr = fmt.Errorf("child inode %d not found: %w", childNum, err)
+			return false
+		}
+		if child.MetaGeneration != p.ChildMetaGeneration {
+			log.Printf("[Recovery] DirRemoveEntry: inode %d of %q changed since the unlink was logged, skipping", childNum, p.Name)
+			return false
+		}
+		return true
+	})
+	switch {
+	case readErr != nil:
+		return false, readErr
+	case errors.Is(err, dir.ErrNotFound), errors.Is(err, dir.ErrRemoved):
+		log.Printf("[Recovery] DirRemoveEntry: %q is not in parent %d, skipping", p.Name, p.ParentInodeNum)
+		return false, nil
+	case err != nil:
 		return false, fmt.Errorf("failed to remove entry %q: %w", p.Name, err)
+	case !removed:
+		return false, nil
 	}
 
 	log.Printf("[Recovery] DirRemoveEntry: removed entry %q from parent %d", p.Name, p.ParentInodeNum)
