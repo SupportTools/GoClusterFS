@@ -8,8 +8,10 @@ type OwnerState uint8
 const (
 	// OwnerAlive is a registered node with a current heartbeat.
 	OwnerAlive OwnerState = iota
-	// OwnerFailing is a node whose heartbeat stopped, or whose journal is being replayed.
+	// OwnerFailing is a live node's slot whose heartbeat stopped.
 	OwnerFailing
+	// OwnerRecovering is a node marked dead whose journal is being replayed.
+	OwnerRecovering
 	// OwnerLost is a node whose journal replay failed or was abandoned.
 	OwnerLost
 	// OwnerReleased is an empty registry slot: its node left, or its replay finished.
@@ -37,6 +39,12 @@ type blocker struct {
 	state    OwnerState
 	occupant [16]byte
 	slot     int
+}
+
+// failing reports whether the node behind the claim is failing or being
+// recovered, so a wait for it has no time limit.
+func (b blocker) failing() bool {
+	return b.state == OwnerFailing || b.state == OwnerRecovering
 }
 
 // worse returns the blocker that limits a wait more: a lost owner ends it, a

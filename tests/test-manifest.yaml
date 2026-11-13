@@ -984,6 +984,29 @@ scenarios:
     environments:
       go: internal/goclusterfs/replay_guard_test.go::TestRmdirFreesDirectoryInode
 
+  - id: crash-between-claim-and-name
+    name: A crash between claiming a new inode and naming it leaves no shared name
+    description: A create or mkdir stops after claiming its inode and before adding the name, and a peer creates a file before replay; the peer's file gets its own inode, no two names share an inode, and fsck finds no errors
+    priority: high
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestCrashBetweenClaimAndNameLeavesNoSharedName
+      docker: TODO  # needs a pause between the claim and the name, which only the Go test hook gives
+      vm: TODO  # a power failure cannot be timed into the window between the claim and the name without that hook
+
+  - id: remove-if-holds-directory-lock
+    name: RemoveIf checks an entry under the directory lock
+    description: A peer node removes the entry while RemoveIf checks it; the peer waits for the directory lock and finds the entry gone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestRemoveIfHoldsDirectoryLockWhileChecking
+
+  - id: dir-changes-refuse-removed-directory
+    name: Directory changes refuse a removed directory
+    description: Add and Remove with a copy of a directory another node removed return ErrRemoved and leave the freed slot unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestDirChangesRefuseRemovedDirectory
+
   - id: failed-write-frees-blocks
     name: Failed writes give back their blocks
     description: A write whose inode write fails frees the blocks it allocated; fsck is clean
@@ -2867,6 +2890,20 @@ scenarios:
     environments:
       go: internal/lock/owner_test.go::TestReplaysSharingRecordTakeTurns
 
+  - id: lock-replay-keeps-live-replay-claims
+    name: A replay does not pass over a live node's replay claims
+    description: A node replaying a dead node in a lower slot stays out of a record that a live node, remounted into its own slot, holds as adopted while it replays its predecessor
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestReplayDoesNotPassOverLiveNodesReplayClaims
+
+  - id: lock-clear-foreign-claims
+    name: A mount clears an earlier occupant's claims in its slot
+    description: After its replay, a node clears claims in its own slot that an earlier occupant left or that are torn, and keeps its own holds
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestClearForeignClaimsKeepsOwnHolds
+
   - id: lock-nested-wait-yields-to-replay
     name: Nested wait on a replaying node yields to the replay
     description: A peer that holds inode Y and waits for a dead node's adopted extent row gives up after the timeout, and the replay, which waits without a limit, takes Y and finishes
@@ -2904,7 +2941,7 @@ scenarios:
 
   - id: mount-own-replay-stops-at-bad-record
     name: Mount stops at a journal record that does not decode
-    description: Any own-journal replay failure other than a lock wait fails the mount at once, with the -skip-recovery hint
+    description: Any own-journal replay failure other than a lock wait returns at once without a retry, and mount fails with the -skip-recovery hint
     priority: go_only
     environments:
       go: cmd/mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode

@@ -687,22 +687,8 @@ func (f *FS) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 }
 
 // Create creates a new file in the root directory.
-func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	ctx = detach(ctx)
-	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
-		node, fh, fuseFlags, errno = f.createFileInternal(ctx, name, flags, mode, out)
-		if errno == syscall.EAGAIN {
-			baseDelay := time.Millisecond * time.Duration(1<<attempt)
-			jitter := time.Duration(rand.Int63n(int64(baseDelay)))
-			backoff := baseDelay + jitter
-			log.Printf("[DEBUG] Create %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
-			time.Sleep(backoff)
-			continue
-		}
-		return
-	}
-	log.Printf("[WARN] Create %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
-	return nil, nil, 0, syscall.EAGAIN
+func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	return f.createFile(detach(ctx), &f.Inode, inode.InodeRoot, name, mode, out)
 }
 
 // claimErrno maps a failure to find or claim an inode slot. Only a slot another
@@ -799,75 +785,132 @@ func (f *FS) freeSlotGeneration(num uint32) uint64 {
 // afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.
 var afterCommit func(op string)
 
-// createFileInternal implements file creation for the root directory.
-func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+// retryClaim runs try again, after a jittered backoff, while another node takes the inode slot it picked first.
+func retryClaim(op, name string, try func() syscall.Errno) syscall.Errno {
+	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
+		errno := try()
+		if errno != syscall.EAGAIN {
+			return errno
+		}
+		baseDelay := time.Millisecond * time.Duration(1<<attempt)
+		backoff := baseDelay + time.Duration(rand.Int63n(int64(baseDelay)))
+		log.Printf("[DEBUG] %s %q: inode slot collision, retry %d/%d (backoff %v)", op, name, attempt+1, MaxCreateRetries, backoff)
+		time.Sleep(backoff)
+	}
+	log.Printf("[WARN] %s %q: exhausted %d retries due to inode slot collisions", op, name, MaxCreateRetries)
+	return syscall.EAGAIN
+}
+
+// owner returns the caller's uid and gid, or the mount's when the request has no caller.
+func (f *FS) owner(ctx context.Context) (uint32, uint32) {
+	if caller, ok := fuse.FromContext(ctx); ok {
+		return caller.Uid, caller.Gid
+	}
+	return f.uid, f.gid
+}
+
+// logCreate commits the intent to create inode num with mode and to name it in directory parentNum.
+func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32, entryType journal.DirEntryType) (uint64, error) {
+	txn := f.journal.Begin()
+	err := txn.LogInodeCreate(&journal.InodeCreatePayload{
+		InodeNum:       uint64(num),
+		Mode:           mode,
+		UID:            uid,
+		GID:            gid,
+		ParentInodeNum: uint64(parentNum),
+		NameHash:       hashString(name),
+		MetaGeneration: f.freeSlotGeneration(num),
+	})
+	if err == nil {
+		err = txn.LogDirAddEntry(&journal.DirAddEntryPayload{
+			ParentInodeNum: uint64(parentNum),
+			ChildInodeNum:  uint64(num),
+			EntryType:      entryType,
+			Name:           name,
+		})
+	}
+	if err != nil {
+		f.journal.Abort(txn)
+		return 0, err
+	}
+	return f.journal.Commit(txn)
+}
+
+// touchParent sets the mtime of directory num, adds links to its link count, and tells other nodes.
+func (f *FS) touchParent(ctx context.Context, num uint32, links uint32, now int64) {
+	// dirMgr.Add may have changed the directory's extents, so update it from disk.
+	dirIno, err := f.updateInodeLocked(ctx, num, func(ino *inode.Inode) error {
+		ino.LinkCount += links
+		ino.Mtime = now
+		return nil
+	})
+	if err != nil {
+		log.Printf("[WARN] directory inode %d: mtime and link count not updated: %v", num, err)
+		return
+	}
+	if f.cacheMgr != nil {
+		f.cacheMgr.BroadcastInvalidateInode(num, dirIno.DataGeneration, dirIno.MetaGeneration)
+	}
+	f.cacheInode(dirIno)
+}
+
+func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode) {
+	out.EntryValid = 0
+	out.AttrValid = 0
+	out.Ino = uint64(ino.InodeNum)
+	out.Mode = uint32(ino.Mode)
+	out.Nlink = uint32(ino.LinkCount)
+	out.Uid = ino.UID
+	out.Gid = ino.GID
+	out.Size = ino.Size
+	out.Atime, out.Atimensec = uint64(ino.Atime/1e9), uint32(ino.Atime%1e9)
+	out.Mtime, out.Mtimensec = uint64(ino.Mtime/1e9), uint32(ino.Mtime%1e9)
+	out.Ctime, out.Ctimensec = uint64(ino.Ctime/1e9), uint32(ino.Ctime%1e9)
+	out.Blksize = BlockSize
+}
+
+// createFile creates a file called name in directory parentNum, whose go-fuse node is parent.
+func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	var node *fs.Inode
+	errno := retryClaim("Create", name, func() (errno syscall.Errno) {
+		node, errno = f.createFileOnce(ctx, parent, parentNum, name, mode, out)
+		return errno
+	})
+	return node, nil, 0, errno
+}
+
+// createFileOnce returns EAGAIN when another node claims the free inode slot it picked first.
+func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	inodeNum, err := f.inodeTbl.FindFreeSlot()
 	if err != nil {
-		return nil, nil, 0, syscall.ENOSPC
+		log.Printf("[DEBUG] Create %q: FindFreeSlot failed: %v", name, err)
+		return nil, syscall.ENOSPC
 	}
-
-	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
+	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
-		return nil, nil, 0, syscall.EIO
+		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", name, parentNum, err)
+		return nil, syscall.EIO
 	}
+	uid, gid := f.owner(ctx)
 
-	uid := f.uid
-	gid := f.gid
-	caller, ok := fuse.FromContext(ctx)
-	if ok {
-		uid = caller.Uid
-		gid = caller.Gid
-	}
-
-	// === WAL: Begin transaction and log intent ===
-	var txn *journal.Transaction
-	var intentSeq uint64
 	if f.journal != nil {
-		txn = f.journal.Begin()
-		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
-			InodeNum:       uint64(inodeNum),
-			Mode:           uint32(inode.S_IFREG) | (mode & 0777),
-			UID:            uid,
-			GID:            gid,
-			ParentInodeNum: uint64(inode.InodeRoot),
-			NameHash:       hashString(name),
-			MetaGeneration: f.freeSlotGeneration(inodeNum),
-		}); err != nil {
-			f.journal.Abort(txn)
-			return nil, nil, 0, syscall.EIO
+		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0777), uid, gid, journal.DirEntryRegular)
+		if err != nil {
+			log.Printf("[DEBUG] Create %q: journal commit failed: %v", name, err)
+			return nil, syscall.EIO
 		}
-		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
-			ParentInodeNum: uint64(inode.InodeRoot),
-			ChildInodeNum:  uint64(inodeNum),
-			EntryType:      journal.DirEntryRegular,
-			Name:           name,
-		}); err != nil {
-			f.journal.Abort(txn)
-			return nil, nil, 0, syscall.EIO
-		}
-		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
-		var commitErr error
-		intentSeq, commitErr = f.journal.Commit(txn)
-		if commitErr != nil {
-			return nil, nil, 0, syscall.EIO
-		}
-		defer f.closeIntent(intentSeq)
+		defer f.closeIntent(seq)
 		if afterCommit != nil {
 			afterCommit("create")
 		}
 	}
-	// === End WAL transaction - intent is now durable ===
 
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
-		return nil, nil, 0, syscall.EIO
-	}
-
+	// Claiming before naming means a crash in between leaks an unnamed inode, not a name for a free slot.
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
-		f.dirMgr.Remove(ctx, dirIno, name)
-		return nil, nil, 0, claimErrno(err)
+		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
+		return nil, claimErrno(err)
 	}
-
 	now := time.Now().UnixNano()
 	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
 	childIno.UID = uid
@@ -876,228 +919,114 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 	childIno.Atime = now
 	childIno.Mtime = now
 	childIno.Ctime = now
-
 	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
+		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
 		f.inodeTbl.Free(ctx, childIno.InodeNum)
-		f.dirMgr.Remove(ctx, dirIno, name)
-		return nil, nil, 0, syscall.EIO
+		return nil, syscall.EIO
+	}
+	if afterCommit != nil {
+		afterCommit("create: inode claimed")
 	}
 
-	// Update cache with freshly-created file inode
+	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
+		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", name, err)
+		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		return nil, syscall.EIO
+	}
 	f.cacheInode(childIno)
+	f.touchParent(ctx, parentNum, 0, now)
 
-	// CRITICAL: Re-read parent directory inode before updating Mtime.
-	// dirMgr.Add() may have allocated a new block and updated extent fields.
-	// Only Size is copied back to dirIno; extent fields are stale.
-	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = f.updateInodeLocked(ctx, inode.InodeRoot, func(ino *inode.Inode) error { ino.Mtime = now; return nil })
-	if err != nil {
-		log.Printf("[DEBUG] Create %q: updating root inode failed: %v", name, err)
-		// The file was created successfully, just log the error
-	} else {
-		// Broadcast invalidation so other nodes refresh their directory cache
-		if f.cacheMgr != nil {
-			f.cacheMgr.BroadcastInvalidateInode(uint32(inode.InodeRoot), dirIno.DataGeneration, dirIno.MetaGeneration)
-		}
-		// Update cache with parent directory inode
-		f.cacheInode(dirIno)
-	}
-
-	file := &File{fs: f, inodeNum: childIno.InodeNum}
-	ch := f.NewPersistentInode(ctx, file, fs.StableAttr{
+	ch := parent.NewPersistentInode(ctx, &File{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  uint64(childIno.InodeNum),
 	})
-
-	out.EntryValid = 0
-	out.AttrValid = 0
-	out.Ino = uint64(childIno.InodeNum)
-	out.Mode = uint32(fuse.S_IFREG | (mode & 0777))
-	out.Nlink = 1
-	out.Uid = uid
-	out.Gid = gid
-	out.Size = 0
-	out.Atime = uint64(now / 1e9)
-	out.Atimensec = uint32(now % 1e9)
-	out.Mtime = uint64(now / 1e9)
-	out.Mtimensec = uint32(now % 1e9)
-	out.Ctime = uint64(now / 1e9)
-	out.Ctimensec = uint32(now % 1e9)
-	out.Blksize = BlockSize
-
-	// === WAL: Mark intent complete ===
-	if f.journal != nil && intentSeq > 0 {
-		if err := f.journal.CompleteIntent(intentSeq); err != nil {
-			log.Printf("[DEBUG] Create %q: CompleteIntent failed: %v", name, err)
-		}
-	}
-
-	return ch, nil, 0, 0
+	fillEntryOut(out, childIno)
+	return ch, 0
 }
 
-// Mkdir creates a new directory in the root directory.
-func (f *FS) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	ctx = detach(ctx)
-	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
-		node, errno := f.mkdirInternal(ctx, name, mode, out)
-		if errno == syscall.EAGAIN {
-			baseDelay := time.Millisecond * time.Duration(1<<attempt)
-			jitter := time.Duration(rand.Int63n(int64(baseDelay)))
-			backoff := baseDelay + jitter
-			log.Printf("[DEBUG] Mkdir %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
-			time.Sleep(backoff)
-			continue
-		}
-		return node, errno
-	}
-	log.Printf("[WARN] Mkdir %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
-	return nil, syscall.EAGAIN
+// makeDir creates a directory called name in directory parentNum, whose go-fuse node is parent.
+func (f *FS) makeDir(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	var node *fs.Inode
+	errno := retryClaim("Mkdir", name, func() (errno syscall.Errno) {
+		node, errno = f.makeDirOnce(ctx, parent, parentNum, name, mode, out)
+		return errno
+	})
+	return node, errno
 }
 
-// mkdirInternal implements directory creation for the root directory.
-func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+// makeDirOnce returns EAGAIN when another node claims the free inode slot it picked first.
+func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	inodeNum, err := f.inodeTbl.FindFreeSlot()
 	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: FindFreeSlot failed: %v", name, err)
 		return nil, syscall.ENOSPC
 	}
-
-	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
+	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: Read parent inode %d failed: %v", name, parentNum, err)
 		return nil, syscall.EIO
 	}
+	uid, gid := f.owner(ctx)
 
-	uid := f.uid
-	gid := f.gid
-	caller, ok := fuse.FromContext(ctx)
-	if ok {
-		uid = caller.Uid
-		gid = caller.Gid
-	}
-
-	// === WAL: Begin transaction and log intent ===
-	var txn *journal.Transaction
-	var intentSeq uint64
 	if f.journal != nil {
-		txn = f.journal.Begin()
-		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
-			InodeNum:       uint64(inodeNum),
-			Mode:           uint32(inode.S_IFDIR) | (mode & 0777),
-			UID:            uid,
-			GID:            gid,
-			ParentInodeNum: uint64(inode.InodeRoot),
-			NameHash:       hashString(name),
-			MetaGeneration: f.freeSlotGeneration(inodeNum),
-		}); err != nil {
-			f.journal.Abort(txn)
+		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR)|(mode&0777), uid, gid, journal.DirEntryDirectory)
+		if err != nil {
+			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
 		}
-		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
-			ParentInodeNum: uint64(inode.InodeRoot),
-			ChildInodeNum:  uint64(inodeNum),
-			EntryType:      journal.DirEntryDirectory,
-			Name:           name,
-		}); err != nil {
-			f.journal.Abort(txn)
-			return nil, syscall.EIO
-		}
-		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
-		var commitErr error
-		intentSeq, commitErr = f.journal.Commit(txn)
-		if commitErr != nil {
-			return nil, syscall.EIO
-		}
-		defer f.closeIntent(intentSeq)
-	}
-	// === End WAL transaction - intent is now durable ===
-
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
-		return nil, syscall.EIO
+		defer f.closeIntent(seq)
 	}
 
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
-		f.dirMgr.Remove(ctx, dirIno, name)
+		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v", name, inodeNum, err)
 		return nil, claimErrno(err)
 	}
-
-	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(inode.InodeRoot)); err != nil {
-		f.dropNewInode(ctx, childIno)
-		f.dirMgr.Remove(ctx, dirIno, name)
-		return nil, syscall.EIO
-	}
-
 	now := time.Now().UnixNano()
 	childIno.Mode = inode.S_IFDIR | uint16(mode&0777)
 	childIno.UID = uid
 	childIno.GID = gid
+	childIno.LinkCount = 2
 	childIno.Atime = now
 	childIno.Mtime = now
 	childIno.Ctime = now
-
+	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(parentNum)); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", name, err)
+		f.dropNewInode(ctx, childIno)
+		return nil, syscall.EIO
+	}
 	err = injectedMkdirFailure()
 	if err == nil {
 		err = f.inodeTbl.Write(ctx, childIno)
 	}
 	if err != nil {
+		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
-		f.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
-
-	// Update cache with freshly-initialized child directory inode
-	f.cacheInode(childIno)
-
-	// CRITICAL: Re-read parent directory inode before updating LinkCount/Mtime.
-	// dirMgr.Add() may have allocated a new block and updated extent fields.
-	// Only Size is copied back to dirIno; extent fields are stale.
-	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = f.updateInodeLocked(ctx, inode.InodeRoot, func(ino *inode.Inode) error {
-		ino.LinkCount++
-		ino.Mtime = now
-		return nil
-	})
-	if err != nil {
-		log.Printf("[WARN] Mkdir %q: link count of directory inode %d not updated: %v", name, inode.InodeRoot, err)
-		// The child directory was created successfully, just log the error
-	} else {
-		// Broadcast invalidation so other nodes refresh their directory cache
-		if f.cacheMgr != nil {
-			f.cacheMgr.BroadcastInvalidateInode(uint32(inode.InodeRoot), dirIno.DataGeneration, dirIno.MetaGeneration)
-		}
-		// Update cache with parent directory inode
-		f.cacheInode(dirIno)
+	if afterCommit != nil {
+		afterCommit("mkdir: inode claimed")
 	}
 
-	childDir := &Dir{fs: f, inodeNum: childIno.InodeNum}
-	ch := f.NewPersistentInode(ctx, childDir, fs.StableAttr{
+	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", name, err)
+		f.dropNewInode(ctx, childIno)
+		return nil, syscall.EIO
+	}
+	f.cacheInode(childIno)
+	f.touchParent(ctx, parentNum, 1, now)
+
+	ch := parent.NewPersistentInode(ctx, &Dir{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
 		Mode: fuse.S_IFDIR,
 		Ino:  uint64(childIno.InodeNum),
 	})
-
-	out.EntryValid = 0
-	out.AttrValid = 0
-	out.Ino = uint64(childIno.InodeNum)
-	out.Mode = uint32(fuse.S_IFDIR | (mode & 0777))
-	out.Nlink = uint32(childIno.LinkCount)
-	out.Uid = uid
-	out.Gid = gid
-	out.Size = childIno.Size
-	out.Atime = uint64(now / 1e9)
-	out.Atimensec = uint32(now % 1e9)
-	out.Mtime = uint64(now / 1e9)
-	out.Mtimensec = uint32(now % 1e9)
-	out.Ctime = uint64(now / 1e9)
-	out.Ctimensec = uint32(now % 1e9)
-	out.Blksize = BlockSize
-
-	// === WAL: Mark intent complete ===
-	if f.journal != nil && intentSeq > 0 {
-		if err := f.journal.CompleteIntent(intentSeq); err != nil {
-			log.Printf("[DEBUG] Mkdir %q: CompleteIntent failed: %v", name, err)
-		}
-	}
-
+	fillEntryOut(out, childIno)
 	return ch, 0
+}
+
+// Mkdir creates a new directory in the root directory.
+func (f *FS) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	return f.makeDir(detach(ctx), &f.Inode, inode.InodeRoot, name, mode, out)
 }
 
 // Unlink removes a file from the root directory.
@@ -1350,433 +1279,13 @@ func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 }
 
 // Create creates a new file.
-//
-// This function wraps createInternal() with a retry loop to handle inode slot
-// collisions that occur when multiple nodes race to create files concurrently.
-// When another node claims the same inode slot, we rollback and retry with a
-// different slot.
-func (d *Dir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	ctx = detach(ctx)
-	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
-		node, fh, fuseFlags, errno = d.createInternal(ctx, name, flags, mode, out)
-		if errno == syscall.EAGAIN {
-			// Jittered exponential backoff: base * 2^attempt + random jitter
-			// This spreads out retries to reduce thundering herd collisions
-			baseDelay := time.Millisecond * time.Duration(1<<attempt) // 1ms, 2ms, 4ms, 8ms, 16ms
-			jitter := time.Duration(rand.Int63n(int64(baseDelay)))    // 0 to baseDelay
-			backoff := baseDelay + jitter
-			log.Printf("[DEBUG] Create %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
-			time.Sleep(backoff)
-			continue
-		}
-		return
-	}
-	log.Printf("[WARN] Create %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
-	return nil, nil, 0, syscall.EAGAIN
-}
-
-// createInternal performs the actual file creation with two-phase allocation.
-//
-// Lock ordering: This function uses a two-phase allocation pattern to respect
-// the lock hierarchy (BlockBitmap Level 6 < Inode Level 8):
-//  1. FindFreeSlot() - no locks
-//  2. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for directory expansion
-//  3. ClaimSlot() - acquires Inode lock (Level 8)
-//
-// WAL Protocol: If journaling is enabled, the function logs intent BEFORE
-// actual metadata writes. The commit point (journal.Commit) ensures crash
-// consistency - operations after commit are recoverable.
-//
-// Returns syscall.EAGAIN if the inode slot was claimed by another node.
-func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	// Phase 1: Find a free inode slot (no distributed locks held)
-	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
-	if err != nil {
-		log.Printf("[DEBUG] Create %q: FindFreeSlot failed: %v", name, err)
-		return nil, nil, 0, syscall.ENOSPC
-	}
-
-	// Phase 2: Read parent directory inode
-	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
-	if err != nil {
-		log.Printf("[DEBUG] Create %q: Read parent inode %d failed: %v", name, d.inodeNum, err)
-		return nil, nil, 0, syscall.EIO
-	}
-
-	// Get uid/gid from context or use defaults
-	uid := d.fs.uid
-	gid := d.fs.gid
-	caller, ok := fuse.FromContext(ctx)
-	if ok {
-		uid = caller.Uid
-		gid = caller.Gid
-	}
-
-	// === WAL: Begin transaction and log intent ===
-	var txn *journal.Transaction
-	var intentSeq uint64
-	if d.fs.journal != nil {
-		txn = d.fs.journal.Begin()
-
-		// Log inode creation intent
-		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
-			InodeNum:       uint64(inodeNum),
-			Mode:           uint32(inode.S_IFREG) | (mode & 0777),
-			UID:            uid,
-			GID:            gid,
-			ParentInodeNum: uint64(d.inodeNum),
-			NameHash:       hashString(name),
-			MetaGeneration: d.fs.freeSlotGeneration(inodeNum),
-		}); err != nil {
-			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Create %q: journal LogInodeCreate failed: %v", name, err)
-			return nil, nil, 0, syscall.EIO
-		}
-
-		// Log directory entry addition intent
-		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
-			ParentInodeNum: uint64(d.inodeNum),
-			ChildInodeNum:  uint64(inodeNum),
-			EntryType:      journal.DirEntryRegular,
-			Name:           name,
-		}); err != nil {
-			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Create %q: journal LogDirAddEntry failed: %v", name, err)
-			return nil, nil, 0, syscall.EIO
-		}
-
-		// COMMIT POINT: After this, the operation WILL complete (even after crash)
-		var commitErr error
-		intentSeq, commitErr = d.fs.journal.Commit(txn)
-		if commitErr != nil {
-			log.Printf("[DEBUG] Create %q: journal commit failed: %v", name, commitErr)
-			return nil, nil, 0, syscall.EIO
-		}
-		defer d.fs.closeIntent(intentSeq)
-	}
-
-	// Phase 3: Add directory entry FIRST (may acquire BlockBitmap lock for directory expansion)
-	// This respects lock ordering: BlockBitmap (Level 6) before Inode (Level 8)
-	if err := d.fs.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
-		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", name, err)
-		return nil, nil, 0, syscall.EIO
-	}
-
-	// Phase 4: Claim the inode slot (acquires Inode lock)
-	// If this fails, another node claimed the slot - rollback the directory entry
-	childIno, err := d.fs.inodeTbl.ClaimSlot(ctx, inodeNum)
-	if err != nil {
-		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v - rolling back", name, inodeNum, err)
-		// Rollback: remove the directory entry we just added
-		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, name); removeErr != nil {
-			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", name, removeErr)
-		}
-		// If slot was taken by another node, signal retry with a different slot
-		return nil, nil, 0, claimErrno(err)
-	}
-
-	// Phase 5: Initialize file inode attributes
-	now := time.Now().UnixNano()
-	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
-	childIno.UID = uid
-	childIno.GID = gid
-	childIno.LinkCount = 1
-	childIno.Atime = now
-	childIno.Mtime = now
-	childIno.Ctime = now
-
-	// Phase 6: Write updated inode
-	if err := d.fs.inodeTbl.Write(ctx, childIno); err != nil {
-		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
-		// Rollback both: free inode and remove directory entry
-		d.fs.inodeTbl.Free(ctx, childIno.InodeNum)
-		d.fs.dirMgr.Remove(ctx, dirIno, name)
-		return nil, nil, 0, syscall.EIO
-	}
-
-	// Update cache with freshly-created file inode
-	d.fs.cacheInode(childIno)
-
-	// CRITICAL: Re-read parent directory inode before updating Mtime.
-	// dirMgr.Add() may have allocated a new block and updated extent fields.
-	// Only Size is copied back to dirIno; extent fields are stale.
-	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = d.fs.updateInodeLocked(ctx, d.inodeNum, func(ino *inode.Inode) error { ino.Mtime = now; return nil })
-	if err != nil {
-		log.Printf("[DEBUG] Create %q: updating parent inode %d failed: %v", name, d.inodeNum, err)
-		// The file was created successfully, just log the error
-	} else {
-		// Broadcast invalidation so other nodes refresh their directory cache
-		if d.fs.cacheMgr != nil {
-			d.fs.cacheMgr.BroadcastInvalidateInode(uint32(d.inodeNum), dirIno.DataGeneration, dirIno.MetaGeneration)
-		}
-		// Update cache with parent directory inode
-		d.fs.cacheInode(dirIno)
-	}
-
-	// Create the file node
-	file := &File{fs: d.fs, inodeNum: childIno.InodeNum}
-	ch := d.NewPersistentInode(ctx, file, fs.StableAttr{
-		Mode: fuse.S_IFREG,
-		Ino:  uint64(childIno.InodeNum),
-	})
-
-	// Populate entry attributes
-	out.EntryValid = 0
-	out.AttrValid = 0
-	out.Ino = uint64(childIno.InodeNum)
-	out.Mode = uint32(fuse.S_IFREG | (mode & 0777))
-	out.Nlink = 1
-	out.Uid = uid
-	out.Gid = gid
-	out.Size = 0
-	out.Atime = uint64(now / 1e9)
-	out.Atimensec = uint32(now % 1e9)
-	out.Mtime = uint64(now / 1e9)
-	out.Mtimensec = uint32(now % 1e9)
-	out.Ctime = uint64(now / 1e9)
-	out.Ctimensec = uint32(now % 1e9)
-	out.Blksize = BlockSize
-
-	// === WAL: Mark intent complete ===
-	// All operations have been successfully executed; mark the intent as complete
-	// so recovery won't replay it.
-	if d.fs.journal != nil && intentSeq > 0 {
-		if err := d.fs.journal.CompleteIntent(intentSeq); err != nil {
-			// Log but don't fail - the operation completed successfully,
-			// worst case is it gets replayed idempotently on recovery
-			log.Printf("[DEBUG] Create %q: CompleteIntent failed: %v", name, err)
-		}
-	}
-
-	return ch, nil, 0, 0
+func (d *Dir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+	return d.fs.createFile(detach(ctx), &d.Inode, d.inodeNum, name, mode, out)
 }
 
 // Mkdir creates a new directory.
-//
-// This function wraps mkdirInternal() with a retry loop to handle inode slot
-// collisions that occur when multiple nodes race to create directories concurrently.
-// When another node claims the same inode slot, we rollback and retry with a
-// different slot.
 func (d *Dir) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	ctx = detach(ctx)
-	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
-		node, errno := d.mkdirInternal(ctx, name, mode, out)
-		if errno == syscall.EAGAIN {
-			// Jittered exponential backoff: base * 2^attempt + random jitter
-			// This spreads out retries to reduce thundering herd collisions
-			baseDelay := time.Millisecond * time.Duration(1<<attempt) // 1ms, 2ms, 4ms, 8ms, 16ms
-			jitter := time.Duration(rand.Int63n(int64(baseDelay)))    // 0 to baseDelay
-			backoff := baseDelay + jitter
-			log.Printf("[DEBUG] Mkdir %q: inode slot collision, retry %d/%d (backoff %v)", name, attempt+1, MaxCreateRetries, backoff)
-			time.Sleep(backoff)
-			continue
-		}
-		return node, errno
-	}
-	log.Printf("[WARN] Mkdir %q: exhausted %d retries due to inode slot collisions", name, MaxCreateRetries)
-	return nil, syscall.EAGAIN
-}
-
-// mkdirInternal performs the actual directory creation with two-phase allocation.
-//
-// Lock ordering: This function uses a two-phase allocation pattern to respect
-// the lock hierarchy (BlockBitmap Level 6 < Inode Level 8):
-//  1. FindFreeSlot() - no locks
-//  2. dirMgr.InitDirectory() - allocates blocks first (Level 6), then acquires inode lock
-//  3. dirMgr.Add() - may acquire BlockBitmap lock (Level 6) for parent directory expansion
-//  4. ClaimSlot() - acquires Inode lock (Level 8)
-//
-// WAL Protocol: If journaling is enabled, the function logs intent BEFORE
-// actual metadata writes. The commit point ensures crash consistency.
-//
-// Note: dirMgr.InitDirectory() already handles lock ordering internally by allocating
-// blocks before acquiring the inode lock.
-//
-// Returns syscall.EAGAIN if the inode slot was claimed by another node.
-func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	// Phase 1: Find a free inode slot (no distributed locks held)
-	inodeNum, err := d.fs.inodeTbl.FindFreeSlot()
-	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: FindFreeSlot failed: %v", name, err)
-		return nil, syscall.ENOSPC
-	}
-
-	// Phase 2: Read parent directory inode
-	dirIno, err := d.fs.inodeTbl.Read(d.inodeNum)
-	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: Read parent inode %d failed: %v", name, d.inodeNum, err)
-		return nil, syscall.EIO
-	}
-
-	// Get uid/gid from context or use defaults
-	uid := d.fs.uid
-	gid := d.fs.gid
-	caller, ok := fuse.FromContext(ctx)
-	if ok {
-		uid = caller.Uid
-		gid = caller.Gid
-	}
-
-	// === WAL: Begin transaction and log intent ===
-	var txn *journal.Transaction
-	var intentSeq uint64
-	if d.fs.journal != nil {
-		txn = d.fs.journal.Begin()
-
-		// Log directory inode creation intent
-		if err := txn.LogInodeCreate(&journal.InodeCreatePayload{
-			InodeNum:       uint64(inodeNum),
-			Mode:           uint32(inode.S_IFDIR) | (mode & 0777),
-			UID:            uid,
-			GID:            gid,
-			ParentInodeNum: uint64(d.inodeNum),
-			NameHash:       hashString(name),
-			MetaGeneration: d.fs.freeSlotGeneration(inodeNum),
-		}); err != nil {
-			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Mkdir %q: journal LogInodeCreate failed: %v", name, err)
-			return nil, syscall.EIO
-		}
-
-		// Log directory entry addition intent
-		if err := txn.LogDirAddEntry(&journal.DirAddEntryPayload{
-			ParentInodeNum: uint64(d.inodeNum),
-			ChildInodeNum:  uint64(inodeNum),
-			EntryType:      journal.DirEntryDirectory,
-			Name:           name,
-		}); err != nil {
-			d.fs.journal.Abort(txn)
-			log.Printf("[DEBUG] Mkdir %q: journal LogDirAddEntry failed: %v", name, err)
-			return nil, syscall.EIO
-		}
-
-		// Note: We don't log BlockAlloc here because we don't know the block number yet.
-		// InitDirectory() will allocate it. In recovery, the block allocation is implicit
-		// from the directory inode's extent info.
-
-		// COMMIT POINT: After this, the operation WILL complete (even after crash)
-		var commitErr error
-		intentSeq, commitErr = d.fs.journal.Commit(txn)
-		if commitErr != nil {
-			log.Printf("[DEBUG] Mkdir %q: journal commit failed: %v", name, commitErr)
-			return nil, syscall.EIO
-		}
-		defer d.fs.closeIntent(intentSeq)
-	}
-
-	// Phase 3: Add directory entry in parent FIRST (may acquire BlockBitmap lock)
-	// This respects lock ordering: BlockBitmap (Level 6) before Inode (Level 8)
-	if err := d.fs.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
-		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", name, err)
-		return nil, syscall.EIO
-	}
-
-	// Phase 4: Claim the inode slot (acquires Inode lock)
-	childIno, err := d.fs.inodeTbl.ClaimSlot(ctx, inodeNum)
-	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v - rolling back", name, inodeNum, err)
-		// Rollback: remove the directory entry we just added
-		if removeErr := d.fs.dirMgr.Remove(ctx, dirIno, name); removeErr != nil {
-			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", name, removeErr)
-		}
-		// If slot was taken by another node, signal retry with a different slot
-		return nil, claimErrno(err)
-	}
-
-	// Phase 5: Initialize directory inode attributes
-	now := time.Now().UnixNano()
-	childIno.Mode = inode.S_IFDIR | uint16(mode&0777)
-	childIno.UID = uid
-	childIno.GID = gid
-	childIno.LinkCount = 2 // . and parent
-	childIno.Atime = now
-	childIno.Mtime = now
-	childIno.Ctime = now
-
-	// Phase 6: Initialize directory contents (allocates data block for . and .. entries)
-	// Note: InitDirectory() handles lock ordering internally
-	if err := d.fs.dirMgr.InitDirectory(ctx, childIno, uint64(d.inodeNum)); err != nil {
-		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", name, err)
-		d.fs.dropNewInode(ctx, childIno)
-		d.fs.dirMgr.Remove(ctx, dirIno, name)
-		return nil, syscall.EIO
-	}
-
-	// Phase 7: Write updated inode
-	err = injectedMkdirFailure()
-	if err == nil {
-		err = d.fs.inodeTbl.Write(ctx, childIno)
-	}
-	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", name, err)
-		d.fs.dropNewInode(ctx, childIno)
-		d.fs.dirMgr.Remove(ctx, dirIno, name)
-		return nil, syscall.EIO
-	}
-
-	// Update cache with freshly-initialized child directory inode
-	d.fs.cacheInode(childIno)
-
-	// CRITICAL: Re-read parent directory inode before updating LinkCount/Mtime.
-	// dirMgr.Add() may have allocated a new block and updated extent fields.
-	// Only Size is copied back to dirIno; extent fields are stale.
-	// Writing the stale dirIno would overwrite the correct extent data on disk.
-	dirIno, err = d.fs.updateInodeLocked(ctx, d.inodeNum, func(ino *inode.Inode) error {
-		// Increment parent link count (for ..)
-		ino.LinkCount++
-		ino.Mtime = now
-		return nil
-	})
-	if err != nil {
-		log.Printf("[WARN] Mkdir %q: link count of directory inode %d not updated: %v", name, d.inodeNum, err)
-		// The child directory was created successfully, just log the error
-		// and skip updating parent LinkCount/Mtime
-	} else {
-		// Broadcast invalidation so other nodes refresh their directory cache
-		if d.fs.cacheMgr != nil {
-			d.fs.cacheMgr.BroadcastInvalidateInode(uint32(d.inodeNum), dirIno.DataGeneration, dirIno.MetaGeneration)
-		}
-		// Update cache with parent directory inode
-		d.fs.cacheInode(dirIno)
-	}
-
-	// Create the directory node
-	childDir := &Dir{fs: d.fs, inodeNum: childIno.InodeNum}
-	ch := d.NewPersistentInode(ctx, childDir, fs.StableAttr{
-		Mode: fuse.S_IFDIR,
-		Ino:  uint64(childIno.InodeNum),
-	})
-
-	// Populate entry attributes
-	out.EntryValid = 0
-	out.AttrValid = 0
-	out.Ino = uint64(childIno.InodeNum)
-	out.Mode = uint32(fuse.S_IFDIR | (mode & 0777))
-	out.Nlink = 2
-	out.Uid = uid
-	out.Gid = gid
-	out.Size = childIno.Size
-	out.Atime = uint64(now / 1e9)
-	out.Atimensec = uint32(now % 1e9)
-	out.Mtime = uint64(now / 1e9)
-	out.Mtimensec = uint32(now % 1e9)
-	out.Ctime = uint64(now / 1e9)
-	out.Ctimensec = uint32(now % 1e9)
-	out.Blksize = BlockSize
-
-	// === WAL: Mark intent complete ===
-	// All operations have been successfully executed; mark the intent as complete
-	// so recovery won't replay it.
-	if d.fs.journal != nil && intentSeq > 0 {
-		if err := d.fs.journal.CompleteIntent(intentSeq); err != nil {
-			// Log but don't fail - the operation completed successfully,
-			// worst case is it gets replayed idempotently on recovery
-			log.Printf("[DEBUG] Mkdir %q: CompleteIntent failed: %v", name, err)
-		}
-	}
-
-	return ch, 0
+	return d.fs.makeDir(detach(ctx), &d.Inode, d.inodeNum, name, mode, out)
 }
 
 // Unlink removes a file.
@@ -3816,26 +3325,12 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 		return syscall.EIO
 	}
 
-	// Find free inode slot for clone (two-phase allocation)
-	cloneInodeNum, err := f.fs.inodeTbl.FindFreeSlot()
+	cloneIno, err := f.fs.claimInode(ctx)
 	if err != nil {
-		log.Printf("[clone] No free inode slots: %v", err)
-		return syscall.ENOSPC
-	}
-
-	// Add directory entry for clone
-	if err := f.fs.dirMgr.Add(ctx, rootIno, cloneName, uint64(cloneInodeNum), dir.DT_REG); err != nil {
-		log.Printf("[clone] Failed to add directory entry: %v", err)
-		return syscall.EIO
-	}
-
-	// Claim the inode slot
-	cloneIno, err := f.fs.inodeTbl.ClaimSlot(ctx, cloneInodeNum)
-	if err != nil {
-		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
-		log.Printf("[clone] Failed to claim inode slot: %v", err)
+		log.Printf("[clone] Failed to claim an inode slot: %v", err)
 		return claimErrno(err)
 	}
+	cloneInodeNum := cloneIno.InodeNum
 
 	now := time.Now().UnixNano()
 	cloneIno.Mode = srcIno.Mode
@@ -3848,10 +3343,14 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 	cloneIno.Ctime = now
 
 	if err := f.fs.shareInto(ctx, srcNum, cloneIno, stillValid); err != nil {
-		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
 		f.fs.discardInode(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to share blocks of inode %d: %v", srcNum, err)
 		return sharingErrno(err)
+	}
+	if err := f.fs.dirMgr.Add(ctx, rootIno, cloneName, uint64(cloneInodeNum), dir.DT_REG); err != nil {
+		f.fs.discardInode(ctx, cloneInodeNum)
+		log.Printf("[clone] Failed to add directory entry: %v", err)
+		return syscall.EIO
 	}
 
 	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, srcNum)

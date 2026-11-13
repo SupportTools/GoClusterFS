@@ -134,8 +134,10 @@ type Occupancy uint8
 const (
 	// OccupiedLive is a node with a current heartbeat.
 	OccupiedLive Occupancy = iota
-	// OccupiedFailing is a node whose heartbeat stopped, or whose journal is being replayed.
+	// OccupiedFailing is a live node's slot whose heartbeat stopped.
 	OccupiedFailing
+	// OccupiedReplaying is a node marked dead whose journal is being replayed.
+	OccupiedReplaying
 	// OccupiedLapsed is a dead node whose replay let its recovery lease lapse: the replay failed or was abandoned.
 	OccupiedLapsed
 	// Unoccupied is an empty slot.
@@ -165,7 +167,9 @@ func (r *Registry) Occupant(slotIdx int, fresh bool) ([16]byte, Occupancy) {
 		return slot.UUID, Unoccupied
 	case slot.State == NodeStateDead && r.failed(slot, HeartbeatTimeout):
 		return slot.UUID, OccupiedLapsed
-	case slot.State == NodeStateDead || r.failed(slot, HeartbeatTimeout):
+	case slot.State == NodeStateDead:
+		return slot.UUID, OccupiedReplaying
+	case r.failed(slot, HeartbeatTimeout):
 		return slot.UUID, OccupiedFailing
 	}
 	return slot.UUID, OccupiedLive

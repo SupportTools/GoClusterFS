@@ -289,7 +289,7 @@ func main() {
 		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, slotIdx)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("Journal recovery for slot %d failed: %v (to discard this journal, mount with -skip-recovery=%d)", slotIdx, err, slotIdx)
 		}
 		if result != nil && result.WasNeeded {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
@@ -299,6 +299,9 @@ func main() {
 		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
 	}
 	releasePrevious(true)
+	if err := lockMgr.ClearForeignClaims(); err != nil {
+		log.Printf("Warning: clearing lock claims earlier occupants left in slot %d failed: %v", slotIdx, err)
+	}
 
 	// Create journal for write-ahead logging (crash consistency)
 	var j *journal.Journal
@@ -592,10 +595,11 @@ func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Jou
 }
 
 var ownerStates = map[node.Occupancy]lock.OwnerState{
-	node.OccupiedLive:    lock.OwnerAlive,
-	node.OccupiedFailing: lock.OwnerFailing,
-	node.OccupiedLapsed:  lock.OwnerLost,
-	node.Unoccupied:      lock.OwnerReleased,
+	node.OccupiedLive:      lock.OwnerAlive,
+	node.OccupiedFailing:   lock.OwnerFailing,
+	node.OccupiedReplaying: lock.OwnerRecovering,
+	node.OccupiedLapsed:    lock.OwnerLost,
+	node.Unoccupied:        lock.OwnerReleased,
 }
 
 // ownReplayRetry is the first wait before a mount retries its own journal
@@ -614,7 +618,7 @@ func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal
 			return result, nil
 		}
 		if !errors.Is(err, lock.ErrLockTimeout) {
-			return nil, fmt.Errorf("journal recovery for slot %d failed: %w (to discard this journal, mount with -skip-recovery=%d)", slot, err, slot)
+			return nil, err
 		}
 		log.Printf("[WARN] Journal recovery for slot %d is waiting for another node's lock: %v; retrying in %v", slot, err, delay)
 		time.Sleep(delay)

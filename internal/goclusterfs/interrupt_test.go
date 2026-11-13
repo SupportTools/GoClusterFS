@@ -126,7 +126,7 @@ func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
 		t.Fatal(err)
 	}
 	release := holdInodeLock(t, nodeA, uint64(slot))
-	_, _, _, errno := nodeB.createFileInternal(context.Background(), "stuck", 0, 0o644, &fuse.EntryOut{})
+	_, errno := nodeB.createFileOnce(context.Background(), &nodeB.Inode, inode.InodeRoot, "stuck", 0o644, &fuse.EntryOut{})
 	release()
 	if errno != syscall.EIO {
 		t.Fatalf("create while inode %d stays locked = %v, want EIO", slot, errno)
