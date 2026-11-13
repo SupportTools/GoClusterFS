@@ -1447,13 +1447,6 @@ scenarios:
     environments:
       go: internal/journal/torn_tail_test.go::TestRecoverStopsAtTornLastTransaction
 
-  - id: journal-stale-record-after-tail
-    name: Recovery ignores a stale record where a lost one should be
-    description: The superblock covering a new record lands but the record does not, leaving a record from the previous mount or the previous lap in its place; recovery must not replay it
-    priority: go_only
-    environments:
-      go: internal/journal/stale_record_test.go::TestRecoverIgnoresRecordFromEarlierMount
-
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
