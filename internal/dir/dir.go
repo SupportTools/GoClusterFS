@@ -72,6 +72,7 @@ var (
 	ErrInvalidEntry = errors.New("invalid directory entry")
 	ErrNoSpace      = errors.New("no space in directory block")
 	ErrCorrupted    = errors.New("directory corrupted")
+	ErrRemoved      = errors.New("directory was removed")
 
 	// errRetryAdd is an internal sentinel error indicating that a concurrent
 	// modification was detected and the Add operation should be retried.
@@ -233,14 +234,12 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 		lockHeld = true
 	}
 
-	// CRITICAL: Re-read the inode from disk after acquiring the lock.
-	// The parameter dirIno may be stale if another node modified the directory.
-	freshIno, err := m.inodeTbl.Read(dirIno.InodeNum)
+	freshIno, err := m.liveDirLocked(dirIno.InodeNum)
 	if err != nil {
 		if lockHeld {
 			m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
 		}
-		return fmt.Errorf("failed to re-read directory inode: %w", err)
+		return err
 	}
 
 	// Check if entry already exists (done under lock to avoid TOCTOU)
@@ -313,63 +312,83 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 
 // Remove removes an entry from a directory.
 func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) error {
+	_, err := m.RemoveIf(ctx, dirIno, name, func(uint64) bool { return true })
+	return err
+}
+
+// RemoveIf removes the entry called name if ok accepts the inode it names. ok runs under the directory lock, so no
+// other node changes the entry between the check and the removal.
+func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool) (bool, error) {
 	if !dirIno.IsDir() {
-		return ErrNotDirectory
+		return false, ErrNotDirectory
 	}
 
 	if name == "" {
-		return ErrNameEmpty
+		return false, ErrNameEmpty
 	}
 
 	if name == "." || name == ".." {
-		return fmt.Errorf("cannot remove %q", name)
+		return false, fmt.Errorf("cannot remove %q", name)
 	}
 
-	// Acquire exclusive lock for write operation
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
-			return fmt.Errorf("failed to acquire directory lock: %w", err)
+			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
 		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
 	}
 
-	// The caller's copy may predate another node's changes to the extent tree.
-	dirIno, err := m.inodeTbl.Read(dirIno.InodeNum)
+	dirIno, err := m.liveDirLocked(dirIno.InodeNum)
 	if err != nil {
-		return fmt.Errorf("failed to re-read directory inode: %w", err)
+		return false, err
 	}
 
-	// Read all blocks and find the entry
 	numBlocks := extent.BlocksForSize(dirIno.Size)
-	if numBlocks == 0 {
-		return ErrNotFound
-	}
-
 	for block := uint64(0); block < numBlocks; block++ {
-		// Look up the extent for this logical block
 		ext, extOffset, err := m.extentMgr.Lookup(dirIno, block)
 		if err == extent.ErrExtentNotFound {
-			// No extent for this block - it's a hole (shouldn't happen for directories)
 			continue
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
 		physBlock := ext.PhysicalBlock + extOffset
 
 		data, err := m.readBlock(physBlock)
 		if err != nil {
-			return err
+			return false, err
 		}
 		for start := 0; start < len(data); start += DirChunkSize {
 			chunk := data[start : start+DirChunkSize]
-			if removeFromChunk(chunk, name) {
-				return m.writeChunk(physBlock, start, chunk)
+			child, found := childInChunk(chunk, name)
+			if !found {
+				continue
 			}
+			if !ok(child) {
+				return false, nil
+			}
+			removeFromChunk(chunk, name)
+			if err := m.writeChunk(physBlock, start, chunk); err != nil {
+				return false, err
+			}
+			return true, nil
 		}
 	}
 
-	return ErrNotFound
+	return false, ErrNotFound
+}
+
+// liveDirLocked re-reads directory num once its lock is held. The caller's copy may predate another node's changes
+// to the directory, or its removal.
+func (m *Manager) liveDirLocked(num uint32) (*inode.Inode, error) {
+	ino, err := m.inodeTbl.Read(num)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-read directory inode: %w", err)
+	}
+	if ino.Magic != inode.InodeMagic || !ino.IsDir() {
+		return nil, ErrRemoved
+	}
+	return ino, nil
 }
 
 // List returns all entries in a directory.
@@ -634,6 +653,15 @@ func addToChunk(chunk []byte, newEntry *DirEntry) bool {
 	return added
 }
 
+func childInChunk(chunk []byte, name string) (child uint64, found bool) {
+	walkChunk(chunk, func(_ int, entry *DirEntry) bool {
+		found = entry.InodeNum != 0 && entry.Name == name
+		child = entry.InodeNum
+		return found
+	})
+	return child, found
+}
+
 // removeFromChunk deletes the entry called name and gives its space to the
 // entry before it in the chunk.
 func removeFromChunk(chunk []byte, name string) bool {
@@ -708,11 +736,9 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		defer m.lockMgr.Release(lock.LockTypeInode, uint64(dirIno.InodeNum))
 	}
 
-	// CRITICAL: Re-read the inode from disk to get the current state.
-	// Another node may have modified the directory while we were allocating the block.
-	freshIno, err := m.inodeTbl.Read(dirIno.InodeNum)
+	freshIno, err := m.liveDirLocked(dirIno.InodeNum)
 	if err != nil {
-		return fmt.Errorf("failed to re-read directory inode: %w", err)
+		return err
 	}
 
 	// CONFLICT DETECTION 1: Check if entry already exists.
