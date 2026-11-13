@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -18,9 +17,8 @@ var (
 
 // TestMultiNodeConcurrentCreatesDoNotCollide has two nodes create files in one
 // directory at the same time. Each node starts its inode search in its own part
-// of the table, so no create fails with EAGAIN and inode claims do not collide.
-// It does not read the files back from the other node: concurrent directory
-// updates can still lose an entry until lock claims are confirmed (PR #29).
+// of the table, so no create fails with EAGAIN and inode claims do not collide,
+// and each node then reads every file back from the other node.
 func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 	perNode := 150
 	if testing.Short() {
@@ -36,7 +34,6 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 		t.Fatalf("start node 1: %v", err)
 	}
 
-	var eioRetries atomic.Int64
 	start := time.Now()
 	errs := cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
 		eagain, failed := 0, 0
@@ -44,11 +41,6 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 		for i := 0; i < perNode; i++ {
 			name := fmt.Sprintf("node%d-%03d", idx, i)
 			err := node.WriteFile(name, []byte(name))
-			// A signal to this process interrupts the FUSE request, and a create waiting for the directory lock then fails with EIO.
-			for retry := 0; errors.Is(err, syscall.EIO) && retry < 5; retry++ {
-				eioRetries.Add(1)
-				err = node.WriteFile(name, []byte(name))
-			}
 			switch {
 			case errors.Is(err, syscall.EAGAIN):
 				eagain++
@@ -67,8 +59,8 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 	elapsed := time.Since(start)
 	collisions := len(claimCollisionRe.FindAllString(logs[0].String(), -1)) +
 		len(claimCollisionRe.FindAllString(logs[1].String(), -1))
-	t.Logf("%d concurrent creates on 2 nodes took %v with %d inode claim collisions and %d EIO retries",
-		2*perNode, elapsed, collisions, eioRetries.Load())
+	t.Logf("%d concurrent creates on 2 nodes took %v with %d inode claim collisions",
+		2*perNode, elapsed, collisions)
 
 	for idx, err := range errs {
 		if err != nil {
@@ -77,6 +69,24 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 	}
 	if collisions > 0 {
 		t.Errorf("%d inode claims collided between the nodes, want 0", collisions)
+	}
+
+	for reader := 0; reader < 2; reader++ {
+		writer := 1 - reader
+		var missing []string
+		_, ok := waitFor(propagationTimeout, func() bool {
+			missing = missing[:0]
+			for i := 0; i < perNode; i++ {
+				name := fmt.Sprintf("node%d-%03d", writer, i)
+				if data, err := cluster.Node(reader).ReadFile(name); err != nil || string(data) != name {
+					missing = append(missing, name)
+				}
+			}
+			return len(missing) == 0
+		})
+		if !ok {
+			t.Errorf("node %d cannot read %d of node %d's files: %v", reader, len(missing), writer, missing)
+		}
 	}
 	if t.Failed() {
 		for idx, buf := range logs {
