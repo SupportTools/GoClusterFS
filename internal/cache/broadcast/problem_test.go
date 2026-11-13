@@ -19,7 +19,7 @@ func TestProblemSaysWhyPeersMissInvalidations(t *testing.T) {
 	if got := tr.Problem(); !strings.Contains(got, "no unicast peers") {
 		t.Errorf("no multicast and no peers: %q", got)
 	}
-	tr.AddPeer("peer", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
+	tr.AddPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9})
 	if got := tr.Problem(); got != "" {
 		t.Errorf("a unicast peer is known: %q", got)
 	}
