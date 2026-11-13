@@ -37,7 +37,7 @@ func unlinkSkippedByReplay(t *testing.T, fsys *FS, path string, offset, size uin
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { otherDev.Close() })
+	t.Cleanup(func() { _ = otherDev.Close() })
 	slot := int(snapFSNodes.Add(1)-1) % 64
 	var otherUUID [16]byte
 	copy(otherUUID[:], "openfileholder12")
@@ -47,7 +47,7 @@ func unlinkSkippedByReplay(t *testing.T, fsys *FS, path string, offset, size uin
 		t.Fatal(err)
 	}
 
-	go fsys.Unlink(ctx, name)
+	go func() { _ = fsys.Unlink(ctx, name) }()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		root, err := fsys.inodeTbl.Read(inode.InodeRoot)
 		if err != nil {
@@ -60,7 +60,7 @@ func unlinkSkippedByReplay(t *testing.T, fsys *FS, path string, offset, size uin
 			t.Fatal("the unlink never removed its entry")
 		}
 	}
-	fsys.dev.Close()
+	_ = fsys.dev.Close()
 	if err := other.Release(lock.LockTypeInode, uint64(num)); err != nil {
 		t.Fatal(err)
 	}

@@ -62,7 +62,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	if err != nil {
 		t.Fatalf("open %s: %v", path, err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 
 	slot := int(snapFSNodes.Add(1)-1) % 64
 	var nodeUUID [16]byte
