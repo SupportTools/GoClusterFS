@@ -288,7 +288,7 @@ func main() {
 		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, slotIdx)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("Journal recovery for slot %d failed: %v (to discard this journal, mount with -skip-recovery=%d)", slotIdx, err, slotIdx)
 		}
 		if result != nil && result.WasNeeded {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
@@ -617,7 +617,7 @@ func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal
 			return result, nil
 		}
 		if !errors.Is(err, lock.ErrLockTimeout) {
-			return nil, fmt.Errorf("journal recovery for slot %d failed: %w (to discard this journal, mount with -skip-recovery=%d)", slot, err, slot)
+			return nil, err
 		}
 		log.Printf("[WARN] Journal recovery for slot %d is waiting for another node's lock: %v; retrying in %v", slot, err, delay)
 		time.Sleep(delay)
