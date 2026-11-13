@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
@@ -278,5 +279,67 @@ func TestKeepIndexFollowsInodeOnlyWrites(t *testing.T) {
 	m.KeepIndex(dirIno.InodeNum, 0, 1<<62)
 	if _, _, ok := m.cachedLookup(dirIno.InodeNum, "x"); ok {
 		t.Fatal("KeepIndex moved an index whose generation was not the one given")
+	}
+}
+
+// Goroutines on one node share its hold on the directory's cluster lock, so only the directory lock keeps their chunk edits apart.
+func TestSameNodeEditsKeepEveryEntry(t *testing.T) {
+	nodes, dirIno := newNodes(t, 2)
+	a, b := nodes[0], nodes[1]
+	ctx := context.Background()
+	const workers, each = 8, 20
+	for i := range workers * each {
+		mustAdd(t, a, dirIno, fmt.Sprintf("old-%d", i), uint64(5000+i))
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*workers*each)
+	for w := range workers {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				if err := a.Add(ctx, dirIno, fmt.Sprintf("new-%d-%d", w, i), uint64(1000+w*each+i), DT_REG); err != nil {
+					errs <- err
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := range each {
+				if err := a.Remove(ctx, dirIno, fmt.Sprintf("old-%d", w*each+i)); err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	entries, err := b.List(ctx, dirIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onDisk := map[string]uint64{}
+	for _, e := range entries {
+		onDisk[e.Name] = e.InodeNum
+	}
+	for w := range workers {
+		for i := range each {
+			name := fmt.Sprintf("new-%d-%d", w, i)
+			if onDisk[name] != uint64(1000+w*each+i) {
+				t.Errorf("%s is missing on disk", name)
+			}
+			if child, err := lookupChild(a, dirIno, name); err != nil || child != onDisk[name] {
+				t.Errorf("node A lookup of %s: inode %d, %v; disk has %d", name, child, err, onDisk[name])
+			}
+			old := fmt.Sprintf("old-%d", w*each+i)
+			if _, ok := onDisk[old]; ok {
+				t.Errorf("%s is still on disk after its removal", old)
+			}
+		}
 	}
 }

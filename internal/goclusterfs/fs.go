@@ -409,16 +409,27 @@ func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*
 	if err != nil {
 		return nil, err
 	}
-	readGen := ino.MetaGeneration
 	if err := update(ino); err != nil {
 		return nil, err
 	}
 	if err := f.inodeTbl.WriteWithLockHeld(ino); err != nil {
 		return nil, err
 	}
-	if ino.IsDir() && f.dirMgr != nil {
-		f.dirMgr.KeepIndex(num, readGen, ino.MetaGeneration)
+	return ino, nil
+}
+
+// updateDirLocked is updateInodeLocked for directory num, under the directory lock that keeps this node's entry changes out, so its index can follow the write.
+func (f *FS) updateDirLocked(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
+	defer f.dirMgr.LockDir(num)()
+	var readGen uint64
+	ino, err := f.updateUnderInodeLock(ctx, num, func(ino *inode.Inode) error {
+		readGen = ino.MetaGeneration
+		return update(ino)
+	})
+	if err != nil {
+		return nil, err
 	}
+	f.dirMgr.KeepIndex(num, readGen, ino.MetaGeneration)
 	return ino, nil
 }
 
@@ -898,7 +909,7 @@ func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32
 // touchParent sets the mtime of directory num, adds links to its link count, and tells other nodes.
 func (f *FS) touchParent(ctx context.Context, num uint32, links uint32, now int64) {
 	// dirMgr.Add may have changed the directory's extents, so update it from disk.
-	dirIno, err := f.updateInodeLocked(ctx, num, func(ino *inode.Inode) error {
+	dirIno, err := f.updateDirLocked(ctx, num, func(ino *inode.Inode) error {
 		ino.LinkCount += links
 		ino.Mtime = now
 		return nil
@@ -1174,7 +1185,7 @@ func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) sys
 		return syscall.EISDIR
 	}
 	now := time.Now().UnixNano()
-	updated, err := f.updateInodeLocked(ctx, num, func(ino *inode.Inode) error {
+	updated, err := f.updateDirLocked(ctx, num, func(ino *inode.Inode) error {
 		if testHookAfterSetattrRead != nil {
 			testHookAfterSetattrRead()
 		}
@@ -1567,7 +1578,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 
 	// Update directory mtime, and its link count for directory removal
 	now := time.Now().UnixNano()
-	if updated, err := d.fs.updateInodeLocked(ctx, d.inodeNum, func(ino *inode.Inode) error {
+	if updated, err := d.fs.updateDirLocked(ctx, d.inodeNum, func(ino *inode.Inode) error {
 		if isDir {
 			ino.LinkCount--
 		}

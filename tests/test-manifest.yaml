@@ -3761,3 +3761,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/dir/index_test.go::TestKeepIndexFollowsInodeOnlyWrites
+
+  - id: dir-same-node-edits
+    name: Same-node entry changes keep every entry
+    description: Goroutines on one node add and remove names in one directory at once; the disk and the node's index agree and lose nothing
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestSameNodeEditsKeepEveryEntry

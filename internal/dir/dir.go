@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -101,6 +102,23 @@ type Manager struct {
 	lockMgr    *lock.Manager
 	dataOffset uint64 // Starting disk offset for data blocks
 	indexes    *indexCache
+	// dirMu serializes this node's changes to a directory: its cluster lock admits every goroutine on the node at once.
+	dirMu [dirStripes]sync.RWMutex
+}
+
+const dirStripes = 256
+
+// LockDir keeps this node's other changes and index builds for directory num out until the returned func runs; take it before any cluster lock.
+func (m *Manager) LockDir(num uint32) func() {
+	mu := &m.dirMu[num%dirStripes]
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (m *Manager) readLockDir(num uint32) func() {
+	mu := &m.dirMu[num%dirStripes]
+	mu.RLock()
+	return mu.RUnlock
 }
 
 // NewManager creates a new directory manager.
@@ -138,6 +156,7 @@ func (m *Manager) Lookup(ctx context.Context, dirIno *inode.Inode, name string) 
 		return s.child, s.ftype, nil
 	}
 
+	defer m.readLockDir(dirIno.InodeNum)()
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeShared); err != nil {
 			return 0, 0, fmt.Errorf("failed to acquire directory lock: %w", err)
@@ -189,6 +208,7 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	}
 	entry.RecLen = entrySize(entry)
 
+	defer m.LockDir(dirIno.InodeNum)()
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to add entries simultaneously, they may race
 	// to allocate the same logical block position. If a conflict is detected,
@@ -304,6 +324,7 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 		return false, fmt.Errorf("cannot remove %q", name)
 	}
 
+	defer m.LockDir(dirIno.InodeNum)()
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
 			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
@@ -357,7 +378,7 @@ func (m *Manager) List(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, er
 		return nil, ErrNotDirectory
 	}
 
-	// Acquire shared lock for read operation
+	defer m.readLockDir(dirIno.InodeNum)()
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeShared); err != nil {
 			return nil, fmt.Errorf("failed to acquire directory lock: %w", err)
@@ -403,6 +424,7 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	if dirIno.Size > 0 {
 		return fmt.Errorf("directory already has content")
 	}
+	defer m.LockDir(dirIno.InodeNum)()
 
 	// IMPORTANT: Block allocation must happen BEFORE acquiring inode lock
 	// to respect lock ordering (bitmap lock level 6 < inode lock level 8)
