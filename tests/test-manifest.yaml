@@ -1408,6 +1408,41 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
 
+  - id: journal-stale-record-after-tail
+    name: Recovery ignores a stale record where a lost one should be
+    description: The superblock covering a new record lands but the record does not, leaving a record from the previous mount or the previous lap in its place; recovery must not replay it
+    priority: go_only
+    environments:
+      go: internal/journal/stale_record_test.go::TestRecoverIgnoresRecordFromEarlierMount
+
+  - id: journal-stale-record-previous-lap
+    name: Recovery ignores a same-size record from the journal's previous lap
+    description: The record a lost one should replace is a transaction of the same size from the same mount's previous lap; only its seq tells it apart, and recovery must not replay it
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverIgnoresSameSizeRecordFromEarlierLap
+
+  - id: journal-stale-completion
+    name: Recovery ignores a completion from an earlier mount
+    description: An intent's completion is lost, and the previous mount's completion of the intent with the same seq is in its place; recovery still replays the intent
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverIgnoresCompletionFromEarlierMount
+
+  - id: journal-commit-order
+    name: Recovery replays transactions committed out of Begin order
+    description: A transaction that began later commits first; both are replayed, since a record's seq is the order it was written in
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverReplaysCommitsOutOfBeginOrder
+
+  - id: journal-version-1-replay
+    name: Recovery reads a version 1 journal as older builds wrote it
+    description: A dirty version 1 journal numbers records in Begin order and uses IntentCompletion records; recovery replays its incomplete transactions
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverReplaysVersion1Journal
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run

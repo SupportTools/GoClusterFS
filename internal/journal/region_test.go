@@ -2,6 +2,7 @@ package journal
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"testing"
 
@@ -180,7 +181,7 @@ func TestRegionWriteRead(t *testing.T) {
 	}
 }
 
-func TestRegionNextSeq(t *testing.T) {
+func TestRegionAppendNumbersRecords(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10*1024*1024)
 	defer cleanup()
 
@@ -190,19 +191,17 @@ func TestRegionNextSeq(t *testing.T) {
 		t.Fatalf("InitRegion failed: %v", err)
 	}
 
-	// Get sequence numbers
-	seq1 := region.NextSeq()
-	seq2 := region.NextSeq()
-	seq3 := region.NextSeq()
-
-	if seq1 != 1 {
-		t.Errorf("First seq = %d, want 1", seq1)
+	record := func(uint64) ([]byte, error) { return make([]byte, 100), nil }
+	for want := uint64(1); want <= 2; want++ {
+		if seq, _, _, err := region.Append(record); err != nil || seq != want {
+			t.Errorf("Append = seq %d, %v; want seq %d", seq, err, want)
+		}
 	}
-	if seq2 != 2 {
-		t.Errorf("Second seq = %d, want 2", seq2)
+	if _, _, _, err := region.Append(func(uint64) ([]byte, error) { return nil, errors.New("no record") }); err == nil {
+		t.Error("Append wrote a record its build failed to make")
 	}
-	if seq3 != 3 {
-		t.Errorf("Third seq = %d, want 3", seq3)
+	if seq, _, _, err := region.Append(record); err != nil || seq != 3 {
+		t.Errorf("Append after a failed one = seq %d, %v; want seq 3, the failed one used none", seq, err)
 	}
 }
 
@@ -331,8 +330,8 @@ func TestRegionReset(t *testing.T) {
 	}
 
 	// Simulate some activity
-	region.NextSeq()
-	region.NextSeq()
+	nextSeq(region)
+	nextSeq(region)
 	if err := region.MarkDirty(); err != nil {
 		t.Fatal(err)
 	}
@@ -428,4 +427,13 @@ func TestRegionJournalFull(t *testing.T) {
 	if err != ErrJournalFull {
 		t.Errorf("Expected ErrJournalFull, got %v", err)
 	}
+}
+
+// nextSeq takes the region's next seq the way Append does, for tests that write records with WriteAt.
+func nextSeq(r *Region) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	seq := r.superblock.NextSeq
+	r.superblock.NextSeq++
+	return seq
 }

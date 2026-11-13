@@ -141,9 +141,24 @@ func NewTransaction(seq uint64, nodeUUID [16]byte, generation uint64) *Transacti
 	}
 }
 
-// Seq returns the transaction's sequence number.
+// Seq returns the transaction's sequence number, which Commit assigns as it writes the record.
 func (txn *Transaction) Seq() uint64 {
 	return txn.header.Seq
+}
+
+func (txn *Transaction) setSeq(seq uint64) {
+	txn.header.Seq = seq
+}
+
+// completionLength is the length of a completion record: a header and the completed intent's seq.
+const completionLength = TxnHeaderSize + 8
+
+// completionRecord marks intent intentSeq done. Version 2 journals write it in place of an IntentCompletion, so that
+// it carries the seq and owner every record is checked against.
+func completionRecord(seq uint64, nodeUUID [16]byte, generation, intentSeq uint64) ([]byte, error) {
+	txn := NewTransaction(seq, nodeUUID, generation)
+	txn.data = binary.LittleEndian.AppendUint64(nil, intentSeq)
+	return txn.serialize(TxnTypeIntentComplete)
 }
 
 // EntryCount returns the number of entries in the transaction.
@@ -185,8 +200,11 @@ func (txn *Transaction) TotalLength() uint32 {
 // Serialize converts the transaction to bytes for writing to disk.
 // Sets the type to TxnTypeCommit and computes checksum.
 func (txn *Transaction) Serialize() ([]byte, error) {
-	// Update header
-	txn.header.Type = TxnTypeCommit
+	return txn.serialize(TxnTypeCommit)
+}
+
+func (txn *Transaction) serialize(typ TxnType) ([]byte, error) {
+	txn.header.Type = typ
 	txn.header.EntryCount = uint32(len(txn.entries))
 	txn.header.TotalLength = txn.TotalLength()
 
