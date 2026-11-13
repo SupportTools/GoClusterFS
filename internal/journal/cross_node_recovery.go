@@ -126,7 +126,7 @@ type txnApplyResult struct {
 // applyTransaction applies a single recovered transaction idempotently.
 func applyTransaction(ctx context.Context, rctx *RecoveryContext, txn *RecoveredTxn) (*txnApplyResult, error) {
 	result := &txnApplyResult{}
-	r := newTxnReplay()
+	r := newTxnReplay(txn.Header.OwnerNodeUUID)
 
 	for _, entry := range txn.Entries {
 		applied, err := applyEntry(ctx, rctx, r, entry)
@@ -147,12 +147,13 @@ func applyTransaction(ctx context.Context, rctx *RecoveryContext, txn *Recovered
 // node's. A peer can take a dead node's locks before its journal is replayed, so each record checks that what it
 // changes is still as the operation left it.
 type txnReplay struct {
+	owner   [16]byte
 	created map[uint64]bool
 	wrote   map[uint32]uint64
 }
 
-func newTxnReplay() *txnReplay {
-	return &txnReplay{created: make(map[uint64]bool), wrote: make(map[uint32]uint64)}
+func newTxnReplay(owner [16]byte) *txnReplay {
+	return &txnReplay{owner: owner, created: make(map[uint64]bool), wrote: make(map[uint32]uint64)}
 }
 
 // unchanged reports whether ino is in use and was last written before a record logged its MetaGeneration as gen, or
@@ -194,7 +195,8 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 	}
 }
 
-// applyInodeCreate claims the inode's slot if it is still free and nobody used it since the create was logged.
+// applyInodeCreate claims the inode's slot if it is still free and nobody used it since the create was logged, or
+// takes over the create's own claim if it landed before the crash.
 func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeInodeCreate(payload)
 	if err != nil {
@@ -205,13 +207,49 @@ func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		return free.MetaGeneration == p.MetaGeneration
 	})
 	if errors.Is(err, inode.ErrInodeInUse) {
-		log.Printf("[Recovery] InodeCreate: slot %d is in use or was used since, skipping", p.InodeNum)
-		return false, nil
+		ino, err = r.ownClaim(rctx, p)
+		if ino == nil && err == nil {
+			log.Printf("[Recovery] InodeCreate: slot %d is in use or was used since, skipping", p.InodeNum)
+			return false, nil
+		}
 	}
 	if err != nil {
 		return false, fmt.Errorf("failed to claim inode %d: %w", p.InodeNum, err)
 	}
 
+	if ino.Mode == 0 {
+		if err := initCreated(ctx, rctx, ino, p); err != nil {
+			return false, fmt.Errorf("failed to set up inode %d: %w", p.InodeNum, err)
+		}
+	}
+	r.created[p.InodeNum] = true
+	r.wrote[ino.InodeNum] = ino.MetaGeneration
+
+	log.Printf("[Recovery] InodeCreate: created inode %d", p.InodeNum)
+	return true, nil
+}
+
+// ownClaim returns the slot's inode if the create's own claim landed and nothing wrote the inode since: the logging
+// node wrote it last, and at most as often as a create does before adding the name.
+func (r *txnReplay) ownClaim(rctx *RecoveryContext, p *InodeCreatePayload) (*inode.Inode, error) {
+	ino, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
+	if err != nil {
+		return nil, err
+	}
+	writes := ino.MetaGeneration - p.MetaGeneration
+	maxWrites := uint64(2) // the claim, then the attributes
+	if uint16(p.Mode)&inode.S_IFMT == inode.S_IFDIR {
+		maxWrites = 3 // the claim, "." and "..", then the attributes
+	}
+	if ino.Magic != inode.InodeMagic || ino.LastModifierUUID != r.owner || writes < 1 || writes > maxWrites ||
+		ino.Mode != 0 && ino.Mode != uint16(p.Mode) {
+		return nil, nil
+	}
+	return ino, nil
+}
+
+// initCreated gives a newly claimed inode the logged attributes, and a directory its "." and ".." entries.
+func initCreated(ctx context.Context, rctx *RecoveryContext, ino *inode.Inode, p *InodeCreatePayload) error {
 	ino.Mode = uint16(p.Mode)
 	ino.UID = p.UID
 	ino.GID = p.GID
@@ -219,14 +257,11 @@ func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 	ino.Atime = now
 	ino.Mtime = now
 	ino.Ctime = now
-	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
-		return false, fmt.Errorf("failed to write inode %d: %w", p.InodeNum, err)
+	if !ino.IsDir() {
+		return rctx.InodeTbl.Write(ctx, ino)
 	}
-	r.created[p.InodeNum] = true
-	r.wrote[ino.InodeNum] = ino.MetaGeneration
-
-	log.Printf("[Recovery] InodeCreate: created inode %d", p.InodeNum)
-	return true, nil
+	ino.LinkCount = 2
+	return rctx.DirMgr.InitDirectory(ctx, ino, p.ParentInodeNum)
 }
 
 // applyInodeUpdate updates an inode's metadata.
@@ -314,6 +349,14 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		return false, nil
 	case err != nil:
 		return false, fmt.Errorf("failed to add entry %q: %w", p.Name, err)
+	}
+	if p.EntryType == DirEntryDirectory {
+		if err := rctx.InodeTbl.Update(ctx, uint32(p.ParentInodeNum), func(parent *inode.Inode) error {
+			parent.LinkCount++
+			return nil
+		}); err != nil {
+			return true, fmt.Errorf("failed to count the link from %q in parent %d: %w", p.Name, p.ParentInodeNum, err)
+		}
 	}
 
 	log.Printf("[Recovery] DirAddEntry: added entry %q -> inode %d in parent %d",
