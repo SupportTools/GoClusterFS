@@ -1399,6 +1399,47 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
 
+  - id: cow-write-power-failure
+    name: Power failure during copy-on-write writes to a snapshotted file
+    description: Power fails at each device write of a write that copies blocks a snapshot shares; after replay fsck finds only leaks, which repair fixes, each block holds its old or new data and the snapshot is unchanged. The VM test rewrites blocks with fsync until a power failure and checks every acknowledged write
+    priority: high
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringCopyOnWrite
+      docker: TODO  # a container stop flushes the page cache and cannot cut power
+      vm: run-vm-tests.sh::test_cow_write_power_failure
+
+  - id: snapshot-create-delete-power-failure
+    name: Power failure while snapshots are created and deleted
+    description: Power fails at each device write of a snapshot create, and of a delete with its background job; the file and other snapshots keep their data and the snapshot is either gone or complete. The VM test creates and deletes snapshots until a power failure and checks each acknowledged step
+    priority: high
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringSnapshotCreate
+      docker: TODO  # a container stop flushes the page cache and cannot cut power
+      vm: run-vm-tests.sh::test_snapshot_create_delete_power_failure
+
+  - id: snapshot-delete-power-failure-go
+    name: Power failure at each write of a snapshot delete
+    description: Power fails at each device write of a snapshot delete and its background job; the file and the other snapshot keep their data and the deleted snapshot is either gone or intact
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringSnapshotDelete
+
+  - id: trim-reuse-power-failure
+    name: Power failure between freeing blocks and discarding them
+    description: Power fails at each device write of an unlink whose blocks TRIM has queued; after replay a new file reuses the blocks and TRIM flushes with discards that punch holes, and no file loses data. The VM test, with discard passed to the shared disk, removes and rewrites files until a power failure and checks every acknowledged file
+    priority: high
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringUnlinkThenTrimAfterReuse
+      docker: TODO  # a container stop flushes the page cache and cannot cut power
+      vm: run-vm-tests.sh::test_trim_reuse_power_failure
+
+  - id: journal-torn-tail
+    name: Recovery stops at a torn last transaction
+    description: The last sector of a multi-sector transaction never lands; recovery replays the transactions before it and stops
+    priority: go_only
+    environments:
+      go: internal/journal/torn_tail_test.go::TestRecoverStopsAtTornLastTransaction
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
