@@ -52,7 +52,6 @@ func crashAfterCommit(t *testing.T, fsys *FS, op string) <-chan struct{} {
 	return crashed
 }
 
-// remountAndReplay opens the image as the next mount would and replays the journal.
 // remountAndReplay opens the image as a new node and replays the crashed node's
 // journal, keeping that node's locks through the replay as mount does.
 func remountAndReplay(t *testing.T, path string, offset, size uint64) *FS {
