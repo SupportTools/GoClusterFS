@@ -183,7 +183,7 @@ func TestStalledNodesWritesStopAtWriteGate(t *testing.T) {
 	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 		t.Fatalf("stop node A: %v", err)
 	}
-	defer cluster.KillNode(0)
+	defer func() { _ = cluster.KillNode(0) }()
 
 	waitSlotEmpty(t, cluster.ImagePath, nodeA.slot, 90*time.Second)
 	if err := b.WriteFileAt("fenced", bytes.Repeat([]byte{'B'}, 4096), 0); err != nil {
@@ -221,7 +221,7 @@ func waitSlotEmpty(t *testing.T, imagePath string, slot int, timeout time.Durati
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dev.Close()
+	defer mustClose(t, dev)
 	sb, err := superblock.Read(dev)
 	if err != nil {
 		t.Fatal(err)

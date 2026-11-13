@@ -35,12 +35,6 @@ linters:
       - path: ^cmd/mount/
         linters: [errcheck]
 
-      - path: ^tests/benchmark/
-        linters: [errcheck]
-
-      - path: ^tests/integration/
-        linters: [errcheck]
-
       - path: ^internal/goclusterfs/fs\.go$
         linters: [unused]
         text: "errRetryCreate|field sb is unused"
