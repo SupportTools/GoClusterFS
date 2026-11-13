@@ -68,6 +68,7 @@ func openLockedTreeFSNodeWithRegion(t *testing.T, path, lockPath string, slot in
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], fmt.Sprintf("testnode%08d", slot))
 	lm := lock.NewManager(lockDev, 0, region, nodeUUID, slot)
+	t.Cleanup(lm.ReleaseCached)
 	bm := bitmap.NewRegion(dev, treeFSBitmapOffset, treeFSDataBlocks, lm, nodeUUID)
 	inodeTbl := inode.NewTable(dev, treeFSInodeOffset, 4096*inode.InodeSize, lm, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, lm, treeFSDataOffset)

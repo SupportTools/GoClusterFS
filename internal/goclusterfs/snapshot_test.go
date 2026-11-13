@@ -69,6 +69,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	copy(nodeUUID[:], "testnode12345678")
 	nodeUUID[15] = byte(slot)
 	locks := lock.NewManager(dev, snapFSLockOffset, superblock.LockRegionSize, nodeUUID, slot)
+	t.Cleanup(locks.ReleaseCached)
 	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
