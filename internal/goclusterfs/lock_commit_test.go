@@ -18,6 +18,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // openLockedTreeFS is openTreeFS with a lock manager, as on a real mount.
@@ -26,13 +27,20 @@ func openLockedTreeFS(t *testing.T, path string) *FS {
 	return openLockedTreeFSNode(t, path, newLockImage(t), 1)
 }
 
+const testLockRegion = 1 << 20
+
 func newLockImage(t *testing.T) string {
+	t.Helper()
+	return newLockImageOfSize(t, testLockRegion)
+}
+
+func newLockImageOfSize(t *testing.T, size int64) string {
 	t.Helper()
 	lockPath := filepath.Join(t.TempDir(), "locks.img")
 	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Truncate(lockPath, 1<<20); err != nil {
+	if err := os.Truncate(lockPath, size); err != nil {
 		t.Fatal(err)
 	}
 	return lockPath
@@ -41,6 +49,11 @@ func newLockImage(t *testing.T) string {
 // openLockedTreeFSNode opens the image as one node of a cluster whose lock region
 // is lockPath; nodes differ by slot.
 func openLockedTreeFSNode(t *testing.T, path, lockPath string, slot int) *FS {
+	t.Helper()
+	return openLockedTreeFSNodeWithRegion(t, path, lockPath, slot, testLockRegion)
+}
+
+func openLockedTreeFSNodeWithRegion(t *testing.T, path, lockPath string, slot int, region uint64) *FS {
 	t.Helper()
 	dev, err := storage.Open(path)
 	if err != nil {
@@ -55,7 +68,7 @@ func openLockedTreeFSNode(t *testing.T, path, lockPath string, slot int) *FS {
 
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], fmt.Sprintf("testnode%08d", slot))
-	lm := lock.NewManager(lockDev, 0, 1<<20, nodeUUID, slot)
+	lm := lock.NewManager(lockDev, 0, region, nodeUUID, slot)
 	bm := bitmap.NewRegion(dev, treeFSBitmapOffset, treeFSDataBlocks, lm, nodeUUID)
 	inodeTbl := inode.NewTable(dev, treeFSInodeOffset, 4096*inode.InodeSize, lm, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, lm, treeFSDataOffset)
@@ -293,10 +306,11 @@ func TestConcurrentRefcountReadsDoNotDelaySnapshots(t *testing.T) {
 // A whole-sector write must not land between another node's read and write
 // back of the same sector, or that write-back erases it.
 func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
+	// A full-size lock region, so the two writes' other locks rarely share a record and serialize them.
 	path := newTreeFSImage(t)
-	lockPath := newLockImage(t)
-	fsA := openLockedTreeFSNode(t, path, lockPath, 1)
-	fsB := openLockedTreeFSNode(t, path, lockPath, 2)
+	lockPath := newLockImageOfSize(t, int64(superblock.LockRegionSize))
+	fsA := openLockedTreeFSNodeWithRegion(t, path, lockPath, 1, superblock.LockRegionSize)
+	fsB := openLockedTreeFSNodeWithRegion(t, path, lockPath, 2, superblock.LockRegionSize)
 	fileA := newRegularFile(t, fsA)
 	fileB := &File{fs: fsB, inodeNum: fileA.inodeNum}
 	writeAt(t, fileA, make([]byte, BlockSize), 0)
