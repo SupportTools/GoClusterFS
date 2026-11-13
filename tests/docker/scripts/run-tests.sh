@@ -2425,6 +2425,47 @@ test_extent_cache_coherency() {
     return 0
 }
 
+# Node B has read a directory; it must see node A's creates and removes there.
+test_dir_index_follows_other_node() {
+    log "Testing that lookups follow another node's directory changes..."
+
+    local writer="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]}"
+    local d="/mnt/goclusterfs/dirindex_$(date +%s)"
+
+    exec_on_node "$writer" sh -c "mkdir $d && for i in \$(seq 1 200); do : > $d/f\$i; done"
+    sleep 1.5
+    if ! exec_on_node "$reader" sh -c "for i in \$(seq 1 200); do stat $d/f\$i > /dev/null || exit 1; done"; then
+        log "ERROR: $reader could not stat every file $writer made in $d"
+        return 1
+    fi
+
+    exec_on_node "$writer" sh -c "echo new > $d/new && rm $d/f5 && rm $d/f6 && echo again > $d/f6"
+    # The reader's kernel may keep old entries for its 1s -attr-timeout.
+    sleep 1.5
+
+    local failed=0
+    if [[ "$(exec_on_node "$reader" cat "$d/new")" != new ]]; then
+        log "ERROR: $reader does not see $d/new"
+        failed=1
+    fi
+    if exec_on_node "$reader" test -e "$d/f5"; then
+        log "ERROR: $reader still sees $d/f5 after $writer removed it"
+        failed=1
+    fi
+    if [[ "$(exec_on_node "$reader" cat "$d/f6")" != again ]]; then
+        log "ERROR: $reader reads the removed $d/f6, not its replacement"
+        failed=1
+    fi
+    exec_on_node "$writer" rm -rf "$d"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log "Directory lookup coherency test passed"
+    return 0
+}
+
 # Print the free 1MB blocks that statfs reports on node $1
 statfs_free_blocks() {
     exec_on_node "$1" stat -f -c %f /mnt/goclusterfs
@@ -3285,6 +3326,7 @@ run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
 run_test "More Than 4096 Files" test_more_than_4096_files
 run_test "Extent Cache Coherency" test_extent_cache_coherency
+run_test "Directory Lookup Coherency" test_dir_index_follows_other_node
 run_test "Statfs After Remount" test_statfs_after_remount
 run_test "Statfs Multi-Node" test_statfs_multinode
 run_test "Rolling Restart" test_rolling_restart

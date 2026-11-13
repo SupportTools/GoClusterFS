@@ -62,6 +62,12 @@ type fsCollector struct {
 	cacheLockHintMissesDesc   *prometheus.Desc
 	cacheLockHintHitRateDesc  *prometheus.Desc
 
+	dirIndexEntriesDesc  *prometheus.Desc
+	dirIndexDirsDesc     *prometheus.Desc
+	dirIndexHitsDesc     *prometheus.Desc
+	dirIndexMissesDesc   *prometheus.Desc
+	dirIndexRebuildsDesc *prometheus.Desc
+
 	// Journal metrics
 	journalStateDesc          *prometheus.Desc
 	journalHeadOffsetDesc     *prometheus.Desc
@@ -237,6 +243,32 @@ func newFSCollector(s *Server) *fsCollector {
 		cacheLockHintHitRateDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "cache", "lock_hint_hit_rate"),
 			"Lock hint cache hit rate (0.0-1.0)",
+			nil, nil,
+		),
+
+		dirIndexEntriesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "dir_index", "entries"),
+			"Names held in in-memory directory indexes",
+			nil, nil,
+		),
+		dirIndexDirsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "dir_index", "dirs"),
+			"Directories with an in-memory index",
+			nil, nil,
+		),
+		dirIndexHitsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "dir_index", "hits_total"),
+			"Name lookups answered from a directory index",
+			nil, nil,
+		),
+		dirIndexMissesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "dir_index", "misses_total"),
+			"Name lookups that took the directory lock because no current index existed",
+			nil, nil,
+		),
+		dirIndexRebuildsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "dir_index", "rebuilds_total"),
+			"Full reads of a directory to build its index",
 			nil, nil,
 		),
 
@@ -451,6 +483,11 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cacheLockHintHitsDesc
 	ch <- c.cacheLockHintMissesDesc
 	ch <- c.cacheLockHintHitRateDesc
+	ch <- c.dirIndexEntriesDesc
+	ch <- c.dirIndexDirsDesc
+	ch <- c.dirIndexHitsDesc
+	ch <- c.dirIndexMissesDesc
+	ch <- c.dirIndexRebuildsDesc
 
 	// Journal
 	ch <- c.journalStateDesc
@@ -581,6 +618,14 @@ func (c *fsCollector) collectCacheStats(ch chan<- prometheus.Metric, stats *Cach
 	ch <- prometheus.MustNewConstMetric(c.cacheLockHintHitsDesc, prometheus.CounterValue, float64(stats.LockHintCache.Hits))
 	ch <- prometheus.MustNewConstMetric(c.cacheLockHintMissesDesc, prometheus.CounterValue, float64(stats.LockHintCache.Misses))
 	ch <- prometheus.MustNewConstMetric(c.cacheLockHintHitRateDesc, prometheus.GaugeValue, stats.LockHintCache.HitRate)
+
+	if d := stats.DirIndex; d != nil {
+		ch <- prometheus.MustNewConstMetric(c.dirIndexEntriesDesc, prometheus.GaugeValue, float64(d.Entries))
+		ch <- prometheus.MustNewConstMetric(c.dirIndexDirsDesc, prometheus.GaugeValue, float64(d.Dirs))
+		ch <- prometheus.MustNewConstMetric(c.dirIndexHitsDesc, prometheus.CounterValue, float64(d.Hits))
+		ch <- prometheus.MustNewConstMetric(c.dirIndexMissesDesc, prometheus.CounterValue, float64(d.Misses))
+		ch <- prometheus.MustNewConstMetric(c.dirIndexRebuildsDesc, prometheus.CounterValue, float64(d.Rebuilds))
+	}
 }
 
 func (c *fsCollector) collectJournalStats(ch chan<- prometheus.Metric, stats *JournalStatsResponse) {

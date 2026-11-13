@@ -409,11 +409,15 @@ func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*
 	if err != nil {
 		return nil, err
 	}
+	readGen := ino.MetaGeneration
 	if err := update(ino); err != nil {
 		return nil, err
 	}
 	if err := f.inodeTbl.WriteWithLockHeld(ino); err != nil {
 		return nil, err
+	}
+	if ino.IsDir() && f.dirMgr != nil {
+		f.dirMgr.KeepIndex(num, readGen, ino.MetaGeneration)
 	}
 	return ino, nil
 }

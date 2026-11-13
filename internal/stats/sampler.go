@@ -7,6 +7,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/api"
 	"github.com/supporttools/GoClusterFS/internal/cache"
+	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
@@ -21,6 +22,8 @@ const (
 type CacheSource interface{ Stats() cache.Stats }
 
 type LockSource interface{ Stats() lock.Stats }
+
+type DirSource interface{ IndexStats() dir.IndexStats }
 
 type JournalSource interface{ Stats() journal.JournalStats }
 
@@ -42,6 +45,7 @@ type NodeSource interface {
 type Sources struct {
 	Cache     CacheSource
 	Locks     LockSource
+	Dirs      DirSource
 	Journal   JournalSource
 	Trim      TrimSource
 	Blocks    BlockSource
@@ -130,6 +134,12 @@ func (s *Sampler) sampleCounters() {
 	}
 	if s.src.Cache != nil {
 		s.current.Cache = cacheResponse(s.src.Cache.Stats(), locks)
+	}
+	if s.src.Dirs != nil {
+		if s.current.Cache == nil {
+			s.current.Cache = &api.CacheStatsResponse{}
+		}
+		s.current.Cache.DirIndex = dirIndexInfo(s.src.Dirs.IndexStats())
 	}
 	if s.src.Journal != nil {
 		s.current.Journal = journalResponse(s.src.Journal.Stats())

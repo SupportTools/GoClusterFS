@@ -1799,6 +1799,54 @@ test_extent_cache_coherency() {
     return 0
 }
 
+# Node B has read a directory; it must see node A's creates and removes there.
+test_dir_index_follows_other_node() {
+    log_info "Testing that lookups follow another VM's directory changes..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping directory lookup coherency test (requires 2+ VMs)"
+        return 0
+    fi
+
+    ensure_cluster_healthy 2
+
+    local writer=1
+    local reader=2
+    local d="/mnt/goclusterfs/dirindex_$(date +%s)"
+
+    ssh_run "$writer" "mkdir $d && for i in \$(seq 1 200); do : > $d/f\$i; done"
+    sleep 1.5
+    if ! ssh_run "$reader" "for i in \$(seq 1 200); do stat $d/f\$i > /dev/null || exit 1; done"; then
+        log_error "VM $reader could not stat every file VM $writer made in $d"
+        return 1
+    fi
+
+    ssh_run "$writer" "echo new > $d/new && rm $d/f5 && rm $d/f6 && echo again > $d/f6"
+    # The reader's kernel may keep old entries for its 1s -attr-timeout.
+    sleep 1.5
+
+    local failed=0
+    if [[ "$(ssh_run "$reader" "cat $d/new")" != new ]]; then
+        log_error "VM $reader does not see $d/new"
+        failed=1
+    fi
+    if ssh_run "$reader" "test -e $d/f5"; then
+        log_error "VM $reader still sees $d/f5 after VM $writer removed it"
+        failed=1
+    fi
+    if [[ "$(ssh_run "$reader" "cat $d/f6")" != again ]]; then
+        log_error "VM $reader reads the removed $d/f6, not its replacement"
+        failed=1
+    fi
+    ssh_run "$writer" "rm -rf $d"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log_info "Directory lookup coherency test passed"
+    return 0
+}
+
 # Print the free 1MB blocks that statfs reports on VM $1
 statfs_free_blocks_on_vm() {
     ssh_run "$1" "stat -f -c %f /mnt/goclusterfs"
@@ -3593,6 +3641,7 @@ main() {
     run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
     run_test "More Than 4096 Files" test_more_than_4096_files
     run_test "Extent Cache Coherency" test_extent_cache_coherency
+    run_test "Directory Lookup Coherency" test_dir_index_follows_other_node
     run_test "Statfs After Remount" test_statfs_after_remount
     run_test "Statfs Multi-Node" test_statfs_multinode
     run_test "Rolling Restart" test_rolling_restart
