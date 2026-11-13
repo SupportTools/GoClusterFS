@@ -637,6 +637,15 @@ scenarios:
       docker: TODO  # needs a lock record written as the stopped node at a known moment; Go-only harness
       vm: TODO  # same as docker
 
+  - id: stalled-node-writes-stop-at-write-gate
+    name: Stalled node's write stops at the write gate
+    description: Node A is stopped while a writer writes through it; after node B replays A and writes the file, A resumes with its heartbeat held, so its queued write reaches the write gate first, which refuses it and stops A, and the file keeps B's data byte for byte
+    priority: high
+    environments:
+      go: lock_reclaim_test.go::TestStalledNodesWritesStopAtWriteGate
+      docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
+      vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
+
   - id: lock-adopt-owner
     name: Replaying node takes over a dead node's exclusive locks
     description: AdoptOwner holds the dead node's exclusive records through the replay and ReleaseAdopted frees them; shared records and other nodes' records stay

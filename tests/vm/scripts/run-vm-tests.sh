@@ -50,6 +50,10 @@ test_failed=0
 run_test() {
     local test_name="$1"
     local test_func="$2"
+    # VM_TEST_ONLY runs only the tests whose names contain it
+    if [[ -n "${VM_TEST_ONLY:-}" && "$test_name" != *"$VM_TEST_ONLY"* ]]; then
+        return 0
+    fi
 
     log_info "=========================================="
     log_info "Running test: $test_name"
@@ -2987,6 +2991,82 @@ unmount_goclusterfs() {
     done
 }
 
+# A node stopped while a writer writes through it is proven dead and replayed by
+# a peer, and the peer writes the file. When the stopped node resumes, its
+# heartbeat is held (GOCLUSTERFS_TEST_HEARTBEAT_HOLD), so its queued write reaches
+# the write gate first. The gate must refuse it and stop the node, and the
+# file must keep the peer's data byte for byte.
+test_stalled_node_writes_stop_at_write_gate() {
+    log_info "Testing that a stalled node's queued write stops at the write gate..."
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: Need at least 2 VMs for this test"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+    local stalled=1 peer=2 pids waited
+    unmount_goclusterfs "$stalled" || { log_error "VM $stalled: unmount failed"; return 1; }
+    setup_goclusterfs "$stalled" false "GOCLUSTERFS_TEST_HEARTBEAT_HOLD=30s"
+
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/fenced && sync"
+    ssh_run "$stalled" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/fenced.A"
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/fenced.B"
+    ssh_run "$stalled" "nohup sh -c 'while dd if=/tmp/fenced.A of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc 2>/dev/null; do :; done' < /dev/null > /dev/null 2>&1 &"
+    sleep 1
+
+    local marker="stalled-node gate test: stopping VM $stalled $(date +%s)"
+    mark_vm_logs "$marker"
+    pids=$(mount_pids "$stalled")
+    ssh_run "$stalled" "kill -STOP $(echo $pids)"
+    local peer_log stalled_log
+    peer_log=$(get_vm_mount_log "$peer")
+    stalled_log=$(get_vm_mount_log "$stalled")
+    waited=0
+    until sed -n "/$marker/,\$p" "$peer_log" | grep -q "Starting journal replay for node"; do
+        if [[ $waited -ge 120 ]]; then
+            log_error "VM $peer did not start replaying VM $stalled within 120s"
+            ssh_run "$stalled" "kill -CONT $(echo $pids)"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    sleep 5
+    if ! ssh_run "$peer" "dd if=/tmp/fenced.B of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc 2>/dev/null && sync"; then
+        log_error "VM $peer could not write after taking over"
+        ssh_run "$stalled" "kill -CONT $(echo $pids)"
+        return 1
+    fi
+    ssh_run "$stalled" "kill -CONT $(echo $pids)"
+
+    # The held heartbeat stops the node after 30s whatever the gate does; by then a write the gate let through has landed.
+    waited=0
+    while [[ -n "$(mount_pids "$stalled")" && $waited -lt 45 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    local result=0
+    if ! ssh_run "$peer" "cmp -s ${GOCLUSTERFS_MOUNT}/fenced /tmp/fenced.B"; then
+        log_error "fenced does not hold VM $peer's data after VM $stalled resumed"
+        result=1
+    fi
+    if [[ -n "$(mount_pids "$stalled")" ]]; then
+        log_error "VM $stalled did not stop after resuming from its takeover"
+        result=1
+    fi
+    if ! sed -n "/$marker/,\$p" "$stalled_log" | grep -q "checking the slot before a write"; then
+        log_error "VM $stalled stopped without its write gate checking the slot"
+        result=1
+    fi
+
+    if [[ -n "$(mount_pids "$stalled")" ]]; then
+        crash_goclusterfs "$stalled" || true
+    fi
+    ssh_run "$stalled" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fenced'; fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
+    setup_goclusterfs "$stalled" false
+    [[ $result -eq 0 ]] && log_info "Stalled node's queued write stopped at the write gate"
+    return $result
+}
+
 # A power failure while files are written may leave blocks that no file maps.
 # With every node unmounted, fsck -repair frees any it finds, the check after
 # it is clean, and no file changes.
@@ -3538,6 +3618,7 @@ main() {
     run_test "Reversed Write Order" test_reversed_write_order
     run_test "Concurrent Writes Power Failure" test_concurrent_writes_power_failure
     run_test "fsck Repair After Power Failure" test_fsck_repair_after_power_failure
+    run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
 
     # Summary
     log_info "=========================================="
