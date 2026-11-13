@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/logging"
 )
 
 // MaxResponseSize bounds how much of one response the client reads.
@@ -77,13 +79,26 @@ func (c *Client) BaseURL() string {
 	return c.baseURL
 }
 
-// doRequest performs an HTTP request and returns the response body.
+// doRequest performs an HTTP request and returns the response body. A
+// status of 400 or above is an *APIError.
 func (c *Client) doRequest(ctx context.Context, method, path string) ([]byte, error) {
+	body, status, err := c.send(ctx, method, path)
+	if err != nil {
+		return nil, err
+	}
+	if status >= 400 {
+		return nil, apiError(status, body)
+	}
+	return body, nil
+}
+
+// send performs an HTTP request and returns the body and status whatever the status.
+func (c *Client) send(ctx context.Context, method, path string) ([]byte, int, error) {
 	url := c.baseURL + path
 
 	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Accept", "application/json")
@@ -91,37 +106,33 @@ func (c *Client) doRequest(ctx context.Context, method, path string) ([]byte, er
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
 
+	start := time.Now()
+	logging.Debugf("%s %s (token set: %v, timeout %v)", method, url, c.token != "", c.httpClient.Timeout)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
+		logging.Debugf("%s %s failed after %v: %v", method, url, time.Since(start).Round(time.Millisecond), err)
+		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize+1))
+	logging.Debugf("%s %s: %s, %d bytes in %v", method, url, resp.Status, len(body), time.Since(start).Round(time.Millisecond))
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, 0, fmt.Errorf("read response: %w", err)
 	}
 
 	if len(body) > MaxResponseSize {
-		return nil, fmt.Errorf("response from %s is larger than %d bytes", path, MaxResponseSize)
+		return nil, 0, fmt.Errorf("response from %s is larger than %d bytes", path, MaxResponseSize)
 	}
+	return body, resp.StatusCode, nil
+}
 
-	if resp.StatusCode >= 400 {
-		var errResp ErrorResponse
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-			return nil, &APIError{
-				StatusCode: resp.StatusCode,
-				Message:    errResp.Error,
-				Details:    errResp.Details,
-			}
-		}
-		return nil, &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    http.StatusText(resp.StatusCode),
-		}
+func apiError(status int, body []byte) *APIError {
+	var errResp ErrorResponse
+	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
+		return &APIError{StatusCode: status, Message: errResp.Error, Details: errResp.Details}
 	}
-
-	return body, nil
+	return &APIError{StatusCode: status, Message: http.StatusText(status)}
 }
 
 // Get performs a GET request and decodes the JSON response into v.

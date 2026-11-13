@@ -27,7 +27,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 ./goclusterfs-fsck ./disk.img                                 # device is a positional argument
 ```
 
-`goclusterfs-mount` stays in the foreground until the filesystem is unmounted. `-format` formats and then mounts. It logs a lot of `[DEBUG]` lines even without `-debug`, which only turns on go-fuse request tracing. Flags and defaults: `./goclusterfs-mount -h`, `./goclusterfs-fsck -h`, [docs/API-CONFIG.md](docs/API-CONFIG.md).
+`goclusterfs-mount` stays in the foreground until the filesystem is unmounted. `-format` formats and then mounts. `-debug` turns on `[DEBUG]` log lines and `-fuse-debug` go-fuse request tracing. The three commands share exit codes (`internal/cli`), listed in the README. Flags and defaults: `./goclusterfs-mount -h`, `./goclusterfs-fsck -h`, [docs/API-CONFIG.md](docs/API-CONFIG.md).
 
 ## Code Map
 
@@ -56,6 +56,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
 | `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
+| `internal/cli` | Exit codes, flag parsing and error hints shared by the three commands |
+| `internal/logging` | The `-debug` switch: `logging.Debugf` prints only with `-debug` |
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
 | `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
 | `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
