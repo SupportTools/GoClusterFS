@@ -8,6 +8,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // openSharedDevice opens one image twice, as two nodes sharing a device do.
@@ -42,14 +43,17 @@ func openSharedDevice(t *testing.T, size int64) (*storage.Device, *storage.Devic
 func newNodeTable(dev *storage.Device, name string, slot int) *Table {
 	var uuid [16]byte
 	copy(uuid[:], name)
-	return NewTable(dev, 0, 4<<20, lock.NewManager(dev, 8<<20, 1<<20, uuid, slot), uuid)
+	return NewTable(dev, 0, 4<<20, lock.NewManager(dev, lockOffset, superblock.LockRegionSize, uuid, slot), uuid)
 }
+
+// A full-size lock region: a smaller one can put both inode locks on one record and serialize the writes.
+const lockOffset = 8 << 20
 
 // TestNeighborInodeWritesFromTwoNodes has two nodes update two inodes in one
 // table sector at once. Each write rewrites the whole sector, so an unlocked
 // sector lets one node put back a stale copy of the other node's inode.
 func TestNeighborInodeWritesFromTwoNodes(t *testing.T) {
-	devA, devB := openSharedDevice(t, 16<<20)
+	devA, devB := openSharedDevice(t, lockOffset+superblock.LockRegionSize)
 	tables := []*Table{newNodeTable(devA, "node-a", 1), newNodeTable(devB, "node-b", 2)}
 	ctx := context.Background()
 
