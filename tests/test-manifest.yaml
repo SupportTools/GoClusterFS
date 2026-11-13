@@ -2760,6 +2760,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestWriteWhenInodeAndBlockShareLockRecord
 
+  - id: lock-long-hold-stays-fresh
+    name: Long lock hold stays fresh
+    description: A node holding a lock longer than the stale threshold, with no new acquires, keeps other nodes out because a background renewer rewrites its claim slot
+    priority: go_only
+    environments:
+      go: internal/lock/renew_test.go::TestLongHoldStaysFreshWithoutNewAcquires
+
+  - id: lock-adopted-slots-stay-fresh
+    name: Adopted lock slots stay fresh during a long replay
+    description: Claims a replaying node took over from a dead node keep other nodes out past the stale threshold until ReleaseAdopted
+    priority: go_only
+    environments:
+      go: internal/lock/renew_test.go::TestAdoptedSlotsStayFreshUntilReleased
+
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
     description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old

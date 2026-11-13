@@ -240,6 +240,7 @@ func main() {
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
+	lockMgr.Start()
 	nodeReg.SetOwnerDeadHandler(func(owner [16]byte, slot int) func() { return adoptLocks(lockMgr, owner, slot) })
 	releasePrevious := func() {}
 	if owner, ok := nodeReg.DeadPreviousOwner(); ok {

@@ -145,6 +145,8 @@ type Manager struct {
 	tornCount atomic.Int32
 	// slotWrite, when a test sets it, replaces the device write of a slot.
 	slotWrite func(buf []byte, offset int64) (int, error)
+	// stopRenew and renewDone run the renewer between Start and Stop.
+	stopRenew, renewDone chan struct{}
 
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
@@ -182,6 +184,7 @@ type heldLock struct {
 
 type heldRecord struct {
 	mode    LockMode
+	key     lockKey // the key this node's slot names
 	keys    int
 	since   time.Time // when this node claimed the record
 	renewed time.Time // when this node last wrote its slot
@@ -206,6 +209,9 @@ func covers(held, want LockMode) bool {
 // renewAfter is the age of a slot after which this node writes it again before
 // relying on it, so other nodes never see a slot in use as stale.
 var renewAfter = StaleThreshold / 3
+
+// staleAfter is StaleThreshold; tests shorten it.
+var staleAfter = StaleThreshold
 
 // acquireTimeout is how long Acquire waits at most; tests shorten it.
 var acquireTimeout = DefaultTimeout
@@ -504,7 +510,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.claimed })
 
 	m.mu.Lock()
-	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: time.Now(), renewed: written}
+	m.records[recordID] = &heldRecord{mode: mode, key: key, keys: 1, since: time.Now(), renewed: written}
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
 	return true, true, nil

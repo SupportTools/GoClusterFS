@@ -47,8 +47,9 @@ type claimSlot struct {
 }
 
 type adoptedSlot struct {
-	slot  int
-	owner [16]byte
+	slot    int
+	owner   [16]byte
+	renewed time.Time
 }
 
 type slotRef struct {
@@ -105,7 +106,7 @@ func isZeroSlot(buf []byte) bool {
 }
 
 func (s *claimSlot) stale() bool {
-	return time.Since(time.Unix(0, s.acquireTime)) > StaleThreshold
+	return time.Since(time.Unix(0, s.acquireTime)) > staleAfter
 }
 
 func rowSlot(row []byte, slot int) []byte {

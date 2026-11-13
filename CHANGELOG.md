@@ -85,3 +85,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The README quick start now uses the real binary names and flags.
 - Create, mkdir, clone and snapshot failed with "No space left on device" when the lock wait for the new inode gave up or its slot could not be read. They now fail with `EIO`. `ENOSPC` means the inode table is full.
 - Directory entries went only into the first 4 KB of each 1 MB directory block, so a block held about 250 short names or 15 long ones, and a busy directory took a new block every few creates. Entries now fill the whole block. A lookup reads each block in one I/O, and an add or remove writes only the 4 KB it changed.
+- A lock held for more than 15 seconds by one operation, or by a node replaying a crashed node's journal, went stale, and another node could take it while it was still in use. The holding node now writes its claims again every few seconds in the background.

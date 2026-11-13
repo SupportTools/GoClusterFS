@@ -53,13 +53,14 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (b
 	case err != nil:
 		dead = &claimSlot{owner: owner}
 	}
+	now := time.Now()
 	dead.mode, dead.adopted = LockModeExclusive, true
-	dead.acquireTime = time.Now().UnixNano()
+	dead.acquireTime = now.UnixNano()
 	if err := m.writeSlot(recordID, ownerSlot, dead); err != nil {
 		return false, err
 	}
 	m.mu.Lock()
-	m.adopted[recordID] = adoptedSlot{slot: ownerSlot, owner: owner}
+	m.adopted[recordID] = adoptedSlot{slot: ownerSlot, owner: owner, renewed: now}
 	m.mu.Unlock()
 	return true, nil
 }
