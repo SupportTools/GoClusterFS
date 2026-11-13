@@ -3593,3 +3593,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/setattr_race_test.go::TestFileSetattrKeepsOtherNodesSize
+
+  - id: logging-no-ungated-debug
+    name: No [DEBUG] line bypasses -debug
+    description: No non-test Go file calls log.Printf or log.Println with a [DEBUG] prefix; they go through logging.Debugf
+    priority: go_only
+    environments:
+      go: internal/logging/guard_test.go::TestDebugLinesGoThroughDebugf
