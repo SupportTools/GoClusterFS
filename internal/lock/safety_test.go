@@ -132,6 +132,9 @@ func TestConcurrentAcquireOnOneNodeKeepsOtherNodesOut(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
+	// The workers wait for each other while holding, so all must join the hold, however late the scheduler starts them.
+	defer func(d time.Duration) { holdTurn = d }(holdTurn)
+	holdTurn = time.Minute
 
 	const workers = 4
 	for iter := 0; iter < 30; iter++ {
