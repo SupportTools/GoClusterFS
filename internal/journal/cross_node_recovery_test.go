@@ -50,7 +50,7 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
 
-	nodeUUID := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	nodeUUID := testNodeUUID
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, nil, nodeUUID)
@@ -79,7 +79,7 @@ func TestApplyInodeCreate(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
 	// Create a payload for inode creation
 	// Note: Use inode number < 100 since test context only creates 100 inodes
@@ -132,7 +132,7 @@ func TestApplyInodeUpdate(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
 	// First, create an inode to update
 	// Note: Use inode number < 100 since test context only creates 100 inodes
@@ -168,7 +168,7 @@ func TestApplyInodeDelete(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
 	// First, create an inode to delete
 	// Note: Use inode number < 100 since test context only creates 100 inodes
@@ -280,34 +280,9 @@ func TestApplyDirAddEntry(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
-	// Create a parent directory inode
-	parentPayload := &InodeCreatePayload{
-		InodeNum: uint64(inode.InodeRoot),
-		Mode:     uint32(inode.S_IFDIR | 0755),
-		UID:      0,
-		GID:      0,
-	}
-	if _, err := applyInodeCreate(ctx, rctx, r, parentPayload.Serialize()); err != nil {
-		t.Fatalf("Setup: failed to create parent inode: %v", err)
-	}
-
-	// Update link count for parent
-	parentIno, err := rctx.InodeTbl.Read(inode.InodeRoot)
-	if err != nil {
-		t.Fatalf("Setup: failed to read parent inode: %v", err)
-	}
-	parentIno.LinkCount = 2
-	if err := rctx.InodeTbl.Write(ctx, parentIno); err != nil {
-		t.Fatalf("Setup: failed to write parent inode: %v", err)
-	}
-
-	// Initialize the directory structure
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
-	if err := rctx.DirMgr.InitDirectory(ctx, parentIno, uint64(inode.InodeRoot)); err != nil {
-		t.Fatalf("Setup: failed to init directory: %v", err)
-	}
+	newRootDir(t, rctx)
 
 	// Create a child inode
 	childPayload := &InodeCreatePayload{
@@ -337,7 +312,7 @@ func TestApplyDirAddEntry(t *testing.T) {
 	}
 
 	// Verify the entry was added
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
+	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	childNum, _, err := rctx.DirMgr.Lookup(ctx, parentIno, "testfile.txt")
 	if err != nil {
 		t.Fatalf("Failed to lookup added entry: %v", err)
@@ -361,25 +336,9 @@ func TestApplyDirRemoveEntry(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
-	// Setup: Create parent dir, child inode, and add entry
-	parentPayload := &InodeCreatePayload{
-		InodeNum: uint64(inode.InodeRoot),
-		Mode:     uint32(inode.S_IFDIR | 0755),
-	}
-	if _, err := applyInodeCreate(ctx, rctx, r, parentPayload.Serialize()); err != nil {
-		t.Fatalf("Setup: failed to create parent inode: %v", err)
-	}
-	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
-	parentIno.LinkCount = 2
-	if err := rctx.InodeTbl.Write(ctx, parentIno); err != nil {
-		t.Fatal(err)
-	}
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
-	if err := rctx.DirMgr.InitDirectory(ctx, parentIno, uint64(inode.InodeRoot)); err != nil {
-		t.Fatalf("Setup: failed to init directory: %v", err)
-	}
+	newRootDir(t, rctx)
 
 	childPayload := &InodeCreatePayload{InodeNum: 20, Mode: 0644}
 	if _, err := applyInodeCreate(ctx, rctx, r, childPayload.Serialize()); err != nil {
@@ -417,7 +376,7 @@ func TestApplyDirRemoveEntry(t *testing.T) {
 	}
 
 	// Verify the entry was removed
-	parentIno, _ = rctx.InodeTbl.Read(inode.InodeRoot)
+	parentIno, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	_, _, err = rctx.DirMgr.Lookup(ctx, parentIno, "toremove.txt")
 	if err != dir.ErrNotFound {
 		t.Errorf("Entry should be removed, but Lookup returned err=%v", err)
@@ -438,7 +397,7 @@ func TestApplyExtentAdd(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
 	// Create an inode to attach the extent to
 	inodePayload := &InodeCreatePayload{
@@ -496,7 +455,7 @@ func TestApplyExtentAdd(t *testing.T) {
 	}
 
 	// A second replay finds the inode written since the write was logged.
-	applied, err = applyExtentAdd(ctx, rctx, newTxnReplay(), extentPayload.Serialize())
+	applied, err = applyExtentAdd(ctx, rctx, newTxnReplay([16]byte{}), extentPayload.Serialize())
 	if err != nil {
 		t.Fatalf("applyExtentAdd (idempotent) failed: %v", err)
 	}
@@ -512,7 +471,7 @@ func TestApplyExtentAddIntoTree(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 
 	if _, err := applyInodeCreate(ctx, rctx, r, (&InodeCreatePayload{InodeNum: 51, Mode: 0644}).Serialize()); err != nil {
 		t.Fatalf("Setup: failed to create inode: %v", err)
@@ -540,7 +499,7 @@ func TestApplyExtentAddIntoTree(t *testing.T) {
 	}
 	payload := (&ExtentAddPayload{InodeNum: 51, FileBlock: 6, DiskBlock: lost, Length: 1, MetaGeneration: ino.MetaGeneration}).Serialize()
 	for attempt, wantApplied := range []bool{true, false} {
-		applied, err := applyExtentAdd(ctx, rctx, newTxnReplay(), payload)
+		applied, err := applyExtentAdd(ctx, rctx, newTxnReplay([16]byte{}), payload)
 		if err != nil {
 			t.Fatalf("replay %d: %v", attempt, err)
 		}
@@ -650,14 +609,14 @@ func TestApplyExtentFreeCutsUnchangedInode(t *testing.T) {
 	ino := newDataInode(t, rctx, 50, 1, 2, 3)
 
 	stale := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration - 1, Size: 1 << 20}
-	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay(), stale.Serialize()); err != nil || applied {
+	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay([16]byte{}), stale.Serialize()); err != nil || applied {
 		t.Fatalf("applyExtentFree logged before a later inode write = %v, %v; want false, nil", applied, err)
 	}
 	free := (&ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration, Size: 1 << 20}).Serialize()
-	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay(), free); err != nil || !applied {
+	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay([16]byte{}), free); err != nil || !applied {
 		t.Fatalf("applyExtentFree = %v, %v; want true, nil", applied, err)
 	}
-	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay(), free); err != nil || applied {
+	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay([16]byte{}), free); err != nil || applied {
 		t.Fatalf("second applyExtentFree = %v, %v; want false, nil", applied, err)
 	}
 
@@ -719,7 +678,7 @@ func TestPayloadsWithoutGenerations(t *testing.T) {
 func recoveredTxn(records ...interface {
 	Serialize() []byte
 }) *RecoveredTxn {
-	txn := &RecoveredTxn{}
+	txn := &RecoveredTxn{Header: &TxnHeader{}}
 	for _, rec := range records {
 		var op TxnOpType
 		switch rec.(type) {
@@ -745,14 +704,8 @@ func recoveredTxn(records ...interface {
 func newRootDir(t *testing.T, rctx *RecoveryContext) {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := applyInodeCreate(ctx, rctx, newTxnReplay(), (&InodeCreatePayload{InodeNum: uint64(inode.InodeRoot), Mode: uint32(inode.S_IFDIR | 0755)}).Serialize()); err != nil {
-		t.Fatal(err)
-	}
-	root, err := rctx.InodeTbl.Read(inode.InodeRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := rctx.DirMgr.InitDirectory(ctx, root, uint64(inode.InodeRoot)); err != nil {
+	root := &InodeCreatePayload{InodeNum: uint64(inode.InodeRoot), Mode: uint32(inode.S_IFDIR | 0755), ParentInodeNum: uint64(inode.InodeRoot)}
+	if _, err := applyInodeCreate(ctx, rctx, newTxnReplay([16]byte{}), root.Serialize()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -934,6 +887,64 @@ func TestReplayedCreateSkipsUsedSlot(t *testing.T) {
 	}
 }
 
+var testNodeUUID = [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+// A create's claim lands before the crash: replay adds the name if the logging node wrote the inode last, and no more
+// often than a create does before naming it. Nothing else can reach an unnamed inode.
+func TestReplayedCreateFinishesOwnClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		owner  [16]byte
+		writes int
+		named  bool
+	}{
+		{"claimed", testNodeUUID, 0, true},
+		{"claimed and set up", testNodeUUID, 1, true},
+		{"claimed by another node", [16]byte{}, 0, false},
+		{"written since", testNodeUUID, 2, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rctx, cleanup := testRecoveryContext(t)
+			defer cleanup()
+			ctx := context.Background()
+			newRootDir(t, rctx)
+			free, err := rctx.InodeTbl.Read(50)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ino, err := rctx.InodeTbl.ClaimSlot(ctx, 50)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for range tc.writes {
+				ino.Mode = inode.S_IFREG | 0644
+				if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			create := recoveredTxn(
+				&InodeCreatePayload{InodeNum: 50, Mode: uint32(inode.S_IFREG | 0644), ParentInodeNum: uint64(inode.InodeRoot), MetaGeneration: free.MetaGeneration},
+				&DirAddEntryPayload{ParentInodeNum: uint64(inode.InodeRoot), ChildInodeNum: 50, EntryType: DirEntryRegular, Name: "made"},
+			)
+			create.Header.OwnerNodeUUID = tc.owner
+			if _, err := applyTransaction(ctx, rctx, create); err != nil {
+				t.Fatal(err)
+			}
+			num, err := lookupRoot(t, rctx, "made")
+			if tc.named && (err != nil || num != 50) {
+				t.Errorf("entry after replay: %d, %v; want inode 50", num, err)
+			}
+			if !tc.named && !errors.Is(err, dir.ErrNotFound) {
+				t.Errorf("replay named a slot it cannot tell is the create's own: %d, %v", num, err)
+			}
+			if ino, err := rctx.InodeTbl.Read(50); tc.named && (err != nil || ino.Mode != inode.S_IFREG|0644) {
+				t.Errorf("inode 50 after replay: mode %#o, %v", ino.Mode, err)
+			}
+		})
+	}
+}
+
 func TestReplayedCreateFinishesUnclaimedSlot(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
@@ -976,7 +987,7 @@ func TestApplyExtentAddSkipsChangedInode(t *testing.T) {
 	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
 		t.Fatal(err)
 	}
-	if applied, err := applyExtentAdd(ctx, rctx, newTxnReplay(), write); err != nil || applied {
+	if applied, err := applyExtentAdd(ctx, rctx, newTxnReplay([16]byte{}), write); err != nil || applied {
 		t.Fatalf("replay after a truncate = %v, %v; want false, nil", applied, err)
 	}
 	if ino, err := rctx.InodeTbl.Read(50); err != nil || ino.Size != 0 || ino.ExtentCount != 0 {
@@ -989,7 +1000,7 @@ func TestApplyDirEntrySkipsRemovedParent(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	r := newTxnReplay()
+	r := newTxnReplay([16]byte{})
 	free, err := rctx.InodeTbl.Read(51)
 	if err != nil {
 		t.Fatal(err)

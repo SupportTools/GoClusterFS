@@ -240,6 +240,44 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 	return t.writeWithTree(inode)
 }
 
+// Update applies change to inode num and writes it back, holding the inode lock from the read to the write.
+func (t *Table) Update(ctx context.Context, num uint32, change func(*Inode) error) error {
+	committed, err := t.lockedUpdate(ctx, num, change)
+	if committed != nil {
+		committed()
+	}
+	return err
+}
+
+func (t *Table) lockedUpdate(ctx context.Context, num uint32, change func(*Inode) error) (func(), error) {
+	if uint64(num) >= t.totalInodes {
+		return nil, ErrInodeOutOfRange
+	}
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
+			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
+		}
+		defer t.unlock(lock.LockTypeInode, uint64(num))
+	}
+	unlockSector, err := t.lockSector(num)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockSector()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	ino, err := t.readInodeUnlocked(num)
+	if err != nil {
+		return nil, err
+	}
+	if err := change(ino); err != nil {
+		return nil, err
+	}
+	return t.writeWithTree(ino)
+}
+
 // WriteWithLockHeld writes an inode to disk without acquiring the distributed lock.
 // Use this when the caller already holds the inode lock (e.g., in directory operations).
 // This prevents deadlock from trying to acquire the same lock twice.

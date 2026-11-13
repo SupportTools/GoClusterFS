@@ -180,6 +180,9 @@ func (m *Manager) lookupUnlocked(ctx context.Context, dirIno *inode.Inode, name 
 // Add adds a new entry to a directory.
 // Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8) error {
+	if dirIno.Magic != inode.InodeMagic {
+		return ErrRemoved
+	}
 	if !dirIno.IsDir() {
 		return ErrNotDirectory
 	}
@@ -318,6 +321,9 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 
 // RemoveIf removes name if ok accepts the inode it names; ok runs under the directory lock.
 func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool) (bool, error) {
+	if dirIno.Magic != inode.InodeMagic {
+		return false, ErrRemoved
+	}
 	if !dirIno.IsDir() {
 		return false, ErrNotDirectory
 	}
