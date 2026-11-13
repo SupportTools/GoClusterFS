@@ -144,6 +144,8 @@ type Manager struct {
 	claims map[uint64]*pendingClaim
 	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
 	adopted map[uint64]adoptedSlot
+	// ownerView, when set, says which node holds each registry slot.
+	ownerView OwnerView
 	// tornSince is when this node first read each slot that fails its checksum
 	// with the bytes it has now.
 	tornMu    sync.Mutex
@@ -151,6 +153,8 @@ type Manager struct {
 	tornCount atomic.Int32
 	// slotWrite, when a test sets it, replaces the device write of a slot.
 	slotWrite func(buf []byte, offset int64) (int, error)
+	// stopWatch and watchDone run the long-hold watcher between Start and Stop.
+	stopWatch, watchDone chan struct{}
 
 	// Callback for cache invalidation
 	onAcquire OnAcquireFunc
@@ -193,6 +197,8 @@ type heldRecord struct {
 	renewed time.Time // when this node last wrote its slot
 	// cacheGen identifies the current cached period; keys == 0 means cached.
 	cacheGen uint64
+	// warnedLong is set once this hold was logged as held too long.
+	warnedLong bool
 }
 
 // pendingClaim counts the local Acquire calls waiting for a record. When
@@ -368,8 +374,11 @@ func (m *Manager) LogStats() {
 	log.Printf("lock: claim times (us upper bound:count):%s max=%dus", times.String(), time.Duration(m.maxClaimTime.Load()).Microseconds())
 }
 
-// Acquire attempts to acquire a lock with the given parameters.
-// Blocks until the lock is acquired, the context ends, or DefaultTimeout passes.
+// Acquire attempts to acquire a lock with the given parameters. It blocks until
+// the lock is acquired, the context ends, a live holder keeps it for
+// DefaultTimeout, or the journal replay of a failed holder fails. A goroutine
+// that already holds a lock also gives up after DefaultTimeout of waiting for a
+// failed holder, since that holder's replay may need the lock it holds.
 //
 // Same-node reference counting: When multiple goroutines from the same node
 // need the same lock, the first goroutine acquires the distributed lock and
@@ -379,6 +388,10 @@ func (m *Manager) LogStats() {
 //
 // Resources that hash to the same record share it: a node holding the record
 // for one resource excludes other nodes from every resource in that record.
+//
+// A goroutine must not hold a lock while it waits for another goroutine that
+// needs the same record. Once the hold's turn is over, that goroutine cannot
+// join it, and both wait until the timeout.
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
 	if int(lockType) >= numLockTypes {
 		return fmt.Errorf("lock: unknown lock type %d", lockType)
@@ -397,19 +410,25 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		m.mu.Unlock()
 		return err
 	}
+	// A goroutine holding other locks may hold one a failed node's replay needs.
+	nested := m.goroutineHoldsAnyLocked(gid)
 	m.addClaimWaiterLocked(recordID)
 	m.mu.Unlock()
 	defer m.dropClaimWaiter(recordID)
+	replay := isReplay(ctx)
 
 	retryCount := 0
 	startTime := time.Now()
+	var liveWait time.Duration
+	var lastFailingLog time.Time
 
 	// Retry loop with exponential backoff
 	delay := RetryBaseDelay
 	for {
 		// Always attempt acquire first, then check context after failure
 		// This ensures we try at least once even if context is nearly expired
-		held, added, err := m.attemptAcquire(key, recordID, mode, gid, time.Since(startTime))
+		tryStart := time.Now()
+		held, added, by, err := m.attemptAcquire(key, recordID, mode, gid, time.Since(startTime))
 		if err != nil {
 			log.Printf("[DEBUG] lock.Acquire: type=%d res=%d - attempt error: %v", lockType, resourceID, err)
 			return err
@@ -437,17 +456,34 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			defer m.waiting.Add(-1)
 		}
 
-		// Check context cancellation, but allow at least 3 retries. A caller whose
-		// context never ends still gives up after acquireTimeout.
-		if retryCount >= 3 && (ctx.Err() != nil || time.Since(startTime) > acquireTimeout) {
-			log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v (%d tries); record %d %s",
-				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), retryCount, recordID, m.describeHolder(recordID))
-			return ErrLockTimeout
+		if by.state == OwnerLost {
+			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
+				"the journal replay of node %x (slot %d), which holds record %d, failed or was abandoned", by.occupant[:8], by.slot, recordID))
+		}
+		if by.failing() && time.Since(lastFailingLog) >= acquireTimeout {
+			lastFailingLog = time.Now()
+			log.Printf("[WARN] lock: type=%d res=%d mode=%d has waited %v for node %x (slot %d), which holds it and is failing or being recovered; waiting until its journal replay ends",
+				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), by.occupant[:8], by.slot)
+		}
+
+		// Check context cancellation, but allow at least 3 retries. A wait gives
+		// up after acquireTimeout of waiting for live holders, or for failing ones
+		// while this goroutine holds other locks; a replay's wait never does.
+		if retryCount >= 3 && (ctx.Err() != nil || !replay && liveWait > acquireTimeout) {
+			if by.failing() && nested {
+				return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
+					"this goroutine holds other locks, and record %d is held by node %x (slot %d), which is failing or being recovered and whose replay may need one of them",
+					recordID, by.occupant[:8], by.slot))
+			}
+			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf("record %d %s", recordID, m.describeHolder(recordID)))
 		}
 
 		// Add jitter to prevent thundering herd
 		jitter := time.Duration(rand.Int63n(int64(delay / 2)))
 		time.Sleep(delay + jitter)
+		if !by.failing() || nested {
+			liveWait += time.Since(tryStart)
+		}
 
 		// Exponential backoff
 		delay *= 2
@@ -466,7 +502,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 // callers must not hold a local mutex across Acquire that those holders may
 // need. A request from a goroutine that holds other locks stops waiting for the
 // drain after another turn, so two goroutines cannot wait on each other's records.
-func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gid uint64, waited time.Duration) (held, added bool, err error) {
+func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gid uint64, waited time.Duration) (held, added bool, by blocker, err error) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
@@ -482,26 +518,26 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			selfDeadlock := m.goroutineHoldsRecordLocked(recordID, gid)
 			m.mu.Unlock()
 			if selfDeadlock {
-				return false, false, fmt.Errorf("%w: cannot upgrade a shared lock to exclusive", ErrDeadlockRisk)
+				return false, false, blocker{}, fmt.Errorf("%w: cannot upgrade a shared lock to exclusive", ErrDeadlockRisk)
 			}
-			return false, false, nil
+			return false, false, blocker{}, nil
 		}
 		if age(rec.since) > holdTurn && !m.goroutineHoldsRecordLocked(recordID, gid) &&
 			(waited < holdTurn || !m.goroutineHoldsAnyLocked(gid)) {
 			if rec.keys > 0 {
 				m.mu.Unlock()
-				return false, false, nil
+				return false, false, blocker{}, nil
 			}
 			delete(m.records, recordID)
 			m.yieldUntil[recordID] = time.Now().Add(yieldGap)
 			m.mu.Unlock()
-			return false, false, m.releaseRecord(recordID)
+			return false, false, blocker{}, m.releaseRecord(recordID)
 		}
 		renew := age(rec.renewed) > renewAfter
 		m.mu.Unlock()
 		if renew {
 			if err := m.renewRecord(recordID, key, rec); err != nil {
-				return false, false, err
+				return false, false, blocker{}, err
 			}
 		}
 		m.mu.Lock()
@@ -510,7 +546,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			held.goroutines[gid]++
 			m.mu.Unlock()
 			m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.held })
-			return true, false, nil
+			return true, false, blocker{}, nil
 		}
 		if rec.keys == 0 {
 			m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.cached })
@@ -520,20 +556,20 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 		rec.keys++
 		m.addHeldKeyLocked(key, recordID, mode, gid)
 		m.mu.Unlock()
-		return true, true, nil
+		return true, true, blocker{}, nil
 	}
 	if until, ok := m.yieldUntil[recordID]; ok {
 		if time.Now().Before(until) {
 			m.mu.Unlock()
-			return false, false, nil
+			return false, false, blocker{}, nil
 		}
 		delete(m.yieldUntil, recordID)
 	}
 	m.mu.Unlock()
 
-	written, won, err := m.claim(recordID, key, mode)
+	written, won, by, err := m.claim(recordID, key, mode)
 	if err != nil || !won {
-		return false, false, err
+		return false, false, by, err
 	}
 	m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.claimed })
 
@@ -541,7 +577,15 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: time.Now(), renewed: written}
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
-	return true, true, nil
+	return true, true, blocker{}, nil
+}
+
+// giveUp logs why an Acquire stopped waiting and returns ErrLockTimeout with
+// that reason, so callers can tell who holds the lock.
+func (m *Manager) giveUp(lockType LockType, resourceID uint64, mode LockMode, start time.Time, reason string) error {
+	log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v: %s",
+		lockType, resourceID, mode, time.Since(start).Round(time.Millisecond), reason)
+	return fmt.Errorf("%w: %s", ErrLockTimeout, reason)
 }
 
 func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) bool {

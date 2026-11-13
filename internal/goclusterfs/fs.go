@@ -315,6 +315,7 @@ func (f *FS) Close() error {
 	}
 	// Other nodes would otherwise wait for these holds to go stale.
 	if f.lockMgr != nil {
+		f.lockMgr.Stop()
 		f.lockMgr.ReleaseCached()
 		f.lockMgr.LogStats()
 	}

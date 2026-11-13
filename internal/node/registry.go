@@ -108,9 +108,13 @@ type Registry struct {
 	pidNS      uint64
 	onSlotLost func(slot int, owner [16]byte)
 
-	onOwnerDead  func(owner [16]byte, slot int) (release func())
-	deadPrevious *[16]byte
-	sightings    map[int]sighting
+	onOwnerDead   func(owner [16]byte, slot int) (done func(replayed bool))
+	previousOwner *[16]byte
+	sightings     map[int]sighting
+
+	// seen holds the last read of each slot, for Occupant.
+	seenMu sync.Mutex
+	seen   map[int]*Slot
 
 	// Cross-node recovery
 	recoveryHandler      RecoveryHandler
@@ -161,6 +165,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
 		sightings:            make(map[int]sighting),
+		seen:                 make(map[int]*Slot),
 		bootID:               readBootID(),
 		pidNS:                readPIDNamespace(),
 	}
@@ -189,30 +194,33 @@ func (r *Registry) SetSlotLostHandler(fn func(slot int, owner [16]byte)) {
 
 // SetOwnerDeadHandler sets what failure detection calls, before replaying a
 // proven-dead node's journal, with that node's UUID and registry slot; for
-// example to take over its locks. The returned function runs after the replay.
-func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte, slot int) (release func())) {
+// example to take over its locks. The returned function runs after the replay
+// and is told whether it succeeded: after a failed replay, the dead node's locks
+// must stay held until a later replay succeeds.
+func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte, slot int) (done func(replayed bool))) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onOwnerDead = fn
 }
 
-// DeadPreviousOwner returns the UUID of the exited mount on this host whose
-// slot Register took, if any. Its journal is this node's to replay at mount.
-func (r *Registry) DeadPreviousOwner() ([16]byte, bool) {
+// PreviousOwner returns the UUID of the node whose slot Register took, if the
+// slot was not empty. Its journal is this node's to replay at mount, and its
+// lock claims are this node's to keep until then.
+func (r *Registry) PreviousOwner() ([16]byte, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if r.deadPrevious == nil {
+	if r.previousOwner == nil {
 		return [16]byte{}, false
 	}
-	return *r.deadPrevious, true
+	return *r.previousOwner, true
 }
 
-func (r *Registry) ownerDead(owner [16]byte, slot int) func() {
+func (r *Registry) ownerDead(owner [16]byte, slot int) func(replayed bool) {
 	r.mu.Lock()
 	fn := r.onOwnerDead
 	r.mu.Unlock()
 	if fn == nil {
-		return func() {}
+		return func(bool) {}
 	}
 	return fn(owner, slot)
 }
@@ -299,8 +307,8 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 			return -1, err
 		}
 		r.localSlot = i
-		if r.deadLocalOwner(slot) {
-			r.deadPrevious = &slot.UUID
+		if slot.State != NodeStateEmpty {
+			r.previousOwner = &slot.UUID
 		}
 		return i, nil
 	}
@@ -759,14 +767,15 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			r.mu.Unlock()
 			continue
 		}
+		r.remember(i, slot)
 		r.observe(i, slot)
 
 		// Stale heartbeats need 2x timeout for consensus, and none this node saw advance lately.
-		if !r.failed(slot, 2*HeartbeatTimeout) || (r.recentlyAlive(i) && !r.deadLocalOwner(slot)) {
+		// Peers wait for a failed node's locks until its replay ends, so only a node proven dead, not one paused, is replayed.
+		if !r.failed(slot, 2*HeartbeatTimeout) || (r.recentlyAlive(i) && !r.deadLocalOwner(slot)) || !r.provenDead(i, slot) {
 			r.mu.Unlock()
 			continue
 		}
-		dead := r.provenDead(i, slot)
 
 		// Skip if already recovering
 		if r.recoveryInProgress[i] {
@@ -784,12 +793,9 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			r.mu.Unlock()
 			continue // Another node beat us to it
 		}
-		release := func() {}
-		if dead {
-			release = r.ownerDead(info.UUID, i)
-		}
+		done := r.ownerDead(info.UUID, i)
 		err = handler(info)
-		release()
+		done(err == nil)
 		if err != nil {
 			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v",
 				i, info.UUID[:8], err, recoveryLease)

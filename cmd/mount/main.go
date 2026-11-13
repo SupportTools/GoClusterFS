@@ -240,9 +240,14 @@ func main() {
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
-	nodeReg.SetOwnerDeadHandler(func(owner [16]byte, slot int) func() { return adoptLocks(lockMgr, owner, slot) })
-	releasePrevious := func() {}
-	if owner, ok := nodeReg.DeadPreviousOwner(); ok {
+	lockMgr.SetOwnerView(func(slot int, fresh bool) ([16]byte, lock.OwnerState) {
+		occupant, occupancy := nodeReg.Occupant(slot, fresh)
+		return occupant, ownerStates[occupancy]
+	})
+	lockMgr.Start()
+	nodeReg.SetOwnerDeadHandler(func(owner [16]byte, slot int) func(bool) { return adoptLocks(lockMgr, owner, slot) })
+	releasePrevious := func(bool) {}
+	if owner, ok := nodeReg.PreviousOwner(); ok {
 		releasePrevious = adoptLocks(lockMgr, owner, slotIdx)
 	}
 
@@ -281,7 +286,7 @@ func main() {
 		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
 
 		// Replay a dirty journal left in this slot's region by its previous owner
-		result, err := journal.ScanAndRecover(dev, journalOffset, journalSize, recoveryHandler)
+		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, slotIdx)
 		if err != nil {
 			log.Fatalf("Journal recovery for slot %d failed: %v (to discard this journal, mount with -skip-recovery=%d)", slotIdx, err, slotIdx)
 		}
@@ -292,7 +297,10 @@ func main() {
 	} else if skip {
 		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
 	}
-	releasePrevious()
+	releasePrevious(true)
+	if err := lockMgr.ClearForeignClaims(); err != nil {
+		log.Printf("Warning: clearing lock claims earlier occupants left in slot %d failed: %v", slotIdx, err)
+	}
 
 	// Create journal for write-ahead logging (crash consistency)
 	var j *journal.Journal
@@ -585,15 +593,53 @@ func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Jou
 	return src
 }
 
+var ownerStates = map[node.Occupancy]lock.OwnerState{
+	node.OccupiedLive:      lock.OwnerAlive,
+	node.OccupiedFailing:   lock.OwnerFailing,
+	node.OccupiedReplaying: lock.OwnerRecovering,
+	node.OccupiedLapsed:    lock.OwnerLost,
+	node.Unoccupied:        lock.OwnerReleased,
+}
+
+// ownReplayRetry is the first wait before a mount retries its own journal
+// replay; tests shorten it.
+var ownReplayRetry = time.Second
+
+// recoverOwnJournal replays the journal this node's slot holds from its
+// previous owner. A replay that gave up waiting for another node's lock is
+// retried with backoff. Any other failure, such as a record that does not
+// decode or an I/O error, cannot get better by waiting, so it stops the mount.
+func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal.RecoveryHandler, slot int) (*journal.ScanRecoveryResult, error) {
+	delay := ownReplayRetry
+	for {
+		result, err := journal.ScanAndRecover(dev, offset, size, handler)
+		if err == nil {
+			return result, nil
+		}
+		if !errors.Is(err, lock.ErrLockTimeout) {
+			return nil, err
+		}
+		log.Printf("[WARN] Journal recovery for slot %d is waiting for another node's lock: %v; retrying in %v", slot, err, delay)
+		time.Sleep(delay)
+		delay = min(2*delay, 30*time.Second)
+	}
+}
+
 // adoptLocks takes over a dead node's exclusive locks and clears its read holds
 // before its journal is replayed, and returns the function that frees the
-// exclusive locks after the replay.
-func adoptLocks(locks *lock.Manager, owner [16]byte, slot int) func() {
+// exclusive locks after a replay that succeeded. After a failed replay the locks
+// stay held for the next attempt.
+func adoptLocks(locks *lock.Manager, owner [16]byte, slot int) func(replayed bool) {
 	adopted, err := locks.AdoptOwner(owner, slot)
 	if err != nil {
 		log.Printf("Warning: Failed to take over the locks of dead node %x: %v", owner[:8], err)
 	}
-	return func() {
+	return func(replayed bool) {
+		if !replayed {
+			locks.ForgetAdopted(adopted)
+			log.Printf("[WARN] The journal replay of dead node %x failed; its %d lock records stay held until a replay succeeds", owner[:8], len(adopted))
+			return
+		}
 		if err := locks.ReleaseAdopted(adopted); err != nil {
 			log.Printf("Warning: Failed to release the locks taken over from dead node %x: %v", owner[:8], err)
 		}
