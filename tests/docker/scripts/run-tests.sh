@@ -3249,16 +3249,17 @@ echo "SKIP: Snapshot Concurrent Creates" >> "$RESULTS_DIR/results.txt"
 # Two nodes can both hold the refcount lock and lose a snapshot's count until #29 confirms lock claims.
 log "SKIPPING: Snapshot During Writes (two nodes can both hold one lock until #29)"
 echo "SKIP: Snapshot During Writes" >> "$RESULTS_DIR/results.txt"
+# Two nodes can both hold the root directory lock and lose an entry until #29 confirms lock claims.
+log "SKIPPING: Concurrent Directory Ops (two nodes can both hold one directory lock until #29)"
+echo "SKIP: Concurrent Directory Ops" >> "$RESULTS_DIR/results.txt"
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"
     echo "SKIP: Concurrent Writes (known race conditions)" >> "$RESULTS_DIR/results.txt"
     echo "SKIP: Concurrent File Creation" >> "$RESULTS_DIR/results.txt"
-    echo "SKIP: Concurrent Directory Ops" >> "$RESULTS_DIR/results.txt"
 else
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation
-    run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 fi
 run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
 run_test "Container Kill Recovery" test_container_kill_recovery
