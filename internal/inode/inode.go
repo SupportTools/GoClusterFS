@@ -227,6 +227,11 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inode.InodeNum))
 	}
+	unlockSector, err := t.lockSector(inode.InodeNum)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockSector()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -242,9 +247,14 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 		return ErrInodeOutOfRange
 	}
 
+	unlockSector, err := t.lockSector(inode.InodeNum)
+	if err != nil {
+		return err
+	}
 	t.mu.Lock()
 	committed, err := t.writeWithTree(inode)
 	t.mu.Unlock()
+	unlockSector()
 	if committed != nil {
 		committed()
 	}
@@ -382,6 +392,11 @@ func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
 	}
+	unlockSector, err := t.lockSector(num)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockSector()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -451,6 +466,11 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inodeNum))
 	}
+	unlockSector, err := t.lockSector(inodeNum)
+	if err != nil {
+		return err
+	}
+	defer unlockSector()
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -523,7 +543,23 @@ func (t *Table) writeInodeUnlocked(inode *Inode) error {
 	return t.writeInodeSector(inode, false)
 }
 
-// writeInodeSector writes an inode into its sector. With checkTree, a copy
+// lockSector takes the cluster lock on the inode table sector that holds
+// inodeNum. The sector holds 15 other inodes that other nodes may write at the
+// same time. It is a leaf lock: take it after the inode lock and before t.mu,
+// and take no other cluster lock while holding it.
+func (t *Table) lockSector(inodeNum uint32) (func(), error) {
+	if t.lockMgr == nil {
+		return func() {}, nil
+	}
+	sector := uint64(inodeNum) / InodesPerSector
+	if err := t.lockMgr.Acquire(context.Background(), lock.LockTypeInodeSector, sector, lock.LockModeExclusive); err != nil {
+		return nil, fmt.Errorf("failed to acquire inode table sector lock: %w", err)
+	}
+	return func() { t.lockMgr.Release(lock.LockTypeInodeSector, sector) }, nil
+}
+
+// writeInodeSector writes an inode into its sector. The caller holds the
+// sector's lock (lockSector) and t.mu. With checkTree, a copy
 // whose extent tree differs from the stored one fails with ErrTreeConflict:
 // it has no extent edits, so writing it would roll back or wipe a tree that
 // another node committed, and the tree it read may already be freed.
@@ -531,14 +567,6 @@ func (t *Table) writeInodeSector(inode *Inode, checkTree bool) error {
 	// Calculate sector containing this inode
 	sectorIdx := uint64(inode.InodeNum) / InodesPerSector
 	inodeOffset := uint64(inode.InodeNum) % InodesPerSector
-
-	// The sector holds 15 other inodes that other nodes may write at the same time.
-	if t.lockMgr != nil {
-		if err := t.lockMgr.Acquire(context.Background(), lock.LockTypeInodeSector, sectorIdx, lock.LockModeExclusive); err != nil {
-			return fmt.Errorf("failed to acquire inode table sector lock: %w", err)
-		}
-		defer t.lockMgr.Release(lock.LockTypeInodeSector, sectorIdx)
-	}
 
 	// Read the entire sector first (we need to preserve other inodes)
 	sectorOffset := int64(t.offset) + int64(sectorIdx)*SectorSize
@@ -578,6 +606,12 @@ func (t *Table) writeInodeSector(inode *Inode, checkTree bool) error {
 
 // InitRootInode initializes the root directory inode if it doesn't exist.
 func (t *Table) InitRootInode(ctx context.Context) error {
+	unlockSector, err := t.lockSector(InodeRoot)
+	if err != nil {
+		return err
+	}
+	defer unlockSector()
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
