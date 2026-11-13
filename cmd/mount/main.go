@@ -255,6 +255,11 @@ func main() {
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 
+	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write, and replay frees shared blocks through them.
+	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
+	extentMgr.SetRefcounts(refcountReg)
+	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
+
 	// Check for and recover any dirty journal from a previous crash
 	// This must happen BEFORE we create our own journal to avoid data loss
 	// -skip-recovery names the slot whose journal the operator chose to discard;
@@ -375,10 +380,6 @@ func main() {
 	} else {
 		log.Println("SFB: disabled (all files use full 1MB blocks)")
 	}
-
-	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write.
-	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
-	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)

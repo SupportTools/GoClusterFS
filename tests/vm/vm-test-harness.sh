@@ -607,6 +607,15 @@ kill_vm() {
 
     if is_vm_running "$vm_id"; then
         kill -9 "$(cat "$pid_file")" 2>/dev/null || true
+        local waited=0
+        while is_vm_running "$vm_id"; do
+            if [[ $waited -ge 50 ]]; then
+                log_error "VM $vm_id: QEMU still running 10s after SIGKILL"
+                return 1
+            fi
+            sleep 0.2
+            waited=$((waited + 1))
+        done
         mark_vm_log "$vm_id" "VM $vm_id killed"
     fi
     rm -f "$pid_file"

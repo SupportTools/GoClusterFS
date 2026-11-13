@@ -2,6 +2,7 @@ package journal
 
 import (
 	"bytes"
+	"github.com/supporttools/GoClusterFS/internal/storage"
 	"testing"
 )
 
@@ -188,7 +189,8 @@ func TestJournalSuperblockIsEmpty(t *testing.T) {
 }
 
 func TestJournalSuperblockAvailableSpace(t *testing.T) {
-	dataAreaSize := uint32(1000)
+	const sector = storage.SectorSize
+	dataAreaSize := uint32(10 * sector)
 
 	tests := []struct {
 		name      string
@@ -196,12 +198,13 @@ func TestJournalSuperblockAvailableSpace(t *testing.T) {
 		tail      uint32
 		wantSpace uint32
 	}{
-		{"empty", 0, 0, 1000},
-		{"partial used", 0, 300, 700},
-		{"half used", 0, 500, 500},
-		{"nearly full", 0, 900, 100},
-		{"wrapped partial", 500, 200, 300}, // tail wrapped around
-		{"wrapped more", 800, 100, 700},
+		{"empty", 0, 0, 9 * sector},
+		{"partial used", 0, 3 * sector, 6 * sector},
+		{"half used", 0, 5 * sector, 4 * sector},
+		{"one sector free", 0, 9 * sector, 0},
+		{"tail at the end", 2 * sector, 10 * sector, 1 * sector},
+		{"wrapped partial", 5 * sector, 2 * sector, 2 * sector},
+		{"wrapped full", 8 * sector, 7 * sector, 0},
 	}
 
 	for _, tt := range tests {

@@ -151,9 +151,14 @@ jobs:
         run: go test -v -run 'TestEmbeddedBuild|TestServesBuild' ./internal/webui/
 
   integration-tests:
-    name: Integration Tests
+    name: Integration Tests (group ${{ matrix.group }})
     runs-on: ubuntu-latest
     needs: build-and-unit-test
+    strategy:
+      fail-fast: false
+      matrix:
+        # tests/scripts/integration-groups.sh splits the tests by recorded run time
+        group: [1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -178,11 +183,21 @@ jobs:
       - name: Build
         run: make build
 
+      - name: Check test groups
+        run: tests/scripts/integration-groups.sh check ${{ strategy.job-total }}
+
       - name: Integration Tests
+        shell: bash
         run: |
-          # Run integration tests with -short to skip stress tests that timeout in CI
-          # Stress tests (TestStressRandomFailures, TestStress) require local execution
-          # Lock order violation fix (Task #4798) enables concurrent file/directory creation tests
-          # Extent locking fix (Task #4801) enables concurrent same-file writes test
-          go test -v -timeout 8m -short ./tests/integration/...
+          tests=$(tests/scripts/integration-groups.sh regex ${{ strategy.job-total }} ${{ matrix.group }})
+          # -short skips the stress tests, which need longer than CI allows
+          go test -v -timeout 8m -short -run "$tests" ./tests/integration/... 2>&1 | tee integration-${{ matrix.group }}.log
         timeout-minutes: 10
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-log-${{ matrix.group }}
+          path: integration-${{ matrix.group }}.log
+          retention-days: 7

@@ -234,6 +234,7 @@ func decodeAllPayloads(p []byte) {
 	_, _ = DeserializeSFBMigrate(p)
 	_, _ = DeserializeExtentAdd(p)
 	_, _ = DeserializeExtentRemove(p)
+	_, _ = DeserializeExtentFree(p)
 	_, _ = DeserializeSnapshotCreate(p)
 	_, _ = DeserializeSnapshotDelete(p)
 	_, _ = DeserializeRefCountUpdate(p)

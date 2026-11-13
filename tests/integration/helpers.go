@@ -522,12 +522,25 @@ func (m *MountedFS) PID() int {
 	return 0
 }
 
-// Kill sends SIGKILL to the mount process to simulate a crash.
+// Kill sends SIGKILL to the mount process to simulate a crash and waits until it is gone.
 func (m *MountedFS) Kill() error {
 	if m.MountCmd == nil || m.MountCmd.Process == nil {
 		return fmt.Errorf("mount process not running")
 	}
-	return m.MountCmd.Process.Kill()
+	if err := m.MountCmd.Process.Kill(); err != nil {
+		return err
+	}
+	exited := make(chan struct{})
+	go func() {
+		_ = m.MountCmd.Wait()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+		return nil
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("mount process %d still running 10s after SIGKILL", m.MountCmd.Process.Pid)
+	}
 }
 
 // OpenFile opens a file in the mounted filesystem for read/write operations.

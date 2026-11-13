@@ -6,8 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -23,15 +24,11 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
-// failWrite writes data at off and makes the final inode commit fail, as a
-// failing device would. A write persists the inode each time it allocates, so
-// only the block it allocated last leaks; a one-block write leaks that block.
-func failWrite(t *testing.T, f *File, data []byte, off int64) {
+// leakBlock allocates a block that no inode maps, as a crash between an allocation and its inode write leaves.
+func leakBlock(t *testing.T, fsys *FS) {
 	t.Helper()
-	testHookBeforeInodeCommit = func() error { return errors.New("injected inode write failure") }
-	defer func() { testHookBeforeInodeCommit = nil }()
-	if _, errno := f.Write(context.Background(), nil, data, off); errno != syscall.EIO {
-		t.Fatalf("write with a failing inode commit: errno %v, want EIO", errno)
+	if _, err := fsys.bitmapMgr.Alloc(context.Background(), 1); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -110,9 +107,9 @@ func TestFsckRepairReclaimsLeakedBlocks(t *testing.T) {
 	pairBlock := physicalBlock(t, fsys, pair.inodeNum, 0)
 	free := fsys.bitmapMgr.FreeCount()
 
-	failWrite(t, grow, pattern(4, 4096), BlockSize)
+	leakBlock(t, fsys)
 	if got := fsys.bitmapMgr.FreeCount(); got != free-1 {
-		t.Fatalf("the failed write leaked %d blocks, want 1", free-got)
+		t.Fatalf("leaked %d blocks, want 1", free-got)
 	}
 	deleteWithTimedOutFree(t, fsys, "victim.bin")
 	deleteWithTimedOutFree(t, fsys, "clone.bin")
@@ -270,8 +267,8 @@ func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 				t.Fatal(err)
 			}
 			// One leaked block with no count, and one a cloned pair left with a count of 2.
-			f := createFile(t, fsys, "f.bin")
-			failWrite(t, f, pattern(8, 4096), 0)
+			createFile(t, fsys, "f.bin")
+			leakBlock(t, fsys)
 			pair := createFile(t, fsys, "pair-a.bin")
 			writeAt(t, pair, pattern(9, 100), 0)
 			setxattr(t, pair, "user.clone", "/pair-b.bin")
@@ -421,4 +418,200 @@ func TestFsckRepairFreesEmptySFBContainers(t *testing.T) {
 	}
 	checkFile(t, lookupFile(t, fsys, "small.txt"), pattern(1, 5000))
 	checkFile(t, lookupFile(t, fsys, "moved.txt"), append(pattern(2, 10000), pattern(3, 10000)...))
+}
+
+// holdRefcountLock makes another node hold the refcount lock until the test
+// ends, so frees on fsys wait for it.
+func holdRefcountLock(t *testing.T, fsys *FS) {
+	t.Helper()
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot := int(snapFSNodes.Add(1)-1) % 64
+	var otherUUID [16]byte
+	copy(otherUUID[:], "lockholder123456")
+	otherUUID[15] = byte(slot)
+	other := lock.NewManager(fsys.dev, sb.LockBitmapOffset, sb.LockBitmapSize, otherUUID, slot)
+	if err := other.Acquire(context.Background(), lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func allocatedBlocks(t *testing.T, fsys *FS) map[uint64]bool {
+	t.Helper()
+	out := map[uint64]bool{}
+	for b := uint64(0); b < fsys.bitmapMgr.TotalBlocks(); b++ {
+		allocated, err := fsys.bitmapMgr.IsAllocated(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if allocated {
+			out[b] = true
+		}
+	}
+	return out
+}
+
+// crashWhileFreeing runs op until its block free waits on a refcount lock another
+// node holds and stuck reports its earlier changes on disk, then crashes the
+// node there by closing its device.
+func crashWhileFreeing(t *testing.T, fsys *FS, op func(), stuck func() bool) {
+	t.Helper()
+	holdRefcountLock(t, fsys)
+	go op()
+	deadline := time.Now().Add(10 * time.Second)
+	for !stuck() {
+		if time.Now().After(deadline) {
+			t.Fatal("the operation did not reach its block free")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fsys.dev.Close()
+}
+
+// replayAndRepair remounts after the crash, replays the journal, and checks that
+// fsck -repair leaves exactly before minus released allocated. Replay may leave
+// any of released allocated; check must report those as leaked and repair must
+// free them and nothing else. It returns the image mounted again.
+func replayAndRepair(t *testing.T, path string, offset, size uint64, before map[uint64]bool, released []uint64) *FS {
+	t.Helper()
+	want := maps.Clone(before)
+	for _, b := range released {
+		delete(want, b)
+	}
+	remounted := remountAndReplay(t, path, offset, size)
+	var leaked []uint64
+	for b := range allocatedBlocks(t, remounted) {
+		if !want[b] {
+			leaked = append(leaked, b)
+		}
+	}
+	slices.Sort(leaked)
+	for _, b := range leaked {
+		if !slices.Contains(released, b) {
+			t.Fatalf("block %d is allocated after replay but the operation did not release it", b)
+		}
+	}
+	for b := range want {
+		if allocated, _ := remounted.bitmapMgr.IsAllocated(b); !allocated {
+			t.Fatalf("replay freed block %d, which should stay allocated", b)
+		}
+	}
+
+	check := runFsck(t, remounted, fsck.DefaultOptions())
+	for _, b := range leaked {
+		if !strings.Contains(problemList(check), fmt.Sprintf("block %d: leaked", b)) {
+			t.Fatalf("check did not report block %d, which replay left allocated:%s", b, problemList(check))
+		}
+	}
+	if len(leaked) == 0 && strings.Contains(problemList(check), "leaked") {
+		t.Fatalf("check reported leaks although replay freed every released block:%s", problemList(check))
+	}
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	wantExit := fsck.ExitClean
+	if len(leaked) > 0 {
+		wantExit = fsck.ExitCorrected
+	}
+	if r := runFsck(t, remounted, repair); r.ExitCode() != wantExit {
+		t.Fatalf("repair exit %d, want %d:%s", r.ExitCode(), wantExit, problemList(r))
+	}
+	expectCleanFsck(t, remounted)
+
+	remounted = openFormattedFS(t, path)
+	if got := allocatedBlocks(t, remounted); !maps.Equal(got, want) {
+		t.Fatalf("allocated after repair %v, want %v", slices.Sorted(maps.Keys(got)), slices.Sorted(maps.Keys(want)))
+	}
+	return remounted
+}
+
+// A crash after a truncate wrote the shorter inode, but before it freed the
+// blocks it cut: replay leaves those blocks allocated (or, once it frees them,
+// frees them), and repair frees whatever replay left.
+func TestFsckRepairReclaimsInterruptedTruncate(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	victim := createFile(t, fsys, "victim.bin")
+	writeAt(t, victim, pattern(1, 3*BlockSize), 0)
+	other := createFile(t, fsys, "other.bin")
+	writeAt(t, other, pattern(2, 2*BlockSize), 0)
+	cut := []uint64{physicalBlock(t, fsys, victim.inodeNum, 1), physicalBlock(t, fsys, victim.inodeNum, 2)}
+	before := allocatedBlocks(t, fsys)
+
+	crashWhileFreeing(t, fsys, func() { tryTruncate(victim, BlockSize) }, func() bool {
+		ino, err := fsys.inodeTbl.Read(victim.inodeNum)
+		return err == nil && ino.Size == BlockSize
+	})
+
+	remounted := replayAndRepair(t, path, offset, size, before, cut)
+	checkFile(t, lookupFile(t, remounted, "victim.bin"), pattern(1, BlockSize))
+	checkFile(t, lookupFile(t, remounted, "other.bin"), pattern(2, 2*BlockSize))
+}
+
+// A crash while unlinking a file in a subdirectory, after its entry is gone but
+// before its blocks are freed: replay deletes the inode, and leaves the blocks
+// allocated (or, once it frees them, frees them). Repair frees whatever is left.
+func TestFsckRepairReclaimsInterruptedSubdirectoryUnlink(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	ctx := context.Background()
+	sub := newRegularFile(t, fsys)
+	subIno, err := fsys.updateInode(ctx, sub.inodeNum, func(ino *inode.Inode) error {
+		ino.Mode = inode.S_IFDIR | 0o755
+		ino.LinkCount = 2
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.dirMgr.InitDirectory(ctx, subIno, uint64(inode.InodeRoot)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.inodeTbl.Write(ctx, subIno); err != nil {
+		t.Fatal(err)
+	}
+	root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.dirMgr.Add(ctx, root, "sub", uint64(sub.inodeNum), dir.DT_DIR); err != nil {
+		t.Fatal(err)
+	}
+	victim := newRegularFile(t, fsys)
+	if _, err := fsys.updateInode(ctx, victim.inodeNum, func(ino *inode.Inode) error {
+		ino.LinkCount = 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if subIno, err = fsys.inodeTbl.Read(sub.inodeNum); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.dirMgr.Add(ctx, subIno, "victim.bin", uint64(victim.inodeNum), dir.DT_REG); err != nil {
+		t.Fatal(err)
+	}
+	writeAt(t, victim, pattern(1, 2*BlockSize), 0)
+	other := createFile(t, fsys, "other.bin")
+	writeAt(t, other, pattern(2, BlockSize), 0)
+	released := []uint64{physicalBlock(t, fsys, victim.inodeNum, 0), physicalBlock(t, fsys, victim.inodeNum, 1)}
+	before := allocatedBlocks(t, fsys)
+
+	subDir := &Dir{fs: fsys, inodeNum: sub.inodeNum}
+	crashWhileFreeing(t, fsys, func() { subDir.Unlink(ctx, "victim.bin") }, func() bool {
+		ino, err := fsys.inodeTbl.Read(sub.inodeNum)
+		if err != nil {
+			return false
+		}
+		_, _, err = fsys.dirMgr.Lookup(ctx, ino, "victim.bin")
+		return errors.Is(err, dir.ErrNotFound)
+	})
+
+	remounted := replayAndRepair(t, path, offset, size, before, released)
+	subIno, err = remounted.inodeTbl.Read(sub.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := remounted.dirMgr.Lookup(ctx, subIno, "victim.bin"); !errors.Is(err, dir.ErrNotFound) {
+		t.Fatalf("sub/victim.bin after replay: %v, want it gone", err)
+	}
+	checkFile(t, lookupFile(t, remounted, "other.bin"), pattern(2, BlockSize))
 }

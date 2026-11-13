@@ -31,6 +31,7 @@ const (
 	TxnOpExtentAdd    TxnOpType = 0x0500
 	TxnOpExtentRemove TxnOpType = 0x0501
 	TxnOpExtentUpdate TxnOpType = 0x0502
+	TxnOpExtentFree   TxnOpType = 0x0503
 
 	// Snapshot Operations (0x06xx)
 	TxnOpSnapshotCreate TxnOpType = 0x0600
@@ -69,6 +70,8 @@ func (op TxnOpType) String() string {
 		return "ExtentRemove"
 	case TxnOpExtentUpdate:
 		return "ExtentUpdate"
+	case TxnOpExtentFree:
+		return "ExtentFree"
 	case TxnOpSnapshotCreate:
 		return "SnapshotCreate"
 	case TxnOpSnapshotDelete:
@@ -631,6 +634,70 @@ func DeserializeExtentRemove(buf []byte) (*ExtentRemovePayload, error) {
 	}, nil
 }
 
+// ExtentFreePayload lists the mapped extents a truncate or unlink frees from one inode, the size it cuts the inode to,
+// and the inode's MetaGeneration when they were logged. Replay frees a block only if the inode has not been written
+// since and still maps it there.
+type ExtentFreePayload struct {
+	InodeNum       uint64
+	MetaGeneration uint64
+	Size           uint64
+	Extents        []FreedExtent
+}
+
+// FreedExtent is Length file blocks from FileBlock, mapped to the disk blocks from DiskBlock.
+type FreedExtent struct {
+	FileBlock uint64
+	DiskBlock uint64
+	Length    uint32
+}
+
+const (
+	extentFreeHeaderSize = 32
+	freedExtentSize      = 24
+)
+
+// Serialize converts the payload to bytes: a 32-byte header, then 24 bytes per extent.
+func (p *ExtentFreePayload) Serialize() []byte {
+	buf := make([]byte, extentFreeHeaderSize+freedExtentSize*len(p.Extents))
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.MetaGeneration)
+	binary.LittleEndian.PutUint64(buf[16:24], p.Size)
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(p.Extents)))
+	for i, e := range p.Extents {
+		x := buf[extentFreeHeaderSize+i*freedExtentSize:]
+		binary.LittleEndian.PutUint64(x[0:8], e.FileBlock)
+		binary.LittleEndian.PutUint64(x[8:16], e.DiskBlock)
+		binary.LittleEndian.PutUint32(x[16:20], e.Length)
+	}
+	return buf
+}
+
+// DeserializeExtentFree parses an ExtentFreePayload from bytes.
+func DeserializeExtentFree(buf []byte) (*ExtentFreePayload, error) {
+	if len(buf) < extentFreeHeaderSize {
+		return nil, ErrTxnTooSmall
+	}
+	count := binary.LittleEndian.Uint32(buf[24:28])
+	if uint64(count) > uint64(len(buf)-extentFreeHeaderSize)/freedExtentSize {
+		return nil, ErrTxnTooSmall
+	}
+	p := &ExtentFreePayload{
+		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
+		MetaGeneration: binary.LittleEndian.Uint64(buf[8:16]),
+		Size:           binary.LittleEndian.Uint64(buf[16:24]),
+		Extents:        make([]FreedExtent, count),
+	}
+	for i := range p.Extents {
+		x := buf[extentFreeHeaderSize+i*freedExtentSize:]
+		p.Extents[i] = FreedExtent{
+			FileBlock: binary.LittleEndian.Uint64(x[0:8]),
+			DiskBlock: binary.LittleEndian.Uint64(x[8:16]),
+			Length:    binary.LittleEndian.Uint32(x[16:20]),
+		}
+	}
+	return p, nil
+}
+
 // ============================================================================
 // Snapshot Operation Payloads
 // ============================================================================
@@ -771,6 +838,11 @@ func (txn *Transaction) LogExtentAdd(payload *ExtentAddPayload) error {
 // LogExtentRemove adds an extent removal to the transaction.
 func (txn *Transaction) LogExtentRemove(payload *ExtentRemovePayload) error {
 	return txn.addEntry(TxnOpExtentRemove, payload.Serialize())
+}
+
+// LogExtentFree adds an inode's freed extents to the transaction.
+func (txn *Transaction) LogExtentFree(payload *ExtentFreePayload) error {
+	return txn.addEntry(TxnOpExtentFree, payload.Serialize())
 }
 
 // LogSnapshotCreate adds a snapshot creation to the transaction.

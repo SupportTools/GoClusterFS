@@ -609,7 +609,11 @@ test_restart_keeps_peer_journal() {
 
     local slot_before
     slot_before=$(ssh_run "$vm_a" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1")
-    ssh_run "$vm_a" "pkill -9 goclusterfs-mount; sleep 1; umount -l /mnt/goclusterfs 2>/dev/null; true"
+    if ! crash_goclusterfs "$vm_a"; then
+        ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
+        return 1
+    fi
+    ssh_run "$vm_a" "umount -l /mnt/goclusterfs 2>/dev/null; true"
     if ! setup_goclusterfs "$vm_a" false; then
         ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
         return 1
@@ -2946,13 +2950,38 @@ test_concurrent_writes_power_failure() {
     return 0
 }
 
+# Print the PIDs of goclusterfs-mount on VM $1: processes with an argument equal to the path setup_goclusterfs starts
+# it with. On Alpine the gcompat loader runs it, so its name and argv[0] are the loader's. A zombie has no arguments.
+mount_pids() {
+    ssh_run "$1" 'for p in /proc/[0-9]*; do tr "\0" "\n" 2>/dev/null <$p/cmdline | grep -qx "/usr/local/bin/goclusterfs-moun[t]" && echo ${p#/proc/}; done; true'
+}
+
+# Kill goclusterfs-mount on VM $1 with SIGKILL, as a crash would, and fail unless it is gone within 10s.
+crash_goclusterfs() {
+    local vm_id=$1 pids waited=0
+    pids=$(mount_pids "$vm_id")
+    if [[ -z "$pids" ]]; then
+        log_error "VM $vm_id: no goclusterfs-mount process to kill"
+        return 1
+    fi
+    ssh_run "$vm_id" "kill -9 $(echo $pids)"
+    while [[ -n "$(mount_pids "$vm_id")" ]]; do
+        if [[ $waited -ge 50 ]]; then
+            log_error "VM $vm_id: goclusterfs-mount still running 10s after SIGKILL"
+            return 1
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+}
+
 # Unmount GoClusterFS on VM $1 and wait for the mount process to exit, which
 # marks its journal clean.
 unmount_goclusterfs() {
     local vm_id=$1
     ssh_run "$vm_id" "fusermount3 -u ${GOCLUSTERFS_MOUNT}" || return 1
     local waited=0
-    while ssh_run "$vm_id" "pidof goclusterfs-mount > /dev/null"; do
+    while [[ -n "$(mount_pids "$vm_id")" ]]; do
         if [[ $waited -ge 30 ]]; then
             return 1
         fi
