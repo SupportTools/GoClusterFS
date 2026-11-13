@@ -185,7 +185,6 @@ The package also defines `NetworkEnabledConfig`, `HighConsistencyConfig` and `Hi
 |-------|---------|---------|
 | `CommitMode` | `CommitSync` | `CommitSync` syncs every commit. `CommitBatch` groups commits, up to `MaxBatchTransactions` (32) or `MaxBatchAge` (100 ms). `CommitAsync` never syncs and is for tests only |
 | `CheckpointInterval` | `5s` | Time between checkpoints. A checkpoint is also forced when a transaction does not fit |
-| `FullThreshold` | `75` | Not used |
 
 Each node's journal is 4 MB, set by the on-disk layout.
 

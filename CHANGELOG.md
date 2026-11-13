@@ -63,6 +63,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Removed
 
 - The legacy single-block prototype in the repository root (`main.go`).
+- The journal's `FullThreshold` setting, which nothing read. A checkpoint still runs every 5 seconds and when a transaction does not fit.
 
 ### Fixed
 
