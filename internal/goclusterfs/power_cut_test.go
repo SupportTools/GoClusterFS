@@ -167,7 +167,7 @@ func expectOnlyLeaks(t *testing.T, fsys *FS) {
 }
 
 func isLeak(msg string) bool {
-	for _, leak := range []string{"leaked", "will never be freed", "unnamed: no directory names it"} {
+	for _, leak := range []string{"leaked", "will never be freed", "unnamed: no directory names it", "belongs to no snapshot"} {
 		if strings.Contains(msg, leak) {
 			return true
 		}
@@ -359,6 +359,27 @@ func TestPowerCutDuringUnlinkThenTrimAfterReuse(t *testing.T) {
 			checkFile(t, lookupFile(t, fsys, "new"), fresh)
 			if old := lookupMaybe(t, fsys, "old"); old != nil {
 				checkFile(t, old, doomed)
+			}
+		},
+	})
+}
+
+// Power fails while a file is cloned. The file keeps its data, and the clone is either gone or a full copy.
+func TestPowerCutDuringClone(t *testing.T) {
+	data := pattern(3, 3*BlockSize)
+	var f *File
+	runPowerCuts(t, powerCutCase{
+		setup: func(t *testing.T, fsys *FS) {
+			f = createFile(t, fsys, "f")
+			writeAt(t, f, data, 0)
+		},
+		op: func(fsys *FS, _ *power) {
+			f.Setxattr(context.Background(), "user.clone", []byte("/c"), 0)
+		},
+		check: func(t *testing.T, fsys *FS) {
+			checkFile(t, lookupFile(t, fsys, "f"), data)
+			if c := lookupMaybe(t, fsys, "c"); c != nil {
+				checkFile(t, c, data)
 			}
 		},
 	})

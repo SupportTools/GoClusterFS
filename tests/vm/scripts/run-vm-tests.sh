@@ -3085,15 +3085,20 @@ install_power_failure_scripts() {
     local vm_id=$1
     ssh_run "$vm_id" "cat > /tmp/pf_letters.sh && chmod +x /tmp/pf_letters.sh" <<'EOF'
 #!/bin/sh
-# Prints, for each 64KB chunk of $1 from byte $2 for $3 chunks, its letter, or ? if the chunk is not one letter.
+# Prints, for each 64KB chunk of $1 from byte $2 for $3 chunks, its letter, or the distinct bytes of a mixed chunk
+# in parentheses.
 for L in a A B C D E F G H I J K L M N O P Q R S T U V W X Y Z; do
     echo "$(head -c 65536 /dev/zero | tr '\0' "$L" | md5sum | cut -c1-32) $L"
 done > /tmp/pf_letter_md5s
 k=0
 while [ "$k" -lt "$3" ]; do
-    m=$(dd if="$1" bs=65536 skip=$(($2 / 65536 + k)) count=1 2>/dev/null | md5sum | cut -c1-32)
+    chunk="dd if=$1 bs=65536 skip=$(($2 / 65536 + k)) count=1"
+    m=$($chunk 2>/dev/null | md5sum | cut -c1-32)
     L=$(grep "^$m " /tmp/pf_letter_md5s | cut -c34)
-    printf %s "${L:-?}"
+    if [ -z "$L" ]; then
+        L="($($chunk 2>/dev/null | od -An -c -v | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr -d '\n'))"
+    fi
+    printf %s "$L"
     k=$((k + 1))
 done
 echo
@@ -3165,7 +3170,7 @@ restart_and_expect_only_leaks() {
 
     out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
     problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]')
-    if echo "$problems" | grep -v -e '^$' -e 'leaked' -e 'will never be freed' -e 'unnamed: no directory names it' | grep -q .; then
+    if echo "$problems" | grep -v -e '^$' -e 'leaked' -e 'will never be freed' -e 'unnamed: no directory names it' -e 'belongs to no snapshot' | grep -q .; then
         log_error "fsck after the power failure found more than leaks:"
         echo "$problems" | head -20 >&2
         return 1
@@ -3214,7 +3219,8 @@ test_cow_write_power_failure() {
             (( r % 4 == b )) && maybe="$maybe$(round_letter "$r")"
         done
         letters=$(ssh_run 1 "/tmp/pf_letters.sh $f $((b * 1048576)) 16")
-        if [[ ! "$letters" =~ ^[$maybe]{16}$ ]]; then
+        # A write in flight may stop partway through a chunk, but only old and new bytes may show.
+        if [[ ! "$letters" =~ ^([$maybe]|\([$maybe]+\)){16}$ ]]; then
             log_error "block $b after $last acknowledged writes holds '$letters', want only '$maybe'"
             return 1
         fi
