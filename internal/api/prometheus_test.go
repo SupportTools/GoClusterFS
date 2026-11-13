@@ -13,13 +13,13 @@ import (
 
 func TestMetricsEndpoint_BasicUp(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -132,14 +132,14 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected status 200, got %d", resp.StatusCode)
@@ -226,14 +226,14 @@ func TestMetricsEndpoint_JournalCleanState(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -256,13 +256,13 @@ func TestMetricsEndpoint_ExportsCapacity(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("read body error: %v", err)
@@ -291,14 +291,14 @@ func TestMetricsEndpoint_TrimDisabled(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -334,14 +334,14 @@ func TestMetricsEndpoint_ClusterFollower(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -358,13 +358,13 @@ func TestMetricsEndpoint_ClusterFollower(t *testing.T) {
 
 func TestMetricsEndpoint_ContentType(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	resp, err := http.Get("http://" + server.Addr() + "/metrics")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	contentType := resp.Header.Get("Content-Type")
 	// Prometheus handler returns text/plain with version info
@@ -376,7 +376,7 @@ func TestMetricsEndpoint_ContentType(t *testing.T) {
 
 func TestMetricsEndpoint_MethodNotAllowed(t *testing.T) {
 	server := startTestServer(t)
-	defer server.Stop()
+	defer stopServer(t, server)
 
 	client := &http.Client{}
 	req, err := http.NewRequest(http.MethodPost, "http://"+server.Addr()+"/metrics", nil)
@@ -388,7 +388,7 @@ func TestMetricsEndpoint_MethodNotAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("expected status 405, got %d", resp.StatusCode)

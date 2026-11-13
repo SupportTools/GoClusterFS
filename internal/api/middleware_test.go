@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net/http"
 	"testing"
@@ -18,7 +19,7 @@ func TestAuthMiddleware_NoTokenConfigured(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	// Request without auth should succeed when no token configured
@@ -26,7 +27,7 @@ func TestAuthMiddleware_NoTokenConfigured(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
@@ -43,7 +44,7 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -54,7 +55,7 @@ func TestAuthMiddleware_ValidToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200, got %d", resp.StatusCode)
@@ -71,14 +72,14 @@ func TestAuthMiddleware_MissingHeader(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	resp, err := http.Get("http://" + server.Addr() + "/api/v1/status")
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", resp.StatusCode)
@@ -95,7 +96,7 @@ func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -106,7 +107,7 @@ func TestAuthMiddleware_InvalidFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", resp.StatusCode)
@@ -123,7 +124,7 @@ func TestAuthMiddleware_WrongToken(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -134,7 +135,7 @@ func TestAuthMiddleware_WrongToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("expected 401, got %d", resp.StatusCode)
@@ -151,7 +152,7 @@ func TestAuthMiddleware_SkipPaths(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	// /health and /metrics should be accessible without auth
@@ -162,7 +163,7 @@ func TestAuthMiddleware_SkipPaths(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request error: %v", err)
 			}
-			defer resp.Body.Close()
+			defer closeBody(resp)
 
 			if resp.StatusCode != http.StatusOK {
 				t.Errorf("expected 200 for %s, got %d", path, resp.StatusCode)
@@ -181,7 +182,7 @@ func TestCORSMiddleware_NoOrigins(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -192,7 +193,7 @@ func TestCORSMiddleware_NoOrigins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	// No CORS headers should be set
 	if cors := resp.Header.Get("Access-Control-Allow-Origin"); cors != "" {
@@ -210,7 +211,7 @@ func TestCORSMiddleware_AllowedOrigin(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -221,7 +222,7 @@ func TestCORSMiddleware_AllowedOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	cors := resp.Header.Get("Access-Control-Allow-Origin")
 	if cors != "http://example.com" {
@@ -239,7 +240,7 @@ func TestCORSMiddleware_DisallowedOrigin(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -250,7 +251,7 @@ func TestCORSMiddleware_DisallowedOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	// No CORS headers for disallowed origin
 	if cors := resp.Header.Get("Access-Control-Allow-Origin"); cors != "" {
@@ -268,7 +269,7 @@ func TestCORSMiddleware_Wildcard(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -279,7 +280,7 @@ func TestCORSMiddleware_Wildcard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	cors := resp.Header.Get("Access-Control-Allow-Origin")
 	if cors != "*" {
@@ -297,7 +298,7 @@ func TestCORSMiddleware_Preflight(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	client := &http.Client{}
@@ -309,7 +310,7 @@ func TestCORSMiddleware_Preflight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusNoContent {
 		t.Errorf("expected 204 for preflight, got %d", resp.StatusCode)
@@ -379,7 +380,7 @@ func TestRateLimitMiddleware_Disabled(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	// Make many requests - all should succeed
@@ -388,7 +389,7 @@ func TestRateLimitMiddleware_Disabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request error: %v", err)
 		}
-		resp.Body.Close()
+		closeBody(resp)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("request %d: expected 200, got %d", i, resp.StatusCode)
@@ -407,7 +408,7 @@ func TestRateLimitMiddleware_Enabled(t *testing.T) {
 	if err := server.Start(context.Background()); err != nil {
 		t.Fatalf("Start error: %v", err)
 	}
-	defer server.Stop()
+	defer stopServer(t, server)
 	time.Sleep(10 * time.Millisecond)
 
 	// First 3 requests should succeed (burst)
@@ -416,7 +417,7 @@ func TestRateLimitMiddleware_Enabled(t *testing.T) {
 		if err != nil {
 			t.Fatalf("request error: %v", err)
 		}
-		resp.Body.Close()
+		closeBody(resp)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("request %d: expected 200, got %d", i+1, resp.StatusCode)
@@ -428,7 +429,7 @@ func TestRateLimitMiddleware_Enabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Errorf("4th request: expected 429, got %d", resp.StatusCode)
@@ -493,7 +494,9 @@ func TestServerStopStopsRateLimiter(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		srv.Stop()
+		if err := srv.Stop(); start && err != nil || !start && !errors.Is(err, ErrServerNotStarted) {
+			t.Fatalf("started=%v: Stop = %v", start, err)
+		}
 		select {
 		case <-srv.rateLimiter.stopped:
 		case <-time.After(time.Second):

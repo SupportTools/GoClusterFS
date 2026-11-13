@@ -69,7 +69,7 @@ func getStatus(url string) int {
 	if err != nil {
 		return 0
 	}
-	resp.Body.Close()
+	closeBody(resp)
 	return resp.StatusCode
 }
 
@@ -95,7 +95,7 @@ func TestStopLetsRequestsInFlightFinish(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-		conn.Close()
+		_ = conn.Close()
 		t.Error("the server accepted a new connection while stopping")
 	}
 
