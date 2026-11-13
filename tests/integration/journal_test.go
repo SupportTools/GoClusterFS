@@ -230,11 +230,6 @@ func TestJournalCrashRecoveryMultipleOps(t *testing.T) {
 		}
 	}
 
-	// Force sync
-	if err := syncPath(mfs.MountPoint); err != nil {
-		t.Fatal(err)
-	}
-
 	t.Log("All operations complete, simulating crash...")
 
 	// Crash
