@@ -40,11 +40,14 @@ const (
 	RequiredSnapshots  uint64 = 1 << 1 // Snapshot structures present
 	RequiredEncryption uint64 = 1 << 2 // Encryption enabled (future)
 	RequiredCompressed uint64 = 1 << 3 // Compression enabled (future)
+
+	// RequiredTypedLockRecords means each lock type has its own lock records; builds without it hash every type over all of them.
+	RequiredTypedLockRecords uint64 = 1 << 4
 )
 
 // FlagsWeSupport defines which required flags this version understands.
 // Update this as new features are implemented.
-var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots
+var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredTypedLockRecords
 
 // Errors
 var (
@@ -129,7 +132,11 @@ func (sb *Superblock) CanMount() error {
 		return fmt.Errorf("%w: unknown required flags 0x%x",
 			ErrUnknownRequired, unknownFlags)
 	}
-
+	if sb.RequiredFlags&RequiredTypedLockRecords == 0 {
+		return fmt.Errorf("%w: the volume was formatted before each lock type had its own lock records, so its nodes "+
+			"would not exclude this version's. Copy the data off with the version that formatted it, then reformat with -format",
+			ErrUnsupportedLayout)
+	}
 	return nil
 }
 

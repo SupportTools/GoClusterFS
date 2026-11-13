@@ -10,12 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - The on-disk format is now version 3. Mount refuses devices formatted by earlier builds. Version 1 kept one journal for all nodes. Version 2 had room for 4096 inodes, and on devices over 128 GB its refcounts overwrote the snapshot registry and then data blocks. Copy the data off with the old build, reformat with `-format`, and copy it back.
 - Devices must be at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
-- Mount also refuses version 3 devices formatted before lock records had one claim slot per node. Copy the data off with the build that formatted them and reformat.
+- Mount also refuses version 3 devices formatted before lock records had one claim slot per node, or before each lock type had its own lock records. Older builds refuse devices this version formats. Copy the data off with the build that formatted them and reformat.
 - Node clocks must agree within a few seconds. See the node requirements in `docs/OPERATIONS.md`.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
-  - This version places lock records differently (each lock type has its own records), so old and new binaries on one device do not exclude each other.
   - Directory entries now fill all 4 KB chunks of a directory block. When an older binary removes the first entry of a later chunk, it grows the last entry of the chunk before it across the boundary. This version then stops listing that entry, and fsck reports the directory block.
 - Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
 - Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
