@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -527,11 +526,7 @@ func main() {
 	// through the mount, and the unmount fails while they hold files open.
 	var unmounted atomic.Bool
 	// The watch runs from the signal, or from an unmount another tool started, to the exit.
-	var watchOnce sync.Once
-	var stopWatch func()
-	watchShutdown := func() {
-		watchOnce.Do(func() { stopWatch = goclusterfs.WatchShutdown(8 * time.Second) })
-	}
+	watch := &goclusterfs.ShutdownWatch{Limit: 8 * time.Second}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -541,11 +536,12 @@ func main() {
 				continue
 			}
 			log.Println("Received signal, unmounting...")
-			watchShutdown()
+			watch.Start()
 			goclusterfs.ShutdownStep("API server stop", stopAPI)
 			goclusterfs.ShutdownStep("unmount", func() {
 				if err := server.Unmount(); err != nil {
 					log.Printf("Unmount of %s failed: %v. Close the files and shells that use it, then send the signal again or run fusermount3 -u %s", *mountPoint, err, *mountPoint)
+					watch.End()
 				}
 			})
 		}
@@ -554,7 +550,7 @@ func main() {
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
 	server.Wait()
 	unmounted.Store(true)
-	watchShutdown()
+	watch.Start()
 	goclusterfs.ShutdownStep("API server stop", stopAPI)
 
 	exit := cli.ExitOK
@@ -594,7 +590,7 @@ func main() {
 
 	log.Println("Filesystem unmounted.")
 	_ = dev.Close()
-	stopWatch()
+	watch.End()
 	os.Exit(exit)
 }
 

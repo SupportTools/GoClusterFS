@@ -3,6 +3,7 @@ package goclusterfs
 import (
 	"log"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -28,4 +29,30 @@ func WatchShutdown(limit time.Duration) (stop func()) {
 		log.Printf("[WARN] shutdown still running after %v; goroutines:\n%s", limit, buf[:n])
 	})
 	return func() { timer.Stop() }
+}
+
+// ShutdownWatch runs WatchShutdown for one shutdown at a time. Start begins a
+// watch unless one runs; End stops it, for example when an unmount fails and
+// the mount keeps serving, so it does not report a shutdown that is not running.
+type ShutdownWatch struct {
+	Limit time.Duration
+	mu    sync.Mutex
+	stop  func()
+}
+
+func (w *ShutdownWatch) Start() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stop == nil {
+		w.stop = WatchShutdown(w.Limit)
+	}
+}
+
+func (w *ShutdownWatch) End() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.stop != nil {
+		w.stop()
+		w.stop = nil
+	}
 }

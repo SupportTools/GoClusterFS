@@ -43,3 +43,24 @@ func TestStalledShutdownLogsGoroutines(t *testing.T) {
 		t.Errorf("want one goroutine dump from the stalled shutdown, got:\n%.400s", got)
 	}
 }
+
+// An unmount that fails ends the watch; the next attempt starts a new one.
+func TestEndedShutdownWatchDoesNotDump(t *testing.T) {
+	logs := captureLog(t)
+	watch := &ShutdownWatch{Limit: 30 * time.Millisecond}
+
+	watch.Start()
+	watch.End()
+	time.Sleep(90 * time.Millisecond)
+	if strings.Contains(logs.String(), "shutdown still running") {
+		t.Fatalf("an ended watch dumped goroutines:\n%.400s", logs.String())
+	}
+
+	watch.Start()
+	watch.Start()
+	time.Sleep(90 * time.Millisecond)
+	watch.End()
+	if got := strings.Count(logs.String(), "shutdown still running"); got != 1 {
+		t.Errorf("%d dumps from the second shutdown, want 1", got)
+	}
+}
