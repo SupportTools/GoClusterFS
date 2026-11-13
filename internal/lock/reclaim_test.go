@@ -278,3 +278,22 @@ func TestAdoptOwnerClearsDeadReader(t *testing.T) {
 	}
 	requireAcquired(t, writer, LockTypeInode, 9, LockModeExclusive)
 }
+
+// After a failed replay the dead node's claims stay on the device, so peers and
+// the node that failed both wait for a later replay.
+func TestForgetAdoptedKeepsDeadNodesClaims(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	requireAcquired(t, dead, LockTypeInode, 2, LockModeExclusive)
+	adopted, err := replayer.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(adopted) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v", adopted, err)
+	}
+
+	replayer.ForgetAdopted(adopted)
+	requireBlocked(t, peer, LockTypeInode, 2, LockModeExclusive)
+	requireBlocked(t, replayer, LockTypeInode, 2, LockModeExclusive)
+}

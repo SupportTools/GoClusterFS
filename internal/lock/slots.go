@@ -141,11 +141,20 @@ func (m *Manager) readRow(recordID uint64) ([]byte, error) {
 }
 
 // rowConflicts reports whether a slot other than this node's and ignore
-// conflicts with a claim in mode, and whether one of those is in a lower slot
-// or adopted, which this node must defer to. A write claim conflicts with every
-// live slot, a read claim with live write slots. Slots older than StaleThreshold
-// do not conflict, and torn slots conflict until they stay torn for tornExpiry.
-func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignore int) (conflict, lower bool) {
+// conflicts with a claim in mode, whether one of those is in a lower slot or
+// adopted, which this node must defer to, and what stands in the way. A write
+// claim conflicts with every live slot, a read claim with live write slots, and
+// a torn slot counts as a write claim. With an owner view a slot stays live
+// until its registry slot is empty. Without one, it stays live until it is older
+// than StaleThreshold, or for a torn slot, until it stays torn for tornExpiry.
+//
+// ignore is the slot of a dead node whose claim this node adopted for a replay.
+// Another replay's adopted claim then counts as lower only in a lower slot and
+// not at all in a higher one, so two replays sharing a record take turns.
+func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignore int) (conflict, lower bool, by blocker) {
+	m.mu.Lock()
+	view := m.ownerView
+	m.mu.Unlock()
 	for slot := range SlotsPerRecord {
 		if slot == m.nodeSlot || slot == ignore {
 			continue
@@ -155,18 +164,31 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 		if err != nil {
 			torn = rowSlot(row, slot)
 		}
-		if m.tornTooLong(slotRef{recordID, slot}, torn) {
+		tornTooLong := m.tornTooLong(slotRef{recordID, slot}, torn)
+		if err == nil && (s == nil || (mode != LockModeExclusive && s.mode != LockModeExclusive)) {
 			continue
 		}
-		if err == nil && (s == nil || s.stale() || (mode != LockModeExclusive && s.mode != LockModeExclusive)) {
+		adopted := s != nil && s.adopted
+		if adopted && ignore >= 0 && slot > ignore {
 			continue
 		}
-		conflict = true
-		if slot < m.nodeSlot || (s != nil && s.adopted) {
-			return true, true
+		b := blocker{slot: slot}
+		if view == nil {
+			if tornTooLong || (s != nil && s.stale()) {
+				continue
+			}
+		} else if b = m.slotState(view, slot, s); b.state == OwnerReleased {
+			continue
+		}
+		if conflict {
+			b = worse(by, b)
+		}
+		conflict, by = true, b
+		if slot < m.nodeSlot || adopted {
+			lower = true
 		}
 	}
-	return conflict, false
+	return conflict, lower, by
 }
 
 // tornTooLong reports whether ref has read torn, with the same bytes, for
@@ -260,7 +282,7 @@ func (m *Manager) dropClaimWaiter(recordID uint64) {
 // claim tries to win recordID in mode through this node's slot, as described
 // at the top of this file, and returns when the slot it relies on was written.
 // Callers hold the record's gate and have a waiter registered for it.
-func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written time.Time, won bool, err error) {
+func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written time.Time, won bool, by blocker, err error) {
 	m.mu.Lock()
 	c := m.claims[recordID]
 	rewrite := c.written.IsZero() || c.mode != mode || age(c.written) > renewAfter
@@ -274,11 +296,11 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 	if behindLower {
 		row, err := m.readRow(recordID)
 		if err != nil {
-			return time.Time{}, false, err
+			return time.Time{}, false, blocker{}, err
 		}
-		if _, lower := m.rowConflicts(recordID, row, mode, ignore); lower {
+		if _, lower, by := m.rowConflicts(recordID, row, mode, ignore); lower {
 			m.deferred.Add(1)
-			return time.Time{}, false, nil
+			return time.Time{}, false, by, nil
 		}
 		m.mu.Lock()
 		c.behindLower = false
@@ -292,37 +314,37 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 		c.written, c.mode = start, mode
 		m.mu.Unlock()
 		if err != nil {
-			return time.Time{}, false, err
+			return time.Time{}, false, blocker{}, err
 		}
 	}
 	row, err := m.readRow(recordID)
 	if err != nil {
-		return time.Time{}, false, err
+		return time.Time{}, false, blocker{}, err
 	}
 	if rewrite {
 		m.recordClaimTime(time.Since(start))
 	}
 
-	conflict, lower := m.rowConflicts(recordID, row, mode, ignore)
+	conflict, lower, by := m.rowConflicts(recordID, row, mode, ignore)
 	switch {
 	case !conflict:
 		m.mu.Lock()
 		written = c.written
 		c.written = time.Time{}
 		m.mu.Unlock()
-		return written, true, nil
+		return written, true, blocker{}, nil
 	case lower:
 		m.conflicts.Add(1)
 		if err := m.releaseRecord(recordID); err != nil {
-			return time.Time{}, false, err
+			return time.Time{}, false, by, err
 		}
 		m.mu.Lock()
 		c.written, c.behindLower = time.Time{}, true
 		m.mu.Unlock()
-		return time.Time{}, false, nil
+		return time.Time{}, false, by, nil
 	default:
 		m.waits.Add(1)
-		return time.Time{}, false, nil
+		return time.Time{}, false, by, nil
 	}
 }
 

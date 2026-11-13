@@ -487,3 +487,40 @@ func damageJournalHeader(t *testing.T, dev *storage.Device, offset int64, damage
 	}
 	return bytes.Clone(header)
 }
+
+// A transaction that cannot be applied yet fails with ErrApplyFailed, which a
+// mount retries; the retry resumes the journal and finishes it.
+func TestScanAndRecoverRetriesFailedApply(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+	j, err := Init(dev, 0, DefaultJournalSlotSize, [16]byte{1, 2, 3, 4}, 1, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := j.Begin()
+	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Commit(txn); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	handler := func(*RecoveredTxn) error {
+		calls++
+		if calls == 1 {
+			return errors.New("lock held by a live node")
+		}
+		return nil
+	}
+	if _, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, handler); !errors.Is(err, ErrApplyFailed) {
+		t.Fatalf("first attempt: %v, want ErrApplyFailed", err)
+	}
+	result, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, handler)
+	if err != nil || result == nil || !result.WasNeeded || calls != 2 {
+		t.Fatalf("retry = %+v, %v after %d handler calls; want the transaction replayed", result, err, calls)
+	}
+	if result, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, handler); err != nil || result != nil {
+		t.Errorf("after the retry the journal still needs recovery: %+v, %v", result, err)
+	}
+}

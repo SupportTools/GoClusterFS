@@ -628,6 +628,10 @@ func TestFailureDetectionLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeSlot failed: %v", err)
 	}
+	reg2.mu.Lock()
+	reg2.sightings[failingSlot] = sighting{uuid: staleSlot.UUID, seq: staleSlot.HeartbeatSeq, beat: staleSlot.HeartbeatTime,
+		since: time.Now().Add(-HeartbeatTimeout - deathMargin)}
+	reg2.mu.Unlock()
 
 	// Set up recovery handler
 	recovered := make(chan *FailedNodeInfo, 1)
@@ -1053,7 +1057,7 @@ func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
 	}
 }
 
-func TestDetectionReleasesLocksOnlyOfProvenDeadNodes(t *testing.T) {
+func TestDetectionReplaysOnlyProvenDeadNodes(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
@@ -1072,15 +1076,15 @@ func TestDetectionReleasesLocksOnlyOfProvenDeadNodes(t *testing.T) {
 		events = append(events, fmt.Sprintf("replay %d", info.SlotIndex))
 		return nil
 	})
-	reg.SetOwnerDeadHandler(func(owner [16]byte, _ int) func() {
+	reg.SetOwnerDeadHandler(func(owner [16]byte, _ int) func(bool) {
 		events = append(events, fmt.Sprintf("adopt %x", owner[:1]))
-		return func() { events = append(events, fmt.Sprintf("release %x", owner[:1])) }
+		return func(bool) { events = append(events, fmt.Sprintf("release %x", owner[:1])) }
 	})
 	reg.detectAndRecoverFailedNodes()
 
-	want := []string{"adopt 03", "replay 2", "release 03", "replay 3"}
+	want := []string{"adopt 03", "replay 2", "release 03"}
 	if fmt.Sprint(events) != fmt.Sprint(want) {
-		t.Errorf("events %v, want %v: only the exited node's locks are taken, and held through its replay", events, want)
+		t.Errorf("events %v, want %v: only the exited node is replayed, with its locks held through the replay", events, want)
 	}
 	if slow.UUID != ([16]byte{4}) {
 		t.Fatalf("slow node UUID %x", slow.UUID)
@@ -1100,8 +1104,8 @@ func TestRegisterReportsItsDeadPreviousIncarnation(t *testing.T) {
 		t.Fatalf("Register = %d, %v; want slot 0 of the exited mount", slot, err)
 	}
 
-	if owner, ok := reg.DeadPreviousOwner(); !ok || owner != ([16]byte{1}) {
-		t.Errorf("DeadPreviousOwner = %x, %v; want the previous incarnation 01", owner, ok)
+	if owner, ok := reg.PreviousOwner(); !ok || owner != ([16]byte{1}) {
+		t.Errorf("PreviousOwner = %x, %v; want the previous incarnation 01", owner, ok)
 	}
 }
 
@@ -1220,5 +1224,102 @@ func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
 	}
 	if slot, err := reg.readSlot(0); err != nil || slot.State != NodeStateDead || slot.RecoveryOwner != reg.localUUID {
 		t.Errorf("slot after the abandoned release: %+v, %v; want dead under this registry's lease", slot, err)
+	}
+}
+
+func TestOccupantReportsHowSlotStands(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	now := time.Now()
+	slots := []*Slot{
+		{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{1}, HeartbeatTime: now.Unix()},
+		{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{2}, HeartbeatTime: now.Add(-3 * HeartbeatTimeout).Unix()},
+		{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{3}, RecoveryStart: now.Unix()},
+		{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{4}, RecoveryStart: now.Add(-2 * recoveryLease).Unix()},
+		{Magic: SlotMagic, State: NodeStateEmpty},
+	}
+	want := []Occupancy{OccupiedLive, OccupiedFailing, OccupiedFailing, OccupiedLapsed, Unoccupied}
+	for i, slot := range slots {
+		if err := reg.writeSlot(i, slot); err != nil {
+			t.Fatal(err)
+		}
+		if uuid, got := reg.Occupant(i, true); got != want[i] || uuid != slot.UUID {
+			t.Errorf("slot %d: Occupant = %x, %d; want %x, %d", i, uuid[:1], got, slot.UUID[:1], want[i])
+		}
+	}
+}
+
+func TestOccupantAnswersFromLastReadUnlessFresh(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if _, got := reg.Occupant(0, false); got != Unoccupied {
+		t.Fatalf("empty slot: Occupant = %d", got)
+	}
+	if err := reg.writeSlot(0, &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{1}, HeartbeatTime: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, got := reg.Occupant(0, false); got != Unoccupied {
+		t.Errorf("cached read: Occupant = %d, want the earlier read's %d", got, Unoccupied)
+	}
+	if _, got := reg.Occupant(0, true); got != OccupiedLive {
+		t.Errorf("fresh read: Occupant = %d, want %d", got, OccupiedLive)
+	}
+}
+
+func TestRegisterReportsPreviousOwnerOfAnyTakenSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix()}
+	copy(gone.Hostname[:], "elsewhere")
+	if err := reg.writeSlot(0, gone); err != nil {
+		t.Fatal(err)
+	}
+	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 0 {
+		t.Fatalf("Register = %d, %v; want the failed slot 0", slot, err)
+	}
+	if owner, ok := reg.PreviousOwner(); !ok || owner != gone.UUID {
+		t.Errorf("PreviousOwner = %x, %v; want the failed node %x of another host", owner, ok, gone.UUID)
+	}
+
+	fresh := NewRegistry(dev, 0)
+	if _, err := fresh.Register(context.Background(), "node2"); err != nil {
+		t.Fatal(err)
+	}
+	if owner, ok := fresh.PreviousOwner(); ok {
+		t.Errorf("PreviousOwner = %x after taking an empty slot, want none", owner)
+	}
+}
+
+func TestFailedReplayKeepsDeadNodesLocks(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+		t.Skip("no kernel boot ID or PID namespace")
+	}
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	writeLocalSlot(t, reg, 2, exitedPID(t), 1)
+
+	var replayed []bool
+	reg.SetRecoveryHandler(func(*FailedNodeInfo) error { return errors.New("journal replay failed") })
+	reg.SetOwnerDeadHandler(func([16]byte, int) func(bool) {
+		return func(ok bool) { replayed = append(replayed, ok) }
+	})
+	reg.detectAndRecoverFailedNodes()
+
+	if fmt.Sprint(replayed) != "[false]" {
+		t.Fatalf("lock handler told %v, want one failed replay", replayed)
+	}
+	slot, err := reg.readSlot(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slot.State != NodeStateDead || slot.UUID != ([16]byte{3}) {
+		t.Errorf("after a failed replay slot 2 is %s with node %x; want it still dead with the failed node", slot.State, slot.UUID[:1])
 	}
 }

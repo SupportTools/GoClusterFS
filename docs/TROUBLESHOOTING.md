@@ -151,7 +151,7 @@ grep "lock.Acquire" /var/log/goclusterfs.log | tail -20
 ps aux | grep goclusterfs-mount
 ```
 
-A crashed node's locks free up on their own: other nodes take them over once they are 15 seconds old, or once the node is proven dead. A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
+A crashed node's locks free up on their own once another node proves it dead and replays its journal: in about 3 to 6 seconds when a surviving mount shares its host and PID namespace, and up to about 35 seconds otherwise. Waits for them log `which holds it and is failing or being recovered`. A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
 
 ### "Journal recovery for slot N failed"
 

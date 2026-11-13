@@ -90,6 +90,18 @@ func (m *Manager) ReleaseAdopted(records []uint64) error {
 	return nil
 }
 
+// ForgetAdopted drops this node's own record of the adoptions in records and
+// leaves their claims on the device, after a replay that failed. The dead
+// node's locks then stay held until another replay adopts and releases them,
+// and this node no longer passes over them.
+func (m *Manager) ForgetAdopted(records []uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, recordID := range records {
+		delete(m.adopted, recordID)
+	}
+}
+
 func (m *Manager) releaseAdopted(recordID uint64) error {
 	gate := m.recordGate(recordID)
 	gate.Lock()

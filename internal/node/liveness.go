@@ -117,12 +117,62 @@ func (r *Registry) recentlyAlive(slotIdx int) bool {
 }
 
 // provenDead reports whether a slot's node is dead, not merely slow: its mount
-// process is gone, or this node has seen the same heartbeat for longer than
-// HeartbeatTimeout plus deathMargin. Called with r.mu held.
+// process is gone, this node has seen the same heartbeat for longer than
+// HeartbeatTimeout plus deathMargin, or the slot is marked dead, which a node
+// does only after proving it or fsck after releasing it. Called with r.mu held.
 func (r *Registry) provenDead(slotIdx int, slot *Slot) bool {
-	if r.deadLocalOwner(slot) {
+	if slot.State == NodeStateDead || r.deadLocalOwner(slot) {
 		return true
 	}
 	last, seen := r.sightings[slotIdx]
 	return seen && last.uuid == slot.UUID && time.Since(last.since) >= HeartbeatTimeout+deathMargin
+}
+
+// Occupancy is how the node in a registry slot stands.
+type Occupancy uint8
+
+const (
+	// OccupiedLive is a node with a current heartbeat.
+	OccupiedLive Occupancy = iota
+	// OccupiedFailing is a node whose heartbeat stopped, or whose journal is being replayed.
+	OccupiedFailing
+	// OccupiedLapsed is a dead node whose replay let its recovery lease lapse: the replay failed or was abandoned.
+	OccupiedLapsed
+	// Unoccupied is an empty slot.
+	Unoccupied
+)
+
+// Occupant returns the node in registry slot slotIdx and how it stands. With
+// fresh set, or before failure detection has read the slot, it reads the slot
+// from the device; otherwise it uses failure detection's last read. A slot it
+// cannot read counts as live.
+func (r *Registry) Occupant(slotIdx int, fresh bool) ([16]byte, Occupancy) {
+	r.seenMu.Lock()
+	slot, ok := r.seen[slotIdx]
+	r.seenMu.Unlock()
+	if fresh || !ok {
+		read, err := r.readSlot(slotIdx)
+		if err != nil {
+			return [16]byte{}, OccupiedLive
+		}
+		r.remember(slotIdx, read)
+		slot = read
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	switch {
+	case slot.State == NodeStateEmpty:
+		return slot.UUID, Unoccupied
+	case slot.State == NodeStateDead && r.failed(slot, HeartbeatTimeout):
+		return slot.UUID, OccupiedLapsed
+	case slot.State == NodeStateDead || r.failed(slot, HeartbeatTimeout):
+		return slot.UUID, OccupiedFailing
+	}
+	return slot.UUID, OccupiedLive
+}
+
+func (r *Registry) remember(slotIdx int, slot *Slot) {
+	r.seenMu.Lock()
+	defer r.seenMu.Unlock()
+	r.seen[slotIdx] = slot
 }

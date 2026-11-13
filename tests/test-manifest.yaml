@@ -611,11 +611,20 @@ scenarios:
 
   - id: slow-node-keeps-locks
     name: Paused but alive node keeps its locks
-    description: Node A is paused (SIGSTOP) for 17s holding the root directory lock; node B must not take the lock before it is stale, nor take over A's locks as a dead node's
+    description: Node A is paused (SIGSTOP) for 17s holding the root directory lock; node B must not take the lock while A is paused, nor take over A's locks as a dead node's
     priority: high
     environments:
       go: lock_reclaim_test.go::TestSlowNodeKeepsLocks
       docker: TODO  # needs SIGSTOP on a mount process and a lock record written as that node; Go-only harness
+      vm: TODO  # same as docker
+
+  - id: waiter-outlasts-lock-timeout-through-failover
+    name: Lock wait outlasts the timeout through a failover
+    description: Node A holds the root directory lock alive for 13s, then stops; node B's create waits past the 30s lock timeout until A is proven dead and replayed, and succeeds without EIO
+    priority: high
+    environments:
+      go: lock_reclaim_test.go::TestWaiterOutlastsLockTimeoutThroughFailover
+      docker: TODO  # needs a lock record written as the stopped node at a known moment; Go-only harness
       vm: TODO  # same as docker
 
   - id: lock-adopt-owner
@@ -2801,6 +2810,118 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestWriteWhenInodeAndBlockShareLockRecord
+
+  - id: lock-failing-holder-blocks-until-released
+    name: Failing holder's claim blocks until its registry slot empties
+    description: A claim older than the stale threshold keeps blocking while its node is failing, and frees once the node's registry slot is empty
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestFailingHoldersOldClaimBlocksUntilRegistrySlotEmpties
+
+  - id: lock-wait-for-failing-holder-has-no-timeout
+    name: Wait for a failing holder outlasts the lock timeout
+    description: A wait for a failing holder's claim does not count toward the lock timeout and succeeds once the replay ends
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestWaitForFailingHolderOutlastsTimeout
+
+  - id: lock-wait-for-live-holder-times-out
+    name: Wait for a live holder still times out
+    description: A wait for a live, heartbeating holder still gives up after the lock timeout
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestWaitForLiveHolderStillTimesOut
+
+  - id: lock-wait-ends-when-replay-lapses
+    name: Lock wait ends when the holder's replay lapses
+    description: A wait for a failing holder gives up once the replay of its journal fails or is abandoned
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestWaitEndsWhenHoldersReplayLapses
+
+  - id: lock-claim-frees-on-fresh-empty-registry-read
+    name: Claim frees only on a fresh empty registry read
+    description: A cached registry read showing the slot empty does not free a claim; only a read from the device after the row does
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestClaimFreesOnlyWhenFreshRegistryReadIsEmpty
+
+  - id: lock-torn-slot-frees-with-registry-slot
+    name: Torn lock slot frees when its registry slot empties
+    description: A torn claim slot blocks while the node in its registry slot is failing and frees once that slot is empty
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestTornSlotFreesWhenItsRegistrySlotEmpties
+
+  - id: lock-peers-wait-out-successor-replay
+    name: Peers wait out a successor's replay of its predecessor
+    description: A live node that took a dead node's registry slot keeps its predecessor's claims while it replays that journal, and peers wait without a timeout
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestPeersWaitOutLiveNodesReplayOfItsPredecessor
+
+  - id: lock-replays-sharing-record-take-turns
+    name: Replays sharing a lock record take turns
+    description: Two nodes replaying dead nodes whose claims share a record do not wait on each other; the replay of the lower dead slot goes first
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestReplaysSharingRecordTakeTurns
+
+  - id: lock-nested-wait-yields-to-replay
+    name: Nested wait on a replaying node yields to the replay
+    description: A peer that holds inode Y and waits for a dead node's adopted extent row gives up after the timeout, and the replay, which waits without a limit, takes Y and finishes
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestNestedWaitOnReplayingNodeYieldsToReplay
+
+  - id: lock-long-hold-logged-once
+    name: Long lock hold is logged once
+    description: A node that holds a lock longer than a minute logs one warning naming the record and the key that holds it, since a claim never goes stale and a leaked hold lasts until unmount
+    priority: go_only
+    environments:
+      go: internal/lock/holds_test.go::TestLongHoldIsLoggedOnce
+
+  - id: lock-forget-adopted-keeps-claims
+    name: A failed replay keeps the dead node's lock claims
+    description: After a failed replay the replaying node forgets its adoptions but leaves the claims on the device, so peers and the failed replayer wait for a later replay
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestForgetAdoptedKeepsDeadNodesClaims
+
+  - id: registry-failed-replay-keeps-locks
+    name: Failure detection keeps a dead node's locks after a failed replay
+    description: When the replay of a dead node's journal fails, the lock handler is told so and the registry slot stays dead with the failed node
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestFailedReplayKeepsDeadNodesLocks
+
+  - id: journal-retries-failed-apply
+    name: Journal recovery marks a failed apply as retryable
+    description: A transaction that cannot be applied fails ScanAndRecover with ErrApplyFailed, and the next attempt resumes the journal and finishes it
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestScanAndRecoverRetriesFailedApply
+
+  - id: registry-occupant-states
+    name: Registry reports how each slot's node stands
+    description: Occupant reports a live node, a failing or dead one under replay, a dead one whose replay lapsed, and an empty slot, and answers from the last read unless asked for a fresh one
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestOccupantReportsHowSlotStands
+
+  - id: registry-occupant-cache
+    name: Registry answers occupancy from its last read unless fresh
+    description: Occupant answers from failure detection's last read of a slot, and reads the device when asked for a fresh answer
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestOccupantAnswersFromLastReadUnlessFresh
+
+  - id: registry-previous-owner-of-taken-slot
+    name: Register reports the previous owner of any taken slot
+    description: Register reports the node whose failed slot it took, from any host, so mount keeps that node's lock claims through the replay
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterReportsPreviousOwnerOfAnyTakenSlot
 
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
