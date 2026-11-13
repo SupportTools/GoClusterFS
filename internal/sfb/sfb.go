@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
@@ -320,13 +321,25 @@ func (m *Manager) AllocateSlot(ctx context.Context, size uint64) (containerBlock
 	return containerBlock, slotIndex, nil
 }
 
+// unlock releases a container lock. ErrNotLockOwner means a double release:
+// the extra one may have dropped another holder's lock early.
+func (m *Manager) unlock(container uint64) {
+	err := m.lockMgr.Release(lock.LockTypeSFBContainer, container)
+	switch {
+	case errors.Is(err, lock.ErrNotLockOwner):
+		log.Printf("[ERROR] sfb: released the lock on container %d that this node does not hold (double release or lock bookkeeping bug)", container)
+	case err != nil:
+		log.Printf("[WARN] sfb: releasing the lock on container %d failed: %v", container, err)
+	}
+}
+
 // tryAllocFromContainer attempts to allocate a slot from a specific container.
 func (m *Manager) tryAllocFromContainer(ctx context.Context, block uint64, tier Tier) (uint16, error) {
 	// Acquire SFBContainer lock (Level 7)
 	if err := m.lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, block, lock.LockModeExclusive); err != nil {
 		return 0, err
 	}
-	defer m.lockMgr.Release(lock.LockTypeSFBContainer, block)
+	defer m.unlock(block)
 
 	// Load container (from cache or disk)
 	container, err := m.loadContainer(block)
@@ -383,7 +396,9 @@ func (m *Manager) createContainer(ctx context.Context, tier Tier) (uint64, error
 
 	// Write header to disk
 	if err := m.writeContainerHeader(block, &header); err != nil {
-		m.bitmap.Free(ctx, block)
+		if freeErr := m.bitmap.Free(ctx, block); freeErr != nil {
+			err = errors.Join(err, fmt.Errorf("block %d stays allocated with no owner: %w", block, freeErr))
+		}
 		return 0, err
 	}
 
@@ -406,7 +421,7 @@ func (m *Manager) FreeSlot(ctx context.Context, containerBlock uint64, slotIndex
 	if err := m.lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, containerBlock, lock.LockModeExclusive); err != nil {
 		return err
 	}
-	defer m.lockMgr.Release(lock.LockTypeSFBContainer, containerBlock)
+	defer m.unlock(containerBlock)
 
 	// Load container
 	container, err := m.loadContainer(containerBlock)

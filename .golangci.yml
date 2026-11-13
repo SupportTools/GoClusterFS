@@ -29,13 +29,7 @@ linters:
       - path: ^internal/cache/
         linters: [errcheck]
 
-      - path: ^internal/fileops/
-        linters: [errcheck]
-
       - path: ^internal/goclusterfs/
-        linters: [errcheck]
-
-      - path: ^internal/sfb/
         linters: [errcheck]
 
       - path: ^cmd/gfsctl/

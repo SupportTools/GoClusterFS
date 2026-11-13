@@ -16,7 +16,7 @@ func freeUDPPorts(t *testing.T, n int) []int {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
 	}
 	return ports
@@ -141,7 +141,7 @@ func TestCheckPortsFailsOnTakenPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	cfg := DefaultConfig()
 	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]

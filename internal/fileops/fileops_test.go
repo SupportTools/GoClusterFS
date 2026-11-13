@@ -78,12 +78,12 @@ func TestOpenStaysInsideTheRoot(t *testing.T) {
 			t.Errorf("open(%q): %v", p, err)
 			continue
 		}
-		f.Close()
+		_ = f.Close()
 	}
 	for _, p := range []string{"/link", "/linkdir/passwd", "/inside-link"} {
 		if f, err := o.open(p); !errors.Is(err, api.ErrInvalidPath) {
 			if f != nil {
-				f.Close()
+				_ = f.Close()
 			}
 			t.Errorf("open(%q) = %v, want ErrInvalidPath", p, err)
 		}
@@ -104,7 +104,7 @@ func TestSameDevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		t.Fatal(err)
