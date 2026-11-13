@@ -6,21 +6,18 @@ This document provides a comprehensive reference for all configuration options i
 
 1. [Command-Line Flags](#command-line-flags)
 2. [HTTP API Statistics](#http-api-statistics)
-3. [Cache Configuration](#cache-configuration)
-4. [Journal Configuration](#journal-configuration)
-5. [TRIM Configuration](#trim-configuration)
-6. [Broadcast Configuration](#broadcast-configuration)
-7. [Configuration Presets](#configuration-presets)
-8. [Tuning Recommendations](#tuning-recommendations)
+3. [Code-Level Settings](#code-level-settings)
+4. [Tuning Recommendations](#tuning-recommendations)
+5. [Environment Variables](#environment-variables)
 
 ---
 
 ## Command-Line Flags
 
-These flags are passed when starting `goclusterfs`:
+These are the `goclusterfs-mount` flags:
 
 ```bash
-./goclusterfs [flags]
+./goclusterfs-mount [flags]
 ```
 
 ### Required Flags
@@ -36,7 +33,7 @@ These flags are passed when starting `goclusterfs`:
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Format the device (destroys all data) |
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
-| `-debug` | bool | `false` | Enable verbose debug logging |
+| `-debug` | bool | `false` | Log every FUSE request and reply. Mount logs its own `[DEBUG]` lines either way |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 
 ### Cache Flags
@@ -82,7 +79,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-sfb` | bool | `true` | Ignored. SFB containers are disabled |
-| `-snapshots` | bool | `true` | Enable O(1) file snapshots |
+| `-snapshots` | bool | `true` | Enable file snapshots and clones through extended attributes |
 
 ### HTTP API Flags
 
@@ -96,13 +93,13 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
 | `-dashboard` | bool | `true` | Serve the [web dashboard](#web-dashboard) under `/ui/` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with `-api-token`, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With `-api-token` set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
 
-Without `-api-token`, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
+Without a token, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
 
 By default the API only accepts connections from this host. To serve other hosts, set `-api-addr` (for example `:8080` or `10.0.0.5:8080`) and `-api-token-file`. Mount exits before it opens the device when the address is not loopback (`127.0.0.0/8`, `::1` or `localhost`) and the token is empty.
 
-Give the token with `-api-token-file` or the `GOCLUSTERFS_API_TOKEN` environment variable, and set only one of them. Mount refuses a token file that group or others can read. `-api-token` still works, but `ps` and `/proc/<pid>/cmdline` show it to every local user, and with it they could change any file's snapshots through the API. The API uses plain HTTP, so a token sent to another host crosses the network unencrypted: put a TLS proxy in front of the API, or reach it over an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 node`).
+Give the token with `-api-token-file` or the `GOCLUSTERFS_API_TOKEN` environment variable, and set only one of them; mount exits when more than one is set, even with `-api=false`. Mount refuses a token file that group or others can read, that belongs to a user other than the mount's or root, or that is empty or over 4096 bytes. `-api-token` still works, but `ps` and `/proc/<pid>/cmdline` show it to every local user, and with it they could change any file's snapshots through the API. The API uses plain HTTP, so a token sent to another host crosses the network unencrypted: put a TLS proxy in front of the API, or reach it over an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 node`).
 
 The rate limit counts requests per connecting IP address, and per /64 for IPv6. It ignores `X-Forwarded-For`, so behind a proxy every client shares the proxy's limit. `/health`, `/metrics` and `/ui/` are never limited. The limiter tracks at most 65,536 clients at once; while it is full, new clients get 429 until idle clients' buckets refill and are dropped, about 2 seconds (longer below 0.5 requests per second).
 
@@ -161,521 +158,91 @@ Mount copies its managers' counters every second. While requests read capacity o
 
 ---
 
-## Cache Configuration
+## Code-Level Settings
 
-The cache subsystem is configured via the `cache.Config` struct in `internal/cache/config.go`.
+The settings below have no flag unless the table names one. `goclusterfs-mount` uses these defaults; changing the others means editing the Go code and rebuilding.
 
-### Configuration Fields
+### Cache
 
-```go
-type Config struct {
-    // Inode cache
-    InodeCacheSize    int           // Maximum cached inodes
-    InodeTTL          time.Duration // Time before inode needs revalidation
+`internal/cache/config.go`. Mount starts from `DefaultConfig()` and applies the flags.
 
-    // Extent cache
-    ExtentCacheSize   int           // Maximum cached extent mappings
+| Field | Default | Flag | Meaning |
+|-------|---------|------|---------|
+| `InodeCacheSize` | `10000` | | Cached inodes |
+| `InodeTTL` | `5s` | `-cache-ttl` | How long a cached inode is used before it is checked against the disk |
+| `ExtentCacheSize` | `50000` | | Cached mappings from (inode, logical block) to physical block. A mapping is only used with the inode version it was looked up with, so any inode write by any node makes it stale |
+| `NegativeCacheSize` | `1000` | | Cached "not found" lookups |
+| `NegativeTTL` | `1s` | | How long a "not found" result is kept |
+| `StrictMode` | `false` | `-cache-strict` | Check every cached inode against the disk before use |
 
-    // Negative cache (tracks "not found" lookups)
-    NegativeCacheSize int           // Maximum negative entries
-    NegativeTTL       time.Duration // Time before negative entry expires
+The package also defines `NetworkEnabledConfig`, `HighConsistencyConfig` and `HighPerformanceConfig`. `goclusterfs-mount` does not use them.
 
-    // Coherency mode
-    StrictMode        bool          // Always validate against disk
+### Journal
 
-    // Network broadcast settings
-    Network           broadcast.Config
-}
-```
+`internal/journal/journal.go`.
 
-### Field Details
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `CommitMode` | `CommitSync` | `CommitSync` syncs every commit. `CommitBatch` groups commits, up to `MaxBatchTransactions` (32) or `MaxBatchAge` (100 ms). `CommitAsync` never syncs and is for tests only |
+| `CheckpointInterval` | `5s` | Time between checkpoints. A checkpoint is also forced when a transaction does not fit |
+| `FullThreshold` | `75` | Not used |
 
-#### InodeCacheSize
+Each node's journal is 4 MB, set by the on-disk layout.
 
-| Property | Value |
-|----------|-------|
-| Default | `10000` |
-| Memory | ~3.5 MB (for defaults) |
-| Recommended | 10,000 - 100,000 |
+### TRIM
 
-The maximum number of inodes to cache. Each cached inode stores metadata, generations, and timestamps.
+`internal/trim/trim.go`.
 
-**Sizing guidance**:
-- Count unique files accessed in typical workload
-- Add 20% headroom
-- Example: 50,000 files accessed → set to 60,000
+| Field | Default | Flag | Meaning |
+|-------|---------|------|---------|
+| `Enabled` | `true` | `-trim` | Discard freed blocks. After the device refuses a discard as unsupported, as image files do, TRIM stays off for the rest of the mount |
+| `BatchSize` | `256` | `-trim-batch` | Freed blocks queued before a discard |
+| `MaxAge` | `5s` | `-trim-age` | Longest a freed block waits before it is discarded |
 
-#### InodeTTL
+### Broadcast
 
-| Property | Value |
-|----------|-------|
-| Default | `5 * time.Second` |
-| Range | 100ms - 5 minutes |
-| Recommended | 1s - 30s |
+`internal/cache/broadcast/transport.go`.
 
-Time after which a cached inode must be revalidated against disk.
-
-**Trade-offs**:
-- Shorter TTL: Higher consistency, more disk reads
-- Longer TTL: Better performance, eventual consistency
-
-#### ExtentCacheSize
-
-| Property | Value |
-|----------|-------|
-| Default | `50000` |
-| Memory | ~3.2 MB (for defaults) |
-| Recommended | 50,000 - 500,000 |
-
-The maximum number of extent mappings to cache. Extent cache maps (inode, logical block) → physical block. A cached mapping is only used with the inode version it was looked up with, so any inode write by any node makes it stale.
-
-**Sizing guidance**:
-- Large files benefit more from extent caching
-- Formula: `num_large_files * avg_extents_per_file`
-
-#### NegativeCacheSize
-
-| Property | Value |
-|----------|-------|
-| Default | `1000` |
-| Memory | ~40 KB |
-| Recommended | 1,000 - 10,000 |
-
-Cache for "file not found" lookups. Prevents repeated disk reads for non-existent files.
-
-#### NegativeTTL
-
-| Property | Value |
-|----------|-------|
-| Default | `1 * time.Second` |
-| Range | 100ms - 10s |
-| Recommended | 500ms - 2s |
-
-How long to cache "not found" results. Keep short to detect newly created files.
-
-#### StrictMode
-
-| Property | Value |
-|----------|-------|
-| Default | `false` |
-
-When `true`, always validates cache entries against disk before use.
-
-**Use cases**:
-- Database files
-- Shared configuration files
-- Any file modified by multiple nodes simultaneously
-
-**Impact**: Significantly more disk I/O, but guarantees consistency.
-
----
-
-## Journal Configuration
-
-The journal subsystem is configured via structures in `internal/journal/journal.go`.
-
-### Commit Modes
-
-```go
-type CommitMode int
-
-const (
-    CommitSync  CommitMode = iota  // fsync every commit (default)
-    CommitAsync                     // No sync (testing only)
-    CommitBatch                     // Batch syncs for performance
-)
-```
-
-#### CommitSync (Default)
-
-| Property | Value |
-|----------|-------|
-| Durability | Highest |
-| Performance | Lower |
-| Use case | Production default |
-
-Every transaction is followed by `fsync()`. Guarantees data survives power failure.
-
-#### CommitAsync
-
-| Property | Value |
-|----------|-------|
-| Durability | None |
-| Performance | Highest |
-| Use case | Testing only |
-
-**WARNING**: No durability guarantees. Data may be lost on crash.
-
-#### CommitBatch
-
-| Property | Value |
-|----------|-------|
-| Durability | High (batched) |
-| Performance | Higher than sync |
-| Use case | Write-heavy workloads |
-
-Groups multiple transactions before `fsync()`. Trades some latency for throughput.
-
-### Batch Configuration
-
-```go
-type BatchConfig struct {
-    MaxBatchTransactions int           // Max transactions per batch
-    MaxBatchAge          time.Duration // Max time before forced flush
-}
-```
-
-#### MaxBatchTransactions
-
-| Property | Value |
-|----------|-------|
-| Default | `32` |
-| Range | 1 - 256 |
-| Recommended | 16 - 64 |
-
-Maximum transactions to accumulate before forcing a sync.
-
-#### MaxBatchAge
-
-| Property | Value |
-|----------|-------|
-| Default | `100 * time.Millisecond` |
-| Range | 10ms - 1s |
-| Recommended | 50ms - 200ms |
-
-Maximum time to wait before forcing a sync, even if batch isn't full.
-
-### Journal Sizing
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| SlotSize | 4 MB | Size of each journal slot |
-| CheckpointInterval | 5 seconds | Time between checkpoints |
-| FullThreshold | 75% | Trigger forced checkpoint |
-
----
-
-## TRIM Configuration
-
-TRIM/BLKDISCARD configuration is in `internal/trim/trim.go`.
-
-```go
-type Config struct {
-    BatchSize  int           // Blocks per TRIM batch
-    MaxAge     time.Duration // Max age before forced flush
-    DataOffset uint64        // Offset to data region
-    Enabled    bool          // Whether TRIM is enabled
-}
-```
-
-### Field Details
-
-#### BatchSize
-
-| Property | Value |
-|----------|-------|
-| Default | `256` |
-| Range | 16 - 4096 |
-| Recommended | 128 - 512 |
-
-Number of blocks to accumulate before issuing TRIM command.
-
-**Trade-offs**:
-- Smaller batches: Lower latency, more syscalls
-- Larger batches: Higher latency, fewer syscalls
-
-#### MaxAge
-
-| Property | Value |
-|----------|-------|
-| Default | `5 * time.Second` |
-| Range | 1s - 60s |
-| Recommended | 5s - 30s |
-
-Maximum time to hold TRIM requests before flushing, even if batch isn't full.
-
-#### Enabled
-
-| Property | Value |
-|----------|-------|
-| Default | `true` |
-
-Set to `false` for devices that don't benefit from TRIM (HDDs, some SANs).
-
----
-
-## Broadcast Configuration
-
-Network broadcast configuration is in `internal/cache/broadcast/transport.go`.
-
-```go
-type Config struct {
-    Enabled              bool
-    MulticastGroup       string
-    MulticastPort        int
-    MulticastTTL         int
-    MaxMulticastFailures int
-    HeartbeatInterval    time.Duration
-    Secret               string
-    Interface            string
-}
-```
-
-### Field Details
-
-#### Enabled
-
-| Property | Value |
-|----------|-------|
-| Default | `true` (when network enabled) |
-
-Master switch for network broadcast functionality.
-
-#### MulticastGroup
-
-| Property | Value |
-|----------|-------|
-| Default | `239.192.74.75` |
-| Range | 239.0.0.0/8 (local admin scope) |
-
-IPv4 multicast group address. All cluster nodes must use the same group.
-
-**Note**: `239.192.0.0/14` is reserved for local administrative use.
-
-#### MulticastPort
-
-| Property | Value |
-|----------|-------|
-| Default | `31337` |
-| Range | 1024 - 65535 |
-
-UDP port for multicast. Unicast uses `UnicastPort` (default `31338`), which must differ: the multicast socket holds this port. If either port cannot be bound, the mount fails unless `-broadcast=false`.
-
-#### MulticastTTL
-
-| Property | Value |
-|----------|-------|
-| Default | `1` |
-| Range | 1 - 255 |
-
-IP TTL for multicast packets. `1` = same subnet only.
-
-**Values**:
-- 1: Same subnet (recommended)
-- 32: Same site
-- 64: Same region
-- 128: Same continent
-
-#### MaxMulticastFailures
-
-| Property | Value |
-|----------|-------|
-| Default | `3` |
-| Range | 1 - 10 |
-
-Consecutive multicast failures before falling back to unicast.
-
-#### HeartbeatInterval
-
-| Property | Value |
-|----------|-------|
-| Default | `30 * time.Second` |
-| Range | 5s - 120s |
-| Recommended | 15s - 60s |
-
-Interval between heartbeat messages to detect node failures.
-
-#### Secret
-
-| Property | Value |
-|----------|-------|
-| Default | (empty) |
-
-HMAC secret for message authentication. All nodes must use the same secret. With broadcast on and no secret, mount logs a `WARNING` line at startup.
-
-**Generating a secret**:
-```bash
-openssl rand -hex 32
-```
-
-#### Interface
-
-| Property | Value |
-|----------|-------|
-| Default | (auto-detected) |
-
-Network interface name for multicast traffic (e.g., `eth0`, `ens192`).
-
----
-
-## Configuration Presets
-
-### DefaultConfig
-
-Balanced configuration for general workloads.
-
-```go
-func DefaultConfig() Config {
-    return Config{
-        InodeCacheSize:    10000,
-        InodeTTL:          5 * time.Second,
-        ExtentCacheSize:   50000,
-        NegativeCacheSize: 1000,
-        NegativeTTL:       1 * time.Second,
-        StrictMode:        false,
-        Network: broadcast.Config{
-            Enabled: false,
-        },
-    }
-}
-```
-
-### NetworkEnabledConfig
-
-Default configuration with network broadcast enabled.
-
-```go
-func NetworkEnabledConfig() Config {
-    cfg := DefaultConfig()
-    cfg.Network = broadcast.Config{
-        Enabled:           true,
-        MulticastGroup:    "239.192.74.75",
-        MulticastPort:     31337,
-        UnicastPort:       31338,
-        MulticastTTL:      1,
-        HeartbeatInterval: 30 * time.Second,
-    }
-    return cfg
-}
-```
-
-### HighConsistencyConfig
-
-For workloads requiring strong consistency.
-
-```go
-func HighConsistencyConfig() Config {
-    cfg := NetworkEnabledConfig()
-    cfg.StrictMode = true
-    cfg.InodeTTL = 1 * time.Second
-    cfg.NegativeTTL = 500 * time.Millisecond
-    return cfg
-}
-```
-
-### HighPerformanceConfig
-
-For read-heavy workloads where eventual consistency is acceptable.
-
-```go
-func HighPerformanceConfig() Config {
-    cfg := DefaultConfig()
-    cfg.InodeCacheSize = 50000
-    cfg.ExtentCacheSize = 200000
-    cfg.InodeTTL = 30 * time.Second
-    cfg.NegativeTTL = 5 * time.Second
-    return cfg
-}
-```
+| Field | Default | Flag | Meaning |
+|-------|---------|------|---------|
+| `Enabled` | `true` | `-broadcast` | Send and receive cache invalidations |
+| `MulticastGroup` | `239.192.74.75` | `-mcast-group` | All nodes of a cluster must use the same group. `239.192.0.0/14` is for local administrative use |
+| `MulticastPort` | `31337` | `-mcast-port` | UDP port for multicast |
+| `UnicastPort` | `31338` | `-unicast-port` | UDP port for unicast; must differ from `MulticastPort` |
+| `MulticastTTL` | `1` | | Multicast packets stay in the local subnet |
+| `MaxMulticastFailures` | `3` | | After this many failed multicast sends, counted over the whole mount, the node sends to its unicast peers instead until it unmounts |
+| `HeartbeatInterval` | `30s` | | How often a node announces itself over UDP, so peers learn its unicast address. Failure detection uses the on-disk heartbeat, not this |
+| `Secret` | (empty) | `-broadcast-secret` | HMAC secret; all nodes must use the same one. With broadcast on and no secret, mount logs a `WARNING` at startup. Generate one with `openssl rand -hex 32` |
+| `Interface` | (system default) | `-broadcast-iface` | Network interface for multicast, such as `eth0` |
 
 ---
 
 ## Tuning Recommendations
 
-### Read-Heavy Workloads
+| Workload | Flags | Notes |
+|----------|-------|-------|
+| Read-heavy | `-cache-ttl 30s` | Open files can see other nodes' changes up to 30 seconds late |
+| Shared files, databases | `-cache-strict -attr-timeout 0` | Every node sees changes as soon as possible; `stat` and `ls` get much slower |
+| SSD or NVMe | `-trim-batch 512 -trim-age 10s` | Fewer, larger discards |
+| HDD, or storage without discard | `-trim=false` | |
+| Small files | | SFB is disabled, so each file with data uses a full 1 MB block |
 
-Optimize for cache hit rate:
-
-```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -cache-ttl 30s \
-    -journal \
-    -broadcast
-```
-
-**Code-level tuning**:
-- InodeCacheSize: 50,000+
-- ExtentCacheSize: 200,000+
-- InodeTTL: 30 seconds
-- StrictMode: false
-
-### Write-Heavy Workloads
-
-Optimize for write throughput:
+Cache sizes and journal commit modes have no flags.
 
 ```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -cache-ttl 1s \
-    -journal \
-    -trim \
-    -trim-batch 512
+./goclusterfs-mount -device /dev/device -mount /mnt/fs -cache-ttl 30s
 ```
-
-**Code-level tuning**:
-- CommitMode: CommitBatch
-- MaxBatchTransactions: 64
-- MaxBatchAge: 200ms
-- TRIM BatchSize: 512
-
-### Database Workloads
-
-Optimize for consistency:
-
-```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -cache-strict \
-    -journal \
-    -broadcast
-```
-
-**Code-level tuning**:
-- StrictMode: true
-- CommitMode: CommitSync
-- InodeTTL: 1 second
-
-### Small Files (< 64KB)
-
-SFB containers are disabled, so small files use full 1 MB blocks. `-sfb` is accepted and ignored.
-
-### Large File Streaming
-
-For sequential large file access:
-
-```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -journal \
-    -cache-ttl 1s
-```
-
-**Code-level tuning**:
-- ExtentCacheSize: 500,000+
-- ReadAheadBlocks: (if implemented)
-
-### Memory-Constrained Environments
-
-Reduce memory footprint:
-
-```bash
-./goclusterfs -device /dev/device -mount /mnt/fs \
-    -cache-ttl 1s \
-    -journal
-```
-
-**Code-level tuning**:
-- InodeCacheSize: 5,000
-- ExtentCacheSize: 20,000
-- NegativeCacheSize: 500
 
 ---
 
 ## Environment Variables
 
-GoClusterFS respects the following environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `GOCLUSTERFS_DEBUG` | Enable debug logging (alternative to `-debug`) |
-| `GOCLUSTERFS_SECRET` | Broadcast secret (alternative to `-broadcast-secret`) |
+| Variable | Read by | Meaning |
+|----------|---------|---------|
+| `GOCLUSTERFS_API_TOKEN` | `goclusterfs-mount` | The API token, instead of `-api-token-file`. Set only one of them |
+| `GFSCTL_HOST`, `GFSCTL_PORT`, `GFSCTL_TOKEN`, `GFSCTL_OUTPUT`, `GFSCTL_TIMEOUT` | `gfsctl` | Defaults for its flags; see [gfsctl](../README.md#gfsctl) |
+| `XDG_CONFIG_HOME` | `gfsctl` | Its config file is `$XDG_CONFIG_HOME/gfsctl/`, or `~/.config/gfsctl/` |
+| `NO_COLOR` | `gfsctl` | Turns off colored output |
 
 ---
 
