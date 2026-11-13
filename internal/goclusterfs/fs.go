@@ -1609,7 +1609,7 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	// The kernel stops reads at the size it cached, which a lookup during another
 	// node's write can leave short. Expiring it makes fstat and reads ask again.
 	if errno := f.NotifyContent(-1, 0); errno != 0 && errno != syscall.ENOSYS {
-		log.Printf("[DEBUG] File.Open: inode %d: expiring kernel attributes failed: %v", f.inodeNum, errno)
+		logging.Debugf("File.Open: inode %d: expiring kernel attributes failed: %v", f.inodeNum, errno)
 	}
 	// Return nil FileHandle - the File node itself implements Read/Write/etc.
 	// The fuse.FOPEN_KEEP_CACHE flag tells the kernel to keep cached data valid
