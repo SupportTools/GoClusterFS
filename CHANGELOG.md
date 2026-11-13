@@ -81,6 +81,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Two nodes could each hold a lock and wait for the other's, then fail with `EIO` after 30 seconds, when a write's inode and block locks mapped to records the other node held. Each lock type now has its own lock records.
 - Inode allocation races between nodes; allocation now retries with jittered backoff.
 - Directory operations now update caches and send broadcast invalidations.
+- A node that lost broadcast invalidations, for example when its receive buffer filled during a burst of writes on another node, kept stale inodes until `-cache-ttl` and logged nothing. It now sees the gap in the sender's sequence numbers, drops its inode and extent caches, and logs it at most every 10 seconds. The unmount stats line reports `lost=N`.
+- Broadcast deduplication kept every message for 5 minutes: about 224 MB per 2.4 million messages, and cleaning it up held up message handling for up to 200 ms. It now keeps a 64-message window per sender.
 - Docker and VM test suites now run on fresh hosts.
 - The README quick start now uses the real binary names and flags.
 - Create, mkdir, clone and snapshot failed with "No space left on device" when the lock wait for the new inode gave up or its slot could not be read. They now fail with `EIO`. `ENOSPC` means the inode table is full.

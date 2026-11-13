@@ -89,6 +89,36 @@ func TestLostMessageDropsCaches(t *testing.T) {
 	}
 }
 
+// TestVeryLateMessageKeepsTracking checks that a message older than the window,
+// such as one delayed on the other path, does not move tracking back.
+func TestVeryLateMessageKeepsTracking(t *testing.T) {
+	handler := newMockHandler()
+	b, err := NewBroadcaster(DisabledConfig(), [16]byte{1}, 0, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := NewMessageBuilder([16]byte{2})
+	late := peer.InvalidateInode(10, 1, 1)
+	for i := 0; i < 100; i++ {
+		b.handleMessage(peer.Heartbeat(), nil)
+	}
+
+	b.handleMessage(late, nil)
+	b.handleMessage(peer.InvalidateInode(11, 1, 1), nil)
+	time.Sleep(50 * time.Millisecond)
+
+	stats := b.Stats()
+	if got := handler.getClearCount(); got != 0 || stats.MessagesLost != 0 {
+		t.Errorf("after a very late message: %d clears, %d lost; want 0 and 0", got, stats.MessagesLost)
+	}
+	if stats.DuplicatesDropped != 1 {
+		t.Errorf("DuplicatesDropped = %d, want 1 for the very late message", stats.DuplicatesDropped)
+	}
+	if got := handler.getInodeInvalidations(); len(got) != 1 || got[0] != 11 {
+		t.Errorf("invalidated inodes = %v, want [11]", got)
+	}
+}
+
 func waitForClears(t *testing.T, h *mockHandler, want int) {
 	t.Helper()
 	for deadline := time.Now().Add(2 * time.Second); h.getClearCount() < want; {

@@ -119,8 +119,8 @@ func TestBroadcasterDuplication(t *testing.T) {
 		{seq: 1000, dup: true},
 		{seq: 1004, dup: true},
 		{seq: 1004 + seqWindow + 1, missed: seqWindow},
-		{seq: 1004, missed: 1},
-		{seq: 1005},
+		{seq: 1004, dup: true},
+		{seq: 1004 + seqWindow + 2},
 	}
 	for i, s := range steps {
 		dup, missed := b.track(peer, s.seq)

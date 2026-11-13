@@ -261,8 +261,9 @@ func (b *Broadcaster) handlePeerAnnounce(msg *Message, addr *net.UDPAddr) {
 }
 
 // track records seq from sender. It reports whether seq was already handled,
-// and how many of the sender's messages are missing: the ones skipped before
-// seq, or 1 when seq is too far behind to tell, which restarts the tracking.
+// and how many of the sender's messages were skipped before seq. A seq older
+// than the window counts as handled: it was either seen, or counted missing
+// when highest passed it.
 func (b *Broadcaster) track(sender [16]byte, seq uint64) (dup bool, missed uint64) {
 	b.sendersMu.Lock()
 	defer b.sendersMu.Unlock()
@@ -281,16 +282,15 @@ func (b *Broadcaster) track(sender [16]byte, seq uint64) (dup bool, missed uint6
 		return false, ahead - 1
 	case seq == s.highest:
 		return true, 0
-	case s.highest-seq <= seqWindow:
+	case s.highest-seq > seqWindow:
+		return true, 0
+	default:
 		bit := uint64(1) << (s.highest - seq - 1)
 		if s.seen&bit != 0 {
 			return true, 0
 		}
 		s.seen |= bit
 		return false, 0
-	default:
-		*s = senderSeq{highest: seq, heard: s.heard}
-		return false, 1
 	}
 }
 

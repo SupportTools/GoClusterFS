@@ -1873,6 +1873,13 @@ scenarios:
     environments:
       go: internal/cache/broadcast/loss_test.go::TestLostMessageDropsCaches
 
+  - id: broadcast-very-late-message
+    name: Very late broadcast message keeps tracking
+    description: A message older than the sequence window is dropped as a duplicate and does not make the next message look like loss
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestVeryLateMessageKeepsTracking
+
   - id: broadcast-clears-coalesce
     name: Cache clears after loss coalesce
     description: Gaps found while a cache clear runs cost one more clear, run off the receive path
