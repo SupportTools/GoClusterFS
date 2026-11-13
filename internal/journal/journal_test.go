@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -679,19 +680,7 @@ func TestBatchCommitReturnsSyncError(t *testing.T) {
 		result <- err
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		j.batchMu.Lock()
-		pending := j.batchPendingCount
-		j.batchMu.Unlock()
-		if pending == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("commit never joined a batch")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitForPendingBatch(t, j)
 	if err := dev.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -732,5 +721,59 @@ func TestCheckpointAdvancesHeadNow(t *testing.T) {
 	}
 	if head, tail := j.Region().HeadOffset(), j.Region().TailOffset(); head != tail {
 		t.Fatalf("head %d != tail %d after Checkpoint", head, tail)
+	}
+}
+
+func waitForPendingBatch(t *testing.T, j *Journal) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		j.batchMu.Lock()
+		pending := j.batchPendingCount
+		j.batchMu.Unlock()
+		if pending > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("commit never joined a batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Stop reports a final batch flush that failed, and a second Stop does nothing.
+func TestStopReportsFailedBatchFlush(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10*1024*1024)
+	defer cleanup()
+	config := DefaultConfig()
+	config.CommitMode = CommitBatch
+	config.BatchConfig = BatchConfig{MaxBatchTransactions: 100, MaxBatchAge: time.Minute}
+	j, err := Init(dev, 0, DefaultJournalSlotSize, [16]byte{1}, 1, config)
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	txn := j.Begin()
+	if err := txn.LogInodeCreate(testInodePayload(100)); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := j.Commit(txn)
+		result <- err
+	}()
+	waitForPendingBatch(t, j)
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := j.Stop(); !errors.Is(err, os.ErrInvalid) {
+		t.Fatalf("Stop = %v, want the failed sync's error", err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("Commit returned nil after its batch sync failed")
+	}
+	if err := j.Stop(); err != nil {
+		t.Fatalf("second Stop = %v, want nil", err)
 	}
 }
