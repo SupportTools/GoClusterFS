@@ -2424,13 +2424,13 @@ test_stress_single_node() {
 # Based on Go TestMultiNodeConcurrentDirectoryOps which creates files not directories
 test_concurrent_directory_ops() {
     log_info "Testing concurrent directory operations across VMs..."
-    ensure_cluster_healthy 2
 
     # Need at least 2 VMs for this test
     if [[ $NODE_COUNT -lt 2 ]]; then
         log_info "SKIP: Need at least 2 VMs for concurrent directory ops test"
         return 0
     fi
+    ensure_cluster_healthy 2
 
     local vm1=1
     local vm2=2
@@ -2668,12 +2668,11 @@ test_concurrent_same_file_writes() {
 # Test 11: Three VMs write to same file at different offsets
 test_concurrent_same_file_writes_3vms() {
     log_info "Testing concurrent same-file writes (3 VMs)..."
-    ensure_cluster_healthy 3
-
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
         return 0
     fi
+    ensure_cluster_healthy 3
 
     local filename="samefile_3vm.txt"
     local chunk_size=$((300 * 1024))  # 300KB each
@@ -2759,12 +2758,11 @@ test_mixed_size_writes() {
 # Test 13: Overlapping block writes (all within same 1MB block)
 test_overlapping_block_writes() {
     log_info "Testing overlapping block writes..."
-    ensure_cluster_healthy 3
-
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
         return 0
     fi
+    ensure_cluster_healthy 3
 
     local filename="overlap_block.txt"
     local chunk_size=$((256 * 1024))  # 256KB each
@@ -2807,12 +2805,11 @@ test_overlapping_block_writes() {
 # Test 14: Write stress test - multiple rounds
 test_concurrent_write_stress() {
     log_info "Testing concurrent write stress (multiple rounds)..."
-    ensure_cluster_healthy 3
-
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
         return 0
     fi
+    ensure_cluster_healthy 3
 
     local filename="write_stress.txt"
     local chunk_size=$((250 * 1024))  # 250KB each
@@ -2995,7 +2992,11 @@ unmount_goclusterfs() {
 # it is clean, and no file changes.
 test_fsck_repair_after_power_failure() {
     log_info "Testing fsck -repair after a power failure..."
-    ensure_cluster_healthy 2
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: Need at least 2 VMs for this test"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
     local survivor=1
     local victim=2
     local fsck=/usr/local/bin/goclusterfs-fsck
@@ -3024,7 +3025,7 @@ test_fsck_repair_after_power_failure() {
     before=$(ssh_run "$victim" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
 
     local vm_id
-    for vm_id in "$survivor" "$victim"; do
+    for vm_id in $(seq 1 "$NODE_COUNT"); do
         if ! unmount_goclusterfs "$vm_id"; then
             log_error "VM $vm_id: GoClusterFS did not unmount"
             return 1
@@ -3048,7 +3049,7 @@ test_fsck_repair_after_power_failure() {
         return 1
     fi
 
-    for vm_id in "$survivor" "$victim"; do
+    for vm_id in $(seq 1 "$NODE_COUNT"); do
         setup_goclusterfs "$vm_id" false || return 1
     done
     if [[ "$before" != *"$keep_md5  keep.bin"* ]]; then
