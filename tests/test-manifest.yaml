@@ -522,7 +522,6 @@ scenarios:
     name: Four nodes create 4200 files in one directory
     description: Four nodes each create 1050 empty files in one shared directory at the same time; every create succeeds and one node lists all 4200
     priority: medium
-    # Skipped until #29: double holds of the directory lock lose entries, and a lost reader count outlasts the lock timeout.
     # Docker/VM: test_more_than_4096_files already runs 4200 concurrent creates on 4 nodes, spread over 42 directories.
     environments:
       go: dir_capacity_test.go::TestMultiNodeCreatesInOneDirectory

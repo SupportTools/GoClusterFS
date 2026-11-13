@@ -13,7 +13,6 @@ import (
 // TestMultiNodeCreatesInOneDirectory has four nodes create 4200 empty files in
 // one directory at the same time, so every create waits on the same directory lock.
 func TestMultiNodeCreatesInOneDirectory(t *testing.T) {
-	t.Skip("until lock claims are confirmed (#29), two nodes can both hold the directory lock and lose an entry, and a lost reader count keeps creates out past the lock timeout")
 	const nodes = 4
 	perNode := 1050
 	if testing.Short() {
