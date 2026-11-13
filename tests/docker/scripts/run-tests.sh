@@ -3245,16 +3245,15 @@ run_test "Clone In-Place Write" test_clone_in_place_write
 run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 run_test "Snapshot During Writes" test_snapshot_during_writes
+run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"
     echo "SKIP: Concurrent Writes (known race conditions)" >> "$RESULTS_DIR/results.txt"
     echo "SKIP: Concurrent File Creation" >> "$RESULTS_DIR/results.txt"
-    echo "SKIP: Concurrent Directory Ops" >> "$RESULTS_DIR/results.txt"
 else
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation
-    run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 fi
 run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
 run_test "Container Kill Recovery" test_container_kill_recovery
