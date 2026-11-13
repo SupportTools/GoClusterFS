@@ -16,8 +16,8 @@ env:
   NODE_VERSION: "22.23.4"
 
 jobs:
-  build-and-unit-test:
-    name: Build and Unit Tests
+  build:
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -50,6 +50,28 @@ jobs:
             exit 1
           fi
 
+  unit-tests:
+    name: Unit Tests (group ${{ matrix.group }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # tests/scripts/unit-groups.sh splits the packages by recorded run time
+        group: [1, 2, 3]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Check package groups
+        run: tests/scripts/unit-groups.sh check ${{ strategy.job-total }}
+
       # Test images go on tmpfs: 4KB O_DIRECT writes on the runner's disk can take
       # longer than the 20ms a lock record write is allowed.
       - name: Unit Tests
@@ -60,18 +82,42 @@ jobs:
         run: |
           mkdir -p "$TMPDIR"
           dd if=/dev/zero of="$TMPDIR/odirect-check" bs=4096 count=1 oflag=direct
-          make test-unit 2>&1 | tee unit-test.log
+          pkgs=$(tests/scripts/unit-groups.sh packages ${{ strategy.job-total }} ${{ matrix.group }})
+          make test-unit UNIT_PKGS="$pkgs" UNIT_TIMEOUT=8m COVER_PROFILE=coverage-${{ matrix.group }}.out 2>&1 | tee unit-test-${{ matrix.group }}.log
+        timeout-minutes: 10
 
+      - name: Upload coverage and log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-tests-${{ matrix.group }}
+          path: |
+            coverage-${{ matrix.group }}.out
+            unit-test-${{ matrix.group }}.log
+          retention-days: 7
+
+  unit-coverage:
+    name: Unit Test Coverage
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - name: Download coverage
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: unit-tests-*
+          merge-multiple: true
+
+      # The groups test disjoint packages, so their profiles concatenate.
       - name: Coverage summary
         run: |
           {
             echo "## Unit test coverage"
             echo
-            echo "**Total: $(go tool cover -func=coverage.out | awk '/^total:/ {print $NF}')**"
+            echo "**Total: $(awk 'FNR > 1 { n += $2; if ($3 > 0) c += $2 } END { printf "%.1f%%", 100 * c / n }' coverage-*.out)**"
             echo
             echo "| Package | Coverage |"
             echo "| --- | --- |"
-            awk '$1 == "ok" && $4 == "coverage:" {print "| " $2 " | " $5 " |"}' unit-test.log
+            awk '$1 == "ok" && $4 == "coverage:" {print "| " $2 " | " $5 " |"}' unit-test-*.log | sort
           } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
@@ -153,7 +199,7 @@ jobs:
   integration-tests:
     name: Integration Tests (group ${{ matrix.group }})
     runs-on: ubuntu-latest
-    needs: build-and-unit-test
+    needs: [build, unit-tests]
     strategy:
       fail-fast: false
       matrix:

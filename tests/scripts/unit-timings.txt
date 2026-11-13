@@ -1,0 +1,24 @@
+# Seconds per unit test package in CI (-race), averaged over main 9c19263, 8d02d3b, ba5668b, 29feedb.
+# unit-groups.sh balances CI groups with these; packages not listed count as 5s.
+github.com/supporttools/GoClusterFS/internal/api 2.2
+github.com/supporttools/GoClusterFS/internal/bitmap 2.4
+github.com/supporttools/GoClusterFS/internal/cache 1.1
+github.com/supporttools/GoClusterFS/internal/cache/broadcast 2.5
+github.com/supporttools/GoClusterFS/internal/dir 43.8
+github.com/supporttools/GoClusterFS/internal/extent 4.1
+github.com/supporttools/GoClusterFS/internal/fileops 1.0
+github.com/supporttools/GoClusterFS/internal/fsck 44.9
+github.com/supporttools/GoClusterFS/internal/goclusterfs 328.2
+github.com/supporttools/GoClusterFS/internal/inode 6.0
+github.com/supporttools/GoClusterFS/internal/journal 4.0
+github.com/supporttools/GoClusterFS/internal/lock 58.4
+github.com/supporttools/GoClusterFS/internal/metrics 1.1
+github.com/supporttools/GoClusterFS/internal/node 14.6
+github.com/supporttools/GoClusterFS/internal/refcount 1.3
+github.com/supporttools/GoClusterFS/internal/sfb 1.0
+github.com/supporttools/GoClusterFS/internal/snapshot 4.6
+github.com/supporttools/GoClusterFS/internal/stats 1.2
+github.com/supporttools/GoClusterFS/internal/storage 1.9
+github.com/supporttools/GoClusterFS/internal/superblock 1.2
+github.com/supporttools/GoClusterFS/internal/trim 1.4
+github.com/supporttools/GoClusterFS/internal/webui 1.0
