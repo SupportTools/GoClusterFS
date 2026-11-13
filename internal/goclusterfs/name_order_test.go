@@ -73,8 +73,8 @@ func TestCrashBetweenClaimAndNameReplaysTheName(t *testing.T) {
 		create     func(fsys *FS)
 		isDir      bool
 	}{
-		{"create: inode claimed", func(fsys *FS) { fsys.Create(ctx, "crashed", 0, 0o644, &fuse.EntryOut{}) }, false},
-		{"mkdir: inode claimed", func(fsys *FS) { fsys.Mkdir(ctx, "crashed", 0o755, &fuse.EntryOut{}) }, true},
+		{"create: inode claimed", func(fsys *FS) { _, _, _, _ = fsys.Create(ctx, "crashed", 0, 0o644, &fuse.EntryOut{}) }, false},
+		{"mkdir: inode claimed", func(fsys *FS) { _, _ = fsys.Mkdir(ctx, "crashed", 0o755, &fuse.EntryOut{}) }, true},
 	} {
 		t.Run(tc.crashPoint, func(t *testing.T) {
 			fsys, path, offset, size := journaledFS(t)
@@ -112,7 +112,7 @@ func TestMkdirReplaysAfterCrash(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	links := readRoot(t, fsys).LinkCount
 	crashed := crashAfterCommit(t, fsys, "mkdir")
-	go fsys.Mkdir(context.Background(), "made", 0o755, &fuse.EntryOut{})
+	go func() { _, _ = fsys.Mkdir(context.Background(), "made", 0o755, &fuse.EntryOut{}) }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)

@@ -32,7 +32,9 @@ func TestWriteFinishesAfterInterruptDuringLockWait(t *testing.T) {
 		held <- err
 		if err == nil {
 			time.Sleep(500 * time.Millisecond)
-			nodeA.lockMgr.Release(lock.LockTypeInode, res)
+			if err := nodeA.lockMgr.Release(lock.LockTypeInode, res); err != nil {
+				t.Errorf("release inode lock %d: %v", res, err)
+			}
 		}
 		close(released)
 	}()
@@ -95,11 +97,15 @@ func holdLock(t *testing.T, fsys *FS, typ lock.LockType, res uint64) (release fu
 		for {
 			select {
 			case <-stop:
-				fsys.lockMgr.Release(typ, res)
+				if err := fsys.lockMgr.Release(typ, res); err != nil {
+					t.Errorf("release lock type %d res %d: %v", typ, res, err)
+				}
 				return
 			case <-tick.C:
 				if fsys.lockMgr.Acquire(context.Background(), typ, res, lock.LockModeExclusive) == nil {
-					fsys.lockMgr.Release(typ, res)
+					if err := fsys.lockMgr.Release(typ, res); err != nil {
+						t.Errorf("release the rejoined lock type %d res %d: %v", typ, res, err)
+					}
 				}
 			}
 		}

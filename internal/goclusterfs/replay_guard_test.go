@@ -17,7 +17,7 @@ func TestUnlinkCrashKeepsFileInReusedSlot(t *testing.T) {
 	sub, f := newSubdirFile(t, fsys, pattern(3, 2*BlockSize))
 
 	crashed := crashAfterCommit(t, fsys, "unlink: blocks freed")
-	go sub.Unlink(context.Background(), "doomed.bin")
+	go func() { _ = sub.Unlink(context.Background(), "doomed.bin") }()
 	<-crashed
 
 	other := createFile(t, fsys, "other.bin")
@@ -41,7 +41,7 @@ func TestRootUnlinkReplayFreesFileAndBlocks(t *testing.T) {
 	blocks := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
 
 	crashed := crashAfterCommit(t, fsys, "unlink")
-	go fsys.Unlink(ctx, "doomed.bin")
+	go func() { _ = fsys.Unlink(ctx, "doomed.bin") }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)
@@ -87,7 +87,7 @@ func TestWriteReplayMapsBlocksAndSize(t *testing.T) {
 	data := pattern(5, 2*BlockSize)
 
 	crashed := crashAfterCommit(t, fsys, "write")
-	go f.Write(context.Background(), nil, data, 0)
+	go func() { _, _ = f.Write(context.Background(), nil, data, 0) }()
 	<-crashed
 	releaseDeadNodeLock(t, fsys, f.inodeNum)
 
@@ -103,7 +103,7 @@ func TestWriteReplayKeepsLaterTruncate(t *testing.T) {
 	f := createFile(t, fsys, "cut.bin")
 
 	crashed := crashAfterCommit(t, fsys, "write")
-	go f.Write(context.Background(), nil, pattern(5, 2*BlockSize), 0)
+	go func() { _, _ = f.Write(context.Background(), nil, pattern(5, 2*BlockSize), 0) }()
 	<-crashed
 	releaseDeadNodeLock(t, fsys, f.inodeNum)
 	truncateFile(t, lookupFile(t, openFormattedFS(t, path), "cut.bin"), 0)
