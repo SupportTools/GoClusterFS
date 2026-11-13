@@ -24,9 +24,11 @@ func newTestInodeTable(t *testing.T) *inode.Table {
 		t.Skipf("Cannot create test file: %v", err)
 	}
 	path := f.Name()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { _ = os.Remove(path) })
 	err = f.Truncate(testTableSize)
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err != nil {
 		t.Skipf("Cannot truncate test file: %v", err)
 	}
@@ -35,7 +37,7 @@ func newTestInodeTable(t *testing.T) *inode.Table {
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 
 	return inode.NewTable(dev, 0, testTableSize, nil, [16]byte{})
 }

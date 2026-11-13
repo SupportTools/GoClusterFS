@@ -30,7 +30,7 @@ func unicastTo(t *testing.T) (*Broadcaster, *net.UDPConn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { raw.Close() })
+	t.Cleanup(func() { _ = raw.Close() })
 	ports := freeUDPPorts(t, 2)
 	cfg := DefaultConfig()
 	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]
