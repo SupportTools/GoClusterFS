@@ -20,7 +20,7 @@ func getDashboard(t *testing.T, url, token string) (*http.Response, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer mustClose(t, resp.Body)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)

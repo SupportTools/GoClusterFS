@@ -69,16 +69,16 @@ func TestWriteInsideFallocatedRange(t *testing.T) {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
 	if err := syscall.Fallocate(int(f.Fd()), 0, 0, 4*mb); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Fallocate failed: %v", err)
 	}
 	data := chunk(7, 4096)
 	const at = mb + 512*1024
 	if _, err := f.WriteAt(data, at); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("write inside the fallocated range failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 
 	remount(t, mfs)
 	want := make([]byte, 4*mb)

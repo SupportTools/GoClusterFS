@@ -28,7 +28,7 @@ func TestAPIServesHealthOnLoopback(t *testing.T) {
 	for {
 		resp, err := client.Get("http://" + addr + "/health")
 		if err == nil {
-			resp.Body.Close()
+			mustClose(t, resp.Body)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("GET /health returned %d, want 200", resp.StatusCode)
 			}
@@ -65,7 +65,7 @@ func TestMountRefusesUnauthenticatedRemoteAPI(t *testing.T) {
 		timedOut := ctx.Err() != nil
 		cancel()
 		if timedOut {
-			exec.Command("fusermount", "-u", mountPoint).Run()
+			_ = exec.Command("fusermount", "-u", mountPoint).Run()
 			t.Fatalf("-api-addr %s without -api-token: mount kept running", addr)
 		}
 		if err == nil {
@@ -80,7 +80,7 @@ func TestMountRefusesUnauthenticatedRemoteAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to open image: %v", err)
 	}
-	defer f.Close()
+	defer mustClose(t, f)
 	head := make([]byte, 4096)
 	if _, err := io.ReadFull(f, head); err != nil {
 		t.Fatalf("Failed to read image: %v", err)

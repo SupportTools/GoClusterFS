@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -44,7 +45,7 @@ func freeUDPPorts(t *testing.T, n int) []int {
 		if err != nil {
 			t.Fatalf("Failed to find a free UDP port: %v", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
 	}
 	return ports
@@ -57,7 +58,7 @@ func freeLoopbackAddr(t *testing.T) string {
 		t.Fatalf("Failed to find a free port: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	return addr
 }
 
@@ -118,11 +119,11 @@ func NewMountedFS(t *testing.T, sizeMB int) *MountedFS {
 		t.Fatalf("Failed to create temp image: %v", err)
 	}
 	imagePath := imgFile.Name()
-	imgFile.Close()
+	mustClose(t, imgFile)
 
 	// Allocate the image file
 	if err := allocateImage(imagePath, sizeMB); err != nil {
-		os.Remove(imagePath)
+		_ = os.Remove(imagePath)
 		t.Fatalf("Failed to allocate image: %v", err)
 	}
 	t.Logf("Created %dMB image at %s", sizeMB, imagePath)
@@ -130,7 +131,7 @@ func NewMountedFS(t *testing.T, sizeMB int) *MountedFS {
 	// Create mount point directory
 	mountPoint, err := os.MkdirTemp("", "goclusterfs_mnt_")
 	if err != nil {
-		os.Remove(imagePath)
+		_ = os.Remove(imagePath)
 		t.Fatalf("Failed to create mount point: %v", err)
 	}
 	t.Logf("Mount point: %s", mountPoint)
@@ -162,9 +163,7 @@ func allocateImage(path string, sizeMB int) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	return f.Truncate(superblock.MinDeviceSize + int64(sizeMB)*1024*1024)
+	return errors.Join(f.Truncate(superblock.MinDeviceSize+int64(sizeMB)*1024*1024), f.Close())
 }
 
 // Format formats the filesystem by running mount with -format and then killing it
@@ -216,12 +215,12 @@ func (m *MountedFS) Format() error {
 
 	// Unmount the filesystem that was started during format
 	unmountCmd := exec.Command("fusermount", "-u", m.MountPoint)
-	unmountCmd.Run() // Ignore error - might not be mounted yet
+	_ = unmountCmd.Run()
 
 	// Kill the process
 	if cmd.Process != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 	}
 
 	if !formatted {
@@ -265,7 +264,7 @@ func (m *MountedFS) Mount(debug bool) error {
 
 	// Wait for mount to become accessible
 	if err := m.WaitForMount(10 * time.Second); err != nil {
-		m.Unmount() // Try to clean up
+		_ = m.Unmount()
 		return err
 	}
 
@@ -298,7 +297,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 
 	// Wait for mount to become accessible
 	if err := m.WaitForMount(10 * time.Second); err != nil {
-		m.Unmount() // Try to clean up
+		_ = m.Unmount()
 		return err
 	}
 
@@ -356,15 +355,17 @@ func (m *MountedFS) Unmount() error {
 		}()
 
 		select {
-		case <-done:
-			// Process exited cleanly
+		case err := <-done:
+			if err != nil {
+				m.t.Logf("mount process exited: %v", err)
+			}
 		case <-time.After(10 * time.Second):
 			// Force kill only as last resort after generous timeout
 			m.t.Log("Warning: mount process did not exit in time, force killing")
 			if m.cancel != nil {
 				m.cancel()
 			}
-			m.MountCmd.Process.Kill()
+			_ = m.MountCmd.Process.Kill()
 		}
 	}
 
@@ -375,16 +376,16 @@ func (m *MountedFS) Unmount() error {
 // Cleanup unmounts and removes all temporary files.
 func (m *MountedFS) Cleanup() {
 	// Unmount first
-	m.Unmount()
+	_ = m.Unmount()
 
 	// Remove mount point directory
 	if m.MountPoint != "" {
-		os.RemoveAll(m.MountPoint)
+		_ = os.RemoveAll(m.MountPoint)
 	}
 
 	// Remove image file
 	if m.ImagePath != "" {
-		os.Remove(m.ImagePath)
+		_ = os.Remove(m.ImagePath)
 	}
 }
 
@@ -423,10 +424,8 @@ func (m *MountedFS) WriteFileAt(name string, data []byte, offset int64) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	_, err = f.WriteAt(data, offset)
-	return err
+	return errors.Join(err, f.Close())
 }
 
 // ReadFile reads data from a file in the mounted filesystem.
@@ -516,11 +515,11 @@ func NewMountedFSWithImage(t *testing.T, imagePath string) *MountedFS {
 // Used for shared image scenarios where multiple mounts use the same backing file.
 func (m *MountedFS) CleanupMountOnly() {
 	// Unmount first
-	m.Unmount()
+	_ = m.Unmount()
 
 	// Remove mount point directory only
 	if m.MountPoint != "" {
-		os.RemoveAll(m.MountPoint)
+		_ = os.RemoveAll(m.MountPoint)
 	}
 	// Note: ImagePath is NOT removed - caller manages shared image
 }
@@ -584,7 +583,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 
 	// Wait for mount to become accessible
 	if err := m.WaitForMount(10 * time.Second); err != nil {
-		m.Unmount() // Try to clean up
+		_ = m.Unmount()
 		return err
 	}
 
@@ -618,10 +617,19 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 
 	// Wait for mount to become accessible
 	if err := m.WaitForMount(10 * time.Second); err != nil {
-		m.Unmount() // Try to clean up
+		_ = m.Unmount()
 		return err
 	}
 
 	m.t.Logf("Mounted at %s with SFB enabled", m.MountPoint)
 	return nil
+}
+
+// mustClose reports a failed close. On a FUSE mount, closing a written file
+// returns the errors from flushing it.
+func mustClose(tb testing.TB, c io.Closer) {
+	tb.Helper()
+	if err := c.Close(); err != nil {
+		tb.Errorf("close: %v", err)
+	}
 }

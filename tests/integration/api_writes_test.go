@@ -68,7 +68,7 @@ func startAPIMount(t *testing.T, token string, sizeMB int, extraArgs ...string) 
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if resp, err := http.Get("http://" + m.addr + "/health"); err == nil {
-			resp.Body.Close()
+			mustClose(t, resp.Body)
 			return m
 		}
 		if time.Now().After(deadline) {
@@ -100,7 +100,7 @@ func (m *apiMount) call(method, path string, body any) (int, string, error) {
 	if err != nil {
 		return 0, "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(data), nil
 }
@@ -268,7 +268,7 @@ func TestAPIWritesDuringFileIO(t *testing.T) {
 				t.Errorf("open f%d: %v", i, err)
 				return
 			}
-			defer f.Close()
+			defer mustClose(t, f)
 			for v := 1; ; v++ {
 				select {
 				case <-stop:
@@ -333,7 +333,9 @@ func TestAPIWritesDuringFileIO(t *testing.T) {
 					} else if err := checkChunked(data, i, size); err != nil {
 						t.Errorf("clone of snapshot %s: %v", name, err)
 					}
-					m.Remove(dest[1:])
+					if err := m.Remove(dest[1:]); err != nil {
+						t.Error(err)
+					}
 				}
 				retry("DELETE", "/api/v1/snapshots/"+name+"?path="+src, nil)
 			}
@@ -346,7 +348,9 @@ func TestAPIWritesDuringFileIO(t *testing.T) {
 				} else if err := checkChunked(data, i, size); err != nil {
 					t.Errorf("clone of %s: %v", src, err)
 				}
-				m.Remove(dest[1:])
+				if err := m.Remove(dest[1:]); err != nil {
+					t.Error(err)
+				}
 			}
 		}
 	}
@@ -490,7 +494,7 @@ func TestMountTokenSources(t *testing.T) {
 	if strings.Contains(m.log.String(), "WARNING: -api-token is visible") {
 		t.Error("warned about -api-token when the token came from the environment")
 	}
-	os.Unsetenv("GOCLUSTERFS_API_TOKEN")
+	_ = os.Unsetenv("GOCLUSTERFS_API_TOKEN")
 
 	out, _ = runMount(t, "-device", missing, "-mount", dir, "-api-token", "from-flag")
 	if !strings.Contains(out, "WARNING: -api-token is visible to every local user") {

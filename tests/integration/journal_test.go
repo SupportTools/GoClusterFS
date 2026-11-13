@@ -3,6 +3,7 @@ package integration
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -98,7 +99,9 @@ func TestJournalCrashRecoveryDirectory(t *testing.T) {
 	}
 
 	// Sync
-	syncPath(mfs.Path("recovered_dir/nested.txt"))
+	if err := syncPath(mfs.Path("recovered_dir/nested.txt")); err != nil {
+		t.Fatal(err)
+	}
 
 	t.Log("Directory and file created, simulating crash...")
 
@@ -227,9 +230,6 @@ func TestJournalCrashRecoveryMultipleOps(t *testing.T) {
 		}
 	}
 
-	// Force sync
-	syncPath(mfs.MountPoint)
-
 	t.Log("All operations complete, simulating crash...")
 
 	// Crash
@@ -274,7 +274,9 @@ func TestJournalCrashDuringWrite(t *testing.T) {
 	if err := mfs.WriteFile("baseline.txt", baseline); err != nil {
 		t.Fatalf("WriteFile baseline failed: %v", err)
 	}
-	syncPath(mfs.Path("baseline.txt"))
+	if err := syncPath(mfs.Path("baseline.txt")); err != nil {
+		t.Fatal(err)
+	}
 	t.Log("Baseline file created and synced")
 
 	// Start a goroutine that writes files rapidly
@@ -406,8 +408,7 @@ func syncPath(path string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return f.Sync()
+	return errors.Join(f.Sync(), f.Close())
 }
 
 // cleanupStaleFuseMount attempts to unmount a stale FUSE mount.
@@ -416,12 +417,12 @@ func syncPath(path string) error {
 func cleanupStaleFuseMount(mountPoint string) {
 	// Try fusermount -u to properly unmount the stale FUSE mount
 	// This may fail if the mount is already gone, which is fine
-	exec.Command("fusermount", "-u", mountPoint).Run()
-	exec.Command("fusermount3", "-u", mountPoint).Run()
+	_ = exec.Command("fusermount", "-u", mountPoint).Run()
+	_ = exec.Command("fusermount3", "-u", mountPoint).Run()
 
 	// Give the kernel a moment to clean up
 	time.Sleep(100 * time.Millisecond)
 
 	// Cleanup any hidden FUSE files
-	os.Remove(mountPoint + "/.fuse_hidden*")
+	_ = os.Remove(mountPoint + "/.fuse_hidden*")
 }

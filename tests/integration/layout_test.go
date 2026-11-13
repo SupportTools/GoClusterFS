@@ -94,7 +94,7 @@ func TestMountRefusesLayoutV2(t *testing.T) {
 		sb.Version = 2
 		err = superblock.Write(dev, sb)
 	}
-	dev.Close()
+	mustClose(t, dev)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestLargeVolume(t *testing.T) {
 	}
 	start := time.Now()
 	err = unix.Fallocate(int(filler.Fd()), 0, 0, v2RefcountBlocks<<20)
-	filler.Close()
+	mustClose(t, filler)
 	if err != nil {
 		t.Fatalf("fallocate %d blocks: %v", v2RefcountBlocks, err)
 	}
@@ -195,7 +195,7 @@ func TestLargeVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 	ino, err := inode.NewTable(dev, sb.InodeTableOffset, sb.InodeCount*inode.InodeSize, nil, [16]byte{}).Read(highIno)
-	dev.Close()
+	mustClose(t, dev)
 	if err != nil {
 		t.Fatal(err)
 	}

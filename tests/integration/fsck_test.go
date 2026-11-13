@@ -149,7 +149,7 @@ func shareLikeOlderVersions(t *testing.T, image string, src, clone uint32) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dev.Close()
+	defer mustClose(t, dev)
 	sb, err := superblock.Read(dev)
 	if err != nil {
 		t.Fatal(err)
