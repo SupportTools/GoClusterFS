@@ -219,14 +219,37 @@ func TestSnapshotKeepsDataThroughWrites(t *testing.T) {
 
 func waitSnapshotGone(t *testing.T, fsys *FS, name string) {
 	t.Helper()
+	var dataInode uint32
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		_, err := fsys.snapshotReg.GetByName(context.Background(), name)
+		desc, err := fsys.snapshotReg.GetByName(context.Background(), name)
 		if errors.Is(err, snapshot.ErrSnapshotNotFound) {
-			return
+			break
+		}
+		if err == nil && desc.HasData() {
+			dataInode = desc.DataInode
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("snapshot %q still listed after 10s: %v", name, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dataInode != 0 {
+		waitInodeFree(t, fsys, dataInode)
+	}
+}
+
+// The delete job frees a snapshot's data inode after it removes the descriptor.
+func waitInodeFree(t *testing.T, fsys *FS, num uint32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ino, err := fsys.inodeTbl.Read(num)
+		if err == nil && ino.Magic == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("data inode %d still in use 10s after its snapshot was removed (err=%v)", num, err)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -386,9 +409,7 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 	waitSnapshotGone(t, remounted, "half-created")
 	waitSnapshotGone(t, remounted, "half-deleted")
 	for _, num := range []uint32{data.InodeNum, deleting.DataInode} {
-		if ino, err := remounted.inodeTbl.Read(num); err != nil || ino.Magic != 0 {
-			t.Errorf("data inode %d still in use after recovery (err=%v)", num, err)
-		}
+		waitInodeFree(t, remounted, num)
 	}
 	for _, b := range blocks {
 		if got := refcountOf(t, remounted, b); got > 1 {

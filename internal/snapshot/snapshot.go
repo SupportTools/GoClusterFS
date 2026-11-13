@@ -17,6 +17,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"iter"
 	"sync"
 	"time"
 
@@ -223,10 +224,15 @@ func (d *Descriptor) SetName(name string) error {
 	return nil
 }
 
+type device interface {
+	ReadAt(buf []byte, offset int64) (int, error)
+	WriteAt(buf []byte, offset int64) (int, error)
+}
+
 // Registry manages all snapshots on disk.
 type Registry struct {
 	mu              sync.RWMutex
-	dev             *storage.Device
+	dev             device
 	offset          uint64        // Region start offset on device
 	size            uint64        // Region size in bytes
 	maxDescriptors  uint64        // Maximum number of descriptors
@@ -343,11 +349,7 @@ func (r *Registry) Get(ctx context.Context, snapshotID uint64) (*Descriptor, err
 	defer r.mu.RUnlock()
 
 	// Scan for the descriptor (linear search for now)
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for _, desc := range r.descriptors() {
 		if desc.IsValid() && desc.SnapshotID == snapshotID {
 			return desc, nil
 		}
@@ -361,11 +363,7 @@ func (r *Registry) GetByName(ctx context.Context, name string) (*Descriptor, err
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for _, desc := range r.descriptors() {
 		if desc.IsValid() && desc.GetName() == name {
 			return desc, nil
 		}
@@ -380,11 +378,7 @@ func (r *Registry) List(ctx context.Context) ([]*Descriptor, error) {
 	defer r.mu.RUnlock()
 
 	var snapshots []*Descriptor
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for _, desc := range r.descriptors() {
 		if desc.IsValid() && (desc.Flags&FlagHidden) == 0 {
 			snapshots = append(snapshots, desc)
 		}
@@ -399,11 +393,7 @@ func (r *Registry) ListForInode(ctx context.Context, inodeNum uint32) ([]*Descri
 	defer r.mu.RUnlock()
 
 	var snapshots []*Descriptor
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for _, desc := range r.descriptors() {
 		if desc.IsValid() && desc.TargetInode == inodeNum {
 			snapshots = append(snapshots, desc)
 		}
@@ -423,11 +413,7 @@ func (r *Registry) GetChildren(ctx context.Context, snapshotID uint64) ([]*Descr
 	defer r.mu.RUnlock()
 
 	var children []*Descriptor
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for _, desc := range r.descriptors() {
 		if desc.IsValid() && desc.ParentID == snapshotID {
 			children = append(children, desc)
 		}
@@ -455,11 +441,7 @@ func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID u
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for slot, desc := range r.descriptors() {
 		if desc.IsValid() && desc.SnapshotID == snapshotID {
 			desc.ParentID = newParentID
 			return r.writeDescriptor(slot, desc)
@@ -506,11 +488,7 @@ func (r *Registry) updateState(ctx context.Context, snapshotID uint64, newState,
 	defer r.mu.Unlock()
 
 	// Find and update the descriptor
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for slot, desc := range r.descriptors() {
 		if desc.IsValid() && desc.SnapshotID == snapshotID {
 			if from != StateInvalid && desc.State != from {
 				return ErrSnapshotInvalidState
@@ -543,11 +521,7 @@ func (r *Registry) SetRefCountJobID(ctx context.Context, snapshotID, jobID uint6
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for slot, desc := range r.descriptors() {
 		if desc.IsValid() && desc.SnapshotID == snapshotID {
 			desc.RefCountJobID = jobID
 			return r.writeDescriptor(slot, desc)
@@ -581,11 +555,7 @@ func (r *Registry) Remove(ctx context.Context, snapshotID uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
+	for slot, desc := range r.descriptors() {
 		if desc.IsValid() && desc.SnapshotID == snapshotID {
 			if desc.State != StateDeleting {
 				return ErrSnapshotInvalidState
@@ -644,12 +614,7 @@ func (r *Registry) Scan(ctx context.Context) (ScanStats, error) {
 	var stats ScanStats
 	var maxID uint64
 
-	for slot := uint64(0); slot < r.maxDescriptors; slot++ {
-		desc, err := r.readDescriptor(slot)
-		if err != nil {
-			continue
-		}
-
+	for _, desc := range r.descriptors() {
 		if desc.IsFree() {
 			stats.FreeSlots++
 			continue
@@ -731,21 +696,25 @@ func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	return free, maxID, nil
 }
 
-// readDescriptor reads a descriptor from a slot.
-func (r *Registry) readDescriptor(slot uint64) (*Descriptor, error) {
-	if slot >= r.maxDescriptors {
-		return nil, ErrInvalidDescriptor
+// descriptors yields every readable descriptor and its slot, reading each sector once.
+func (r *Registry) descriptors() iter.Seq2[uint64, *Descriptor] {
+	return func(yield func(uint64, *Descriptor) bool) {
+		for sector := range r.maxDescriptors / DescriptorsPerSector {
+			data, err := r.readSector(sector)
+			if err != nil {
+				continue
+			}
+			for i := range uint64(DescriptorsPerSector) {
+				desc, err := decodeDescriptor(data, i)
+				if err != nil {
+					continue
+				}
+				if !yield(sector*DescriptorsPerSector+i, desc) {
+					return
+				}
+			}
+		}
 	}
-
-	sectorIdx := slot / DescriptorsPerSector
-	descOffset := slot % DescriptorsPerSector
-
-	sectorData, err := r.readSector(sectorIdx)
-	if err != nil {
-		return nil, err
-	}
-
-	return decodeDescriptor(sectorData, descOffset)
 }
 
 // writeDescriptor writes a descriptor to a slot.

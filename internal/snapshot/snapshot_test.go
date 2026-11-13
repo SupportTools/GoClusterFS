@@ -613,6 +613,62 @@ func TestRegistryScan(t *testing.T) {
 	}
 }
 
+type countingDevice struct {
+	device
+	reads int
+}
+
+func (d *countingDevice) ReadAt(buf []byte, offset int64) (int, error) {
+	d.reads++
+	return d.device.ReadAt(buf, offset)
+}
+
+// Mount scans the registry, and reading a sector per descriptor made that 31 times slower.
+func TestRegistryReadsEachSectorOnce(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	const sectors, snapshots = 16, 40
+	registry := NewRegistry(dev, 0, sectors*SectorSize, nil)
+	for i := range snapshots {
+		if _, err := registry.Create(ctx, fmt.Sprintf("snap-%d", i), 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counter := &countingDevice{device: dev}
+	registry.dev = counter
+
+	const missing = 1
+	walks := map[string]func() error{
+		"Scan": func() error {
+			stats, err := registry.Scan(ctx)
+			if err == nil && stats.CreatingCount != snapshots {
+				err = fmt.Errorf("found %d snapshots, want %d", stats.CreatingCount, snapshots)
+			}
+			return err
+		},
+		"Get":              func() error { _, err := registry.Get(ctx, missing); return err },
+		"GetByName":        func() error { _, err := registry.GetByName(ctx, "missing"); return err },
+		"List":             func() error { _, err := registry.List(ctx); return err },
+		"ListForInode":     func() error { _, err := registry.ListForInode(ctx, 999); return err },
+		"GetChildren":      func() error { _, err := registry.GetChildren(ctx, missing); return err },
+		"UpdateParentID":   func() error { return registry.UpdateParentID(ctx, missing, 0) },
+		"UpdateState":      func() error { return registry.UpdateState(ctx, missing, StateActive) },
+		"SetRefCountJobID": func() error { return registry.SetRefCountJobID(ctx, missing, 7) },
+		"Remove":           func() error { return registry.Remove(ctx, missing) },
+	}
+	for name, walk := range walks {
+		counter.reads = 0
+		if err := walk(); err != nil && !errors.Is(err, ErrSnapshotNotFound) {
+			t.Errorf("%s: %v", name, err)
+		}
+		if counter.reads != sectors {
+			t.Errorf("%s read %d sectors, want %d", name, counter.reads, sectors)
+		}
+	}
+}
+
 func TestRegistryPersistence(t *testing.T) {
 	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
 	if tmpDir == "" {
@@ -990,9 +1046,8 @@ func TestRegistryIDsAfterOlderImagesAndSlotReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for slot := uint64(0); slot < old.maxDescriptors; slot++ {
-		d, err := old.readDescriptor(slot)
-		if err != nil || d.IsFree() {
+	for slot, d := range old.descriptors() {
+		if d.IsFree() {
 			continue
 		}
 		var n int
