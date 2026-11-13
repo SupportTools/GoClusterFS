@@ -31,15 +31,26 @@ type Broadcaster struct {
 	nodeSlot  uint32
 	localPort uint16
 
-	// Deduplication
-	seenMu sync.RWMutex
-	seen   map[seenKey]time.Time // first seen time
+	sendMu sync.Mutex
+
+	sendersMu sync.Mutex
+	senders   map[[16]byte]*senderSeq
+
+	lossLogMu    sync.Mutex
+	lossLoggedAt time.Time
+
+	clearMu      sync.Mutex
+	clearRunning bool
+	clearAgain   bool
+
+	trailersLeft atomic.Int32
 
 	// Stats
 	invalidationsReceived uint64
 	invalidationsSent     uint64
 	duplicatesDropped     uint64
 	messagesIgnored       uint64 // messages from self
+	messagesLost          uint64
 
 	// Lifecycle
 	ctx     context.Context
@@ -48,11 +59,24 @@ type Broadcaster struct {
 	running atomic.Bool
 }
 
-// seenKey identifies a message. Each node's sequence starts at its boot time in
-// nanoseconds, so two nodes' sequence ranges can overlap.
-type seenKey struct {
-	sender [16]byte
-	seq    uint64
+const (
+	seqWindow = 64
+
+	// After an invalidation, a node sends a heartbeat every trailerDelay, trailers
+	// times, so a peer that lost the end of a burst still sees the sequence gap.
+	trailerDelay = 50 * time.Millisecond
+	trailers     = 10
+
+	lossLogInterval = 10 * time.Second
+	senderExpiry    = 5 * time.Minute
+)
+
+// senderSeq tracks one sender's sequence numbers. Bit i of seen marks
+// highest-1-i as received.
+type senderSeq struct {
+	highest uint64
+	seen    uint64
+	heard   time.Time
 }
 
 // NewBroadcaster creates a new cache invalidation broadcaster.
@@ -69,7 +93,7 @@ func NewBroadcaster(cfg Config, localUUID [16]byte, nodeSlot uint32, handler Inv
 		localUUID: localUUID,
 		nodeSlot:  nodeSlot,
 		localPort: uint16(cfg.UnicastPort),
-		seen:      make(map[seenKey]time.Time),
+		senders:   make(map[[16]byte]*senderSeq),
 	}
 
 	return b, nil
@@ -138,10 +162,13 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
 		return
 	}
 
-	// Deduplicate
-	if b.isDuplicate(msg.SenderUUID, msg.Sequence) {
+	dup, missed := b.track(msg.SenderUUID, msg.Sequence)
+	if dup {
 		atomic.AddUint64(&b.duplicatesDropped, 1)
 		return
+	}
+	if missed > 0 {
+		b.dropCachesAfterLoss(msg.SenderUUID, missed)
 	}
 
 	switch msg.Type {
@@ -233,40 +260,111 @@ func (b *Broadcaster) handlePeerAnnounce(msg *Message, addr *net.UDPAddr) {
 		payload.NodeSlot, uuidStr[:16], peerAddr)
 }
 
-// isDuplicate checks if we've seen this message from this sender recently.
-func (b *Broadcaster) isDuplicate(sender [16]byte, seq uint64) bool {
-	b.seenMu.Lock()
-	defer b.seenMu.Unlock()
+// track records seq from sender. It reports whether seq was already handled,
+// and how many of the sender's messages were skipped before seq. A seq older
+// than the window counts as handled: it was either seen, or counted missing
+// when highest passed it.
+func (b *Broadcaster) track(sender [16]byte, seq uint64) (dup bool, missed uint64) {
+	b.sendersMu.Lock()
+	defer b.sendersMu.Unlock()
 
-	key := seenKey{sender: sender, seq: seq}
-	if _, exists := b.seen[key]; exists {
-		return true
+	s, ok := b.senders[sender]
+	if !ok {
+		b.senders[sender] = &senderSeq{highest: seq, heard: time.Now()}
+		return false, 0
 	}
-
-	b.seen[key] = time.Now()
-	return false
+	s.heard = time.Now()
+	switch {
+	case seq > s.highest:
+		ahead := seq - s.highest
+		s.seen = s.seen<<ahead | 1<<(ahead-1)
+		s.highest = seq
+		return false, ahead - 1
+	case seq == s.highest:
+		return true, 0
+	case s.highest-seq > seqWindow:
+		return true, 0
+	default:
+		bit := uint64(1) << (s.highest - seq - 1)
+		if s.seen&bit != 0 {
+			return true, 0
+		}
+		s.seen |= bit
+		return false, 0
+	}
 }
 
-// heartbeatLoop sends periodic heartbeats.
+// dropCachesAfterLoss clears the caches, since any lost message may have been
+// an invalidation this node never applied.
+func (b *Broadcaster) dropCachesAfterLoss(sender [16]byte, missed uint64) {
+	total := atomic.AddUint64(&b.messagesLost, missed)
+	if b.handler != nil {
+		b.requestClear()
+	}
+
+	b.lossLogMu.Lock()
+	defer b.lossLogMu.Unlock()
+	if time.Since(b.lossLoggedAt) < lossLogInterval {
+		return
+	}
+	b.lossLoggedAt = time.Now()
+	log.Printf("[broadcast] missed %d messages from %x, dropped all cached inodes and extents (%d missed since start, logged at most every %v). If this repeats, raise net.core.rmem_max to at least 1 MB",
+		missed, sender[:8], total, lossLogInterval)
+}
+
+// requestClear makes sure a cache clear starts after this call. Clears run off
+// the receive path, one at a time: a full clear takes over a millisecond, and a
+// receiver that clears for every message it reads falls further behind.
+func (b *Broadcaster) requestClear() {
+	b.clearMu.Lock()
+	defer b.clearMu.Unlock()
+	if b.clearRunning {
+		b.clearAgain = true
+		return
+	}
+	b.clearRunning = true
+	go b.runClears()
+}
+
+func (b *Broadcaster) runClears() {
+	for {
+		b.handler.Clear()
+		b.clearMu.Lock()
+		if !b.clearAgain {
+			b.clearRunning = false
+			b.clearMu.Unlock()
+			return
+		}
+		b.clearAgain = false
+		b.clearMu.Unlock()
+	}
+}
+
+// heartbeatLoop sends periodic heartbeats, and trailing ones after invalidations.
 func (b *Broadcaster) heartbeatLoop() {
 	defer b.wg.Done()
 
 	ticker := time.NewTicker(b.transport.config.HeartbeatInterval)
 	defer ticker.Stop()
+	trailer := time.NewTicker(trailerDelay)
+	defer trailer.Stop()
 
 	for {
 		select {
 		case <-b.ctx.Done():
 			return
+		case <-trailer.C:
+			if b.trailersLeft.Load() > 0 {
+				b.trailersLeft.Add(-1)
+				_ = b.send(b.builder.Heartbeat)
+			}
 		case <-ticker.C:
-			msg := b.builder.Heartbeat()
 			// Heartbeat failures are expected during network issues
-			_ = b.transport.Send(msg)
+			_ = b.send(b.builder.Heartbeat)
 		}
 	}
 }
 
-// cleanupLoop periodically cleans up old deduplication entries.
 func (b *Broadcaster) cleanupLoop() {
 	defer b.wg.Done()
 
@@ -278,22 +376,31 @@ func (b *Broadcaster) cleanupLoop() {
 		case <-b.ctx.Done():
 			return
 		case <-ticker.C:
-			b.cleanupSeen()
+			b.forgetQuietSenders()
 		}
 	}
 }
 
-// cleanupSeen removes old entries from the deduplication map.
-func (b *Broadcaster) cleanupSeen() {
-	b.seenMu.Lock()
-	defer b.seenMu.Unlock()
+// forgetQuietSenders drops senders not heard from in senderExpiry. Each mount
+// has a new UUID, so this removes nodes that unmounted.
+func (b *Broadcaster) forgetQuietSenders() {
+	b.sendersMu.Lock()
+	defer b.sendersMu.Unlock()
 
-	cutoff := time.Now().Add(-5 * time.Minute)
-	for key, seen := range b.seen {
-		if seen.Before(cutoff) {
-			delete(b.seen, key)
+	cutoff := time.Now().Add(-senderExpiry)
+	for sender, s := range b.senders {
+		if s.heard.Before(cutoff) {
+			delete(b.senders, sender)
 		}
 	}
+}
+
+// send numbers and sends a message under sendMu, so peers receive this node's
+// messages in sequence order and read a gap as a lost message.
+func (b *Broadcaster) send(build func() *Message) error {
+	b.sendMu.Lock()
+	defer b.sendMu.Unlock()
+	return b.transport.Send(build())
 }
 
 // announcePresence broadcasts our presence to the cluster.
@@ -309,8 +416,8 @@ func (b *Broadcaster) announcePresence() {
 		}
 	}
 
-	msg := b.builder.PeerAnnounce(b.nodeSlot, b.localPort, ipAddr)
-	if err := b.transport.Send(msg); err != nil {
+	announce := func() *Message { return b.builder.PeerAnnounce(b.nodeSlot, b.localPort, ipAddr) }
+	if err := b.send(announce); err != nil {
 		log.Printf("[broadcast] failed to announce presence: %v", err)
 	}
 }
@@ -321,8 +428,8 @@ func (b *Broadcaster) BroadcastInvalidateInode(inodeNum uint32, dataGen, metaGen
 		return
 	}
 
-	msg := b.builder.InvalidateInode(inodeNum, dataGen, metaGen)
-	if err := b.transport.Send(msg); err != nil {
+	b.trailersLeft.Store(trailers)
+	if err := b.send(func() *Message { return b.builder.InvalidateInode(inodeNum, dataGen, metaGen) }); err != nil {
 		// Log but don't fail - correctness comes from generation counters
 		log.Printf("[broadcast] failed to send inode invalidation: %v", err)
 	}
@@ -335,8 +442,8 @@ func (b *Broadcaster) BroadcastInvalidateExtent(inodeNum uint32, dataGen uint64)
 		return
 	}
 
-	msg := b.builder.InvalidateExtent(inodeNum, dataGen)
-	if err := b.transport.Send(msg); err != nil {
+	b.trailersLeft.Store(trailers)
+	if err := b.send(func() *Message { return b.builder.InvalidateExtent(inodeNum, dataGen) }); err != nil {
 		log.Printf("[broadcast] failed to send extent invalidation: %v", err)
 	}
 	atomic.AddUint64(&b.invalidationsSent, 1)
@@ -348,8 +455,8 @@ func (b *Broadcaster) BroadcastInvalidateAll() {
 		return
 	}
 
-	msg := b.builder.InvalidateAll()
-	if err := b.transport.Send(msg); err != nil {
+	b.trailersLeft.Store(trailers)
+	if err := b.send(b.builder.InvalidateAll); err != nil {
 		log.Printf("[broadcast] failed to send InvalidateAll: %v", err)
 	}
 	atomic.AddUint64(&b.invalidationsSent, 1)
@@ -364,6 +471,7 @@ func (b *Broadcaster) Stats() BroadcasterStats {
 		InvalidationsSent:     atomic.LoadUint64(&b.invalidationsSent),
 		DuplicatesDropped:     atomic.LoadUint64(&b.duplicatesDropped),
 		MessagesIgnored:       atomic.LoadUint64(&b.messagesIgnored),
+		MessagesLost:          atomic.LoadUint64(&b.messagesLost),
 		Transport:             b.transport.Stats(),
 	}
 }
@@ -374,6 +482,7 @@ type BroadcasterStats struct {
 	InvalidationsSent     uint64
 	DuplicatesDropped     uint64
 	MessagesIgnored       uint64
+	MessagesLost          uint64
 	Transport             TransportStats
 }
 
@@ -383,6 +492,7 @@ func (b *Broadcaster) ResetStats() {
 	atomic.StoreUint64(&b.invalidationsSent, 0)
 	atomic.StoreUint64(&b.duplicatesDropped, 0)
 	atomic.StoreUint64(&b.messagesIgnored, 0)
+	atomic.StoreUint64(&b.messagesLost, 0)
 }
 
 // IsEnabled returns whether broadcasting is enabled.

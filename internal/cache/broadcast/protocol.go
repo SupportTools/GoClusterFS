@@ -8,7 +8,7 @@
 // Design principles:
 //   - Fire-and-forget: Messages are best-effort; correctness comes from generation counters
 //   - Multicast first: Efficient for clusters, with unicast fallback
-//   - Deduplication: Sequence numbers prevent duplicate processing
+//   - Sequence numbers: peers drop duplicates and clear their caches on a gap
 //   - Optional security: HMAC authentication for untrusted networks
 package broadcast
 

@@ -1889,10 +1889,52 @@ scenarios:
 
   - id: broadcast-deduplication
     name: Broadcast message deduplication
-    description: Duplicate messages are detected and dropped
+    description: Duplicate messages are detected and dropped, and sequence gaps are counted as lost messages
     priority: go_only
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestBroadcasterDuplication
+
+  - id: broadcast-loss-drops-caches
+    name: Broadcast loss drops caches
+    description: A gap in a peer's sequence numbers clears the inode and extent caches once; a late message does not clear them again
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestLostMessageDropsCaches
+
+  - id: broadcast-very-late-message
+    name: Very late broadcast message keeps tracking
+    description: A message older than the sequence window is dropped as a duplicate and does not make the next message look like loss
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestVeryLateMessageKeepsTracking
+
+  - id: broadcast-clears-coalesce
+    name: Cache clears after loss coalesce
+    description: Gaps found while a cache clear runs cost one more clear, run off the receive path
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestClearsCoalesce
+
+  - id: broadcast-trailing-heartbeats
+    name: Heartbeats follow an invalidation
+    description: A node sends heartbeats after its last invalidation, so peers notice when they lost the end of a burst
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestHeartbeatsFollowInvalidation
+
+  - id: broadcast-send-order
+    name: Concurrent broadcasts leave in sequence order
+    description: Invalidations sent from many goroutines reach a peer in sequence order, so reordering is not read as loss
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestConcurrentSendsArriveInOrder
+
+  - id: broadcast-burst-coverage
+    name: Burst of invalidations reaches a slow peer
+    description: One node invalidates 3000 inodes as fast as it can; within 1s the peer has dropped each one, by its message or by a cache clear after lost messages
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/loss_test.go::TestBurstOfInvalidationsReachesPeer
 
   - id: broadcast-handle-inode
     name: Broadcast handle inode invalidation
