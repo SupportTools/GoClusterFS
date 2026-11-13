@@ -60,21 +60,23 @@ func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		tb.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		tb.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -163,8 +165,8 @@ func TestManagerSharedLocks(t *testing.T) {
 	}
 
 	// Release both
-	mgr1.Release(LockTypeInode, 100)
-	mgr2.Release(LockTypeInode, 100)
+	release(t, mgr1, LockTypeInode, 100)
+	release(t, mgr2, LockTypeInode, 100)
 }
 
 func TestManagerLockOrdering(t *testing.T) {
@@ -191,7 +193,7 @@ func TestManagerLockOrdering(t *testing.T) {
 		t.Error("Expected deadlock prevention error when acquiring lower-level lock")
 	}
 
-	mgr.Release(LockTypeExtent, 100)
+	release(t, mgr, LockTypeExtent, 100)
 }
 
 func TestManagerCorrectLockOrdering(t *testing.T) {
@@ -218,8 +220,8 @@ func TestManagerCorrectLockOrdering(t *testing.T) {
 	}
 
 	// Release in reverse order
-	mgr.Release(LockTypeExtent, 200)
-	mgr.Release(LockTypeInode, 100)
+	release(t, mgr, LockTypeExtent, 200)
+	release(t, mgr, LockTypeInode, 100)
 }
 
 func TestManagerHelpers(t *testing.T) {
@@ -319,8 +321,12 @@ func TestHeldLocks(t *testing.T) {
 	}
 
 	// Acquire some locks
-	mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
-	mgr.Acquire(ctx, LockTypeExtent, 200, LockModeShared)
+	if err := mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Acquire(ctx, LockTypeExtent, 200, LockModeShared); err != nil {
+		t.Fatal(err)
+	}
 
 	held = mgr.HeldLocks()
 	if len(held) != 2 {
@@ -328,8 +334,8 @@ func TestHeldLocks(t *testing.T) {
 	}
 
 	// Release and check
-	mgr.Release(LockTypeInode, 100)
-	mgr.Release(LockTypeExtent, 200)
+	release(t, mgr, LockTypeInode, 100)
+	release(t, mgr, LockTypeExtent, 200)
 
 	held = mgr.HeldLocks()
 	if len(held) != 0 {
@@ -364,8 +370,10 @@ func BenchmarkLockAcquireRelease(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		mgr.Acquire(ctx, LockTypeInode, uint64(i%1000), LockModeExclusive)
-		mgr.Release(LockTypeInode, uint64(i%1000))
+		if err := mgr.Acquire(ctx, LockTypeInode, uint64(i%1000), LockModeExclusive); err != nil {
+			b.Fatal(err)
+		}
+		release(b, mgr, LockTypeInode, uint64(i%1000))
 	}
 }
 
@@ -382,12 +390,16 @@ func BenchmarkLockRepeatedAcquire(b *testing.B) {
 	ctx := context.Background()
 
 	// Warm up the hint cache with one cycle
-	mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
-	mgr.Release(LockTypeInode, 100)
+	if err := mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive); err != nil {
+		b.Fatal(err)
+	}
+	release(b, mgr, LockTypeInode, 100)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive)
-		mgr.Release(LockTypeInode, 100)
+		if err := mgr.Acquire(ctx, LockTypeInode, 100, LockModeExclusive); err != nil {
+			b.Fatal(err)
+		}
+		release(b, mgr, LockTypeInode, 100)
 	}
 }

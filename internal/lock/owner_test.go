@@ -284,7 +284,7 @@ func TestNestedWaitOnReplayingNodeYieldsToReplay(t *testing.T) {
 		close(holdsY)
 		<-askX
 		err := peer.Acquire(context.Background(), LockTypeExtent, extentX, LockModeExclusive)
-		peer.Release(LockTypeInode, inodeY)
+		release(t, peer, LockTypeInode, inodeY)
 		peer.ReleaseCached()
 		peerResult <- err
 	}()

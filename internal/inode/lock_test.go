@@ -42,10 +42,14 @@ func TestWriteDoesNotHangBehindSameNodeReader(t *testing.T) {
 			return
 		}
 		_, err := table.Read(dir.InodeNum)
-		lm.Release(lock.LockTypeInode, key)
+		if relErr := lm.Release(lock.LockTypeInode, key); err == nil {
+			err = relErr
+		}
 		readDone <- err
 	}()
-	lm.Release(lock.LockTypeInode, key)
+	if err := lm.Release(lock.LockTypeInode, key); err != nil {
+		t.Fatal(err)
+	}
 
 	for name, done := range map[string]chan error{"Write": writeDone, "listing": readDone} {
 		select {
