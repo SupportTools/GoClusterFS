@@ -45,8 +45,8 @@ func expectOneNamePerInode(t *testing.T, fsys *FS) map[string]uint64 {
 	return names
 }
 
-// A create or mkdir crashes between claiming its inode and naming it, and a peer creates a file before replay. The
-// peer's file must get an inode of its own.
+// A create or mkdir crashes between claiming its inode and naming it, and a peer creates a file in the first free
+// slot before replay. The peer's file must get an inode of its own.
 func TestCrashBetweenClaimAndNameLeavesNoSharedName(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -63,10 +63,7 @@ func TestCrashBetweenClaimAndNameLeavesNoSharedName(t *testing.T) {
 			<-crashed
 			afterCommit = nil
 
-			peer := openFormattedFS(t, path)
-			if _, _, _, errno := peer.Create(ctx, "peer.txt", 0, 0o644, &fuse.EntryOut{}); errno != 0 {
-				t.Fatalf("peer create: %v", errno)
-			}
+			createFile(t, openFormattedFS(t, path), "peer.txt")
 
 			remounted := remountAndReplay(t, path, offset, size)
 			if _, ok := expectOneNamePerInode(t, remounted)["peer.txt"]; !ok {
