@@ -12,6 +12,8 @@ permissions:
 env:
   GO_VERSION: "1.26"
   GOLANGCI_LINT_VERSION: v2.15.0
+  # Exact release, at least 48 hours old when pinned (company package-age policy).
+  NODE_VERSION: "22.23.4"
 
 jobs:
   build-and-unit-test:
@@ -48,9 +50,17 @@ jobs:
             exit 1
           fi
 
+      # Test images go on tmpfs: 4KB O_DIRECT writes on the runner's disk can take
+      # longer than the 20ms a lock record write is allowed.
       - name: Unit Tests
         shell: bash
-        run: make test-unit 2>&1 | tee unit-test.log
+        env:
+          TMPDIR: /dev/shm/gcfs-unit
+          GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-unit
+        run: |
+          mkdir -p "$TMPDIR"
+          dd if=/dev/zero of="$TMPDIR/odirect-check" bs=4096 count=1 oflag=direct
+          make test-unit 2>&1 | tee unit-test.log
 
       - name: Coverage summary
         run: |
@@ -113,10 +123,42 @@ jobs:
       - name: Run govulncheck
         run: make vuln
 
+  dashboard:
+    name: Dashboard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/dashboard/package-lock.json
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Install, lint, typecheck and build
+        run: make dashboard
+
+      - name: Check the build embeds and serves
+        run: go test -v -run 'TestEmbeddedBuild|TestServesBuild' ./internal/webui/
+
   integration-tests:
-    name: Integration Tests
+    name: Integration Tests (group ${{ matrix.group }})
     runs-on: ubuntu-latest
     needs: build-and-unit-test
+    strategy:
+      fail-fast: false
+      matrix:
+        # tests/scripts/integration-groups.sh splits the tests by recorded run time
+        group: [1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -141,11 +183,21 @@ jobs:
       - name: Build
         run: make build
 
+      - name: Check test groups
+        run: tests/scripts/integration-groups.sh check ${{ strategy.job-total }}
+
       - name: Integration Tests
+        shell: bash
         run: |
-          # Run integration tests with -short to skip stress tests that timeout in CI
-          # Stress tests (TestStressRandomFailures, TestStress) require local execution
-          # Lock order violation fix (Task #4798) enables concurrent file/directory creation tests
-          # Extent locking fix (Task #4801) enables concurrent same-file writes test
-          go test -v -timeout 8m -short ./tests/integration/...
+          tests=$(tests/scripts/integration-groups.sh regex ${{ strategy.job-total }} ${{ matrix.group }})
+          # -short skips the stress tests, which need longer than CI allows
+          go test -v -timeout 8m -short -run "$tests" ./tests/integration/... 2>&1 | tee integration-${{ matrix.group }}.log
         timeout-minutes: 10
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-log-${{ matrix.group }}
+          path: integration-${{ matrix.group }}.log
+          retention-days: 7

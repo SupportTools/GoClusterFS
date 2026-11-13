@@ -63,7 +63,7 @@ func testDevice(t testing.TB, dataMB int) (*storage.Device, func()) {
 	return dev, cleanup
 }
 
-// testLayout is the layout of every test device: up to 4 GB, data blocks start at 263 MB.
+// testLayout is the layout of every test device: up to 4 GB, data blocks start at 326 MB.
 var testLayout = superblock.New(superblock.MinDeviceSize, 0)
 
 // writeSuperblock writes the v3 superblock for dev with totalBlocks data blocks.

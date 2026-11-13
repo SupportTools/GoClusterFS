@@ -14,8 +14,9 @@
 #
 # VM N listens for SSH on 127.0.0.1:$((VM_SSH_BASE_PORT + N - 1)), default base 2222.
 # A lock allows one run per checkout; runs from different checkouts on one host
-# need different VM_SSH_BASE_PORT values. Each run gets its own SSH key and copy of goclusterfs-mount. VM console, QEMU and
-# mount logs go to tests/vm/results/.
+# need different VM_SSH_BASE_PORT values. Each run gets its own SSH key and copies of
+# goclusterfs-mount and, when built, goclusterfs-fsck. VM console, QEMU and mount logs go
+# to tests/vm/results/.
 
 set -euo pipefail
 
@@ -127,6 +128,9 @@ init_vm_run() {
     export VM_RUN_DIR VM_RUN_OWNER VM_RUN_LOCK_FD
 
     cp "${PROJECT_ROOT}/goclusterfs-mount" "${VM_RUN_DIR}/goclusterfs-mount"
+    if [[ -x "${PROJECT_ROOT}/goclusterfs-fsck" ]]; then
+        cp "${PROJECT_ROOT}/goclusterfs-fsck" "${VM_RUN_DIR}/goclusterfs-fsck"
+    fi
     ssh-keygen -t ed25519 -f "$(get_ssh_key)" -N "" -q -C "goclusterfs-vm-run"
     write_setup_disk "${VM_RUN_DIR}/setup.img"
     rm -f "${RESULTS_DIR}"/vm*.log
@@ -512,10 +516,13 @@ setup_goclusterfs() {
 
     log_info "Setting up GoClusterFS on VM $vm_id (format=$format_disk)..."
 
-    log_info "Copying goclusterfs-mount binary..."
+    log_info "Copying goclusterfs binaries..."
+    local binaries=("${VM_RUN_DIR}/goclusterfs-mount")
+    if [[ -x "${VM_RUN_DIR}/goclusterfs-fsck" ]]; then
+        binaries+=("${VM_RUN_DIR}/goclusterfs-fsck")
+    fi
     scp ${SSH_OPTIONS} -i "$(get_ssh_key)" -P "$ssh_port" \
-        "${VM_RUN_DIR}/goclusterfs-mount" \
-        "${SSH_USER}@127.0.0.1:/usr/local/bin/goclusterfs-mount"
+        "${binaries[@]}" "${SSH_USER}@127.0.0.1:/usr/local/bin/"
 
     # Mount GoClusterFS
     local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device /dev/vda"
@@ -600,6 +607,15 @@ kill_vm() {
 
     if is_vm_running "$vm_id"; then
         kill -9 "$(cat "$pid_file")" 2>/dev/null || true
+        local waited=0
+        while is_vm_running "$vm_id"; do
+            if [[ $waited -ge 50 ]]; then
+                log_error "VM $vm_id: QEMU still running 10s after SIGKILL"
+                return 1
+            fi
+            sleep 0.2
+            waited=$((waited + 1))
+        done
         mark_vm_log "$vm_id" "VM $vm_id killed"
     fi
     rm -f "$pid_file"

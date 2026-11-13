@@ -126,9 +126,10 @@ type txnApplyResult struct {
 // applyTransaction applies a single recovered transaction idempotently.
 func applyTransaction(ctx context.Context, rctx *RecoveryContext, txn *RecoveredTxn) (*txnApplyResult, error) {
 	result := &txnApplyResult{}
+	r := newTxnReplay()
 
 	for _, entry := range txn.Entries {
-		applied, err := applyEntry(ctx, rctx, entry)
+		applied, err := applyEntry(ctx, rctx, r, entry)
 		if err != nil {
 			return result, fmt.Errorf("failed to apply entry op=%s: %w", entry.Entry.OpType, err)
 		}
@@ -142,18 +143,40 @@ func applyTransaction(ctx context.Context, rctx *RecoveryContext, txn *Recovered
 	return result, nil
 }
 
+// txnReplay is what replaying one transaction changed, so that its later records can tell those changes from another
+// node's. A peer can take a dead node's locks before its journal is replayed, so each record checks that what it
+// changes is still as the operation left it.
+type txnReplay struct {
+	created map[uint64]bool
+	wrote   map[uint32]uint64
+}
+
+func newTxnReplay() *txnReplay {
+	return &txnReplay{created: make(map[uint64]bool), wrote: make(map[uint32]uint64)}
+}
+
+// unchanged reports whether ino is in use and was last written before a record logged its MetaGeneration as gen, or
+// by this replay.
+func (r *txnReplay) unchanged(ino *inode.Inode, gen uint64) bool {
+	if ino.Magic != inode.InodeMagic {
+		return false
+	}
+	wrote, ok := r.wrote[ino.InodeNum]
+	return ino.MetaGeneration == gen || ok && ino.MetaGeneration == wrote
+}
+
 // applyEntry applies a single journal entry idempotently.
-// Returns true if the operation was applied, false if it was already applied.
-func applyEntry(ctx context.Context, rctx *RecoveryContext, entry *RecoveredEntry) (bool, error) {
+// Returns true if the operation was applied, false if it was already applied or must not be.
+func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry *RecoveredEntry) (bool, error) {
 	switch entry.Entry.OpType {
 	case TxnOpInodeCreate:
-		return applyInodeCreate(ctx, rctx, entry.Payload)
+		return applyInodeCreate(ctx, rctx, r, entry.Payload)
 	case TxnOpInodeUpdate:
 		return applyInodeUpdate(ctx, rctx, entry.Payload)
 	case TxnOpInodeDelete:
-		return applyInodeDelete(ctx, rctx, entry.Payload)
+		return applyInodeDelete(ctx, rctx, r, entry.Payload)
 	case TxnOpDirAddEntry:
-		return applyDirAddEntry(ctx, rctx, entry.Payload)
+		return applyDirAddEntry(ctx, rctx, r, entry.Payload)
 	case TxnOpDirRemoveEntry:
 		return applyDirRemoveEntry(ctx, rctx, entry.Payload)
 	case TxnOpBlockAlloc:
@@ -161,9 +184,9 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, entry *RecoveredEntr
 	case TxnOpBlockFree:
 		return applyBlockFree(ctx, rctx, entry.Payload)
 	case TxnOpExtentAdd:
-		return applyExtentAdd(ctx, rctx, entry.Payload)
-	case TxnOpExtentRemove:
-		return applyExtentRemove(ctx, rctx, entry.Payload)
+		return applyExtentAdd(ctx, rctx, r, entry.Payload)
+	case TxnOpExtentFree:
+		return applyExtentFree(ctx, rctx, r, entry.Payload)
 	default:
 		// Unhandled operation types are logged but not an error
 		log.Printf("[Recovery] Skipping unhandled operation type: %s", entry.Entry.OpType)
@@ -171,43 +194,36 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, entry *RecoveredEntr
 	}
 }
 
-// applyInodeCreate creates an inode if it doesn't already exist.
-func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
+// applyInodeCreate claims the inode's slot if it is still free and nobody used it since the create was logged.
+func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeInodeCreate(payload)
 	if err != nil {
 		return false, err
 	}
 
-	// Check if inode already exists
-	existing, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
-	if err == nil && existing.Magic == inode.InodeMagic {
-		// Inode already exists - idempotent skip
-		log.Printf("[Recovery] InodeCreate: inode %d already exists, skipping", p.InodeNum)
+	ino, err := rctx.InodeTbl.ClaimSlotIf(ctx, uint32(p.InodeNum), func(free *inode.Inode) bool {
+		return free.MetaGeneration == p.MetaGeneration
+	})
+	if errors.Is(err, inode.ErrInodeInUse) {
+		log.Printf("[Recovery] InodeCreate: slot %d is in use or was used since, skipping", p.InodeNum)
 		return false, nil
 	}
-
-	// Create the inode
-	ino := &inode.Inode{
-		Magic:     inode.InodeMagic,
-		InodeNum:  uint32(p.InodeNum),
-		Mode:      uint16(p.Mode),
-		UID:       p.UID,
-		GID:       p.GID,
-		LinkCount: 1,
-	}
-	if err == nil {
-		ino.DataGeneration = existing.DataGeneration + 1
-		ino.MetaGeneration = existing.MetaGeneration + 1
+	if err != nil {
+		return false, fmt.Errorf("failed to claim inode %d: %w", p.InodeNum, err)
 	}
 
+	ino.Mode = uint16(p.Mode)
+	ino.UID = p.UID
+	ino.GID = p.GID
 	now := time.Now().UnixNano()
 	ino.Atime = now
 	ino.Mtime = now
 	ino.Ctime = now
-
-	if err := rctx.InodeTbl.WriteWithLockHeld(ino); err != nil {
+	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
 		return false, fmt.Errorf("failed to write inode %d: %w", p.InodeNum, err)
 	}
+	r.created[p.InodeNum] = true
+	r.wrote[ino.InodeNum] = ino.MetaGeneration
 
 	log.Printf("[Recovery] InodeCreate: created inode %d", p.InodeNum)
 	return true, nil
@@ -237,23 +253,21 @@ func applyInodeUpdate(ctx context.Context, rctx *RecoveryContext, payload []byte
 	return false, nil
 }
 
-// applyInodeDelete marks an inode as deleted.
-func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
+// applyInodeDelete frees the inode if it is unchanged since the unlink was logged.
+func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeInodeDelete(payload)
 	if err != nil {
 		return false, err
 	}
 
-	// Check if inode exists
-	ino, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
-	if err != nil || ino.Magic != inode.InodeMagic {
-		// Already deleted or doesn't exist - idempotent skip
-		log.Printf("[Recovery] InodeDelete: inode %d already deleted, skipping", p.InodeNum)
+	freed, err := rctx.InodeTbl.FreeIf(ctx, uint32(p.InodeNum), func(ino *inode.Inode) bool {
+		return r.unchanged(ino, p.MetaGeneration)
+	})
+	if errors.Is(err, inode.ErrInodeNotInUse) || err == nil && !freed {
+		log.Printf("[Recovery] InodeDelete: inode %d is free or was written since, skipping", p.InodeNum)
 		return false, nil
 	}
-
-	// Free the inode
-	if err := rctx.InodeTbl.Free(ctx, uint32(p.InodeNum)); err != nil {
+	if err != nil {
 		return false, fmt.Errorf("failed to free inode %d: %w", p.InodeNum, err)
 	}
 
@@ -261,17 +275,20 @@ func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, payload []byte
 	return true, nil
 }
 
-// applyDirAddEntry adds a directory entry if it doesn't exist.
-func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
+// applyDirAddEntry adds the entry for an inode this transaction's replay created.
+func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeDirAddEntry(payload)
 	if err != nil {
 		return false, err
 	}
+	if !r.created[p.ChildInodeNum] {
+		log.Printf("[Recovery] DirAddEntry: replay did not create inode %d, skipping %q", p.ChildInodeNum, p.Name)
+		return false, nil
+	}
 
-	// Read parent directory inode
-	parentIno, err := rctx.InodeTbl.Read(uint32(p.ParentInodeNum))
-	if err != nil {
-		return false, fmt.Errorf("parent inode %d not found", p.ParentInodeNum)
+	parentIno, ok, err := liveDir(rctx, p.ParentInodeNum)
+	if !ok {
+		return false, err
 	}
 
 	// Check if entry already exists
@@ -314,21 +331,33 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, payload []byte
 	return true, nil
 }
 
-// applyDirRemoveEntry removes a directory entry if it exists.
+// liveDir reads the inode num and reports whether it is a directory in use. Another node may have removed it since
+// the record was logged.
+func liveDir(rctx *RecoveryContext, num uint64) (*inode.Inode, bool, error) {
+	ino, err := rctx.InodeTbl.Read(uint32(num))
+	if err != nil {
+		return nil, false, fmt.Errorf("parent inode %d not found", num)
+	}
+	if ino.Magic != inode.InodeMagic || !ino.IsDir() {
+		log.Printf("[Recovery] inode %d is no longer a directory, skipping", num)
+		return nil, false, nil
+	}
+	return ino, true, nil
+}
+
+// applyDirRemoveEntry removes the entry if it still names the child the unlink logged, unchanged since.
 func applyDirRemoveEntry(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
 	p, err := DeserializeDirRemoveEntry(payload)
 	if err != nil {
 		return false, err
 	}
 
-	// Read parent directory inode
-	parentIno, err := rctx.InodeTbl.Read(uint32(p.ParentInodeNum))
-	if err != nil {
-		return false, fmt.Errorf("parent inode %d not found", p.ParentInodeNum)
+	parentIno, ok, err := liveDir(rctx, p.ParentInodeNum)
+	if !ok {
+		return false, err
 	}
 
-	// Check if entry exists
-	_, _, err = rctx.DirMgr.Lookup(ctx, parentIno, p.Name)
+	childNum, _, err := rctx.DirMgr.Lookup(ctx, parentIno, p.Name)
 	if err == dir.ErrNotFound {
 		// Already removed - idempotent skip
 		log.Printf("[Recovery] DirRemoveEntry: entry %q already removed from parent %d, skipping",
@@ -337,6 +366,18 @@ func applyDirRemoveEntry(ctx context.Context, rctx *RecoveryContext, payload []b
 	}
 	if err != nil {
 		return false, fmt.Errorf("lookup failed: %w", err)
+	}
+	if childNum != p.ChildInodeNum {
+		log.Printf("[Recovery] DirRemoveEntry: %q now names inode %d, not %d, skipping", p.Name, childNum, p.ChildInodeNum)
+		return false, nil
+	}
+	child, err := rctx.InodeTbl.Read(uint32(childNum))
+	if err != nil {
+		return false, fmt.Errorf("child inode %d not found: %w", childNum, err)
+	}
+	if child.MetaGeneration != p.ChildMetaGeneration {
+		log.Printf("[Recovery] DirRemoveEntry: inode %d of %q changed since the unlink was logged, skipping", childNum, p.Name)
+		return false, nil
 	}
 
 	// Remove the entry
@@ -393,63 +434,39 @@ func applyBlockAlloc(ctx context.Context, rctx *RecoveryContext, payload []byte)
 	return applied, nil
 }
 
-// applyBlockFree marks blocks as free if currently allocated.
+// applyBlockFree frees nothing: older builds logged logical file blocks here, and freeing those numbers as physical
+// blocks would free blocks other files map. Truncate and unlink now log ExtentFree.
 func applyBlockFree(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
 	p, err := DeserializeBlockFree(payload)
 	if err != nil {
 		return false, err
 	}
-
-	applied := false
-	for i := uint32(0); i < p.Count; i++ {
-		blockNum := p.StartBlock + uint64(i)
-
-		// Check if allocated
-		isAllocated, err := rctx.BitmapMgr.IsAllocated(blockNum)
-		if err != nil {
-			return applied, fmt.Errorf("failed to check block %d: %w", blockNum, err)
-		}
-
-		if !isAllocated {
-			// Already free - idempotent skip for this block
-			continue
-		}
-
-		// Free the block
-		if err := rctx.BitmapMgr.Free(ctx, blockNum); err != nil {
-			return applied, fmt.Errorf("failed to free block %d: %w", blockNum, err)
-		}
-		applied = true
-	}
-
-	if applied {
-		log.Printf("[Recovery] BlockFree: freed blocks %d-%d for inode %d",
-			p.StartBlock, p.StartBlock+uint64(p.Count)-1, p.InodeNum)
-	} else {
-		log.Printf("[Recovery] BlockFree: blocks %d-%d already free, skipping",
-			p.StartBlock, p.StartBlock+uint64(p.Count)-1)
-	}
-
-	return applied, nil
+	log.Printf("[Recovery] BlockFree: leaving file blocks %d-%d of inode %d allocated",
+		p.StartBlock, p.StartBlock+uint64(p.Count)-1, p.InodeNum)
+	return false, nil
 }
 
-// applyExtentAdd adds an extent to an inode if not already present.
-func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
+// applyExtentAdd maps the logged blocks where the inode has a hole and grows the inode to the write's size, if the
+// inode is unchanged since the write was logged.
+func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeExtentAdd(payload)
 	if err != nil {
 		return false, err
 	}
 
-	return updateExtents(ctx, rctx, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
-		// Check if extent already exists at this file block
-		if _, _, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock); err == nil {
-			// Extent already exists at this position - idempotent skip
-			log.Printf("[Recovery] ExtentAdd: extent at file block %d already exists for inode %d, skipping",
-				p.FileBlock, p.InodeNum)
+	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+		if !r.unchanged(ino, p.MetaGeneration) {
+			log.Printf("[Recovery] ExtentAdd: inode %d is free or was written since, skipping", p.InodeNum)
 			return false, nil
 		}
+		grown := ino.Size < p.Size
+		ino.Size = max(ino.Size, p.Size)
+		if _, _, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock); err == nil {
+			log.Printf("[Recovery] ExtentAdd: extent at file block %d already exists for inode %d, skipping",
+				p.FileBlock, p.InodeNum)
+			return grown, nil
+		}
 
-		// Add the extent using the extent manager's recovery-friendly method
 		// Note: Journal payload uses FileBlock/DiskBlock, extent uses LogicalBlock/PhysicalBlock
 		ext := &extent.Extent{
 			LogicalBlock:  p.FileBlock,
@@ -458,10 +475,9 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, payload []byte) 
 			Flags:         extent.FlagAllocated,
 		}
 		if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, ext); err != nil {
-			// Check for overlap (concurrent recovery may have added it)
 			if err == extent.ErrExtentOverlap {
 				log.Printf("[Recovery] ExtentAdd: extent overlaps, likely concurrent recovery, skipping")
-				return false, nil
+				return grown, nil
 			}
 			return false, fmt.Errorf("failed to add extent: %w", err)
 		}
@@ -471,38 +487,10 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, payload []byte) 
 	})
 }
 
-// applyExtentRemove removes an extent from an inode if present.
-func applyExtentRemove(ctx context.Context, rctx *RecoveryContext, payload []byte) (bool, error) {
-	p, err := DeserializeExtentRemove(payload)
-	if err != nil {
-		return false, err
-	}
-
-	return updateExtents(ctx, rctx, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
-		// Check if extent exists
-		if _, _, err := rctx.ExtentMgr.Lookup(ino, p.FileBlock); err != nil {
-			// Extent doesn't exist - already removed, idempotent skip
-			log.Printf("[Recovery] ExtentRemove: extent at file block %d already removed from inode %d, skipping",
-				p.FileBlock, p.InodeNum)
-			return false, nil
-		}
-
-		// Remove the extent using truncate to the file block position
-		// This removes extents from FileBlock onwards for Length blocks
-		// Note: Journal uses uint64 for FileBlock, but extent manager uses uint32
-		if err := rctx.ExtentMgr.RemoveExtentForRecovery(ctx, ino, uint32(p.FileBlock), p.Length); err != nil {
-			return false, fmt.Errorf("failed to remove extent: %w", err)
-		}
-		log.Printf("[Recovery] ExtentRemove: removed extent file=%d len=%d from inode %d",
-			p.FileBlock, p.Length, p.InodeNum)
-		return true, nil
-	})
-}
-
 // updateExtents reads an inode, applies change, and writes it back when change
 // reports an update, starting over if another node changed the inode's extent
 // tree in between.
-func updateExtents(ctx context.Context, rctx *RecoveryContext, inodeNum uint32, change func(*inode.Inode) (bool, error)) (bool, error) {
+func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, inodeNum uint32, change func(*inode.Inode) (bool, error)) (bool, error) {
 	const attempts = 5
 	for attempt := 1; ; attempt++ {
 		ino, err := rctx.InodeTbl.Read(inodeNum)
@@ -516,6 +504,7 @@ func updateExtents(ctx context.Context, rctx *RecoveryContext, inodeNum uint32, 
 		}
 		err = rctx.InodeTbl.Write(ctx, ino)
 		if err == nil {
+			r.wrote[inodeNum] = ino.MetaGeneration
 			return true, nil
 		}
 		rctx.ExtentMgr.DiscardPending(ctx, ino)
@@ -559,4 +548,25 @@ func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
 			txn.Header.Seq, result.applied, result.skipped)
 		return nil
 	}
+}
+
+// applyExtentFree cuts the inode to the logged size and frees its blocks past it, through refcounts for shared ones,
+// if the inode is unchanged since the free was logged. Otherwise the operation's inode write landed, or another node
+// changed the inode after the crash, and the blocks may be in use again.
+func applyExtentFree(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
+	p, err := DeserializeExtentFree(payload)
+	if err != nil {
+		return false, err
+	}
+	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+		if !r.unchanged(ino, p.MetaGeneration) {
+			log.Printf("[Recovery] ExtentFree: inode %d is free or was written since, skipping", p.InodeNum)
+			return false, nil
+		}
+		if err := rctx.ExtentMgr.Truncate(ctx, ino, min(ino.Size, p.Size)); err != nil {
+			return false, fmt.Errorf("failed to free the blocks of inode %d past %d bytes: %w", p.InodeNum, p.Size, err)
+		}
+		log.Printf("[Recovery] ExtentFree: cut inode %d to %d bytes", p.InodeNum, ino.Size)
+		return true, nil
+	})
 }

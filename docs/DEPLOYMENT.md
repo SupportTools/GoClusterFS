@@ -64,6 +64,8 @@ newgrp fuse
 | Connectivity | All nodes on same L2 network segment |
 | Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
 | Ports | UDP 31337 (multicast) and UDP 31338 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
+| Several mounts per host | Each mount on a host needs its own `-unicast-port` and `-api-addr`. Mounts of different volumes also need their own `-mcast-group` or `-mcast-port` |
+| Several clusters per LAN | Give each cluster its own `-mcast-group`, or set `-broadcast-secret`; otherwise clusters receive each other's invalidations and peer announcements |
 | Latency | < 10ms between nodes recommended |
 
 ---
@@ -98,7 +100,7 @@ Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the
 
 ## Block Device Setup
 
-GoClusterFS can use any O_DIRECT-capable block device of at least 264 MB. The layout reserves 256 MB for 64 node journals of 4 MB.
+GoClusterFS can use any O_DIRECT-capable block device of at least 327 MB. The layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
 
 ### Option 1: File-Backed Device (Development/Testing)
 

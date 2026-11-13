@@ -144,8 +144,8 @@ func TestClaimErrno(t *testing.T) {
 	for err, want := range map[error]syscall.Errno{
 		inode.ErrInodeFull:  syscall.ENOSPC,
 		inode.ErrInodeInUse: syscall.EAGAIN,
-		fmt.Errorf("failed to acquire inode lock: %w", lock.ErrLockTimeout):   syscall.EIO,
-		fmt.Errorf("failed to acquire inode lock: %w", lock.ErrInvalidRecord): syscall.EIO,
+		fmt.Errorf("failed to acquire inode lock: %w", lock.ErrLockTimeout): syscall.EIO,
+		fmt.Errorf("failed to read inode slot: %w", syscall.EIO):            syscall.EIO,
 	} {
 		if got := claimErrno(err); got != want {
 			t.Errorf("claimErrno(%v) = %v, want %v", err, got, want)

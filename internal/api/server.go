@@ -72,13 +72,18 @@ func NewServer(cfg Config) (*Server, error) {
 
 	// Build middleware chain (order: rate limit -> logging -> loopback Host check -> CORS -> auth).
 	// Probes and scrapers on loopback share one bucket, so /health and /metrics skip the limiter.
-	middlewares := []Middleware{RateLimitMiddleware(s.rateLimiter, "/health", "/metrics"), LoggingMiddleware}
+	// The dashboard's static files hold no data, and a browser can't send a token when it loads them.
+	exempt := []string{"/health", "/metrics"}
+	if cfg.Dashboard != nil {
+		exempt = append(exempt, "/ui/")
+	}
+	middlewares := []Middleware{RateLimitMiddleware(s.rateLimiter, exempt...), LoggingMiddleware}
 	if cfg.AuthToken == "" && cfg.LoopbackOnly() {
 		middlewares = append(middlewares, LoopbackHostMiddleware)
 	}
 	middlewares = append(middlewares,
 		CORSMiddleware(cfg.CORSOrigins),
-		AuthMiddleware(cfg.AuthToken, "/health", "/metrics"),
+		AuthMiddleware(cfg.AuthToken, exempt...),
 	)
 	handler := Chain(s.router, middlewares...)
 
