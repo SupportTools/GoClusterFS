@@ -6,7 +6,7 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"slices"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +35,11 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap lets http.ResponseController reach the connection, for per-request write deadlines.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 // LoggingMiddleware logs HTTP requests with method, path, status, and duration.
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,9 +57,20 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// exempt reports whether p is one of paths, or lies under a path that ends in "/".
+func exempt(p string, paths []string) bool {
+	under := path.Clean(p) + "/"
+	for _, e := range paths {
+		if p == e || strings.HasSuffix(e, "/") && strings.HasPrefix(under, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // AuthMiddleware returns a middleware that validates Bearer tokens.
 // If token is empty, authentication is disabled.
-// Paths in skipPaths are not authenticated (e.g., /health, /metrics).
+// Paths in skipPaths are not authenticated (e.g., /health, /metrics); see exempt.
 func AuthMiddleware(token string, skipPaths ...string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,12 +80,9 @@ func AuthMiddleware(token string, skipPaths ...string) Middleware {
 				return
 			}
 
-			// Check if path should skip auth
-			for _, path := range skipPaths {
-				if r.URL.Path == path {
-					next.ServeHTTP(w, r)
-					return
-				}
+			if exempt(r.URL.Path, skipPaths) {
+				next.ServeHTTP(w, r)
+				return
 			}
 
 			// Extract Bearer token from Authorization header
@@ -128,6 +141,15 @@ func CORSMiddleware(origins []string) Middleware {
 			if allowOrigin == "" {
 				next.ServeHTTP(w, r)
 				return
+			}
+
+			// POST is CORS-safelisted, so browsers send it whenever the preflight
+			// succeeds. Writes must stay same-origin: fail every preflight but GET and HEAD.
+			if r.Method == http.MethodOptions {
+				if m := r.Header.Get("Access-Control-Request-Method"); m != "" && m != http.MethodGet && m != http.MethodHead {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
 			}
 
 			// Set CORS headers
@@ -261,11 +283,11 @@ func (rl *RateLimiter) retryAfter() string {
 }
 
 // RateLimitMiddleware returns a middleware that enforces rate limiting per client.
-// If limiter is nil, no rate limiting is applied. Paths in skipPaths are never limited.
+// If limiter is nil, no rate limiting is applied. Paths in skipPaths are never limited; see exempt.
 func RateLimitMiddleware(limiter *RateLimiter, skipPaths ...string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if limiter == nil || slices.Contains(skipPaths, r.URL.Path) {
+			if limiter == nil || exempt(r.URL.Path, skipPaths) {
 				next.ServeHTTP(w, r)
 				return
 			}

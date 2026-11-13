@@ -360,6 +360,12 @@ func (t *Table) scanMagic(from, to uint64, fn func(num, magic uint32) bool) {
 // This function acquires the distributed inode lock (Level 8), so callers must ensure
 // any BlockBitmap locks (Level 6) are acquired BEFORE calling this function.
 func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
+	return t.ClaimSlotIf(ctx, num, func(*Inode) bool { return true })
+}
+
+// ClaimSlotIf claims the slot if it is free and ok accepts the free inode, read under the slot's lock. Otherwise it
+// returns ErrInodeInUse.
+func (t *Table) ClaimSlotIf(ctx context.Context, num uint32, ok func(free *Inode) bool) (*Inode, error) {
 	if uint64(num) >= t.totalInodes {
 		return nil, ErrInodeOutOfRange
 	}
@@ -391,7 +397,7 @@ func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to re-read inode slot: %w", err)
 	}
-	if existing.Magic != 0 {
+	if existing.Magic != 0 || !ok(existing) {
 		return nil, ErrInodeInUse
 	}
 
@@ -436,18 +442,24 @@ func (t *Table) Alloc(ctx context.Context) (*Inode, error) {
 
 // Free marks an inode as free.
 func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
+	_, err := t.FreeIf(ctx, inodeNum, func(*Inode) bool { return true })
+	return err
+}
+
+// FreeIf frees the inode if ok accepts it, read under the inode's lock, and reports whether it did.
+func (t *Table) FreeIf(ctx context.Context, inodeNum uint32, ok func(*Inode) bool) (bool, error) {
 	if uint64(inodeNum) >= t.totalInodes {
-		return ErrInodeOutOfRange
+		return false, ErrInodeOutOfRange
 	}
 
 	if inodeNum < InodeFirstUsable {
-		return fmt.Errorf("cannot free reserved inode %d", inodeNum)
+		return false, fmt.Errorf("cannot free reserved inode %d", inodeNum)
 	}
 
 	// Acquire distributed lock if available
 	if t.lockMgr != nil {
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inodeNum), lock.LockModeExclusive); err != nil {
-			return fmt.Errorf("failed to acquire inode lock: %w", err)
+			return false, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
 		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inodeNum))
 	}
@@ -455,15 +467,15 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Read current inode
 	inode, err := t.readInodeUnlocked(inodeNum)
 	if err != nil {
-		return err
+		return false, err
 	}
-
-	// Verify it's in use
 	if inode.Magic == 0 {
-		return ErrInodeNotInUse
+		return false, ErrInodeNotInUse
+	}
+	if !ok(inode) {
+		return false, nil
 	}
 
 	// Keep the generations so the slot's next occupant gets higher ones.
@@ -472,8 +484,10 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 		DataGeneration: inode.DataGeneration,
 		MetaGeneration: inode.MetaGeneration,
 	}
-
-	return t.writeInodeUnlocked(emptyInode)
+	if err := t.writeInodeUnlocked(emptyInode); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // TotalInodes returns the total number of inodes in the table.

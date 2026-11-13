@@ -405,6 +405,9 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.MulticastPort != 31337 {
 		t.Errorf("Expected port 31337, got %d", cfg.MulticastPort)
 	}
+	if cfg.UnicastPort != 31338 {
+		t.Errorf("Expected unicast port 31338, got %d", cfg.UnicastPort)
+	}
 	if cfg.MulticastTTL != 1 {
 		t.Errorf("Expected TTL 1, got %d", cfg.MulticastTTL)
 	}

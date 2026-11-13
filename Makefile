@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount build-fsck test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
+.PHONY: build build-mount build-fsck build-gfsctl dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
 
 # Go parameters
 GOCMD=go
@@ -14,6 +14,10 @@ GOMOD=$(GOCMD) mod
 # Binary names
 MOUNT_BINARY=goclusterfs-mount
 FSCK_BINARY=goclusterfs-fsck
+GFSCTL_BINARY=gfsctl
+
+DASHBOARD_DIR=web/dashboard
+DASHBOARD_DIST=internal/webui/build/dist
 
 GOLANGCI_LINT_VERSION=v2.15.0
 GOVULNCHECK_VERSION=v1.9.0
@@ -23,7 +27,7 @@ COVER_PROFILE=coverage.out
 .DEFAULT_GOAL := help
 
 # Build all binaries
-build: build-mount build-fsck
+build: build-mount build-fsck build-gfsctl
 
 build-mount:
 	@echo "Building $(MOUNT_BINARY)..."
@@ -34,6 +38,17 @@ build-fsck:
 	@echo "Building $(FSCK_BINARY)..."
 	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/fsck
 	@echo "Built $(FSCK_BINARY) successfully"
+
+build-gfsctl:
+	@echo "Building $(GFSCTL_BINARY)..."
+	$(GOBUILD) -o $(GFSCTL_BINARY) ./cmd/gfsctl
+	@echo "Built $(GFSCTL_BINARY) successfully"
+
+# Builds the web dashboard into $(DASHBOARD_DIST), which goclusterfs-mount embeds; run before build
+dashboard:
+	@echo "Building the web dashboard..."
+	cd $(DASHBOARD_DIR) && npm ci && npm run lint && npm run build
+	@echo "Built the dashboard into $(DASHBOARD_DIST)"
 
 # Unit tests (fast, no FUSE needed)
 test: test-unit
@@ -124,14 +139,14 @@ check-qemu:
 	@echo "QEMU is available"
 
 # Run multi-node tests in QEMU VMs
-test-multinode-vm: check-qemu build-mount
+test-multinode-vm: check-qemu build-mount build-fsck
 	@echo "Running multi-node VM tests..."
 	@mkdir -p tests/vm/results
 	$(VM_TEST_HARNESS) --run-tests --nodes=2
 	@echo "VM tests completed"
 
 # Run VM tests with more nodes
-test-multinode-vm-3: check-qemu build-mount
+test-multinode-vm-3: check-qemu build-mount build-fsck
 	@echo "Running multi-node VM tests (3 nodes)..."
 	@mkdir -p tests/vm/results
 	$(VM_TEST_HARNESS) --run-tests --nodes=3
@@ -167,7 +182,8 @@ vuln:
 # Utilities
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(COVER_PROFILE)
+	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(GFSCTL_BINARY) $(COVER_PROFILE)
+	rm -rf $(DASHBOARD_DIST)
 	rm -f *.img
 	@echo "Clean complete"
 
@@ -194,6 +210,8 @@ help:
 	@echo "    build          - Build all binaries"
 	@echo "    build-mount    - Build goclusterfs-mount binary"
 	@echo "    build-fsck     - Build goclusterfs-fsck binary"
+	@echo "    build-gfsctl   - Build gfsctl binary"
+	@echo "    dashboard      - Build the web dashboard (npm ci) for build to embed; run make dashboard build"
 	@echo ""
 	@echo "  Test:"
 	@echo "    test           - Run unit tests (alias for test-unit)"

@@ -314,7 +314,7 @@ func TestRegionCheckpoint(t *testing.T) {
 	// Total data area minus (tail - new head)
 	// Note: tail is sector-aligned (SectorSize) not 1000
 	alignedTail := uint32(storage.SectorSize) // 1000 bytes rounds up to SectorSize
-	expected := region.DataAreaSize() - (alignedTail - 500)
+	expected := region.DataAreaSize() - (alignedTail - 500) - storage.SectorSize
 	if space != expected {
 		t.Errorf("Available space = %d, want %d", space, expected)
 	}
@@ -379,9 +379,9 @@ func TestRegionAvailableSpace(t *testing.T) {
 	dataAreaSize := region.DataAreaSize()
 	initialSpace := region.AvailableSpace()
 
-	// Initially should have full data area available
-	if initialSpace != dataAreaSize {
-		t.Errorf("Initial space = %d, want %d", initialSpace, dataAreaSize)
+	// Initially the whole data area but the one sector that stays free
+	if initialSpace != dataAreaSize-storage.SectorSize {
+		t.Errorf("Initial space = %d, want %d", initialSpace, dataAreaSize-storage.SectorSize)
 	}
 
 	// Write 1000 bytes
@@ -393,8 +393,8 @@ func TestRegionAvailableSpace(t *testing.T) {
 	// Space should decrease by sector-aligned amount (SectorSize, not 1000)
 	afterWrite := region.AvailableSpace()
 	alignedLen := uint32(storage.SectorSize) // 1000 bytes rounds up to SectorSize for O_DIRECT
-	if afterWrite != dataAreaSize-alignedLen {
-		t.Errorf("Space after write = %d, want %d", afterWrite, dataAreaSize-alignedLen)
+	if afterWrite != initialSpace-alignedLen {
+		t.Errorf("Space after write = %d, want %d", afterWrite, initialSpace-alignedLen)
 	}
 }
 

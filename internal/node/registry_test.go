@@ -1072,7 +1072,7 @@ func TestDetectionReleasesLocksOnlyOfProvenDeadNodes(t *testing.T) {
 		events = append(events, fmt.Sprintf("replay %d", info.SlotIndex))
 		return nil
 	})
-	reg.SetOwnerDeadHandler(func(owner [16]byte) func() {
+	reg.SetOwnerDeadHandler(func(owner [16]byte, _ int) func() {
 		events = append(events, fmt.Sprintf("adopt %x", owner[:1]))
 		return func() { events = append(events, fmt.Sprintf("release %x", owner[:1])) }
 	})

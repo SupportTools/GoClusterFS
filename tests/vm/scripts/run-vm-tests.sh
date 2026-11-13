@@ -609,7 +609,11 @@ test_restart_keeps_peer_journal() {
 
     local slot_before
     slot_before=$(ssh_run "$vm_a" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1")
-    ssh_run "$vm_a" "pkill -9 goclusterfs-mount; sleep 1; umount -l /mnt/goclusterfs 2>/dev/null; true"
+    if ! crash_goclusterfs "$vm_a"; then
+        ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
+        return 1
+    fi
+    ssh_run "$vm_a" "umount -l /mnt/goclusterfs 2>/dev/null; true"
     if ! setup_goclusterfs "$vm_a" false; then
         ssh_run "$vm_b" "touch /tmp/peer-writer.stop"
         return 1
@@ -2420,13 +2424,13 @@ test_stress_single_node() {
 # Based on Go TestMultiNodeConcurrentDirectoryOps which creates files not directories
 test_concurrent_directory_ops() {
     log_info "Testing concurrent directory operations across VMs..."
-    ensure_cluster_healthy 2
 
     # Need at least 2 VMs for this test
     if [[ $NODE_COUNT -lt 2 ]]; then
         log_info "SKIP: Need at least 2 VMs for concurrent directory ops test"
         return 0
     fi
+    ensure_cluster_healthy 2
 
     local vm1=1
     local vm2=2
@@ -2664,12 +2668,11 @@ test_concurrent_same_file_writes() {
 # Test 11: Three VMs write to same file at different offsets
 test_concurrent_same_file_writes_3vms() {
     log_info "Testing concurrent same-file writes (3 VMs)..."
-    ensure_cluster_healthy 3
-
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
         return 0
     fi
+    ensure_cluster_healthy 3
 
     local filename="samefile_3vm.txt"
     local chunk_size=$((300 * 1024))  # 300KB each
@@ -2755,12 +2758,11 @@ test_mixed_size_writes() {
 # Test 13: Overlapping block writes (all within same 1MB block)
 test_overlapping_block_writes() {
     log_info "Testing overlapping block writes..."
-    ensure_cluster_healthy 3
-
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
         return 0
     fi
+    ensure_cluster_healthy 3
 
     local filename="overlap_block.txt"
     local chunk_size=$((256 * 1024))  # 256KB each
@@ -2803,12 +2805,11 @@ test_overlapping_block_writes() {
 # Test 14: Write stress test - multiple rounds
 test_concurrent_write_stress() {
     log_info "Testing concurrent write stress (multiple rounds)..."
-    ensure_cluster_healthy 3
-
     if [[ $NODE_COUNT -lt 3 ]]; then
         log_warn "Skipping: Need at least 3 VMs for this test"
         return 0
     fi
+    ensure_cluster_healthy 3
 
     local filename="write_stress.txt"
     local chunk_size=$((250 * 1024))  # 250KB each
@@ -2943,6 +2944,128 @@ test_concurrent_writes_power_failure() {
     # Victim's partial data may or may not be present (undefined behavior during power failure)
     # We just verify the system recovers without corruption
     log_info "Recovery successful after power failure during concurrent writes"
+    return 0
+}
+
+# Print the PIDs of goclusterfs-mount on VM $1: processes with an argument equal to the path setup_goclusterfs starts
+# it with. On Alpine the gcompat loader runs it, so its name and argv[0] are the loader's. A zombie has no arguments.
+mount_pids() {
+    ssh_run "$1" 'for p in /proc/[0-9]*; do tr "\0" "\n" 2>/dev/null <$p/cmdline | grep -qx "/usr/local/bin/goclusterfs-moun[t]" && echo ${p#/proc/}; done; true'
+}
+
+# Kill goclusterfs-mount on VM $1 with SIGKILL, as a crash would, and fail unless it is gone within 10s.
+crash_goclusterfs() {
+    local vm_id=$1 pids waited=0
+    pids=$(mount_pids "$vm_id")
+    if [[ -z "$pids" ]]; then
+        log_error "VM $vm_id: no goclusterfs-mount process to kill"
+        return 1
+    fi
+    ssh_run "$vm_id" "kill -9 $(echo $pids)"
+    while [[ -n "$(mount_pids "$vm_id")" ]]; do
+        if [[ $waited -ge 50 ]]; then
+            log_error "VM $vm_id: goclusterfs-mount still running 10s after SIGKILL"
+            return 1
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+}
+
+# Unmount GoClusterFS on VM $1 and wait for the mount process to exit, which
+# marks its journal clean.
+unmount_goclusterfs() {
+    local vm_id=$1
+    ssh_run "$vm_id" "fusermount3 -u ${GOCLUSTERFS_MOUNT}" || return 1
+    local waited=0
+    while [[ -n "$(mount_pids "$vm_id")" ]]; do
+        if [[ $waited -ge 30 ]]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# A power failure while files are written may leave blocks that no file maps.
+# With every node unmounted, fsck -repair frees any it finds, the check after
+# it is clean, and no file changes.
+test_fsck_repair_after_power_failure() {
+    log_info "Testing fsck -repair after a power failure..."
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: Need at least 2 VMs for this test"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+    local survivor=1
+    local victim=2
+    local fsck=/usr/local/bin/goclusterfs-fsck
+
+    if ! ssh_run "$survivor" "test -x $fsck"; then
+        log_error "goclusterfs-fsck is not on the VMs: build it with make build"
+        return 1
+    fi
+
+    ssh_run "$survivor" "dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/keep.bin bs=1M count=4 2>/dev/null && sync"
+    local keep_md5
+    keep_md5=$(ssh_run "$survivor" "md5sum ${GOCLUSTERFS_MOUNT}/keep.bin | cut -d' ' -f1")
+
+    ssh_run "$victim" "for i in 1 2 3 4 5 6 7 8; do dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/victim_\$i.bin bs=1M count=8 2>/dev/null; done" &
+    local writer=$!
+    sleep 2
+    log_info "Simulating power failure on VM $victim mid-write..."
+    kill_vm "$victim"
+    wait "$writer" 2>/dev/null || true
+
+    start_vm "$victim" false
+    wait_vm_healthy "$victim"
+    setup_goclusterfs "$victim" false
+    # Whatever the victim's writes left, repair must not change it.
+    local before
+    before=$(ssh_run "$victim" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
+
+    local vm_id
+    for vm_id in $(seq 1 "$NODE_COUNT"); do
+        if ! unmount_goclusterfs "$vm_id"; then
+            log_error "VM $vm_id: GoClusterFS did not unmount"
+            return 1
+        fi
+    done
+
+    local out rc
+    out=$(ssh_run "$survivor" "$fsck -repair /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    echo "$out" | grep '^\[' | head -20
+    log_info "fsck -repair exit $rc, $(echo "$out" | grep -c 'leaked') leaked-block lines"
+    if [[ "$rc" != 0 && "$rc" != 1 ]]; then
+        log_error "fsck -repair exited $rc"
+        return 1
+    fi
+    out=$(ssh_run "$survivor" "$fsck /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    if [[ "$rc" != 0 ]] || echo "$out" | grep -q 'leaked'; then
+        echo "$out" | grep '^\[' | head -20
+        log_error "fsck after repair: exit $rc"
+        return 1
+    fi
+
+    for vm_id in $(seq 1 "$NODE_COUNT"); do
+        setup_goclusterfs "$vm_id" false || return 1
+    done
+    if [[ "$before" != *"$keep_md5  keep.bin"* ]]; then
+        log_error "keep.bin changed before repair"
+        return 1
+    fi
+    for vm_id in "$survivor" "$victim"; do
+        local after
+        after=$(ssh_run "$vm_id" "cd ${GOCLUSTERFS_MOUNT} && md5sum keep.bin victim_*.bin 2>/dev/null")
+        if [[ "$after" != "$before" ]]; then
+            log_error "VM $vm_id: files changed by repair"
+            diff <(echo "$before") <(echo "$after") >&2 || true
+            return 1
+        fi
+    done
+    log_info "fsck -repair left a clean volume and every file unchanged"
     return 0
 }
 
@@ -3363,10 +3486,8 @@ main() {
     run_test "Snapshot Preserves Data" test_snapshot_preserves_data
     run_test "Clone In-Place Write" test_clone_in_place_write
     run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
-    # Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
-    log_info "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
-    # Two nodes can both hold the refcount lock and lose a snapshot's count until #29 confirms lock claims.
-    log_info "SKIPPING: Snapshot During Writes (two nodes can both hold one lock until #29)"
+    run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
+    run_test "Snapshot During Writes" test_snapshot_during_writes
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation
@@ -3416,6 +3537,7 @@ main() {
     run_test "Concurrent Write Stress" test_concurrent_write_stress
     run_test "Reversed Write Order" test_reversed_write_order
     run_test "Concurrent Writes Power Failure" test_concurrent_writes_power_failure
+    run_test "fsck Repair After Power Failure" test_fsck_repair_after_power_failure
 
     # Summary
     log_info "=========================================="

@@ -30,6 +30,7 @@ func TestSerializeDeserialize(t *testing.T) {
 		CreateTime:    1700000000,
 		LastMountTime: 1700001000,
 		LastWriteTime: 1700002000,
+		LockSlotSize:  4096,
 	}
 	copy(sb.Magic[:], Magic)
 	copy(sb.UUID[:], []byte("0123456789abcdef"))
@@ -92,6 +93,9 @@ func TestSerializeDeserialize(t *testing.T) {
 	}
 	if restored.DataRegionOffset != sb.DataRegionOffset {
 		t.Errorf("DataRegionOffset = %d, want %d", restored.DataRegionOffset, sb.DataRegionOffset)
+	}
+	if restored.LockSlotSize != sb.LockSlotSize {
+		t.Errorf("LockSlotSize = %d, want %d", restored.LockSlotSize, sb.LockSlotSize)
 	}
 }
 
@@ -234,12 +238,12 @@ func TestNewSuperblock(t *testing.T) {
 		offset, size uint64
 	}{
 		{"node registry", 1 << 20, 1 << 20},
-		{"locks", 2 << 20, 1 << 20},
-		{"snapshots", 3 << 20, 1 << 20},
-		{"journals", 4 << 20, 64 * 4 << 20},
-		{"block bitmap", 260 << 20, 1 << 20},
-		{"refcounts", 261 << 20, 1 << 20},
-		{"inode table", 262 << 20, 3 << 20},
+		{"locks", 2 << 20, 64 << 20},
+		{"snapshots", 66 << 20, 1 << 20},
+		{"journals", 67 << 20, 64 * 4 << 20},
+		{"block bitmap", 323 << 20, 1 << 20},
+		{"refcounts", 324 << 20, 1 << 20},
+		{"inode table", 325 << 20, 3 << 20},
 	}
 	got := [][2]uint64{
 		{sb.NodeRegistryOffset, sb.NodeRegistrySize},
@@ -255,10 +259,10 @@ func TestNewSuperblock(t *testing.T) {
 			t.Errorf("%s at %d size %d, want %d size %d", w.name, got[i][0], got[i][1], w.offset, w.size)
 		}
 	}
-	if sb.DataRegionOffset != 265<<20 {
-		t.Errorf("DataRegionOffset = %d, want %d", sb.DataRegionOffset, 265<<20)
+	if sb.DataRegionOffset != 328<<20 {
+		t.Errorf("DataRegionOffset = %d, want %d", sb.DataRegionOffset, 328<<20)
 	}
-	if want := uint64(deviceSize-265<<20) >> 20; sb.TotalBlocks != want {
+	if want := uint64(deviceSize-328<<20) >> 20; sb.TotalBlocks != want {
 		t.Errorf("TotalBlocks = %d, want %d", sb.TotalBlocks, want)
 	}
 	if sb.JournalSlotSize() != 4<<20 {

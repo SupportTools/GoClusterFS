@@ -31,6 +31,7 @@ const (
 	TxnOpExtentAdd    TxnOpType = 0x0500
 	TxnOpExtentRemove TxnOpType = 0x0501
 	TxnOpExtentUpdate TxnOpType = 0x0502
+	TxnOpExtentFree   TxnOpType = 0x0503
 
 	// Snapshot Operations (0x06xx)
 	TxnOpSnapshotCreate TxnOpType = 0x0600
@@ -69,6 +70,8 @@ func (op TxnOpType) String() string {
 		return "ExtentRemove"
 	case TxnOpExtentUpdate:
 		return "ExtentUpdate"
+	case TxnOpExtentFree:
+		return "ExtentFree"
 	case TxnOpSnapshotCreate:
 		return "SnapshotCreate"
 	case TxnOpSnapshotDelete:
@@ -84,8 +87,8 @@ func (op TxnOpType) String() string {
 // Inode Operation Payloads
 // ============================================================================
 
-// InodeCreatePayload is logged when creating a new inode.
-// Size: 40 bytes
+// InodeCreatePayload is logged when creating a new inode, with the MetaGeneration of the free slot it takes.
+// Size: 48 bytes
 type InodeCreatePayload struct {
 	InodeNum       uint64
 	Mode           uint32
@@ -94,17 +97,19 @@ type InodeCreatePayload struct {
 	ParentInodeNum uint64
 	NameHash       uint64 // Hash of filename (for verification)
 	Reserved       uint32
+	MetaGeneration uint64
 }
 
 // Serialize converts the payload to bytes.
 func (p *InodeCreatePayload) Serialize() []byte {
-	buf := make([]byte, 40)
+	buf := make([]byte, 48)
 	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
 	binary.LittleEndian.PutUint32(buf[8:12], p.Mode)
 	binary.LittleEndian.PutUint32(buf[12:16], p.UID)
 	binary.LittleEndian.PutUint32(buf[16:20], p.GID)
 	binary.LittleEndian.PutUint64(buf[20:28], p.ParentInodeNum)
 	binary.LittleEndian.PutUint64(buf[28:36], p.NameHash)
+	binary.LittleEndian.PutUint64(buf[40:48], p.MetaGeneration)
 	return buf
 }
 
@@ -120,7 +125,16 @@ func DeserializeInodeCreate(buf []byte) (*InodeCreatePayload, error) {
 		GID:            binary.LittleEndian.Uint32(buf[16:20]),
 		ParentInodeNum: binary.LittleEndian.Uint64(buf[20:28]),
 		NameHash:       binary.LittleEndian.Uint64(buf[28:36]),
+		MetaGeneration: trailingUint64(buf, 40),
 	}, nil
+}
+
+// trailingUint64 reads the uint64 at off, or returns 0 for a record an older build wrote without it.
+func trailingUint64(buf []byte, off int) uint64 {
+	if len(buf) < off+8 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(buf[off : off+8])
 }
 
 // InodeUpdateMask indicates which fields are being updated.
@@ -167,16 +181,18 @@ func DeserializeInodeUpdate(buf []byte) (*InodeUpdatePayload, error) {
 	}, nil
 }
 
-// InodeDeletePayload is logged when deleting an inode.
-// Size: 8 bytes
+// InodeDeletePayload is logged when deleting an inode, with the inode's MetaGeneration.
+// Size: 16 bytes
 type InodeDeletePayload struct {
-	InodeNum uint64
+	InodeNum       uint64
+	MetaGeneration uint64
 }
 
 // Serialize converts the payload to bytes.
 func (p *InodeDeletePayload) Serialize() []byte {
-	buf := make([]byte, 8)
+	buf := make([]byte, 16)
 	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.MetaGeneration)
 	return buf
 }
 
@@ -186,7 +202,8 @@ func DeserializeInodeDelete(buf []byte) (*InodeDeletePayload, error) {
 		return nil, ErrTxnTooSmall
 	}
 	return &InodeDeletePayload{
-		InodeNum: binary.LittleEndian.Uint64(buf[0:8]),
+		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
+		MetaGeneration: trailingUint64(buf, 8),
 	}, nil
 }
 
@@ -253,15 +270,16 @@ func DeserializeDirAddEntry(buf []byte) (*DirAddEntryPayload, error) {
 	}, nil
 }
 
-// DirRemoveEntryPayload is logged when removing a directory entry.
-// Size: 24 bytes header + variable name (padded to 4-byte boundary)
+// DirRemoveEntryPayload is logged when removing a directory entry, with the child's MetaGeneration.
+// Size: 24 bytes header + variable name (padded to 4-byte boundary) + 8 bytes MetaGeneration
 type DirRemoveEntryPayload struct {
-	ParentInodeNum uint64
-	ChildInodeNum  uint64
-	EntryType      DirEntryType
-	NameLen        uint8
-	Reserved       [2]byte
-	Name           string // Variable length
+	ParentInodeNum      uint64
+	ChildInodeNum       uint64
+	EntryType           DirEntryType
+	NameLen             uint8
+	Reserved            [2]byte
+	Name                string // Variable length
+	ChildMetaGeneration uint64
 }
 
 // Serialize converts the payload to bytes.
@@ -272,12 +290,13 @@ func (p *DirRemoveEntryPayload) Serialize() []byte {
 	}
 	paddedNameLen := (nameLen + 3) &^ 3
 
-	buf := make([]byte, 24+paddedNameLen)
+	buf := make([]byte, 24+paddedNameLen+8)
 	binary.LittleEndian.PutUint64(buf[0:8], p.ParentInodeNum)
 	binary.LittleEndian.PutUint64(buf[8:16], p.ChildInodeNum)
 	buf[16] = byte(p.EntryType)
 	buf[17] = uint8(nameLen)
 	copy(buf[24:], p.Name[:nameLen])
+	binary.LittleEndian.PutUint64(buf[24+paddedNameLen:], p.ChildMetaGeneration)
 	return buf
 }
 
@@ -291,11 +310,12 @@ func DeserializeDirRemoveEntry(buf []byte) (*DirRemoveEntryPayload, error) {
 		return nil, ErrTxnTooSmall
 	}
 	return &DirRemoveEntryPayload{
-		ParentInodeNum: binary.LittleEndian.Uint64(buf[0:8]),
-		ChildInodeNum:  binary.LittleEndian.Uint64(buf[8:16]),
-		EntryType:      DirEntryType(buf[16]),
-		NameLen:        buf[17],
-		Name:           string(buf[24 : 24+nameLen]),
+		ParentInodeNum:      binary.LittleEndian.Uint64(buf[0:8]),
+		ChildInodeNum:       binary.LittleEndian.Uint64(buf[8:16]),
+		EntryType:           DirEntryType(buf[16]),
+		NameLen:             buf[17],
+		Name:                string(buf[24 : 24+nameLen]),
+		ChildMetaGeneration: trailingUint64(buf, 24+(nameLen+3)&^3),
 	}, nil
 }
 
@@ -566,24 +586,29 @@ const (
 	ExtentFlagEncrypted  ExtentFlags = 1 << 4 // Encrypted (future)
 )
 
-// ExtentAddPayload is logged when adding an extent to an inode.
-// Size: 32 bytes
+// ExtentAddPayload is logged when a write maps new blocks, with the inode's MetaGeneration and the size the write
+// gives the file.
+// Size: 48 bytes
 type ExtentAddPayload struct {
-	InodeNum  uint64
-	FileBlock uint64 // Logical block within file
-	DiskBlock uint64 // Physical block on device
-	Length    uint32 // Number of blocks
-	Flags     ExtentFlags
+	InodeNum       uint64
+	FileBlock      uint64 // Logical block within file
+	DiskBlock      uint64 // Physical block on device
+	Length         uint32 // Number of blocks
+	Flags          ExtentFlags
+	MetaGeneration uint64
+	Size           uint64
 }
 
 // Serialize converts the payload to bytes.
 func (p *ExtentAddPayload) Serialize() []byte {
-	buf := make([]byte, 32)
+	buf := make([]byte, 48)
 	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
 	binary.LittleEndian.PutUint64(buf[8:16], p.FileBlock)
 	binary.LittleEndian.PutUint64(buf[16:24], p.DiskBlock)
 	binary.LittleEndian.PutUint32(buf[24:28], p.Length)
 	binary.LittleEndian.PutUint32(buf[28:32], uint32(p.Flags))
+	binary.LittleEndian.PutUint64(buf[32:40], p.MetaGeneration)
+	binary.LittleEndian.PutUint64(buf[40:48], p.Size)
 	return buf
 }
 
@@ -593,11 +618,13 @@ func DeserializeExtentAdd(buf []byte) (*ExtentAddPayload, error) {
 		return nil, ErrTxnTooSmall
 	}
 	return &ExtentAddPayload{
-		InodeNum:  binary.LittleEndian.Uint64(buf[0:8]),
-		FileBlock: binary.LittleEndian.Uint64(buf[8:16]),
-		DiskBlock: binary.LittleEndian.Uint64(buf[16:24]),
-		Length:    binary.LittleEndian.Uint32(buf[24:28]),
-		Flags:     ExtentFlags(binary.LittleEndian.Uint32(buf[28:32])),
+		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
+		FileBlock:      binary.LittleEndian.Uint64(buf[8:16]),
+		DiskBlock:      binary.LittleEndian.Uint64(buf[16:24]),
+		Length:         binary.LittleEndian.Uint32(buf[24:28]),
+		Flags:          ExtentFlags(binary.LittleEndian.Uint32(buf[28:32])),
+		MetaGeneration: trailingUint64(buf, 32),
+		Size:           trailingUint64(buf, 40),
 	}, nil
 }
 
@@ -628,6 +655,35 @@ func DeserializeExtentRemove(buf []byte) (*ExtentRemovePayload, error) {
 		InodeNum:  binary.LittleEndian.Uint64(buf[0:8]),
 		FileBlock: binary.LittleEndian.Uint64(buf[8:16]),
 		Length:    binary.LittleEndian.Uint32(buf[16:20]),
+	}, nil
+}
+
+// ExtentFreePayload is logged when a truncate or unlink frees an inode's blocks past Size, with the inode's
+// MetaGeneration. Records from builds before this one also list the extents; replay ignores them.
+type ExtentFreePayload struct {
+	InodeNum       uint64
+	MetaGeneration uint64
+	Size           uint64
+}
+
+// Serialize converts the payload to bytes.
+func (p *ExtentFreePayload) Serialize() []byte {
+	buf := make([]byte, 32)
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.MetaGeneration)
+	binary.LittleEndian.PutUint64(buf[16:24], p.Size)
+	return buf
+}
+
+// DeserializeExtentFree parses an ExtentFreePayload from bytes.
+func DeserializeExtentFree(buf []byte) (*ExtentFreePayload, error) {
+	if len(buf) < 32 {
+		return nil, ErrTxnTooSmall
+	}
+	return &ExtentFreePayload{
+		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
+		MetaGeneration: binary.LittleEndian.Uint64(buf[8:16]),
+		Size:           binary.LittleEndian.Uint64(buf[16:24]),
 	}, nil
 }
 
@@ -771,6 +827,11 @@ func (txn *Transaction) LogExtentAdd(payload *ExtentAddPayload) error {
 // LogExtentRemove adds an extent removal to the transaction.
 func (txn *Transaction) LogExtentRemove(payload *ExtentRemovePayload) error {
 	return txn.addEntry(TxnOpExtentRemove, payload.Serialize())
+}
+
+// LogExtentFree adds an inode's freed extents to the transaction.
+func (txn *Transaction) LogExtentFree(payload *ExtentFreePayload) error {
+	return txn.addEntry(TxnOpExtentFree, payload.Serialize())
 }
 
 // LogSnapshotCreate adds a snapshot creation to the transaction.

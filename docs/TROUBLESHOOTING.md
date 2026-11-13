@@ -306,6 +306,24 @@ There is no profiling endpoint.
 
 ## Cluster Issues
 
+### Mount Fails: "Failed to start cache broadcast"
+
+**Symptom**: The mount exits at startup with `Failed to start cache broadcast: ...`.
+
+**Cause**: With `-broadcast` on (the default), the node must bind UDP `-mcast-port` (31337) and `-unicast-port` (31338). Another process holds one of them, the two flags are set to the same port, or `-broadcast-iface` names a missing interface.
+
+**Solutions**:
+```bash
+# Find what holds the ports
+ss -ulpn | grep -E ':3133[78]'
+
+# Use other ports (every node must use the same -mcast-port)
+./goclusterfs-mount ... -mcast-port 41337 -unicast-port 41338
+
+# Or run without broadcast; peers then see changes after -cache-ttl
+./goclusterfs-mount ... -broadcast=false
+```
+
 ### Nodes Not Seeing Updates
 
 **Symptom**: File changes on one node not visible on others.
@@ -318,14 +336,14 @@ There is no profiling endpoint.
 ```bash
 # Verify multicast working
 # On receiver node:
-tcpdump -i eth0 udp port 31337
+tcpdump -i eth0 udp port 31337 or udp port 31338
 
 # On sender node:
 # Modify a file and watch for packets
 
 # If no packets, check:
 # 1. Firewall rules
-iptables -L -n | grep 31337
+iptables -L -n | grep -E '3133[78]'
 
 # 2. Multicast routing
 ip maddr show
@@ -468,12 +486,13 @@ If a node mounts the device while `-repair` runs, repair stops before its next w
 
 ### What `-repair` Changes
 
-- It rebuilds block refcounts from the extents of every inode, snapshot and clone, including extent trees. It skips this when it could not read an inode or extent tree, because counts that miss an owner let the runtime free a block another file still uses.
+- It rebuilds block refcounts from the extents of every inode, snapshot and clone, including extent trees. It skips this when it could not read an inode or extent tree, or when `-skip-phase` skipped the bitmap or inode phase, because counts that miss an owner let the runtime free a block another file still uses.
 - It marks the blocks that older versions shared without counting as counted, so this version can snapshot, clone and free those files.
 - It rewrites refcount sectors that fail their checksum from the same references.
 - It fixes the superblock checksum, but only when every other superblock field passed its checks.
+- It frees leaked blocks: blocks the bitmap marks allocated that no inode, extent tree or older small-file container maps. Writes and mkdirs that fail, interrupted truncates and unlinks, frees that gave up waiting for a lock, and small-file migrations leave them behind. It sets their refcounts to 0 first. It keeps all of them, refcounts included, when it could not read an inode or extent tree, when `-skip-phase` skipped the bitmap, inode or refcount phase, or when a node's journal still needs replay (even with `-force`). It also keeps those in bitmap sectors with a bad checksum.
 
-It never frees blocks, deletes inodes, or edits directories. Problems not marked `[FIXABLE]` stay as they are.
+It never deletes inodes or edits directories. Problems not marked `[FIXABLE]` stay as they are.
 
 ### Exit Codes
 

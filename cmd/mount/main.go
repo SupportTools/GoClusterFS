@@ -23,6 +23,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
+	"github.com/supporttools/GoClusterFS/internal/fileops"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
@@ -35,6 +36,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 	"github.com/supporttools/GoClusterFS/internal/version"
+	"github.com/supporttools/GoClusterFS/internal/webui"
 )
 
 type fsStatusProvider struct {
@@ -91,7 +93,8 @@ func main() {
 		// Network broadcast configuration
 		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
 		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group address")
-		multicastPort    = flag.Int("mcast-port", 31337, "Multicast/unicast port")
+		multicastPort    = flag.Int("mcast-port", 31337, "UDP port for multicast messages")
+		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
 
@@ -107,11 +110,13 @@ func main() {
 		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
 
 		// API server configuration
-		apiEnabled = flag.Bool("api", true, "Enable HTTP API server for management")
-		apiAddr    = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs -api-token")
-		apiToken   = flag.String("api-token", "", "Bearer token for API authentication (empty=disabled, loopback only)")
-		apiCORS    = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
-		apiRate    = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
+		apiEnabled   = flag.Bool("api", true, "Enable HTTP API server for management")
+		apiAddr      = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs a token")
+		apiTokenFile = flag.String("api-token-file", "", "File (mode 0600) holding the API bearer token; a token also turns on API writes. Or set "+apiTokenEnv)
+		apiToken     = flag.String("api-token", "", "API bearer token; visible to all local users in ps, prefer -api-token-file")
+		apiCORS      = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
+		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
+		dashboard    = flag.Bool("dashboard", true, "Serve the web dashboard on the API server under /ui/")
 	)
 	flag.Parse()
 
@@ -126,7 +131,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	apiCfg := apiConfig(*apiAddr, *apiToken, *apiCORS, *apiRate)
+	token, tokenSrc, err := loadAPIToken(*apiTokenFile, *apiToken)
+	if err != nil {
+		log.Fatalf("Invalid API settings: %v", err)
+	}
+	if tokenSrc == tokenFromFlag {
+		log.Printf("WARNING: -api-token is visible to every local user in ps and /proc/<pid>/cmdline, and it unlocks API writes. Use -api-token-file or %s instead.", apiTokenEnv)
+	}
+	apiCfg := apiConfig(*apiAddr, token, *apiCORS, *apiRate)
+	if *dashboard {
+		apiCfg.Dashboard = webui.Handler()
+	}
 	if *apiEnabled {
 		if err := apiCfg.Validate(); err != nil {
 			log.Fatalf("Invalid API settings: %v", err)
@@ -136,11 +151,31 @@ func main() {
 			if errors.Is(err, api.ErrWildcardCORSWithoutToken) {
 				hint = "list the allowed origins in -api-cors"
 			}
-			log.Fatalf("Refusing to start the API: %v. Set -api-token, %s, or pass -api=false", err, hint)
+			log.Fatalf("Refusing to start the API: %v. Set -api-token-file (or %s), %s, or pass -api=false", err, apiTokenEnv, hint)
 		}
 	}
 	if *broadcastEnabled && *broadcastSecret == "" {
-		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to port %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort)
+		log.Printf("WARNING: -broadcast is on without -broadcast-secret. Broadcast messages are not authenticated: any host that can send UDP to ports %d and %d can make this node drop its caches and add itself as a peer. Set the same -broadcast-secret on every node, or pass -broadcast=false.", *multicastPort, *unicastPort)
+	}
+
+	networkCfg := broadcast.Config{
+		Enabled:              *broadcastEnabled,
+		MulticastGroup:       *multicastGroup,
+		MulticastPort:        *multicastPort,
+		UnicastPort:          *unicastPort,
+		MulticastTTL:         1, // Same subnet
+		MaxMulticastFailures: 3,
+		HeartbeatInterval:    30 * time.Second,
+		Secret:               *broadcastSecret,
+		Interface:            *broadcastIface,
+	}
+	broadcastFailed := func(err error) {
+		log.Fatalf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
+	}
+	// Bind and release the ports before registering or formatting, so a taken
+	// port fails the mount before it changes anything on disk.
+	if err := broadcast.CheckPorts(networkCfg); err != nil {
+		broadcastFailed(err)
 	}
 
 	// Check mount point exists
@@ -205,10 +240,10 @@ func main() {
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
-	nodeReg.SetOwnerDeadHandler(func(owner [16]byte) func() { return adoptLocks(lockMgr, owner) })
+	nodeReg.SetOwnerDeadHandler(func(owner [16]byte, slot int) func() { return adoptLocks(lockMgr, owner, slot) })
 	releasePrevious := func() {}
 	if owner, ok := nodeReg.DeadPreviousOwner(); ok {
-		releasePrevious = adoptLocks(lockMgr, owner)
+		releasePrevious = adoptLocks(lockMgr, owner, slotIdx)
 	}
 
 	// Create managers with distributed locking enabled
@@ -219,6 +254,11 @@ func main() {
 	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
+
+	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write, and replay frees shared blocks through them.
+	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
+	extentMgr.SetRefcounts(refcountReg)
+	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
 
 	// Check for and recover any dirty journal from a previous crash
 	// This must happen BEFORE we create our own journal to avoid data loss
@@ -278,17 +318,7 @@ func main() {
 	cacheCfg := cache.DefaultConfig()
 	cacheCfg.StrictMode = *cacheStrict
 	cacheCfg.InodeTTL = *cacheTTL
-	cacheCfg.Network = broadcast.Config{
-		Enabled:              *broadcastEnabled,
-		MulticastGroup:       *multicastGroup,
-		MulticastPort:        *multicastPort,
-		UnicastPort:          *multicastPort,
-		MulticastTTL:         1, // Same subnet
-		MaxMulticastFailures: 3,
-		HeartbeatInterval:    30 * time.Second,
-		Secret:               *broadcastSecret,
-		Interface:            *broadcastIface,
-	}
+	cacheCfg.Network = networkCfg
 
 	// Create cache manager for read optimization
 	cacheMgr, err := cache.NewManager(cacheCfg, inodeTbl, lockMgr)
@@ -310,12 +340,13 @@ func main() {
 
 	// Start network broadcast for cross-node cache invalidation
 	if *broadcastEnabled {
+		// Without broadcast, peers see this node's changes only after -cache-ttl,
+		// so a mount that asked for broadcast does not continue without it.
 		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
-			log.Printf("Warning: Failed to start cache broadcast: %v (continuing without broadcast)", err)
-		} else if cacheMgr.BroadcastEnabled() {
-			log.Printf("Broadcast: enabled on %s:%d (secret=%v)",
-				*multicastGroup, *multicastPort, *broadcastSecret != "")
+			broadcastFailed(err)
 		}
+		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
+			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
 	} else {
 		log.Println("Broadcast: disabled (using storage-only cache validation)")
 	}
@@ -349,10 +380,6 @@ func main() {
 	} else {
 		log.Println("SFB: disabled (all files use full 1MB blocks)")
 	}
-
-	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write.
-	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
-	log.Printf("Refcount: region at %dMB (%d blocks)", refcountOffset/(1024*1024), totalBlocks)
 
 	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)
@@ -436,6 +463,8 @@ func main() {
 			})
 			apiServer.SetStatsProvider(sampler)
 			apiServer.RegisterHealthChecker(api.DefaultHealthChecker())
+			apiServer.SetFileService(fileops.New(*mountPoint, gfs.SnapshotRegistry()))
+			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start API server: %v", err)
 				apiServer.Stop()
@@ -445,6 +474,14 @@ func main() {
 			} else {
 				log.Printf("API server listening on %s (auth=%v, cors=%v)",
 					apiServer.Addr(), apiCfg.AuthToken != "", len(apiCfg.CORSOrigins) > 0)
+				if !apiServer.WritesEnabled() {
+					log.Printf("API: snapshot, clone and admin endpoints are off; set -api-token-file or %s to turn them on", apiTokenEnv)
+				}
+				if apiCfg.Dashboard != nil && webui.Built() {
+					log.Printf("API: dashboard at /ui/")
+				} else if apiCfg.Dashboard != nil {
+					log.Printf("API: this binary has no dashboard build; /ui/ explains how to add it")
+				}
 			}
 		}
 	} else {
@@ -548,10 +585,11 @@ func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Jou
 	return src
 }
 
-// adoptLocks takes over a dead node's exclusive locks before its journal is
-// replayed and returns the function that frees them after the replay.
-func adoptLocks(locks *lock.Manager, owner [16]byte) func() {
-	adopted, err := locks.AdoptOwner(owner)
+// adoptLocks takes over a dead node's exclusive locks and clears its read holds
+// before its journal is replayed, and returns the function that frees the
+// exclusive locks after the replay.
+func adoptLocks(locks *lock.Manager, owner [16]byte, slot int) func() {
+	adopted, err := locks.AdoptOwner(owner, slot)
 	if err != nil {
 		log.Printf("Warning: Failed to take over the locks of dead node %x: %v", owner[:8], err)
 	}

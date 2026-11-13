@@ -69,6 +69,7 @@ func (c *Checker) checkBitmap() error {
 		// the checksum would make it trust bits that may be wrong.
 		if !sectorChecksumValid(sectorBuf) {
 			checksumErrors++
+			c.badBitmap[sectorIdx] = true
 			c.addProblem(PhaseBitmap, Error, fmt.Sprintf("sector %d", sectorIdx),
 				"checksum mismatch: the runtime cannot allocate or free blocks in this sector", false)
 		}

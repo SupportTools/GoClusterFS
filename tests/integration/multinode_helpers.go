@@ -56,9 +56,11 @@ func NewMultiNodeCluster(t *testing.T, nodeCount, sizeMB int) *MultiNodeCluster 
 		sizeMB:    sizeMB,
 	}
 
-	// Create mount instances (but don't mount yet)
+	// Create mount instances (but don't mount yet), sharing one multicast port
+	ports := freeUDPPorts(t, nodeCount+1)
 	for i := 0; i < nodeCount; i++ {
 		cluster.Nodes[i] = NewMountedFSWithImage(t, imagePath)
+		cluster.Nodes[i].portArgs = portArgs(t, ports[0], ports[i+1])
 	}
 
 	// Register cleanup
@@ -120,9 +122,6 @@ func (c *MultiNodeCluster) KillNode(idx int) error {
 	if err := c.Nodes[idx].Kill(); err != nil {
 		return err
 	}
-
-	// Wait briefly for process to die and unmount to propagate
-	time.Sleep(500 * time.Millisecond)
 
 	// Force unmount to clean up mount point
 	c.Nodes[idx].Unmount()
