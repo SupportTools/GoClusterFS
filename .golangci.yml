@@ -26,9 +26,6 @@ linters:
       - path: ^internal/cache/
         linters: [errcheck]
 
-      - path: ^internal/goclusterfs/.*_test\.go$
-        linters: [errcheck]
-
       - path: ^cmd/gfsctl/
         linters: [errcheck]
 

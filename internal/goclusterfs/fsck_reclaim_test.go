@@ -469,7 +469,7 @@ func crashWhileFreeing(t *testing.T, fsys *FS, op func(), stuck func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	fsys.dev.Close()
+	_ = fsys.dev.Close()
 }
 
 // replayAndRepair remounts after the crash, replays the journal, and checks that
@@ -540,7 +540,7 @@ func TestFsckRepairReclaimsInterruptedTruncate(t *testing.T) {
 	cut := []uint64{physicalBlock(t, fsys, victim.inodeNum, 1), physicalBlock(t, fsys, victim.inodeNum, 2)}
 	before := allocatedBlocks(t, fsys)
 
-	crashWhileFreeing(t, fsys, func() { tryTruncate(victim, BlockSize) }, func() bool {
+	crashWhileFreeing(t, fsys, func() { _ = tryTruncate(victim, BlockSize) }, func() bool {
 		ino, err := fsys.inodeTbl.Read(victim.inodeNum)
 		return err == nil && ino.Size == BlockSize
 	})
@@ -598,7 +598,7 @@ func TestFsckRepairReclaimsInterruptedSubdirectoryUnlink(t *testing.T) {
 	before := allocatedBlocks(t, fsys)
 
 	subDir := &Dir{fs: fsys, inodeNum: sub.inodeNum}
-	crashWhileFreeing(t, fsys, func() { subDir.Unlink(ctx, "victim.bin") }, func() bool {
+	crashWhileFreeing(t, fsys, func() { _ = subDir.Unlink(ctx, "victim.bin") }, func() bool {
 		ino, err := fsys.inodeTbl.Read(sub.inodeNum)
 		if err != nil {
 			return false

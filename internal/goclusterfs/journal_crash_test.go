@@ -91,7 +91,7 @@ func expectCleanFsck(t *testing.T, fsys *FS) {
 func TestCreateReplaysAfterCheckpointAndCrash(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	crashed := crashAfterCommit(t, fsys, "create")
-	go fsys.Create(context.Background(), "crashed.txt", 0, 0o644, &fuse.EntryOut{})
+	go func() { _, _, _, _ = fsys.Create(context.Background(), "crashed.txt", 0, 0o644, &fuse.EntryOut{}) }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)
@@ -112,7 +112,7 @@ func TestTruncateReplayKeepsMappedBlocks(t *testing.T) {
 	}
 
 	crashed := crashAfterCommit(t, fsys, "setattr")
-	go tryTruncate(victim, BlockSize)
+	go func() { _ = tryTruncate(victim, BlockSize) }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)
@@ -148,7 +148,7 @@ func TestTruncateReplayKeepsSnapshotBlocks(t *testing.T) {
 	}
 
 	crashed := crashAfterCommit(t, fsys, "setattr")
-	go tryTruncate(victim, BlockSize)
+	go func() { _ = tryTruncate(victim, BlockSize) }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)
@@ -169,7 +169,7 @@ func TestUnlinkReplayFreesFileAndBlocks(t *testing.T) {
 	blocks := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
 
 	crashed := crashAfterCommit(t, fsys, "unlink")
-	go sub.Unlink(ctx, "doomed.bin")
+	go func() { _ = sub.Unlink(ctx, "doomed.bin") }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)
