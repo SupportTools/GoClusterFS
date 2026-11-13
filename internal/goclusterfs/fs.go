@@ -904,19 +904,13 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		}
 	}
 
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
-		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", name, err)
-		return nil, syscall.EIO
-	}
+	// Claim the slot before naming it: a crash in between leaks an unnamed inode instead of leaving a name another
+	// node's create can take over.
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v - rolling back", name, inodeNum, err)
-		if removeErr := f.dirMgr.Remove(ctx, dirIno, name); removeErr != nil {
-			log.Printf("[ERROR] Create %q: rollback Remove failed: %v", name, removeErr)
-		}
+		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
 		return nil, claimErrno(err)
 	}
-
 	now := time.Now().UnixNano()
 	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
 	childIno.UID = uid
@@ -928,7 +922,15 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
 		log.Printf("[DEBUG] Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
 		f.inodeTbl.Free(ctx, childIno.InodeNum)
-		f.dirMgr.Remove(ctx, dirIno, name)
+		return nil, syscall.EIO
+	}
+	if afterCommit != nil {
+		afterCommit("create: inode claimed")
+	}
+
+	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
+		log.Printf("[DEBUG] Create %q: dirMgr.Add failed: %v", name, err)
+		f.inodeTbl.Free(ctx, childIno.InodeNum)
 		return nil, syscall.EIO
 	}
 	f.cacheInode(childIno)
@@ -975,19 +977,11 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		defer f.closeIntent(seq)
 	}
 
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
-		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", name, err)
-		return nil, syscall.EIO
-	}
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
-		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v - rolling back", name, inodeNum, err)
-		if removeErr := f.dirMgr.Remove(ctx, dirIno, name); removeErr != nil {
-			log.Printf("[ERROR] Mkdir %q: rollback Remove failed: %v", name, removeErr)
-		}
+		log.Printf("[DEBUG] Mkdir %q: ClaimSlot %d failed: %v", name, inodeNum, err)
 		return nil, claimErrno(err)
 	}
-
 	now := time.Now().UnixNano()
 	childIno.Mode = inode.S_IFDIR | uint16(mode&0777)
 	childIno.UID = uid
@@ -999,7 +993,6 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(parentNum)); err != nil {
 		log.Printf("[DEBUG] Mkdir %q: InitDirectory failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
-		f.dirMgr.Remove(ctx, dirIno, name)
 		return nil, syscall.EIO
 	}
 	err = injectedMkdirFailure()
@@ -1009,7 +1002,15 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err != nil {
 		log.Printf("[DEBUG] Mkdir %q: Write inode failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
-		f.dirMgr.Remove(ctx, dirIno, name)
+		return nil, syscall.EIO
+	}
+	if afterCommit != nil {
+		afterCommit("mkdir: inode claimed")
+	}
+
+	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
+		log.Printf("[DEBUG] Mkdir %q: dirMgr.Add failed: %v", name, err)
+		f.dropNewInode(ctx, childIno)
 		return nil, syscall.EIO
 	}
 	f.cacheInode(childIno)
@@ -3324,26 +3325,12 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 		return syscall.EIO
 	}
 
-	// Find free inode slot for clone (two-phase allocation)
-	cloneInodeNum, err := f.fs.inodeTbl.FindFreeSlot()
+	cloneIno, err := f.fs.claimInode(ctx)
 	if err != nil {
-		log.Printf("[clone] No free inode slots: %v", err)
-		return syscall.ENOSPC
-	}
-
-	// Add directory entry for clone
-	if err := f.fs.dirMgr.Add(ctx, rootIno, cloneName, uint64(cloneInodeNum), dir.DT_REG); err != nil {
-		log.Printf("[clone] Failed to add directory entry: %v", err)
-		return syscall.EIO
-	}
-
-	// Claim the inode slot
-	cloneIno, err := f.fs.inodeTbl.ClaimSlot(ctx, cloneInodeNum)
-	if err != nil {
-		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
-		log.Printf("[clone] Failed to claim inode slot: %v", err)
+		log.Printf("[clone] Failed to claim an inode slot: %v", err)
 		return claimErrno(err)
 	}
+	cloneInodeNum := cloneIno.InodeNum
 
 	now := time.Now().UnixNano()
 	cloneIno.Mode = srcIno.Mode
@@ -3356,10 +3343,14 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 	cloneIno.Ctime = now
 
 	if err := f.fs.shareInto(ctx, srcNum, cloneIno, stillValid); err != nil {
-		f.fs.dirMgr.Remove(ctx, rootIno, cloneName)
 		f.fs.discardInode(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to share blocks of inode %d: %v", srcNum, err)
 		return sharingErrno(err)
+	}
+	if err := f.fs.dirMgr.Add(ctx, rootIno, cloneName, uint64(cloneInodeNum), dir.DT_REG); err != nil {
+		f.fs.discardInode(ctx, cloneInodeNum)
+		log.Printf("[clone] Failed to add directory entry: %v", err)
+		return syscall.EIO
 	}
 
 	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, srcNum)
