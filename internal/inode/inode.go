@@ -434,6 +434,16 @@ func (t *Table) ClaimSlot(ctx context.Context, num uint32) (*Inode, error) {
 // ClaimSlotIf claims the slot if it is free and ok accepts the free inode, read under the slot's lock. Otherwise it
 // returns ErrInodeInUse.
 func (t *Table) ClaimSlotIf(ctx context.Context, num uint32, ok func(free *Inode) bool) (*Inode, error) {
+	return t.claimSlot(ctx, num, ok, nil)
+}
+
+// ClaimSlotAs claims a free slot and lets init fill in the new inode before its first write, so a crash cannot leave
+// the slot claimed without those fields.
+func (t *Table) ClaimSlotAs(ctx context.Context, num uint32, init func(*Inode)) (*Inode, error) {
+	return t.claimSlot(ctx, num, func(*Inode) bool { return true }, init)
+}
+
+func (t *Table) claimSlot(ctx context.Context, num uint32, ok func(free *Inode) bool, init func(*Inode)) (*Inode, error) {
 	if uint64(num) >= t.totalInodes {
 		return nil, ErrInodeOutOfRange
 	}
@@ -475,6 +485,9 @@ func (t *Table) ClaimSlotIf(ctx context.Context, num uint32, ok func(free *Inode
 	}
 
 	newInode := t.newInodeInSlot(num, existing)
+	if init != nil {
+		init(newInode)
+	}
 	if err := t.writeInodeUnlocked(newInode); err != nil {
 		return nil, fmt.Errorf("failed to write new inode: %w", err)
 	}

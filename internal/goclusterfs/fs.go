@@ -3254,13 +3254,13 @@ func sharingErrno(err error) syscall.Errno {
 
 // claimInode allocates an inode slot, retrying when another node takes the
 // free slot first.
-func (f *FS) claimInode(ctx context.Context) (*inode.Inode, error) {
+func (f *FS) claimInode(ctx context.Context, init func(*inode.Inode)) (*inode.Inode, error) {
 	for attempt := 0; ; attempt++ {
 		num, err := f.inodeTbl.FindFreeSlot()
 		if err != nil {
 			return nil, err
 		}
-		ino, err := f.inodeTbl.ClaimSlot(ctx, num)
+		ino, err := f.inodeTbl.ClaimSlotAs(ctx, num, init)
 		if !errors.Is(err, inode.ErrInodeInUse) || attempt == maxConflictRetries-1 {
 			return ino, err
 		}
@@ -3323,18 +3323,14 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	data, err := f.fs.claimInode(ctx)
+	data, err := f.fs.claimInode(ctx, func(ino *inode.Inode) {
+		ino.Mode, ino.UID, ino.GID = src.Mode, src.UID, src.GID
+		ino.Mtime, ino.Ctime = src.Mtime, src.Ctime
+		ino.Flags |= inode.FlagSnapshotData
+	})
 	if err != nil {
 		log.Printf("[snapshot] No inode for the data of a snapshot of inode %d: %v", f.inodeNum, err)
 		return claimErrno(err)
-	}
-	data.Mode, data.UID, data.GID = src.Mode, src.UID, src.GID
-	data.Mtime, data.Ctime = src.Mtime, src.Ctime
-	data.Flags |= inode.FlagSnapshotData
-	if err := f.fs.inodeTbl.Write(ctx, data); err != nil {
-		f.fs.inodeTbl.Free(ctx, data.InodeNum)
-		log.Printf("[snapshot] Failed to write data inode %d: %v", data.InodeNum, err)
-		return syscall.EIO
 	}
 
 	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
@@ -3445,22 +3441,18 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 		return syscall.EIO
 	}
 
-	cloneIno, err := f.fs.claimInode(ctx)
+	now := time.Now().UnixNano()
+	cloneIno, err := f.fs.claimInode(ctx, func(ino *inode.Inode) {
+		ino.Mode, ino.UID, ino.GID = srcIno.Mode, srcIno.UID, srcIno.GID
+		ino.Atime, ino.Mtime, ino.Ctime = now, now, now
+	})
 	if err != nil {
 		log.Printf("[clone] Failed to claim an inode slot: %v", err)
 		return claimErrno(err)
 	}
 	cloneInodeNum := cloneIno.InodeNum
-
-	now := time.Now().UnixNano()
-	cloneIno.Mode = srcIno.Mode
-	cloneIno.UID = srcIno.UID
-	cloneIno.GID = srcIno.GID
 	cloneIno.LinkCount = 1
 	cloneIno.Flags |= inode.FlagHasSnapshot
-	cloneIno.Atime = now
-	cloneIno.Mtime = now
-	cloneIno.Ctime = now
 
 	if err := f.fs.shareInto(ctx, srcNum, cloneIno, stillValid); err != nil {
 		f.fs.discardInode(ctx, cloneInodeNum)

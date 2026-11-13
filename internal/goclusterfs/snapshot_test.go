@@ -376,13 +376,11 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 	blocks := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
 
 	// Crash after the blocks were shared, before the snapshot became active.
-	data, err := fsys.claimInode(ctx)
+	data, err := fsys.claimInode(ctx, func(ino *inode.Inode) {
+		ino.Mode = inode.S_IFREG | 0o644
+		ino.Flags |= inode.FlagSnapshotData
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	data.Mode = inode.S_IFREG | 0o644
-	data.Flags |= inode.FlagSnapshotData
-	if err := fsys.inodeTbl.Write(ctx, data); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fsys.snapshotReg.Create(ctx, "half-created", f.inodeNum, 0, data.InodeNum, 2, uint64(len(content)), snapshot.FlagReadOnly); err != nil {
