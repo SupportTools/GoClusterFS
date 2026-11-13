@@ -158,7 +158,6 @@ func TestUnlinkCrashAfterBlockFreeKeepsReusedBlock(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	sub, f := newSubdirFile(t, fsys, pattern(3, 2*BlockSize))
 	freed := []uint64{physicalBlock(t, fsys, f.inodeNum, 0), physicalBlock(t, fsys, f.inodeNum, 1)}
-	// Created first, so it cannot take the unlinked inode's slot: replaying InodeDelete would free it.
 	other := createFile(t, fsys, "other.bin")
 
 	crashed := crashAfterCommit(t, fsys, "unlink: blocks freed")

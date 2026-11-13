@@ -185,6 +185,12 @@ func expectAllocated(t *testing.T, fsys *FS, blocks []uint64, want bool) {
 // newSubdir adds an empty directory to the root as Mkdir does.
 func newSubdir(t *testing.T, fsys *FS, name string) *Dir {
 	t.Helper()
+	return newDirIn(t, fsys, inode.InodeRoot, name)
+}
+
+// newDirIn adds an empty directory to directory parent as Mkdir does.
+func newDirIn(t *testing.T, fsys *FS, parent uint32, name string) *Dir {
+	t.Helper()
 	ctx := context.Background()
 	num, err := fsys.inodeTbl.FindFreeSlot()
 	if err != nil {
@@ -194,21 +200,21 @@ func newSubdir(t *testing.T, fsys *FS, name string) *Dir {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fsys.dirMgr.InitDirectory(ctx, ino, uint64(inode.InodeRoot)); err != nil {
+	if err := fsys.dirMgr.InitDirectory(ctx, ino, uint64(parent)); err != nil {
 		t.Fatal(err)
 	}
 	ino.Mode = inode.S_IFDIR | 0o755
 	if err := fsys.inodeTbl.Write(ctx, ino); err != nil {
 		t.Fatal(err)
 	}
-	root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+	parentIno, err := fsys.inodeTbl.Read(parent)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fsys.dirMgr.Add(ctx, root, name, uint64(num), dir.DT_DIR); err != nil {
+	if err := fsys.dirMgr.Add(ctx, parentIno, name, uint64(num), dir.DT_DIR); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fsys.updateInode(ctx, inode.InodeRoot, func(r *inode.Inode) error { r.LinkCount++; return nil }); err != nil {
+	if _, err := fsys.updateInode(ctx, parent, func(r *inode.Inode) error { r.LinkCount++; return nil }); err != nil {
 		t.Fatal(err)
 	}
 	return &Dir{fs: fsys, inodeNum: num}
