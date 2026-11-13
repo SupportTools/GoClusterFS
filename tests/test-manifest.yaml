@@ -764,6 +764,13 @@ scenarios:
     environments:
       go: internal/journal/journal_test.go::TestBatchCommitReturnsSyncError
 
+  - id: journal-stop-failed-flush
+    name: Stop reports a failed final flush
+    description: Journal Stop returns the error of a final batch flush that failed, the waiting commit gets it too, and a second Stop does nothing
+    priority: go_only
+    environments:
+      go: internal/journal/journal_test.go::TestStopReportsFailedBatchFlush
+
   - id: checkpoint-keeps-incomplete-intents
     name: Checkpoints never pass an intent that has not completed
     description: A transaction committed but not yet applied stays in the journal through a checkpoint and an unmount, and the next mount replays it; completed intents are checkpointed away
