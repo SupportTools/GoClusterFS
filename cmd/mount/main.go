@@ -197,7 +197,7 @@ func main() {
 
 	dev, err := storage.Open(*devicePath)
 	if err != nil {
-		failf("Cannot open %s: %v; %s", *devicePath, err, cli.OpenHint(err))
+		failf("Failed to open device: %v; %s", err, cli.OpenHint(err))
 	}
 
 	// Get device size (returns int64, no error)

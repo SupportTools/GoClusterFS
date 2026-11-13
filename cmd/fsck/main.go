@@ -137,7 +137,7 @@ func main() {
 	// Open device
 	dev, err := storage.Open(devicePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Cannot open %s: %v; %s\n", devicePath, err, cli.OpenHint(err))
+		fmt.Fprintf(os.Stderr, "Error: Failed to open device: %v; %s\n", err, cli.OpenHint(err))
 		os.Exit(fsck.ExitOperational)
 	}
 	defer dev.Close()
