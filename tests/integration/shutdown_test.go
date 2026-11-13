@@ -58,12 +58,12 @@ func TestHealthAndSignalShutdown(t *testing.T) {
 	exited := make(chan error, 1)
 	go func() { exited <- m.MountCmd.Wait() }()
 	if _, ok := waitFor(15*time.Second, func() bool { return strings.Contains(m.log.String(), "Close the files and shells that use it") }); !ok {
-		held.Close()
+		mustClose(t, held)
 		t.Fatalf("SIGTERM with an open file did not report a busy unmount:\n%s", m.log.String())
 	}
 	select {
 	case err := <-exited:
-		held.Close()
+		mustClose(t, held)
 		t.Fatalf("mount exited (%v) while a file under it was open", err)
 	case <-time.After(time.Second):
 	}
@@ -74,7 +74,7 @@ func TestHealthAndSignalShutdown(t *testing.T) {
 		t.Errorf("GET /health after SIGTERM = %d, want a refused connection", code)
 	}
 
-	held.Close()
+	mustClose(t, held)
 	if err := m.MountCmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}

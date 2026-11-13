@@ -40,11 +40,11 @@ func NewMultiNodeCluster(t *testing.T, nodeCount, sizeMB int) *MultiNodeCluster 
 		t.Fatalf("Failed to create temp image: %v", err)
 	}
 	imagePath := imgFile.Name()
-	imgFile.Close()
+	mustClose(t, imgFile)
 
 	// Allocate the image file
 	if err := allocateImage(imagePath, sizeMB); err != nil {
-		os.Remove(imagePath)
+		_ = os.Remove(imagePath)
 		t.Fatalf("Failed to allocate image: %v", err)
 	}
 	t.Logf("Created shared %dMB image at %s for %d nodes", sizeMB, imagePath, nodeCount)
@@ -124,7 +124,7 @@ func (c *MultiNodeCluster) KillNode(idx int) error {
 	}
 
 	// Force unmount to clean up mount point
-	c.Nodes[idx].Unmount()
+	_ = c.Nodes[idx].Unmount()
 
 	return nil
 }

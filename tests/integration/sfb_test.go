@@ -246,14 +246,14 @@ func TestSFBMigrationAt64KB(t *testing.T) {
 
 	// Seek to end and write
 	if _, err := f.Seek(0, 2); err != nil { // Seek to end
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Seek failed: %v", err)
 	}
 	if _, err := f.Write(appendData); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Write (append) failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 
 	// Verify file size increased
 	info, err := mfs.Stat("migration_test")

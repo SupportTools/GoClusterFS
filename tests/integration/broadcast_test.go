@@ -257,7 +257,7 @@ func TestBroadcastInvalidatesPeerCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer mustClose(t, f)
 	buf := make([]byte, 128)
 	if n, _ := f.ReadAt(buf, 0); !bytes.Equal(buf[:n], first) {
 		t.Fatalf("node 1 read %q, want %q", buf[:n], first)
@@ -302,14 +302,14 @@ func TestMountFailsOnTakenBroadcastPortBeforeFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer held.Close()
+	defer mustClose(t, held)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, binary, "-device", image, "-mount", mountPoint, "-format",
 		"-mcast-port", strconv.Itoa(ports[0]), "-unicast-port", strconv.Itoa(ports[1])).CombinedOutput()
 	if ctx.Err() != nil {
-		exec.Command("fusermount", "-u", mountPoint).Run()
+		_ = exec.Command("fusermount", "-u", mountPoint).Run()
 		t.Fatal("mount kept running with its unicast port taken")
 	}
 	if err == nil {
@@ -323,7 +323,7 @@ func TestMountFailsOnTakenBroadcastPortBeforeFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer mustClose(t, f)
 	head := make([]byte, 4096)
 	if _, err := io.ReadFull(f, head); err != nil {
 		t.Fatal(err)

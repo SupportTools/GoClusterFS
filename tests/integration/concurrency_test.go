@@ -25,7 +25,7 @@ func TestConcurrentPwritesToFallocatedBlock(t *testing.T) {
 			t.Fatalf("OpenFile failed: %v", err)
 		}
 		if err := syscall.Fallocate(int(f.Fd()), 0, 0, 1<<20); err != nil {
-			f.Close()
+			mustClose(t, f)
 			t.Fatalf("Fallocate failed: %v", err)
 		}
 
@@ -59,7 +59,7 @@ func TestConcurrentPwritesToFallocatedBlock(t *testing.T) {
 				t.Fatalf("round %d: writer %d's data was lost", round, w)
 			}
 		}
-		f.Close()
+		mustClose(t, f)
 		if err := os.Remove(mfs.Path(name)); err != nil {
 			t.Fatalf("Remove failed: %v", err)
 		}

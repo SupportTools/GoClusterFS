@@ -1890,7 +1890,7 @@ func TestMultiNodeSubBlockWritesToOneBlock(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			defer f.Close()
+			defer mustClose(t, f)
 			for s := halfStart; s < halfStart+halves; s++ {
 				if _, err := f.WriteAt(fill(byte('a'+idx), sector/2), int64(s*sector+idx*sector/2)); err != nil {
 					return err
@@ -1961,7 +1961,7 @@ func TestMultiNodeWritesToOneFallocatedBlock(t *testing.T) {
 			t.Fatalf("OpenFile %s: %v", name(i), err)
 		}
 		err = syscall.Fallocate(int(f.Fd()), 0, 0, 1024*1024)
-		f.Close()
+		mustClose(t, f)
 		if err != nil {
 			t.Fatalf("Fallocate %s: %v", name(i), err)
 		}

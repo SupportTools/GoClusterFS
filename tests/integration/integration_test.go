@@ -705,10 +705,10 @@ func TestAppendFile(t *testing.T) {
 	// Append data
 	appended := []byte(" World!")
 	if _, err := f.Write(appended); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Append write failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 
 	// Read back
 	readBack, err := mfs.ReadFile("append.txt")
@@ -1039,7 +1039,7 @@ func TestSparseFileBlocks(t *testing.T) {
 	// Seek to 2MB offset (past first 2 blocks)
 	sparseOffset := int64(2 * 1024 * 1024)
 	if _, err := f.Seek(sparseOffset, 0); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Seek failed: %v", err)
 	}
 
@@ -1049,10 +1049,10 @@ func TestSparseFileBlocks(t *testing.T) {
 		smallData[i] = byte(i % 256)
 	}
 	if _, err := f.Write(smallData); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Write failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 
 	// Get file stats
 	var stat syscall.Stat_t
@@ -1106,13 +1106,13 @@ func TestFallocateUnwrittenBlocks(t *testing.T) {
 	allocSize := int64(3 * 1024 * 1024)
 	err = syscall.Fallocate(int(f.Fd()), 0, 0, allocSize)
 	if err != nil {
-		f.Close()
+		mustClose(t, f)
 		if err == syscall.ENOTSUP || err == syscall.EOPNOTSUPP {
 			t.Skip("fallocate not supported")
 		}
 		t.Fatalf("Fallocate failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 
 	// Get file stats after fallocate
 	var stat syscall.Stat_t
@@ -1144,10 +1144,10 @@ func TestFallocateUnwrittenBlocks(t *testing.T) {
 		writeData[i] = byte(i % 256)
 	}
 	if _, err := f.Write(writeData); err != nil {
-		f.Close()
+		mustClose(t, f)
 		t.Fatalf("Write failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 
 	// Get stats after write
 	if err := syscall.Stat(mfs.Path("fallocated.bin"), &stat); err != nil {

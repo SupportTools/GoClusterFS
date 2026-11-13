@@ -850,7 +850,7 @@ func TestSnapshotsDuringWritesAcrossNodes(t *testing.T) {
 			writerDone <- err
 			return
 		}
-		defer f.Close()
+		defer mustClose(t, f)
 		for round := 1; ; round++ {
 			for off := 0; off < size; off += chunkSize {
 				select {
