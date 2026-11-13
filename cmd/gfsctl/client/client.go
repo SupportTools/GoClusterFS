@@ -113,7 +113,7 @@ func (c *Client) send(ctx context.Context, method, path string) ([]byte, int, er
 		logging.Debugf("%s %s failed after %v: %v", method, url, time.Since(start).Round(time.Millisecond), err)
 		return nil, 0, fmt.Errorf("request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize+1))
 	logging.Debugf("%s %s: %s, %d bytes in %v", method, url, resp.Status, len(body), time.Since(start).Round(time.Millisecond))
