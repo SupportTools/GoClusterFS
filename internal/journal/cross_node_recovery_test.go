@@ -618,26 +618,24 @@ func TestReplayJournalNeverInitializedAndDamaged(t *testing.T) {
 	}
 }
 
-// newDataInode creates inode num mapping disk block i+1 at file block i for each of n blocks, and returns it.
-func newDataInode(t *testing.T, rctx *RecoveryContext, num uint32, n uint64) *inode.Inode {
+// newDataInode claims slot num for a file that maps file block i to disk block blocks[i], and returns it.
+func newDataInode(t *testing.T, rctx *RecoveryContext, num uint32, blocks ...uint64) *inode.Inode {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := applyInodeCreate(ctx, rctx, newTxnReplay(), (&InodeCreatePayload{InodeNum: uint64(num), Mode: 0644}).Serialize()); err != nil {
-		t.Fatal(err)
-	}
-	ino, err := rctx.InodeTbl.Read(num)
+	ino, err := rctx.InodeTbl.ClaimSlot(ctx, num)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range n {
-		if err := rctx.BitmapMgr.MarkAllocated(ctx, i+1); err != nil {
+	ino.Mode = inode.S_IFREG | 0644
+	for i, b := range blocks {
+		if err := rctx.BitmapMgr.MarkAllocated(ctx, b); err != nil {
 			t.Fatal(err)
 		}
-		if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, &extent.Extent{LogicalBlock: i, PhysicalBlock: i + 1, Length: 1, Flags: extent.FlagAllocated}); err != nil {
+		if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, &extent.Extent{LogicalBlock: uint64(i), PhysicalBlock: b, Length: 1, Flags: extent.FlagAllocated}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ino.Size = n << 20
+	ino.Size = uint64(len(blocks)) << 20
 	if err := rctx.InodeTbl.Write(ctx, ino); err != nil {
 		t.Fatal(err)
 	}
@@ -649,7 +647,7 @@ func TestApplyExtentFreeCutsUnchangedInode(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)
 	defer cleanup()
 	ctx := context.Background()
-	ino := newDataInode(t, rctx, 50, 3)
+	ino := newDataInode(t, rctx, 50, 1, 2, 3)
 
 	stale := &ExtentFreePayload{InodeNum: 50, MetaGeneration: ino.MetaGeneration - 1, Size: 1 << 20}
 	if applied, err := applyExtentFree(ctx, rctx, newTxnReplay(), stale.Serialize()); err != nil || applied {
@@ -776,7 +774,7 @@ func TestReplayedUnlinkKeepsReusedInode(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	newRootDir(t, rctx)
-	doomed := newDataInode(t, rctx, 50, 2)
+	doomed := newDataInode(t, rctx, 50, 1, 2)
 	root, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	if err := rctx.DirMgr.Add(ctx, root, "doomed", 50, dir.DT_REG); err != nil {
 		t.Fatal(err)
@@ -795,7 +793,7 @@ func TestReplayedUnlinkKeepsReusedInode(t *testing.T) {
 	if err := rctx.InodeTbl.Free(ctx, 50); err != nil {
 		t.Fatal(err)
 	}
-	reused := newDataInode(t, rctx, 50, 2)
+	reused := newDataInode(t, rctx, 50, 3, 4)
 	root, _ = rctx.InodeTbl.Read(inode.InodeRoot)
 	if err := rctx.DirMgr.Add(ctx, root, "doomed", 50, dir.DT_REG); err != nil {
 		t.Fatal(err)
@@ -811,7 +809,7 @@ func TestReplayedUnlinkKeepsReusedInode(t *testing.T) {
 	if num, err := lookupRoot(t, rctx, "doomed"); err != nil || num != 50 {
 		t.Errorf("entry of the reused inode after replay: %d, %v", num, err)
 	}
-	for _, b := range []uint64{1, 2} {
+	for _, b := range []uint64{3, 4} {
 		if got, err := rctx.BitmapMgr.IsAllocated(b); err != nil || !got {
 			t.Errorf("block %d of the reused inode freed by replay (err %v)", b, err)
 		}
@@ -825,7 +823,7 @@ func TestReplayedUnlinkFreesUnchangedInode(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	newRootDir(t, rctx)
-	doomed := newDataInode(t, rctx, 50, 2)
+	doomed := newDataInode(t, rctx, 50, 1, 2)
 	root, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	if err := rctx.DirMgr.Add(ctx, root, "doomed", 50, dir.DT_REG); err != nil {
 		t.Fatal(err)
@@ -859,10 +857,10 @@ func TestApplyDirRemoveEntryKeepsReusedName(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 	newRootDir(t, rctx)
-	old := newDataInode(t, rctx, 50, 0)
+	old := newDataInode(t, rctx, 50)
 	remove := (&DirRemoveEntryPayload{ParentInodeNum: uint64(inode.InodeRoot), ChildInodeNum: 50, Name: "name", ChildMetaGeneration: old.MetaGeneration}).Serialize()
 
-	newDataInode(t, rctx, 51, 0)
+	newDataInode(t, rctx, 51)
 	root, _ := rctx.InodeTbl.Read(inode.InodeRoot)
 	if err := rctx.DirMgr.Add(ctx, root, "name", 51, dir.DT_REG); err != nil {
 		t.Fatal(err)
@@ -879,7 +877,7 @@ func TestApplyDirRemoveEntryKeepsReusedName(t *testing.T) {
 	if err := rctx.InodeTbl.Free(ctx, 50); err != nil {
 		t.Fatal(err)
 	}
-	newDataInode(t, rctx, 50, 0)
+	newDataInode(t, rctx, 50)
 	root, _ = rctx.InodeTbl.Read(inode.InodeRoot)
 	if err := rctx.DirMgr.Add(ctx, root, "name", 50, dir.DT_REG); err != nil {
 		t.Fatal(err)
