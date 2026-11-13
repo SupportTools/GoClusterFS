@@ -29,9 +29,6 @@ linters:
       - path: ^internal/goclusterfs/
         linters: [errcheck]
 
-      - path: ^cmd/gfsctl/
-        linters: [errcheck]
-
       - path: ^cmd/mount/
         linters: [errcheck]
 
@@ -41,6 +38,10 @@ linters:
       - path: ^tests/integration/
         linters: [errcheck]
 
+      # gfsctl prints to the terminal and, like fmt.Printf, ignores write errors there.
+      - path: ^cmd/gfsctl/
+        linters: [errcheck]
+        text: "`fmt\\.Fprint(f|ln)?` is not checked"
       - path: ^internal/goclusterfs/fs\.go$
         linters: [unused]
         text: "errRetryCreate|field sb is unused"
