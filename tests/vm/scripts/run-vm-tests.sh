@@ -3061,8 +3061,12 @@ test_stalled_node_writes_stop_at_write_gate() {
     if [[ -n "$(mount_pids "$stalled")" ]]; then
         crash_goclusterfs "$stalled" || true
     fi
-    ssh_run "$stalled" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fenced'; fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
-    setup_goclusterfs "$stalled" false
+    # The bracket keeps pkill from matching the shell that runs it.
+    ssh_run "$stalled" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fence[d]'; fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
+    if ! setup_goclusterfs "$stalled" false; then
+        log_error "VM $stalled: remount after the test failed"
+        result=1
+    fi
     [[ $result -eq 0 ]] && log_info "Stalled node's queued write stopped at the write gate"
     return $result
 }
