@@ -66,7 +66,7 @@ func TestInodeAndExtentLocksDoNotWaitInACycle(t *testing.T) {
 		if err != nil {
 			return fmt.Errorf("inode %d: %w", inode, err)
 		}
-		defer m.Release(LockTypeInode, inode)
+		defer release(t, m, LockTypeInode, inode)
 		held.Wait()
 		if err := acquireWithin(m, 2*time.Second, LockTypeExtent, extent, LockModeExclusive); err != nil {
 			return fmt.Errorf("extent %d while holding inode %d: %w", extent, inode, err)
@@ -130,7 +130,7 @@ func TestLocksDoNotWaitOnRecordsOfOtherTypes(t *testing.T) {
 	}
 	defer func() {
 		for _, r := range rows {
-			b.Release(LockTypeInode, inodeIn[r])
+			release(t, b, LockTypeInode, inodeIn[r])
 		}
 	}()
 
@@ -142,7 +142,7 @@ func TestLocksDoNotWaitOnRecordsOfOtherTypes(t *testing.T) {
 			if err := acquireWithin(a, 200*time.Millisecond, lt, id, LockModeExclusive); err != nil {
 				t.Fatalf("type %d resource %d waited on a record node B holds for inode locks: %v", lt, id, err)
 			}
-			a.Release(lt, id)
+			release(t, a, lt, id)
 		}
 	}
 }
@@ -164,12 +164,12 @@ func TestLocksOfOneTypeAreTakenInRecordOrder(t *testing.T) {
 	if err := acquireWithin(m, time.Second, LockTypeInode, low, LockModeExclusive); !errors.Is(err, ErrDeadlockRisk) {
 		t.Fatalf("inode %d below held inode %d: err = %v, want ErrDeadlockRisk", low, high, err)
 	}
-	m.Release(LockTypeInode, high)
+	release(t, m, LockTypeInode, high)
 
 	requireAcquired(t, m, LockTypeInode, low, LockModeExclusive)
 	requireAcquired(t, m, LockTypeInode, high, LockModeExclusive)
-	m.Release(LockTypeInode, high)
-	m.Release(LockTypeInode, low)
+	release(t, m, LockTypeInode, high)
+	release(t, m, LockTypeInode, low)
 }
 
 func TestAcquireRefusesUnknownLockType(t *testing.T) {

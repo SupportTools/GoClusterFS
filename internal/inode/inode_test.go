@@ -30,21 +30,23 @@ func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		tb.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		tb.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -650,7 +652,9 @@ func BenchmarkAllocInode(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		table.Alloc(ctx)
+		if _, err := table.Alloc(ctx); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -667,7 +671,9 @@ func BenchmarkReadInode(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		table.Read(inode.InodeNum)
+		if _, err := table.Read(inode.InodeNum); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -685,7 +691,9 @@ func BenchmarkWriteInode(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		inode.Size = uint64(i)
-		table.Write(ctx, inode)
+		if err := table.Write(ctx, inode); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

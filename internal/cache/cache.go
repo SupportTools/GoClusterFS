@@ -149,6 +149,7 @@ func (m *Manager) Stats() Stats {
 		stats.InvalidationsSent = bstats.InvalidationsSent
 		stats.InvalidationsReceived = bstats.InvalidationsReceived
 		stats.BroadcastDuplicates = bstats.DuplicatesDropped
+		stats.BroadcastLost = bstats.MessagesLost
 		stats.MulticastEnabled = bstats.Transport.MulticastEnabled
 		stats.PeerCount = bstats.Transport.PeerCount
 	}
@@ -186,6 +187,7 @@ type Stats struct {
 	InvalidationsSent     uint64
 	InvalidationsReceived uint64
 	BroadcastDuplicates   uint64
+	BroadcastLost         uint64
 	MulticastEnabled      bool
 	PeerCount             int
 }

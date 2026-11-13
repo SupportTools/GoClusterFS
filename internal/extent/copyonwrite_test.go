@@ -40,8 +40,7 @@ func (m *Manager) CopyOnWrite(ctx context.Context, ino *inode.Inode, ext *Extent
 	}
 	if err := m.CopyBlockData(mapped, dataOffset); err != nil {
 		m.DiscardPending(ctx, ino)
-		m.bitmap.Free(ctx, mapped.NewPhysBlock)
-		return nil, err
+		return nil, m.freeUnmapped(ctx, []uint64{mapped.NewPhysBlock}, err)
 	}
 	*ext = Extent{logicalBlock, mapped.NewPhysBlock, 1, cur.Flags &^ (FlagShared | FlagCounted)}
 	return mapped, nil

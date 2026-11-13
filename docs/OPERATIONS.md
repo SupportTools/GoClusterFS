@@ -26,7 +26,7 @@ When a mount exits, it logs totals for the whole mount:
 TRIM stats: queued=..., discarded=..., calls=..., coalesce=...
 Journal stats: commits=..., bytes=..., state=...
 Cache stats: inodes=... (hit=...%), extents=... (hit=...%)
-Broadcast stats: sent=..., received=..., duplicates=...
+Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 ```
 
 The cache hit percentages are wrong today and can read far above 100%, so don't tune by them. Cache sizes are fixed in code (10,000 inodes, 50,000 extents). Only the TTL and strict mode have flags; see [Cache Tuning](#cache-tuning).
@@ -41,6 +41,7 @@ The cache hit percentages are wrong today and can read far above 100%, so don't 
 | `ERROR: heartbeats to node registry slot N have failed` | This node cannot write the device. It stops. |
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Warning: Failed to start cache broadcast` | The mount runs without broadcast. Other nodes' changes show up after `-cache-ttl` instead of right away. |
+| `[broadcast] missed N messages from ...` | This node lost broadcast messages, usually because its receive buffer filled during a burst of changes on another node. It dropped all cached inodes and extents and rereads them from the device. Logged at most every 10 seconds. If it repeats, raise `net.core.rmem_max` to at least 1 MB (`sysctl -w net.core.rmem_max=1048576`) and remount. |
 | `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
 | `[WARN] lock: gave up waiting for ...` | A lock wait gave up after 30 seconds (`DefaultTimeout`), or a background task was stopped at unmount. The line names the node that holds the lock. A file operation that was waiting fails with EIO. See [Interrupted File Operations](#interrupted-file-operations). |
 
@@ -464,7 +465,7 @@ done
 
 Nodes prove they are alive by writing a heartbeat to their registry slot on the device every second. That is what failure detection uses.
 
-Separately, each node sends a broadcast heartbeat over UDP every 30 seconds, and an invalidation message for each metadata change:
+Separately, each node sends a broadcast heartbeat over UDP every 30 seconds, an invalidation message for each metadata change, and a heartbeat every 50 ms for 500 ms after its last invalidation:
 
 ```bash
 tcpdump -i eth0 -c 10 udp port 31337
@@ -530,7 +531,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
-**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default, unicast on `31338`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Losing them only delays cache updates until `-cache-ttl`.
+**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default, unicast on `31338`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Each node numbers its messages, and a node that sees a gap in a peer's numbers drops all cached inodes and extents. The heartbeats after a node's last invalidation let peers notice a lost final message too. Only when those heartbeats are lost as well do cache updates wait for `-cache-ttl`.
 
 - With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.

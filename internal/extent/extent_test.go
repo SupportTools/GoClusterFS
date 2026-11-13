@@ -30,21 +30,23 @@ func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	}
 
 	if err := f.Truncate(size); err != nil {
-		f.Close()
-		os.Remove(testFile)
+		_ = f.Close()
+		_ = os.Remove(testFile)
 		tb.Skipf("Cannot truncate test file: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 
 	dev, err := storage.Open(testFile)
 	if err != nil {
-		os.Remove(testFile)
+		_ = os.Remove(testFile)
 		tb.Skipf("O_DIRECT not supported: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(testFile)
+		_ = dev.Close()
+		_ = os.Remove(testFile)
 	}
 
 	return dev, cleanup
@@ -289,7 +291,9 @@ func TestInsertOverlap(t *testing.T) {
 		Length:        5,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext1)
+	if err := mgr.Insert(ctx, ino, ext1); err != nil {
+		t.Fatal(err)
+	}
 
 	// Try to insert overlapping extent (blocks 3-7)
 	ext2 := &Extent{
@@ -338,7 +342,9 @@ func TestLookup(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 
 	// Lookup within extent
 	found, offset, err := mgr.Lookup(ino, 15)
@@ -385,7 +391,9 @@ func TestLookupNotFound(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 
 	// Lookup before extent
 	_, _, err := mgr.Lookup(ino, 5)
@@ -413,7 +421,9 @@ func TestLookupPhysical(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 
 	// Lookup physical block
 	phys, err := mgr.LookupPhysical(ino, 15)
@@ -508,8 +518,12 @@ func TestTruncate(t *testing.T) {
 		Flags:         FlagAllocated,
 	}
 
-	mgr.Insert(ctx, ino, ext1)
-	mgr.Insert(ctx, ino, ext2)
+	if err := mgr.Insert(ctx, ino, ext1); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Insert(ctx, ino, ext2); err != nil {
+		t.Fatal(err)
+	}
 	ino.AllocatedBlocks = 10
 	ino.Size = 15 * BlockSize
 
@@ -543,7 +557,9 @@ func TestTruncatePartial(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 	ino.AllocatedBlocks = 10
 	ino.Size = 10 * BlockSize
 
@@ -581,7 +597,9 @@ func TestTruncateToZero(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 	ino.AllocatedBlocks = 10
 	ino.Size = 10 * BlockSize
 
@@ -621,8 +639,12 @@ func TestListExtents(t *testing.T) {
 		Flags:         FlagAllocated,
 	}
 
-	mgr.Insert(ctx, ino, ext2)
-	mgr.Insert(ctx, ino, ext1)
+	if err := mgr.Insert(ctx, ino, ext2); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Insert(ctx, ino, ext1); err != nil {
+		t.Fatal(err)
+	}
 
 	// List should return sorted
 	extents := listExtents(t, mgr, ino)
@@ -696,7 +718,9 @@ func TestTruncateAdjustsWrittenBlocks(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated, // Not FlagUnwritten
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 	ino.AllocatedBlocks = 10
 	ino.WrittenBlocks = 10
 	ino.Size = 10 * BlockSize
@@ -729,7 +753,9 @@ func TestTruncateToZeroAdjustsWrittenBlocks(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 	ino.AllocatedBlocks = 10
 	ino.WrittenBlocks = 10
 	ino.Size = 10 * BlockSize
@@ -761,7 +787,9 @@ func TestTruncateUnwrittenExtentDoesNotAffectWrittenBlocks(t *testing.T) {
 		Length:        10,
 		Flags:         FlagAllocated | FlagUnwritten,
 	}
-	mgr.Insert(ctx, ino, ext)
+	if err := mgr.Insert(ctx, ino, ext); err != nil {
+		t.Fatal(err)
+	}
 	ino.AllocatedBlocks = 10
 	ino.WrittenBlocks = 0 // Unwritten extents don't count as written
 	ino.Size = 10 * BlockSize
@@ -822,11 +850,15 @@ func BenchmarkLookup(b *testing.B) {
 	ctx := context.Background()
 
 	// Insert extents
-	mgr.Insert(ctx, ino, &Extent{LogicalBlock: 0, PhysicalBlock: 100, Length: 1000, Flags: FlagAllocated})
+	if err := mgr.Insert(ctx, ino, &Extent{LogicalBlock: 0, PhysicalBlock: 100, Length: 1000, Flags: FlagAllocated}); err != nil {
+		b.Fatal(err)
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		mgr.Lookup(ino, uint64(i%1000))
+		if _, _, err := mgr.Lookup(ino, uint64(i%1000)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -842,12 +874,14 @@ func BenchmarkInsert(b *testing.B) {
 			Magic:    inode.InodeMagic,
 			InodeNum: uint32(i),
 		}
-		mgr.Insert(ctx, ino, &Extent{
+		if err := mgr.Insert(ctx, ino, &Extent{
 			LogicalBlock:  0,
 			PhysicalBlock: uint64(i * 10),
 			Length:        5,
 			Flags:         FlagAllocated,
-		})
+		}); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

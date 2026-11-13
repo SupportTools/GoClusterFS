@@ -786,8 +786,8 @@ func (f *FS) freeSlotGeneration(num uint32) uint64 {
 // afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.
 var afterCommit func(op string)
 
-// retryClaim runs try again, after a jittered backoff, while another node takes the inode slot it picked first.
-func retryClaim(op, name string, try func() syscall.Errno) syscall.Errno {
+// retryRace runs try again, after a jittered backoff, while it returns EAGAIN for losing a race with another node.
+func retryRace(op, name string, try func() syscall.Errno) syscall.Errno {
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
 		errno := try()
 		if errno != syscall.EAGAIN {
@@ -795,11 +795,22 @@ func retryClaim(op, name string, try func() syscall.Errno) syscall.Errno {
 		}
 		baseDelay := time.Millisecond * time.Duration(1<<attempt)
 		backoff := baseDelay + time.Duration(rand.Int63n(int64(baseDelay)))
-		logging.Debugf("%s %q: inode slot collision, retry %d/%d (backoff %v)", op, name, attempt+1, MaxCreateRetries, backoff)
+		logging.Debugf("%s %q: lost a race with another node, retry %d/%d (backoff %v)", op, name, attempt+1, MaxCreateRetries, backoff)
 		time.Sleep(backoff)
 	}
-	log.Printf("[WARN] %s %q: exhausted %d retries due to inode slot collisions", op, name, MaxCreateRetries)
+	log.Printf("[WARN] %s %q: lost %d races with other nodes", op, name, MaxCreateRetries)
 	return syscall.EAGAIN
+}
+
+// nameErrno maps a failure to add, find or remove a directory entry.
+func nameErrno(err error) syscall.Errno {
+	switch {
+	case errors.Is(err, dir.ErrExists):
+		return syscall.EEXIST
+	case errors.Is(err, dir.ErrNotFound), errors.Is(err, dir.ErrRemoved):
+		return syscall.ENOENT
+	}
+	return syscall.EIO
 }
 
 // owner returns the caller's uid and gid, or the mount's when the request has no caller.
@@ -873,7 +884,7 @@ func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode) {
 // createFile creates a file called name in directory parentNum, whose go-fuse node is parent.
 func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	var node *fs.Inode
-	errno := retryClaim("Create", name, func() (errno syscall.Errno) {
+	errno := retryRace("Create", name, func() (errno syscall.Errno) {
 		node, errno = f.createFileOnce(ctx, parent, parentNum, name, mode, out)
 		return errno
 	})
@@ -932,7 +943,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
 		logging.Debugf("Create %q: dirMgr.Add failed: %v", name, err)
 		f.inodeTbl.Free(ctx, childIno.InodeNum)
-		return nil, syscall.EIO
+		return nil, nameErrno(err)
 	}
 	f.cacheInode(childIno)
 	f.touchParent(ctx, parentNum, 0, now)
@@ -948,7 +959,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 // makeDir creates a directory called name in directory parentNum, whose go-fuse node is parent.
 func (f *FS) makeDir(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var node *fs.Inode
-	errno := retryClaim("Mkdir", name, func() (errno syscall.Errno) {
+	errno := retryRace("Mkdir", name, func() (errno syscall.Errno) {
 		node, errno = f.makeDirOnce(ctx, parent, parentNum, name, mode, out)
 		return errno
 	})
@@ -976,6 +987,9 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 			return nil, syscall.EIO
 		}
 		defer f.closeIntent(seq)
+		if afterCommit != nil {
+			afterCommit("mkdir")
+		}
 	}
 
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
@@ -1012,7 +1026,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
 		logging.Debugf("Mkdir %q: dirMgr.Add failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
-		return nil, syscall.EIO
+		return nil, nameErrno(err)
 	}
 	f.cacheInode(childIno)
 	f.touchParent(ctx, parentNum, 1, now)
@@ -1303,6 +1317,19 @@ func (d *Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 // removeEntry removes a file or empty directory.
 func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.Errno {
+	return retryRace("Remove", name, func() syscall.Errno { return d.removeEntryOnce(ctx, name, isDir) })
+}
+
+// sameForRemoval reports whether cur still matches the removal's checks: a file's writes don't count, a directory's new entries do.
+func sameForRemoval(was, cur *inode.Inode) bool {
+	if cur.Magic != inode.InodeMagic || cur.Mode&inode.S_IFMT != was.Mode&inode.S_IFMT || cur.LinkCount != was.LinkCount {
+		return false
+	}
+	return !was.IsDir() || cur.MetaGeneration == was.MetaGeneration
+}
+
+// removeEntryOnce returns EAGAIN when another node changes the child between the lookup and the removal.
+func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) syscall.Errno {
 	// Invalidate parent directory cache before modifying
 	d.fs.invalidateInode(d.inodeNum)
 
@@ -1311,13 +1338,9 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		return syscall.EIO
 	}
 
-	// Look up the entry
 	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
-		if err == dir.ErrNotFound {
-			return syscall.ENOENT
-		}
-		return syscall.EIO
+		return nameErrno(err)
 	}
 
 	// Invalidate child inode cache - it's being removed
@@ -1433,21 +1456,49 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 	// Now execute the actual metadata operations (safe - recoverable if crash)
 
-	// Remove directory entry
-	if err := d.fs.dirMgr.Remove(ctx, dirIno, name); err != nil {
+	// Another node may have removed the name, or changed the child, since the lookup.
+	var changed, readFailed bool
+	removed, err := d.fs.dirMgr.RemoveIf(ctx, dirIno, name, func(child uint64) bool {
+		if child != childInodeNum {
+			return false
+		}
+		cur, err := d.fs.inodeTbl.Read(uint32(child))
+		readFailed = err != nil
+		changed = err == nil && !sameForRemoval(childIno, cur)
+		return err == nil && !changed
+	})
+	switch {
+	case err != nil:
+		return nameErrno(err)
+	case readFailed:
 		return syscall.EIO
+	case changed:
+		return syscall.EAGAIN
+	case !removed:
+		return syscall.ENOENT
+	}
+	if afterCommit != nil {
+		afterCommit("unlink: name removed")
 	}
 
 	if willFreeInode {
-		sfbBacked, sfbSlot := childIno.IsSFBBacked(), childIno.InlineExtents[0].PhysicalBlock
+		// An open handle may write the file after the name is gone, so free what the inode maps when it is freed.
+		var freed *inode.Inode
+		ok, err := d.fs.inodeTbl.FreeIf(ctx, uint32(childInodeNum), func(ino *inode.Inode) bool {
+			freed = ino
+			return !isDir || ino.MetaGeneration == childIno.MetaGeneration
+		})
 		// Free the inode first: once it is gone, replaying this unlink's ExtentFree cannot free the blocks a second time.
-		if err := d.fs.inodeTbl.Free(ctx, uint32(childInodeNum)); err != nil {
+		if err != nil {
 			log.Printf("[WARN] removeEntry %q: inode %d not freed, keeping its blocks: %v", name, childInodeNum, err)
+		} else if !ok {
+			log.Printf("[WARN] removeEntry %q: directory inode %d changed after its name was removed, keeping it", name, childInodeNum)
 		} else {
 			if afterCommit != nil {
 				afterCommit("unlink: inode freed")
 			}
-			d.fs.extentMgr.Delete(ctx, childIno)
+			sfbBacked, sfbSlot := freed.IsSFBBacked(), freed.InlineExtents[0].PhysicalBlock
+			d.fs.extentMgr.Delete(ctx, freed)
 			if sfbBacked {
 				d.fs.freeSFBSlot(ctx, sfbSlot)
 			}
@@ -3375,7 +3426,7 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 	if err := f.fs.dirMgr.Add(ctx, rootIno, cloneName, uint64(cloneInodeNum), dir.DT_REG); err != nil {
 		f.fs.discardInode(ctx, cloneInodeNum)
 		log.Printf("[clone] Failed to add directory entry: %v", err)
-		return syscall.EIO
+		return nameErrno(err)
 	}
 
 	log.Printf("[clone] Created '%s' (inode %d) from inode %d", cloneName, cloneInodeNum, srcNum)

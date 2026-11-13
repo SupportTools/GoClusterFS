@@ -99,75 +99,54 @@ func TestBroadcasterDisabled(t *testing.T) {
 
 func TestBroadcasterDuplication(t *testing.T) {
 	peer := [16]byte{9}
-	handler := newMockHandler()
-	uuid := [16]byte{1, 2, 3, 4}
-	cfg := DefaultConfig()
-	cfg.Enabled = false // We'll test deduplication logic directly
-
-	b, err := NewBroadcaster(cfg, uuid, 0, handler)
+	b, err := NewBroadcaster(DisabledConfig(), [16]byte{1, 2, 3, 4}, 0, newMockHandler())
 	if err != nil {
 		t.Fatalf("NewBroadcaster failed: %v", err)
 	}
 
-	// Test isDuplicate directly
-	seq1 := uint64(1000)
-	seq2 := uint64(2000)
-
-	// First time should not be duplicate
-	if b.isDuplicate(peer, seq1) {
-		t.Error("First check of seq1 should not be duplicate")
+	steps := []struct {
+		seq    uint64
+		dup    bool
+		missed uint64
+	}{
+		{seq: 1000},
+		{seq: 1000, dup: true},
+		{seq: 1001},
+		{seq: 1004, missed: 2},
+		{seq: 1003},
+		{seq: 1003, dup: true},
+		{seq: 1002},
+		{seq: 1000, dup: true},
+		{seq: 1004, dup: true},
+		{seq: 1004 + seqWindow + 1, missed: seqWindow},
+		{seq: 1004, dup: true},
+		{seq: 1004 + seqWindow + 2},
 	}
-
-	// Second time should be duplicate
-	if !b.isDuplicate(peer, seq1) {
-		t.Error("Second check of seq1 should be duplicate")
-	}
-
-	// Different sequence should not be duplicate
-	if b.isDuplicate(peer, seq2) {
-		t.Error("First check of seq2 should not be duplicate")
-	}
-
-	// Original sequence still duplicate
-	if !b.isDuplicate(peer, seq1) {
-		t.Error("Third check of seq1 should still be duplicate")
+	for i, s := range steps {
+		dup, missed := b.track(peer, s.seq)
+		if dup != s.dup || missed != s.missed {
+			t.Errorf("step %d: track(%d) = dup %v, missed %d; want dup %v, missed %d", i, s.seq, dup, missed, s.dup, s.missed)
+		}
 	}
 }
 
-func TestBroadcasterCleanupSeen(t *testing.T) {
-	peer := [16]byte{9}
-	handler := newMockHandler()
-	uuid := [16]byte{1, 2, 3, 4}
-	cfg := DefaultConfig()
-	cfg.Enabled = false
-
-	b, err := NewBroadcaster(cfg, uuid, 0, handler)
+func TestBroadcasterForgetsQuietSenders(t *testing.T) {
+	b, err := NewBroadcaster(DisabledConfig(), [16]byte{1, 2, 3, 4}, 0, newMockHandler())
 	if err != nil {
 		t.Fatalf("NewBroadcaster failed: %v", err)
 	}
+	quiet, active := [16]byte{8}, [16]byte{9}
+	b.track(quiet, 1)
+	b.track(active, 1)
+	b.senders[quiet].heard = time.Now().Add(-senderExpiry - time.Second)
 
-	// Add some entries
-	for i := uint64(1); i <= 10; i++ {
-		b.isDuplicate(peer, i)
+	b.forgetQuietSenders()
+
+	if _, ok := b.senders[quiet]; ok {
+		t.Error("sender not heard from for longer than senderExpiry is still tracked")
 	}
-
-	b.seenMu.Lock()
-	initialCount := len(b.seen)
-	b.seenMu.Unlock()
-
-	if initialCount != 10 {
-		t.Errorf("Expected 10 seen entries, got %d", initialCount)
-	}
-
-	// Cleanup shouldn't remove recent entries
-	b.cleanupSeen()
-
-	b.seenMu.Lock()
-	afterCleanup := len(b.seen)
-	b.seenMu.Unlock()
-
-	if afterCleanup != 10 {
-		t.Errorf("Expected 10 entries after cleanup (all recent), got %d", afterCleanup)
+	if _, ok := b.senders[active]; !ok {
+		t.Error("recently heard sender was forgotten")
 	}
 }
 
@@ -427,41 +406,30 @@ func TestConfigDisabled(t *testing.T) {
 	}
 }
 
-// TestConcurrentDeduplication tests thread-safety of deduplication.
 func TestConcurrentDeduplication(t *testing.T) {
 	peer := [16]byte{9}
-	handler := newMockHandler()
-	uuid := [16]byte{1, 2, 3, 4}
-	cfg := DefaultConfig()
-	cfg.Enabled = false
-
-	b, err := NewBroadcaster(cfg, uuid, 0, handler)
+	b, err := NewBroadcaster(DisabledConfig(), [16]byte{1, 2, 3, 4}, 0, newMockHandler())
 	if err != nil {
 		t.Fatalf("NewBroadcaster failed: %v", err)
 	}
 
 	var wg sync.WaitGroup
-	duplicates := int64(0)
-
-	// Multiple goroutines checking the same sequence
+	var duplicates atomic.Int64
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				if b.isDuplicate(peer, 12345) {
-					atomic.AddInt64(&duplicates, 1)
+				if dup, _ := b.track(peer, 12345); dup {
+					duplicates.Add(1)
 				}
 			}
 		}()
 	}
-
 	wg.Wait()
 
-	// Should have exactly 999 duplicates (first check from each goroutine races,
-	// but at least 990 should be duplicates)
-	if duplicates < 990 {
-		t.Errorf("Expected at least 990 duplicates, got %d", duplicates)
+	if got := duplicates.Load(); got != 999 {
+		t.Errorf("duplicates = %d, want 999", got)
 	}
 }
 

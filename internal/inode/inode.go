@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/bits"
 	"sync"
 	"syscall"
@@ -225,7 +226,7 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inode.InodeNum), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inode.InodeNum))
+		defer t.unlock(lock.LockTypeInode, uint64(inode.InodeNum))
 	}
 	unlockSector, err := t.lockSector(inode.InodeNum)
 	if err != nil {
@@ -237,6 +238,44 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 	defer t.mu.Unlock()
 
 	return t.writeWithTree(inode)
+}
+
+// Update applies change to inode num and writes it back, holding the inode lock from the read to the write.
+func (t *Table) Update(ctx context.Context, num uint32, change func(*Inode) error) error {
+	committed, err := t.lockedUpdate(ctx, num, change)
+	if committed != nil {
+		committed()
+	}
+	return err
+}
+
+func (t *Table) lockedUpdate(ctx context.Context, num uint32, change func(*Inode) error) (func(), error) {
+	if uint64(num) >= t.totalInodes {
+		return nil, ErrInodeOutOfRange
+	}
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
+			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
+		}
+		defer t.unlock(lock.LockTypeInode, uint64(num))
+	}
+	unlockSector, err := t.lockSector(num)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockSector()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	ino, err := t.readInodeUnlocked(num)
+	if err != nil {
+		return nil, err
+	}
+	if err := change(ino); err != nil {
+		return nil, err
+	}
+	return t.writeWithTree(ino)
 }
 
 // WriteWithLockHeld writes an inode to disk without acquiring the distributed lock.
@@ -396,7 +435,7 @@ func (t *Table) ClaimSlotIf(ctx context.Context, num uint32, ok func(free *Inode
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
+		defer t.unlock(lock.LockTypeInode, uint64(num))
 	}
 	unlockSector, err := t.lockSector(num)
 	if err != nil {
@@ -476,7 +515,7 @@ func (t *Table) FreeIf(ctx context.Context, inodeNum uint32, ok func(*Inode) boo
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inodeNum), lock.LockModeExclusive); err != nil {
 			return false, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inodeNum))
+		defer t.unlock(lock.LockTypeInode, uint64(inodeNum))
 	}
 	unlockSector, err := t.lockSector(inodeNum)
 	if err != nil {
@@ -569,7 +608,19 @@ func (t *Table) lockSector(inodeNum uint32) (func(), error) {
 	if err := t.lockMgr.Acquire(context.Background(), lock.LockTypeInodeSector, sector, lock.LockModeExclusive); err != nil {
 		return nil, fmt.Errorf("failed to acquire inode table sector lock: %w", err)
 	}
-	return func() { t.lockMgr.Release(lock.LockTypeInodeSector, sector) }, nil
+	return func() { t.unlock(lock.LockTypeInodeSector, sector) }, nil
+}
+
+// unlock releases a lock taken for an inode table update. ErrNotLockOwner means
+// a double release: the extra one may have dropped another holder's lock early.
+func (t *Table) unlock(lt lock.LockType, id uint64) {
+	err := t.lockMgr.Release(lt, id)
+	switch {
+	case errors.Is(err, lock.ErrNotLockOwner):
+		log.Printf("[ERROR] inode table: released lock type %d id %d that this node does not hold (double release or lock bookkeeping bug)", lt, id)
+	case err != nil:
+		log.Printf("[WARN] inode table: releasing lock type %d id %d failed: %v", lt, id, err)
+	}
 }
 
 // writeInodeSector writes an inode into its sector. The caller holds the
