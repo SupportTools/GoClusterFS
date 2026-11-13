@@ -771,6 +771,9 @@ func (f *FS) dropNewInode(ctx context.Context, ino *inode.Inode) {
 // testHookBeforeMkdirInodeWrite, when set by a test, fails a mkdir's inode write with its error.
 var testHookBeforeMkdirInodeWrite func() error
 
+// testHookAfterSetattrRead, when set by a test, runs between a setattr's read of the inode and its write.
+var testHookAfterSetattrRead func()
+
 func injectedMkdirFailure() error {
 	if testHookBeforeMkdirInodeWrite != nil {
 		return testHookBeforeMkdirInodeWrite()
@@ -1137,7 +1140,10 @@ func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) sys
 		return syscall.EISDIR
 	}
 	now := time.Now().UnixNano()
-	updated, err := f.updateInode(ctx, num, func(ino *inode.Inode) error {
+	updated, err := f.updateInodeLocked(ctx, num, func(ino *inode.Inode) error {
+		if testHookAfterSetattrRead != nil {
+			testHookAfterSetattrRead()
+		}
 		if mode, ok := in.GetMode(); ok {
 			ino.Mode = inode.S_IFDIR | uint16(mode&0777)
 			ino.Ctime = now
@@ -2721,6 +2727,9 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	if err != nil {
 		return syscall.EIO, nil
 	}
+	if testHookAfterSetattrRead != nil {
+		testHookAfterSetattrRead()
+	}
 
 	if _, resizing := in.GetSize(); resizing && ino.IsSFBBacked() {
 		if err := f.migrateToExtent(ctx, ino); err != nil {
@@ -2734,6 +2743,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 			return syscall.EIO, nil
 		}
 	}
+	readGen := ino.MetaGeneration
 
 	now := time.Now().UnixNano()
 
@@ -2849,7 +2859,8 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		ino.Mtime = mtime.UnixNano()
 	}
 
-	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
+	// Another node's write, such as an append inside an allocated block, may have changed the size since ino was read.
+	if err := f.fs.inodeTbl.WriteIfUnchanged(ctx, ino, readGen); err != nil {
 		f.fs.extentMgr.DiscardPending(ctx, ino)
 		if errors.Is(err, extent.ErrTreeConflict) {
 			// Nothing was applied, so close the intent before the retry logs a new one.
