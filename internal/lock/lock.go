@@ -456,8 +456,14 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			defer m.waiting.Add(-1)
 		}
 
+		failingWhileNested := by.state == OwnerFailing && nested && !replay
+		if failingWhileNested && isRetryable(ctx) {
+			return m.giveUp(ErrReplayBlocked, lockType, resourceID, mode, startTime, fmt.Sprintf(
+				"record %d is held by node %x (slot %d), which is failing or being recovered; releasing the other locks held here",
+				recordID, by.occupant[:8], by.slot))
+		}
 		if by.state == OwnerLost {
-			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
+			return m.giveUp(ErrLockTimeout, lockType, resourceID, mode, startTime, fmt.Sprintf(
 				"the journal replay of node %x (slot %d), which holds record %d, failed or was abandoned", by.occupant[:8], by.slot, recordID))
 		}
 		if by.state == OwnerFailing && time.Since(lastFailingLog) >= acquireTimeout {
@@ -470,12 +476,12 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		// up after acquireTimeout of waiting for live holders, or for failing ones
 		// while this goroutine holds other locks; a replay's wait never does.
 		if retryCount >= 3 && (ctx.Err() != nil || !replay && liveWait > acquireTimeout) {
-			if by.state == OwnerFailing {
-				return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
+			if failingWhileNested {
+				return m.giveUp(ErrReplayBlocked, lockType, resourceID, mode, startTime, fmt.Sprintf(
 					"this goroutine holds other locks, and record %d is held by node %x (slot %d), which is failing or being recovered and whose replay may need one of them",
 					recordID, by.occupant[:8], by.slot))
 			}
-			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf("record %d %s", recordID, m.describeHolder(recordID)))
+			return m.giveUp(ErrLockTimeout, lockType, resourceID, mode, startTime, fmt.Sprintf("record %d %s", recordID, m.describeHolder(recordID)))
 		}
 
 		// Add jitter to prevent thundering herd
@@ -580,12 +586,12 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	return true, true, blocker{}, nil
 }
 
-// giveUp logs why an Acquire stopped waiting and returns ErrLockTimeout with
-// that reason, so callers can tell who holds the lock.
-func (m *Manager) giveUp(lockType LockType, resourceID uint64, mode LockMode, start time.Time, reason string) error {
+// giveUp logs why an Acquire stopped waiting and returns err with that
+// reason, so callers can tell who holds the lock.
+func (m *Manager) giveUp(err error, lockType LockType, resourceID uint64, mode LockMode, start time.Time, reason string) error {
 	log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v: %s",
 		lockType, resourceID, mode, time.Since(start).Round(time.Millisecond), reason)
-	return fmt.Errorf("%w: %s", ErrLockTimeout, reason)
+	return fmt.Errorf("%w: %s", err, reason)
 }
 
 func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) bool {

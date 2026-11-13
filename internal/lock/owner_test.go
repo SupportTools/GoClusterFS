@@ -316,3 +316,33 @@ func TestNestedWaitOnReplayingNodeYieldsToReplay(t *testing.T) {
 	reg.set(1, OwnerReleased)
 	requireAcquired(t, peer, LockTypeExtent, extentX, LockModeExclusive)
 }
+
+// A caller that can release its locks and retry gets ErrReplayBlocked at once,
+// instead of holding them for the timeout while a replay may need one.
+func TestRetryableNestedWaitOnFailingHolderReturnsAtOnce(t *testing.T) {
+	shortenAcquireTimeout(t, 5*time.Second)
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	reg := newFakeRegistry()
+	reg.set(1, OwnerFailing)
+	reg.set(4, OwnerAlive)
+	peer.SetOwnerView(reg.view)
+	const inodeY = 2
+	extentX := uint64(1)
+	for peer.hashToRecord(LockTypeExtent, extentX) == peer.hashToRecord(LockTypeInode, inodeY) {
+		extentX++
+	}
+	requireAcquired(t, dead, LockTypeExtent, extentX, LockModeExclusive)
+	requireAcquired(t, peer, LockTypeInode, inodeY, LockModeExclusive)
+
+	start := time.Now()
+	err := peer.Acquire(Retryable(context.Background()), LockTypeExtent, extentX, LockModeExclusive)
+	if !errors.Is(err, ErrReplayBlocked) || !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("Acquire = %v, want ErrReplayBlocked, which is an ErrLockTimeout", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("gave up after %v, want at once", took)
+	}
+}
