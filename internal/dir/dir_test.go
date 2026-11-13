@@ -16,6 +16,15 @@ import (
 )
 
 // testSetup creates a test environment with all dependencies.
+// claimFree claims the first free inode the way the filesystem does.
+func claimFree(ctx context.Context, table *inode.Table) (*inode.Inode, error) {
+	num, err := table.FindFreeSlot()
+	if err != nil {
+		return nil, err
+	}
+	return table.ClaimSlot(ctx, num)
+}
+
 func testSetup(t *testing.T) (context.Context, *Manager, *inode.Table, func()) {
 	t.Helper()
 
@@ -256,7 +265,7 @@ func TestInitDirectory(t *testing.T) {
 	defer cleanup()
 
 	// Allocate a directory inode
-	dirIno, err := inodeTbl.Alloc(ctx)
+	dirIno, err := claimFree(ctx, inodeTbl)
 	if err != nil {
 		t.Fatalf("Failed to allocate inode: %v", err)
 	}
@@ -320,7 +329,7 @@ func TestLookup(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, err := inodeTbl.Alloc(ctx)
+	dirIno, err := claimFree(ctx, inodeTbl)
 	if err != nil {
 		t.Fatalf("Failed to allocate inode: %v", err)
 	}
@@ -362,7 +371,7 @@ func TestLookupErrors(t *testing.T) {
 	defer cleanup()
 
 	// Create a regular file (not a directory)
-	fileIno, err := inodeTbl.Alloc(ctx)
+	fileIno, err := claimFree(ctx, inodeTbl)
 	if err != nil {
 		t.Fatalf("Failed to allocate inode: %v", err)
 	}
@@ -375,7 +384,7 @@ func TestLookupErrors(t *testing.T) {
 	}
 
 	// Create directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -398,7 +407,7 @@ func TestAddEntry(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -446,7 +455,7 @@ func TestAddDuplicate(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -467,7 +476,7 @@ func TestAddErrors(t *testing.T) {
 	defer cleanup()
 
 	// Create a regular file
-	fileIno, _ := inodeTbl.Alloc(ctx)
+	fileIno, _ := claimFree(ctx, inodeTbl)
 	fileIno.Mode = inode.S_IFREG | 0644
 
 	// Add to non-directory should fail
@@ -477,7 +486,7 @@ func TestAddErrors(t *testing.T) {
 	}
 
 	// Create directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -500,7 +509,7 @@ func TestRemoveEntry(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -536,7 +545,7 @@ func TestRemoveErrors(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -564,7 +573,7 @@ func TestIsEmpty(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -595,7 +604,7 @@ func TestManyEntries(t *testing.T) {
 	defer cleanup()
 
 	// Create and initialize directory
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -653,7 +662,7 @@ func BenchmarkLookup(b *testing.B) {
 	ctx := context.Background()
 
 	// Create directory with entries
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	dirMgr.InitDirectory(ctx, dirIno, 2)
 
@@ -703,7 +712,7 @@ func BenchmarkAdd(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
 		// Create fresh directory for each iteration
-		dirIno, _ := inodeTbl.Alloc(ctx)
+		dirIno, _ := claimFree(ctx, inodeTbl)
 		dirIno.Mode = inode.S_IFDIR | 0755
 		dirMgr.InitDirectory(ctx, dirIno, 2)
 		b.StartTimer()
@@ -843,7 +852,7 @@ func firstBlock(t *testing.T, dirMgr *Manager, dirIno *inode.Inode) []byte {
 func TestBlockUsesEveryChunk(t *testing.T) {
 	ctx, dirMgr, inodeTbl, cleanup := testSetup(t)
 	defer cleanup()
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
 		t.Fatal(err)
@@ -875,7 +884,7 @@ func TestBlockUsesEveryChunk(t *testing.T) {
 func TestRemoveFirstEntryOfChunk(t *testing.T) {
 	ctx, dirMgr, inodeTbl, cleanup := testSetup(t)
 	defer cleanup()
-	dirIno, _ := inodeTbl.Alloc(ctx)
+	dirIno, _ := claimFree(ctx, inodeTbl)
 	dirIno.Mode = inode.S_IFDIR | 0755
 	if err := dirMgr.InitDirectory(ctx, dirIno, 2); err != nil {
 		t.Fatal(err)

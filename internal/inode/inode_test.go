@@ -14,6 +14,15 @@ import (
 )
 
 // createTestDevice creates a test file for O_DIRECT testing.
+// claimFree claims the first free inode the way the filesystem does.
+func claimFree(ctx context.Context, table *Table) (*Inode, error) {
+	num, err := table.FindFreeSlot()
+	if err != nil {
+		return nil, err
+	}
+	return table.ClaimSlot(ctx, num)
+}
+
 func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	tb.Helper()
 
@@ -243,7 +252,7 @@ func TestDeserializeCorrupted(t *testing.T) {
 	}
 }
 
-func TestAllocInode(t *testing.T) {
+func TestClaimInode(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
@@ -254,9 +263,9 @@ func TestAllocInode(t *testing.T) {
 	ctx := context.Background()
 
 	// Allocate first inode
-	inode, err := table.Alloc(ctx)
+	inode, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Alloc failed: %v", err)
+		t.Fatalf("claim failed: %v", err)
 	}
 
 	if inode.InodeNum != InodeFirstUsable {
@@ -268,9 +277,9 @@ func TestAllocInode(t *testing.T) {
 	}
 
 	// Allocate second inode
-	inode2, err := table.Alloc(ctx)
+	inode2, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Second Alloc failed: %v", err)
+		t.Fatalf("second claim failed: %v", err)
 	}
 
 	if inode2.InodeNum != InodeFirstUsable+1 {
@@ -287,9 +296,9 @@ func TestFreeInode(t *testing.T) {
 	ctx := context.Background()
 
 	// Allocate an inode
-	inode, err := table.Alloc(ctx)
+	inode, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Alloc failed: %v", err)
+		t.Fatalf("claim failed: %v", err)
 	}
 
 	// Free it
@@ -309,9 +318,9 @@ func TestFreeInode(t *testing.T) {
 	}
 
 	// Allocate again - should get same number
-	inode2, err := table.Alloc(ctx)
+	inode2, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Re-Alloc failed: %v", err)
+		t.Fatalf("claim after free failed: %v", err)
 	}
 
 	if inode2.InodeNum != inode.InodeNum {
@@ -362,9 +371,9 @@ func TestWriteRead(t *testing.T) {
 	ctx := context.Background()
 
 	// Allocate an inode
-	inode, err := table.Alloc(ctx)
+	inode, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Alloc failed: %v", err)
+		t.Fatalf("claim failed: %v", err)
 	}
 
 	// Modify it
@@ -541,7 +550,7 @@ func TestPersistence(t *testing.T) {
 
 	// Allocate and write some inodes
 	for i := 0; i < 5; i++ {
-		inode, err := table.Alloc(ctx)
+		inode, err := claimFree(ctx, table)
 		if err != nil {
 			t.Fatalf("Alloc %d failed: %v", i, err)
 		}
@@ -580,7 +589,7 @@ func TestMultipleSectors(t *testing.T) {
 	// 16 inodes per sector, so 50 inodes spans 4 sectors
 	inodes := make([]*Inode, 50)
 	for i := 0; i < 50; i++ {
-		inode, err := table.Alloc(ctx)
+		inode, err := claimFree(ctx, table)
 		if err != nil {
 			t.Fatalf("Alloc %d failed: %v", i, err)
 		}
@@ -613,9 +622,9 @@ func TestMetaGenerationIncrement(t *testing.T) {
 	ctx := context.Background()
 
 	// Allocate an inode
-	inode, err := table.Alloc(ctx)
+	inode, err := claimFree(ctx, table)
 	if err != nil {
-		t.Fatalf("Alloc failed: %v", err)
+		t.Fatalf("claim failed: %v", err)
 	}
 
 	initialGen := inode.MetaGeneration
@@ -642,7 +651,7 @@ func TestMetaGenerationIncrement(t *testing.T) {
 	}
 }
 
-func BenchmarkAllocInode(b *testing.B) {
+func BenchmarkClaimInode(b *testing.B) {
 	dev, cleanup := createTestDevice(b, 100<<20)
 	defer cleanup()
 
@@ -652,7 +661,7 @@ func BenchmarkAllocInode(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := table.Alloc(ctx); err != nil {
+		if _, err := claimFree(ctx, table); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -667,7 +676,7 @@ func BenchmarkReadInode(b *testing.B) {
 	ctx := context.Background()
 
 	// Allocate one inode to read
-	inode, _ := table.Alloc(ctx)
+	inode, _ := claimFree(ctx, table)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -686,7 +695,7 @@ func BenchmarkWriteInode(b *testing.B) {
 	ctx := context.Background()
 
 	// Allocate one inode to write
-	inode, _ := table.Alloc(ctx)
+	inode, _ := claimFree(ctx, table)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
