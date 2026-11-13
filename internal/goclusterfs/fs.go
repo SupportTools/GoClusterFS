@@ -2644,8 +2644,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 		if !lockHeld && f.fs.lockMgr != nil {
-			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeShared); err != nil {
-				log.Printf("[DEBUG] Write inode %d: failed to acquire shared inode lock: %v", f.inodeNum, err)
+			// A shared hold could not take the extent lock below on the same record.
+			mode := lock.LockModeShared
+			if !newBlock && f.fs.lockMgr.SameRecord(lock.LockTypeInode, uint64(f.inodeNum), lock.LockTypeExtent, physBlock) {
+				mode = lock.LockModeExclusive
+			}
+			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), mode); err != nil {
+				log.Printf("[DEBUG] Write inode %d: failed to acquire inode lock: %v", f.inodeNum, err)
 				return 0, syscall.EIO
 			}
 			inPlaceLockHeld = true

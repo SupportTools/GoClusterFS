@@ -3181,9 +3181,11 @@ test_snapshot_during_writes() {
     fi
     local run=$$
     local file=/mnt/goclusterfs/busy.bin
+    local since
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     exec_on_node "$node_a" sh -c "head -c 2097152 /dev/zero | tr '\\000' c > $file" || return 1
-    exec_on_node "$node_a" sh -c "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/dev/null || exit 1; done; done; done" &
+    exec_on_node "$node_a" sh -c "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/tmp/busy.err || { cat /tmp/busy.err; exit 1; }; done; done; done" &
     local writer=$!
 
     local i clone sum
@@ -3201,7 +3203,11 @@ test_snapshot_during_writes() {
         sums+=("$(exec_on_node "$node_b" sh -c "md5sum < $clone | cut -d' ' -f1")")
     done
     exec_on_node "$node_a" touch /tmp/busy.stop
-    wait "$writer" || { log "ERROR: writer on $node_a failed"; return 1; }
+    if ! wait "$writer"; then
+        log "ERROR: writer on $node_a failed; its write errors:"
+        docker logs --since "$since" "$node_a" 2>&1 | grep -E 'Write inode|\[WARN\]' | tail -20
+        return 1
+    fi
 
     for i in "${!clones[@]}"; do
         clone=${clones[$i]}

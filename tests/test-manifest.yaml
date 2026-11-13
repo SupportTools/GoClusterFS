@@ -2684,6 +2684,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestWholeSectorWriteSurvivesPeerPartialWrite
 
+  - id: write-when-inode-and-block-share-lock-record
+    name: Write succeeds when the inode and block share a lock record
+    description: A write into an existing block whose extent lock maps to the same lock record as the file's inode lock succeeds instead of failing as a shared-to-exclusive upgrade
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestWriteWhenInodeAndBlockShareLockRecord
+
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
     description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old

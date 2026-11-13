@@ -709,3 +709,8 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 
 	return hash % (m.size / RowSize)
 }
+
+// SameRecord reports whether two locks map to one record, so one goroutine holding both holds the record in the stronger mode.
+func (m *Manager) SameRecord(aType LockType, aID uint64, bType LockType, bID uint64) bool {
+	return m.hashToRecord(aType, aID) == m.hashToRecord(bType, bID)
+}
