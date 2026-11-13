@@ -3259,13 +3259,15 @@ test_snapshot_create_delete_power_failure() {
         log_error "snap_pf.bin changed"
         return 1
     fi
-    # Recovery finishes deletes that were under way in the background after mount.
+    # Recovery finishes snapshots left creating or deleting in the background after mount. Entries are name:state.
     local listed waited=0
-    while listed=$(ssh_run 1 "getfattr --only-values -n user.snapshots $f 2>/dev/null"); \
-        [[ $waited -lt 20 ]] && echo "$listed" | tr ',' '\n' | awk -v d="$deleted" 'sub(/^pf_s/, "") && $0 + 0 <= d {found = 1} END {exit !found}'; do
+    while listed=$(ssh_run 1 "getfattr --only-values -n user.snapshots $f 2>/dev/null" | tr ',' '\n'); \
+        [[ $waited -lt 20 ]] && echo "$listed" | awk -F: -v d="$deleted" \
+            '$1 ~ /^pf_s/ && ($2 != "active" || substr($1, 5) + 0 <= d) {found = 1} END {exit !found}'; do
         sleep 1
         waited=$((waited + 1))
     done
+    listed=$(echo "$listed" | cut -d: -f1)
     local i name
     for ((i = 1; i <= created + 1; i++)); do
         name=pf_s$i
