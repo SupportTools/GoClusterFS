@@ -10,10 +10,11 @@ import (
 // locks have records of their own, so none may wait: a sector lock waiting on a
 // record held for another lock type could close a cycle of waits between nodes.
 func TestSectorLocksDoNotWaitOnOtherLocks(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 1<<20)
+	const region = 256 * RecordSize
+	dev, cleanup := createTestDevice(t, region)
 	defer cleanup()
-	a := newTestNode(dev, 0, 1<<20, 1)
-	b := newTestNode(dev, 0, 1<<20, 2)
+	a := newTestNode(dev, 0, region, 1)
+	b := newTestNode(dev, 0, region, 2)
 
 	const inodes, sectors = 1024, 64
 	for id := uint64(0); id < inodes; id++ {
