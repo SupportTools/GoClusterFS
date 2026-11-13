@@ -135,9 +135,10 @@ type Manager struct {
 	claims map[uint64]*pendingClaim
 	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
 	adopted map[uint64]adoptedSlot
-	// tornSince is when this node first read each slot that fails its checksum.
+	// tornSince is when this node first read each slot that fails its checksum
+	// with the bytes it has now.
 	tornMu    sync.Mutex
-	tornSince map[slotRef]time.Time
+	tornSince map[slotRef]tornSighting
 	tornCount atomic.Int32
 	// slotWrite, when a test sets it, replaces the device write of a slot.
 	slotWrite func(buf []byte, offset int64) (int, error)
@@ -247,7 +248,7 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		yieldUntil: make(map[uint64]time.Time),
 		claims:     make(map[uint64]*pendingClaim),
 		adopted:    make(map[uint64]adoptedSlot),
-		tornSince:  make(map[slotRef]time.Time),
+		tornSince:  make(map[slotRef]tornSighting),
 	}
 }
 

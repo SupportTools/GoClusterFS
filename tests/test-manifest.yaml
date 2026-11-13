@@ -2550,6 +2550,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestTornSlotExpires
 
+  - id: lock-torn-slot-wait-restarts
+    name: Torn slot wait restarts when its bytes change
+    description: A node with an old torn sighting of a slot does not ignore it when the slot reads torn with other bytes, as a live write in flight does
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTornSlotWaitRestartsWhenBytesChange
+
   - id: lock-own-slot-adoption-outlives-replay-acquire
     name: Own-slot adoption outlives the replay's acquires
     description: A node restarted into its own slot keeps the adopted claim there after its replay acquires and releases the record, until ReleaseAdopted

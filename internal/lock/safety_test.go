@@ -766,6 +766,23 @@ func TestTornSlotExpires(t *testing.T) {
 	requireAcquired(t, a, LockTypeInode, 51, LockModeExclusive)
 }
 
+// A node may keep an old torn sighting of a slot it stopped reading. When it
+// later reads that slot torn again with other bytes, a node is writing it, so
+// the wait starts over instead of ignoring the slot.
+func TestTornSlotWaitRestartsWhenBytesChange(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	defer func(d time.Duration) { tornExpiry = d }(tornExpiry)
+	tornExpiry = 200 * time.Millisecond
+	a := newTestNode(dev, 0, 1<<20, 1)
+	tearSlot(t, a, LockTypeInode, 51, 2)
+	requireBlocked(t, a, LockTypeInode, 51, LockModeExclusive)
+
+	time.Sleep(tornExpiry)
+	tearSlot(t, a, LockTypeInode, 51, 2)
+	requireBlocked(t, a, LockTypeInode, 51, LockModeExclusive)
+}
+
 // Readers on two nodes hold one record together; a writer waits for both.
 func TestSlotReadersShareWritersWait(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)

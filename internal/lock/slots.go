@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"time"
 
@@ -53,6 +54,11 @@ type adoptedSlot struct {
 type slotRef struct {
 	record uint64
 	slot   int
+}
+
+type tornSighting struct {
+	since time.Time
+	sum   uint64
 }
 
 func encodeSlot(s *claimSlot) []byte {
@@ -145,7 +151,11 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 			continue
 		}
 		s, err := decodeSlot(rowSlot(row, slot))
-		if m.tornTooLong(slotRef{recordID, slot}, err != nil) {
+		var torn []byte
+		if err != nil {
+			torn = rowSlot(row, slot)
+		}
+		if m.tornTooLong(slotRef{recordID, slot}, torn) {
 			continue
 		}
 		if err == nil && (s == nil || s.stale() || (mode != LockModeExclusive && s.mode != LockModeExclusive)) {
@@ -159,25 +169,31 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 	return conflict, false
 }
 
-// tornTooLong records when this node first read ref torn and reports whether it
-// has stayed torn for tornExpiry. A slot that reads whole again is forgotten.
-func (m *Manager) tornTooLong(ref slotRef, torn bool) bool {
-	if !torn && m.tornCount.Load() == 0 {
+// tornTooLong reports whether ref has read torn, with the same bytes, for
+// tornExpiry; torn is nil when the slot reads whole. Changed bytes mean a node
+// is writing the slot, so they start the wait again.
+func (m *Manager) tornTooLong(ref slotRef, torn []byte) bool {
+	if torn == nil && m.tornCount.Load() == 0 {
 		return false
 	}
 	m.tornMu.Lock()
 	defer m.tornMu.Unlock()
 	defer func() { m.tornCount.Store(int32(len(m.tornSince))) }()
-	if !torn {
+	if torn == nil {
 		delete(m.tornSince, ref)
 		return false
 	}
-	first, ok := m.tornSince[ref]
-	if !ok {
-		m.tornSince[ref] = time.Now()
+	// Not CRC32C: a slot holds the CRC of its own contents, so every slot torn
+	// the same way has the same CRC32C whatever it says.
+	h := fnv.New64a()
+	h.Write(torn)
+	sum := h.Sum64()
+	seen, ok := m.tornSince[ref]
+	if !ok || seen.sum != sum {
+		m.tornSince[ref] = tornSighting{since: time.Now(), sum: sum}
 		return false
 	}
-	return age(first) > tornExpiry
+	return age(seen.since) > tornExpiry
 }
 
 // ownAdoptedLocked reports whether AdoptOwner kept recordID in this node's own
