@@ -16,6 +16,8 @@
 //	Level 7: SFBContainer
 //	Level 8: Inode (by number)
 //	Level 9: Extent (by block)
+//	Level 10: InodeSector (by inode table sector), a leaf: held only around
+//	one sector's read-modify-write, with no other lock taken while held
 package lock
 
 import (
@@ -90,6 +92,7 @@ const (
 	LockTypeSFBContainer LockType = 7
 	LockTypeInode        LockType = 8
 	LockTypeExtent       LockType = 9
+	LockTypeInodeSector  LockType = 10
 )
 
 // LockMode indicates shared (read) or exclusive (write) access.

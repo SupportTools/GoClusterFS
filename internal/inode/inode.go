@@ -532,6 +532,14 @@ func (t *Table) writeInodeSector(inode *Inode, checkTree bool) error {
 	sectorIdx := uint64(inode.InodeNum) / InodesPerSector
 	inodeOffset := uint64(inode.InodeNum) % InodesPerSector
 
+	// The sector holds 15 other inodes that other nodes may write at the same time.
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(context.Background(), lock.LockTypeInodeSector, sectorIdx, lock.LockModeExclusive); err != nil {
+			return fmt.Errorf("failed to acquire inode table sector lock: %w", err)
+		}
+		defer t.lockMgr.Release(lock.LockTypeInodeSector, sectorIdx)
+	}
+
 	// Read the entire sector first (we need to preserve other inodes)
 	sectorOffset := int64(t.offset) + int64(sectorIdx)*SectorSize
 
