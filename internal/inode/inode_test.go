@@ -13,7 +13,6 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-// createTestDevice creates a test file for O_DIRECT testing.
 // claimFree claims the first free inode the way the filesystem does.
 func claimFree(ctx context.Context, table *Table) (*Inode, error) {
 	num, err := table.FindFreeSlot()
@@ -23,6 +22,7 @@ func claimFree(ctx context.Context, table *Table) (*Inode, error) {
 	return table.ClaimSlot(ctx, num)
 }
 
+// createTestDevice creates a test file for O_DIRECT testing.
 func createTestDevice(tb testing.TB, size int64) (*storage.Device, func()) {
 	tb.Helper()
 

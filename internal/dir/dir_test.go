@@ -15,7 +15,6 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-// testSetup creates a test environment with all dependencies.
 // claimFree claims the first free inode the way the filesystem does.
 func claimFree(ctx context.Context, table *inode.Table) (*inode.Inode, error) {
 	num, err := table.FindFreeSlot()
@@ -25,6 +24,7 @@ func claimFree(ctx context.Context, table *inode.Table) (*inode.Inode, error) {
 	return table.ClaimSlot(ctx, num)
 }
 
+// testSetup creates a test environment with all dependencies.
 func testSetup(t *testing.T) (context.Context, *Manager, *inode.Table, func()) {
 	t.Helper()
 
