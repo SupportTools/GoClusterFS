@@ -210,7 +210,7 @@ Each node's journal is 4 MB, set by the on-disk layout.
 | `MulticastPort` | `31337` | `-mcast-port` | UDP port for multicast |
 | `UnicastPort` | `31338` | `-unicast-port` | UDP port for unicast; must differ from `MulticastPort` |
 | `MulticastTTL` | `1` | | Multicast packets stay in the local subnet |
-| `MaxMulticastFailures` | `3` | | After this many failed multicast sends, counted over the whole mount, the node sends to its unicast peers instead until it unmounts |
+| `MaxMulticastFailures` | `3` | | After this many multicast sends fail in a row, the node sends only to its unicast peers for 30 seconds, then tries multicast again. A successful send resets the count. `0` turns multicast off |
 | `HeartbeatInterval` | `30s` | | How often a node announces itself over UDP, so peers learn its unicast address. Failure detection uses the on-disk heartbeat, not this |
 | `Secret` | (empty) | `-broadcast-secret` | HMAC secret; all nodes must use the same one. With broadcast on and no secret, mount logs a `WARNING` at startup. Generate one with `openssl rand -hex 32` |
 | `Interface` | (system default) | `-broadcast-iface` | Network interface for multicast, such as `eth0` |
