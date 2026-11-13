@@ -17,6 +17,8 @@
 //	Level 7: SFBContainer
 //	Level 8: Inode (by number)
 //	Level 9: Extent (by block)
+//	Level 10: InodeSector (by inode table sector), a leaf: held only around
+//	one sector's read-modify-write, with no other lock taken while held
 package lock
 
 import (
@@ -97,6 +99,7 @@ const (
 	LockTypeSFBContainer LockType = 7
 	LockTypeInode        LockType = 8
 	LockTypeExtent       LockType = 9
+	LockTypeInodeSector  LockType = 10
 )
 
 // LockMode indicates shared (read) or exclusive (write) access.
@@ -272,7 +275,7 @@ func (m *Manager) Stats() Stats {
 	return Stats{Held: held, Waiting: int(m.waiting.Load())}
 }
 
-const numLockTypes = int(LockTypeExtent) + 1
+const numLockTypes = int(LockTypeInodeSector) + 1
 
 // acquireCounts says how one lock type's acquires on this node were served:
 // a key this node already held, a join of a held record, a cached record, a
@@ -707,7 +710,18 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 	hash *= 0xFF51AFD7ED558CCD
 	hash ^= hash >> 33
 
-	return hash % (m.size / RowSize)
+	// Inode table sector locks get their own records. A sector lock is a leaf,
+	// so its holder never waits on another lock, and no cycle of waits between
+	// nodes can pass through a record only sector locks use.
+	records := m.size / RowSize
+	leaf := records / 16
+	if leaf == 0 {
+		return hash % records
+	}
+	if lockType == LockTypeInodeSector {
+		return records - leaf + hash%leaf
+	}
+	return hash % (records - leaf)
 }
 
 // SameRecord reports whether two locks map to one record, so one goroutine holding both holds the record in the stronger mode.

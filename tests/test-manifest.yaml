@@ -422,6 +422,16 @@ scenarios:
       docker: run-tests.sh::test_extent_cache_coherency
       vm: run-vm-tests.sh::test_extent_cache_coherency
 
+  # Since #29 this test passes on main too; the inode-sector-neighbor-writes unit test is the regression check, and shell loops over docker exec and ssh would not hit the race either.
+  - id: multinode-neighbor-inode-writes
+    name: Neighbor inode writes from two nodes
+    description: Two nodes write files whose inodes share inode table sectors; every file keeps its data
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeNeighborInodeWrites
+      docker: TODO
+      vm: TODO
+
   # Docker and VM tests run shell tools over docker exec and ssh, which cannot keep signalling the thread inside a FUSE call.
   - id: multinode-create-with-signals
     name: Creates survive signals during lock waits
@@ -1907,6 +1917,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/interrupt_test.go::TestWriteFailsWhenLockIsNotFreed
+
+  - id: inode-sector-neighbor-writes
+    name: Neighbor inode writes keep both inodes
+    description: Two nodes increment two inodes in one inode table sector; neither loses an update
+    priority: go_only
+    environments:
+      go: internal/inode/sector_lock_test.go::TestNeighborInodeWritesFromTwoNodes
+
+  - id: sector-locks-own-records
+    name: Sector locks never wait on other lock types
+    description: Inode table sector locks map to reserved lock records, so a node holding inode locks never blocks another node's sector lock
+    priority: go_only
+    environments:
+      go: internal/lock/sector_test.go::TestSectorLocksDoNotWaitOnOtherLocks
 
   - id: create-stuck-inode-lock-eio
     name: Create fails with EIO when the new inode's lock is never freed
