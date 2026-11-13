@@ -502,28 +502,34 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("Received signal, unmounting...")
+		stopWatch := goclusterfs.WatchShutdown(8 * time.Second)
+		defer stopWatch()
 
 		// Stop API server first
 		if apiServer != nil {
-			if err := apiServer.Stop(); err != nil {
-				log.Printf("Warning: Failed to stop API server: %v", err)
-			}
-			sampler.Stop()
+			goclusterfs.ShutdownStep("API server stop", func() {
+				if err := apiServer.Stop(); err != nil {
+					log.Printf("Warning: Failed to stop API server: %v", err)
+				}
+				sampler.Stop()
+			})
 		}
 
 		// Close filesystem (stops snapshot worker, TRIM, journal, etc.)
-		nodeReg.Stop()
+		goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
 		if err := gfs.Close(); err != nil {
 			log.Printf("Warning: Failed to close filesystem: %v", err)
 		}
 
 		// Stop broadcaster to notify peers
-		if err := cacheMgr.StopBroadcast(); err != nil {
-			log.Printf("Warning: Failed to stop broadcast: %v", err)
-		}
+		goclusterfs.ShutdownStep("broadcast stop", func() {
+			if err := cacheMgr.StopBroadcast(); err != nil {
+				log.Printf("Warning: Failed to stop broadcast: %v", err)
+			}
+		})
 
 		// Unmount using go-fuse server method
-		server.Unmount()
+		goclusterfs.ShutdownStep("unmount", func() { server.Unmount() })
 	}()
 
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")

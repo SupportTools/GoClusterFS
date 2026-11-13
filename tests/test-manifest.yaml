@@ -3479,3 +3479,17 @@ scenarios:
     priority: go_only
     environments:
       go: internal/api/prometheus_test.go::TestMetricsEndpoint_ExportsCapacity
+
+  - id: shutdown-slow-step-logged
+    name: Slow shutdown step is logged
+    description: A shutdown step that takes longer than the limit logs its name and duration, and a quick one logs nothing
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/shutdown_test.go::TestOnlySlowShutdownStepsAreLogged
+
+  - id: shutdown-stall-dumps-goroutines
+    name: Stalled shutdown dumps goroutines
+    description: A shutdown still running past the limit logs every goroutine's stack once, and one that ends first logs nothing
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/shutdown_test.go::TestStalledShutdownLogsGoroutines

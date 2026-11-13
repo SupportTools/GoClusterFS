@@ -50,6 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
 - Apache License 2.0.
+- A shutdown step that takes longer than 2 seconds logs its name and duration, and a shutdown still running after 8 seconds logs every goroutine's stack.
 
 ### Changed
 
