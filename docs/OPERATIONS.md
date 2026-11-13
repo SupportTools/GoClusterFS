@@ -188,7 +188,7 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 ### Known Gaps in Slot Ownership
 
 - Slot claims use a read-compare-write on the device, then re-read the slot after 100 ms. Two nodes can still both keep a slot if one node's write lands more than 100 ms after its read, for example during a storage stall.
-- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to a new mount, which can take its slot and replay and reset its journal. Running nodes wait until it is proven dead (about 20 seconds, see above). The paused node exits on its next heartbeat after it resumes, up to 1 second later, and can write to the journal region in that second.
+- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to a new mount, which can take its slot and replay and reset its journal. Running nodes wait until it is proven dead (about 20 seconds, see above). When the paused node resumes, it refuses further writes and exits, but writes it started before the pause can still land.
 - A restarted container comes back in a new PID namespace, so its mount cannot prove by PID that the previous incarnation exited. It waits up to about 12 seconds for the old slot's heartbeat to go stale, then replays that journal before serving.
 
 ### Adding a New Node
@@ -269,7 +269,12 @@ Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, 
 
 **When another node's claim stops counting.** A claim counts until the registry slot with the same number is empty: its node unmounted cleanly, or another node replayed its journal and freed the slot. A node checks this by reading the registry slot from the device after it reads the record, so it cannot miss a node that registered in the meantime. A torn slot follows the same rule. After its replay, a mount clears the claims in its own slot that an earlier occupant left. How old a claim is does not matter, so a lock that a node never releases, for example after a bug, stays held until that node unmounts. The node logs a warning for each lock it has held for more than 60 seconds. A replay that fails or gets stuck keeps the dead node's locks held until a later replay succeeds; waits for them fail with `EIO` once its recovery lease lapses, about a minute after the replay last made progress. A mount whose own journal replay gives up waiting for another node's lock retries every 1 to 30 seconds and logs who holds the lock each time. Any other replay failure, such as a record that does not decode or an I/O error, fails the mount at once with the `-skip-recovery` hint.
 
-**The hazard: a stalled node keeps writing.** If a node stops for about 20 seconds while it holds a lock, other nodes prove it dead, replay its journal and take its locks. When the stalled node resumes, it exits on its next heartbeat, up to 1 second later, but it can finish the writes it had started. No write path checks that the lock is still held, and there is no fencing token. Two nodes then write the same metadata, which can double-allocate blocks or lose directory entries.
+**The hazard: a stalled node's last writes.** If a node stops for about 20 seconds while it holds a lock, other nodes prove it dead, replay its journal and take its locks. Before every device write, a node checks that it wrote its heartbeat less than 5 seconds ago. If not, it writes a heartbeat first, and if its registry slot is no longer its own, it refuses the write and exits. Some writes still land after the takeover:
+
+- a write that passed the check just before the stall, and I/O the kernel or the storage queued during it;
+- writes in the second after the takeover, if the stalled node resumed while the other node was marking its slot dead.
+
+Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap, for example SCSI-3 persistent reservations (or NVMe reservations), with which surviving nodes revoke a dead node's access to the device. GoClusterFS does not use them.
 
 Common causes of a stall:
 

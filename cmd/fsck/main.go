@@ -238,15 +238,17 @@ const repairHelp = `
 Repair:
   Unmount the filesystem on every node first. -repair refuses to run while a
   node's heartbeat still moves, which it can take up to 11 seconds to rule out
-  right after an unmount, or while a stopped node's journal still needs replay
-  (-force overrides only the second check).
+  right after an unmount, while a stopped node's journal still needs replay
+  (-force overrides only this check), or when mount would refuse the layout.
 
   -repair rewrites block refcounts from the extents of every inode, snapshot
-  and clone, marks blocks that older versions shared as counted, and fixes the
-  superblock checksum when every other superblock field checks out. It never
-  frees blocks, deletes inodes or edits directories, and it leaves problems
-  not marked [FIXABLE] as they are. It skips the refcount rebuild when some
-  inode could not be read, since the rebuilt counts could then be too low.
+  and clone, marks blocks that older versions shared as counted, frees leaked
+  blocks that nothing maps, frees inodes that no directory names along with
+  their blocks, and fixes the superblock checksum when every other superblock
+  field checks out. It never edits directories, and it leaves problems not
+  marked [FIXABLE] as they are. It keeps the refcounts, leaked blocks and
+  unnamed inodes as they are when it could not read every reference to them
+  or a node's journal still needs replay, since it could then miss an owner.
 
   Back up the device first (for example with dd) and run -repair -dry-run to
   see what would change.

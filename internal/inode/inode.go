@@ -568,6 +568,47 @@ func (t *Table) FreeIf(ctx context.Context, inodeNum uint32, ok func(*Inode) boo
 	return true, nil
 }
 
+// UpdateIf reads an inode under its lock and, if update accepts it, writes back
+// the changes update made before the lock is released. It returns the inode as
+// update left it and whether it was written. Blocks the write releases are
+// freed after the lock is dropped.
+func (t *Table) UpdateIf(ctx context.Context, inodeNum uint32, update func(*Inode) (bool, error)) (*Inode, bool, error) {
+	if uint64(inodeNum) >= t.totalInodes {
+		return nil, false, ErrInodeOutOfRange
+	}
+	committed, inode, written, err := t.updateIfLocked(ctx, inodeNum, update)
+	if committed != nil {
+		committed()
+	}
+	return inode, written, err
+}
+
+func (t *Table) updateIfLocked(ctx context.Context, inodeNum uint32, update func(*Inode) (bool, error)) (func(), *Inode, bool, error) {
+	if t.lockMgr != nil {
+		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inodeNum), lock.LockModeExclusive); err != nil {
+			return nil, nil, false, fmt.Errorf("failed to acquire inode lock: %w", err)
+		}
+		defer t.unlock(lock.LockTypeInode, uint64(inodeNum))
+	}
+	inode, err := t.Read(inodeNum)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if ok, err := update(inode); err != nil || !ok {
+		return nil, inode, false, err
+	}
+	unlockSector, err := t.lockSector(inodeNum)
+	if err != nil {
+		return nil, inode, false, err
+	}
+	defer unlockSector()
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	committed, err := t.writeWithTree(inode)
+	return committed, inode, err == nil, err
+}
+
 // TotalInodes returns the total number of inodes in the table.
 func (t *Table) TotalInodes() uint64 {
 	return t.totalInodes

@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -370,6 +371,45 @@ func TestMultiShardIO(t *testing.T) {
 				i, readBuf.Bytes()[i], buf.Bytes()[i])
 			break
 		}
+	}
+}
+
+func TestWriteGateRefusesWrites(t *testing.T) {
+	tmpDir := os.Getenv("GOCLUSTERFS_TEST_DIR")
+	if tmpDir == "" {
+		tmpDir = t.TempDir()
+	}
+	path := filepath.Join(tmpDir, "test_gate.bin")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(path) }()
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	refused := errors.New("refused")
+	dev.SetWriteGate(func(offset int64) error {
+		if offset >= SectorSize {
+			return refused
+		}
+		return nil
+	})
+	buf := NewAlignedBuffer(SectorSize)
+	copy(buf.Bytes(), bytes.Repeat([]byte{'x'}, SectorSize))
+	if _, err := dev.WriteAt(buf.Bytes(), 0); err != nil {
+		t.Fatalf("write the gate allows: %v", err)
+	}
+	if _, err := dev.WriteAtUnsharded(buf.Bytes(), SectorSize); !errors.Is(err, refused) {
+		t.Fatalf("write the gate refuses = %v, want %v", err, refused)
+	}
+	if _, err := dev.ReadAt(buf.Bytes(), SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf.Bytes(), make([]byte, SectorSize)) {
+		t.Error("a refused write reached the device")
 	}
 }
 

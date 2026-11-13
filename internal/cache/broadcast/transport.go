@@ -33,7 +33,8 @@ type Transport struct {
 	multicastRecv     uint64
 	unicastSent       uint64
 	unicastRecv       uint64
-	multicastFailures uint64
+	multicastFailures uint64 // total over the transport's life
+	multicast         multicastHealth
 	lastSendErr       atomic.Pointer[error]
 
 	// State
@@ -65,7 +66,8 @@ type Config struct {
 	// Default: 1 (same subnet only)
 	MulticastTTL int
 
-	// MaxMulticastFailures is the threshold before switching to unicast.
+	// MaxMulticastFailures is how many multicast sends may fail in a row before
+	// the transport sends only to unicast peers for a while. 0 turns multicast off.
 	// Default: 3
 	MaxMulticastFailures int
 
@@ -310,15 +312,21 @@ func (t *Transport) deliver(data []byte) error {
 	// Try multicast first. It goes out on the unicast socket: ListenMulticastUDP
 	// turns off multicast loopback on its socket, so other nodes on this host
 	// would not receive what that socket sends.
-	if t.multicastConn != nil && atomic.LoadUint64(&t.multicastFailures) < uint64(t.config.MaxMulticastFailures) {
+	limit := t.config.MaxMulticastFailures
+	if t.multicastConn != nil && t.multicast.usable(time.Now(), limit) {
 		_, err := t.unicastConn.WriteToUDP(data, t.multicastAddr)
-		if err != nil {
-			atomic.AddUint64(&t.multicastFailures, 1)
-			log.Printf("[broadcast] multicast send failed (%d failures): %v",
-				atomic.LoadUint64(&t.multicastFailures), err)
-		} else {
+		if err == nil {
 			atomic.AddUint64(&t.multicastSent, 1)
+			if t.multicast.succeeded(limit) {
+				log.Printf("[broadcast] multicast sends work again")
+			}
 			return nil
+		}
+		total := atomic.AddUint64(&t.multicastFailures, 1)
+		if t.multicast.failed(time.Now(), limit) {
+			log.Printf("[broadcast] multicast send failed (%d in total): %v; sending only to unicast peers for %v", total, err, multicastRetry)
+		} else {
+			log.Printf("[broadcast] multicast send failed (%d in total): %v", total, err)
 		}
 	}
 
@@ -372,9 +380,55 @@ func (t *Transport) PeerCount() int {
 	return len(t.peers)
 }
 
-// ResetMulticastFailures resets the failure counter to re-enable multicast.
+// ResetMulticastFailures re-enables multicast sends at once.
 func (t *Transport) ResetMulticastFailures() {
-	atomic.StoreUint64(&t.multicastFailures, 0)
+	t.multicast.reset()
+}
+
+// multicastRetry is how long a transport sends only to unicast peers after
+// MaxMulticastFailures multicast sends failed in a row.
+const multicastRetry = 30 * time.Second
+
+// multicastHealth tracks multicast sends that failed in a row. A limit of 0
+// turns multicast off.
+type multicastHealth struct {
+	mu      sync.Mutex
+	streak  int
+	retryAt time.Time
+}
+
+func (h *multicastHealth) usable(now time.Time, limit int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return limit > 0 && (h.streak < limit || !now.Before(h.retryAt))
+}
+
+// failed records a failed send and reports whether multicast is now paused.
+func (h *multicastHealth) failed(now time.Time, limit int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.streak++
+	if h.streak < limit {
+		return false
+	}
+	h.retryAt = now.Add(multicastRetry)
+	return true
+}
+
+// succeeded records a successful send and reports whether multicast had been paused.
+func (h *multicastHealth) succeeded(limit int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	paused := h.streak >= limit
+	h.streak = 0
+	return paused
+}
+
+func (h *multicastHealth) reset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.streak = 0
+	h.retryAt = time.Time{}
 }
 
 // Problem says why peers may miss this node's invalidations, or returns ""
@@ -389,7 +443,7 @@ func (t *Transport) Problem() string {
 	if err := t.lastSendErr.Load(); err != nil {
 		return "the last invalidation send failed: " + (*err).Error()
 	}
-	multicast := t.multicastConn != nil && atomic.LoadUint64(&t.multicastFailures) < uint64(t.config.MaxMulticastFailures)
+	multicast := t.multicastConn != nil && t.multicast.usable(time.Now(), t.config.MaxMulticastFailures)
 	if !multicast && t.PeerCount() == 0 {
 		return "multicast is unavailable and no unicast peers are known"
 	}

@@ -33,7 +33,6 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
-	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/stats"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -108,7 +107,7 @@ func main() {
 		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Max age before TRIM flush")
 
 		// SFB configuration (Sub-File Block containers for small files)
-		sfbEnabled = flag.Bool("sfb", true, "Enable SFB containers for small files (<64KB)")
+		_ = flag.Bool("sfb", true, "Ignored: SFB containers are disabled, and every file uses full 1MB blocks")
 
 		// Snapshot configuration
 		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
@@ -251,6 +250,7 @@ func main() {
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
 	}
+	dev.SetWriteGate(nodeReg.WriteGate)
 	nodeUUID := nodeReg.LocalUUID()
 	log.Printf("Registered as node %d (UUID: %x)", slotIdx, nodeUUID[:8])
 	journalOffset, journalSize := nodeReg.LocalJournal()
@@ -397,17 +397,10 @@ func main() {
 		log.Println("TRIM: disabled")
 	}
 
-	// Create SFB manager for small file optimization
-	var sfbMgr *sfb.Manager
-	if *sfbEnabled {
-		sfbMgr = sfb.NewManager(dev, bm, lockMgr)
-		log.Println("SFB: enabled (tiers: 4KB/8KB/16KB/64KB)")
-	} else {
-		log.Println("SFB: disabled (all files use full 1MB blocks)")
-	}
+	log.Println("SFB: disabled (-sfb is ignored); new files use full 1MB blocks, and files older builds stored in SFB slots move to full blocks on their next write")
 
-	// Create filesystem with journal, TRIM, SFB, and refcount for crash consistency
-	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, sfbMgr, refcountReg, lockMgr, nodeUUID, dataOffset)
+	// Create filesystem with journal, TRIM, and refcount for crash consistency
+	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nil, refcountReg, lockMgr, nodeUUID, dataOffset)
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -576,13 +569,6 @@ func main() {
 		jStats := j.Stats()
 		log.Printf("Journal stats: commits=%d, bytes=%d, state=%v",
 			jStats.CommitCount, jStats.BytesWritten, jStats.State)
-	}
-
-	// Print final SFB stats
-	if sfbMgr != nil {
-		total, byTier := sfbMgr.GetContainerStats()
-		log.Printf("SFB stats: containers=%d (4KB=%d, 8KB=%d, 16KB=%d, 64KB=%d)",
-			total, byTier[0], byTier[1], byTier[2], byTier[3])
 	}
 
 	// Print final cache stats

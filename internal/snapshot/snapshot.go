@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"log"
 	"sync"
 	"time"
 
@@ -271,6 +272,18 @@ func NewRegistry(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager
 	}
 }
 
+// unlock releases the registry lock. ErrNotLockOwner means a double release:
+// the extra one may have dropped another holder's lock early.
+func (r *Registry) unlock() {
+	err := r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+	switch {
+	case errors.Is(err, lock.ErrNotLockOwner):
+		log.Printf("[ERROR] snapshot registry: released the registry lock that this node does not hold (double release or lock bookkeeping bug)")
+	case err != nil:
+		log.Printf("[WARN] snapshot registry: releasing the registry lock failed: %v", err)
+	}
+}
+
 // Create creates a new snapshot descriptor.
 //
 // Parameters:
@@ -297,7 +310,7 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire snapshot lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -435,7 +448,7 @@ func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID u
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire snapshot lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -481,7 +494,7 @@ func (r *Registry) updateState(ctx context.Context, snapshotID uint64, newState,
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire snapshot lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -515,7 +528,7 @@ func (r *Registry) SetRefCountJobID(ctx context.Context, snapshotID, jobID uint6
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire snapshot lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()
@@ -549,7 +562,7 @@ func (r *Registry) Remove(ctx context.Context, snapshotID uint64) error {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeSnapshot, 0, lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire snapshot lock: %w", err)
 		}
-		defer r.lockMgr.Release(lock.LockTypeSnapshot, 0)
+		defer r.unlock()
 	}
 
 	r.mu.Lock()

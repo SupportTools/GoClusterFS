@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -39,26 +41,28 @@ func setupTestDevice(t *testing.T) (*storage.Device, string, func()) {
 	devPath := filepath.Join(tmpDir, "test.img")
 	f, err := os.Create(devPath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to create device file: %v", err)
 	}
 
 	if err := f.Truncate(testDeviceSize); err != nil {
-		f.Close()
-		os.RemoveAll(tmpDir)
+		_ = f.Close()
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to truncate device: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	dev, err := storage.Open(devPath)
 	if err != nil {
-		os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to open device: %v", err)
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.RemoveAll(tmpDir)
+		_ = dev.Close()
+		_ = os.RemoveAll(tmpDir)
 	}
 
 	return dev, devPath, cleanup
@@ -652,5 +656,78 @@ func TestDeleteJobRequiresDeletingState(t *testing.T) {
 	}
 	if e, err := env.refs.Get(env.ctx, blocks[0]); err != nil || e.RefCount != 2 {
 		t.Fatalf("block refcount %+v, %v; want 2", e, err)
+	}
+}
+
+// Two delete jobs run for one snapshot, as when a node mounts while another
+// node deletes it. The second job read the descriptor before the first one
+// freed the data inode, which a new file or snapshot then took. The second job
+// must leave the new inode alone and finish without error.
+func TestSecondDeleteJobLeavesReusedDataInode(t *testing.T) {
+	for _, reuse := range []string{"file", "snapshot"} {
+		t.Run(reuse, func(t *testing.T) {
+			env := newWorkerEnv(t)
+			file, blocks := env.file(2)
+			old := env.snapshot(file, "old", StateActive)
+			if err := env.reg.Delete(env.ctx, old.SnapshotID); err != nil {
+				t.Fatal(err)
+			}
+			job := &Job{SnapshotID: old.SnapshotID}
+
+			// Another node's worker, with its own job lock.
+			other := NewWorker(env.reg, env.ext, env.tbl, DefaultWorkerConfig())
+			paused, resume := make(chan struct{}), make(chan struct{})
+			var first atomic.Bool
+			t.Cleanup(func() { afterDeleteJobGet = nil })
+			afterDeleteJobGet = func(uint64) {
+				if first.CompareAndSwap(false, true) {
+					close(paused)
+					<-resume
+				}
+			}
+			second := make(chan error, 1)
+			go func() { second <- other.processDeleteJob(env.ctx, job) }()
+			<-paused
+			if err := env.w.processDeleteJob(env.ctx, job); err != nil {
+				t.Fatalf("first delete job: %v", err)
+			}
+			env.checkGone(old)
+
+			num, want, owners := uint32(0), []uint64(nil), uint32(0)
+			if reuse == "file" {
+				var ino *inode.Inode
+				ino, want = env.file(1)
+				num = ino.InodeNum
+			} else {
+				num, want, owners = env.snapshot(file, "new", StateActive).DataInode, blocks, 2
+			}
+			if num != old.DataInode {
+				t.Fatalf("the new %s took inode %d, not the freed data inode %d", reuse, num, old.DataInode)
+			}
+
+			close(resume)
+			if err := <-second; err != nil {
+				t.Errorf("second delete job: %v", err)
+			}
+			ino, err := env.tbl.Read(num)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := env.ext.DataBlocks(ino)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("the new %s maps blocks %v after the second job, want %v", reuse, got, want)
+			}
+			for _, b := range want {
+				if !env.allocated(b) {
+					t.Errorf("block %d of the new %s was freed", b, reuse)
+				}
+				if e, err := env.refs.GetUnlocked(b); err != nil || owners != 0 && e.RefCount != owners {
+					t.Errorf("block %d: refcount %d (err=%v), want %d", b, e.RefCount, err, owners)
+				}
+			}
+		})
 	}
 }

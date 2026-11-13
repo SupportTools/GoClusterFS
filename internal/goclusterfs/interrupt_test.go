@@ -10,6 +10,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -60,7 +61,7 @@ func TestWriteFailsWhenLockIsNotFreed(t *testing.T) {
 	fileA := newRegularFile(t, nodeA)
 	fileB := &File{fs: nodeB, inodeNum: fileA.inodeNum}
 
-	release := holdInodeLock(t, nodeA, uint64(fileA.inodeNum))
+	release := holdLock(t, nodeA, lock.LockTypeInode, uint64(fileA.inodeNum))
 	ctx, interrupt := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, interrupt)
 	start := time.Now()
@@ -75,15 +76,15 @@ func TestWriteFailsWhenLockIsNotFreed(t *testing.T) {
 	}
 }
 
-// holdInodeLock takes an inode lock on fsys and keeps it until release is
-// called. Like a busy holder, it rejoins the lock every second, which keeps the
-// record from going stale.
-func holdInodeLock(t *testing.T, fsys *FS, res uint64) (release func()) {
+// holdLock takes a lock on fsys and keeps it until release is called. Like a
+// busy holder, it rejoins the lock every second, which keeps the record from
+// going stale.
+func holdLock(t *testing.T, fsys *FS, typ lock.LockType, res uint64) (release func()) {
 	t.Helper()
 	held, stop, stopped := make(chan error, 1), make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
-		err := fsys.lockMgr.Acquire(context.Background(), lock.LockTypeInode, res, lock.LockModeExclusive)
+		err := fsys.lockMgr.Acquire(context.Background(), typ, res, lock.LockModeExclusive)
 		held <- err
 		if err != nil {
 			return
@@ -93,17 +94,17 @@ func holdInodeLock(t *testing.T, fsys *FS, res uint64) (release func()) {
 		for {
 			select {
 			case <-stop:
-				fsys.lockMgr.Release(lock.LockTypeInode, res)
+				fsys.lockMgr.Release(typ, res)
 				return
 			case <-tick.C:
-				if fsys.lockMgr.Acquire(context.Background(), lock.LockTypeInode, res, lock.LockModeExclusive) == nil {
-					fsys.lockMgr.Release(lock.LockTypeInode, res)
+				if fsys.lockMgr.Acquire(context.Background(), typ, res, lock.LockModeExclusive) == nil {
+					fsys.lockMgr.Release(typ, res)
 				}
 			}
 		}
 	}()
 	if err := <-held; err != nil {
-		t.Fatalf("hold inode lock %d: %v", res, err)
+		t.Fatalf("hold lock type %d res %d: %v", typ, res, err)
 	}
 	return func() {
 		close(stop)
@@ -125,7 +126,7 @@ func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	release := holdInodeLock(t, nodeA, uint64(slot))
+	release := holdLock(t, nodeA, lock.LockTypeInode, uint64(slot))
 	_, errno := nodeB.createFileOnce(context.Background(), &nodeB.Inode, inode.InodeRoot, "stuck", 0o644, &fuse.EntryOut{})
 	release()
 	if errno != syscall.EIO {
@@ -137,6 +138,50 @@ func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
 	}
 	if _, _, err := nodeB.dirMgr.Lookup(context.Background(), root, "stuck"); !errors.Is(err, dir.ErrNotFound) {
 		t.Errorf("lookup after the failed create: %v, want the entry rolled back", err)
+	}
+}
+
+// TestAllocationReportsStuckBitmapLockAsEIO keeps the bitmap lock held on
+// another node past lock.DefaultTimeout. A write and a fallocate that need new
+// blocks must fail with EIO, not ENOSPC: the device has free blocks.
+func TestAllocationReportsStuckBitmapLockAsEIO(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits lock.DefaultTimeout")
+	}
+	path := newFormattedImage(t)
+	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
+	written, fallocated := newRegularFile(t, nodeB), newRegularFile(t, nodeB)
+
+	release := holdLock(t, nodeA, lock.LockTypeBlockBitmap, 0)
+	writeErr, fallocErr := make(chan syscall.Errno, 1), make(chan syscall.Errno, 1)
+	go func() {
+		_, errno := written.Write(context.Background(), nil, []byte("needs a block"), 0)
+		writeErr <- errno
+	}()
+	go func() {
+		fallocErr <- fallocated.Allocate(context.Background(), nil, 0, BlockSize, 0)
+	}()
+	gotWrite, gotFalloc := <-writeErr, <-fallocErr
+	release()
+	if gotWrite != syscall.EIO {
+		t.Errorf("write while the bitmap stays locked = %v, want EIO", gotWrite)
+	}
+	if gotFalloc != syscall.EIO {
+		t.Errorf("fallocate while the bitmap stays locked = %v, want EIO", gotFalloc)
+	}
+}
+
+func TestAllocErrno(t *testing.T) {
+	for err, want := range map[error]syscall.Errno{
+		fmt.Errorf("failed to allocate blocks: %w", bitmap.ErrNoFreeBlocks):         syscall.ENOSPC,
+		fmt.Errorf("failed to acquire bitmap lock: %w", lock.ErrLockTimeout):        syscall.EIO,
+		fmt.Errorf("failed to read bitmap sector 3: %w", bitmap.ErrInvalidChecksum): syscall.EIO,
+		fmt.Errorf("failed to read bitmap sector 3: %w", syscall.EIO):               syscall.EIO,
+		fmt.Errorf("failed to write bitmap sector 3: %w", syscall.ENOSPC):           syscall.ENOSPC,
+	} {
+		if got := allocErrno(err); got != want {
+			t.Errorf("allocErrno(%v) = %v, want %v", err, got, want)
+		}
 	}
 }
 
