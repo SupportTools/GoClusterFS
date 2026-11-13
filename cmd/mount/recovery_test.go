@@ -25,7 +25,7 @@ func dirtyJournal(t *testing.T) *storage.Device {
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { _ = os.Remove(path) })
 	if err := os.Truncate(path, int64(journal.DefaultJournalSlotSize)); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func dirtyJournal(t *testing.T) *storage.Device {
 	if err != nil {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 	j, err := journal.Init(dev, 0, journal.DefaultJournalSlotSize, [16]byte{1}, 1, journal.DefaultConfig())
 	if err != nil {
 		t.Fatal(err)
