@@ -89,4 +89,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A mount that took the registry slot of a failed node on another host did not keep that node's locks while it replayed the node's journal.
 - Two nodes replaying dead nodes whose locks shared a record waited on each other until the lock timeout.
 - A failed journal replay of a dead node still freed that node's locks, so other nodes could use half-replayed metadata until the retry a minute later. The locks now stay held until a replay succeeds.
-- A mount whose own journal replay could not apply a transaction, for example while another node held a lock it needed, exited at once. It now retries with backoff; a journal it cannot read still fails the mount.
+- A mount whose own journal replay gave up waiting for another node's lock exited at once. It now retries with backoff and logs the holder; any other replay failure still fails the mount.

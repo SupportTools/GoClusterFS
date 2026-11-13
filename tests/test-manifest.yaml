@@ -2895,12 +2895,19 @@ scenarios:
     environments:
       go: internal/node/registry_test.go::TestFailedReplayKeepsDeadNodesLocks
 
-  - id: journal-retries-failed-apply
-    name: Journal recovery marks a failed apply as retryable
-    description: A transaction that cannot be applied fails ScanAndRecover with ErrApplyFailed, and the next attempt resumes the journal and finishes it
+  - id: mount-own-replay-retries-lock-wait
+    name: Mount retries its own replay while another node holds a lock
+    description: A mount whose own journal replay gives up waiting for another node's lock retries with backoff and replays the transaction once the lock frees
     priority: go_only
     environments:
-      go: internal/journal/recovery_test.go::TestScanAndRecoverRetriesFailedApply
+      go: cmd/mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
+
+  - id: mount-own-replay-stops-at-bad-record
+    name: Mount stops at a journal record that does not decode
+    description: Any own-journal replay failure other than a lock wait fails the mount at once, with the -skip-recovery hint
+    priority: go_only
+    environments:
+      go: cmd/mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
 
   - id: registry-occupant-states
     name: Registry reports how each slot's node stands

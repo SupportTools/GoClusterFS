@@ -288,7 +288,7 @@ func main() {
 		// Replay a dirty journal left in this slot's region by its previous owner
 		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, slotIdx)
 		if err != nil {
-			log.Fatalf("Journal recovery for slot %d failed: %v (to discard this journal, mount with -skip-recovery=%d)", slotIdx, err, slotIdx)
+			log.Fatal(err)
 		}
 		if result != nil && result.WasNeeded {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
@@ -597,18 +597,25 @@ var ownerStates = map[node.Occupancy]lock.OwnerState{
 	node.Unoccupied:      lock.OwnerReleased,
 }
 
+// ownReplayRetry is the first wait before a mount retries its own journal
+// replay; tests shorten it.
+var ownReplayRetry = time.Second
+
 // recoverOwnJournal replays the journal this node's slot holds from its
-// previous owner. A transaction that cannot be applied yet, for example while a
-// lock it needs is held, is retried with backoff; a journal that cannot be read
-// fails at once.
+// previous owner. A replay that gave up waiting for another node's lock is
+// retried with backoff. Any other failure, such as a record that does not
+// decode or an I/O error, cannot get better by waiting, so it stops the mount.
 func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal.RecoveryHandler, slot int) (*journal.ScanRecoveryResult, error) {
-	delay := time.Second
+	delay := ownReplayRetry
 	for {
 		result, err := journal.ScanAndRecover(dev, offset, size, handler)
-		if !errors.Is(err, journal.ErrApplyFailed) {
-			return result, err
+		if err == nil {
+			return result, nil
 		}
-		log.Printf("[WARN] Journal recovery for slot %d could not apply a transaction: %v; retrying in %v", slot, err, delay)
+		if !errors.Is(err, lock.ErrLockTimeout) {
+			return nil, fmt.Errorf("journal recovery for slot %d failed: %w (to discard this journal, mount with -skip-recovery=%d)", slot, err, slot)
+		}
+		log.Printf("[WARN] Journal recovery for slot %d is waiting for another node's lock: %v; retrying in %v", slot, err, delay)
 		time.Sleep(delay)
 		delay = min(2*delay, 30*time.Second)
 	}

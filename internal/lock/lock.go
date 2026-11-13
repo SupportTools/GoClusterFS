@@ -456,17 +456,14 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			defer m.waiting.Add(-1)
 		}
 
-		switch by.state {
-		case OwnerLost:
-			log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v: the journal replay of node %x (slot %d), which holds it, failed or was abandoned",
+		if by.state == OwnerLost {
+			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
+				"the journal replay of node %x (slot %d), which holds record %d, failed or was abandoned", by.occupant[:8], by.slot, recordID))
+		}
+		if by.state == OwnerFailing && time.Since(lastFailingLog) >= acquireTimeout {
+			lastFailingLog = time.Now()
+			log.Printf("[WARN] lock: type=%d res=%d mode=%d has waited %v for node %x (slot %d), which holds it and is failing or being recovered; waiting until its journal replay ends",
 				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), by.occupant[:8], by.slot)
-			return ErrLockTimeout
-		case OwnerFailing:
-			if time.Since(lastFailingLog) >= acquireTimeout {
-				lastFailingLog = time.Now()
-				log.Printf("[WARN] lock: type=%d res=%d mode=%d has waited %v for node %x (slot %d), which holds it and is failing or being recovered; waiting until its journal replay ends",
-					lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), by.occupant[:8], by.slot)
-			}
 		}
 
 		// Check context cancellation, but allow at least 3 retries. A wait gives
@@ -474,13 +471,11 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		// while this goroutine holds other locks; a replay's wait never does.
 		if retryCount >= 3 && (ctx.Err() != nil || !replay && liveWait > acquireTimeout) {
 			if by.state == OwnerFailing {
-				log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v: this goroutine holds other locks, and record %d is held by node %x (slot %d), which is failing or being recovered and whose replay may need one of them",
-					lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), recordID, by.occupant[:8], by.slot)
-			} else {
-				log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v (%d tries); record %d %s",
-					lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), retryCount, recordID, m.describeHolder(recordID))
+				return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf(
+					"this goroutine holds other locks, and record %d is held by node %x (slot %d), which is failing or being recovered and whose replay may need one of them",
+					recordID, by.occupant[:8], by.slot))
 			}
-			return ErrLockTimeout
+			return m.giveUp(lockType, resourceID, mode, startTime, fmt.Sprintf("record %d %s", recordID, m.describeHolder(recordID)))
 		}
 
 		// Add jitter to prevent thundering herd
@@ -583,6 +578,14 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
 	return true, true, blocker{}, nil
+}
+
+// giveUp logs why an Acquire stopped waiting and returns ErrLockTimeout with
+// that reason, so callers can tell who holds the lock.
+func (m *Manager) giveUp(lockType LockType, resourceID uint64, mode LockMode, start time.Time, reason string) error {
+	log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v: %s",
+		lockType, resourceID, mode, time.Since(start).Round(time.Millisecond), reason)
+	return fmt.Errorf("%w: %s", ErrLockTimeout, reason)
 }
 
 func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) bool {

@@ -12,9 +12,6 @@ var (
 	ErrRecoveryFailed = errors.New("journal recovery failed")
 	ErrCorruptTxn     = errors.New("corrupt transaction found")
 	ErrUnexpectedEnd  = errors.New("unexpected end of journal data")
-	// ErrApplyFailed wraps a failure to apply a readable transaction, which a
-	// later attempt can retry, as opposed to a journal that cannot be read.
-	ErrApplyFailed = errors.New("applying a transaction failed")
 )
 
 // RecoveredTxn represents a transaction found during recovery.
@@ -302,7 +299,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 			if handler != nil {
 				if err := handler(recoveredTxn); err != nil {
 					stats.Errors++
-					return fmt.Errorf("%w: txn %d: %w", ErrApplyFailed, txnHeader.Seq, err)
+					return fmt.Errorf("handler failed for txn %d: %w", txnHeader.Seq, err)
 				}
 			}
 
