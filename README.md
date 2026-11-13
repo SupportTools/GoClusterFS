@@ -7,10 +7,10 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Clustered Access**: Multiple nodes can mount the same block device concurrently
 - **O_DIRECT I/O**: Bypasses host page cache for true cluster coherency
 - **Generation-Based Cache Coherency**: Efficient validation without cross-node communication
-- **Write-Ahead Journal**: Crash-consistent metadata updates with configurable commit modes
+- **Write-Ahead Journal**: Crash-consistent metadata updates, one journal per node
 - **Distributed Locking**: CAS-based on-disk locks for safe concurrent access
 - **Network Cache Invalidation**: UDP multicast for near-instant cross-node cache updates
-- **Copy-on-Write Snapshots**: O(1) file snapshots with refcount-based block sharing
+- **Copy-on-Write Snapshots**: File snapshots and clones that share blocks until a write (experimental)
 - **Thin Provisioning**: Allocate-on-write with TRIM/BLKDISCARD support
 - **8-Phase fsck**: Comprehensive filesystem consistency checker with repair mode
 
@@ -29,7 +29,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **Name lookups are slow.** Each lookup reads the whole directory from disk and scans it entry by entry. In one test on a single node, a lookup took about 25 ms, and `ls -l` on a 1,000-file directory took about 47 seconds.
 - **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime, and a read can stop at the old size. A file that stays open can use the old size and block mappings for up to `-cache-ttl` (default 5s). Opening the file after `-attr-timeout` has passed reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
-- **On-disk format version 3.** Mount refuses images formatted by earlier builds. Copy the data off with the old build, reformat, and copy it back.
+- **On-disk format version 3.** Mount refuses images formatted by earlier builds, including version 3 images formatted before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) gave each lock type its own lock records. Copy the data off with the build that formatted the image, reformat, and copy it back.
 - **The inode count is set at format time.** `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB, so one per data block), between 4096 and 16,777,216. It cannot change later.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
@@ -97,13 +97,14 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 |------|---------|-------------|
 | `-cache-strict` | `false` | Always validate cache against disk |
 | `-cache-ttl` | `5s` | Time before cache entries need revalidation |
+| `-attr-timeout` | `1s` | How long the kernel caches file attributes and directory entries |
 
 ### Journal Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-journal` | `true` | Enable write-ahead journal |
-| `-skip-recovery=N` | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous) |
+| `-skip-recovery=N` | `-1` (off) | Emergency only: discard the journal of registry slot N instead of replaying it, if the mount takes slot N. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot) |
 
 ### Network Broadcast Options
 
@@ -131,7 +132,7 @@ With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-b
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-sfb` | `true` | Ignored. SFB containers are disabled and every file uses full blocks |
-| `-snapshots` | `true` | Enable O(1) file snapshots |
+| `-snapshots` | `true` | Enable file snapshots and clones through extended attributes |
 
 ### HTTP API Options
 
@@ -145,7 +146,7 @@ With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-b
 | `-api-rate-limit` | `0` (off) | Requests per second per client IP, with bursts of twice that |
 | `-dashboard` | `true` | Serve the web dashboard at `http://<api-addr>/ui/` |
 
-The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and no token is set. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
+The API only listens on this host by default. Mount refuses to start when `-api-addr` can be reached from other hosts and no token is set. If the API port is taken, mount logs a warning and runs without the API. See [HTTP API Flags](docs/API-CONFIG.md#http-api-flags).
 
 ## gfsctl
 
@@ -270,8 +271,9 @@ GoClusterFS uses a layered architecture:
 # Unit tests
 make test-unit
 
-# Integration tests (requires FUSE)
-make test-integration
+# Integration tests as CI runs them (requires FUSE)
+make build
+go test -v -short -timeout 20m ./tests/integration/...
 
 # Multi-node Docker tests
 make test-multinode-docker
@@ -282,6 +284,15 @@ make test-multinode-vm
 # Validate test coverage across environments
 make test-parity
 ```
+
+Integration tests start `./goclusterfs-mount`, so run `make build` first. They put images and mount points in `$TMPDIR`, which must support O_DIRECT, and unmount with `fusermount`. CI passes `-short`, which skips the crash-recovery, large-file, many-file and stress tests and shrinks some multi-node tests. To run the skipped tests too, drop `-short`:
+
+```bash
+mkdir -p ~/gcfs-tmp
+TMPDIR=~/gcfs-tmp go test -v -timeout 30m ./tests/integration/...
+```
+
+The full suite took about 15 minutes on one test host, and the tests that `-short` skips about 4 of them. `TestLargeVolume` creates a 200 GB sparse image. `make test-integration` runs the full suite with a 5-minute timeout, which is too short.
 
 VM tests need an x86_64 Linux host with `/dev/kvm`, `qemu-system-x86_64`, OpenBSD `nc` (Debian's `netcat-openbsd`) and `setpriv` from util-linux. VM N listens for SSH on `127.0.0.1:2222+N-1`; set `VM_SSH_BASE_PORT` to run two suites on one host. Each VM's console, QEMU and mount logs are written to `tests/vm/results/`, including logs from before a VM was killed. QEMU 10+ uses io_uring, which counts against the locked-memory limit. With the common 8 MB default, QEMU fails with `Failed to initialize io_uring: Cannot allocate memory`. Raise the limit for the test user, then log in again:
 
@@ -295,4 +306,4 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Contributing
 
-[Contributing guidelines to be added]
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems as described in [SECURITY.md](SECURITY.md).

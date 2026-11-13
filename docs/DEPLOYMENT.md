@@ -82,6 +82,9 @@ cd GoClusterFS
 # Build goclusterfs-mount, goclusterfs-fsck and gfsctl
 make build
 
+# Or include the web dashboard (needs Node 22 and npm)
+make dashboard build
+
 # Optional: Install to system path
 sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ```
@@ -94,7 +97,7 @@ sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ./gfsctl version
 ```
 
-Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the GitHub Releases page.
+`make build` reports version `dev`. Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives, with the version set and the dashboard included, on the GitHub Releases page. Run the same version on every node: builds from before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) refuse volumes formatted by later builds with `unknown required flags 0x10`, and later builds refuse theirs.
 
 ---
 
@@ -168,7 +171,7 @@ mkdir -p /mnt/goclusterfs
 
 Press Ctrl+C or run `fusermount3 -u /mnt/goclusterfs` to unmount. Never pass `-format` again on a device that holds data, and never while another node has it mounted.
 
-The block size is fixed at 1 MB, and the inode count at 4096.
+The block size is fixed at 1 MB. `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB), between 4096 and 16,777,216, and the count cannot change later. The block bitmap, refcount table and inode table are sized from the device, so a 1 GB image holds 698 data blocks.
 
 ### Verify Format
 
@@ -230,6 +233,8 @@ systemctl daemon-reload
 systemctl enable goclusterfs
 systemctl start goclusterfs
 ```
+
+`systemctl stop` runs `ExecStop`, which unmounts; the mount process then flushes its journal, releases its locks and exits 0. See [What Happens at Shutdown](OPERATIONS.md#what-happens-at-shutdown).
 
 ---
 
@@ -295,8 +300,11 @@ Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock 
 Each mount logs `Broadcast: enabled on 239.192.74.75:31337, unicast port 31338` at startup. If broadcast cannot start, for example because a port is taken, the mount fails; pass `-broadcast=false` to run without it. It logs `Broadcast stats` when it unmounts.
 
 ```bash
-# Verify multicast is working
-tcpdump -i eth0 udp port 31337
+# Verify broadcast is working
+tcpdump -i eth0 udp port 31337 or udp port 31338
+
+# Verify every node registered
+gfsctl stats cluster
 ```
 
 ### Network Configuration Options
