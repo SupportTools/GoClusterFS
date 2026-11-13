@@ -23,12 +23,6 @@ linters:
     # Known findings as of 2026-10-24 in code other open PRs are changing; delete each rule once fixed.
     rules:
       # errcheck still has findings under these paths; delete a path's rule once it is clean.
-      - path: ^internal/cache/
-        linters: [errcheck]
-
-      - path: ^cmd/gfsctl/
-        linters: [errcheck]
-
       - path: ^cmd/mount/
         linters: [errcheck]
 
@@ -38,6 +32,10 @@ linters:
       - path: ^tests/integration/
         linters: [errcheck]
 
+      # gfsctl prints to the terminal and, like fmt.Printf, ignores write errors there.
+      - path: ^cmd/gfsctl/
+        linters: [errcheck]
+        text: "`fmt\\.Fprint(f|ln)?` is not checked"
       - path: ^internal/goclusterfs/fs\.go$
         linters: [unused]
         text: "errRetryCreate|field sb is unused"

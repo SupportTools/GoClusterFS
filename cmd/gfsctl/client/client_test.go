@@ -33,11 +33,11 @@ func TestAPIErrorCarriesStatusAndDetails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret" {
 			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":"invalid token","code":401}`))
+			_, _ = w.Write([]byte(`{"error":"invalid token","code":401}`))
 			return
 		}
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 	c := &Client{baseURL: srv.URL, httpClient: srv.Client()}
