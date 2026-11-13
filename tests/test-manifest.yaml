@@ -1002,6 +1002,13 @@ scenarios:
       docker: TODO  # needs a pause between one node's lookup and its removal, which only the Go test hook gives
       vm: TODO  # the race window is too short to hit on purpose without that hook
 
+  - id: unlink-frees-blocks-written-after-name-removed
+    name: Unlink frees blocks written after its name was removed
+    description: An open handle writes a new block between unlink removing the name and freeing the inode; the free gives back every block, and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/name_order_test.go::TestUnlinkFreesBlocksWrittenAfterNameRemoved
+
   - id: create-name-errors
     name: A failed name add reports EEXIST or ENOENT
     description: Create and mkdir into a taken name return EEXIST, into a removed directory ENOENT, and give back the claimed inode

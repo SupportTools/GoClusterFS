@@ -1467,6 +1467,9 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	case !removed:
 		return syscall.ENOENT
 	}
+	if afterCommit != nil {
+		afterCommit("unlink: name removed")
+	}
 
 	if willFreeInode {
 		// An open handle may write the file after the name is gone, so free what the inode maps when it is freed.

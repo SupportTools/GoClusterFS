@@ -191,6 +191,25 @@ func TestRemoveRacesPeerRecreate(t *testing.T) {
 	}
 }
 
+// An open handle writes the file after unlink removes its name: the free gives back what the inode maps then.
+func TestUnlinkFreesBlocksWrittenAfterNameRemoved(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	victim := createFile(t, fsys, "victim")
+	writeAt(t, victim, pattern(1, BlockSize), 0)
+	afterCommit = func(op string) {
+		if op == "unlink: name removed" {
+			afterCommit = nil
+			writeAt(t, victim, pattern(2, BlockSize), BlockSize)
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+
+	if errno := fsys.RootDir().Unlink(context.Background(), "victim"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	expectCleanFsck(t, fsys)
+}
+
 // A create or mkdir whose name is taken, or whose directory another node removed, reports EEXIST or ENOENT and gives
 // back the inode it claimed.
 func TestCreateNameErrors(t *testing.T) {
