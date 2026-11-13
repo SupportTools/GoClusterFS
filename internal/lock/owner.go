@@ -1,6 +1,9 @@
 package lock
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // OwnerState is what the node registry says about the node in a registry slot.
 type OwnerState uint8
@@ -91,4 +94,23 @@ func ForReplay(ctx context.Context) context.Context {
 func isReplay(ctx context.Context) bool {
 	replay, _ := ctx.Value(replayKey{}).(bool)
 	return replay
+}
+
+// ErrReplayBlocked is the ErrLockTimeout of a goroutine that holds other locks
+// and waited for a failing node's lock: that node's replay may need a lock it
+// holds. A caller that can release its locks and retry should do so.
+var ErrReplayBlocked = fmt.Errorf("%w: other locks held while a failing node holds this one", ErrLockTimeout)
+
+type retryKey struct{}
+
+// Retryable marks ctx as a caller's that releases its locks and retries on
+// ErrReplayBlocked, so such a wait returns it at once instead of after
+// DefaultTimeout, and the replay need not wait for the caller.
+func Retryable(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryKey{}, true)
+}
+
+func isRetryable(ctx context.Context) bool {
+	retryable, _ := ctx.Value(retryKey{}).(bool)
+	return retryable
 }

@@ -2911,6 +2911,20 @@ scenarios:
     environments:
       go: internal/lock/owner_test.go::TestNestedWaitOnReplayingNodeYieldsToReplay
 
+  - id: lock-retryable-nested-wait-returns-at-once
+    name: Retryable nested wait on a failing holder returns at once
+    description: A caller that can release its locks and retry gets ErrReplayBlocked, an ErrLockTimeout, at once instead of after the lock timeout
+    priority: go_only
+    environments:
+      go: internal/lock/owner_test.go::TestRetryableNestedWaitOnFailingHolderReturnsAtOnce
+
+  - id: in-place-write-steps-aside-for-replay
+    name: In-place write steps aside for a replay
+    description: An overwrite of a block whose lock a failed node held lets go of its inode lock, waits holding nothing while the replay takes the inode lock, then completes without EIO
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/replay_wait_test.go::TestInPlaceWriteStepsAsideForReplay
+
   - id: lock-long-hold-logged-once
     name: Long lock hold is logged once
     description: A node that holds a lock longer than a minute logs one warning naming the record and the key that holds it, since a claim never goes stale and a leaked hold lasts until unmount
