@@ -22,6 +22,8 @@ DASHBOARD_DIST=internal/webui/build/dist
 GOLANGCI_LINT_VERSION=v2.15.0
 GOVULNCHECK_VERSION=v1.9.0
 COVER_PROFILE=coverage.out
+UNIT_PKGS ?= ./internal/...
+UNIT_TIMEOUT ?= 20m
 
 # Default target
 .DEFAULT_GOAL := help
@@ -55,7 +57,7 @@ test: test-unit
 
 test-unit:
 	@echo "Running unit tests with race detector..."
-	$(GOTEST) -v -race -covermode=atomic -coverprofile=$(COVER_PROFILE) ./internal/...
+	$(GOTEST) -v -race -timeout $(UNIT_TIMEOUT) -covermode=atomic -coverprofile=$(COVER_PROFILE) $(UNIT_PKGS)
 
 # Integration tests (requires FUSE and built binary)
 test-integration: check-fuse build
