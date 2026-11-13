@@ -8,7 +8,7 @@ import (
 //
 // Checks performed:
 //   - Bitmap allocation matches inode extent references
-//   - Inode link count matches directory entry references
+//   - Every inode in use has a name in a directory; repair frees unnamed ones
 //   - No leaked blocks (allocated but unreferenced); repair frees them
 //   - No phantom blocks (referenced but not allocated)
 //
@@ -21,11 +21,13 @@ func (c *Checker) crossValidate() error {
 
 	c.logf("  Cross-validating collected data...\n")
 
-	// Counters for summary
 	phantomBlocks := 0
-	linkCountMismatches := 0
 
-	// 1. Compare bitmap allocation with inode block references
+	c.logf("  Checking for inodes no directory names...\n")
+	if err := c.checkUnnamed(); err != nil {
+		return err
+	}
+
 	c.logf("  Checking bitmap vs inode references...\n")
 	if err := c.checkLeaks(); err != nil {
 		return err
@@ -48,45 +50,11 @@ func (c *Checker) crossValidate() error {
 			false)
 	}
 
-	// 2. Validate inode link count matches directory entry references
-	c.logf("  Checking link count consistency...\n")
-	for inodeNum := range c.inodeUsed {
-		dirRefs := c.dirEntryRefs[inodeNum]
-
-		// Special case: root directory (inode 2) doesn't need a parent reference
-		if inodeNum == InodeRoot {
-			continue
-		}
-
-		// Snapshot inodes may have special linking
-		if c.snapshotInodes[inodeNum] {
-			continue
-		}
-
-		// Every used inode should be referenced by at least one directory entry
-		// (except root and snapshot targets)
-		if dirRefs == 0 {
-			if linkCountMismatches < 10 {
-				c.addProblem(PhaseCrossValidation, Warning, fmt.Sprintf("inode %d", inodeNum),
-					"in use but not referenced by any directory entry",
-					false)
-			}
-			linkCountMismatches++
-		}
-	}
-	if linkCountMismatches > 10 {
-		c.addProblem(PhaseCrossValidation, Warning, "inodes",
-			fmt.Sprintf("%d additional unreferenced inodes", linkCountMismatches-10),
-			false)
-	}
-
 	c.result.TotalBlocks = c.sbData.TotalBlocks
 	c.result.AllocatedBlocks = uint64(len(c.bitmapAllocated))
 	c.result.TotalInodes = c.sbData.InodeTableSize / InodeSize
 
-	// 3. Summary statistics
 	c.logf("  Phantom blocks: %d\n", phantomBlocks)
-	c.logf("  Link count issues: %d\n", linkCountMismatches)
 
 	return nil
 }

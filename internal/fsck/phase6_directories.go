@@ -3,6 +3,8 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -51,9 +53,11 @@ type DirEntryData struct {
 //   - Entry names don't contain null bytes
 //   - Referenced inodes exist and are in use
 //   - File type in entry matches inode mode
-//   - No orphaned inodes (not referenced by any directory)
 //   - Root directory exists and is accessible
 //   - Check for directory cycles (not implemented yet)
+//
+// It also finds the inodes other than root that no directory names, which
+// phase 8 reports. "." and ".." are not names.
 func (c *Checker) checkDirectories() error {
 	if c.sbData == nil {
 		return fmt.Errorf("superblock not validated")
@@ -67,7 +71,6 @@ func (c *Checker) checkDirectories() error {
 	dirCount := 0
 	entryCount := 0
 	invalidEntries := 0
-	orphanedInodes := uint64(0)
 
 	// Find all directory inodes and validate their entries
 	inodeTableOffset := sb.InodeTableOffset
@@ -79,6 +82,7 @@ func (c *Checker) checkDirectories() error {
 		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
 
 		if c.readSector(sectorBuf, sectorOffset) != nil {
+			c.namesIncomplete = append(c.namesIncomplete, fmt.Sprintf("inode table sector %d is unreadable", sectorIdx))
 			continue
 		}
 
@@ -105,9 +109,12 @@ func (c *Checker) checkDirectories() error {
 			}
 
 			// Read and validate directory entries
-			entries, errs := c.readDirectoryEntries(inodeNum, inode, dataRegionOffset)
+			entries, errs, complete := c.readDirectoryEntries(inodeNum, inode, dataRegionOffset)
 			entryCount += len(entries)
 			invalidEntries += len(errs)
+			if len(errs) > 0 || !complete {
+				c.namesIncomplete = append(c.namesIncomplete, fmt.Sprintf("directory inode %d is not fully readable", inodeNum))
+			}
 
 			for _, err := range errs {
 				c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum), err, false)
@@ -128,8 +135,10 @@ func (c *Checker) checkDirectories() error {
 					continue
 				}
 
-				// Record directory reference for cross-validation
-				c.dirEntryRefs[uint32(entry.InodeNum)]++
+				if entry.Name != "." && entry.Name != ".." {
+					c.dirEntryRefs[uint32(entry.InodeNum)]++
+					c.dirNames[inodeNum]++
+				}
 
 				// Validate file type matches inode mode
 				if entry.InodeNum < uint64(len(c.inodeUsed)) {
@@ -145,49 +154,36 @@ func (c *Checker) checkDirectories() error {
 		}
 	}
 
-	// Check for orphaned inodes (in use but not referenced by any directory)
-	for inodeNum := range c.inodeUsed {
-		if inodeNum == InodeRoot || c.snapshotData[inodeNum] {
-			continue
-		}
-		if c.dirEntryRefs[inodeNum] == 0 {
-			orphanedInodes++
-			if orphanedInodes <= 10 {
-				c.addProblem(PhaseDirectories, Warning, fmt.Sprintf("inode %d", inodeNum),
-					"inode in use but not referenced by any directory",
-					false)
-			}
+	for _, inodeNum := range slices.Sorted(maps.Keys(c.inodeUsed)) {
+		if inodeNum != InodeRoot && c.dirEntryRefs[inodeNum] == 0 {
+			c.unnamed = append(c.unnamed, inodeNum)
 		}
 	}
-	if orphanedInodes > 10 {
-		c.addProblem(PhaseDirectories, Warning, "orphans",
-			fmt.Sprintf("%d additional orphaned inodes", orphanedInodes-10),
-			false)
-	}
-
-	c.result.OrphanedInodes = orphanedInodes
 
 	c.logf("  Directories validated: %d\n", dirCount)
 	c.logf("  Total entries: %d\n", entryCount)
 	c.logf("  Invalid entries: %d\n", invalidEntries)
-	c.logf("  Orphaned inodes: %d\n", orphanedInodes)
+	c.logf("  Inodes without a name, snapshot data included: %d\n", len(c.unnamed))
 
 	return nil
 }
 
 // readDirectoryEntries reads all entries from a directory inode.
-// Returns parsed entries and a list of error messages for problems found.
-func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOffset uint64) ([]*DirEntryData, []string) {
+// Returns parsed entries, a list of error messages for problems found, and
+// whether it read every extent the runtime may read entries from.
+func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOffset uint64) ([]*DirEntryData, []string, bool) {
 	var entries []*DirEntryData
 	var errors []string
+	complete := true
 	blockBuf := storage.NewAlignedBuffer(DirBlockSize).Bytes()
 
 	for _, ext := range c.inodeExtents(inodeNum, inode) {
-		if ext.Length == 0 || (ext.Flags&ExtentFlagAllocated) == 0 || (ext.Flags&ExtentFlagSFB) != 0 {
+		if ext.Length == 0 {
 			continue
 		}
 		// Phase 4 reports extents outside the device.
-		if ext.PhysicalBlock >= c.sbData.TotalBlocks || ext.Length > c.sbData.TotalBlocks-ext.PhysicalBlock {
+		if (ext.Flags&ExtentFlagAllocated) == 0 || (ext.Flags&ExtentFlagSFB) != 0 || c.onDevice(ext) < ext.Length {
+			complete = false
 			continue
 		}
 
@@ -205,7 +201,7 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 		}
 	}
 
-	return entries, errors
+	return entries, errors, complete
 }
 
 // parseDirBlock parses the entries of every 4 KB chunk of a directory block.
