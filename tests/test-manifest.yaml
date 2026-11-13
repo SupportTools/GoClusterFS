@@ -1925,12 +1925,54 @@ scenarios:
     environments:
       go: internal/inode/sector_lock_test.go::TestNeighborInodeWritesFromTwoNodes
 
-  - id: sector-locks-own-records
-    name: Sector locks never wait on other lock types
-    description: Inode table sector locks map to reserved lock records, so a node holding inode locks never blocks another node's sector lock
+  - id: lock-type-wait-cycle
+    name: Inode and extent locks do not wait in a cycle
+    description: Two nodes each hold an inode lock and want an extent lock that would share the other's inode record; neither waits on the other
     priority: go_only
     environments:
-      go: internal/lock/sector_test.go::TestSectorLocksDoNotWaitOnOtherLocks
+      go: internal/lock/type_records_test.go::TestInodeAndExtentLocksDoNotWaitInACycle
+
+  - id: lock-types-own-records
+    name: Each lock type has its own records
+    description: The per-type record counts fill a volume's lock region exactly, and no two types map a resource to the same record
+    priority: go_only
+    environments:
+      go: internal/lock/type_records_test.go::TestLockTypesHaveTheirOwnRecords
+
+  - id: locks-no-wait-other-types
+    name: Locks never wait on records of another type
+    description: With one node holding a lock in every inode record, another node takes locks of every other type without waiting
+    priority: go_only
+    environments:
+      go: internal/lock/type_records_test.go::TestLocksDoNotWaitOnRecordsOfOtherTypes
+
+  - id: lock-record-order
+    name: Locks of one type are taken in record order
+    description: A goroutine holding a lock is refused a lock of the same type in a lower record, and may take one in a higher record
+    priority: go_only
+    environments:
+      go: internal/lock/type_records_test.go::TestLocksOfOneTypeAreTakenInRecordOrder
+
+  - id: lock-unknown-type
+    name: Acquire refuses a lock type outside the record layout
+    description: A lock type with no records of its own is refused instead of hashed over all records
+    priority: go_only
+    environments:
+      go: internal/lock/type_records_test.go::TestAcquireRefusesUnknownLockType
+
+  - id: mount-refuses-hashed-lock-records
+    name: Mount refuses volumes without per-type lock records
+    description: A superblock without RequiredTypedLockRecords fails CanMount with advice to reformat
+    priority: go_only
+    environments:
+      go: internal/superblock/superblock_test.go::TestCanMountRefusesHashedLockRecords
+
+  - id: fsck-refuses-hashed-lock-records
+    name: fsck refuses volumes without per-type lock records
+    description: fsck phase 1 reports a missing RequiredTypedLockRecords flag as fatal, with advice to reformat
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckRefusesHashedLockRecords
 
   - id: create-stuck-inode-lock-eio
     name: Create fails with EIO when the new inode's lock is never freed
