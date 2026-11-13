@@ -18,11 +18,11 @@ func serveHealth(t *testing.T, code int, status api.HealthStatus) *fakeAPI {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/status" && r.Header.Get("Authorization") == "" {
 			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(api.ErrorResponse{Error: "unauthorized", Code: http.StatusUnauthorized})
+			_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "unauthorized", Code: http.StatusUnauthorized})
 			return
 		}
 		w.WriteHeader(code)
-		json.NewEncoder(w).Encode(api.HealthResponse{Status: status, Checks: map[string]api.ComponentHealth{
+		_ = json.NewEncoder(w).Encode(api.HealthResponse{Status: status, Checks: map[string]api.ComponentHealth{
 			"recovery": {Status: status, Message: "replaying the journal of the crashed node in slot 3"},
 		}})
 	}))

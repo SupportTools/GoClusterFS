@@ -25,12 +25,19 @@ func hitRateInfo(size int, hits, misses uint64) api.CacheHitRateInfo {
 }
 
 func cacheResponse(c cache.Stats, l lock.Stats) *api.CacheStatsResponse {
-	return &api.CacheStatsResponse{
+	resp := &api.CacheStatsResponse{
 		InodeCache:    hitRateInfo(c.InodeCacheSize, c.InodeCacheHits, c.InodeCacheMisses),
 		ExtentCache:   hitRateInfo(c.ExtentCacheSize, c.ExtentCacheHits, c.ExtentCacheMisses),
 		NegativeCache: hitRateInfo(c.NegativeCacheSize, c.NegativeHits, c.NegativeMisses),
 		LockHintCache: hitRateInfo(l.HintCacheSize, l.HintHits, l.HintMisses),
 	}
+	resp.InodeCache.Capacity = c.InodeCacheCapacity
+	resp.ExtentCache.Capacity = c.ExtentCacheCapacity
+	resp.NegativeCache.Capacity = c.NegativeCacheCapacity
+	if c.BroadcastEnabled {
+		resp.Broadcast = &api.BroadcastTables{Peers: c.PeerCount, Senders: c.BroadcastSenders, MaxPeers: c.BroadcastMaxPeers}
+	}
+	return resp
 }
 
 func lockResponse(l lock.Stats) *api.LockStatsResponse {

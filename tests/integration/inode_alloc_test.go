@@ -3,6 +3,7 @@ package integration
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"regexp"
 	"strings"
 	"syscall"
@@ -74,17 +75,26 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 	for reader := 0; reader < 2; reader++ {
 		writer := 1 - reader
 		var missing []string
+		var readErr error
 		_, ok := waitFor(propagationTimeout, func() bool {
 			missing = missing[:0]
 			for i := 0; i < perNode; i++ {
 				name := fmt.Sprintf("node%d-%03d", writer, i)
-				if data, err := cluster.Node(reader).ReadFile(name); err != nil || string(data) != name {
+				data, err := cluster.Node(reader).ReadFile(name)
+				if err != nil && !errors.Is(err, fs.ErrNotExist) {
+					readErr = err
+					return true
+				}
+				if err != nil || string(data) != name {
 					missing = append(missing, name)
 				}
 			}
 			return len(missing) == 0
 		})
-		if !ok {
+		switch {
+		case readErr != nil:
+			t.Errorf("node %d reading node %d's files: %v", reader, writer, readErr)
+		case !ok:
 			t.Errorf("node %d cannot read %d of node %d's files: %v", reader, len(missing), writer, missing)
 		}
 	}

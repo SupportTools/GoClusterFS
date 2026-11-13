@@ -41,7 +41,7 @@ func newFormattedImageOfSize(t *testing.T, size int64) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 	if _, err := superblock.Format(dev, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
@@ -62,7 +62,7 @@ func openFormattedFS(t *testing.T, path string) *FS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 	sb, err := superblock.Read(dev)
 	if err != nil {
 		t.Fatal(err)
@@ -130,6 +130,7 @@ func problemList(r *fsck.Result) string {
 // Everything the runtime writes, including snapshots, clones, copies on
 // write and extent trees, must pass fsck without a single problem.
 func TestFsckAcceptsRuntimeImage(t *testing.T) {
+	t.Parallel()
 	fsys := openFormattedFS(t, newFormattedImage(t))
 	ctx := context.Background()
 

@@ -35,7 +35,7 @@ func TestInPlaceWriteStepsAsideForReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lockDev.Close()
+	defer func() { _ = lockDev.Close() }()
 	var replayed atomic.Bool
 	view := func(slot int, fresh bool) ([16]byte, lock.OwnerState) {
 		switch {
@@ -74,9 +74,13 @@ func TestInPlaceWriteStepsAsideForReplay(t *testing.T) {
 	if err := replayer.Acquire(replayCtx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
 		t.Fatalf("the replay could not take the file's inode lock: %v", err)
 	}
-	replayer.Release(lock.LockTypeInode, uint64(f.inodeNum))
+	if err := replayer.Release(lock.LockTypeInode, uint64(f.inodeNum)); err != nil {
+		t.Errorf("the replay could not release the file's inode lock: %v", err)
+	}
 	replayer.ReleaseCached()
-	dead.ReleaseExtent(block)
+	if err := dead.ReleaseExtent(block); err != nil {
+		t.Errorf("the failed node could not release block %d: %v", block, err)
+	}
 	dead.ReleaseCached()
 	replayed.Store(true)
 

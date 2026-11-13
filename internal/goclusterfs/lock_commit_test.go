@@ -58,12 +58,12 @@ func openLockedTreeFSNodeWithRegion(t *testing.T, path, lockPath string, slot in
 	if err != nil {
 		t.Fatalf("open %s: %v", path, err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 	lockDev, err := storage.Open(lockPath)
 	if err != nil {
 		t.Fatalf("open %s: %v", lockPath, err)
 	}
-	t.Cleanup(func() { lockDev.Close() })
+	t.Cleanup(func() { _ = lockDev.Close() })
 
 	var nodeUUID [16]byte
 	copy(nodeUUID[:], fmt.Sprintf("testnode%08d", slot))

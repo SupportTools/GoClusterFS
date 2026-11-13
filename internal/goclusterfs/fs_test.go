@@ -24,16 +24,16 @@ func createTestFS(t *testing.T) (*FS, func()) {
 
 	// Create 20MB test image
 	if err := tmpFile.Truncate(20 * 1024 * 1024); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
 		t.Fatalf("Failed to truncate: %v", err)
 	}
-	tmpFile.Close()
+	_ = tmpFile.Close()
 
 	// Open with O_DIRECT
 	dev, err := storage.Open(tmpFile.Name())
 	if err != nil {
-		os.Remove(tmpFile.Name())
+		_ = os.Remove(tmpFile.Name())
 		t.Fatalf("Failed to open device: %v", err)
 	}
 
@@ -71,8 +71,8 @@ func createTestFS(t *testing.T) (*FS, func()) {
 	}
 
 	cleanup := func() {
-		dev.Close()
-		os.Remove(tmpFile.Name())
+		_ = dev.Close()
+		_ = os.Remove(tmpFile.Name())
 	}
 
 	return fs, cleanup

@@ -93,7 +93,7 @@ func TestUnlinkCrashBeforeInodeFreeKeepsCloneBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { otherDev.Close() })
+	t.Cleanup(func() { _ = otherDev.Close() })
 	slot := int(snapFSNodes.Add(1)-1) % 64
 	var otherUUID [16]byte
 	copy(otherUUID[:], "inodeholder12345")
@@ -103,7 +103,7 @@ func TestUnlinkCrashBeforeInodeFreeKeepsCloneBlocks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	go sub.Unlink(ctx, "doomed.bin")
+	go func() { _ = sub.Unlink(ctx, "doomed.bin") }()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		subIno, err := fsys.inodeTbl.Read(sub.inodeNum)
 		if err != nil {
@@ -121,7 +121,7 @@ func TestUnlinkCrashBeforeInodeFreeKeepsCloneBlocks(t *testing.T) {
 		t.Fatalf("inode %d freed while another node holds its lock (magic %#x, err %v)", f.inodeNum, ino.Magic, err)
 	}
 	expectRefcounts(t, fsys, blocks, 2)
-	fsys.dev.Close()
+	_ = fsys.dev.Close()
 	if err := other.Release(lock.LockTypeInode, uint64(f.inodeNum)); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestUnlinkCrashAfterInodeFreeKeepsCloneBlocks(t *testing.T) {
 	blocks := cloneShares(t, fsys, f, 2)
 
 	crashed := crashAfterCommit(t, fsys, "unlink: inode freed")
-	go sub.Unlink(context.Background(), "doomed.bin")
+	go func() { _ = sub.Unlink(context.Background(), "doomed.bin") }()
 	<-crashed
 
 	remounted := remountAndReplay(t, path, offset, size)
@@ -161,7 +161,7 @@ func TestUnlinkCrashAfterBlockFreeKeepsReusedBlock(t *testing.T) {
 	other := createFile(t, fsys, "other.bin")
 
 	crashed := crashAfterCommit(t, fsys, "unlink: blocks freed")
-	go sub.Unlink(context.Background(), "doomed.bin")
+	go func() { _ = sub.Unlink(context.Background(), "doomed.bin") }()
 	<-crashed
 
 	data := pattern(9, 4*BlockSize)
@@ -207,7 +207,7 @@ func TestFailedWriteCrashKeepsReusedBlock(t *testing.T) {
 	if err := writeImageRange(path, offset, journalAtFree); err != nil {
 		t.Fatal(err)
 	}
-	fsys.dev.Close()
+	_ = fsys.dev.Close()
 
 	remounted := remountAndReplay(t, path, offset, size)
 	ino, err := remounted.inodeTbl.Read(f.inodeNum)
@@ -226,7 +226,7 @@ func readImageRange(path string, off, n uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	b := make([]byte, n)
 	_, err = f.ReadAt(b, int64(off))
 	return b, err
@@ -237,9 +237,9 @@ func writeImageRange(path string, off uint64, b []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if _, err := f.WriteAt(b, int64(off)); err != nil {
-		return err
+	_, err = f.WriteAt(b, int64(off))
+	if err == nil {
+		err = f.Sync()
 	}
-	return f.Sync()
+	return errors.Join(err, f.Close())
 }

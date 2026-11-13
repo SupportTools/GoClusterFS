@@ -109,7 +109,7 @@ func TestTwoNodesOnOneHost(t *testing.T) {
 
 	t.Run("unicast", func(t *testing.T) {
 		a.config.MaxMulticastFailures = 0
-		a.AddPeer("b", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ports[2]})
+		a.AddPeer(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ports[2]})
 		if err := a.Send(builder.InvalidateExtent(7, 1)); err != nil {
 			t.Fatal(err)
 		}
