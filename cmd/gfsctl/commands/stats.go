@@ -51,7 +51,7 @@ func init() {
 func runStats(cmd *cobra.Command, args []string) error {
 	// Watch mode not compatible with JSON output
 	if statsWatch && GetOutputFormat() == "json" {
-		return fmt.Errorf("watch mode is not compatible with JSON output")
+		return usageErrorf("--watch does not work with -o json; drop one of them")
 	}
 
 	// Determine which stats to show
@@ -65,7 +65,7 @@ func runStats(cmd *cobra.Command, args []string) error {
 	case "", "cache", "journal", "trim", "lock", "sfb", "cluster", "all":
 		// valid
 	default:
-		return fmt.Errorf("unknown component: %s (valid: cache, journal, trim, lock, sfb, cluster, all)", component)
+		return usageErrorf("unknown component: %s (valid: cache, journal, trim, lock, sfb, cluster, all)", component)
 	}
 
 	// Create the display function

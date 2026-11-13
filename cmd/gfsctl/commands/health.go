@@ -11,7 +11,10 @@ var healthCmd = &cobra.Command{
 	Use:   "health",
 	Short: "Check filesystem health",
 	Long: `Check the health status of the filesystem and its components.
-Returns exit code 0 if healthy, 1 if unhealthy.
+
+Exit codes: 0 ok, 1 degraded (the mount works with a problem, such as a
+journal replay of a crashed node or broadcast down), 4 unhealthy (the
+mount cannot work correctly), 8 no answer from the API.
 
 Examples:
   gfsctl health                 # Check health in text format
@@ -59,10 +62,8 @@ func runHealth(cmd *cobra.Command, args []string) error {
 
 	f.Println()
 
-	// Return error if unhealthy (for scripting)
-	if health.Status == "unhealthy" {
-		return fmt.Errorf("filesystem is unhealthy")
+	if health.Status != "ok" {
+		return healthError{status: string(health.Status)}
 	}
-
 	return nil
 }

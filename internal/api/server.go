@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -39,9 +40,12 @@ type Server struct {
 	fileService  FileService
 	adminService AdminService
 
-	// Write requests in flight; Stop waits for them so the mount outlives them.
-	writes   sync.WaitGroup
-	stopping bool
+	// Requests in flight; Stop waits for them so the mount outlives them.
+	requests       sync.WaitGroup
+	stopping       bool
+	closed         bool
+	cancelRequests context.CancelFunc
+	served         chan struct{}
 
 	// Lifecycle state
 	started   bool
@@ -85,7 +89,7 @@ func NewServer(cfg Config) (*Server, error) {
 		CORSMiddleware(cfg.CORSOrigins),
 		AuthMiddleware(cfg.AuthToken, exempt...),
 	)
-	handler := Chain(s.router, middlewares...)
+	handler := s.track(Chain(s.router, middlewares...))
 
 	// Create HTTP server
 	s.server = &http.Server{
@@ -120,8 +124,14 @@ func (s *Server) Start(ctx context.Context) error {
 	s.started = true
 	s.startTime = time.Now()
 
+	base, cancel := context.WithCancel(context.Background())
+	s.cancelRequests = cancel
+	s.server.BaseContext = func(net.Listener) context.Context { return base }
+	s.served = make(chan struct{})
+
 	// Start serving in background
 	go func() {
+		defer close(s.served)
 		log.Printf("api: server listening on %s", ln.Addr())
 		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("api: server error: %v", err)
@@ -131,9 +141,9 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully shuts down the API server.
-// It waits for active connections to complete up to the configured
-// ShutdownTimeout before forcefully closing them.
+// Stop shuts down the API server. Requests in flight get ShutdownTimeout to
+// finish; after that their contexts are cancelled and their connections
+// closed. Stop returns once every handler has returned.
 func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		if s.rateLimiter != nil {
@@ -141,29 +151,32 @@ func (s *Server) Stop() error {
 		}
 		s.mu.Lock()
 		s.stopping = true
-		if !s.started {
-			s.mu.Unlock()
+		started, timeout := s.started, s.config.ShutdownTimeout
+		s.mu.Unlock()
+		if !started {
 			s.stopErr = ErrServerNotStarted
 			return
 		}
-		timeout := s.config.ShutdownTimeout
-		s.mu.Unlock()
 
 		log.Printf("api: shutting down server...")
-
-		// Create shutdown context with timeout
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-
-		// Attempt graceful shutdown
 		if err := s.server.Shutdown(ctx); err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
+			s.cancelRequests()
+			_ = s.server.Close()
+			if errors.Is(err, context.DeadlineExceeded) {
 				s.stopErr = ErrShutdownTimeout
 			} else {
 				s.stopErr = fmt.Errorf("shutdown error: %w", err)
 			}
 		}
-		s.waitForWrites()
+		<-s.served
+
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		s.waitForRequests()
+		s.cancelRequests()
 
 		log.Printf("api: server stopped")
 	})
@@ -171,18 +184,35 @@ func (s *Server) Stop() error {
 	return s.stopErr
 }
 
-// waitForWrites waits for snapshot, clone and admin requests that are still
-// running. They cannot be cancelled once the filesystem has started them.
-func (s *Server) waitForWrites() {
+// track counts each request so Stop can wait for it, and refuses requests
+// that arrive after Stop stopped waiting.
+func (s *Server) track(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, "server is shutting down", "")
+			return
+		}
+		s.requests.Add(1)
+		s.mu.Unlock()
+		defer s.requests.Done()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// waitForRequests waits for handlers that are still running. Snapshot, clone
+// and admin requests cannot be cancelled once the filesystem has started them.
+func (s *Server) waitForRequests() {
 	done := make(chan struct{})
 	go func() {
-		s.writes.Wait()
+		s.requests.Wait()
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		log.Printf("api: waiting for write requests in flight to finish")
+		log.Printf("api: waiting for requests in flight to finish")
 		<-done
 	}
 }
