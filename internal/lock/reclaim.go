@@ -3,76 +3,84 @@ package lock
 import (
 	"log"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-// adoptSettle is how long AdoptOwner waits before re-reading the records it
-// took, so a peer's racing stale takeover of one of them is noticed.
-const adoptSettle = 50 * time.Millisecond
-
-// AdoptOwner makes this node the holder of every exclusive lock record owner
-// holds and returns their IDs. Call it only once owner is proven dead, before
-// replaying owner's journal, and pass the result to ReleaseAdopted after the
-// replay: until then peers cannot take the locks of the dead node's unfinished
-// operations, while this node's own acquires reuse them.
-//
-// Shared records are left to the staleness rule: OwnerUUID names only the
-// latest reader, who may have released already while others still read.
-func (m *Manager) AdoptOwner(owner [16]byte) ([]uint64, error) {
-	var taken []uint64
-	for recordID := uint64(0); recordID < m.size/RecordSize; recordID++ {
-		ok, err := m.adoptRecord(recordID, owner)
-		if err != nil {
-			return taken, err
-		}
-		if ok {
-			taken = append(taken, recordID)
-		}
-	}
-	if len(taken) == 0 {
-		return nil, nil
-	}
-
-	time.Sleep(adoptSettle)
+// AdoptOwner keeps the write claims of owner, a node proven dead whose
+// registry slot is ownerSlot, in place while owner's journal is replayed, and
+// returns their records. It writes each of owner's write slots, and any torn
+// slot in ownerSlot, again with the current time, so peers stay off those
+// records until ReleaseAdopted while this node's own acquires ignore them.
+// owner's read slots are cleared at once. Call it before the replay and pass
+// the result to ReleaseAdopted after it.
+func (m *Manager) AdoptOwner(owner [16]byte, ownerSlot int) ([]uint64, error) {
 	var adopted []uint64
-	for _, recordID := range taken {
-		if m.holdsExclusive(recordID) {
+	for recordID := uint64(0); recordID < m.size/RowSize; recordID++ {
+		kept, err := m.adoptRecord(recordID, owner, ownerSlot)
+		if err != nil {
+			return adopted, err
+		}
+		if kept {
 			adopted = append(adopted, recordID)
 		}
 	}
-	log.Printf("lock: took over %d lock records of dead node %x", len(adopted), owner[:8])
+	if len(adopted) > 0 {
+		log.Printf("lock: took over %d lock records of dead node %x", len(adopted), owner[:8])
+	}
 	return adopted, nil
 }
 
-func (m *Manager) adoptRecord(recordID uint64, owner [16]byte) (bool, error) {
+func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (bool, error) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
 
-	for {
-		record, err := m.readRecord(recordID)
-		if err != nil {
-			return false, err
-		}
-		if record.Mode != LockModeExclusive || record.OwnerUUID != owner {
-			return false, nil
-		}
-		adopted := *record
-		adopted.OwnerUUID = m.nodeUUID
-		adopted.OwnerSlot = uint32(m.nodeSlot)
-		adopted.AcquireTime = time.Now().Unix()
-		adopted.Sequence++
-		ok, err := m.casRecord(recordID, record, &adopted)
-		if err != nil {
-			return false, err
-		}
-		if ok {
-			return true, nil
-		}
+	if _, inUse := m.ownSlotUse(recordID); ownerSlot == m.nodeSlot && inUse {
+		return false, nil
 	}
+	buf := storage.GetBuffer(SlotSize)
+	defer storage.PutBuffer(buf)
+	if _, err := m.dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, ownerSlot)); err != nil {
+		return false, err
+	}
+	dead, err := decodeSlot(buf.Bytes())
+	switch {
+	case err == nil && (dead == nil || dead.owner != owner):
+		return false, nil
+	case err == nil && dead.mode != LockModeExclusive:
+		return false, m.writeSlot(recordID, ownerSlot, nil)
+	case err != nil:
+		dead = &claimSlot{owner: owner}
+	}
+	dead.mode, dead.adopted = LockModeExclusive, true
+	dead.acquireTime = time.Now().UnixNano()
+	if err := m.writeSlot(recordID, ownerSlot, dead); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	m.adopted[recordID] = adoptedSlot{slot: ownerSlot, owner: owner}
+	m.mu.Unlock()
+	return true, nil
 }
 
-// ReleaseAdopted frees the records AdoptOwner returned that this node still
-// holds without using them itself; a record in use is freed by its own release.
+// ownSlotUse reports whether this node holds recordID or has a claim written
+// for it, and in which mode.
+func (m *Manager) ownSlotUse(recordID uint64) (LockMode, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rec, ok := m.records[recordID]; ok {
+		return rec.mode, true
+	}
+	if c, ok := m.claims[recordID]; ok && !c.written.IsZero() {
+		return c.mode, true
+	}
+	return 0, false
+}
+
+// ReleaseAdopted clears the dead node's slots that AdoptOwner kept. A slot
+// that is this node's own and in use again is left to its own release, and a
+// slot a new node has written since is left alone.
 func (m *Manager) ReleaseAdopted(records []uint64) error {
 	for _, recordID := range records {
 		if err := m.releaseAdopted(recordID); err != nil {
@@ -88,28 +96,25 @@ func (m *Manager) releaseAdopted(recordID uint64) error {
 	defer gate.Unlock()
 
 	m.mu.Lock()
-	_, inUse := m.records[recordID]
+	a, ok := m.adopted[recordID]
+	delete(m.adopted, recordID)
 	m.mu.Unlock()
-	if inUse {
+	if !ok {
 		return nil
 	}
-
-	for {
-		record, err := m.readRecord(recordID)
-		if err != nil {
-			return err
+	if a.slot == m.nodeSlot {
+		if mode, inUse := m.ownSlotUse(recordID); inUse {
+			return m.writeSlot(recordID, a.slot, m.ownClaim(recordID, lockKey{}, mode, time.Now()))
 		}
-		if record.Mode != LockModeExclusive || record.OwnerUUID != m.nodeUUID {
-			return nil
-		}
-		ok, err := m.casRecord(recordID, record, &Record{Sequence: record.Sequence + 1})
-		if err != nil || ok {
-			return err
-		}
+		return m.writeSlot(recordID, a.slot, nil)
 	}
-}
-
-func (m *Manager) holdsExclusive(recordID uint64) bool {
-	record, err := m.readRecord(recordID)
-	return err == nil && record.Mode == LockModeExclusive && record.OwnerUUID == m.nodeUUID
+	buf := storage.GetBuffer(SlotSize)
+	defer storage.PutBuffer(buf)
+	if _, err := m.dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, a.slot)); err != nil {
+		return err
+	}
+	if s, err := decodeSlot(buf.Bytes()); err != nil || s == nil || !s.adopted || s.owner != a.owner {
+		return nil
+	}
+	return m.writeSlot(recordID, a.slot, nil)
 }

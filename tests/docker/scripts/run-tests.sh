@@ -3181,9 +3181,11 @@ test_snapshot_during_writes() {
     fi
     local run=$$
     local file=/mnt/goclusterfs/busy.bin
+    local since
+    since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
     exec_on_node "$node_a" sh -c "head -c 2097152 /dev/zero | tr '\\000' c > $file" || return 1
-    exec_on_node "$node_a" sh -c "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/dev/null || exit 1; done; done; done" &
+    exec_on_node "$node_a" sh -c "rm -f /tmp/busy.stop; for c in a b c; do head -c 65536 /dev/zero | tr '\\000' \$c > /tmp/busy_\$c; done; while [ ! -f /tmp/busy.stop ]; do for c in a b c; do for k in \$(seq 0 31); do [ -f /tmp/busy.stop ] && exit 0; dd if=/tmp/busy_\$c of=$file bs=65536 seek=\$k count=1 conv=notrunc 2>/tmp/busy.err || { cat /tmp/busy.err; exit 1; }; done; done; done" &
     local writer=$!
 
     local i clone sum
@@ -3201,7 +3203,11 @@ test_snapshot_during_writes() {
         sums+=("$(exec_on_node "$node_b" sh -c "md5sum < $clone | cut -d' ' -f1")")
     done
     exec_on_node "$node_a" touch /tmp/busy.stop
-    wait "$writer" || { log "ERROR: writer on $node_a failed"; return 1; }
+    if ! wait "$writer"; then
+        log "ERROR: writer on $node_a failed; its write errors:"
+        docker logs --since "$since" "$node_a" 2>&1 | grep -E 'Write inode|\[WARN\]' | tail -20
+        return 1
+    fi
 
     for i in "${!clones[@]}"; do
         clone=${clones[$i]}
@@ -3243,15 +3249,9 @@ run_test "Extent Tree Interleaved Appends" test_extent_tree_interleaved_appends
 run_test "Snapshot Preserves Data" test_snapshot_preserves_data
 run_test "Clone In-Place Write" test_clone_in_place_write
 run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
-# Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
-log "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
-echo "SKIP: Snapshot Concurrent Creates" >> "$RESULTS_DIR/results.txt"
-# Two nodes can both hold the refcount lock and lose a snapshot's count until #29 confirms lock claims.
-log "SKIPPING: Snapshot During Writes (two nodes can both hold one lock until #29)"
-echo "SKIP: Snapshot During Writes" >> "$RESULTS_DIR/results.txt"
-# Two nodes can both hold the root directory lock and lose an entry until #29 confirms lock claims.
-log "SKIPPING: Concurrent Directory Ops (two nodes can both hold one directory lock until #29)"
-echo "SKIP: Concurrent Directory Ops" >> "$RESULTS_DIR/results.txt"
+run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
+run_test "Snapshot During Writes" test_snapshot_during_writes
+run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"

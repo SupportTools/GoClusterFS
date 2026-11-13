@@ -435,6 +435,7 @@ type SuperblockData struct {
 	BlockBitmapSize   uint64
 	RefCountTableSize uint64
 	SnapshotRegSize   uint64
+	LockSlotSize      uint32
 
 	// Counters
 	InodeCount    uint64

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-GoClusterFS is a clustered FUSE filesystem written in Go. Several Linux nodes mount the same shared block device at the same time. Nodes coordinate through structures on the device itself: a node registry, CAS locks, and a write-ahead journal. All device I/O uses O_DIRECT, so no node trusts its own page cache. UDP multicast messages make cache invalidation faster, but correctness does not depend on them.
+GoClusterFS is a clustered FUSE filesystem written in Go. Several Linux nodes mount the same shared block device at the same time. Nodes coordinate through structures on the device itself: a node registry, lock records with one claim slot per node, and a write-ahead journal. All device I/O uses O_DIRECT, so no node trusts its own page cache. UDP multicast messages make cache invalidation faster, but correctness does not depend on them.
 
 FUSE binding: `github.com/hanwen/go-fuse/v2`. Linux only.
 
@@ -44,7 +44,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/inode` | Inode table, 256-byte inodes, CRC32C per sector |
 | `internal/extent` | File block mapping: 2 extents inline in the inode, the rest in an on-disk overflow tree |
 | `internal/dir` | Directory entries |
-| `internal/lock` | Distributed CAS locks stored on the device |
+| `internal/lock` | Distributed locks stored on the device: a node writes its claim into its own slot of a lock record, then reads the record |
 | `internal/node` | Node registry, heartbeats, failed-node detection |
 | `internal/journal` | Write-ahead journal, local and cross-node recovery |
 | `internal/cache` | Inode and extent caches, checked against on-disk generation counters |
@@ -69,15 +69,15 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 |--------|------|--------|
 | 0 | 1 MB | Superblock (first 4 KB) |
 | 1 MB | 1 MB | Node registry: 64 slots of 4 KB |
-| 2 MB | 1 MB | Lock records |
-| 3 MB | 1 MB | Snapshot registry |
-| 4 MB | 256 MB | Journals: 64 × 4 MB, one per registry slot |
-| 260 MB | 1 MB per 8 TB of device | Block bitmap |
+| 2 MB | 64 MB | Lock records: 256 records of 64 claim slots of 4 KB, one slot per registry slot |
+| 66 MB | 1 MB | Snapshot registry |
+| 67 MB | 256 MB | Journals: 64 × 4 MB, one per registry slot |
+| 323 MB | 1 MB per 8 TB of device | Block bitmap |
 | next | about 8 MB per TB of device | Block refcounts |
 | next | 256 bytes per inode | Inode table: one inode per `-bytes-per-inode` bytes of device (default 1 MB), 4096 to 16M inodes; root is inode 2 |
 | next | rest | Data blocks |
 
-The last three metadata regions are sized at format time, each at least 1 MB and rounded up to whole MB. On devices up to 4 GB the data blocks start at 263 MB. The smallest device is 264 MB. Registry slot `i` owns the journal at `4 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes) and version 2 images (1 MB bitmap, refcount and inode regions: 4096 inodes, refcounts overflow past 128 GB); copy the data off with the old build and reformat.
+The last three metadata regions are sized at format time, each at least 1 MB and rounded up to whole MB. On devices up to 4 GB the data blocks start at 326 MB. The smallest device is 327 MB. Registry slot `i` owns the journal at `67 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes) and version 2 images (1 MB bitmap, refcount and inode regions: 4096 inodes, refcounts overflow past 128 GB). It also refuses version 3 images formatted before per-node lock slots, which have no lock slot size in the superblock and a 1 MB lock region. Copy the data off with the old build and reformat.
 
 ## Snapshots and Clones
 

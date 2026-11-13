@@ -288,7 +288,6 @@ scenarios:
     name: Concurrent directory operations
     description: Multiple nodes create directories simultaneously
     priority: high
-    # Skipped in all three suites until #29: two nodes can both hold the root directory lock and lose an entry.
     environments:
       go: multinode_test.go::TestMultiNodeConcurrentDirectoryOps
       docker: run-tests.sh::test_concurrent_directory_ops
@@ -349,6 +348,34 @@ scenarios:
       go: tree_reservation_test.go::TestWriteInsideFallocatedRange
       docker: TODO
       vm: TODO
+
+  # Docker/VM TODO: these need two nodes writing sub-block ranges of one block at
+  # the same moment and a byte-exact check after a remount; the Go tests run the
+  # real mount binary for both nodes.
+  - id: multinode-sub-block-writes
+    name: Sub-block writes to one block from two nodes
+    description: Two nodes write whole sectors and halves of the same sectors of one block at once; every write survives
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeSubBlockWritesToOneBlock
+      docker: TODO  # needs two nodes writing one block at the same moment and a byte-exact check after a remount
+      vm: TODO  # same as docker
+
+  - id: multinode-fallocated-block-writes
+    name: Writes to one fallocated block from two nodes
+    description: Two nodes write different sectors of one fallocated block at once; both survive and the rest reads as zeros
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeWritesToOneFallocatedBlock
+      docker: TODO  # needs two nodes writing one fallocated block at the same moment and a byte-exact check after a remount
+      vm: TODO  # same as docker
+
+  - id: multinode-reader-sees-no-uncommitted-blocks
+    name: Reader never sees uncommitted blocks
+    description: While node A writes a new file of fresh blocks without extent locks, node B's reads show only holes, the old size or each block's own data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestReaderNeverSeesUncommittedBlocks
 
   - id: multinode-overlapping-block-writes
     name: Overlapping block writes
@@ -2420,7 +2447,6 @@ scenarios:
     name: Snapshots on one node while another overwrites the file
     description: Every snapshot node B takes while node A overwrites the file chunk by chunk shows one moment of the file and never changes afterwards
     priority: high
-    # Skipped in all three suites until #29: two nodes can both hold the refcount lock and lose a count.
     environments:
       go: snapshot_test.go::TestSnapshotsDuringWritesAcrossNodes
       docker: run-tests.sh::test_snapshot_during_writes
@@ -2430,7 +2456,6 @@ scenarios:
     name: Concurrent snapshots on two nodes
     description: Two nodes snapshot their own files at the same time; each file keeps all its snapshots, and deleting one node's snapshots leaves the other's
     priority: high
-    # Skipped in all three suites (Go in -short mode) until #29: two nodes can both claim one free inode.
     environments:
       go: snapshot_test.go::TestSnapshotConcurrentCreatesAcrossNodes
       docker: run-tests.sh::test_snapshot_concurrent_creates
@@ -2509,7 +2534,7 @@ scenarios:
   # Docker/VM TODO: a shell test would have to freeze a node (docker pause, or
   # SIGSTOP on the QEMU process) inside a lock-held section that lasts
   # milliseconds, then resume it after StaleThreshold. Shell tests cannot target
-  # that window, so the Go test simulates the pause by aging the on-disk record.
+  # that window, so the Go test simulates the pause by aging the holder's claim slot.
   - id: lock-stale-reclaim-paused-holder
     name: Stale lock reclaimed from paused holder
     description: A holder stalled past StaleThreshold loses its lock to another node without being told
@@ -2575,16 +2600,9 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReadersOnTwoNodesCannotBothWrite
 
-  - id: lock-join-fails-after-takeover
-    name: Join fails after takeover
-    description: A key joining an exclusive hold that another node took over as stale gets ErrLockLost instead of joining
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestJoinFailsAfterRecordTakenOver
-
   - id: lock-busy-record-renewed
     name: Busy record renewed on join
-    description: A key joining an exclusive record this node has held past renewAfter rewrites its AcquireTime, so a busy node does not lose the record as stale
+    description: A key joining an exclusive record this node has held past renewAfter writes its claim slot again, so a busy node does not lose the record as stale
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestJoiningKeyRenewsBusyRecord
@@ -2596,20 +2614,6 @@ scenarios:
     environments:
       go: internal/inode/lock_test.go::TestWriteDoesNotHangBehindSameNodeReader
 
-  - id: lock-stale-shared-reclaim
-    name: Stale shared lock reclaim drops dead readers
-    description: Reclaiming a stale shared record resets the reader count so it can be fully released
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestStaleSharedLockReclaimResetsReaderCount
-
-  - id: lock-leaked-shared-count-goes-stale
-    name: Leaked reader count goes stale
-    description: New readers do not refresh a shared record's age, so a reader count leaked by a lost update cannot block writers forever
-    priority: go_only
-    environments:
-      go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
-
   - id: write-failure-keeps-committed-blocks
     name: Failed write keeps blocks committed mid-write
     description: When the final inode write fails after a mid-write persist committed a new block, the retry finds that block still allocated and mapped
@@ -2617,16 +2621,215 @@ scenarios:
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestFailedWriteKeepsBlocksCommittedMidWrite
 
-  - id: lock-region-bounded
-    name: Lock region stays bounded
-    description: Many acquire/release cycles across resources and two nodes reuse the fixed region, leave no record held, and write nothing outside it
+  - id: lock-released-hold-cached
+    name: Released hold cached for grace
+    description: After its last local holder releases, a node keeps the record for CacheGrace, and another node gets it soon after
     priority: go_only
     environments:
-      go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles
+      go: internal/lock/safety_test.go::TestReleasedHoldIsCachedForGrace
 
-  # ===========================================================================
-  # HTTP API (one process on one host; Docker and VM would test nothing more)
-  # ===========================================================================
+  - id: lock-idle-hold-frees-before-turn
+    name: Idle cached hold frees before the turn ends
+    description: Another node gets a record held idle in a cache sooner than the HoldTurn a busy holder keeps it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestIdleCachedHoldFreesBeforeTurnEnds
+
+  - id: lock-overlapping-holds-yield
+    name: Overlapping local holds still yield
+    description: A node whose local holds of one record keep overlapping stops taking new ones after its turn, so another node gets the record
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestOverlappingLocalHoldsStillYield
+
+  - id: lock-torn-slot-expires
+    name: Torn slot expires
+    description: A slot that keeps failing its checksum stops blocking other nodes after tornExpiry
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTornSlotExpires
+
+  - id: lock-torn-slot-wait-restarts
+    name: Torn slot wait restarts when its bytes change
+    description: A node with an old torn sighting of a slot does not ignore it when the slot reads torn with other bytes, as a live write in flight does
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTornSlotWaitRestartsWhenBytesChange
+
+  - id: lock-own-slot-adoption-outlives-replay-acquire
+    name: Own-slot adoption outlives the replay's acquires
+    description: A node restarted into its own slot keeps the adopted claim there after its replay acquires and releases the record, until ReleaseAdopted
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestOwnSlotAdoptionOutlivesReplayAcquire
+
+  - id: lock-replayer-wins-adopted-record
+    name: Replayer wins an adopted record over a lower-slot waiter
+    description: A waiter in a lower slot defers to an adopted slot, so the replayer gets the record instead of waiting behind the waiter
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestReplayerWinsAdoptedRecordOverLowerWaiter
+
+  - id: lock-release-adopted-keeps-new-owner
+    name: ReleaseAdopted keeps a new owner's claim
+    description: A claim written by a node that registered into the dead node's slot survives ReleaseAdopted
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestReleaseAdoptedKeepsNewOwnersClaim
+
+  - id: whole-sector-write-survives-peer-partial-write
+    name: Whole-sector write survives a peer's partial write
+    description: Node A's whole-sector write and node B's 1-byte write to the same sector at once; A's write is never lost to B's read-modify-write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestWholeSectorWriteSurvivesPeerPartialWrite
+
+  - id: write-when-inode-and-block-share-lock-record
+    name: Write succeeds when the inode and block share a lock record
+    description: A write into an existing block whose extent lock maps to the same lock record as the file's inode lock succeeds instead of failing as a shared-to-exclusive upgrade
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestWriteWhenInodeAndBlockShareLockRecord
+
+  - id: lock-leaked-shared-count-goes-stale
+    name: Leaked read claim goes stale
+    description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestNewReadersDoNotKeepLeakedSharedLockFresh
+
+  - id: lock-slot-claims-exclude-under-slow-writes
+    name: Slot claims exclude under slow writes
+    description: Six nodes take one lock for writing and reading while every slot write takes up to 30ms; a writer never holds beside another holder
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlotClaimsExcludeUnderSlowWrites
+
+  - id: lock-torn-slot-counts-as-claim
+    name: Torn slot counts as a claim
+    description: A claim slot that fails its checksum blocks the record until it is cleared
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestTornSlotCountsAsClaim
+
+  - id: lock-slot-readers-share-writers-wait
+    name: Readers share, writers wait
+    description: Read claims on two nodes hold one record together; a write claim waits until both release
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlotReadersShareWritersWait
+
+  - id: lock-contended-claims-all-finish
+    name: Contended claims all finish
+    description: Four nodes take one write lock 25 times each with no delays; every acquire finishes
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestContendedSlotClaimsAllFinish
+
+  - id: lock-racing-claims-lower-slot-wins
+    name: Racing claims, lower slot wins
+    description: One node writes its claim and stalls before reading the row while another claims; the node in the lower slot gets the lock and the other waits for its release
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestRacingClaimsLowerSlotWins
+
+  - id: lock-dead-claimant-blocks-until-stale
+    name: Dead claimant blocks only until stale
+    description: A claim left by a node that stopped mid-claim, in a lower or a higher slot, keeps a live node waiting only until the claim is 15 seconds old
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestDeadClaimantBlocksOnlyUntilStale
+
+  - id: lock-abandoned-claim-cleared
+    name: Abandoned claim is cleared
+    description: A lower-slot node that gives up waiting clears the claim it kept, so a higher-slot node gets the lock as soon as the holder releases
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestAbandonedClaimIsCleared
+
+  - id: lock-slow-slot-writes-no-freeze
+    name: Slow slot writes cause no freeze
+    description: With every slot write taking 333ms, two nodes still hand one lock back and forth four times without a stall
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestSlowSlotWritesCauseNoFreeze
+
+  - id: lock-adopt-owner-renews-old-claim
+    name: Takeover renews a dead node's old claim
+    description: AdoptOwner writes a dead node's write claim again, so peers stay off the record until the replay ends even if the claim was already stale
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerRenewsDeadNodesOldClaim
+
+  - id: lock-adopt-owner-clears-torn-slot
+    name: Takeover clears a dead node's torn slot
+    description: A torn slot in a dead node's registry slot never goes stale; AdoptOwner keeps it for the replay and ReleaseAdopted clears it
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerClearsDeadNodesTornSlot
+
+  - id: lock-adopt-owner-own-slot
+    name: Restarted node takes over its predecessor's claims
+    description: A node restarted into its own registry slot keeps its predecessor's claims during the replay, then clears those it does not use itself
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerOfOwnSlotPredecessor
+
+  - id: superblock-refuses-layout-without-lock-slots
+    name: Mount refuses layout without lock slots
+    description: A v3 image formatted before per-node lock slots, with a 1 MB lock region and no slot size, is refused with a message to reformat
+    priority: go_only
+    environments:
+      go: internal/superblock/io_test.go::TestReadRejectsLayoutWithoutLockSlots
+
+  - id: lock-cached-rejoin-no-disk-io
+    name: Cached rejoin needs no disk I/O
+    description: Re-acquiring a cached hold on the same node writes no slot and reads no row
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestCachedHoldRejoinNeedsNoDiskIO
+
+  - id: lock-paused-node-drops-cached-hold
+    name: Paused node drops a cached hold taken over
+    description: A cached write hold older than renewAfter is released and acquired afresh, so a node waking from a pause does not reuse a record another node took over
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestPausedNodeDropsCachedHoldTakenOver
+
+  - id: lock-release-cached
+    name: Release cached holds
+    description: ReleaseCached lets other nodes take kept records at once
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
+
+  - id: lock-busy-node-yields
+    name: Busy node yields a cached record
+    description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
+
+  - id: lock-concurrent-dir-reads-create
+    name: Concurrent directory reads do not delay create or unlink
+    description: Two nodes taking a shared claim on one directory at once leave no reader count behind, so a create or unlink there finishes within 2s
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestConcurrentDirReadsDoNotDelayCreateOrUnlink
+
+  - id: lock-concurrent-refcount-reads-snapshots
+    name: Concurrent refcount reads do not delay snapshots
+    description: Two nodes reading refcounts at once leave no reader count behind, so snapshot create, copy-on-write and snapshot delete each finish within 2s
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/lock_commit_test.go::TestConcurrentRefcountReadsDoNotDelaySnapshots
+
+  - id: lock-adopt-owner-clears-dead-reader
+    name: Dead node's reader bit cleared on takeover
+    description: AdoptOwner clears a proven-dead node's read slot, so a writer gets a record the dead node kept for reading
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerClearsDeadReader
 
   - id: lock-acquire-without-deadline-gives-up
     name: Acquire without a deadline gives up
@@ -2641,6 +2844,24 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestTimedOutAcquireLogsHolder
+
+  - id: lock-release-cached-parallel
+    name: Unmount frees kept locks in parallel
+    description: On slow storage ReleaseCached frees kept records in parallel, so 16 records take about as long as one
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestReleaseCachedWithSlowWritesRunsInParallel
+
+  - id: lock-region-bounded
+    name: Lock region stays bounded
+    description: Many acquire/release cycles across resources and two nodes reuse the fixed region, leave no record held, and write nothing outside it
+    priority: go_only
+    environments:
+      go: internal/lock/safety_test.go::TestLockRegionStaysBoundedAcrossCycles
+
+  # ===========================================================================
+  # HTTP API (one process on one host; Docker and VM would test nothing more)
+  # ===========================================================================
 
   - id: api-health-loopback
     name: API answers /health on loopback

@@ -138,7 +138,7 @@ func (sb *SuperblockData) layout() *superblock.Superblock {
 		BlockBitmapOffset: sb.BlockBitmapOffset, BlockBitmapSize: sb.BlockBitmapSize,
 		RefCountTableOffset: sb.RefCountTableOffset, RefCountTableSize: sb.RefCountTableSize,
 		InodeTableOffset: sb.InodeTableOffset, InodeTableSize: sb.InodeTableSize,
-		DataRegionOffset: sb.DataRegionOffset,
+		DataRegionOffset: sb.DataRegionOffset, LockSlotSize: sb.LockSlotSize,
 	}
 }
 
@@ -193,6 +193,8 @@ func (c *Checker) parseSuperblock(buf []byte) *SuperblockData {
 	sb.CreateTime = int64(binary.LittleEndian.Uint64(buf[240:248]))
 	sb.LastMountTime = int64(binary.LittleEndian.Uint64(buf[248:256]))
 	sb.LastWriteTime = int64(binary.LittleEndian.Uint64(buf[256:264]))
+
+	sb.LockSlotSize = binary.LittleEndian.Uint32(buf[264:268])
 
 	return sb
 }

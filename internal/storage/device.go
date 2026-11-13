@@ -171,6 +171,16 @@ func (d *Device) Path() string {
 // Both offset and len(buf) MUST be aligned to SectorSize.
 // Concurrent reads to different 1MB regions proceed in parallel.
 func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
+	return d.readAt(buf, offset, true)
+}
+
+// ReadAtUnsharded is ReadAt without the shard lock, so other I/O to the same
+// 1MB region cannot delay it. Callers must serialize their own I/O to the range.
+func (d *Device) ReadAtUnsharded(buf []byte, offset int64) (int, error) {
+	return d.readAt(buf, offset, false)
+}
+
+func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, err
 	}
@@ -182,9 +192,10 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
 
-	// Lock the affected shard(s)
-	startShard, endShard := d.lockIORange(offset, len(buf))
-	defer d.unlockIORange(startShard, endShard)
+	if sharded {
+		startShard, endShard := d.lockIORange(offset, len(buf))
+		defer d.unlockIORange(startShard, endShard)
+	}
 
 	return d.file.ReadAt(buf, offset)
 }
@@ -193,6 +204,16 @@ func (d *Device) ReadAt(buf []byte, offset int64) (int, error) {
 // Both offset and len(buf) MUST be aligned to SectorSize.
 // Concurrent writes to different 1MB regions proceed in parallel.
 func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
+	return d.writeAt(buf, offset, true)
+}
+
+// WriteAtUnsharded is WriteAt without the shard lock, so other I/O to the same
+// 1MB region cannot delay it. Callers must serialize their own I/O to the range.
+func (d *Device) WriteAtUnsharded(buf []byte, offset int64) (int, error) {
+	return d.writeAt(buf, offset, false)
+}
+
+func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if err := validateAlignment(buf, offset); err != nil {
 		return 0, err
 	}
@@ -204,9 +225,10 @@ func (d *Device) WriteAt(buf []byte, offset int64) (int, error) {
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
 
-	// Lock the affected shard(s)
-	startShard, endShard := d.lockIORange(offset, len(buf))
-	defer d.unlockIORange(startShard, endShard)
+	if sharded {
+		startShard, endShard := d.lockIORange(offset, len(buf))
+		defer d.unlockIORange(startShard, endShard)
+	}
 
 	return d.file.WriteAt(buf, offset)
 }

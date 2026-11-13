@@ -3486,10 +3486,8 @@ main() {
     run_test "Snapshot Preserves Data" test_snapshot_preserves_data
     run_test "Clone In-Place Write" test_clone_in_place_write
     run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
-    # Two nodes can both take one free inode's lock and claim the inode until #29 confirms lock claims.
-    log_info "SKIPPING: Snapshot Concurrent Creates (two nodes can both claim one free inode until #29)"
-    # Two nodes can both hold the refcount lock and lose a snapshot's count until #29 confirms lock claims.
-    log_info "SKIPPING: Snapshot During Writes (two nodes can both hold one lock until #29)"
+    run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
+    run_test "Snapshot During Writes" test_snapshot_during_writes
 
     run_test "Concurrent Writes" test_concurrent_writes
     run_test "Concurrent File Creation" test_concurrent_file_creation
@@ -3527,8 +3525,7 @@ main() {
     run_test "Append File" test_append_file
     run_test "Rename File" test_rename_file
     run_test "Stress Single Node" test_stress_single_node
-    # Two nodes can both hold the root directory lock and lose an entry until #29 confirms lock claims.
-    log_info "SKIPPING: Concurrent Directory Ops (two nodes can both hold one directory lock until #29)"
+    run_test "Concurrent Directory Ops" test_concurrent_directory_ops
     run_test "Long-Running Stability" test_stability
 
     # Run concurrent same-file write tests (using pre-extension pattern)

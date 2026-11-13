@@ -344,8 +344,14 @@ func damageJournalHeader(t *testing.T, imagePath, offset string) {
 
 func verifyFiles(t *testing.T, node *MountedFS, names []string) {
 	t.Helper()
+	// The kernel can keep a size it looked up mid-write for -attr-timeout.
+	deadline := time.Now().Add(node.attrTimeout() + 500*time.Millisecond)
 	for _, name := range names {
 		got, err := node.ReadFile(name)
+		for err == nil && !bytes.Equal(got, []byte(name)) && time.Now().Before(deadline) {
+			time.Sleep(100 * time.Millisecond)
+			got, err = node.ReadFile(name)
+		}
 		if err != nil {
 			t.Errorf("read %s: %v", name, err)
 			continue
@@ -354,6 +360,22 @@ func verifyFiles(t *testing.T, node *MountedFS, names []string) {
 			t.Errorf("%s: got %q", name, got)
 		}
 	}
+}
+
+// defaultAttrTimeout is goclusterfs-mount's -attr-timeout default.
+const defaultAttrTimeout = time.Second
+
+func (m *MountedFS) attrTimeout() time.Duration {
+	for i, arg := range m.ExtraArgs {
+		v, ok := strings.CutPrefix(arg, "-attr-timeout=")
+		if !ok && arg == "-attr-timeout" && i+1 < len(m.ExtraArgs) {
+			v, ok = m.ExtraArgs[i+1], true
+		}
+		if d, err := time.ParseDuration(v); ok && err == nil {
+			return d
+		}
+	}
+	return defaultAttrTimeout
 }
 
 func mustMatch(t *testing.T, re *regexp.Regexp, log *syncBuffer, what string) string {

@@ -108,7 +108,7 @@ type Registry struct {
 	pidNS      uint64
 	onSlotLost func(slot int, owner [16]byte)
 
-	onOwnerDead  func(owner [16]byte) (release func())
+	onOwnerDead  func(owner [16]byte, slot int) (release func())
 	deadPrevious *[16]byte
 	sightings    map[int]sighting
 
@@ -188,9 +188,9 @@ func (r *Registry) SetSlotLostHandler(fn func(slot int, owner [16]byte)) {
 }
 
 // SetOwnerDeadHandler sets what failure detection calls, before replaying a
-// proven-dead node's journal, with that node's UUID; for example to take over
-// its locks. The returned function runs after the replay.
-func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte) (release func())) {
+// proven-dead node's journal, with that node's UUID and registry slot; for
+// example to take over its locks. The returned function runs after the replay.
+func (r *Registry) SetOwnerDeadHandler(fn func(owner [16]byte, slot int) (release func())) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onOwnerDead = fn
@@ -207,14 +207,14 @@ func (r *Registry) DeadPreviousOwner() ([16]byte, bool) {
 	return *r.deadPrevious, true
 }
 
-func (r *Registry) ownerDead(owner [16]byte) func() {
+func (r *Registry) ownerDead(owner [16]byte, slot int) func() {
 	r.mu.Lock()
 	fn := r.onOwnerDead
 	r.mu.Unlock()
 	if fn == nil {
 		return func() {}
 	}
-	return fn(owner)
+	return fn(owner, slot)
 }
 
 // SetJournalArea makes Register record a journal region in the claimed slot:
@@ -786,7 +786,7 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		}
 		release := func() {}
 		if dead {
-			release = r.ownerDead(info.UUID)
+			release = r.ownerDead(info.UUID, i)
 		}
 		err = handler(info)
 		release()
