@@ -7,6 +7,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/api"
 	"github.com/supporttools/GoClusterFS/internal/cache"
+	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
@@ -38,6 +39,18 @@ func cacheResponse(c cache.Stats, l lock.Stats) *api.CacheStatsResponse {
 		resp.Broadcast = &api.BroadcastTables{Peers: c.PeerCount, Senders: c.BroadcastSenders, MaxPeers: c.BroadcastMaxPeers}
 	}
 	return resp
+}
+
+func dirIndexInfo(d dir.IndexStats) *api.DirIndexInfo {
+	return &api.DirIndexInfo{
+		Dirs:     d.Dirs,
+		Entries:  d.Entries,
+		Limit:    d.Limit,
+		Hits:     d.Hits,
+		Misses:   d.Misses,
+		Rebuilds: d.Rebuilds,
+		HitRate:  hitRate(d.Hits, d.Misses),
+	}
 }
 
 func lockResponse(l lock.Stats) *api.LockStatsResponse {

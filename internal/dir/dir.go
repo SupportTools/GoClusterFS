@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sync"
 
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -100,6 +101,24 @@ type Manager struct {
 	extentMgr  *extent.Manager
 	lockMgr    *lock.Manager
 	dataOffset uint64 // Starting disk offset for data blocks
+	indexes    *indexCache
+	// dirMu serializes this node's changes to a directory: its cluster lock admits every goroutine on the node at once.
+	dirMu [dirStripes]sync.RWMutex
+}
+
+const dirStripes = 256
+
+// LockDir keeps this node's other changes and index builds for directory num out until the returned func runs; take it before any cluster lock.
+func (m *Manager) LockDir(num uint32) func() {
+	mu := &m.dirMu[num%dirStripes]
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (m *Manager) readLockDir(num uint32) func() {
+	mu := &m.dirMu[num%dirStripes]
+	mu.RLock()
+	return mu.RUnlock
 }
 
 // NewManager creates a new directory manager.
@@ -111,6 +130,7 @@ func NewManager(dev *storage.Device, inodeTbl *inode.Table, extentMgr *extent.Ma
 		extentMgr:  extentMgr,
 		lockMgr:    lockMgr,
 		dataOffset: dataOffset,
+		indexes:    newIndexCache(DefaultIndexEntries),
 	}
 }
 
@@ -129,12 +149,14 @@ func (m *Manager) Lookup(ctx context.Context, dirIno *inode.Inode, name string) 
 		return 0, 0, ErrNameTooLong
 	}
 
-	// Empty directory
-	if dirIno.Size == 0 {
-		return 0, 0, ErrNotFound
+	if s, found, ok := m.cachedLookup(dirIno.InodeNum, name); ok {
+		if !found {
+			return 0, 0, ErrNotFound
+		}
+		return s.child, s.ftype, nil
 	}
 
-	// Acquire shared lock for read operation
+	defer m.readLockDir(dirIno.InodeNum)()
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeShared); err != nil {
 			return 0, 0, fmt.Errorf("failed to acquire directory lock: %w", err)
@@ -142,44 +164,25 @@ func (m *Manager) Lookup(ctx context.Context, dirIno *inode.Inode, name string) 
 		defer m.unlock(dirIno.InodeNum)
 	}
 
-	// Read directory data and scan for entry
-	entries, err := m.readEntries(ctx, dirIno)
-	if err != nil {
-		return 0, 0, err
-	}
-
-	for _, entry := range entries {
-		if entry.InodeNum != 0 && entry.Name == name {
-			return entry.InodeNum, entry.FileType, nil
-		}
-	}
-
-	return 0, 0, ErrNotFound
-}
-
-// lookupUnlocked finds an entry without acquiring locks.
-// Used internally by methods that already hold the directory lock.
-func (m *Manager) lookupUnlocked(ctx context.Context, dirIno *inode.Inode, name string) (uint64, uint8, error) {
-	if dirIno.Size == 0 {
+	fresh, err := m.liveDirLocked(dirIno.InodeNum)
+	if errors.Is(err, ErrRemoved) {
 		return 0, 0, ErrNotFound
 	}
-
-	entries, err := m.readEntries(ctx, dirIno)
 	if err != nil {
 		return 0, 0, err
 	}
-
-	for _, entry := range entries {
-		if entry.InodeNum != 0 && entry.Name == name {
-			return entry.InodeNum, entry.FileType, nil
-		}
+	x, err := m.indexOf(fresh)
+	if err != nil {
+		return 0, 0, err
 	}
-
-	return 0, 0, ErrNotFound
+	s, found, _ := x.find(fresh.MetaGeneration, name)
+	if !found {
+		return 0, 0, ErrNotFound
+	}
+	return s.child, s.ftype, nil
 }
 
 // Add adds a new entry to a directory.
-// Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8) error {
 	if dirIno.Magic != inode.InodeMagic {
 		return ErrRemoved
@@ -205,6 +208,7 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	}
 	entry.RecLen = entrySize(entry)
 
+	defer m.LockDir(dirIno.InodeNum)()
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to add entries simultaneously, they may race
 	// to allocate the same logical block position. If a conflict is detected,
@@ -238,93 +242,62 @@ func (m *Manager) unlock(dirInode uint32) {
 // addInternal performs the actual add operation.
 // Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
 func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
-	// Acquire exclusive lock for write operation
-	// NOTE: We do NOT use defer here because we may need to release the lock
-	// before calling addToNewBlock (which acquires its own lock). Using defer
-	// would cause the lock to be released twice, potentially releasing a lock
-	// held by a different goroutine.
-	lockHeld := false
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
-		lockHeld = true
 	}
-
-	freshIno, err := m.liveDirLocked(dirIno.InodeNum)
-	if err != nil {
-		if lockHeld {
-			m.unlock(dirIno.InodeNum)
-		}
-		return err
-	}
-
-	// Check if entry already exists (done under lock to avoid TOCTOU)
-	_, _, err = m.lookupUnlocked(ctx, freshIno, entry.Name)
-	if err == nil {
-		if lockHeld {
-			m.unlock(dirIno.InodeNum)
-		}
-		return ErrExists
-	}
-	if err != ErrNotFound {
-		if lockHeld {
-			m.unlock(dirIno.InodeNum)
-		}
-		return err
-	}
-
-	// Try to find space in existing blocks (doesn't need bitmap lock)
-	if freshIno.Size > 0 {
-		added, err := m.addToExistingBlock(ctx, freshIno, entry)
-		if err != nil {
-			if lockHeld {
-				m.unlock(dirIno.InodeNum)
-			}
-			return err
-		}
-		if added {
-			// Increment MetaGeneration to signal modification
-			freshIno.MetaGeneration++
-			if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
-				if lockHeld {
-					m.unlock(dirIno.InodeNum)
-				}
-				if errors.Is(err, extent.ErrTreeConflict) {
-					return errRetryAdd
-				}
-				return fmt.Errorf("failed to write directory inode: %w", err)
-			}
-			if lockHeld {
-				m.unlock(dirIno.InodeNum)
-			}
-			// Copy the fresh state back to caller's inode
-			dirIno.Size = freshIno.Size
-			return nil
-		}
-	}
-
-	// No space in existing blocks - need to allocate a new one
-	// Release inode lock before bitmap allocation to respect lock ordering
-	// (bitmap lock level 6 < inode lock level 8)
-	if lockHeld {
+	freshIno, added, err := m.addToExistingChunk(dirIno.InodeNum, entry, 0)
+	// addToNewBlock allocates a block, which must happen without the directory lock.
+	if m.lockMgr != nil {
 		m.unlock(dirIno.InodeNum)
 	}
+	if err != nil || added {
+		if added {
+			dirIno.Size = freshIno.Size
+		}
+		return err
+	}
 
-	// Allocate block without holding inode lock
 	// CRITICAL: Pass freshIno (not dirIno) so addToNewBlock has the latest size
 	// for calculating which block to allocate. addToNewBlock will re-read anyway,
 	// but starting with a fresher estimate reduces wasted allocations.
-	// NOTE: addToNewBlock handles its own lock acquisition and release.
-	// It may return errRetryAdd if a concurrent modification is detected.
 	err = m.addToNewBlock(ctx, freshIno, entry)
-
-	// Copy updated state back to caller's inode
 	if err == nil {
 		dirIno.Size = freshIno.Size
 	}
-
 	return err
+}
+
+// addToExistingChunk adds entry to the first chunk with room if the directory has more than blocks blocks. Caller holds the directory lock.
+func (m *Manager) addToExistingChunk(num uint32, entry *DirEntry, blocks uint64) (freshIno *inode.Inode, added bool, err error) {
+	freshIno, err = m.liveDirLocked(num)
+	if err != nil {
+		return nil, false, err
+	}
+	x, err := m.indexOf(freshIno)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, exists, _ := x.find(freshIno.MetaGeneration, entry.Name); exists {
+		return nil, false, ErrExists
+	}
+	if extent.BlocksForSize(freshIno.Size) <= blocks {
+		return freshIno, false, nil
+	}
+	at, ok := x.chunkWithRoom(entrySize(entry))
+	if !ok {
+		return freshIno, false, nil
+	}
+	added, err = m.editChunk(freshIno, x, at,
+		func(chunk []byte) bool { return addToChunk(chunk, entry) },
+		func(names map[string]slot) {
+			names[entry.Name] = slot{child: entry.InodeNum, chunk: at, ftype: entry.FileType}
+		})
+	if errors.Is(err, extent.ErrTreeConflict) || (err == nil && !added) {
+		return nil, false, errRetryAdd
+	}
+	return freshIno, added, err
 }
 
 // Remove removes an entry from a directory.
@@ -334,6 +307,7 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 }
 
 // RemoveIf removes name if ok accepts the inode it names; ok runs under the directory lock.
+// The directory inode is written before RemoveIf returns, so before the caller frees the child.
 func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool) (bool, error) {
 	if dirIno.Magic != inode.InodeMagic {
 		return false, ErrRemoved
@@ -350,6 +324,7 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 		return false, fmt.Errorf("cannot remove %q", name)
 	}
 
+	defer m.LockDir(dirIno.InodeNum)()
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
 			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
@@ -357,44 +332,32 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 		defer m.unlock(dirIno.InodeNum)
 	}
 
-	dirIno, err := m.liveDirLocked(dirIno.InodeNum)
-	if err != nil {
-		return false, err
-	}
-
-	numBlocks := extent.BlocksForSize(dirIno.Size)
-	for block := uint64(0); block < numBlocks; block++ {
-		ext, extOffset, err := m.extentMgr.Lookup(dirIno, block)
-		if err == extent.ErrExtentNotFound {
-			continue
-		}
+	for attempt := 0; ; attempt++ {
+		fresh, err := m.liveDirLocked(dirIno.InodeNum)
 		if err != nil {
 			return false, err
 		}
-		physBlock := ext.PhysicalBlock + extOffset
-
-		data, err := m.readBlock(physBlock)
+		x, err := m.indexOf(fresh)
 		if err != nil {
 			return false, err
 		}
-		for start := 0; start < len(data); start += DirChunkSize {
-			chunk := data[start : start+DirChunkSize]
-			child, found := childInChunk(chunk, name)
-			if !found {
-				continue
+		s, found, _ := x.find(fresh.MetaGeneration, name)
+		if !found {
+			return false, ErrNotFound
+		}
+		if !ok(s.child) {
+			return false, nil
+		}
+		removed, err := m.editChunk(fresh, x, s.chunk,
+			func(chunk []byte) bool { return removeFromChunk(chunk, name) },
+			func(names map[string]slot) { delete(names, name) })
+		if removed || err != nil || attempt > 0 {
+			if err == nil && !removed {
+				err = fmt.Errorf("%w: %q is in the index of directory %d but not in its chunk", ErrCorrupted, name, dirIno.InodeNum)
 			}
-			if !ok(child) {
-				return false, nil
-			}
-			removeFromChunk(chunk, name)
-			if err := m.writeChunk(physBlock, start, chunk); err != nil {
-				return false, err
-			}
-			return true, nil
+			return removed, err
 		}
 	}
-
-	return false, ErrNotFound
 }
 
 // liveDirLocked re-reads directory num under its lock: another node may have changed or removed it.
@@ -409,13 +372,13 @@ func (m *Manager) liveDirLocked(num uint32) (*inode.Inode, error) {
 	return ino, nil
 }
 
-// List returns all entries in a directory.
+// List returns all entries in a directory, and refreshes its index.
 func (m *Manager) List(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, error) {
 	if !dirIno.IsDir() {
 		return nil, ErrNotDirectory
 	}
 
-	// Acquire shared lock for read operation
+	defer m.readLockDir(dirIno.InodeNum)()
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeShared); err != nil {
 			return nil, fmt.Errorf("failed to acquire directory lock: %w", err)
@@ -429,7 +392,14 @@ func (m *Manager) List(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, er
 		return nil, fmt.Errorf("failed to read directory inode: %w", err)
 	}
 
-	return m.readEntries(ctx, freshIno)
+	x, entries, err := m.scan(freshIno)
+	if err != nil {
+		return nil, err
+	}
+	if freshIno.Magic == inode.InodeMagic && freshIno.IsDir() {
+		m.indexes.put(x)
+	}
+	return entries, nil
 }
 
 // IsEmpty returns true if the directory contains only "." and ".." entries.
@@ -454,6 +424,7 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	if dirIno.Size > 0 {
 		return fmt.Errorf("directory already has content")
 	}
+	defer m.LockDir(dirIno.InodeNum)()
 
 	// IMPORTANT: Block allocation must happen BEFORE acquiring inode lock
 	// to respect lock ordering (bitmap lock level 6 < inode lock level 8)
@@ -528,101 +499,6 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	return nil
 }
 
-// readEntries reads all entries from a directory.
-func (m *Manager) readEntries(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, error) {
-	entries, err := m.readEntriesOf(ctx, dirIno)
-	if errors.Is(err, extent.ErrStaleTree) {
-		// A cached inode can point at tree nodes another node has rewritten.
-		fresh, readErr := m.inodeTbl.Read(dirIno.InodeNum)
-		if readErr != nil {
-			return nil, err
-		}
-		return m.readEntriesOf(ctx, fresh)
-	}
-	return entries, err
-}
-
-func (m *Manager) readEntriesOf(ctx context.Context, dirIno *inode.Inode) ([]DirEntry, error) {
-	if dirIno.Size == 0 {
-		return nil, nil
-	}
-
-	var entries []DirEntry
-	numBlocks := extent.BlocksForSize(dirIno.Size)
-
-	for block := uint64(0); block < numBlocks; block++ {
-		// Look up the extent for this logical block
-		ext, offset, err := m.extentMgr.Lookup(dirIno, block)
-		if err == extent.ErrExtentNotFound {
-			// No extent for this block - it's a hole (shouldn't happen for directories)
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		physBlock := ext.PhysicalBlock + offset
-
-		// Read the block
-		data, err := m.readBlock(physBlock)
-		if err != nil {
-			return nil, err
-		}
-
-		// Parse entries from this block
-		blockEntries, err := m.parseBlockEntries(data)
-		if err != nil {
-			return nil, err
-		}
-
-		entries = append(entries, blockEntries...)
-	}
-
-	return entries, nil
-}
-
-// parseBlockEntries parses the live entries of every chunk in a block.
-func (m *Manager) parseBlockEntries(data []byte) ([]DirEntry, error) {
-	var entries []DirEntry
-	for start := 0; start < len(data); start += DirChunkSize {
-		walkChunk(data[start:start+DirChunkSize], func(_ int, entry *DirEntry) bool {
-			if entry.InodeNum != 0 {
-				entries = append(entries, *entry)
-			}
-			return false
-		})
-	}
-	return entries, nil
-}
-
-// addToExistingBlock tries to add an entry to an existing directory block.
-func (m *Manager) addToExistingBlock(ctx context.Context, dirIno *inode.Inode, newEntry *DirEntry) (bool, error) {
-	numBlocks := extent.BlocksForSize(dirIno.Size)
-
-	for block := uint64(0); block < numBlocks; block++ {
-		ext, extOffset, err := m.extentMgr.Lookup(dirIno, block)
-		if err == extent.ErrExtentNotFound {
-			continue
-		}
-		if err != nil {
-			return false, err
-		}
-		physBlock := ext.PhysicalBlock + extOffset
-
-		data, err := m.readBlock(physBlock)
-		if err != nil {
-			return false, err
-		}
-		for start := 0; start < len(data); start += DirChunkSize {
-			chunk := data[start : start+DirChunkSize]
-			if addToChunk(chunk, newEntry) {
-				return true, m.writeChunk(physBlock, start, chunk)
-			}
-		}
-	}
-
-	return false, nil
-}
-
 // walkChunk calls fn with each entry of a 4 KB chunk and its offset until fn
 // returns true. An unused chunk starts with RecLen 0 and has no entries.
 func walkChunk(chunk []byte, fn func(offset int, entry *DirEntry) bool) {
@@ -669,15 +545,6 @@ func addToChunk(chunk []byte, newEntry *DirEntry) bool {
 		return added
 	})
 	return added
-}
-
-func childInChunk(chunk []byte, name string) (child uint64, found bool) {
-	walkChunk(chunk, func(_ int, entry *DirEntry) bool {
-		found = entry.InodeNum != 0 && entry.Name == name
-		child = entry.InodeNum
-		return found
-	})
-	return child, found
 }
 
 // removeFromChunk deletes the entry called name and gives its space to the
@@ -754,51 +621,16 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		defer m.unlock(dirIno.InodeNum)
 	}
 
-	freshIno, err := m.liveDirLocked(dirIno.InodeNum)
+	// Another node may have added this name, or blocks with room for it, while the block was allocated.
+	freshIno, added, err := m.addToExistingChunk(dirIno.InodeNum, entry, nextBlock)
 	if err != nil {
 		return err
 	}
-
-	// CONFLICT DETECTION 1: Check if entry already exists.
-	// Another node may have added this entry while we were allocating the block.
-	_, _, lookupErr := m.lookupUnlocked(ctx, freshIno, entry.Name)
-	if lookupErr == nil {
-		// Entry was added by a concurrent operation - return ErrExists
-		logging.Debugf("dir.addToNewBlock: entry %q already exists in inode %d (added by another node)",
-			entry.Name, dirIno.InodeNum)
-		return ErrExists
+	if added {
+		dirIno.Size = freshIno.Size
+		return nil
 	}
-	if lookupErr != ErrNotFound {
-		return lookupErr
-	}
-
-	// Check if the directory has grown since we released the lock
-	freshNextBlock := extent.BlocksForSize(freshIno.Size)
-	if freshNextBlock > nextBlock {
-		// Another node added blocks while we were waiting.
-		// Try to add to existing blocks first (they may have free space now).
-		added, err := m.addToExistingBlock(ctx, freshIno, entry)
-		if err != nil {
-			return err
-		}
-		if added {
-			// Successfully added to existing block.
-			// Increment MetaGeneration and write inode.
-			freshIno.MetaGeneration++
-			if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
-				if errors.Is(err, extent.ErrTreeConflict) {
-					return errRetryAdd
-				}
-				return fmt.Errorf("failed to write directory inode: %w", err)
-			}
-			// The defer will free the block we allocated since blockUsed is false.
-			dirIno.Size = freshIno.Size
-			return nil
-		}
-		// No space in existing blocks, use our newly allocated block
-		// but at the correct position based on fresh state
-		nextBlock = freshNextBlock
-	}
+	nextBlock = max(nextBlock, extent.BlocksForSize(freshIno.Size))
 
 	// CONFLICT DETECTION 2: Check if our target logical block is already occupied.
 	// Another node may have inserted an extent at this position while we were waiting.
@@ -863,6 +695,7 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	// Block is now successfully committed to the filesystem.
 	// Mark as used so the defer doesn't free it.
 	blockUsed = true
+	m.indexes.drop(dirIno.InodeNum)
 
 	// Copy the fresh size back to the caller's inode
 	dirIno.Size = freshIno.Size
