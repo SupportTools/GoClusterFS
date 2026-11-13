@@ -315,6 +315,7 @@ func (f *FS) Close() error {
 	}
 	// Other nodes would otherwise wait for these holds to go stale.
 	if f.lockMgr != nil {
+		f.lockMgr.Stop()
 		f.lockMgr.ReleaseCached()
 		f.lockMgr.LogStats()
 	}
@@ -1751,6 +1752,20 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 	return 0, syscall.EAGAIN
 }
 
+// waitOutReplay waits, holding no lock, for the lock of block physBlock that a
+// failing node holds until its replay ends, then has the write retried. A
+// replay that needed the inode lock this write gave up can finish meanwhile.
+func (f *File) waitOutReplay(ctx context.Context, physBlock uint64) error {
+	if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
+		log.Printf("[WARN] Write inode %d: waiting for block %d after its holder's replay failed: %v", f.inodeNum, physBlock, err)
+		return syscall.EIO
+	}
+	if err := f.fs.lockMgr.ReleaseExtent(physBlock); err != nil {
+		log.Printf("[DEBUG] Write inode %d: releasing block %d after the replay wait failed: %v", f.inodeNum, physBlock, err)
+	}
+	return errRetryWrite
+}
+
 // stillWritableInPlace checks, under the inode lock, that logical block
 // blockNum still maps to physBlock and that no other file shares it.
 func (f *File) stillWritableInPlace(blockNum, physBlock uint64) error {
@@ -2228,10 +2243,20 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// A whole-sector write still takes it, or it lands inside a peer's read-modify-write.
 		extentLockHeld := false
 		if f.fs.lockMgr != nil && !newBlock {
-			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
+			// Holding only the shared inode lock taken above, this write has changed
+			// nothing yet that a retry would not redo, so it can step aside for a replay.
+			retryable := inPlaceLockHeld
+			extentCtx := ctx
+			if retryable {
+				extentCtx = lock.Retryable(ctx)
+			}
+			if err := f.fs.lockMgr.AcquireExtent(extentCtx, physBlock, lock.LockModeExclusive); err != nil {
 				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
 				releaseInPlaceLock()
+				if retryable && errors.Is(err, lock.ErrReplayBlocked) {
+					return 0, f.waitOutReplay(ctx, physBlock)
+				}
 				return 0, syscall.EIO
 			}
 			extentLockHeld = true

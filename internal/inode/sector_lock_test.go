@@ -23,9 +23,11 @@ func openSharedDevice(t *testing.T, size int64) (*storage.Device, *storage.Devic
 		t.Skipf("Cannot create test file: %v", err)
 	}
 	path := f.Name()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { _ = os.Remove(path) })
 	err = f.Truncate(size)
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if err != nil {
 		t.Skipf("Cannot truncate test file: %v", err)
 	}
@@ -35,7 +37,7 @@ func openSharedDevice(t *testing.T, size int64) (*storage.Device, *storage.Devic
 		if devs[i], err = storage.Open(path); err != nil {
 			t.Skipf("O_DIRECT not supported: %v", err)
 		}
-		t.Cleanup(func() { devs[i].Close() })
+		t.Cleanup(func() { _ = devs[i].Close() })
 	}
 	return devs[0], devs[1]
 }

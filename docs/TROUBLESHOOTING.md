@@ -151,7 +151,7 @@ grep "lock.Acquire" /var/log/goclusterfs.log | tail -20
 ps aux | grep goclusterfs-mount
 ```
 
-A crashed node's locks free up on their own: other nodes take them over once they are 15 seconds old, or once the node is proven dead. A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
+A crashed node's locks free up on their own once another node proves it dead and replays its journal: in about 3 to 6 seconds when a surviving mount shares its host and PID namespace, and up to about 35 seconds otherwise. Waits for them log `which holds it and is failing or being recovered`. A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
 
 ### "Journal recovery for slot N failed"
 
@@ -492,8 +492,9 @@ If a node mounts the device while `-repair` runs, repair stops before its next w
 - It rewrites refcount sectors that fail their checksum from the same references.
 - It fixes the superblock checksum, but only when every other superblock field passed its checks.
 - It frees leaked blocks: blocks the bitmap marks allocated that no inode, extent tree or older small-file container maps. Writes and mkdirs that fail, interrupted truncates and unlinks, frees that gave up waiting for a lock, and small-file migrations leave them behind. It sets their refcounts to 0 first. It keeps all of them, refcounts included, when it could not read an inode or extent tree, when `-skip-phase` skipped the bitmap, inode or refcount phase, or when a node's journal still needs replay (even with `-force`). It also keeps those in bitmap sectors with a bad checksum.
+- It frees inodes that no directory names, with their blocks, the way unlink does. Replay leaves them behind when it skips an unlink's records, for example after another node wrote a file that was unlinked while open there. A block that a clone or snapshot also maps loses one owner and stays. It keeps inodes a snapshot refers to, reserved inodes, directories that are not empty, and files that map older small-file slots. It keeps all of them when it could not read every inode, directory or snapshot descriptor, when `-skip-phase` skipped a phase it needs, or when a node's journal still needs replay. There is no `lost+found`, so the data of a freed file is gone: read the `-dry-run` list first.
 
-It never deletes inodes or edits directories. Problems not marked `[FIXABLE]` stay as they are.
+It never edits directories. Problems not marked `[FIXABLE]` stay as they are.
 
 ### Exit Codes
 

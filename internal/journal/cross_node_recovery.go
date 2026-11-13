@@ -16,6 +16,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -548,7 +549,7 @@ func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, ino
 // This is the function that should be called to wire up recovery in fs.go.
 func CreateRecoveryHandler(rctx *RecoveryContext) node.RecoveryHandler {
 	return func(info *node.FailedNodeInfo) error {
-		ctx := context.Background()
+		ctx := lock.ForReplay(context.Background())
 		result, err := ReplayJournal(ctx, rctx, info)
 		if err != nil {
 			return err
@@ -567,7 +568,7 @@ func CreateRecoveryHandler(rctx *RecoveryContext) node.RecoveryHandler {
 // This is used for self-recovery during mount when we need to replay
 // transactions directly without the node.FailedNodeInfo wrapper.
 func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
-	ctx := context.Background()
+	ctx := lock.ForReplay(context.Background())
 	return func(txn *RecoveredTxn) error {
 		result, err := applyTransaction(ctx, rctx, txn)
 		if err != nil {

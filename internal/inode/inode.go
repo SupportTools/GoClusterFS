@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"math/bits"
 	"sync"
 	"syscall"
@@ -225,7 +226,7 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode) (func(), error) {
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inode.InodeNum), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inode.InodeNum))
+		defer t.unlock(lock.LockTypeInode, uint64(inode.InodeNum))
 	}
 	unlockSector, err := t.lockSector(inode.InodeNum)
 	if err != nil {
@@ -434,7 +435,7 @@ func (t *Table) ClaimSlotIf(ctx context.Context, num uint32, ok func(free *Inode
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
+		defer t.unlock(lock.LockTypeInode, uint64(num))
 	}
 	unlockSector, err := t.lockSector(num)
 	if err != nil {
@@ -514,7 +515,7 @@ func (t *Table) FreeIf(ctx context.Context, inodeNum uint32, ok func(*Inode) boo
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(inodeNum), lock.LockModeExclusive); err != nil {
 			return false, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(inodeNum))
+		defer t.unlock(lock.LockTypeInode, uint64(inodeNum))
 	}
 	unlockSector, err := t.lockSector(inodeNum)
 	if err != nil {
@@ -607,7 +608,19 @@ func (t *Table) lockSector(inodeNum uint32) (func(), error) {
 	if err := t.lockMgr.Acquire(context.Background(), lock.LockTypeInodeSector, sector, lock.LockModeExclusive); err != nil {
 		return nil, fmt.Errorf("failed to acquire inode table sector lock: %w", err)
 	}
-	return func() { t.lockMgr.Release(lock.LockTypeInodeSector, sector) }, nil
+	return func() { t.unlock(lock.LockTypeInodeSector, sector) }, nil
+}
+
+// unlock releases a lock taken for an inode table update. ErrNotLockOwner means
+// a double release: the extra one may have dropped another holder's lock early.
+func (t *Table) unlock(lt lock.LockType, id uint64) {
+	err := t.lockMgr.Release(lt, id)
+	switch {
+	case errors.Is(err, lock.ErrNotLockOwner):
+		log.Printf("[ERROR] inode table: released lock type %d id %d that this node does not hold (double release or lock bookkeeping bug)", lt, id)
+	case err != nil:
+		log.Printf("[WARN] inode table: releasing lock type %d id %d failed: %v", lt, id, err)
+	}
 }
 
 // writeInodeSector writes an inode into its sector. The caller holds the

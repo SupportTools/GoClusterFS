@@ -183,7 +183,7 @@ func TestReplayerWinsAdoptedRecordOverLowerWaiter(t *testing.T) {
 	go func() {
 		err := acquireWithin(waiter, 10*time.Second, LockTypeInode, 2, LockModeExclusive)
 		if err == nil {
-			waiter.Release(LockTypeInode, 2)
+			release(t, waiter, LockTypeInode, 2)
 		}
 		waited <- err
 	}()
@@ -277,4 +277,52 @@ func TestAdoptOwnerClearsDeadReader(t *testing.T) {
 		t.Fatalf("AdoptOwner: %v", err)
 	}
 	requireAcquired(t, writer, LockTypeInode, 9, LockModeExclusive)
+}
+
+// After a failed replay the dead node's claims stay on the device, so peers and
+// the node that failed both wait for a later replay.
+func TestForgetAdoptedKeepsDeadNodesClaims(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	requireAcquired(t, dead, LockTypeInode, 2, LockModeExclusive)
+	adopted, err := replayer.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(adopted) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v", adopted, err)
+	}
+
+	replayer.ForgetAdopted(adopted)
+	requireBlocked(t, peer, LockTypeInode, 2, LockModeExclusive)
+	requireBlocked(t, replayer, LockTypeInode, 2, LockModeExclusive)
+}
+
+// A node that takes a slot whose earlier occupant left claims, which no replay
+// adopted, clears them so they do not count as its own; its own holds stay.
+func TestClearForeignClaimsKeepsOwnHolds(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	occupant := NewManager(dev, 0, reclaimRegion, [16]byte{15}, 5)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{6}, 6)
+	reg := newFakeRegistry()
+	reg.set(5, OwnerAlive)
+	reg.set(6, OwnerAlive)
+	peer.SetOwnerView(reg.view)
+	distinctRecords(t, peer, 2, 3, 4)
+
+	writeClaim(t, peer, LockTypeInode, 2, 5, LockModeExclusive)
+	tearSlot(t, peer, LockTypeInode, 3, 5)
+	requireAcquired(t, occupant, LockTypeInode, 4, LockModeExclusive)
+
+	if err := occupant.ClearForeignClaims(); err != nil {
+		t.Fatal(err)
+	}
+	for _, res := range []uint64{2, 3} {
+		requireAcquired(t, peer, LockTypeInode, res, LockModeExclusive)
+		if err := peer.Release(LockTypeInode, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireBlocked(t, peer, LockTypeInode, 4, LockModeExclusive)
 }

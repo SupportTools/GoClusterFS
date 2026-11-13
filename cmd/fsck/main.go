@@ -258,9 +258,9 @@ func printPhases() {
 		{3, "Inodes", "Validates per-inode checksums, mode, link count, extent trees"},
 		{4, "Extents", "Verifies block bounds, allocation, overlap detection"},
 		{5, "Refcounts", "Checks each block's refcount covers the inodes that map it"},
-		{6, "Directories", "Validates entries, detects orphaned inodes"},
+		{6, "Directories", "Validates entries, finds inodes no directory names"},
 		{7, "Snapshots", "Verifies snapshot registry, descriptors and data inodes"},
-		{8, "Cross-Validation", "Finds leaked blocks (repair frees them), blocks mapped but free, unlinked inodes"},
+		{8, "Cross-Validation", "Finds unnamed inodes and leaked blocks (repair frees both), blocks mapped but free"},
 	}
 	for _, p := range phases {
 		fmt.Printf("  Phase %d (%s):\n", p.num, p.name)

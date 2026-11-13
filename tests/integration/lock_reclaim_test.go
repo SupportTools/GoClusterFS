@@ -99,6 +99,54 @@ func TestSlowNodeKeepsLocks(t *testing.T) {
 	}
 }
 
+// TestWaiterOutlastsLockTimeoutThroughFailover has node A hold the root
+// directory lock while alive for 13s and then stop. Node B's create waits on
+// that lock: for a live holder until A's heartbeat is 10s old, then for a
+// failing one until A is proven dead and replayed. The wait runs past the 30s
+// lock timeout, and B's create must still succeed.
+func TestWaiterOutlastsLockTimeoutThroughFailover(t *testing.T) {
+	cluster, nodeA, logB := startPairForLockTest(t)
+	pid := cluster.Node(0).PID()
+	release := holdRootLockAs(t, cluster.ImagePath, nodeA)
+	defer release()
+
+	start := time.Now()
+	result := make(chan error, 1)
+	go func() { result <- cluster.Node(1).WriteFile("through-failover", []byte("x")) }()
+	time.Sleep(13 * time.Second)
+	select {
+	case err := <-result:
+		t.Fatalf("node B's create returned (%v) while node A was alive and held the lock", err)
+	default:
+	}
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop node A: %v", err)
+	}
+	defer cluster.KillNode(0)
+
+	select {
+	case err := <-result:
+		took := time.Since(start)
+		if err != nil {
+			t.Fatalf("node B's create failed after %v while node A failed over: %v", took, err)
+		}
+		if took < 30*time.Second {
+			t.Errorf("node B's create took %v; the test needs a wait longer than the 30s lock timeout", took)
+		}
+		t.Logf("node B's create succeeded after waiting %v", took)
+	case <-time.After(90 * time.Second):
+		t.Fatal("node B's create was still waiting 103s after it started")
+	}
+
+	waited := fmt.Sprintf(`node %x \(slot %d\), which holds it and is failing or being recovered`, nodeA.uuid[:8], nodeA.slot)
+	if !regexp.MustCompile(waited).MatchString(logB.String()) {
+		t.Error("node B did not log that it waited for node A's recovery")
+	}
+	if !regexp.MustCompile(`took over \d+ lock records of dead node ` + fmt.Sprintf("%x", nodeA.uuid[:8])).MatchString(logB.String()) {
+		t.Error("node B did not take over node A's locks")
+	}
+}
+
 type registeredNode struct {
 	uuid [16]byte
 	slot int

@@ -90,6 +90,56 @@ func (m *Manager) ReleaseAdopted(records []uint64) error {
 	return nil
 }
 
+// ClearForeignClaims clears the claims in this node's slot that it did not
+// write: a torn claim, or one an earlier occupant of the slot left that no
+// replay adopted, such as after fsck released the slot. Under an owner view they
+// would count as this node's. Call it after the mount's replay.
+func (m *Manager) ClearForeignClaims() error {
+	for recordID := uint64(0); recordID < m.size/RowSize; recordID++ {
+		if err := m.clearForeignClaim(recordID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) clearForeignClaim(recordID uint64) error {
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	if _, inUse := m.ownSlotUse(recordID); inUse {
+		return nil
+	}
+	m.mu.Lock()
+	_, adopted := m.adopted[recordID]
+	m.mu.Unlock()
+	if adopted {
+		return nil
+	}
+	buf := storage.GetBuffer(SlotSize)
+	defer storage.PutBuffer(buf)
+	if _, err := m.dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, m.nodeSlot)); err != nil {
+		return err
+	}
+	if s, err := decodeSlot(buf.Bytes()); err == nil && (s == nil || s.owner == m.nodeUUID) {
+		return nil
+	}
+	return m.writeSlot(recordID, m.nodeSlot, nil)
+}
+
+// ForgetAdopted drops this node's own record of the adoptions in records and
+// leaves their claims on the device, after a replay that failed. The dead
+// node's locks then stay held until another replay adopts and releases them,
+// and this node no longer passes over them.
+func (m *Manager) ForgetAdopted(records []uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, recordID := range records {
+		delete(m.adopted, recordID)
+	}
+}
+
 func (m *Manager) releaseAdopted(recordID uint64) error {
 	gate := m.recordGate(recordID)
 	gate.Lock()

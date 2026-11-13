@@ -103,6 +103,7 @@ func (c *Checker) checkSnapshots() error {
 
 		if err := c.readSector(sectorBuf, sectorOffset); err != nil {
 			c.addProblem(PhaseSnapshots, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
+			c.snapsIncomplete = append(c.snapsIncomplete, fmt.Sprintf("snapshot registry sector %d is unreadable", sectorIdx))
 			continue
 		}
 
@@ -111,6 +112,7 @@ func (c *Checker) checkSnapshots() error {
 			c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("sector %d", sectorIdx),
 				"checksum mismatch: the runtime cannot read the snapshots in this sector",
 				false)
+			c.snapsIncomplete = append(c.snapsIncomplete, fmt.Sprintf("snapshot registry sector %d fails its checksum", sectorIdx))
 		}
 
 		// Process each descriptor
@@ -130,6 +132,7 @@ func (c *Checker) checkSnapshots() error {
 					fmt.Sprintf("invalid magic: 0x%08X (expected 0x%08X)", desc.Magic, SnapshotMagic),
 					false)
 				invalidDescriptors++
+				c.snapsIncomplete = append(c.snapsIncomplete, fmt.Sprintf("snapshot registry sector %d slot %d is damaged", sectorIdx, descIdx))
 				continue
 			}
 
