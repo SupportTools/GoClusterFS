@@ -130,6 +130,7 @@ func problemList(r *fsck.Result) string {
 // Everything the runtime writes, including snapshots, clones, copies on
 // write and extent trees, must pass fsck without a single problem.
 func TestFsckAcceptsRuntimeImage(t *testing.T) {
+	t.Parallel()
 	fsys := openFormattedFS(t, newFormattedImage(t))
 	ctx := context.Background()
 

@@ -56,6 +56,7 @@ func TestWriteFailsWhenLockIsNotFreed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits lock.DefaultTimeout")
 	}
+	t.Parallel()
 	path := newFormattedImage(t)
 	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
 	fileA := newRegularFile(t, nodeA)
@@ -120,6 +121,7 @@ func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits lock.DefaultTimeout")
 	}
+	t.Parallel()
 	path := newFormattedImage(t)
 	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
 	slot, err := nodeB.inodeTbl.FindFreeSlot()
@@ -148,6 +150,7 @@ func TestAllocationReportsStuckBitmapLockAsEIO(t *testing.T) {
 	if testing.Short() {
 		t.Skip("waits lock.DefaultTimeout")
 	}
+	t.Parallel()
 	path := newFormattedImage(t)
 	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
 	written, fallocated := newRegularFile(t, nodeB), newRegularFile(t, nodeB)
