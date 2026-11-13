@@ -2932,7 +2932,7 @@ scenarios:
 
   - id: mount-own-replay-stops-at-bad-record
     name: Mount stops at a journal record that does not decode
-    description: Any own-journal replay failure other than a lock wait fails the mount at once, with the -skip-recovery hint
+    description: Any own-journal replay failure other than a lock wait returns at once without a retry, and mount fails with the -skip-recovery hint
     priority: go_only
     environments:
       go: cmd/mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode

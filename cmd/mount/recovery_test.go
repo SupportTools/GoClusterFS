@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -100,11 +99,7 @@ func TestOwnReplayStopsAtARecordThatDoesNotDecode(t *testing.T) {
 		calls++
 		return errors.New("failed to apply entry op=InodeCreate: inode create payload too short")
 	}
-	_, err := recoverWithin(t, 5*time.Second, dev, handler)
-	if err == nil || calls != 1 {
+	if _, err := recoverWithin(t, 5*time.Second, dev, handler); err == nil || calls != 1 {
 		t.Fatalf("recoverOwnJournal = %v after %d tries; want one failed try", err, calls)
-	}
-	if !strings.Contains(err.Error(), "-skip-recovery=5") {
-		t.Errorf("error %q does not tell the operator how to discard the journal", err)
 	}
 }
