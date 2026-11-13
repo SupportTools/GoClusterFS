@@ -23,9 +23,6 @@ linters:
     # Known findings as of 2026-10-24 in code other open PRs are changing; delete each rule once fixed.
     rules:
       # errcheck still has findings under these paths; delete a path's rule once it is clean.
-      - path: ^internal/cache/
-        linters: [errcheck]
-
       - path: ^internal/goclusterfs/
         linters: [errcheck]
 

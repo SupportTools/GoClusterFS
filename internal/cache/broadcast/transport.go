@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -208,10 +209,11 @@ func CheckPorts(cfg Config) error {
 	if err != nil {
 		return err
 	}
+	var mcastCloseErr error
 	if multicastConn != nil {
-		multicastConn.Close()
+		mcastCloseErr = multicastConn.Close()
 	}
-	return unicastConn.Close()
+	return errors.Join(mcastCloseErr, unicastConn.Close())
 }
 
 // listen opens the multicast and unicast sockets. If multicast is unavailable,
@@ -238,7 +240,7 @@ func listen(cfg Config, group *net.UDPAddr) (multicastConn, unicastConn *net.UDP
 	unicastConn, err = net.ListenUDP("udp", &net.UDPAddr{Port: cfg.UnicastPort})
 	if err != nil {
 		if multicastConn != nil {
-			multicastConn.Close()
+			_ = multicastConn.Close()
 		}
 		return nil, nil, nil, fmt.Errorf("failed to bind unicast port: %w", err)
 	}
@@ -252,8 +254,8 @@ func listen(cfg Config, group *net.UDPAddr) (multicastConn, unicastConn *net.UDP
 			ttl = 1
 		}
 		if err := setMulticastSendOptions(unicastConn, ifi, ttl); err != nil {
-			multicastConn.Close()
-			unicastConn.Close()
+			_ = multicastConn.Close()
+			_ = unicastConn.Close()
 			return nil, nil, nil, fmt.Errorf("failed to set multicast options on the send socket: %w", err)
 		}
 	}
@@ -521,15 +523,16 @@ func (t *Transport) Stop() error {
 
 	close(t.closeChan)
 
+	var errs []error
 	if t.multicastConn != nil {
-		t.multicastConn.Close()
+		errs = append(errs, t.multicastConn.Close())
 	}
 	if t.unicastConn != nil {
-		t.unicastConn.Close()
+		errs = append(errs, t.unicastConn.Close())
 	}
 
 	t.wg.Wait()
-	return nil
+	return errors.Join(errs...)
 }
 
 // LocalAddr returns the local unicast address.
