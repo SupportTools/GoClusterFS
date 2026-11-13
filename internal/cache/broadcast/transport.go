@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+// readBufferSize is what each socket asks for; Linux caps it at net.core.rmem_max.
+const readBufferSize = 1 << 20
+
 // Transport handles UDP multicast and unicast communication.
 type Transport struct {
 	config Config
@@ -190,7 +193,7 @@ func listen(cfg Config, group *net.UDPAddr) (multicastConn, unicastConn *net.UDP
 	multicastConn, mcastErr = net.ListenMulticastUDP("udp", ifi, group)
 	if mcastErr != nil {
 		multicastConn = nil
-	} else if err := multicastConn.SetReadBuffer(1 << 20); err != nil {
+	} else if err := multicastConn.SetReadBuffer(readBufferSize); err != nil {
 		log.Printf("[broadcast] failed to set read buffer: %v", err)
 	}
 
@@ -200,6 +203,9 @@ func listen(cfg Config, group *net.UDPAddr) (multicastConn, unicastConn *net.UDP
 			multicastConn.Close()
 		}
 		return nil, nil, nil, fmt.Errorf("failed to bind unicast port: %w", err)
+	}
+	if err := unicastConn.SetReadBuffer(readBufferSize); err != nil {
+		log.Printf("[broadcast] failed to set read buffer: %v", err)
 	}
 
 	if multicastConn != nil {
