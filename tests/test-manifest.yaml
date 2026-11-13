@@ -2930,6 +2930,41 @@ scenarios:
     environments:
       go: internal/node/registry_test.go::TestRegisterReportsPreviousOwnerOfAnyTakenSlot
 
+  - id: storage-write-gate-refuses-writes
+    name: Device write gate refuses writes
+    description: A write the gate refuses fails with the gate's error and does not reach the device
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestWriteGateRefusesWrites
+
+  - id: trim-discard-refused-by-write-gate
+    name: Discard refused by the write gate
+    description: A queued discard does not run when the device's write gate refuses it
+    priority: go_only
+    environments:
+      go: internal/trim/trim_test.go::TestDiscardRefusedByWriteGate
+
+  - id: registry-check-ownership-after-pause
+    name: Ownership check after a pause writes a heartbeat
+    description: When the last heartbeat is old, CheckOwnership writes a heartbeat and passes while the slot is still the node's
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestCheckOwnershipWritesHeartbeatAfterPause
+
+  - id: registry-check-ownership-after-takeover
+    name: Ownership check fails once the slot is taken over
+    description: Once peers marked the slot dead, CheckOwnership returns ErrSlotLost and calls the slot-lost handler once
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestCheckOwnershipFailsOnceSlotIsTakenOver
+
+  - id: registry-write-gate-after-takeover
+    name: Write gate refuses data writes once the slot is lost
+    description: With the registry's write gate on the device, a node whose slot was marked dead while it was paused cannot write outside the registry, and the write does not reach the device
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestWriteGateRefusesWritesOnceSlotIsLost
+
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
     description: New readers do not refresh another node's read claim, so a read claim leaked by a stopped node stops blocking writers once it is 15 seconds old

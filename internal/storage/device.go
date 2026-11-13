@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -44,9 +45,11 @@ const (
 type Device struct {
 	ioShards [NumIOShards]sync.Mutex // Sharded locks for parallel I/O
 	closeMu  sync.RWMutex            // Protects close; held shared during I/O
-	file     *os.File
-	path     string
-	size     int64
+	// writeGate, when set, runs before every write and can refuse it.
+	writeGate atomic.Pointer[func(offset int64) error]
+	file      *os.File
+	path      string
+	size      int64
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -220,6 +223,9 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if err := d.CheckWrite(offset); err != nil {
+		return 0, err
+	}
 
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
@@ -231,6 +237,21 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	}
 
 	return d.file.WriteAt(buf, offset)
+}
+
+// SetWriteGate makes every write call gate with its offset first, and fail
+// with gate's error instead of writing.
+func (d *Device) SetWriteGate(gate func(offset int64) error) {
+	d.writeGate.Store(&gate)
+}
+
+// CheckWrite runs the write gate for a write at offset. Callers that change the
+// device without WriteAt, such as a discard, call it first.
+func (d *Device) CheckWrite(offset int64) error {
+	if gate := d.writeGate.Load(); gate != nil {
+		return (*gate)(offset)
+	}
+	return nil
 }
 
 // Sync ensures all written data is persisted to the device.

@@ -180,6 +180,7 @@ For clustered deployments:
 3. **Mount Command**: Use identical mount options across all nodes
 4. **Limits**: At most 64 nodes mount a device at once, and node clocks must agree within a few seconds (run NTP)
 5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
+6. **Stalled nodes**: Other nodes declare a node dead after about 20 seconds of silence, for example a paused VM, and replay its journal. The stalled node checks its registry slot before each write, so when it resumes it refuses new writes and exits. A write it started before the stall can still land. Only storage fencing closes that gap, such as SCSI-3 persistent reservations, which GoClusterFS does not use. See [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits)
 
 Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:
 
