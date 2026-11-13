@@ -175,6 +175,12 @@ ps aux | grep goclusterfs-mount
 
 A crashed node's locks free up on their own once another node proves it dead and replays its journal: in about 3 to 6 seconds when a surviving mount shares its host and PID namespace, and up to about 35 seconds otherwise. If that replay fails, waits give up with `the journal replay of node ... failed or was abandoned`; see [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot). A stalled node is dangerous; see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits).
 
+### Unmount Takes Long
+
+**Symptom**: The mount process takes seconds to exit after `fusermount3 -u`, `Ctrl+C` or `SIGTERM`, or a container stop times out.
+
+**Diagnosis**: Each shutdown step that takes longer than 2 seconds logs `shutdown: <step> took <time>`. If the whole shutdown is still running after 8 seconds, the mount logs `shutdown still running after 8s; goroutines:` followed by every goroutine's stack. Keep that log for a bug report.
+
 ### "Journal recovery for slot N failed"
 
 **Symptom**: Mount exits with `Journal recovery for slot N failed: ... (to discard this journal, mount with -skip-recovery=N)`.

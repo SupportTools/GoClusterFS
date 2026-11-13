@@ -302,29 +302,37 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 func (f *FS) Close() error {
 	// Stop snapshot worker first to complete pending jobs
 	if f.snapshotWkr != nil {
-		f.snapshotWkr.Stop()
+		ShutdownStep("snapshot worker stop", f.snapshotWkr.Stop)
 	}
 
 	// Stop TRIM manager to flush pending discards
 	if f.trimMgr != nil {
-		if err := f.trimMgr.Stop(); err != nil {
-			log.Printf("Warning: failed to stop TRIM manager cleanly: %v", err)
-		}
+		ShutdownStep("TRIM stop", func() {
+			if err := f.trimMgr.Stop(); err != nil {
+				log.Printf("Warning: failed to stop TRIM manager cleanly: %v", err)
+			}
+		})
 	}
 
 	// Stop journal to ensure clean shutdown
 	if f.journal != nil {
-		if err := f.journal.Stop(); err != nil {
-			log.Printf("Warning: failed to stop journal cleanly: %v", err)
-		}
+		ShutdownStep("journal stop", func() {
+			if err := f.journal.Stop(); err != nil {
+				log.Printf("Warning: failed to stop journal cleanly: %v", err)
+			}
+		})
 	}
 	// Other nodes would otherwise wait for these holds to go stale.
 	if f.lockMgr != nil {
-		f.lockMgr.Stop()
-		f.lockMgr.ReleaseCached()
+		ShutdownStep("lock release", func() {
+			f.lockMgr.Stop()
+			f.lockMgr.ReleaseCached()
+		})
 		f.lockMgr.LogStats()
 	}
-	return f.dev.Close()
+	var err error
+	ShutdownStep("device close", func() { err = f.dev.Close() })
+	return err
 }
 
 // getInode retrieves an inode, using the cache when available.

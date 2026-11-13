@@ -542,6 +542,8 @@ func main() {
 	// The API stops before the unmount: its snapshot and clone requests go
 	// through the mount, and the unmount fails while they hold files open.
 	var unmounted atomic.Bool
+	// The watch runs from the signal, or from an unmount another tool started, to the exit.
+	watch := &goclusterfs.ShutdownWatch{Limit: 8 * time.Second}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -551,27 +553,34 @@ func main() {
 				continue
 			}
 			log.Println("Received signal, unmounting...")
-			stopAPI()
-			if err := server.Unmount(); err != nil {
-				log.Printf("Unmount of %s failed: %v. Close the files and shells that use it, then send the signal again or run fusermount3 -u %s", *mountPoint, err, *mountPoint)
-			}
+			watch.Start()
+			goclusterfs.ShutdownStep("API server stop", stopAPI)
+			goclusterfs.ShutdownStep("unmount", func() {
+				if err := server.Unmount(); err != nil {
+					log.Printf("Unmount of %s failed: %v. Close the files and shells that use it, then send the signal again or run fusermount3 -u %s", *mountPoint, err, *mountPoint)
+					watch.End()
+				}
+			})
 		}
 	}()
 
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
 	server.Wait()
 	unmounted.Store(true)
-	stopAPI()
+	watch.Start()
+	goclusterfs.ShutdownStep("API server stop", stopAPI)
 
 	exit := cli.ExitOK
-	nodeReg.Stop()
+	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
 	if err := gfs.Close(); err != nil {
 		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)
 		exit = cli.ExitFailure
 	}
-	if err := cacheMgr.StopBroadcast(); err != nil {
-		log.Printf("Warning: Failed to stop broadcast: %v", err)
-	}
+	goclusterfs.ShutdownStep("broadcast stop", func() {
+		if err := cacheMgr.StopBroadcast(); err != nil {
+			log.Printf("Warning: Failed to stop broadcast: %v", err)
+		}
+	})
 
 	// Print final TRIM stats
 	if trimMgr != nil {
@@ -598,6 +607,7 @@ func main() {
 
 	log.Println("Filesystem unmounted.")
 	_ = dev.Close()
+	watch.End()
 	os.Exit(exit)
 }
 

@@ -1,8 +1,10 @@
 package journal
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -137,10 +139,13 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 			// Advance by one aligned sector (IntentCompletion is padded to 512 bytes)
 			pos, scanned = pos+storage.SectorSize, scanned+storage.SectorSize
 		} else if magic == TxnMagic {
-			// This is a transaction - skip it (we'll process in phase 2)
 			header, err := DeserializeTxnHeader(sectorBuf[:TxnHeaderSize])
 			if err != nil || header.TotalLength < TxnHeaderSize || header.TotalLength > remaining {
 				break
+			}
+			if header.Type == TxnTypeIntentComplete && header.TotalLength == completionLength {
+				completed[binary.LittleEndian.Uint64(sectorBuf[TxnHeaderSize:completionLength])] = true
+				stats.IntentCompletions++
 			}
 			// Advance by aligned transaction length
 			alignedLen := ((header.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
@@ -181,6 +186,12 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 		return nil
 	}
 
+	span := ringSpan(head, tail, dataAreaSize)
+	if sb.Version >= 2 {
+		span = currentSpan(region, sb, span, stats)
+		tail = (head + span) % dataAreaSize
+	}
+
 	// Phase 1: Scan for intent completion records
 	completedIntents := make(map[uint64]bool)
 	if err := scanForCompletions(region, head, tail, dataAreaSize, completedIntents, stats); err != nil {
@@ -188,7 +199,6 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 	}
 
 	// Phase 2: Replay transactions that are not completed
-	span := ringSpan(head, tail, dataAreaSize)
 	pos := head
 	for scanned := uint32(0); scanned < span; {
 		pos %= dataAreaSize
@@ -328,6 +338,58 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 	}
 
 	return nil
+}
+
+// currentSpan returns how much of the span from the head holds records this mount of the journal wrote, in order.
+// The tail in the superblock can land without the record it covers, which leaves an older record there: one from an
+// earlier mount, or from the previous lap of the ring. Scanning stops at the first record that is not the next.
+func currentSpan(region *Region, sb JournalSuperblock, span uint32, stats *RecoveryStats) uint32 {
+	pos, next := sb.HeadOffset, sb.LastCheckpointSeq+1
+	for scanned := uint32(0); scanned < span; next++ {
+		remaining := span - scanned
+		header, err := currentRecord(region, sb, pos, remaining, next)
+		if err != nil {
+			log.Printf("[Recovery] journal: stopping %d bytes before the tail at %d: %v", remaining, pos, err)
+			stats.TxnIncomplete++
+			return scanned
+		}
+		size := sectorAligned(header.TotalLength)
+		pos, scanned = (pos+size)%sb.DataAreaSize, scanned+size
+	}
+	return span
+}
+
+// currentRecord returns the header of the record at pos if it is intact and is record seq of this mount.
+func currentRecord(region *Region, sb JournalSuperblock, pos, remaining uint32, seq uint64) (*TxnHeader, error) {
+	if remaining < storage.SectorSize {
+		return nil, errors.New("partial sector")
+	}
+	first := make([]byte, storage.SectorSize)
+	if _, err := region.ReadAt(first, pos); err != nil {
+		return nil, err
+	}
+	header, err := DeserializeTxnHeader(first[:TxnHeaderSize])
+	switch {
+	case err != nil:
+		return nil, err
+	case header.TotalLength < TxnHeaderSize || sectorAligned(header.TotalLength) > remaining:
+		return nil, fmt.Errorf("length %d", header.TotalLength)
+	case header.OwnerNodeUUID != sb.NodeUUID || header.OwnerGeneration != sb.NodeGeneration:
+		return nil, fmt.Errorf("record from node %x generation %d", header.OwnerNodeUUID[:4], header.OwnerGeneration)
+	case header.Seq != seq:
+		return nil, fmt.Errorf("record %d where %d is next", header.Seq, seq)
+	}
+	buf := first
+	if header.TotalLength > storage.SectorSize {
+		buf = make([]byte, sectorAligned(header.TotalLength))
+		if _, err := region.ReadAt(buf, pos); err != nil {
+			return nil, err
+		}
+	}
+	if err := ValidateTxnChecksum(buf[:header.TotalLength]); err != nil {
+		return nil, err
+	}
+	return header, nil
 }
 
 // parseTxnEntries parses all entries from a transaction buffer.
