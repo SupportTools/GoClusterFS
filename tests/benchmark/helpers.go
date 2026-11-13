@@ -3,7 +3,9 @@ package benchmark
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,8 +62,7 @@ func allocateImage(path string, sizeMB int) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return f.Truncate(superblock.MinDeviceSize + int64(sizeMB)*1024*1024)
+	return errors.Join(f.Truncate(superblock.MinDeviceSize+int64(sizeMB)*1024*1024), f.Close())
 }
 
 // setupBenchmarkFS creates and mounts a new test filesystem for benchmarking.
@@ -79,18 +80,18 @@ func setupBenchmarkFS(b *testing.B, sizeMB int) *BenchmarkFS {
 		b.Fatalf("Failed to create temp image: %v", err)
 	}
 	imagePath := imgFile.Name()
-	imgFile.Close()
+	mustClose(b, imgFile)
 
 	// Allocate the image file
 	if err := allocateImage(imagePath, sizeMB); err != nil {
-		os.Remove(imagePath)
+		_ = os.Remove(imagePath)
 		b.Fatalf("Failed to allocate image: %v", err)
 	}
 
 	// Create mount point directory
 	mountPoint, err := os.MkdirTemp("", "goclusterfs_bench_mnt_")
 	if err != nil {
-		os.Remove(imagePath)
+		_ = os.Remove(imagePath)
 		b.Fatalf("Failed to create mount point: %v", err)
 	}
 
@@ -133,7 +134,7 @@ func (mfs *BenchmarkFS) formatAndMount() {
 
 	// Wait for mount to be accessible
 	if err := mfs.waitForMount(10 * time.Second); err != nil {
-		mfs.MountCmd.Process.Kill()
+		_ = mfs.MountCmd.Process.Kill()
 		mfs.b.Fatalf("Mount not accessible: %v\nStdout: %s\nStderr: %s",
 			err, stdout.String(), stderr.String())
 	}
@@ -161,18 +162,27 @@ func (mfs *BenchmarkFS) Cleanup() {
 	// Stop the mount process
 	mfs.cancel()
 	if mfs.MountCmd != nil && mfs.MountCmd.Process != nil {
-		mfs.MountCmd.Process.Signal(os.Interrupt)
+		_ = mfs.MountCmd.Process.Signal(os.Interrupt)
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	// Try fusermount -u first
 	unmount := exec.Command("fusermount", "-u", mfs.MountPoint)
-	unmount.Run()
+	_ = unmount.Run()
 
 	// Give it time to unmount
 	time.Sleep(100 * time.Millisecond)
 
 	// Clean up files
-	os.RemoveAll(mfs.MountPoint)
-	os.Remove(mfs.ImagePath)
+	_ = os.RemoveAll(mfs.MountPoint)
+	_ = os.Remove(mfs.ImagePath)
+}
+
+// mustClose reports a failed close. On a FUSE mount, closing a written file
+// returns the errors from flushing it.
+func mustClose(tb testing.TB, c io.Closer) {
+	tb.Helper()
+	if err := c.Close(); err != nil {
+		tb.Errorf("close: %v", err)
+	}
 }

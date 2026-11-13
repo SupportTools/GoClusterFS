@@ -152,8 +152,8 @@ func TestExtentTreeTruncate(t *testing.T) {
 			t.Fatalf("filler append %d failed: %v", blk, err)
 		}
 	}
-	frag.Close()
-	filler.Close()
+	mustClose(t, frag)
+	mustClose(t, filler)
 
 	var before syscall.Statfs_t
 	if err := syscall.Statfs(mfs.MountPoint, &before); err != nil {
@@ -209,8 +209,8 @@ func TestExtentTreeSnapshot(t *testing.T) {
 			t.Fatalf("filler append %d failed: %v", blk, err)
 		}
 	}
-	frag.Close()
-	filler.Close()
+	mustClose(t, frag)
+	mustClose(t, filler)
 
 	path := mfs.Path("frag.bin")
 	if err := unix.Setxattr(path, "user.snapshot", []byte("tree-snap"), 0); err != nil {
@@ -242,7 +242,7 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	if _, err := f.Write(tail); err != nil {
 		t.Fatalf("append after snapshot failed: %v", err)
 	}
-	f.Close()
+	mustClose(t, f)
 	want = append(want, tail...)
 
 	// Blocks 4 and 5 are shared with the clone and the snapshot; only the new block 6 is freed.

@@ -67,7 +67,7 @@ func TestSlowNodeKeepsLocks(t *testing.T) {
 	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 		t.Fatalf("pause node A: %v", err)
 	}
-	defer syscall.Kill(pid, syscall.SIGCONT)
+	defer func() { _ = syscall.Kill(pid, syscall.SIGCONT) }()
 	release := holdRootLockAs(t, cluster.ImagePath, nodeA)
 
 	attempt := func(result chan<- error) {
@@ -94,7 +94,9 @@ func TestSlowNodeKeepsLocks(t *testing.T) {
 		t.Error("node B took over the locks of a paused, live node")
 	}
 
-	syscall.Kill(pid, syscall.SIGCONT)
+	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
 	release()
 	if err := cluster.Node(1).WriteFile("after-resume", []byte("x")); err != nil {
 		t.Errorf("node B could not create a file once node A resumed and released the lock: %v", err)
@@ -124,7 +126,7 @@ func TestWaiterOutlastsLockTimeoutThroughFailover(t *testing.T) {
 	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 		t.Fatalf("stop node A: %v", err)
 	}
-	defer cluster.KillNode(0)
+	defer func() { _ = cluster.KillNode(0) }()
 
 	select {
 	case err := <-result:
@@ -273,7 +275,7 @@ func nodeUUID(t *testing.T, imagePath, prefix string) [16]byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dev.Close()
+	defer mustClose(t, dev)
 	sb, err := superblock.Read(dev)
 	if err != nil {
 		t.Fatal(err)
@@ -300,18 +302,20 @@ func holdRootLockAs(t *testing.T, imagePath string, owner registeredNode) func()
 	}
 	sb, err := superblock.Read(dev)
 	if err != nil {
-		dev.Close()
+		mustClose(t, dev)
 		t.Fatal(err)
 	}
 	locks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, owner.uuid, owner.slot)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := locks.Acquire(ctx, lock.LockTypeInode, uint64(inode.InodeRoot), lock.LockModeExclusive); err != nil {
-		dev.Close()
+		mustClose(t, dev)
 		t.Fatalf("hold root directory lock as %x: %v", owner.uuid[:8], err)
 	}
 	return func() {
-		locks.Release(lock.LockTypeInode, uint64(inode.InodeRoot))
-		dev.Close()
+		if err := locks.Release(lock.LockTypeInode, uint64(inode.InodeRoot)); err != nil {
+			t.Errorf("release root directory lock: %v", err)
+		}
+		mustClose(t, dev)
 	}
 }

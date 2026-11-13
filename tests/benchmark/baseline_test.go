@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -41,7 +42,7 @@ func BenchmarkSequentialRead(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to read: %v", err)
 		}
-		f.Close()
+		mustClose(b, f)
 	}
 }
 
@@ -67,7 +68,7 @@ func BenchmarkSequentialWrite(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to write: %v", err)
 		}
-		f.Close()
+		mustClose(b, f)
 	}
 }
 
@@ -102,7 +103,7 @@ func BenchmarkRandomRead(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to read: %v", err)
 		}
-		f.Close()
+		mustClose(b, f)
 	}
 }
 
@@ -137,7 +138,7 @@ func BenchmarkRandomWrite(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to write: %v", err)
 		}
-		f.Close()
+		mustClose(b, f)
 	}
 }
 
@@ -184,8 +185,10 @@ func BenchmarkConcurrentReads(b *testing.B) {
 							return
 						}
 						offset := int64((i * len(localBuf)) % (fileSize - len(localBuf)))
-						f.ReadAt(localBuf, offset)
-						f.Close()
+						if _, err := f.ReadAt(localBuf, offset); err != nil {
+							b.Error(err)
+						}
+						mustClose(b, f)
 					}
 				}(r)
 			}
@@ -227,8 +230,10 @@ func BenchmarkConcurrentWrites(b *testing.B) {
 						if err != nil {
 							return
 						}
-						f.Write(localData)
-						f.Close()
+						if _, err := f.Write(localData); err != nil {
+							b.Error(err)
+						}
+						mustClose(b, f)
 					}
 				}(w)
 			}
@@ -267,7 +272,7 @@ func BenchmarkCacheHitRate(b *testing.B) {
 		if !bytes.Equal(buf, data) {
 			b.Fatalf("Data mismatch")
 		}
-		f.Close()
+		mustClose(b, f)
 	}
 }
 
@@ -304,15 +309,19 @@ func BenchmarkMixedWorkload(b *testing.B) {
 			if err != nil {
 				b.Fatalf("Failed to open file: %v", err)
 			}
-			f.Read(buf)
-			f.Close()
+			if _, err := f.Read(buf); err != nil && err != io.EOF {
+				b.Fatal(err)
+			}
+			mustClose(b, f)
 		} else { // 30% writes
 			f, err := os.OpenFile(filePath, os.O_WRONLY, 0644)
 			if err != nil {
 				b.Fatalf("Failed to open file: %v", err)
 			}
-			f.Write(buf)
-			f.Close()
+			if _, err := f.Write(buf); err != nil {
+				b.Fatal(err)
+			}
+			mustClose(b, f)
 		}
 	}
 }
@@ -330,7 +339,7 @@ func BenchmarkFileCreation(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to create file: %v", err)
 		}
-		f.Close()
+		mustClose(b, f)
 	}
 }
 
