@@ -157,7 +157,7 @@ head -c 16 /dev/device | hexdump -C
 **Symptom**: File operations hang. A signal to the waiting program does not end the wait; `SIGKILL` does. The mount log shows one of:
 
 - `[WARN] lock: gave up waiting ...` naming the holder: a live node held the lock for 30 seconds. The operation fails with EIO, or with ENOSPC if it was allocating blocks.
-- `[WARN] lock: ... which holds it and is failing or being recovered; waiting until its journal replay ends`, every 30 seconds: the holder failed. The wait has no time limit and ends when another node has replayed the failed node's journal. An operation that already held another lock gives up after 30 seconds with EIO instead.
+- `[WARN] lock: ... which holds it and is failing or being recovered; waiting until its journal replay ends`, every 30 seconds: the holder failed. The wait has no time limit and ends when another node has replayed the failed node's journal. An operation that already held another lock gives up after 30 seconds with EIO instead, except an overwrite of existing file data: it lets go of its locks at once, waits, and retries, so it does not fail.
 
 **Causes**:
 1. Another node holds the lock for a long operation, or is stalled
