@@ -204,6 +204,7 @@ func newDirIn(t *testing.T, fsys *FS, parent uint32, name string) *Dir {
 		t.Fatal(err)
 	}
 	ino.Mode = inode.S_IFDIR | 0o755
+	ino.LinkCount = 2
 	if err := fsys.inodeTbl.Write(ctx, ino); err != nil {
 		t.Fatal(err)
 	}
