@@ -257,7 +257,7 @@ func (t *Table) lockedUpdate(ctx context.Context, num uint32, change func(*Inode
 		if err := t.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer t.lockMgr.Release(lock.LockTypeInode, uint64(num))
+		defer t.unlock(lock.LockTypeInode, uint64(num))
 	}
 	unlockSector, err := t.lockSector(num)
 	if err != nil {
