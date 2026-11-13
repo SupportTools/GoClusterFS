@@ -63,7 +63,7 @@ func TestFindFreeSlotFindsEveryFreeInode(t *testing.T) {
 	table.SetAllocationStart(3, 4)
 	claimed := 0
 	for {
-		if _, err := table.Alloc(ctx); errors.Is(err, ErrInodeFull) {
+		if _, err := claimFree(ctx, table); errors.Is(err, ErrInodeFull) {
 			break
 		} else if err != nil {
 			t.Fatal(err)
@@ -82,9 +82,9 @@ func TestFindFreeSlotFindsEveryFreeInode(t *testing.T) {
 	}
 	var found []uint32
 	for range freed {
-		ino, err := table.Alloc(ctx)
+		ino, err := claimFree(ctx, table)
 		if err != nil {
-			t.Fatalf("Alloc with free inodes left: %v", err)
+			t.Fatalf("claim with free inodes left: %v", err)
 		}
 		found = append(found, ino.InodeNum)
 	}

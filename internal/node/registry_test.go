@@ -730,6 +730,7 @@ func TestRegisterYieldsSlotToRacingWriter(t *testing.T) {
 	defer cleanup()
 
 	reg := NewRegistry(dev, 0)
+	own := reg.localUUID
 	result := make(chan int, 1)
 	go func() {
 		slot, err := reg.Register(context.Background(), "slow")
@@ -739,7 +740,16 @@ func TestRegisterYieldsSlotToRacingWriter(t *testing.T) {
 		result <- slot
 	}()
 
-	time.Sleep(claimSettle / 3)
+	// Overwrite only once Register's claim is on disk, inside its settle window, as a racing node's write would land.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		if slot, err := reg.readSlot(0); err == nil && slot.UUID == own {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Register never claimed slot 0")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	racer := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}
 	if err := reg.writeSlot(0, racer); err != nil {
 		t.Fatal(err)

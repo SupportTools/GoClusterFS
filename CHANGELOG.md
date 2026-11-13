@@ -66,6 +66,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- `cmd/crctest`, a development tool that printed two CRC32C values. `internal/storage`'s `TestCRC32C` already checks both, and releases never shipped it.
 - The legacy single-block prototype in the repository root (`main.go`).
 - The journal's `FullThreshold` setting, which nothing read. A checkpoint still runs every 5 seconds and when a transaction does not fit.
 

@@ -283,6 +283,15 @@ func (m *Manager) BroadcastEnabled() bool {
 	return m.broadcaster != nil && m.broadcaster.IsEnabled()
 }
 
+// BroadcastProblem says why peers may miss this node's invalidations, or
+// returns "" when they should get them or broadcast is off.
+func (m *Manager) BroadcastProblem() string {
+	if m.broadcaster == nil {
+		return ""
+	}
+	return m.broadcaster.Problem()
+}
+
 // BroadcastInvalidateInode invalidates an inode locally AND broadcasts
 // the invalidation to peer nodes. Call this after modifying an inode, and
 // cache the new inode after this call, since it drops the local entry.

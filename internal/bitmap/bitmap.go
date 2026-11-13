@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -150,7 +151,7 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 		return nil, r.rollback(allocated, ErrNoFreeBlocks)
 	}
 
-	log.Printf("[DEBUG] bitmap.Alloc: allocated blocks %v", allocated)
+	logging.Debugf("bitmap.Alloc: allocated blocks %v", allocated)
 	return allocated, nil
 }
 
@@ -204,7 +205,7 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 
 	// Check if already free
 	if (sectorData[byteIdx] & (1 << bitIdx)) == 0 {
-		log.Printf("[DEBUG] bitmap.Free: block %d already free!", blockNum)
+		logging.Debugf("bitmap.Free: block %d already free!", blockNum)
 		return ErrAlreadyFree
 	}
 
@@ -215,7 +216,7 @@ func (r *Region) Free(ctx context.Context, blockNum uint64) error {
 		return fmt.Errorf("failed to write bitmap sector: %w", err)
 	}
 
-	log.Printf("[DEBUG] bitmap.Free: freed block %d", blockNum)
+	logging.Debugf("bitmap.Free: freed block %d", blockNum)
 
 	// Queue block for TRIM if manager is configured
 	if r.trimMgr != nil {

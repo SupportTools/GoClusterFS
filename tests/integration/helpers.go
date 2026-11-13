@@ -24,6 +24,7 @@ type MountedFS struct {
 	MountPoint string
 	ExtraArgs  []string  // Appended to the mount command by Mount and FormatAndMount
 	Log        io.Writer // Also receives the mount process output when set
+	Env        []string  // Added to the mount process environment
 	MountCmd   *exec.Cmd
 	BinaryPath string
 	t          *testing.T
@@ -256,6 +257,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
+	m.MountCmd.Env = m.environ()
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
@@ -288,6 +290,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
+	m.MountCmd.Env = m.environ()
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
@@ -393,6 +396,14 @@ func (m *MountedFS) IsMounted() bool {
 		return false
 	}
 	return strings.Contains(string(data), m.MountPoint)
+}
+
+// environ is the mount process environment: the test's, plus Env.
+func (m *MountedFS) environ() []string {
+	if len(m.Env) == 0 {
+		return nil
+	}
+	return append(os.Environ(), m.Env...)
 }
 
 // Path returns the full path for a file relative to the mount point.
@@ -565,6 +576,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
+	m.MountCmd.Env = m.environ()
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)
@@ -598,6 +610,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
+	m.MountCmd.Env = m.environ()
 
 	if err := m.MountCmd.Start(); err != nil {
 		return fmt.Errorf("failed to start mount command: %v", err)

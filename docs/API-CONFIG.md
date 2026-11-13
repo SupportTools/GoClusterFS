@@ -6,9 +6,10 @@ This document provides a comprehensive reference for all configuration options i
 
 1. [Command-Line Flags](#command-line-flags)
 2. [HTTP API Statistics](#http-api-statistics)
-3. [Code-Level Settings](#code-level-settings)
-4. [Tuning Recommendations](#tuning-recommendations)
-5. [Environment Variables](#environment-variables)
+3. [HTTP API Health and Shutdown](#http-api-health-and-shutdown)
+4. [Code-Level Settings](#code-level-settings)
+5. [Tuning Recommendations](#tuning-recommendations)
+6. [Environment Variables](#environment-variables)
 
 ---
 
@@ -33,7 +34,8 @@ These are the `goclusterfs-mount` flags:
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Format the device (destroys all data) |
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
-| `-debug` | bool | `false` | Log every FUSE request and reply. Mount logs its own `[DEBUG]` lines either way |
+| `-debug` | bool | `false` | Print `[DEBUG]` log lines |
+| `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 
 ### Cache Flags
@@ -99,7 +101,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
 | `-dashboard` | bool | `true` | Serve the [web dashboard](#web-dashboard) under `/ui/` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` only checks the API itself. With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` checks the device, journal, journal recovery and broadcast; see [HTTP API Health and Shutdown](#http-api-health-and-shutdown). With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
 
 Without a token, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
 
@@ -163,6 +165,23 @@ Mount copies its managers' counters every second. While requests read capacity o
 `/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
+
+## HTTP API Health and Shutdown
+
+`GET /health` runs four checks and reports the worst of them:
+
+| Check | `ok` | `degraded` | `unhealthy` |
+|-------|------|------------|-------------|
+| `device` | The last device read, write or sync worked | | The last device read, write or sync failed |
+| `journal` | Clean or dirty, or off with `-journal=false` | This node's journal is being replayed | This node's journal is corrupt |
+| `recovery` | No replay is running | This node replays the journal of a crashed node | |
+| `broadcast` | Working, or off with `-broadcast=false` | The last invalidation send failed, or multicast is unavailable and no unicast peers are known | |
+
+`ok` and `degraded` answer 200; `unhealthy` answers 503. Degraded means the mount works with a problem: during a replay, files the crashed node had locked wait until it ends, and with broadcast down, peers see this node's changes only after `-cache-ttl`. Unhealthy means file operations fail. A mount that is not running refuses the connection. A check that is not `ok` has a `message` that says what to do. `gfsctl health` exits 0, 1 or 4 for the three states.
+
+The API starts after the mount has replayed its own journal, so a mount that is still starting refuses the connection too.
+
+On SIGINT or SIGTERM, the mount stops the API before it unmounts, because snapshot and clone requests go through the mount. The API stops accepting connections and gives requests in flight 10 seconds to finish. After that it cancels them and closes their connections; snapshot, clone and admin requests that have started still run to the end, and the API waits for them. After `fusermount3 -u`, the API stops the same way once the unmount is done.
 
 ## Code-Level Settings
 

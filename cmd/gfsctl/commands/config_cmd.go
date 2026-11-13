@@ -53,7 +53,7 @@ func runConfig(cmd *cobra.Command, args []string) error {
 	case "init":
 		return initConfigFile(cmd)
 	default:
-		return fmt.Errorf("unknown subcommand: %s (valid: path, show, init)", subcmd)
+		return usageErrorf("unknown subcommand: %s (valid: path, show, init)", subcmd)
 	}
 }
 
