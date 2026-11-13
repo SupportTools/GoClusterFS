@@ -132,20 +132,22 @@ func TestMkdirReplaysAfterCrash(t *testing.T) {
 func TestRemoveRacesPeerRecreate(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name  string
-		isDir bool
-		reuse bool
-		want  syscall.Errno
+		name   string
+		isDir  bool
+		newDir bool
+		reuse  bool
+		want   syscall.Errno
 	}{
-		{"unlink, new file in another slot", false, false, syscall.ENOENT},
-		{"unlink, new file in the same slot", false, true, 0},
-		{"rmdir, new directory in another slot", true, false, syscall.ENOENT},
+		{"unlink, new file in another slot", false, false, false, syscall.ENOENT},
+		{"unlink, new file in the same slot", false, false, true, 0},
+		{"unlink, new directory in the same slot", false, true, true, syscall.EISDIR},
+		{"rmdir, new directory in another slot", true, true, false, syscall.ENOENT},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, path, _, _ := journaledFS(t)
 			b := openFormattedFS(t, path)
-			remove := func(fsys *FS) syscall.Errno {
-				if tc.isDir {
+			remove := func(fsys *FS, isDir bool) syscall.Errno {
+				if isDir {
 					return fsys.RootDir().Rmdir(ctx, "x")
 				}
 				return fsys.RootDir().Unlink(ctx, "x")
@@ -154,7 +156,7 @@ func TestRemoveRacesPeerRecreate(t *testing.T) {
 				if !tc.reuse {
 					createFile(t, b, "filler")
 				}
-				if tc.isDir {
+				if tc.newDir {
 					newSubdir(t, b, "x")
 				} else {
 					writeAt(t, createFile(t, b, "x"), pattern(2, 2*BlockSize), 0)
@@ -171,14 +173,14 @@ func TestRemoveRacesPeerRecreate(t *testing.T) {
 					return
 				}
 				afterCommit = nil
-				if errno := remove(b); errno != 0 {
+				if errno := remove(b, tc.isDir); errno != 0 {
 					t.Fatalf("B's remove: %v", errno)
 				}
 				recreate()
 			}
 			t.Cleanup(func() { afterCommit = nil })
 
-			if errno := remove(a); errno != tc.want {
+			if errno := remove(a, tc.isDir); errno != tc.want {
 				t.Errorf("A's remove = %v, want %v", errno, tc.want)
 			}
 			if _, kept := expectOneNamePerInode(t, b)["x"]; kept != (tc.want != 0) {
