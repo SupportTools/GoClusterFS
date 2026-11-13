@@ -56,6 +56,10 @@ var beforeInPlaceWrite func()
 // locks for an in-place write, before its data lands.
 var duringInPlaceWrite func()
 
+// afterSectorRead lets tests act while a partial-sector write holds the
+// sector's old contents, before it writes them back.
+var afterSectorRead func()
+
 // beforeSizeUpdate lets tests hold a write after its data landed, before it
 // takes the inode lock to update size and mtime.
 var beforeSizeUpdate func(*File)
@@ -2869,6 +2873,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 					for i := range buf.Bytes() {
 						buf.Bytes()[i] = 0
 					}
+				}
+				if afterSectorRead != nil {
+					afterSectorRead()
 				}
 			}
 

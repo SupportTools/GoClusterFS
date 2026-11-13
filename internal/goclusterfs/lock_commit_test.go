@@ -3,11 +3,10 @@ package goclusterfs
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -306,7 +305,7 @@ func TestConcurrentRefcountReadsDoNotDelaySnapshots(t *testing.T) {
 // A whole-sector write must not land between another node's read and write
 // back of the same sector, or that write-back erases it.
 func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
-	// A full-size lock region, so the two writes' other locks rarely share a record and serialize them.
+	// A full-size lock region, so the two writes' other locks do not share a record and serialize them.
 	path := newTreeFSImage(t)
 	lockPath := newLockImageOfSize(t, int64(superblock.LockRegionSize))
 	fsA := openLockedTreeFSNodeWithRegion(t, path, lockPath, 1, superblock.LockRegionSize)
@@ -324,42 +323,32 @@ func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
 	}
 	sector0 := int64(fsA.dataOffset + (ext.PhysicalBlock+off)*BlockSize)
 
-	var gate chan struct{}
-	var arrived atomic.Int32
-	duringInPlaceWrite = func() {
-		if arrived.Add(1) == 2 {
-			close(gate)
-		}
-		select {
-		case <-gate:
-		case <-time.After(30 * time.Millisecond):
-		}
-	}
-	t.Cleanup(func() { duringInPlaceWrite = nil })
-
-	buf := storage.NewAlignedBuffer(storage.SectorSize)
 	whole := bytes.Repeat([]byte{'A'}, storage.SectorSize)
-	for round := uint64(1); round <= 20; round++ {
-		fsA.lockMgr.ReleaseCached()
-		fsB.lockMgr.ReleaseCached()
-		gate = make(chan struct{})
-		arrived.Store(0)
-		binary.LittleEndian.PutUint64(whole, round)
-
-		errs := make(chan syscall.Errno, 2)
-		go func() { _, errno := fileA.Write(context.Background(), nil, whole, 0); errs <- errno }()
-		go func() { _, errno := fileB.Write(context.Background(), nil, []byte{'b'}, 100); errs <- errno }()
-		for range 2 {
-			if errno := <-errs; errno != 0 {
-				t.Fatalf("round %d: write: %v", round, errno)
+	aDone := make(chan syscall.Errno, 1)
+	var once sync.Once
+	afterSectorRead = func() {
+		once.Do(func() {
+			go func() { _, errno := fileA.Write(context.Background(), nil, whole, 0); aDone <- errno }()
+			select {
+			case errno := <-aDone:
+				aDone <- errno
+			case <-time.After(200 * time.Millisecond):
 			}
-		}
+		})
+	}
+	t.Cleanup(func() { afterSectorRead = nil })
 
-		if _, err := fsA.dev.ReadAt(buf.Bytes(), sector0); err != nil {
-			t.Fatal(err)
-		}
-		if got := binary.LittleEndian.Uint64(buf.Bytes()); got != round {
-			t.Fatalf("round %d: node A's whole-sector write was lost; the sector holds round %d", round, got)
-		}
+	if _, errno := fileB.Write(context.Background(), nil, []byte{'b'}, 100); errno != 0 {
+		t.Fatalf("node B write: %v", errno)
+	}
+	if errno := <-aDone; errno != 0 {
+		t.Fatalf("node A write: %v", errno)
+	}
+	buf := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := fsA.dev.ReadAt(buf.Bytes(), sector0); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Bytes()[0] != 'A' {
+		t.Fatalf("node A's acknowledged whole-sector write was lost: the sector starts with %q", buf.Bytes()[:8])
 	}
 }

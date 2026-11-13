@@ -483,7 +483,7 @@ func TestOverlappingLocalHoldsStillYield(t *testing.T) {
 	}{
 		{1, 2, 3 * time.Millisecond, 6 * time.Millisecond},
 		{2, 1, 3 * time.Millisecond, 6 * time.Millisecond},
-		{1, 2, 100 * time.Millisecond, 300 * time.Millisecond},
+		{1, 2, 100 * time.Millisecond, 600 * time.Millisecond},
 	}
 	for _, tc := range cases {
 		slots := [2]int{tc.busySlot, tc.otherSlot}
@@ -514,7 +514,7 @@ func TestOverlappingLocalHoldsStillYield(t *testing.T) {
 				}
 			})
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(tc.every + 50*time.Millisecond)
 			if err := acquireWithin(other, 3*time.Second, LockTypeInode, 12, LockModeExclusive); err != nil {
 				t.Fatalf("other node never got a record whose local holds keep overlapping: %v", err)
 			}
