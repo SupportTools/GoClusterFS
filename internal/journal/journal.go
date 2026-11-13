@@ -91,10 +91,8 @@ type Journal struct {
 	generation uint64
 	config     Config
 
-	// Active transaction tracking
-	activeTxns      map[uint64]*ActiveTxn
-	oldestActiveSeq uint64
-	pendingIntents  map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
+	activeTxns     map[*Transaction]*ActiveTxn
+	pendingIntents map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
 
 	// Checkpoint tracking
 	lastCheckpointSeq  uint64
@@ -119,11 +117,9 @@ type Journal struct {
 	batchSyncs   uint64 // Number of batch syncs performed
 }
 
-// ActiveTxn tracks an in-progress transaction.
+// ActiveTxn tracks a transaction between Begin and Commit or Abort.
 type ActiveTxn struct {
-	txn       *Transaction
 	startTime time.Time
-	tailPos   uint32 // Position in journal where this txn starts
 }
 
 // Open opens an existing journal for the given node.
@@ -138,7 +134,7 @@ func Open(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		nodeUUID:          nodeUUID,
 		generation:        region.Superblock().NodeGeneration,
 		config:            config,
-		activeTxns:        make(map[uint64]*ActiveTxn),
+		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: region.Superblock().LastCheckpointSeq,
@@ -160,7 +156,7 @@ func Init(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		nodeUUID:          nodeUUID,
 		generation:        generation,
 		config:            config,
-		activeTxns:        make(map[uint64]*ActiveTxn),
+		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: 0,
@@ -256,9 +252,6 @@ func (j *Journal) advanceHead() (bool, error) {
 		}
 		seq = min(seq, blockSeq-1)
 	}
-	for blockSeq, active := range j.activeTxns {
-		block(blockSeq, active.tailPos)
-	}
 	for blockSeq, pos := range j.pendingIntents {
 		block(blockSeq, pos)
 	}
@@ -276,26 +269,13 @@ func (j *Journal) advanceHead() (bool, error) {
 	return true, nil
 }
 
-// Begin starts a new transaction.
-// The transaction will be assigned a sequence number and can have entries added.
-// Call Commit() on the transaction to persist it.
+// Begin starts a new transaction. Commit assigns its sequence number and persists it.
 func (j *Journal) Begin() *Transaction {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	seq := j.region.NextSeq()
-	txn := NewTransaction(seq, j.nodeUUID, j.generation)
-
-	j.activeTxns[seq] = &ActiveTxn{
-		txn:       txn,
-		startTime: time.Now(),
-		tailPos:   j.region.TailOffset(),
-	}
-
-	if j.oldestActiveSeq == 0 || seq < j.oldestActiveSeq {
-		j.oldestActiveSeq = seq
-	}
-
+	txn := NewTransaction(0, j.nodeUUID, j.generation)
+	j.activeTxns[txn] = &ActiveTxn{startTime: time.Now()}
 	return txn
 }
 
@@ -314,28 +294,13 @@ func (j *Journal) Begin() *Transaction {
 func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	j.mu.Lock()
 
-	seq := txn.Seq()
-
-	// Verify this transaction belongs to us
-	active, ok := j.activeTxns[seq]
-	if !ok {
+	if _, ok := j.activeTxns[txn]; !ok {
 		j.mu.Unlock()
-		return 0, fmt.Errorf("transaction %d not found in active set", seq)
-	}
-	if active.txn != txn {
-		j.mu.Unlock()
-		return 0, fmt.Errorf("transaction %d mismatch", seq)
-	}
-
-	// Serialize the transaction
-	data, err := txn.Serialize()
-	if err != nil {
-		j.mu.Unlock()
-		return 0, fmt.Errorf("failed to serialize transaction: %w", err)
+		return 0, errors.New("transaction not found in active set")
 	}
 
 	// Check space for the sector-aligned record WriteAt writes
-	need := sectorAligned(uint32(len(data)))
+	need := sectorAligned(txn.TotalLength())
 	available := j.region.AvailableSpace()
 	if need > available {
 		// Try to force checkpoint to free space
@@ -358,16 +323,13 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 		}
 	}
 
-	// Write to ring buffer
-	start := j.region.TailOffset()
-	written, err := j.region.WriteAt(data)
+	seq, start, written, err := j.region.Append(func(seq uint64) ([]byte, error) {
+		txn.setSeq(seq)
+		return txn.Serialize()
+	})
 	if err != nil {
 		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to write transaction: %w", err)
-	}
-	if written != uint32(len(data)) {
-		j.mu.Unlock()
-		return 0, fmt.Errorf("short write: %d < %d", written, len(data))
 	}
 
 	// Flush superblock with updated tail offset to disk
@@ -384,13 +346,8 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	j.bytesWritten += uint64(written)
 
 	// The operation runs after Commit, so the head must not pass this transaction until CompleteIntent.
-	delete(j.activeTxns, seq)
+	delete(j.activeTxns, txn)
 	j.pendingIntents[seq] = start
-
-	// Update oldest active
-	if seq == j.oldestActiveSeq {
-		j.updateOldestActive()
-	}
 
 	// Release lock BEFORE sync operations to avoid deadlock
 	// The sync operations (CommitSync/CommitBatch) may need to acquire
@@ -435,13 +392,7 @@ func (j *Journal) dropIntent(seq uint64) {
 func (j *Journal) Abort(txn *Transaction) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-
-	seq := txn.Seq()
-	delete(j.activeTxns, seq)
-
-	if seq == j.oldestActiveSeq {
-		j.updateOldestActive()
-	}
+	delete(j.activeTxns, txn)
 }
 
 // waitForBatchSync adds the caller to the batch and waits for sync.
@@ -548,65 +499,54 @@ func (j *Journal) flushBatch() error {
 // It is idempotent: once an intent is complete, later calls do nothing.
 func (j *Journal) CompleteIntent(intentSeq uint64) error {
 	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	if _, ok := j.pendingIntents[intentSeq]; !ok {
+	_, pending := j.pendingIntents[intentSeq]
+	delete(j.pendingIntents, intentSeq)
+	j.mu.Unlock()
+	if !pending {
 		return nil
 	}
-	delete(j.pendingIntents, intentSeq)
 
-	// Create completion record
-	completion := NewIntentCompletion(intentSeq)
-	data := completion.Serialize()
+	// The operation's writes must be durable before a record that says it finished, or a power cut could keep the
+	// record and lose the writes. The record itself is made durable by the next sync.
+	if err := j.syncBeforeCompletion(); err != nil {
+		return fmt.Errorf("failed to sync before completing intent %d: %w", intentSeq, err)
+	}
 
-	// Pad to sector alignment for O_DIRECT compatibility
-	alignedSize := ((IntentCompletionSize + 511) / 512) * 512
-	alignedData := make([]byte, alignedSize)
-	copy(alignedData, data)
+	j.mu.Lock()
+	defer j.mu.Unlock()
 
-	// Check space for the sector-aligned record WriteAt writes
-	available := j.region.AvailableSpace()
-	if sectorAligned(uint32(alignedSize)) > available {
-		if err := j.forceCheckpoint(); err != nil {
-			return ErrJournalFull
-		}
-		available = j.region.AvailableSpace()
-		if sectorAligned(uint32(alignedSize)) > available {
+	need := sectorAligned(completionLength)
+	if need > j.region.AvailableSpace() {
+		if err := j.forceCheckpoint(); err != nil || need > j.region.AvailableSpace() {
 			return ErrJournalFull
 		}
 	}
-
-	// Mark journal dirty before writing
 	if j.region.State() == JournalStateClean {
 		if err := j.region.MarkDirty(); err != nil {
 			return fmt.Errorf("failed to mark journal dirty: %w", err)
 		}
 	}
 
-	// Write to ring buffer
-	written, err := j.region.WriteAt(alignedData)
+	_, _, written, err := j.region.Append(func(seq uint64) ([]byte, error) {
+		return completionRecord(seq, j.nodeUUID, j.generation, intentSeq)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to write intent completion: %w", err)
 	}
-	if written != uint32(alignedSize) {
-		return fmt.Errorf("short write: %d < %d", written, alignedSize)
-	}
-
-	// Flush superblock with updated tail offset
 	if err := j.region.FlushSuperblock(); err != nil {
 		return fmt.Errorf("failed to flush superblock: %w", err)
 	}
-
-	// Sync to disk
-	if j.config.CommitMode == CommitSync {
-		if err := j.region.Sync(); err != nil {
-			return fmt.Errorf("failed to sync journal: %w", err)
-		}
-	}
-
-	// Update metrics
 	j.bytesWritten += uint64(written)
+	return nil
+}
 
+func (j *Journal) syncBeforeCompletion() error {
+	switch j.config.CommitMode {
+	case CommitSync:
+		return j.region.Sync()
+	case CommitBatch:
+		return j.waitForBatchSync()
+	}
 	return nil
 }
 
@@ -615,17 +555,6 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 func (j *Journal) forceCheckpoint() error {
 	_, err := j.advanceHead()
 	return err
-}
-
-// updateOldestActive recalculates the oldest active sequence.
-// Must be called with lock held.
-func (j *Journal) updateOldestActive() {
-	j.oldestActiveSeq = 0
-	for seq := range j.activeTxns {
-		if j.oldestActiveSeq == 0 || seq < j.oldestActiveSeq {
-			j.oldestActiveSeq = seq
-		}
-	}
 }
 
 // NeedsRecovery returns true if the journal has uncommitted transactions.

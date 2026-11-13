@@ -194,14 +194,22 @@ func (r *Region) AvailableSpace() uint32 {
 	return r.superblock.AvailableSpace()
 }
 
-// NextSeq returns and increments the next transaction sequence number.
-func (r *Region) NextSeq() uint64 {
+// Append writes the record build makes for the next seq at the tail. The seq is used up only once the record is
+// written, so the records in the ring carry consecutive seqs.
+func (r *Region) Append(build func(seq uint64) ([]byte, error)) (seq uint64, start, written uint32, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	seq := r.superblock.NextSeq
+	seq, start = r.superblock.NextSeq, r.superblock.TailOffset
+	data, err := build(seq)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if written, err = r.writeLocked(data); err != nil {
+		return 0, 0, 0, err
+	}
 	r.superblock.NextSeq++
-	return seq
+	return seq, start, written, nil
 }
 
 // dataOffset returns the absolute byte offset for a position in the data area.
@@ -215,7 +223,10 @@ func (r *Region) dataOffset(pos uint32) int64 {
 func (r *Region) WriteAt(data []byte) (uint32, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.writeLocked(data)
+}
 
+func (r *Region) writeLocked(data []byte) (uint32, error) {
 	dataLen := uint32(len(data))
 	if dataLen == 0 {
 		return 0, nil
