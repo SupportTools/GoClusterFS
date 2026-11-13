@@ -191,13 +191,13 @@ mkdir -p /mnt/goclusterfs
 ./goclusterfs-mount -device /path/to/device -mount /mnt/goclusterfs
 ```
 
-### Mount with FUSE Request Tracing
+### Mount with Debug Output
 
-`-debug` logs every FUSE request. The mount logs its own `[DEBUG]` lines either way.
+`-debug` adds the mount's `[DEBUG]` lines, and `-fuse-debug` logs every FUSE request and reply.
 
 ```bash
 ./goclusterfs-mount -device /path/to/device -mount /mnt/goclusterfs \
-    -debug
+    -debug -fuse-debug
 ```
 
 ### Systemd Service (Single Node)

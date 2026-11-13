@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/bits"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -120,6 +122,7 @@ type Registry struct {
 	recoveryHandler      RecoveryHandler
 	failureCheckInterval time.Duration // How often to scan for failed nodes
 	recoveryInProgress   map[int]bool  // Slots currently being recovered
+	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 }
 
 // Errors
@@ -794,7 +797,7 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			continue // Another node beat us to it
 		}
 		done := r.ownerDead(info.UUID, i)
-		err = handler(info)
+		err = r.replay(handler, i, info)
 		done(err == nil)
 		if err != nil {
 			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v",
@@ -992,6 +995,22 @@ func (r *Registry) GetFailedNodes() ([]*FailedNodeInfo, error) {
 	return failed, nil
 }
 
+func (r *Registry) replay(handler RecoveryHandler, slotIdx int, info *FailedNodeInfo) error {
+	bit := uint64(1) << slotIdx
+	r.replaying.Or(bit)
+	defer r.replaying.And(^bit)
+	return handler(info)
+}
+
+// Replaying returns the slots whose journal this node is replaying now.
+func (r *Registry) Replaying() []int {
+	var slots []int
+	for mask := r.replaying.Load(); mask != 0; mask &= mask - 1 {
+		slots = append(slots, bits.TrailingZeros64(mask))
+	}
+	return slots
+}
+
 // RecoverFailedNode manually triggers recovery for a specific node.
 // Returns error if the node is not in a failed state or recovery fails.
 func (r *Registry) RecoverFailedNode(slotIdx int) error {
@@ -1033,7 +1052,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 		return err
 	}
 
-	if err := handler(info); err != nil {
+	if err := r.replay(handler, slotIdx, info); err != nil {
 		return fmt.Errorf("recovery handler failed: %w", err)
 	}
 

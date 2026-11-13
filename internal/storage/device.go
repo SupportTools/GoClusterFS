@@ -7,10 +7,12 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -47,6 +49,7 @@ type Device struct {
 	file     *os.File
 	path     string
 	size     int64
+	lastErr  atomic.Pointer[error]
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -197,7 +200,9 @@ func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, error) {
 		defer d.unlockIORange(startShard, endShard)
 	}
 
-	return d.file.ReadAt(buf, offset)
+	n, err := d.file.ReadAt(buf, offset)
+	d.record(err)
+	return n, err
 }
 
 // WriteAt writes data to the device at the specified offset.
@@ -230,7 +235,9 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 		defer d.unlockIORange(startShard, endShard)
 	}
 
-	return d.file.WriteAt(buf, offset)
+	n, err := d.file.WriteAt(buf, offset)
+	d.record(err)
+	return n, err
 }
 
 // Sync ensures all written data is persisted to the device.
@@ -240,7 +247,29 @@ func (d *Device) Sync() error {
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
 
-	return d.file.Sync()
+	err := d.file.Sync()
+	d.record(err)
+	return err
+}
+
+// LastError returns the error of the last read, write or sync that failed,
+// or nil once a later one succeeds.
+func (d *Device) LastError() error {
+	if err := d.lastErr.Load(); err != nil {
+		return *err
+	}
+	return nil
+}
+
+func (d *Device) record(err error) {
+	switch {
+	case err == nil:
+		if d.lastErr.Load() != nil {
+			d.lastErr.Store(nil)
+		}
+	case !errors.Is(err, io.EOF):
+		d.lastErr.Store(&err)
+	}
 }
 
 // Fd returns the file descriptor for use with syscalls.

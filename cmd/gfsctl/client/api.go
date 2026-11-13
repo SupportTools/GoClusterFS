@@ -2,15 +2,26 @@ package client
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
 )
 
-// Health fetches the health status from the API.
+// Health fetches the health status from the API. An unhealthy mount answers
+// 503 with the same body, which Health returns without an error.
 func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
-	var resp HealthResponse
-	if err := c.Get(ctx, "/health", &resp); err != nil {
+	body, status, err := c.send(ctx, http.MethodGet, "/health")
+	if err != nil {
 		return nil, err
 	}
-	return &resp, nil
+	var resp HealthResponse
+	if (status == http.StatusOK || status == http.StatusServiceUnavailable) && json.Unmarshal(body, &resp) == nil && resp.Status != "" {
+		return &resp, nil
+	}
+	if status < 400 {
+		return nil, fmt.Errorf("decode health response: %q", body)
+	}
+	return nil, apiError(status, body)
 }
 
 // Status fetches the filesystem status from the API.

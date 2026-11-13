@@ -16,7 +16,7 @@ This guide covers day-to-day operations for managing GoClusterFS deployments.
 
 ## Monitoring
 
-GoClusterFS has no metrics endpoint. `goclusterfs-mount` writes its log to stderr, so capture it (see [Background Mount](#background-mount-with-logging) or the systemd unit in the [Deployment Guide](DEPLOYMENT.md#systemd-service-single-node)). The log also has many `[DEBUG]` lines, which are always on.
+`goclusterfs-mount` serves health at `/health` and Prometheus metrics at `/metrics` (see [HTTP API Health and Shutdown](API-CONFIG.md#http-api-health-and-shutdown)). It writes its log to stderr, so capture it (see [Background Mount](#background-mount-with-logging) or the systemd unit in the [Deployment Guide](DEPLOYMENT.md#systemd-service-single-node)). With `-debug`, the log also has `[DEBUG]` lines.
 
 ### Totals at Unmount
 

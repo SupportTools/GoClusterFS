@@ -25,6 +25,8 @@
 //	4: Errors remain on disk
 //	8: I/O failure, or the check could not finish or was refused
 //	16: Usage error
+//
+// The exit codes, -debug and error hints match goclusterfs-mount and gfsctl.
 package main
 
 import (
@@ -33,7 +35,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/supporttools/GoClusterFS/internal/cli"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
+	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/version"
 )
@@ -51,6 +55,7 @@ func main() {
 		summaryOnly  = flag.Bool("summary", false, "Only print final summary")
 		showProblems = flag.Bool("show-problems", true, "Show individual problems found")
 		showVersion  = flag.Bool("version", false, "Print version and exit")
+		debug        = flag.Bool("debug", false, "Print [DEBUG] log lines")
 
 		listSlots      = flag.Bool("list-slots", false, "List node registry slots with their lease and journal, then exit")
 		releaseSlotN   = flag.Int("release-slot", -1, "Check that registry slot N can be released and print what releasing it discards")
@@ -77,7 +82,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  8: I/O failure, or the check could not finish or was refused\n")
 		fmt.Fprintf(os.Stderr, "  16: Usage error\n")
 	}
-	flag.Parse()
+	if code, ok := cli.ParseFlags(flag.CommandLine, os.Args[1:]); !ok {
+		os.Exit(code)
+	}
+	logging.SetDebug(*debug)
 
 	if *showVersion {
 		fmt.Println("goclusterfs-fsck", version.String())
@@ -92,7 +100,7 @@ func main() {
 
 	// Validate arguments
 	if flag.NArg() != 1 {
-		flag.Usage()
+		fmt.Fprintf(os.Stderr, "Error: give exactly one device, got %d arguments. Run %s -h to see the flags.\n", flag.NArg(), os.Args[0])
 		os.Exit(fsck.ExitUsage)
 	}
 	if *dryRun && !*repair {
@@ -129,7 +137,7 @@ func main() {
 	// Open device
 	dev, err := storage.Open(devicePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: Failed to open device: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: Cannot open %s: %v; %s\n", devicePath, err, cli.OpenHint(err))
 		os.Exit(fsck.ExitOperational)
 	}
 	defer dev.Close()

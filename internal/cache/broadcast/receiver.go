@@ -385,6 +385,12 @@ func (b *Broadcaster) ResetStats() {
 	atomic.StoreUint64(&b.messagesIgnored, 0)
 }
 
+// Problem says why peers may miss this node's invalidations, or returns ""
+// when they should get them.
+func (b *Broadcaster) Problem() string {
+	return b.transport.Problem()
+}
+
 // IsEnabled returns whether broadcasting is enabled.
 func (b *Broadcaster) IsEnabled() bool {
 	return b.transport.config.Enabled

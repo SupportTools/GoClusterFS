@@ -31,6 +31,7 @@ type Transport struct {
 	unicastSent       uint64
 	unicastRecv       uint64
 	multicastFailures uint64
+	lastSendErr       atomic.Pointer[error]
 
 	// State
 	running   atomic.Bool
@@ -290,6 +291,16 @@ func (t *Transport) Send(msg *Message) error {
 		return fmt.Errorf("marshal error: %w", err)
 	}
 
+	err = t.deliver(data)
+	if err != nil {
+		t.lastSendErr.Store(&err)
+	} else if t.lastSendErr.Load() != nil {
+		t.lastSendErr.Store(nil)
+	}
+	return err
+}
+
+func (t *Transport) deliver(data []byte) error {
 	// Try multicast first. It goes out on the unicast socket: ListenMulticastUDP
 	// turns off multicast loopback on its socket, so other nodes on this host
 	// would not receive what that socket sends.
@@ -358,6 +369,25 @@ func (t *Transport) PeerCount() int {
 // ResetMulticastFailures resets the failure counter to re-enable multicast.
 func (t *Transport) ResetMulticastFailures() {
 	atomic.StoreUint64(&t.multicastFailures, 0)
+}
+
+// Problem says why peers may miss this node's invalidations, or returns ""
+// when they should get them.
+func (t *Transport) Problem() string {
+	if !t.config.Enabled {
+		return ""
+	}
+	if !t.running.Load() {
+		return "broadcast is not running"
+	}
+	if err := t.lastSendErr.Load(); err != nil {
+		return "the last invalidation send failed: " + (*err).Error()
+	}
+	multicast := t.multicastConn != nil && atomic.LoadUint64(&t.multicastFailures) < uint64(t.config.MaxMulticastFailures)
+	if !multicast && t.PeerCount() == 0 {
+		return "multicast is unavailable and no unicast peers are known"
+	}
+	return ""
 }
 
 // Stats returns transport statistics.

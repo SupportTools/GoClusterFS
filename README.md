@@ -75,7 +75,7 @@ df -h mnt
 fusermount3 -u mnt
 ```
 
-The mount process exits after the unmount. To mount the same image again, run the mount command without `-format`.
+The mount process exits after the unmount. Ctrl+C or `kill` (SIGINT or SIGTERM) unmounts too: the mount stops its HTTP API first, then unmounts. While files under the mount are open, the unmount fails and the mount keeps running without its API; close the files and send the signal again. To mount the same image again, run the mount command without `-format`.
 
 ## Command-Line Options
 
@@ -87,7 +87,8 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-mount` | (required) | Mount point directory (must exist) |
 | `-format` | `false` | Format the device, then mount it (destroys data) |
 | `-bytes-per-inode` | `1048576` | With `-format`: one inode per this many bytes of device (4096 to 16,777,216 inodes) |
-| `-debug` | `false` | Log every FUSE request |
+| `-debug` | `false` | Print `[DEBUG]` log lines: file operations, locks, allocation |
+| `-fuse-debug` | `false` | Log every FUSE request and reply |
 | `-version` | `false` | Print the version and exit |
 
 ### Cache Options
@@ -152,7 +153,7 @@ The API only listens on this host by default. Mount refuses to start when `-api-
 
 ```bash
 ./gfsctl status              # mount state, version, capacity
-./gfsctl health              # exits 1 when a component is unhealthy
+./gfsctl health              # exits 1 when degraded, 4 when unhealthy
 ./gfsctl stats               # overview; also: cache, journal, trim, lock, sfb, cluster, all
 ./gfsctl metrics             # Prometheus text from /metrics
 ./gfsctl status -w -i 5s     # refresh every 5 s
@@ -168,6 +169,7 @@ It connects to `localhost:8080` by default. Each setting comes from the first of
 | `--token` | `GFSCTL_TOKEN` | (none) |
 | `--output`, `-o` | `GFSCTL_OUTPUT` | `text` (or `json`) |
 | `--timeout` | `GFSCTL_TIMEOUT` | `30s` |
+| `--debug` | | off: print each API request with its status and time |
 
 Use `GFSCTL_TOKEN` or the config file for the token: other local users can read `--token` with `ps`. gfsctl and the API speak plain HTTP, so for a remote mount don't send the token across the network: tunnel over SSH (`ssh -L 8080:127.0.0.1:8080 node`, then `gfsctl status`) or put a TLS proxy in front of the API. Statistics answer 503 until mount feeds them to the API, and `gfsctl` prints that error.
 
@@ -216,9 +218,25 @@ Run fsck on an unmounted device. The device is a positional argument, and flags 
 ./goclusterfs-fsck -repair ./disk.img
 ```
 
-Exit codes follow fsck(8) and add up: `0` no errors, `1` errors repaired, `4` errors remain, `8` I/O failure or a check that could not finish or was refused, `16` usage error.
+Exit codes follow fsck(8) and add up; see [Exit Codes and Debug Output](#exit-codes-and-debug-output).
 
 `-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
+
+## Exit Codes and Debug Output
+
+`goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` use the same exit codes. They are bits, as with fsck(8), so fsck can add them up: 5 means some errors were repaired and some remain.
+
+| Code | `goclusterfs-mount` | `goclusterfs-fsck` | `gfsctl` |
+|------|---------------------|--------------------|----------|
+| `0` | Mounted, then unmounted cleanly | No errors (warnings may remain) | Success; `health` is ok |
+| `1` | | Errors were repaired | `health` is degraded |
+| `4` | | Errors remain on disk | `health` is unhealthy |
+| `8` | Could not mount, or stopped on an error | I/O failure, or the check could not finish or was refused, for example while the device is mounted | No answer, or an error from the API |
+| `16` | Usage error | Usage error | Usage error |
+
+A usage error is a bad flag, argument or setting; the command changed nothing. Error messages end with what to do next, such as the flag to set or the command to run.
+
+`-debug` (or `--debug`) prints extra `[DEBUG]` lines to stderr and changes nothing else. `goclusterfs-mount` logs file operations, locks and block allocation, `goclusterfs-fsck` logs how long each phase took, and `gfsctl` logs each API request with its status and time. `goclusterfs-mount -fuse-debug` also logs every FUSE request and reply.
 
 ## Architecture
 
