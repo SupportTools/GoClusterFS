@@ -1767,6 +1767,13 @@ scenarios:
     environments:
       go: internal/inode/sector_lock_test.go::TestNeighborInodeWritesFromTwoNodes
 
+  - id: sector-locks-own-records
+    name: Sector locks never wait on other lock types
+    description: Inode table sector locks map to reserved lock records, so a node holding inode locks never blocks another node's sector lock
+    priority: go_only
+    environments:
+      go: internal/lock/sector_test.go::TestSectorLocksDoNotWaitOnOtherLocks
+
   - id: broadcast-ignore-own
     name: Broadcast ignores own messages
     description: Broadcaster ignores messages from itself

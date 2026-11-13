@@ -859,8 +859,18 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 	hash *= 0xFF51AFD7ED558CCD
 	hash ^= hash >> 33
 
-	maxRecords := m.size / RecordSize
-	return hash % maxRecords
+	// Inode table sector locks get their own records. A sector lock is a leaf,
+	// so its holder never waits on another lock, and no cycle of waits between
+	// nodes can pass through a record only sector locks use.
+	records := m.size / RecordSize
+	leaf := records / 16
+	if leaf == 0 {
+		return hash % records
+	}
+	if lockType == LockTypeInodeSector {
+		return records - leaf + hash%leaf
+	}
+	return hash % (records - leaf)
 }
 
 // readRecord reads a lock record from disk.
