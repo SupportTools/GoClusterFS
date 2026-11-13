@@ -1239,7 +1239,7 @@ func TestOccupantReportsHowSlotStands(t *testing.T) {
 		{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{4}, RecoveryStart: now.Add(-2 * recoveryLease).Unix()},
 		{Magic: SlotMagic, State: NodeStateEmpty},
 	}
-	want := []Occupancy{OccupiedLive, OccupiedFailing, OccupiedFailing, OccupiedLapsed, Unoccupied}
+	want := []Occupancy{OccupiedLive, OccupiedFailing, OccupiedReplaying, OccupiedLapsed, Unoccupied}
 	for i, slot := range slots {
 		if err := reg.writeSlot(i, slot); err != nil {
 			t.Fatal(err)

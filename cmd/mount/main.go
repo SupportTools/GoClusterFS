@@ -298,6 +298,9 @@ func main() {
 		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
 	}
 	releasePrevious(true)
+	if err := lockMgr.ClearForeignClaims(); err != nil {
+		log.Printf("Warning: clearing lock claims earlier occupants left in slot %d failed: %v", slotIdx, err)
+	}
 
 	// Create journal for write-ahead logging (crash consistency)
 	var j *journal.Journal
@@ -591,10 +594,11 @@ func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Jou
 }
 
 var ownerStates = map[node.Occupancy]lock.OwnerState{
-	node.OccupiedLive:    lock.OwnerAlive,
-	node.OccupiedFailing: lock.OwnerFailing,
-	node.OccupiedLapsed:  lock.OwnerLost,
-	node.Unoccupied:      lock.OwnerReleased,
+	node.OccupiedLive:      lock.OwnerAlive,
+	node.OccupiedFailing:   lock.OwnerFailing,
+	node.OccupiedReplaying: lock.OwnerRecovering,
+	node.OccupiedLapsed:    lock.OwnerLost,
+	node.Unoccupied:        lock.OwnerReleased,
 }
 
 // ownReplayRetry is the first wait before a mount retries its own journal

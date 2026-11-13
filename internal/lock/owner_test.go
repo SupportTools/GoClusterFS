@@ -211,8 +211,8 @@ func TestReplaysSharingRecordTakeTurns(t *testing.T) {
 	first := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
 	second := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
 	reg := newFakeRegistry()
-	reg.set(1, OwnerFailing)
-	reg.set(2, OwnerFailing)
+	reg.set(1, OwnerRecovering)
+	reg.set(2, OwnerRecovering)
 	reg.set(3, OwnerAlive)
 	reg.set(4, OwnerAlive)
 	first.SetOwnerView(reg.view)
@@ -315,6 +315,31 @@ func TestNestedWaitOnReplayingNodeYieldsToReplay(t *testing.T) {
 	}
 	reg.set(1, OwnerReleased)
 	requireAcquired(t, peer, LockTypeExtent, extentX, LockModeExclusive)
+}
+
+// A node that remounted into its slot holds its predecessor's claims as adopted
+// while it replays that journal. Another node replaying a dead node in a lower
+// slot must not pass over them as another replay's: the remounted node is live.
+func TestReplayDoesNotPassOverLiveNodesReplayClaims(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	remounted := NewManager(dev, 0, reclaimRegion, [16]byte{15}, 5)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	reg := newFakeRegistry()
+	reg.set(2, OwnerRecovering)
+	reg.set(3, OwnerAlive)
+	reg.set(5, OwnerAlive)
+	replayer.SetOwnerView(reg.view)
+
+	writeClaim(t, replayer, LockTypeInode, 2, 5, LockModeExclusive)
+	if adopted, err := remounted.AdoptOwner([16]byte{5}, 5); err != nil || len(adopted) != 1 {
+		t.Fatalf("remounted AdoptOwner = %v, %v", adopted, err)
+	}
+	writeClaim(t, replayer, LockTypeInode, 2, 2, LockModeExclusive)
+	if adopted, err := replayer.AdoptOwner([16]byte{2}, 2); err != nil || len(adopted) != 1 {
+		t.Fatalf("replayer AdoptOwner = %v, %v", adopted, err)
+	}
+	requireBlocked(t, replayer, LockTypeInode, 2, LockModeExclusive)
 }
 
 // A caller that can release its locks and retry gets ErrReplayBlocked at once,

@@ -297,3 +297,32 @@ func TestForgetAdoptedKeepsDeadNodesClaims(t *testing.T) {
 	requireBlocked(t, peer, LockTypeInode, 2, LockModeExclusive)
 	requireBlocked(t, replayer, LockTypeInode, 2, LockModeExclusive)
 }
+
+// A node that takes a slot whose earlier occupant left claims, which no replay
+// adopted, clears them so they do not count as its own; its own holds stay.
+func TestClearForeignClaimsKeepsOwnHolds(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	occupant := NewManager(dev, 0, reclaimRegion, [16]byte{15}, 5)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{6}, 6)
+	reg := newFakeRegistry()
+	reg.set(5, OwnerAlive)
+	reg.set(6, OwnerAlive)
+	peer.SetOwnerView(reg.view)
+	distinctRecords(t, peer, 2, 3, 4)
+
+	writeClaim(t, peer, LockTypeInode, 2, 5, LockModeExclusive)
+	tearSlot(t, peer, LockTypeInode, 3, 5)
+	requireAcquired(t, occupant, LockTypeInode, 4, LockModeExclusive)
+
+	if err := occupant.ClearForeignClaims(); err != nil {
+		t.Fatal(err)
+	}
+	for _, res := range []uint64{2, 3} {
+		requireAcquired(t, peer, LockTypeInode, res, LockModeExclusive)
+		if err := peer.Release(LockTypeInode, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	requireBlocked(t, peer, LockTypeInode, 4, LockModeExclusive)
+}
