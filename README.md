@@ -21,7 +21,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - O_DIRECT-capable storage (tmpfs supports O_DIRECT only on Linux 6.6 and later)
 - Root or `fuse` group membership
 - For multi-node: Shared block device (SAN, iSCSI, NVMe-oF, etc.)
-- A device of at least 264 MB: the layout reserves 256 MB for 64 node journals of 4 MB
+- A device of at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records
 
 ## Limits and Status
 

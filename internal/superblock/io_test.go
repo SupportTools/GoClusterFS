@@ -55,7 +55,7 @@ func writeAt(t *testing.T, dev *storage.Device, offset int64, data []byte) {
 
 func TestFormatThenRead(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize+8<<20)
-	for _, offset := range []int64{1 << 20, 3 << 20, 4<<20 + 7*NodeJournalSize, 260 << 20, 262 << 20} {
+	for _, offset := range []int64{1 << 20, 30 << 20, 66 << 20, 67<<20 + 7*NodeJournalSize, 323 << 20, 325 << 20} {
 		writeAt(t, dev, offset, []byte("stale metadata from an earlier format"))
 	}
 
@@ -73,7 +73,7 @@ func TestFormatThenRead(t *testing.T) {
 	}
 
 	buf := storage.NewAlignedBuffer(storage.SectorSize)
-	for _, offset := range []int64{1 << 20, 3 << 20, 4<<20 + 7*NodeJournalSize, 260 << 20, 262 << 20} {
+	for _, offset := range []int64{1 << 20, 30 << 20, 66 << 20, 67<<20 + 7*NodeJournalSize, 323 << 20, 325 << 20} {
 		if _, err := dev.ReadAt(buf.Bytes(), offset); err != nil {
 			t.Fatal(err)
 		}
@@ -165,6 +165,26 @@ func TestReadRejectsVersion2(t *testing.T) {
 	_, err := Read(dev)
 	if !errors.Is(err, ErrTooOldVersion) || !strings.Contains(err.Error(), "reformat with -format") {
 		t.Errorf("Read v2 superblock: err = %v, want ErrTooOldVersion saying to reformat", err)
+	}
+}
+
+// Builds before per-node lock slots formatted v3 images with a 1 MB lock region
+// and no slot size. Mount must refuse them and say to reformat.
+func TestReadRejectsLayoutWithoutLockSlots(t *testing.T) {
+	dev := testDevice(t, MinDeviceSize)
+	sb := New(dev.Size(), 0)
+	shift := sb.LockBitmapSize - 1<<20
+	sb.LockSlotSize, sb.LockBitmapSize = 0, 1<<20
+	for _, offset := range []*uint64{&sb.SnapshotRegOffset, &sb.JournalRegionOffset, &sb.BlockBitmapOffset,
+		&sb.RefCountTableOffset, &sb.InodeTableOffset, &sb.DataRegionOffset} {
+		*offset -= shift
+	}
+	sb.TotalBlocks += shift / uint64(sb.BlockSize)
+	writeAt(t, dev, 0, sb.Serialize())
+
+	_, err := Read(dev)
+	if !errors.Is(err, ErrUnsupportedLayout) || !strings.Contains(err.Error(), "reformat with -format") {
+		t.Errorf("Read of a layout without lock slots: err = %v, want ErrUnsupportedLayout saying to reformat", err)
 	}
 }
 

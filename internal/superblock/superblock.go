@@ -105,8 +105,11 @@ type Superblock struct {
 	LastMountTime int64 // Last mount time
 	LastWriteTime int64 // Last metadata write
 
-	// Reserved for future use (offset 264-4091)
-	Reserved [3828]byte
+	// LockSlotSize is the size of one node's claim slot in a lock record (offset 264-267).
+	LockSlotSize uint32
+
+	// Reserved for future use (offset 268-4091)
+	Reserved [3824]byte
 
 	// Checksum - last 4 bytes (offset 4092-4095)
 	Checksum uint32 // CRC32C of bytes 0-4091
@@ -200,6 +203,8 @@ func (sb *Superblock) Serialize() []byte {
 	binary.LittleEndian.PutUint64(buf[248:256], uint64(sb.LastMountTime))
 	binary.LittleEndian.PutUint64(buf[256:264], uint64(sb.LastWriteTime))
 
+	binary.LittleEndian.PutUint32(buf[264:268], sb.LockSlotSize)
+
 	// Reserved (already zero)
 
 	// Compute and store checksum (last 4 bytes)
@@ -275,6 +280,8 @@ func Deserialize(buf []byte) (*Superblock, error) {
 	sb.CreateTime = int64(binary.LittleEndian.Uint64(buf[240:248]))
 	sb.LastMountTime = int64(binary.LittleEndian.Uint64(buf[248:256]))
 	sb.LastWriteTime = int64(binary.LittleEndian.Uint64(buf[256:264]))
+
+	sb.LockSlotSize = binary.LittleEndian.Uint32(buf[264:268])
 
 	sb.Checksum = storedChecksum
 

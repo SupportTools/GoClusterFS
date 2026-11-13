@@ -111,9 +111,9 @@ func TestTransactionAddEntries(t *testing.T) {
 	}
 
 	// Total length should have increased
-	// Header (64) + Entry1 (8+40) + Entry2 (8+24+8) = 64 + 48 + 40 = 152
+	// Header (64) + Entry1 (8+48) + Entry2 (8+24+8) = 64 + 56 + 40 = 160
 	// Note: "test.txt" is 8 bytes, already 4-byte aligned
-	expectedLen := uint32(TxnHeaderSize + TxnEntryHeaderSize + 40 + TxnEntryHeaderSize + 24 + 8)
+	expectedLen := uint32(TxnHeaderSize + TxnEntryHeaderSize + 48 + TxnEntryHeaderSize + 24 + 8)
 	if txn.TotalLength() != expectedLen {
 		t.Errorf("TotalLength() = %d, want %d", txn.TotalLength(), expectedLen)
 	}

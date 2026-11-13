@@ -100,7 +100,7 @@ Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives on the
 
 ## Block Device Setup
 
-GoClusterFS can use any O_DIRECT-capable block device of at least 264 MB. The layout reserves 256 MB for 64 node journals of 4 MB.
+GoClusterFS can use any O_DIRECT-capable block device of at least 327 MB. The layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
 
 ### Option 1: File-Backed Device (Development/Testing)
 

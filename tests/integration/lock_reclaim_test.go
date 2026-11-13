@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -19,12 +20,13 @@ import (
 // directory lock. Node B must prove A dead and take the lock well before the
 // 15s staleness threshold, within a 10s mount timeout.
 func TestSurvivorReleasesCrashedNodeLocks(t *testing.T) {
-	cluster, uuidA, logB := startPairForLockTest(t)
+	cluster, nodeA, logB := startPairForLockTest(t)
+	uuidA := nodeA.uuid
 
 	if err := cluster.KillNode(0); err != nil {
 		t.Fatalf("kill node A: %v", err)
 	}
-	release := holdRootLockAs(t, cluster.ImagePath, uuidA)
+	release := holdRootLockAs(t, cluster.ImagePath, nodeA)
 	defer release()
 
 	start := time.Now()
@@ -56,14 +58,15 @@ func TestSurvivorReleasesCrashedNodeLocks(t *testing.T) {
 // node as dead. B must not take the lock before it goes stale, and must never
 // take over A's locks as a dead node's.
 func TestSlowNodeKeepsLocks(t *testing.T) {
-	cluster, uuidA, logB := startPairForLockTest(t)
+	cluster, nodeA, logB := startPairForLockTest(t)
+	uuidA := nodeA.uuid
 	pid := cluster.Node(0).PID()
 
 	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 		t.Fatalf("pause node A: %v", err)
 	}
 	defer syscall.Kill(pid, syscall.SIGCONT)
-	release := holdRootLockAs(t, cluster.ImagePath, uuidA)
+	release := holdRootLockAs(t, cluster.ImagePath, nodeA)
 
 	attempt := func(result chan<- error) {
 		result <- cluster.Node(1).WriteFile("while-a-paused", []byte("x"))
@@ -96,7 +99,12 @@ func TestSlowNodeKeepsLocks(t *testing.T) {
 	}
 }
 
-func startPairForLockTest(t *testing.T) (*MultiNodeCluster, [16]byte, *syncBuffer) {
+type registeredNode struct {
+	uuid [16]byte
+	slot int
+}
+
+func startPairForLockTest(t *testing.T) (*MultiNodeCluster, registeredNode, *syncBuffer) {
 	t.Helper()
 	cluster := NewMultiNodeCluster(t, 2, 50)
 	logA, logB := &syncBuffer{}, &syncBuffer{}
@@ -107,7 +115,11 @@ func startPairForLockTest(t *testing.T) (*MultiNodeCluster, [16]byte, *syncBuffe
 	if err := cluster.StartNode(1, false); err != nil {
 		t.Fatalf("start node B: %v", err)
 	}
-	return cluster, nodeUUID(t, cluster.ImagePath, mustMatch(t, registeredRe, logA, "node A registration")), logB
+	slot, err := strconv.Atoi(mustMatch(t, slotRe, logA, "node A registration"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cluster, registeredNode{nodeUUID(t, cluster.ImagePath, mustMatch(t, registeredRe, logA, "node A registration")), slot}, logB
 }
 
 func nodeUUID(t *testing.T, imagePath, prefix string) [16]byte {
@@ -134,8 +146,8 @@ func nodeUUID(t *testing.T, imagePath, prefix string) [16]byte {
 	return [16]byte{}
 }
 
-// holdRootLockAs writes an exclusive root directory lock record owned by owner, as if owner held it.
-func holdRootLockAs(t *testing.T, imagePath string, owner [16]byte) func() {
+// holdRootLockAs claims the root directory lock for writing in owner's slot, as if owner held it.
+func holdRootLockAs(t *testing.T, imagePath string, owner registeredNode) func() {
 	t.Helper()
 	dev, err := storage.Open(imagePath)
 	if err != nil {
@@ -146,12 +158,12 @@ func holdRootLockAs(t *testing.T, imagePath string, owner [16]byte) func() {
 		dev.Close()
 		t.Fatal(err)
 	}
-	locks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, owner, 0)
+	locks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, owner.uuid, owner.slot)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := locks.Acquire(ctx, lock.LockTypeInode, uint64(inode.InodeRoot), lock.LockModeExclusive); err != nil {
 		dev.Close()
-		t.Fatalf("hold root directory lock as %x: %v", owner[:8], err)
+		t.Fatalf("hold root directory lock as %x: %v", owner.uuid[:8], err)
 	}
 	return func() {
 		locks.Release(lock.LockTypeInode, uint64(inode.InodeRoot))

@@ -56,6 +56,10 @@ var beforeInPlaceWrite func()
 // locks for an in-place write, before its data lands.
 var duringInPlaceWrite func()
 
+// afterSectorRead lets tests act while a partial-sector write holds the
+// sector's old contents, before it writes them back.
+var afterSectorRead func()
+
 // beforeSizeUpdate lets tests hold a write after its data landed, before it
 // takes the inode lock to update size and mtime.
 var beforeSizeUpdate func(*File)
@@ -65,8 +69,9 @@ var beforeSizeUpdate func(*File)
 var beforeShareMark func()
 
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
-// when concurrent modifications are detected.
-const MaxWriteRetries = 3
+// when concurrent modifications are detected. Back-to-back snapshots on another
+// node can force a retry each time; with conflictBackoff, 10 tries span up to 5s.
+const MaxWriteRetries = 10
 
 // errRetryCreate is an internal sentinel error indicating that an inode slot
 // collision was detected during Create/Mkdir and the operation should be retried.
@@ -307,6 +312,11 @@ func (f *FS) Close() error {
 		if err := f.journal.Stop(); err != nil {
 			log.Printf("Warning: failed to stop journal cleanly: %v", err)
 		}
+	}
+	// Other nodes would otherwise wait for these holds to go stale.
+	if f.lockMgr != nil {
+		f.lockMgr.ReleaseCached()
+		f.lockMgr.LogStats()
 	}
 	return f.dev.Close()
 }
@@ -757,33 +767,19 @@ func injectedMkdirFailure() error {
 	return nil
 }
 
-// maxLoggedExtentFrees caps the extents one transaction records; replay leaves any further blocks allocated.
-const maxLoggedExtentFrees = 256
+// logExtentFree records that the operation cuts ino to newSize and frees its blocks past it, so that replay can
+// finish that if the operation's inode write never landed.
+func logExtentFree(txn *journal.Transaction, ino *inode.Inode, newSize uint64) error {
+	return txn.LogExtentFree(&journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration, Size: newSize})
+}
 
-// logExtentFrees records the extents of ino past newSize, so replay can cut the inode and free their blocks if the
-// operation never did. SFB extents point into containers, not at blocks, so they are skipped.
-func (f *FS) logExtentFrees(txn *journal.Transaction, ino *inode.Inode, newSize uint64) error {
-	extents, err := f.extentMgr.ListExtents(ino)
-	if err != nil {
-		return err
+// freeSlotGeneration returns the MetaGeneration of a free inode slot. A create logs it so that replay can tell whether
+// another node used the slot since; a slot it cannot read fails the create's ClaimSlot anyway.
+func (f *FS) freeSlotGeneration(num uint32) uint64 {
+	if free, err := f.inodeTbl.Read(num); err == nil {
+		return free.MetaGeneration
 	}
-	from := (newSize + BlockSize - 1) / BlockSize
-	freed := &journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration, Size: newSize}
-	for _, ext := range extents {
-		if ext.LogicalBlock+ext.Length <= from || ext.Flags&extent.FlagSFB != 0 || len(freed.Extents) == maxLoggedExtentFrees {
-			continue
-		}
-		skip := max(from, ext.LogicalBlock) - ext.LogicalBlock
-		freed.Extents = append(freed.Extents, journal.FreedExtent{
-			FileBlock: ext.LogicalBlock + skip,
-			DiskBlock: ext.PhysicalBlock + skip,
-			Length:    uint32(ext.Length - skip),
-		})
-	}
-	if len(freed.Extents) == 0 {
-		return nil
-	}
-	return txn.LogExtentFree(freed)
+	return 0
 }
 
 // afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.
@@ -821,6 +817,7 @@ func (f *FS) createFileInternal(ctx context.Context, name string, flags uint32, 
 			GID:            gid,
 			ParentInodeNum: uint64(inode.InodeRoot),
 			NameHash:       hashString(name),
+			MetaGeneration: f.freeSlotGeneration(inodeNum),
 		}); err != nil {
 			f.journal.Abort(txn)
 			return nil, nil, 0, syscall.EIO
@@ -978,6 +975,7 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 			GID:            gid,
 			ParentInodeNum: uint64(inode.InodeRoot),
 			NameHash:       hashString(name),
+			MetaGeneration: f.freeSlotGeneration(inodeNum),
 		}); err != nil {
 			f.journal.Abort(txn)
 			return nil, syscall.EIO
@@ -1096,171 +1094,12 @@ func (f *FS) mkdirInternal(ctx context.Context, name string, mode uint32, out *f
 
 // Unlink removes a file from the root directory.
 func (f *FS) Unlink(ctx context.Context, name string) syscall.Errno {
-	ctx = detach(ctx)
-	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
-	if err != nil {
-		return syscall.EIO
-	}
-
-	childInodeNum, fileType, err := f.dirMgr.Lookup(ctx, dirIno, name)
-	if err != nil {
-		if err == dir.ErrNotFound {
-			return syscall.ENOENT
-		}
-		return syscall.EIO
-	}
-
-	if fileType == dir.DT_DIR {
-		return syscall.EISDIR
-	}
-
-	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
-	if err != nil {
-		return syscall.EIO
-	}
-
-	// === WAL: Begin transaction and log intent ===
-	var txn *journal.Transaction
-	var intentSeq uint64
-	if f.journal != nil {
-		txn = f.journal.Begin()
-		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
-			ParentInodeNum: uint64(inode.InodeRoot),
-			ChildInodeNum:  childInodeNum,
-			Name:           name,
-		}); err != nil {
-			f.journal.Abort(txn)
-			return syscall.EIO
-		}
-		var commitErr error
-		intentSeq, commitErr = f.journal.Commit(txn)
-		if commitErr != nil {
-			return syscall.EIO
-		}
-		defer f.closeIntent(intentSeq)
-	}
-	// === End WAL transaction - intent is now durable ===
-
-	if err := f.dirMgr.Remove(ctx, dirIno, name); err != nil {
-		return syscall.EIO
-	}
-
-	childIno.LinkCount--
-	now := time.Now().UnixNano()
-	childIno.Ctime = now
-
-	if childIno.LinkCount == 0 {
-		sfbBacked, sfbSlot := childIno.IsSFBBacked(), childIno.InlineExtents[0].PhysicalBlock
-		if err := f.extentMgr.Delete(ctx, childIno); err != nil {
-			log.Printf("[DEBUG] Unlink %q: freeing blocks failed: %v", name, err)
-		}
-		f.inodeTbl.Free(ctx, childIno.InodeNum)
-		if sfbBacked {
-			f.freeSFBSlot(ctx, sfbSlot)
-		}
-	} else if _, err := f.updateInodeLocked(ctx, childIno.InodeNum, func(ino *inode.Inode) error {
-		ino.LinkCount--
-		ino.Ctime = now
-		return nil
-	}); err != nil {
-		log.Printf("[WARN] Unlink %q: link count of inode %d not updated: %v", name, childIno.InodeNum, err)
-	}
-
-	if _, err := f.updateInodeLocked(ctx, dirIno.InodeNum, func(ino *inode.Inode) error { ino.Mtime = now; return nil }); err != nil {
-		log.Printf("[DEBUG] Unlink %q: updating directory failed: %v", name, err)
-	}
-
-	// === WAL: Mark intent complete ===
-	if f.journal != nil && intentSeq > 0 {
-		if err := f.journal.CompleteIntent(intentSeq); err != nil {
-			log.Printf("[DEBUG] Unlink %q: CompleteIntent failed: %v", name, err)
-		}
-	}
-
-	return 0
+	return f.RootDir().Unlink(ctx, name)
 }
 
 // Rmdir removes an empty directory from the root directory.
 func (f *FS) Rmdir(ctx context.Context, name string) syscall.Errno {
-	ctx = detach(ctx)
-	dirIno, err := f.inodeTbl.Read(inode.InodeRoot)
-	if err != nil {
-		return syscall.EIO
-	}
-
-	childInodeNum, fileType, err := f.dirMgr.Lookup(ctx, dirIno, name)
-	if err != nil {
-		if err == dir.ErrNotFound {
-			return syscall.ENOENT
-		}
-		return syscall.EIO
-	}
-
-	if fileType != dir.DT_DIR {
-		return syscall.ENOTDIR
-	}
-
-	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
-	if err != nil {
-		return syscall.EIO
-	}
-
-	isEmpty, err := f.dirMgr.IsEmpty(ctx, childIno)
-	if err != nil {
-		return syscall.EIO
-	}
-	if !isEmpty {
-		return syscall.ENOTEMPTY
-	}
-
-	// === WAL: Begin transaction and log intent ===
-	var txn *journal.Transaction
-	var intentSeq uint64
-	if f.journal != nil {
-		txn = f.journal.Begin()
-		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
-			ParentInodeNum: uint64(inode.InodeRoot),
-			ChildInodeNum:  childInodeNum,
-			Name:           name,
-		}); err != nil {
-			f.journal.Abort(txn)
-			return syscall.EIO
-		}
-		var commitErr error
-		intentSeq, commitErr = f.journal.Commit(txn)
-		if commitErr != nil {
-			return syscall.EIO
-		}
-		defer f.closeIntent(intentSeq)
-	}
-	// === End WAL transaction - intent is now durable ===
-
-	if err := f.dirMgr.Remove(ctx, dirIno, name); err != nil {
-		return syscall.EIO
-	}
-
-	if err := f.extentMgr.Delete(ctx, childIno); err != nil {
-		log.Printf("[DEBUG] Rmdir %q: freeing blocks failed: %v", name, err)
-	}
-	f.inodeTbl.Free(ctx, childIno.InodeNum)
-
-	now := time.Now().UnixNano()
-	if _, err := f.updateInodeLocked(ctx, dirIno.InodeNum, func(ino *inode.Inode) error {
-		ino.LinkCount--
-		ino.Mtime = now
-		return nil
-	}); err != nil {
-		log.Printf("[WARN] Rmdir %q: link count of directory inode %d not updated: %v", name, dirIno.InodeNum, err)
-	}
-
-	// === WAL: Mark intent complete ===
-	if f.journal != nil && intentSeq > 0 {
-		if err := f.journal.CompleteIntent(intentSeq); err != nil {
-			log.Printf("[DEBUG] Rmdir %q: CompleteIntent failed: %v", name, err)
-		}
-	}
-
-	return 0
+	return f.RootDir().Rmdir(ctx, name)
 }
 
 // Dir represents a directory in the filesystem.
@@ -1579,6 +1418,7 @@ func (d *Dir) createInternal(ctx context.Context, name string, flags uint32, mod
 			GID:            gid,
 			ParentInodeNum: uint64(d.inodeNum),
 			NameHash:       hashString(name),
+			MetaGeneration: d.fs.freeSlotGeneration(inodeNum),
 		}); err != nil {
 			d.fs.journal.Abort(txn)
 			log.Printf("[DEBUG] Create %q: journal LogInodeCreate failed: %v", name, err)
@@ -1787,6 +1627,7 @@ func (d *Dir) mkdirInternal(ctx context.Context, name string, mode uint32, out *
 			GID:            gid,
 			ParentInodeNum: uint64(d.inodeNum),
 			NameHash:       hashString(name),
+			MetaGeneration: d.fs.freeSlotGeneration(inodeNum),
 		}); err != nil {
 			d.fs.journal.Abort(txn)
 			log.Printf("[DEBUG] Mkdir %q: journal LogInodeCreate failed: %v", name, err)
@@ -1999,8 +1840,8 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		}
 	}
 
-	// Determine if inode will be freed (link count becomes 0)
-	willFreeInode := childIno.LinkCount == 1
+	// Rmdir removes only empty directories, whose link count also counts their own "." entry.
+	willFreeInode := isDir || childIno.LinkCount == 1
 
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
@@ -2016,10 +1857,11 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 		// Log directory entry removal
 		if err := txn.LogDirRemoveEntry(&journal.DirRemoveEntryPayload{
-			ParentInodeNum: uint64(d.inodeNum),
-			ChildInodeNum:  uint64(childInodeNum),
-			EntryType:      entryType,
-			Name:           name,
+			ParentInodeNum:      uint64(d.inodeNum),
+			ChildInodeNum:       uint64(childInodeNum),
+			EntryType:           entryType,
+			Name:                name,
+			ChildMetaGeneration: childIno.MetaGeneration,
 		}); err != nil {
 			d.fs.journal.Abort(txn)
 			return syscall.EIO
@@ -2027,14 +1869,15 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 
 		// If link count will become 0, log inode deletion and extent freeing
 		if willFreeInode {
-			if err := d.fs.logExtentFrees(txn, childIno, 0); err != nil {
+			if err := logExtentFree(txn, childIno, 0); err != nil {
 				d.fs.journal.Abort(txn)
 				return syscall.EIO
 			}
 
 			// Log inode deletion
 			if err := txn.LogInodeDelete(&journal.InodeDeletePayload{
-				InodeNum: uint64(childInodeNum),
+				InodeNum:       uint64(childInodeNum),
+				MetaGeneration: childIno.MetaGeneration,
 			}); err != nil {
 				d.fs.journal.Abort(txn)
 				return syscall.EIO
@@ -2083,9 +1926,7 @@ func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.
 		return syscall.EIO
 	}
 
-	// Decrement child link count and potentially free
-	childIno.LinkCount--
-	if childIno.LinkCount == 0 {
+	if willFreeInode {
 		sfbBacked, sfbSlot := childIno.IsSFBBacked(), childIno.InlineExtents[0].PhysicalBlock
 		// Free the inode first: once it is gone, replaying this unlink's ExtentFree cannot free the blocks a second time.
 		if err := d.fs.inodeTbl.Free(ctx, uint32(childInodeNum)); err != nil {
@@ -2576,6 +2417,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 			return 0, syscall.EIO
 		}
+		// A block allocated by this write stays invisible to other nodes until the inode,
+		// whose lock this write holds, is committed, so nobody else can write it meanwhile.
+		newBlock := false
 		if err != nil {
 			// Need to allocate - must acquire lock first
 			if !lockHeld && f.fs.lockMgr != nil {
@@ -2624,6 +2468,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				ino = freshIno
 				inoDirty = true
 				ext = newExt
+				newBlock = true
 			} else {
 				// Allocate block (acquires bitmap lock internally, then releases it)
 				ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
@@ -2799,8 +2644,13 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 		if !lockHeld && f.fs.lockMgr != nil {
-			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeShared); err != nil {
-				log.Printf("[DEBUG] Write inode %d: failed to acquire shared inode lock: %v", f.inodeNum, err)
+			// A shared hold could not take the extent lock below on the same record.
+			mode := lock.LockModeShared
+			if !newBlock && f.fs.lockMgr.SameRecord(lock.LockTypeInode, uint64(f.inodeNum), lock.LockTypeExtent, physBlock) {
+				mode = lock.LockModeExclusive
+			}
+			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), mode); err != nil {
+				log.Printf("[DEBUG] Write inode %d: failed to acquire inode lock: %v", f.inodeNum, err)
 				return 0, syscall.EIO
 			}
 			inPlaceLockHeld = true
@@ -2814,8 +2664,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// When multiple nodes write to different offsets within the same block,
 		// they must serialize their read-modify-write operations to avoid
 		// one node's changes being overwritten by another's stale read.
+		// A whole-sector write still takes it, or it lands inside a peer's read-modify-write.
 		extentLockHeld := false
-		if f.fs.lockMgr != nil {
+		if f.fs.lockMgr != nil && !newBlock {
 			if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
 				log.Printf("[DEBUG] Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
@@ -2846,19 +2697,25 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		sectorOffset := diskOffset - alignedOffset
 
 		for bytesInBlock := 0; bytesInBlock < toWrite; {
-			// Read existing sector
-			if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
-				// New sector - zero it
-				for i := range buf.Bytes() {
-					buf.Bytes()[i] = 0
-				}
-			}
-
-			// Modify
 			copyLen := storage.SectorSize - int(sectorOffset)
 			if copyLen > toWrite-bytesInBlock {
 				copyLen = toWrite - bytesInBlock
 			}
+
+			// Read existing sector unless this write replaces all of it
+			if copyLen < storage.SectorSize {
+				if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
+					// New sector - zero it
+					for i := range buf.Bytes() {
+						buf.Bytes()[i] = 0
+					}
+				}
+				if afterSectorRead != nil {
+					afterSectorRead()
+				}
+			}
+
+			// Modify
 			copy(buf.Bytes()[sectorOffset:], data[bytesWritten+bytesInBlock:bytesWritten+bytesInBlock+copyLen])
 
 			// Write back
@@ -2933,10 +2790,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// Log all extent allocations
 		for _, alloc := range allocatedExtents {
 			if err := txn.LogExtentAdd(&journal.ExtentAddPayload{
-				InodeNum:  uint64(f.inodeNum),
-				FileBlock: alloc.logicalBlock,
-				DiskBlock: alloc.physicalBlock,
-				Length:    alloc.count,
+				InodeNum:       uint64(f.inodeNum),
+				FileBlock:      alloc.logicalBlock,
+				DiskBlock:      alloc.physicalBlock,
+				Length:         alloc.count,
+				MetaGeneration: ino.MetaGeneration,
+				Size:           newSize,
 			}); err != nil {
 				log.Printf("[DEBUG] Write inode %d: LogExtentAdd failed: %v", f.inodeNum, err)
 				return 0, syscall.EIO
@@ -2965,6 +2824,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		defer f.fs.closeIntent(intentSeq)
 		txn = nil // Mark as committed so defer doesn't abort
+		if afterCommit != nil {
+			afterCommit("write")
+		}
 	}
 	// === End WAL transaction ===
 
@@ -3327,7 +3189,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 		if truncating && blocksToFree > 0 {
 			newSize, _ := in.GetSize()
-			if err := f.fs.logExtentFrees(txn, ino, newSize); err != nil {
+			if err := logExtentFree(txn, ino, newSize); err != nil {
 				f.fs.journal.Abort(txn)
 				return syscall.EIO, nil
 			}

@@ -240,10 +240,10 @@ func main() {
 
 	// Create lock manager for distributed locking
 	lockMgr := lock.NewManager(dev, lockOffset, lockSize, nodeUUID, slotIdx)
-	nodeReg.SetOwnerDeadHandler(func(owner [16]byte) func() { return adoptLocks(lockMgr, owner) })
+	nodeReg.SetOwnerDeadHandler(func(owner [16]byte, slot int) func() { return adoptLocks(lockMgr, owner, slot) })
 	releasePrevious := func() {}
 	if owner, ok := nodeReg.DeadPreviousOwner(); ok {
-		releasePrevious = adoptLocks(lockMgr, owner)
+		releasePrevious = adoptLocks(lockMgr, owner, slotIdx)
 	}
 
 	// Create managers with distributed locking enabled
@@ -585,10 +585,11 @@ func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Jou
 	return src
 }
 
-// adoptLocks takes over a dead node's exclusive locks before its journal is
-// replayed and returns the function that frees them after the replay.
-func adoptLocks(locks *lock.Manager, owner [16]byte) func() {
-	adopted, err := locks.AdoptOwner(owner)
+// adoptLocks takes over a dead node's exclusive locks and clears its read holds
+// before its journal is replayed, and returns the function that frees the
+// exclusive locks after the replay.
+func adoptLocks(locks *lock.Manager, owner [16]byte, slot int) func() {
+	adopted, err := locks.AdoptOwner(owner, slot)
 	if err != nil {
 		log.Printf("Warning: Failed to take over the locks of dead node %x: %v", owner[:8], err)
 	}
