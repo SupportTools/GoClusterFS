@@ -72,7 +72,7 @@ func get(t *testing.T, srv *Server, path, host string, header map[string]string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
+	closeBody(resp)
 	return resp
 }
 
@@ -85,7 +85,7 @@ func startServer(t *testing.T, cfg Config) *Server {
 	if err := srv.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { srv.Stop() })
+	t.Cleanup(func() { stopServer(t, srv) })
 	return srv
 }
 
