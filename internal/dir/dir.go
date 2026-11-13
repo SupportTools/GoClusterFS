@@ -316,8 +316,7 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 	return err
 }
 
-// RemoveIf removes the entry called name if ok accepts the inode it names. ok runs under the directory lock, so no
-// other node changes the entry between the check and the removal.
+// RemoveIf removes name if ok accepts the inode it names; ok runs under the directory lock.
 func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool) (bool, error) {
 	if !dirIno.IsDir() {
 		return false, ErrNotDirectory
@@ -378,8 +377,7 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 	return false, ErrNotFound
 }
 
-// liveDirLocked re-reads directory num once its lock is held. The caller's copy may predate another node's changes
-// to the directory, or its removal.
+// liveDirLocked re-reads directory num under its lock: another node may have changed or removed it.
 func (m *Manager) liveDirLocked(num uint32) (*inode.Inode, error) {
 	ino, err := m.inodeTbl.Read(num)
 	if err != nil {

@@ -45,8 +45,7 @@ func expectOneNamePerInode(t *testing.T, fsys *FS) map[string]uint64 {
 	return names
 }
 
-// A create or mkdir crashes between claiming its inode and naming it, and a peer creates a file in the first free
-// slot before replay. The peer's file must get an inode of its own.
+// A create or mkdir crashes between claiming and naming its inode; a peer's file created before replay keeps its own inode.
 func TestCrashBetweenClaimAndNameLeavesNoSharedName(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
@@ -78,8 +77,7 @@ func TestCrashBetweenClaimAndNameLeavesNoSharedName(t *testing.T) {
 	}
 }
 
-// RemoveIf checks the entry under the directory lock: a peer that changes the entry during the check has to wait
-// until RemoveIf is done.
+// A peer that changes an entry while RemoveIf checks it waits for the directory lock.
 func TestRemoveIfHoldsDirectoryLockWhileChecking(t *testing.T) {
 	ctx := context.Background()
 	path := newFormattedImage(t)
@@ -105,8 +103,7 @@ func TestRemoveIfHoldsDirectoryLockWhileChecking(t *testing.T) {
 	}
 }
 
-// Another node removes a directory after this node read it: Add and Remove recheck it under its lock and leave the
-// freed slot alone.
+// Add and Remove with a stale copy of a directory another node removed leave the freed slot alone.
 func TestDirChangesRefuseRemovedDirectory(t *testing.T) {
 	ctx := context.Background()
 	fsys := openFormattedFS(t, newFormattedImage(t))

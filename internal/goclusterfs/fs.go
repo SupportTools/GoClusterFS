@@ -904,8 +904,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		}
 	}
 
-	// Claim the slot before naming it: a crash in between leaks an unnamed inode instead of leaving a name another
-	// node's create can take over.
+	// Claiming before naming means a crash in between leaks an unnamed inode, not a name for a free slot.
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		log.Printf("[DEBUG] Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
