@@ -104,6 +104,7 @@ func expectProblem(t *testing.T, r *fsck.Result, want string) {
 // that no directory names. A dry run changes nothing; repair frees the inode,
 // its data and its tree nodes, and the check after it is clean.
 func TestFsckRepairFreesInodeReplayLeftUnnamed(t *testing.T) {
+	t.Parallel()
 	fsys, path, offset, size := journaledFS(t)
 	keep := createFile(t, fsys, "keep.bin")
 	writeAt(t, keep, pattern(9, BlockSize), 0)
@@ -149,6 +150,7 @@ func TestFsckRepairFreesInodeReplayLeftUnnamed(t *testing.T) {
 // A clone shares the blocks of the file replay leaves unnamed. Repair frees the
 // inode and gives the blocks to the clone alone.
 func TestFsckRepairFreesUnnamedInodeKeepsCloneBlocks(t *testing.T) {
+	t.Parallel()
 	fsys, path, offset, size := journaledFS(t)
 	data := pattern(3, 2*BlockSize)
 	f := createFile(t, fsys, "doomed.bin")
@@ -173,6 +175,7 @@ func TestFsckRepairFreesUnnamedInodeKeepsCloneBlocks(t *testing.T) {
 // A snapshot refers to the file replay leaves unnamed and shares its blocks.
 // Repair keeps the inode and changes nothing.
 func TestFsckRepairKeepsUnnamedSnapshotTarget(t *testing.T) {
+	t.Parallel()
 	fsys, path, offset, size := journaledFS(t)
 	f := createFile(t, fsys, "doomed.bin")
 	writeAt(t, f, pattern(4, 2*BlockSize), 0)
@@ -221,6 +224,7 @@ func unname(t *testing.T, fsys *FS, name string) {
 // unnamed inodes it must not free, or all of them when it may not know every
 // name or snapshot reference.
 func TestFsckRepairKeepsUnnamedInodesItCannotPlace(t *testing.T) {
+	t.Parallel()
 	type setup struct {
 		fsys   *FS
 		sb     *superblock.Superblock

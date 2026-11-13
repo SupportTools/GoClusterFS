@@ -177,6 +177,7 @@ func TestFsckRepairReclaimsLeakedBlocks(t *testing.T) {
 // map it, and never while a node may be using the filesystem. When it keeps the
 // leaks it writes neither the bitmap nor their refcounts.
 func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
+	t.Parallel()
 	repair := fsck.DefaultOptions()
 	repair.Mode = fsck.Repair
 	skip := func(p fsck.Phase) fsck.Options {
@@ -260,6 +261,7 @@ func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 		}, "stopped with a dirty journal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			path := newFormattedImage(t)
 			fsys := openFormattedFS(t, path)
 			sb, err := superblock.Read(fsys.dev)
