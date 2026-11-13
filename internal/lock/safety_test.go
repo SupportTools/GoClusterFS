@@ -33,7 +33,7 @@ func requireBlocked(t *testing.T, m *Manager, lt LockType, id uint64, mode LockM
 	t.Helper()
 	err := acquireWithin(m, 50*time.Millisecond, lt, id, mode)
 	if err == nil {
-		m.Release(lt, id)
+		release(t, m, lt, id)
 		t.Fatalf("node %d acquired type=%d id=%d mode=%d while another holder should exclude it", m.nodeSlot, lt, id, mode)
 	}
 	if !errors.Is(err, ErrLockTimeout) {
@@ -45,6 +45,15 @@ func requireAcquired(t *testing.T, m *Manager, lt LockType, id uint64, mode Lock
 	t.Helper()
 	if err := acquireWithin(m, time.Second, lt, id, mode); err != nil {
 		t.Fatalf("node %d Acquire type=%d id=%d mode=%d: %v", m.nodeSlot, lt, id, mode, err)
+	}
+}
+
+// release reports a failed Release without stopping the test, so goroutines and
+// defers can use it.
+func release(tb testing.TB, m *Manager, lt LockType, id uint64) {
+	tb.Helper()
+	if err := m.Release(lt, id); err != nil {
+		tb.Errorf("node %d Release type=%d id=%d: %v", m.nodeSlot, lt, id, err)
 	}
 }
 
@@ -248,7 +257,7 @@ func TestReadersOnTwoNodesCannotBothWrite(t *testing.T) {
 		go func(m *Manager) {
 			err := acquireWithin(m, 50*time.Millisecond, LockTypeInode, 77, LockModeExclusive)
 			if err == nil {
-				m.Release(LockTypeInode, 77)
+				release(t, m, LockTypeInode, 77)
 			}
 			errs <- err
 		}(m)
@@ -304,7 +313,7 @@ func TestPausedHolderReleaseKeepsReclaimedLock(t *testing.T) {
 	ageSlot(t, a, LockTypeInode, 3, pastStale)
 	requireAcquired(t, b, LockTypeInode, 3, LockModeExclusive)
 
-	a.Release(LockTypeInode, 3)
+	release(t, a, LockTypeInode, 3)
 	time.Sleep(cacheGrace + 50*time.Millisecond)
 	requireBlocked(t, c, LockTypeInode, 3, LockModeExclusive)
 }
@@ -351,7 +360,7 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 					errs <- fmt.Errorf("node %d cycle %d: %w", n, i, err)
 					return
 				}
-				m.Release(lt, id)
+				release(t, m, lt, id)
 			}
 		}(n, m)
 	}
@@ -472,7 +481,7 @@ func BenchmarkFreshAcquireRelease(b *testing.B) {
 		if err := m.Acquire(ctx, LockTypeInode, 100, LockModeExclusive); err != nil {
 			b.Fatal(err)
 		}
-		m.Release(LockTypeInode, 100)
+		release(b, m, LockTypeInode, 100)
 		m.ReleaseCached()
 	}
 }
@@ -511,7 +520,7 @@ func TestOverlappingLocalHoldsStillYield(t *testing.T) {
 					holders.Go(func() {
 						if acquireWithin(busy, 5*time.Second, LockTypeInode, 12, LockModeExclusive) == nil {
 							time.Sleep(tc.hold)
-							busy.Release(LockTypeInode, 12)
+							release(t, busy, LockTypeInode, 12)
 						}
 					})
 				}
@@ -521,7 +530,7 @@ func TestOverlappingLocalHoldsStillYield(t *testing.T) {
 			if err := acquireWithin(other, 3*time.Second, LockTypeInode, 12, LockModeExclusive); err != nil {
 				t.Fatalf("other node never got a record whose local holds keep overlapping: %v", err)
 			}
-			other.Release(LockTypeInode, 12)
+			release(t, other, LockTypeInode, 12)
 		})
 	}
 }
@@ -546,7 +555,7 @@ func TestBusyNodeYieldsCachedRecord(t *testing.T) {
 			}
 			if err := acquireWithin(busy, time.Second, LockTypeInode, 12, LockModeExclusive); err == nil {
 				time.Sleep(time.Millisecond)
-				busy.Release(LockTypeInode, 12)
+				release(t, busy, LockTypeInode, 12)
 			}
 		}
 	}()
@@ -556,7 +565,7 @@ func TestBusyNodeYieldsCachedRecord(t *testing.T) {
 	if err := acquireWithin(other, 2*time.Second, LockTypeInode, 12, LockModeExclusive); err != nil {
 		t.Fatalf("other node never got a record a busy node keeps reusing: %v", err)
 	}
-	other.Release(LockTypeInode, 12)
+	release(t, other, LockTypeInode, 12)
 }
 
 // On slow storage an unmount frees its kept records in parallel, so it takes
@@ -689,7 +698,7 @@ func TestStatsCountsHeldAndWaitingLocks(t *testing.T) {
 	if got := a.Stats(); got.Held != 0 {
 		t.Errorf("holder Stats after release = %+v, want Held 0", got)
 	}
-	b.Release(LockTypeInode, 1)
+	release(t, b, LockTypeInode, 1)
 }
 
 // Six nodes take one lock over and over, mostly for writing, while every slot

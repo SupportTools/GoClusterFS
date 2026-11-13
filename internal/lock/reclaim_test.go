@@ -183,7 +183,7 @@ func TestReplayerWinsAdoptedRecordOverLowerWaiter(t *testing.T) {
 	go func() {
 		err := acquireWithin(waiter, 10*time.Second, LockTypeInode, 2, LockModeExclusive)
 		if err == nil {
-			waiter.Release(LockTypeInode, 2)
+			release(t, waiter, LockTypeInode, 2)
 		}
 		waited <- err
 	}()

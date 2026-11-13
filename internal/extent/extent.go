@@ -217,10 +217,7 @@ func (m *Manager) allocate(ctx context.Context, ino *inode.Inode, logicalBlock, 
 		err = e.commit()
 	}
 	if err != nil {
-		for _, b := range blocks {
-			m.bitmap.Free(ctx, b)
-		}
-		return nil, err
+		return nil, m.freeUnmapped(ctx, blocks, err)
 	}
 
 	ino.AllocatedBlocks += count
@@ -228,6 +225,21 @@ func (m *Manager) allocate(ctx context.Context, ino *inode.Inode, logicalBlock, 
 		ino.WrittenBlocks += count
 	}
 	return &runs[0], nil
+}
+
+// freeUnmapped frees blocks no inode maps and returns cause, joined with an
+// error naming each block it could not free, which stays allocated.
+func (m *Manager) freeUnmapped(ctx context.Context, blocks []uint64, cause error) error {
+	errs := []error{cause}
+	for _, b := range blocks {
+		if err := m.bitmap.Free(ctx, b); err != nil {
+			errs = append(errs, fmt.Errorf("freeing unmapped block %d: %w", b, err))
+		}
+	}
+	if len(errs) == 1 {
+		return cause
+	}
+	return errors.Join(errs...)
 }
 
 // contiguousRuns maps blocks onto consecutive logical blocks starting at
@@ -583,8 +595,7 @@ func (m *Manager) MapCopy(ctx context.Context, ino *inode.Inode, logicalBlock ui
 	}
 	private := Extent{logicalBlock, newBlocks[0], 1, cur.Flags &^ (FlagShared | FlagCounted)}
 	if err := m.remap(ctx, ino, private); err != nil {
-		m.bitmap.Free(ctx, newBlocks[0])
-		return nil, err
+		return nil, m.freeUnmapped(ctx, newBlocks, err)
 	}
 	// The caller releases the old block after the inode write, so that write
 	// must fail if another node copied the block first.

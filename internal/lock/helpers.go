@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 )
 
 // AcquireInode acquires a lock on an inode.
@@ -45,11 +46,11 @@ func (m *Manager) ReleaseVolume() error {
 }
 
 // WithInodeLock executes a function while holding an inode lock.
-func (m *Manager) WithInodeLock(ctx context.Context, inodeNum uint64, mode LockMode, fn func() error) error {
+func (m *Manager) WithInodeLock(ctx context.Context, inodeNum uint64, mode LockMode, fn func() error) (err error) {
 	if err := m.AcquireInode(ctx, inodeNum, mode); err != nil {
 		return err
 	}
-	defer m.ReleaseInode(inodeNum)
+	defer func() { err = errors.Join(err, m.ReleaseInode(inodeNum)) }()
 	return fn()
 }
 
