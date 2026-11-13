@@ -32,10 +32,11 @@ const (
 	snapFSRefcountOffset = 3 << 20
 	snapFSRegistryOffset = 3<<20 + 64<<10
 	snapFSRegistrySize   = 64 << 10
-	snapFSLockOffset     = 3<<20 + 256<<10
-	snapFSLockSize       = 512 << 10
-	snapFSDataOffset     = 4 << 20
-	snapFSDataBlocks     = 60
+	snapFSLockOffset     = 4 << 20
+	// A full lock region: in a smaller one, unrelated locks share rows, so the nodes wait on each other.
+	snapFSLockSize   = 256 * lock.RowSize
+	snapFSDataOffset = snapFSLockOffset + snapFSLockSize
+	snapFSDataBlocks = 60
 )
 
 // snapFSNodes hands each opened FS its own node slot, so instances on one
@@ -69,6 +70,8 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	copy(nodeUUID[:], "testnode12345678")
 	nodeUUID[15] = byte(slot)
 	locks := lock.NewManager(dev, snapFSLockOffset, snapFSLockSize, nodeUUID, slot)
+	// A kept hold released after the device closes would stay claimed until it goes stale.
+	t.Cleanup(locks.ReleaseCached)
 	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
