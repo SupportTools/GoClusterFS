@@ -133,6 +133,9 @@ type Registry struct {
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 }
 
+// emptySlot is a slot no node ever wrote; it has no checksum.
+var emptySlot = make([]byte, SlotSize)
+
 // Errors
 var (
 	ErrNoFreeSlots        = errors.New("no free node slots available")
@@ -765,7 +768,7 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 	// Verify checksum
 	stored := binary.LittleEndian.Uint32(buf[SlotSize-4:])
 	computed := storage.CRC32C(buf[:SlotSize-4])
-	if stored != computed && stored != 0 { // Allow zero checksum for empty slots
+	if stored != computed && !bytes.Equal(buf[:SlotSize], emptySlot) {
 		return nil, ErrInvalidSlot
 	}
 

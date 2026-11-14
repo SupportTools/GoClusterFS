@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("cB1cA1")
+byte('$')
+[]byte("")

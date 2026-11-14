@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -166,7 +167,7 @@ type slotReserve struct {
 // reserved and never used. Replay frees those, so they are not leaks.
 func (c *Checker) reserves() []slotReserve {
 	var out []slotReserve
-	for i := 0; i < int(c.sbData.MaxNodes); i++ {
+	for i := 0; i < min(int(c.sbData.MaxNodes), node.MaxNodes); i++ {
 		if c.journalNeedsReplay(i) == "" {
 			continue
 		}

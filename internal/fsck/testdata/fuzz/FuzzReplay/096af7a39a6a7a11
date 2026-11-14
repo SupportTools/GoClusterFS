@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("\x03\x03b\x03A0")
+byte('p')
+[]byte("")

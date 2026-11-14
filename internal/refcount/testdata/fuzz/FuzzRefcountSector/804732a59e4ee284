@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('l')
+bool(true)
+[]byte("0")
+[]byte("07070!2000107070y21z2017201")

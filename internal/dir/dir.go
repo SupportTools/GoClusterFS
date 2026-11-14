@@ -764,7 +764,7 @@ func parseEntry(buf []byte) (*DirEntry, error) {
 		return nil, ErrInvalidEntry
 	}
 
-	if int(entry.NameLen) > len(buf)-DirEntryHeaderSize {
+	if DirEntryHeaderSize+int(entry.NameLen) > min(len(buf), int(entry.RecLen)) {
 		return nil, ErrInvalidEntry
 	}
 

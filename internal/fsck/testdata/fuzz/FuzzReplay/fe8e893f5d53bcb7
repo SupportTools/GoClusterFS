@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("08120101081A02010c21")
+byte('\x01')
+[]byte("")

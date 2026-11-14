@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\U00105508ǩ")
+string("0")
+string("к")

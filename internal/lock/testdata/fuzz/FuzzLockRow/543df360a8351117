@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('=')
+byte('\x00')
+bool(true)
+byte('N')
+[]byte("800080000")

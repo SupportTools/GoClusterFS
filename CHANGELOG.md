@@ -40,7 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Per-node block reserves (`-block-reserve`, default 64): each node takes a batch of free blocks under one hold of the bitmap lock and hands them to its writes without it, gives unused ones back when idle, at unmount and when space runs low, and waits up to 12 seconds for other nodes' reserves before reporting `ENOSPC`. Journal replay and fsck return the unused reserve of a crashed node. See OPERATIONS.md.
 - `/metrics` and `/api/v1/stats/lock` report, per lock type, the acquires served, the acquires that found the lock taken, and how long those waited (`goclusterfs_lock_acquires_total`, `goclusterfs_lock_blocked_total`, `goclusterfs_lock_wait_seconds_total`).
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
-- Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records) and the journal recovery scan.
+- Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records, lock records, node registry slots, refcount sectors, directory blocks, extent tree nodes, SFB containers), the journal recovery scan, journal replay checked by fsck, and the HTTP API write endpoints and file paths, with seed corpora from two-hour runs.
 - CI gates: unit tests with the race detector and coverage, golangci-lint (`make lint`), govulncheck (`make vuln`), and a `go mod tidy` check.
 - Release workflow: pushing a `v*` tag publishes a GitHub Release with `linux/amd64` and `linux/arm64` archives, checksums, and the matching `CHANGELOG.md` section. `scripts/dist.sh` builds the same archives locally.
 - `goclusterfs-fsck -version` prints the release version, commit, and commit date.
@@ -78,6 +78,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A damaged block reserve record in a journal could make journal replay and `goclusterfs-fsck` allocate up to 32 GB. A reserve record now holds at most 1,048,576 blocks, and a larger `-block-reserve` acts as 1,048,576.
+- A damaged journal record that claimed a length within 4 KB of 4 GB crashed journal recovery with a panic. Recovery now treats it as corrupt.
+- A node registry slot with a zero checksum was accepted whatever it held, so a slot torn or zeroed at its end read as valid. Now only an all-zero slot, which no node has written, skips the checksum.
+- A damaged directory entry whose name ran past the end of its record was read with bytes of the next entry as part of its name. It is now rejected as invalid.
+- Deleting or rewriting a file that an older build stored in an SFB slot crashed the mount when the container header was damaged so the slot lay past its bitmap. The slot is now left allocated.
+- `goclusterfs-fsck` ran for hours on a superblock with a damaged node count, reading one journal per node it claimed. It now reads at most the 64 that the node registry has.
 - One failed write while a node released a lock left its claim on the device, and the node forgot it: other nodes timed out with `EIO` on every resource in that lock record until the node unmounted. The node now clears such a claim again every second until the write succeeds.
 - One failed read of the snapshot registry during a snapshot create could delete other snapshots: the create counted the unreadable sector's slots as free, and a write to a sector it could not read replaced the sector with one that held only the new snapshot, losing up to 30 others. The create still reported success. Both now fail with `EIO` and leave the sector alone. A sector that stays unreadable now blocks every snapshot create; `goclusterfs-fsck` reports it but cannot repair it yet.
 - A node in a higher registry slot could wait 30 seconds and fail with `EIO` for a lock that a node in a lower slot kept releasing and claiming again every few milliseconds. A node that loses a claim to a lower slot now leaves a waiting mark in its own slot, and the holder gives the lock up 250 ms after it first sees a live node's mark.

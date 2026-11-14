@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("9010A1001A10018")
+byte('\x06')
+[]byte("0")

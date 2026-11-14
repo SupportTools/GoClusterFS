@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('\\')
+string("    ")
+bool(false)
+string("0")
+string("0")
+[]byte("")

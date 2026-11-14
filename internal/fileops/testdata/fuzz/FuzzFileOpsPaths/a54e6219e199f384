@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\u07b7\u07bd\u0381\u03820")
+string("0")
+string("0")

@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('"')
+byte('\x04')
+bool(true)
+byte('!')
+[]byte("8000800020002000200080000")

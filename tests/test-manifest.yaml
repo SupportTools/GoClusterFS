@@ -3162,6 +3162,62 @@ scenarios:
     environments:
       go: internal/journal/journal_fuzz_test.go::FuzzJournalScan
 
+  - id: fuzz-journal-replay
+    name: Fuzz journal replay
+    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s; every error fsck then finds names an inode or block the records touched or one those map
+    priority: go_only
+    environments:
+      go: internal/fsck/replay_fuzz_test.go::FuzzReplay
+
+  - id: fuzz-lock-row
+    name: Fuzz lock claim rows
+    description: Rows of valid, torn and checksum-passing garbage claims; a live write claim or torn slot always conflicts, an empty row never does, a released registry slot never blocks, and AdoptOwner and ClearForeignClaims write only their own slot
+    priority: go_only
+    environments:
+      go: internal/lock/slots_fuzz_test.go::FuzzLockRow
+
+  - id: fuzz-registry-slot
+    name: Fuzz node registry slots
+    description: A slot decodes only with a valid checksum or when all zero, round-trips, agrees with its lease expiry, and registry reads report no node in the empty slots around it
+    priority: go_only
+    environments:
+      go: internal/node/registry_fuzz_test.go::FuzzRegistrySlot
+
+  - id: fuzz-refcount-sector
+    name: Fuzz refcount sectors
+    description: Refcount operations over a fuzzed sector match a model, and a sector that fails its checksum refuses them all and stays unchanged on disk
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_fuzz_test.go::FuzzRefcountSector
+
+  - id: fuzz-dir-chunk
+    name: Fuzz directory chunks
+    description: Entries walkChunk returns fit their records and the chunk; chunkRoom agrees with what addToChunk can place; add and remove keep every other live entry
+    priority: go_only
+    environments:
+      go: internal/dir/dir_fuzz_test.go::FuzzDirChunk
+
+  - id: fuzz-sfb-container
+    name: Fuzz SFB containers from older builds
+    description: Freeing a slot clears exactly its bit in a valid container header or leaves the sector unchanged, and reading a slot never panics, whatever header and slot the disk holds
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/sfb_fuzz_test.go::FuzzSFBContainer
+
+  - id: fuzz-api-writes
+    name: Fuzz API write requests
+    description: A request reaches the file or admin service only with the token, from the same origin, by POST or DELETE, with a body of at most 64 KB, and with exactly the fields of one strict JSON object; API responses are JSON
+    priority: go_only
+    environments:
+      go: internal/api/writes_fuzz_test.go::FuzzWriteRequests
+
+  - id: fuzz-fileops-paths
+    name: Fuzz API file paths
+    description: Paths, snapshot names and clone destinations pass only the forms the checks promise, a snapshot clone value splits back into its name and destination, and an accepted path opens exactly the file it names under the mount root
+    priority: go_only
+    environments:
+      go: internal/fileops/fileops_fuzz_test.go::FuzzFileOpsPaths
+
   - id: reserve-unused-later-uses
     name: Unused reserved blocks exclude later uses
     description: Blocks a pending reserve record holds count as unused unless a later record maps or uses them, completed or not; a use logged before the record does not count

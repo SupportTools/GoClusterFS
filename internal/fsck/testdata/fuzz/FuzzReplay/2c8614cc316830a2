@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("\"2171B072")
+byte('\n')
+[]byte("0")

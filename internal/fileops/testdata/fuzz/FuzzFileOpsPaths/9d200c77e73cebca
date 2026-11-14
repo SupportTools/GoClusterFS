@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\U00105514\U00105508")
+string("0")
+string("0")
