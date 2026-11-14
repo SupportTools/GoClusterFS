@@ -71,7 +71,10 @@ func checkDescriptorDecode(t *testing.T, sector []byte, idx uint64) {
 	if err != nil {
 		t.Fatalf("decoding a re-encoded descriptor: %v", err)
 	}
+	// Bytes only some formats use, such as the birth generation without
+	// FlagHasTargetBirth, re-encode as zero and change the checksum.
+	again.Checksum = desc.Checksum
 	if *again != *desc {
-		t.Fatalf("descriptor changed after an encode/decode round trip")
+		t.Fatalf("descriptor changed after an encode/decode round trip: %+v != %+v", again, desc)
 	}
 }
