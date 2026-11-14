@@ -606,6 +606,8 @@ test_reserve_returned_after_crash() {
     local before
     before=$(free_kb)
     ssh_run "$vm_a" "dd if=/dev/urandom of=$file bs=1M count=1 conv=fsync 2>/dev/null" || return 1
+    local sum
+    sum=$(ssh_run "$vm_a" "md5sum $file | cut -d' ' -f1")
     local reserved
     reserved=$(free_kb)
     log_info "free on VM B: ${before}KB before, ${reserved}KB while VM A holds its reserve"
@@ -627,16 +629,24 @@ test_reserve_returned_after_crash() {
         log_error "VM B shows ${now}KB free after VM A's replay, want ${want}KB: the reserve was not returned"
         return 1
     fi
-    if [[ "$(ssh_run "$vm_b" "stat -c %s $file")" != "1048576" ]]; then
-        log_error "VM A's file is not whole on VM B after the replay"
+    log_info "VM A's unused reserve came back after ${waited}s"
+
+    # Allocation is first-fit, so VM B's filler would take the file's block if replay had freed it.
+    local filler=/mnt/goclusterfs/reserve-crash-filler.bin
+    ssh_run "$vm_b" "dd if=/dev/zero of=$filler bs=1M count=128 conv=fsync 2>/dev/null" || return 1
+    if [[ "$(ssh_run "$vm_b" "md5sum $file | cut -d' ' -f1")" != "$sum" ]]; then
+        log_error "VM A's file changed on VM B after the replay and a 128MB write"
         return 1
     fi
-    log_info "VM A's unused reserve came back after ${waited}s"
 
     start_vm "$vm_a" false
     wait_vm_healthy "$vm_a"
     setup_goclusterfs "$vm_a" false
-    ssh_run "$vm_b" "rm -f $file"
+    if [[ "$(ssh_run "$vm_a" "md5sum $file | cut -d' ' -f1")" != "$sum" ]]; then
+        log_error "VM A reads different data from its file after restarting"
+        return 1
+    fi
+    ssh_run "$vm_b" "rm -f $file $filler"
     log_info "Reserve returned after crash test passed"
     return 0
 }

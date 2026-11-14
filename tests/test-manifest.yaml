@@ -3219,11 +3219,11 @@ scenarios:
       go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReservedWriteThatCopies
 
   - id: reserve-returned-after-crash
-    name: Killed node's reserve is returned
-    description: A node takes a block reserve, writes one block from it and is killed; the survivor replays its journal and the unused reserved blocks come back, so free space ends one block below where it started
+    name: Killed node's reserve is returned and its written blocks kept
+    description: A node writes from its block reserve and is killed; the survivor replays its journal, the unused reserved blocks come back, and the written file keeps its data and blocks through later allocations
     priority: high
     environments:
-      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsReservedBlockUsedFreedAndRetaken
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsMappedBlocksOfCrashedNodesReserve
       docker: TODO - Docker kills containers but the harness has no df comparison across nodes; the Go replay test and the VM test cover it
       vm: run-vm-tests.sh::test_reserve_returned_after_crash
 

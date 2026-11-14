@@ -153,6 +153,46 @@ func TestReplayKeepsReservedBlockUsedFreedAndRetaken(t *testing.T) {
 	}
 }
 
+// Node A writes two files from its reserve, the second through two blocks, and
+// crashes holding the rest. After replay the files keep their data and no
+// allocation can take their blocks.
+func TestReplayKeepsMappedBlocksOfCrashedNodesReserve(t *testing.T) {
+	nodeA, path, offset, size := reserveFS(t)
+	fOne, fTwo := createFile(t, nodeA, "one"), createFile(t, nodeA, "two")
+	free := nodeA.bitmapMgr.FreeCount()
+	resA := withReserve(t, nodeA, 8, time.Hour)
+	one, two := pattern(1, 4096), pattern(2, 8192)
+	writeAt(t, fOne, one, 0)
+	writeAt(t, fTwo, two, BlockSize-4096)
+	expectRefills(t, resA)
+	nodeA.snapshotWkr.Stop()
+	nodeA.dev.SetWriteGate(func(int64) error { return errPowerCut })
+
+	nodeB := openFormattedFS(t, path)
+	replayCrashedJournal(t, nodeB, offset, size)
+	fOne, fTwo = lookupFile(t, nodeB, "one"), lookupFile(t, nodeB, "two")
+	checkFile(t, fOne, one)
+	checkFile(t, fTwo, append(make([]byte, BlockSize-4096), two...))
+	mapped := map[uint64]bool{
+		physicalBlock(t, nodeB, fOne.inodeNum, 0): true,
+		physicalBlock(t, nodeB, fTwo.inodeNum, 0): true,
+		physicalBlock(t, nodeB, fTwo.inodeNum, 1): true,
+	}
+	if got, want := nodeB.bitmapMgr.FreeCount(), free-uint64(len(mapped)); got != want {
+		t.Errorf("%d free blocks after the replay, want %d: only the %d mapped blocks stay allocated", got, want, len(mapped))
+	}
+	expectCleanFsck(t, nodeB)
+	rest, err := nodeB.bitmapMgr.Alloc(context.Background(), int(nodeB.bitmapMgr.FreeCount()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range rest {
+		if mapped[b] {
+			t.Fatalf("node B allocated block %d, which node A's file maps", b)
+		}
+	}
+}
+
 // Node B finds the bitmap full while node A holds blocks in reserve. B asks for
 // them back and waits; A gives them back, and B's write gets a block instead of
 // failing with ENOSPC.
