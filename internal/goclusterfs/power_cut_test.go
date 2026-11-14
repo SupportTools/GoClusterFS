@@ -134,7 +134,11 @@ func attachHolePunchingTrim(t *testing.T, fsys *FS, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { img.Close() })
+	t.Cleanup(func() {
+		if err := img.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	sb, err := superblock.Read(fsys.dev)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +272,7 @@ func TestPowerCutDuringCopyOnWrite(t *testing.T) {
 			setxattr(t, f, "user.snapshot", "s1")
 		},
 		op: func(fsys *FS, _ *power) {
-			f.Write(context.Background(), nil, update, BlockSize+4096)
+			_, _ = f.Write(context.Background(), nil, update, BlockSize+4096)
 		},
 		check: func(t *testing.T, fsys *FS) {
 			expectEachBlock(t, lookupFile(t, fsys, "f"), old, updated)
@@ -293,7 +297,7 @@ func TestPowerCutDuringSnapshotCreate(t *testing.T) {
 			writeAt(t, f, current[:BlockSize], 0)
 		},
 		op: func(fsys *FS, _ *power) {
-			f.Setxattr(context.Background(), "user.snapshot", []byte("s1"), 0)
+			_ = f.Setxattr(context.Background(), "user.snapshot", []byte("s1"), 0)
 		},
 		check: func(t *testing.T, fsys *FS) {
 			checkFile(t, lookupFile(t, fsys, "f"), current)
@@ -355,7 +359,7 @@ func TestPowerCutDuringUnlinkThenTrimAfterReuse(t *testing.T) {
 			writeAt(t, createFile(t, fsys, "old"), doomed, 0)
 		},
 		op: func(fsys *FS, _ *power) {
-			fsys.Unlink(context.Background(), "old")
+			_ = fsys.Unlink(context.Background(), "old")
 		},
 		afterMount: func(t *testing.T, fsys *FS) {
 			writeAt(t, createFile(t, fsys, "new"), fresh, 0)
@@ -381,7 +385,7 @@ func TestPowerCutDuringClone(t *testing.T) {
 			writeAt(t, f, data, 0)
 		},
 		op: func(fsys *FS, _ *power) {
-			f.Setxattr(context.Background(), "user.clone", []byte("/c"), 0)
+			_ = f.Setxattr(context.Background(), "user.clone", []byte("/c"), 0)
 		},
 		check: func(t *testing.T, fsys *FS) {
 			checkFile(t, lookupFile(t, fsys, "f"), data)
