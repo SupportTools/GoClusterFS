@@ -83,6 +83,7 @@ func main() {
 		debug     = flag.Bool("debug", false, "Print [DEBUG] log lines")
 		fuseDebug = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
 		showVer   = flag.Bool("version", false, "Print version and exit")
+		preflight = flag.Bool("preflight", false, "Check that this host can mount -device on -mount: FUSE, the device, the mount point and the ports. Prints PASS, WARN or FAIL with a fix for each, changes nothing, and exits 8 if a check fails")
 
 		// Cache configuration
 		cacheStrict   = flag.Bool("cache-strict", false, "Check every cached inode against the device before using it; slower, but other nodes' changes show at once")
@@ -199,6 +200,14 @@ func main() {
 	cacheCfg.Network = networkCfg
 	if err := cacheCfg.Validate(); err != nil {
 		log.Fatalf("Invalid cache flags: %v", err)
+	}
+	if *preflight {
+		cfg := defaultPreflightConfig()
+		cfg.device, cfg.mountPoint, cfg.format, cfg.network = *devicePath, *mountPoint, *format, networkCfg
+		if *apiEnabled {
+			cfg.apiAddr = *apiAddr
+		}
+		os.Exit(runPreflight(os.Stdout, cfg))
 	}
 	broadcastFailed := func(err error) {
 		failf("Failed to start cache broadcast: %v. Free UDP ports %d and %d, choose others with -mcast-port and -unicast-port, or pass -broadcast=false", err, *multicastPort, *unicastPort)
