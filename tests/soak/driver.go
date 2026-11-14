@@ -164,8 +164,11 @@ func (d *driver) upNodes() []*node {
 // after the documented coherence window is logged for review: during a fault, reads can wait out the failure detection.
 func (d *driver) converge(what string, check func() error) error {
 	start := time.Now()
+	stale, longestCall := 0, time.Duration(0)
 	for {
+		callStart := time.Now()
 		err := check()
+		longestCall = max(longestCall, time.Since(callStart))
 		if err == nil {
 			took := time.Since(start)
 			if ms := took.Milliseconds(); ms > d.slowestMs.Load() {
@@ -173,10 +176,12 @@ func (d *driver) converge(what string, check func() error) error {
 			}
 			if took > d.cfg.coherence {
 				d.slow.Add(1)
-				d.logRecord(record{Type: "slow", Detail: fmt.Sprintf("%s took %s", what, took.Round(time.Millisecond))})
+				d.logRecord(record{Type: "slow", Detail: fmt.Sprintf("%s took %s: %d stale answers, longest call %s",
+					what, took.Round(time.Millisecond), stale, longestCall.Round(time.Millisecond))})
 			}
 			return nil
 		}
+		stale++
 		if errors.Is(err, errAgentGone) || time.Since(start) > d.cfg.window || d.ctx.Err() != nil {
 			return fmt.Errorf("%v (still after %s)", err, time.Since(start).Round(time.Millisecond))
 		}
