@@ -110,3 +110,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Two nodes replaying dead nodes whose locks shared a record waited on each other until the lock timeout.
 - A failed journal replay of a dead node still freed that node's locks, so other nodes could use half-replayed metadata until the retry a minute later. The locks now stay held until a replay succeeds.
 - A mount whose own journal replay gave up waiting for another node's lock exited at once. It now retries with backoff and logs the holder; any other replay failure still fails the mount.
+- Replaying a failed node's journal could overwrite an inode change that the replaying node made after the replay read the inode, such as a `chmod` or an append. The replay now writes the inode only if nothing wrote it since the read, and otherwise skips that record.
