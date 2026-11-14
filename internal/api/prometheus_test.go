@@ -110,6 +110,10 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 			HintCacheHitRate: 0.9,
 			ActiveLocks:      10,
 			PendingLocks:     2,
+			Types: []LockTypeStats{
+				{Type: "bitmap", Acquires: 600, Blocked: 230, WaitSeconds: 16.5},
+				{Type: "refcount", Acquires: 40},
+			},
 		},
 		sfb: &SFBStatsResponse{
 			TotalBlocks:        1000,
@@ -194,6 +198,11 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 		"goclusterfs_lock_hint_cache_hit_rate 0.9",
 		"goclusterfs_lock_active_locks 10",
 		"goclusterfs_lock_pending_locks 2",
+		`goclusterfs_lock_acquires_total{type="bitmap"} 600`,
+		`goclusterfs_lock_blocked_total{type="bitmap"} 230`,
+		`goclusterfs_lock_wait_seconds_total{type="bitmap"} 16.5`,
+		`goclusterfs_lock_acquires_total{type="refcount"} 40`,
+		`goclusterfs_lock_blocked_total{type="refcount"} 0`,
 
 		// SFB metrics
 		"goclusterfs_sfb_total_blocks 1000",

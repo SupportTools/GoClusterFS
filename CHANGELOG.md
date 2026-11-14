@@ -36,6 +36,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Experimental: file snapshots and writable clones through `user.snapshot*` and `user.clone` extended attributes. Read a snapshot by cloning it with `user.snapshot.clone`.
 - `goclusterfs-fsck` consistency checker. `-repair` rebuilds block refcounts from every file, snapshot and clone. It refuses to run while the device is in use, and `-repair -dry-run` shows what it would change. Exit codes follow fsck(8): `0` no errors, `1` repaired, `4` errors remain, `8` failed or refused, `16` usage error.
 - Benchmark suite (`tests/benchmark`) and an `internal/metrics` package.
+- `/metrics` and `/api/v1/stats/lock` report, per lock type, the acquires served, the acquires that found the lock taken, and how long those waited (`goclusterfs_lock_acquires_total`, `goclusterfs_lock_blocked_total`, `goclusterfs_lock_wait_seconds_total`).
 - Go, Docker, and QEMU VM test suites, with `tests/test-manifest.yaml` and `make test-parity` to track coverage across them.
 - Fuzz tests for the on-disk decoders (superblock, inode, snapshot descriptor, journal superblock and records) and the journal recovery scan.
 - CI gates: unit tests with the race detector and coverage, golangci-lint (`make lint`), govulncheck (`make vuln`), and a `go mod tidy` check.

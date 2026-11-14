@@ -2233,6 +2233,13 @@ scenarios:
     environments:
       go: internal/lock/type_records_test.go::TestLockTypesHaveTheirOwnRecords
 
+  - id: lock-stats-blocked-acquires
+    name: Lock stats count blocked acquires per type
+    description: An acquire that waits for another node's hold counts as blocked for its lock type with at least the time it waited; one that finds the lock free counts only as an acquire. /metrics exports these as goclusterfs_lock_acquires_total, blocked_total and wait_seconds_total by type
+    priority: go_only
+    environments:
+      go: internal/lock/lock_test.go::TestStatsCountBlockedAcquires
+
   - id: locks-no-wait-other-types
     name: Locks never wait on records of another type
     description: With one node holding a lock in every inode record, another node takes locks of every other type without waiting
