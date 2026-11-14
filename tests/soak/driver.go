@@ -244,13 +244,20 @@ func (d *driver) compareSnaps(n *node, p string) error {
 	return nil
 }
 
+// compareDir checks node n lists dir as the model does. A lane may have removed dir since the caller listed it.
 func (d *driver) compareDir(n *node, dir string) error {
 	d.model.mu.Lock()
-	want := d.model.listing(dir)
+	exists, want := d.model.Dirs[dir], d.model.listing(dir)
 	d.model.mu.Unlock()
 	resp, err := d.call(n, request{Op: "list", Path: dir})
 	if err != nil {
 		return err
+	}
+	if !exists {
+		if resp.Errno != int(syscall.ENOENT) {
+			return fmt.Errorf("%s: list errno %d, want ENOENT", dir, resp.Errno)
+		}
+		return nil
 	}
 	got := slices.Clone(resp.Names)
 	sort.Strings(got)
