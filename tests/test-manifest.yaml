@@ -3886,3 +3886,10 @@ scenarios:
     priority: go_only
     environments:
       go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightNamesAFixForEachFailure
+
+  - id: cli-shell-completions
+    name: Shell completions for the CLIs
+    description: goclusterfs-mount and goclusterfs-fsck print bash and zsh completion scripts built from their own flags; bash completes flag names, file and directory values, and fsck's device argument
+    priority: go_only
+    environments:
+      go: internal/cli/completion_test.go::TestBashCompletion

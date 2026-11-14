@@ -55,6 +55,7 @@ func main() {
 		summaryOnly  = flag.Bool("summary", false, "Only print final summary")
 		showProblems = flag.Bool("show-problems", true, "List each problem found, not only the counts")
 		showVersion  = flag.Bool("version", false, "Print version and exit")
+		completion   = flag.String("completion", "", "Print a bash or zsh completion script for goclusterfs-fsck and exit")
 		debug        = flag.Bool("debug", false, "Print [DEBUG] log lines")
 
 		listSlots      = flag.Bool("list-slots", false, "List node registry slots with their lease and journal, then exit")
@@ -90,6 +91,13 @@ func main() {
 	if *showVersion {
 		fmt.Println("goclusterfs-fsck", version.String())
 		os.Exit(0)
+	}
+	if *completion != "" {
+		if err := cli.WriteCompletion(os.Stdout, *completion, "goclusterfs-fsck", flag.CommandLine, cli.CompletionSpec{Positional: cli.CompleteFile}); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: -completion: %v\n", err)
+			os.Exit(cli.ExitUsage)
+		}
+		os.Exit(cli.ExitOK)
 	}
 
 	// Handle list-phases request
