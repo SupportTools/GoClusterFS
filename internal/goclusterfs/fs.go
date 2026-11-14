@@ -2776,7 +2776,7 @@ func (f *FS) freeSFBSlot(ctx context.Context, packed uint64) {
 		return
 	}
 	h, err := sfb.DeserializeHeader(sector)
-	if err != nil || !bytes.Equal(h.Serialize(), sector[:sfb.HeaderSize]) || slot >= h.SlotCount {
+	if err != nil || !bytes.Equal(h.Serialize(), sector[:sfb.HeaderSize]) || slot >= min(h.SlotCount, uint16(8*len(h.Bitmap))) {
 		log.Printf("[WARN] Free SFB slot %d:%d: no valid container header, leaking the slot", container, slot)
 		return
 	}
