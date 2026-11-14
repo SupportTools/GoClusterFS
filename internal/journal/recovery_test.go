@@ -423,7 +423,7 @@ func TestScanAndRecoverNeverInitialized(t *testing.T) {
 	dev, cleanup := createTestDevice(t, DefaultJournalSlotSize)
 	defer cleanup()
 
-	result, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, nil)
+	result, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, nil, nil)
 	if result != nil || err != nil {
 		t.Fatalf("ScanAndRecover on a zeroed region = %+v, %v; want nil, nil", result, err)
 	}
@@ -455,7 +455,7 @@ func TestScanAndRecoverDamagedHeader(t *testing.T) {
 			_, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, func(*RecoveredTxn) error {
 				replayed = true
 				return nil
-			})
+			}, nil)
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("ScanAndRecover error = %v, want %v", err, tt.want)
 			}

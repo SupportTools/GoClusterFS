@@ -85,7 +85,7 @@ func TestReleaseSlot(t *testing.T) {
 	if got, err := replacement.Register(ctx, "replacement"); err != nil || got != slot {
 		t.Fatalf("a new node registered in slot %d (%v), want released slot %d", got, err, slot)
 	}
-	if result, err := journal.ScanAndRecover(dev, uint64(journalAt), sb.JournalSlotSize(), nil); result != nil || err != nil {
+	if result, err := journal.ScanAndRecover(dev, uint64(journalAt), sb.JournalSlotSize(), nil, nil); result != nil || err != nil {
 		t.Errorf("mount recovery of the released journal = %+v, %v; want nothing to recover", result, err)
 	}
 }

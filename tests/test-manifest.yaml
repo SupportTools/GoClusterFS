@@ -2973,6 +2973,69 @@ scenarios:
     environments:
       go: internal/journal/journal_fuzz_test.go::FuzzJournalScan
 
+  - id: reserve-unused-later-uses
+    name: Unused reserved blocks exclude later uses
+    description: Blocks a pending reserve record holds count as unused unless a later record maps or uses them, completed or not; a use logged before the record does not count
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestReservedUnusedSubtractsLaterUses
+
+  - id: reserve-unused-completed
+    name: Completed reserve records free nothing
+    description: A completed reserve record frees nothing, and after a reserve is renewed only the renewed record's blocks count
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestReservedUnusedIgnoresCompletedReserves
+
+  - id: reserve-used-then-freed
+    name: Replay keeps a reserved block that was used and freed
+    description: A reserved block a write used and a truncate freed, which another node may hold since, is not freed by replay
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestReservedUnusedKeepsUsedThenFreedBlock
+
+  - id: reserve-released-once
+    name: Replay frees unused reserved blocks once
+    description: Recovery passes the unused reserved blocks to release once, after the transactions, then resets the journal
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestRecoverReleasingFreesUnusedReservedOnce
+
+  - id: reserve-complete-stops-replay
+    name: Completing reserves in a crashed journal
+    description: Completing a crashed node's reserve intents in its journal stops replay from freeing their blocks
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteReservesStopsReplayFreeingThem
+
+  - id: block-runs-round-trip
+    name: Block runs round trip
+    description: Reserve and use records store blocks as runs and decode back to the same blocks
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestBlockRunsRoundTrip
+
+  - id: fsck-crashed-reserve
+    name: fsck reports a crashed node's reserve
+    description: fsck reports the blocks a crashed node reserved and never used as reserved, not as leaks, and exits clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_crash_test.go::TestFsckReportsCrashedNodesReserve
+
+  - id: replay-frees-crashed-reserve
+    name: Replay frees a crashed node's unused reserve
+    description: Replaying a crashed node's journal frees the reserved blocks it never used and keeps the one a file maps; fsck is then clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_crash_test.go::TestReplayFreesCrashedNodesUnusedReserve
+
+  - id: fsck-repair-crashed-reserve
+    name: fsck repair frees a crashed reserve once
+    description: fsck -repair -force frees a crashed node's unused reserve and marks it done in the node's journal, so a later replay leaves the blocks alone after another node allocated them
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_crash_test.go::TestFsckRepairFreesCrashedNodesReserveOnce
+
   # ===========================================================================
   # DISTRIBUTED LOCK SAFETY (internal/lock)
   # Two or three lock managers share one device to act as separate nodes.

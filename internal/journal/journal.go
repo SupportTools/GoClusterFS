@@ -624,7 +624,7 @@ func (j *Journal) Region() *Region {
 // - nil, nil if the journal was never initialized or is clean
 // - result, nil if recovery succeeded
 // - nil, error if the journal header is damaged or recovery failed
-func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handler RecoveryHandler) (*ScanRecoveryResult, error) {
+func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handler RecoveryHandler, release func([]uint64) error) (*ScanRecoveryResult, error) {
 	region, err := OpenRegionForRecovery(dev, regionOffset, regionSize)
 	if errors.Is(err, ErrJournalUninitialized) {
 		return nil, nil
@@ -647,7 +647,7 @@ func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handle
 	}
 
 	// Perform recovery
-	stats, err := Recover(region, handler)
+	stats, err := RecoverReleasing(region, handler, nil, release)
 	if err != nil {
 		return nil, fmt.Errorf("journal recovery failed: %w", err)
 	}

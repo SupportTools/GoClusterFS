@@ -58,7 +58,7 @@ func recoverWithin(t *testing.T, d time.Duration, dev *storage.Device, handler j
 	}
 	done := make(chan outcome, 1)
 	go func() {
-		result, err := recoverOwnJournal(dev, 0, journal.DefaultJournalSlotSize, handler, 5)
+		result, err := recoverOwnJournal(dev, 0, journal.DefaultJournalSlotSize, handler, nil, 5)
 		done <- outcome{result, err}
 	}()
 	select {

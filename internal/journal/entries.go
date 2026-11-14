@@ -19,8 +19,10 @@ const (
 	TxnOpDirRename      TxnOpType = 0x0202
 
 	// Block Allocation (0x03xx)
-	TxnOpBlockAlloc TxnOpType = 0x0300
-	TxnOpBlockFree  TxnOpType = 0x0301
+	TxnOpBlockAlloc   TxnOpType = 0x0300
+	TxnOpBlockFree    TxnOpType = 0x0301
+	TxnOpBlockReserve TxnOpType = 0x0302
+	TxnOpBlockUse     TxnOpType = 0x0303
 
 	// Sub-Block/Small File Allocation (0x04xx)
 	TxnOpSFBAlloc   TxnOpType = 0x0400
@@ -58,6 +60,10 @@ func (op TxnOpType) String() string {
 		return "BlockAlloc"
 	case TxnOpBlockFree:
 		return "BlockFree"
+	case TxnOpBlockReserve:
+		return "BlockReserve"
+	case TxnOpBlockUse:
+		return "BlockUse"
 	case TxnOpSFBAlloc:
 		return "SFBAlloc"
 	case TxnOpSFBFree:
@@ -809,6 +815,19 @@ func (txn *Transaction) LogDirRename(payload *DirRenamePayload) error {
 	return txn.addEntry(TxnOpDirRename, payload.Serialize())
 }
 
+// LogBlockReserve records blocks a node marked allocated to hand out later
+// without the bitmap lock. Until the transaction's intent completes, replay
+// frees the ones no later record used.
+func (txn *Transaction) LogBlockReserve(blocks []uint64) error {
+	return txn.addEntry(TxnOpBlockReserve, serializeBlockRuns(blocks))
+}
+
+// LogBlockUse records reserved blocks an inode may map before the transaction
+// that logs their extents commits, so replay does not free them.
+func (txn *Transaction) LogBlockUse(blocks []uint64) error {
+	return txn.addEntry(TxnOpBlockUse, serializeBlockRuns(blocks))
+}
+
 // LogBlockAlloc adds a block allocation to the transaction.
 func (txn *Transaction) LogBlockAlloc(payload *BlockAllocPayload) error {
 	return txn.addEntry(TxnOpBlockAlloc, payload.Serialize())
@@ -862,4 +881,43 @@ func (txn *Transaction) LogSFBFree(payload *SFBFreePayload) error {
 // LogSFBMigrate adds an SFB to extent migration to the transaction.
 func (txn *Transaction) LogSFBMigrate(payload *SFBMigratePayload) error {
 	return txn.addEntry(TxnOpSFBMigrate, payload.Serialize())
+}
+
+// serializeBlockRuns stores blocks as runs of consecutive numbers: a run count,
+// then a start block and length per run.
+func serializeBlockRuns(blocks []uint64) []byte {
+	var runs [][2]uint64
+	for _, b := range blocks {
+		if n := len(runs); n > 0 && runs[n-1][0]+runs[n-1][1] == b {
+			runs[n-1][1]++
+			continue
+		}
+		runs = append(runs, [2]uint64{b, 1})
+	}
+	buf := make([]byte, 4+12*len(runs))
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(runs)))
+	for i, r := range runs {
+		binary.LittleEndian.PutUint64(buf[4+12*i:], r[0])
+		binary.LittleEndian.PutUint32(buf[12+12*i:], uint32(r[1]))
+	}
+	return buf
+}
+
+// DeserializeBlockRuns parses the blocks of a BlockReserve or BlockUse entry.
+func DeserializeBlockRuns(buf []byte) ([]uint64, error) {
+	if len(buf) < 4 {
+		return nil, ErrTxnTooSmall
+	}
+	n := int(binary.LittleEndian.Uint32(buf[0:4]))
+	if len(buf) < 4+12*n {
+		return nil, ErrTxnTooSmall
+	}
+	var blocks []uint64
+	for i := range n {
+		start := binary.LittleEndian.Uint64(buf[4+12*i:])
+		for j := range uint64(binary.LittleEndian.Uint32(buf[12+12*i:])) {
+			blocks = append(blocks, start+j)
+		}
+	}
+	return blocks, nil
 }
