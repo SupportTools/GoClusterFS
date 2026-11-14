@@ -3509,6 +3509,20 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
 
+  - id: lock-higher-slot-not-starved
+    name: Higher slot gets a lock a lower slot keeps claiming again
+    description: A lower slot releases a lock and claims it again as soon as its cached hold expires; a higher slot waiting for it still gets it within 2 seconds each time
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestHigherSlotGetsLockFromLowerSlotThatKeepsReclaimingIt
+
+  - id: lock-yield-only-to-live-waiters
+    name: Holder yields only to a live node's waiting mark
+    description: A holder ends its turn early for a waiting mark whose node is alive in the registry, or is fresh without a registry; it ignores marks of failing, replayed or replaced nodes and stale marks
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestHolderYieldsOnlyToLiveWaiters
+
   - id: lock-concurrent-dir-reads-create
     name: Concurrent directory reads do not delay create or unlink
     description: Two nodes taking a shared claim on one directory at once leave no reader count behind, so a create or unlink there finishes within 2s
