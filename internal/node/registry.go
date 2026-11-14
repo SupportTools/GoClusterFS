@@ -308,6 +308,11 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	if i, err := r.claimFirst(append(r.awaitOtherNamespaceSlots(), allSlots()...), ownFailed); i >= 0 || err != nil {
 		return i, err
 	}
+	// A slot under this hostname from an earlier boot is likely this host's mount before a crash; taking it back
+	// replays its journal before this mount serves. Another host may share the name, so it is watched first.
+	if i, err := r.claimWatched(r.awaitSilentSlots(r.earlierBootSlots(), silentSlotWatch)); i >= 0 || err != nil {
+		return i, err
+	}
 	if i, err := r.claimFirst(allSlots(), empty); i >= 0 || err != nil {
 		return i, err
 	}
@@ -335,6 +340,20 @@ func (r *Registry) PreferSlot(slot int) {
 // takes it, if its heartbeat never changed: past HeartbeatTimeout, so a node
 // that only stalled checks its slot before its next write. Tests shorten it.
 var silentSlotWatch = HeartbeatTimeout + 2*HeartbeatInterval
+
+// earlierBootSlots returns the slots registered under this node's hostname in
+// another kernel boot whose heartbeat looks old by this node's clock.
+func (r *Registry) earlierBootSlots() []int {
+	var slots []int
+	for i := 0; i < MaxNodes; i++ {
+		_, slot, err := r.readSlotRaw(i)
+		if err == nil && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) && !r.sameHost(slot) &&
+			slot.Host() == r.hostname && heartbeatOlderThan(slot, HeartbeatTimeout) {
+			slots = append(slots, i)
+		}
+	}
+	return slots
+}
 
 // otherHostSlots returns the slots of other hosts' nodes whose heartbeat looks old by this node's clock.
 func (r *Registry) otherHostSlots() []int {

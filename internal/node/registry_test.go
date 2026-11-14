@@ -1311,6 +1311,27 @@ func TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne(t *testing.T) {
 	}
 }
 
+// A host that rebooted after a crash takes back the slot it held under the same
+// hostname once the slot proves silent, so its mount replays that journal.
+func TestRegisterTakesBackSlotOfItsEarlierBoot(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	earlier := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 3,
+		HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix(), BootID: [16]byte{0xEE}}
+	copy(earlier.Hostname[:], "node")
+	if err := reg.writeSlot(0, earlier); err != nil {
+		t.Fatal(err)
+	}
+	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 0 {
+		t.Fatalf("Register = %d, %v; want slot 0, held by this hostname before a reboot", slot, err)
+	}
+	if owner, ok := reg.PreviousOwner(); !ok || owner != earlier.UUID {
+		t.Errorf("PreviousOwner = %x, %v; want the earlier boot's node %x", owner, ok, earlier.UUID)
+	}
+}
+
 func TestRegisterTakesAnotherHostsSilentSlotWhenNamedOrNoneIsEmpty(t *testing.T) {
 	for _, named := range []bool{true, false} {
 		t.Run(map[bool]string{true: "named", false: "none empty"}[named], func(t *testing.T) {

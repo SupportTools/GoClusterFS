@@ -763,6 +763,14 @@ scenarios:
     environments:
       go: internal/node/registry_test.go::TestRegisterTakesNamedSlotUnderRecoveryOnlyOnceItsLeaseLapses
 
+  - id: register-takes-back-earlier-boot-slot
+    name: A rebooted host takes back its slot
+    description: A mount takes back the slot its hostname held in an earlier kernel boot, once the slot's heartbeat proves silent, before any empty slot, so it replays that journal before serving
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesBackSlotOfItsEarlierBoot
+      vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
+
   - id: register-leaves-watched-slot-that-changes
     name: Register leaves a watched slot that changed
     description: A slot Register watched stay silent is not taken if a peer marks it dead or its node beats again before the claim
