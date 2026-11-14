@@ -3866,6 +3866,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
 
+  - id: snapshot-unreadable-sector-not-rewritten
+    name: An unreadable snapshot registry sector is not rewritten
+    description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it

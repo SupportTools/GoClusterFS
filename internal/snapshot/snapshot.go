@@ -722,21 +722,25 @@ type ScanStats struct {
 
 // freeSlotAndMaxID returns a free slot, preferring sectors this node owns, and
 // the highest snapshot ID on disk, which includes snapshots other nodes
-// created since this node's scan. Unreadable slots count as free, as they did
-// before. It refuses a name another snapshot already has: names are global,
-// and delete and clone look them up with GetByName.
+// created since this node's scan. It fails if a sector cannot be read: its
+// slots may hold snapshots, and their IDs may be the highest. It refuses a name
+// another snapshot already has: names are global, and delete and clone look
+// them up with GetByName.
 func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	free, owned := r.maxDescriptors, r.maxDescriptors
 	var maxID uint64
 	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
-		data, readErr := r.readSector(sector)
+		data, err := r.readSector(sector)
+		if err != nil {
+			return 0, 0, fmt.Errorf("snapshot registry sector %d: %w", sector, err)
+		}
 		for i := uint64(0); i < DescriptorsPerSector; i++ {
 			slot := sector*DescriptorsPerSector + i
 			if slot >= r.maxDescriptors {
 				break
 			}
 			desc, err := decodeDescriptor(data, i)
-			if readErr != nil || err != nil || desc.IsFree() {
+			if err != nil || desc.IsFree() {
 				free = min(free, slot)
 				if sector%node.MaxNodes == uint64(r.nodeSlot) {
 					owned = min(owned, slot)
@@ -790,8 +794,7 @@ func (r *Registry) writeDescriptor(slot uint64, desc *Descriptor) error {
 
 	sectorData, err := r.readSector(sectorIdx)
 	if err != nil {
-		// Initialize sector if it can't be read
-		sectorData = make([]byte, BytesPerSector)
+		return fmt.Errorf("snapshot registry sector %d: %w", sectorIdx, err)
 	}
 
 	encodeDescriptor(sectorData, descOffset, desc)
