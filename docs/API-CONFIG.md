@@ -37,6 +37,7 @@ These are the `goclusterfs-mount` flags:
 | `-debug` | bool | `false` | Print `[DEBUG]` log lines |
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
+| `-preflight` | bool | `false` | Check FUSE, the device (O_DIRECT, filesystem), the mount point, the broadcast ports and the API address; print `PASS`, `WARN` or `FAIL` with a fix for each, change nothing, and exit 8 if a check fails |
 
 ### Cache Flags
 

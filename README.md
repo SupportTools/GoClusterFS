@@ -92,6 +92,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-debug` | `false` | Print `[DEBUG]` log lines: file operations, locks, allocation |
 | `-fuse-debug` | `false` | Log every FUSE request and reply |
 | `-version` | `false` | Print the version and exit |
+| `-preflight` | `false` | Check that this host can mount `-device` on `-mount`, print a fix for each problem, and exit without changing anything |
 
 ### Cache Options
 
