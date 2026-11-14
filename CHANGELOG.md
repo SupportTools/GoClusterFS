@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
 - Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
 - Snapshots made by older versions captured no data. They still list and delete, but cloning one fails with `ENOTSUP`.
+- Snapshots now record the birth generation of the file they were taken of, so a later file that reuses the inode number cannot list, clone or delete them. Snapshots older versions made do not record it, so after the upgrade they are orphans: `getfattr -n user.snapshots` no longer lists them, `GET /api/v1/snapshots` lists them with `orphan: true`, and `DELETE /api/v1/snapshots/<name>` without `path` deletes them. Older binaries keep the birth generation in inode bytes 196–203 only while they do not rewrite the inode, so upgrade all nodes together.
 - `-skip-recovery` now takes the slot number from the recovery error, as `-skip-recovery=N`, and discards a journal only when the mount takes slot N. A bare `-skip-recovery` is a usage error.
 
 ### Added

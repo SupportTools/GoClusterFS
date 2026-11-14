@@ -124,7 +124,8 @@ type Inode struct {
 	ExtentCount      uint64          // Total extent count
 	ExtentDepth      uint32          // Extent tree depth (0 = inline only)
 	ExtentTreeGen    uint64          // Commit generation of the tree root; its low bit picks the root's active half
-	Reserved         [56]byte        // Padding to 252 bytes
+	BirthGeneration  uint64          // MetaGeneration when this file took the slot; 0 in inodes older versions wrote
+	Reserved         [48]byte        // Padding to 252 bytes
 	Checksum         uint32          // CRC32C checksum
 
 	// PendingTree holds extent-tree changes owned by package extent that are
@@ -504,6 +505,7 @@ func (t *Table) newInodeInSlot(num uint32, free *Inode) *Inode {
 		LinkCount:        1,
 		DataGeneration:   free.DataGeneration + 1,
 		MetaGeneration:   free.MetaGeneration + 1,
+		BirthGeneration:  free.MetaGeneration + 1,
 		LastModifierUUID: t.nodeUUID,
 	}
 }
@@ -838,8 +840,9 @@ func serializeInode(inode *Inode) []byte {
 	binary.LittleEndian.PutUint64(buf[176:184], inode.ExtentCount)
 	binary.LittleEndian.PutUint32(buf[184:188], inode.ExtentDepth)
 	binary.LittleEndian.PutUint64(buf[188:196], inode.ExtentTreeGen)
+	binary.LittleEndian.PutUint64(buf[196:204], inode.BirthGeneration)
 
-	// Reserved bytes 196-251 (56 bytes) - already zero
+	// Reserved bytes 204-251 (48 bytes) - already zero
 
 	// Compute checksum (bytes 0-251)
 	checksum := storage.CRC32C(buf[:InodeSize-4])
@@ -889,6 +892,7 @@ func deserializeInode(buf []byte) (*Inode, error) {
 		ExtentCount:     binary.LittleEndian.Uint64(buf[176:184]),
 		ExtentDepth:     binary.LittleEndian.Uint32(buf[184:188]),
 		ExtentTreeGen:   binary.LittleEndian.Uint64(buf[188:196]),
+		BirthGeneration: binary.LittleEndian.Uint64(buf[196:204]),
 		Checksum:        stored,
 	}
 

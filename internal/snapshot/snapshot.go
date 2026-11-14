@@ -113,7 +113,26 @@ const (
 	// inode that maps the blocks the snapshot captured. Descriptors written by
 	// older versions lack it and hold no data.
 	FlagHasData Flags = 1 << 4
+
+	// FlagHasTargetBirth marks a descriptor that records its file's birth generation, which tells the file apart from
+	// a later file in the same inode slot. Without it the snapshot cannot prove which file it belongs to.
+	FlagHasTargetBirth Flags = 1 << 5
 )
+
+// birthMask keeps the 48 bits of a birth generation a descriptor has room for.
+const birthMask = 1<<48 - 1
+
+// Target names the file a snapshot was taken of: its inode slot and the birth generation of the file in it.
+type Target struct {
+	Inode uint32
+	Birth uint64
+}
+
+// Entry is a snapshot and whether the file it was taken of is gone.
+type Entry struct {
+	*Descriptor
+	Orphan bool
+}
 
 // Errors
 var (
@@ -142,9 +161,9 @@ var (
 //	20      4     TargetInode (file/directory being snapshotted)
 //	24      1     State (Creating/Active/Deleting)
 //	25      1     Flags (ReadOnly/Writable/Hidden)
-//	26      2     Reserved1
+//	26      2     TargetBirth bits 32-47 (only with FlagHasTargetBirth)
 //	28      4     DataInode (hidden inode with the captured extents; only with FlagHasData)
-//	32      4     Reserved2 (older versions wrote an unused extent tree root at 28-35)
+//	32      4     TargetBirth bits 0-31 (only with FlagHasTargetBirth; older versions wrote an unused extent tree root at 28-35)
 //	36      8     TotalBlocks (block count at snapshot time)
 //	44      8     TotalSize (file size at snapshot time)
 //	52      8     CreateTime (Unix timestamp)
@@ -159,9 +178,8 @@ type Descriptor struct {
 	TargetInode   uint32                   // Inode number of snapshotted file
 	State         State                    // Current state
 	Flags         Flags                    // Snapshot flags
-	Reserved1     uint16                   // Alignment padding
 	DataInode     uint32                   // Hidden inode holding the captured extents
-	Reserved2     uint32                   // Reserved
+	TargetBirth   uint64                   // Birth generation of the snapshotted file, 48 bits
 	TotalBlocks   uint64                   // Number of blocks at snapshot time
 	TotalSize     uint64                   // File size at snapshot time
 	CreateTime    int64                    // Creation timestamp
@@ -179,6 +197,12 @@ func (d *Descriptor) IsValid() bool {
 // HasData reports whether the snapshot captured data that can be cloned.
 func (d *Descriptor) HasData() bool {
 	return d.Flags&FlagHasData != 0 && d.DataInode != 0
+}
+
+// BelongsTo reports whether the snapshot was taken of target, the file now in that inode slot.
+func (d *Descriptor) BelongsTo(target Target) bool {
+	return d.Flags&FlagHasTargetBirth != 0 && target.Birth != 0 &&
+		d.TargetInode == target.Inode && d.TargetBirth == target.Birth&birthMask
 }
 
 // IsFree returns true if this slot is free (can be reused).
@@ -299,6 +323,13 @@ func (r *Registry) unlock() {
 func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 	parentID uint64, dataInode uint32, totalBlocks uint64,
 	totalSize uint64, flags Flags) (*Descriptor, error) {
+	return r.CreateFor(ctx, name, Target{Inode: targetInode}, parentID, dataInode, totalBlocks, totalSize, flags)
+}
+
+// CreateFor is Create for a target whose birth generation is known, so the snapshot stays with that file.
+func (r *Registry) CreateFor(ctx context.Context, name string, target Target,
+	parentID uint64, dataInode uint32, totalBlocks uint64,
+	totalSize uint64, flags Flags) (*Descriptor, error) {
 
 	if len(name) >= MaxSnapshotNameLen {
 		return nil, ErrNameTooLong
@@ -327,11 +358,15 @@ func (r *Registry) Create(ctx context.Context, name string, targetInode uint32,
 	if dataInode != 0 {
 		flags |= FlagHasData
 	}
+	if target.Birth != 0 {
+		flags |= FlagHasTargetBirth
+	}
 	desc := &Descriptor{
 		Magic:       DescriptorMagic,
 		SnapshotID:  snapshotID,
 		ParentID:    parentID,
-		TargetInode: targetInode,
+		TargetInode: target.Inode,
+		TargetBirth: target.Birth & birthMask,
 		State:       StateCreating, // Will be marked Active after refcount job
 		Flags:       flags | FlagReadOnly,
 		DataInode:   dataInode,
@@ -412,6 +447,20 @@ func (r *Registry) ListForInode(ctx context.Context, inodeNum uint32) ([]*Descri
 		}
 	}
 
+	return snapshots, nil
+}
+
+// ListForTarget returns the snapshots taken of target.
+func (r *Registry) ListForTarget(ctx context.Context, target Target) ([]*Descriptor, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var snapshots []*Descriptor
+	for _, desc := range r.descriptors() {
+		if desc.IsValid() && desc.BelongsTo(target) {
+			snapshots = append(snapshots, desc)
+		}
+	}
 	return snapshots, nil
 }
 
@@ -844,9 +893,7 @@ func decodeDescriptor(sectorData []byte, descIdx uint64) (*Descriptor, error) {
 		TargetInode:   binary.LittleEndian.Uint32(data[20:24]),
 		State:         State(data[24]),
 		Flags:         Flags(data[25]),
-		Reserved1:     binary.LittleEndian.Uint16(data[26:28]),
 		DataInode:     binary.LittleEndian.Uint32(data[28:32]),
-		Reserved2:     binary.LittleEndian.Uint32(data[32:36]),
 		TotalBlocks:   binary.LittleEndian.Uint64(data[36:44]),
 		TotalSize:     binary.LittleEndian.Uint64(data[44:52]),
 		CreateTime:    int64(binary.LittleEndian.Uint64(data[52:60])),
@@ -855,6 +902,9 @@ func decodeDescriptor(sectorData []byte, descIdx uint64) (*Descriptor, error) {
 		Checksum:      stored,
 	}
 	copy(desc.Name[:], data[76:124])
+	if desc.Flags&FlagHasTargetBirth != 0 {
+		desc.TargetBirth = uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36]))
+	}
 
 	return desc, nil
 }
@@ -880,9 +930,9 @@ func encodeDescriptor(sectorData []byte, descIdx uint64, desc *Descriptor) {
 	binary.LittleEndian.PutUint32(data[20:24], desc.TargetInode)
 	data[24] = byte(desc.State)
 	data[25] = byte(desc.Flags)
-	binary.LittleEndian.PutUint16(data[26:28], desc.Reserved1)
+	binary.LittleEndian.PutUint16(data[26:28], uint16(desc.TargetBirth>>32))
 	binary.LittleEndian.PutUint32(data[28:32], desc.DataInode)
-	binary.LittleEndian.PutUint32(data[32:36], desc.Reserved2)
+	binary.LittleEndian.PutUint32(data[32:36], uint32(desc.TargetBirth))
 	binary.LittleEndian.PutUint64(data[36:44], desc.TotalBlocks)
 	binary.LittleEndian.PutUint64(data[44:52], desc.TotalSize)
 	binary.LittleEndian.PutUint64(data[52:60], uint64(desc.CreateTime))

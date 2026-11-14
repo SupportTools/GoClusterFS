@@ -26,6 +26,8 @@ const (
 
 	// SnapshotFlagHasData marks descriptors whose DataInode holds the captured extents.
 	SnapshotFlagHasData uint8 = 1 << 4
+	// SnapshotFlagHasTargetBirth marks descriptors that record the birth generation of the file they were taken of.
+	SnapshotFlagHasTargetBirth uint8 = 1 << 5
 
 	// MaxSnapshotNameLen is the maximum length of a snapshot name.
 	MaxSnapshotNameLen = 48
@@ -53,6 +55,7 @@ type SnapshotDescriptor struct {
 	CreateTime    int64
 	DeleteTime    int64
 	RefCountJobID uint64
+	TargetBirth   uint64
 	Name          string
 	Checksum      uint32
 }
@@ -161,10 +164,9 @@ func (c *Checker) checkSnapshots() error {
 				seenNames[desc.Name] = desc.SnapshotID
 			}
 
-			// Validate target inode
-			if desc.TargetInode > 0 && !c.inodeUsed[desc.TargetInode] {
-				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("snapshot %d", desc.SnapshotID),
-					fmt.Sprintf("references non-existent inode %d", desc.TargetInode),
+			if why := c.snapshotOrphaned(desc); why != "" {
+				c.addProblem(PhaseSnapshots, Warning, fmt.Sprintf("snapshot %d", desc.SnapshotID),
+					fmt.Sprintf("snapshot %q is an orphan: %s; only the API's full listing shows it, and it can be deleted there", desc.Name, why),
 					false)
 			}
 
@@ -222,6 +224,19 @@ func (c *Checker) checkSnapshots() error {
 	return nil
 }
 
+// snapshotOrphaned says why desc belongs to no existing file, or returns "".
+func (c *Checker) snapshotOrphaned(desc *SnapshotDescriptor) string {
+	switch {
+	case !c.inodeUsed[desc.TargetInode]:
+		return fmt.Sprintf("inode %d, the file it was taken of, is free", desc.TargetInode)
+	case desc.Flags&SnapshotFlagHasTargetBirth == 0:
+		return "an older version wrote it without the birth generation that proves which file it was taken of"
+	case desc.TargetBirth != c.inodeBirth[desc.TargetInode]&(1<<48-1):
+		return fmt.Sprintf("inode %d now holds a later file than the one it was taken of", desc.TargetInode)
+	}
+	return ""
+}
+
 // parseSnapshotDescriptor extracts a snapshot descriptor from raw bytes.
 func parseSnapshotDescriptor(buf []byte) *SnapshotDescriptor {
 	desc := &SnapshotDescriptor{}
@@ -232,8 +247,10 @@ func parseSnapshotDescriptor(buf []byte) *SnapshotDescriptor {
 	desc.TargetInode = binary.LittleEndian.Uint32(buf[20:24])
 	desc.State = buf[24]
 	desc.Flags = buf[25]
-	// Bytes 26-27 reserved
 	desc.DataInode = binary.LittleEndian.Uint32(buf[28:32])
+	if desc.Flags&SnapshotFlagHasTargetBirth != 0 {
+		desc.TargetBirth = uint64(binary.LittleEndian.Uint16(buf[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(buf[32:36]))
+	}
 	desc.TotalBlocks = binary.LittleEndian.Uint64(buf[36:44])
 	desc.TotalSize = binary.LittleEndian.Uint64(buf[44:52])
 	desc.CreateTime = int64(binary.LittleEndian.Uint64(buf[52:60]))

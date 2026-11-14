@@ -118,13 +118,14 @@ Each mount on a host needs its own `-api-addr`. When the port is taken, mount lo
 
 These endpoints change the filesystem or this node's state, and listing snapshots reads filesystem metadata. They only work with a token, also on loopback: the Host check stops web pages, not other local processes. Without a token they answer 403, and mount logs `API: snapshot, clone and admin endpoints are off`. The API refuses cross-origin writes: a CORS preflight for any method but `GET` or `HEAD` fails, and a write whose `Origin` header names another site gets 403. Same-origin pages and non-browser clients can call them.
 
-Snapshots belong to single files. A request names the file by its path in the mount, such as `/dir/file`. The path must be absolute and clean, and may not go through a symlink or out of the mount. Snapshot names are unique in the filesystem. The API creates and clones only names without `:`, `/` or NUL, because `user.snapshot.clone` splits at the first `:`. It deletes any name; escape `/` as `%2F` in the URL.
+Snapshots belong to single files. A snapshot stays with the file it was taken of: once that file is deleted, the snapshot is an orphan, which only the full listing shows and only a delete without `path` removes. A later file that reuses the inode number does not see it. Snapshots written by versions before this record cannot prove their file, so they are orphans too. A request names the file by its path in the mount, such as `/dir/file`. The path must be absolute and clean, and may not go through a symlink or out of the mount. Snapshot names are unique in the filesystem. The API creates and clones only names without `:`, `/` or NUL, because `user.snapshot.clone` splits at the first `:`. It deletes any name; escape `/` as `%2F` in the URL.
 
 | Method and path | Body | Does the same as | Success |
 |-----------------|------|------------------|---------|
-| `GET /api/v1/snapshots[?path=/f]` | | Reads the snapshot registry: every snapshot, or the file's, as `getfattr -n user.snapshots` lists them | 200, `{snapshots: [{id, name, inode, state, size_bytes, blocks, created_at}], total}` |
+| `GET /api/v1/snapshots[?path=/f]` | | Reads the snapshot registry: every snapshot, with `orphan: true` on those whose file is gone, or the file's, as `getfattr -n user.snapshots` lists them | 200, `{snapshots: [{id, name, inode, state, size_bytes, blocks, created_at, orphan}], total}` |
 | `POST /api/v1/snapshots` | `{"path": "/f", "name": "s1"}` | `setfattr -n user.snapshot -v s1 f` | 201 |
 | `DELETE /api/v1/snapshots/s1?path=/f` | | `setfattr -n user.snapshot.delete -v s1 f` | 200 |
+| `DELETE /api/v1/snapshots/s1` | | Deletes an orphan: a snapshot whose file is gone | 200; 409 if its file exists |
 | `POST /api/v1/snapshots/s1/clone` | `{"path": "/f", "dest": "/copy"}` | `setfattr -n user.snapshot.clone -v s1:/copy f` | 201 |
 | `POST /api/v1/clones` | `{"path": "/f", "dest": "/copy"}` | `setfattr -n user.clone -v /copy f` | 201 |
 | `POST /api/v1/admin/flush-journal` | | Checkpoints the journal now | 200 |

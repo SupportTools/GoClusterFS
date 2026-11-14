@@ -90,7 +90,7 @@ Snapshots and clones work through extended attributes on a file (`internal/goclu
 - `setfattr -n user.clone -v /<new-name> <file>` clones the file
 - `setfattr -n user.snapshot.clone -v <snapshot>:/<new-name> <file>` clones from a snapshot
 
-Clone paths are absolute from the filesystem root, and clones can only go in the root directory.
+Clone paths are absolute from the filesystem root, and clones can only go in the root directory. A snapshot records its file's inode number and birth generation, so a later file in the same inode slot does not see it; once its file is deleted it is an orphan, listed and deleted only through the API without a path.
 
 ## Current Limitations
 

@@ -390,6 +390,7 @@ type Checker struct {
 	badBitmap       map[uint64]bool // bitmap sectors with a bad checksum
 	inodeBlocks     map[uint64]int  // block -> reference count from inodes
 	inodeUsed       map[uint32]bool // inode numbers that are in use
+	inodeBirth      map[uint32]uint64
 	dirEntryRefs    map[uint32]int  // inode -> names in directories, not counting "." and ".."
 	dirNames        map[uint32]int  // directory inode -> names it holds
 	namesIncomplete []string        // why dirEntryRefs may miss names
@@ -475,6 +476,7 @@ func New(dev *storage.Device, opts Options) *Checker {
 		finished:        make(map[Phase]bool),
 		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
+		inodeBirth:      make(map[uint32]uint64),
 		dirEntryRefs:    make(map[uint32]int),
 		dirNames:        make(map[uint32]int),
 		snapshotInodes:  make(map[uint32]bool),

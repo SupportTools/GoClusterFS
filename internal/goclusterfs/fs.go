@@ -3363,6 +3363,11 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		log.Printf("[snapshot] Failed to read inode %d: %v", f.inodeNum, err)
 		return syscall.EIO
 	}
+	target, err := f.fs.snapshotTarget(ctx, src)
+	if err != nil {
+		log.Printf("[snapshot] Failed to record the birth generation of inode %d: %v", f.inodeNum, err)
+		return syscall.EIO
+	}
 
 	data, err := f.fs.claimInode(ctx, func(ino *inode.Inode) {
 		ino.Mode, ino.UID, ino.GID = src.Mode, src.UID, src.GID
@@ -3374,7 +3379,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return claimErrno(err)
 	}
 
-	desc, err := f.fs.snapshotReg.Create(ctx, name, f.inodeNum, 0,
+	desc, err := f.fs.snapshotReg.CreateFor(ctx, name, target, 0,
 		data.InodeNum, src.AllocatedBlocks, src.Size, snapshot.FlagReadOnly)
 	if err != nil {
 		log.Printf("[snapshot] Failed to add '%s' to the registry: %v", name, err)
@@ -3418,8 +3423,8 @@ func (f *File) deleteSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	if desc.TargetInode != f.inodeNum {
-		return syscall.EINVAL
+	if errno := f.ownsSnapshot(desc); errno != 0 {
+		return errno
 	}
 
 	if err := f.fs.dropSnapshot(ctx, desc.SnapshotID); err != nil {
@@ -3534,9 +3539,9 @@ func (f *File) createCloneFromSnapshot(ctx context.Context, data string) syscall
 		return syscall.EIO
 	}
 
-	if desc.TargetInode != f.inodeNum {
-		log.Printf("[clone] Snapshot '%s' belongs to inode %d, not %d", snapName, desc.TargetInode, f.inodeNum)
-		return syscall.EINVAL
+	if errno := f.ownsSnapshot(desc); errno != 0 {
+		log.Printf("[clone] Snapshot '%s' was not taken of inode %d", snapName, f.inodeNum)
+		return errno
 	}
 	if desc.State != snapshot.StateActive {
 		return syscall.EBUSY
@@ -3563,7 +3568,7 @@ func (f *File) listSnapshots(ctx context.Context, dest []byte) (uint32, syscall.
 		return 0, syscall.ENOTSUP
 	}
 
-	snapshots, err := f.fs.snapshotReg.ListForInode(ctx, f.inodeNum)
+	snapshots, err := f.fs.FileSnapshots(ctx, f.inodeNum)
 	if err != nil {
 		return 0, syscall.EIO
 	}
@@ -3582,6 +3587,93 @@ func (f *File) listSnapshots(ctx context.Context, dest []byte) (uint32, syscall.
 
 	n := copy(dest, result)
 	return uint32(n), 0
+}
+
+// ownsSnapshot returns ENOENT unless desc was taken of this file, not of an earlier file in the same inode slot.
+func (f *File) ownsSnapshot(desc *snapshot.Descriptor) syscall.Errno {
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		return syscall.EIO
+	}
+	if !desc.BelongsTo(snapshot.Target{Inode: f.inodeNum, Birth: ino.BirthGeneration}) {
+		return syscall.ENOENT
+	}
+	return 0
+}
+
+// snapshotTarget returns what a snapshot of ino records about its file. An inode older versions wrote gets its birth
+// generation now: the generation this write gives it, which no later file in the slot can have.
+func (f *FS) snapshotTarget(ctx context.Context, ino *inode.Inode) (snapshot.Target, error) {
+	if ino.BirthGeneration == 0 {
+		updated, err := f.updateInode(ctx, ino.InodeNum, func(i *inode.Inode) error {
+			if i.BirthGeneration == 0 {
+				i.BirthGeneration = i.MetaGeneration + 1
+			}
+			return nil
+		})
+		if err != nil {
+			return snapshot.Target{}, err
+		}
+		ino = updated
+	}
+	return snapshot.Target{Inode: ino.InodeNum, Birth: ino.BirthGeneration}, nil
+}
+
+// FileSnapshots returns the snapshots of the file in inode slot num.
+func (f *FS) FileSnapshots(ctx context.Context, num uint32) ([]*snapshot.Descriptor, error) {
+	ino, err := f.inodeTbl.Read(num)
+	if err != nil {
+		return nil, err
+	}
+	return f.snapshotReg.ListForTarget(ctx, snapshot.Target{Inode: num, Birth: ino.BirthGeneration})
+}
+
+// AllSnapshots returns every snapshot, marking those whose file is gone or cannot be proven.
+func (f *FS) AllSnapshots(ctx context.Context) ([]snapshot.Entry, error) {
+	descs, err := f.snapshotReg.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]snapshot.Entry, 0, len(descs))
+	for _, d := range descs {
+		orphan, err := f.snapshotOrphan(d)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, snapshot.Entry{Descriptor: d, Orphan: orphan})
+	}
+	return entries, nil
+}
+
+// DeleteOrphanSnapshot deletes a snapshot whose file is gone. A snapshot of an existing file is deleted through it.
+func (f *FS) DeleteOrphanSnapshot(ctx context.Context, name string) error {
+	desc, err := f.snapshotReg.GetByName(ctx, name)
+	if errors.Is(err, snapshot.ErrSnapshotNotFound) {
+		return fmt.Errorf("snapshot %q: %w", name, syscall.ENOENT)
+	}
+	if err != nil {
+		return err
+	}
+	orphan, err := f.snapshotOrphan(desc)
+	if err != nil {
+		return err
+	}
+	if !orphan {
+		return fmt.Errorf("snapshot %q belongs to inode %d, so delete it through that file: %w", name, desc.TargetInode, syscall.EBUSY)
+	}
+	log.Printf("[snapshot] Deleting orphan '%s' (ID=%d) of inode %d", name, desc.SnapshotID, desc.TargetInode)
+	return f.dropSnapshot(ctx, desc.SnapshotID)
+}
+
+func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
+	ino, err := f.inodeTbl.Read(d.TargetInode)
+	if errors.Is(err, inode.ErrInodeOutOfRange) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return ino.Magic == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
 }
 
 // blockExtent returns the single block of ext at offset, so per-block checks
