@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"errors"
 	"slices"
 	"testing"
 )
@@ -178,5 +179,29 @@ func TestCompleteReservesStopsReplayFreeingThem(t *testing.T) {
 	}
 	if got := r.unused(); len(got) != 0 {
 		t.Errorf("replay would still free %v", got)
+	}
+}
+
+// CompleteIntentDurable keeps the intent pending when the completion cannot be
+// written, so the retry writes it and replay then skips the intent.
+func TestCompleteIntentDurableRetriesAfterFailure(t *testing.T) {
+	j := newTestJournal(t)
+	seq := commitIntents(t, j, false)[0]
+	j.region.dev.SetWriteGate(func(int64) error { return errors.New("injected write error") })
+	if err := j.CompleteIntentDurable(seq); err == nil {
+		t.Fatal("CompleteIntentDurable hid the write error")
+	}
+	if _, _, pending := j.IntentLag(seq); !pending {
+		t.Fatal("the intent stopped being pending although its completion was not written")
+	}
+	j.region.dev.SetWriteGate(func(int64) error { return nil })
+	if err := j.CompleteIntentDurable(seq); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, pending := j.IntentLag(seq); pending {
+		t.Error("the intent is still pending after its completion was written")
+	}
+	if got := replayedAfterCrash(t, j); len(got) != 0 {
+		t.Errorf("replayed %v after a crash, want nothing", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -215,6 +216,59 @@ func TestReplayKeepsMappedBlocksOfCrashedNodesReserve(t *testing.T) {
 	}
 }
 
+// Node B holds the bitmap lock while node A's refill waits for it. Statfs and a
+// write that maps a block under its inode lock on A must not wait for the refill:
+// if B died holding the lock, its replay could need that inode lock.
+func TestInodeLockHoldersDoNotWaitForRefill(t *testing.T) {
+	nodeA, path, _, _ := reserveFS(t)
+	nodeB := openFormattedFS(t, path)
+	resA := withReserve(t, nodeA, 8, time.Hour)
+	f := createFile(t, nodeA, "f")
+	writeAt(t, f, pattern(1, 4096), 0)
+	expectRefills(t, resA)
+	var held []uint64
+	for {
+		b, ok := resA.TakeReady()
+		if !ok {
+			break
+		}
+		held = append(held, b)
+	}
+
+	ctx := context.Background()
+	if err := nodeB.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	refilled := make(chan struct{})
+	go func() {
+		defer close(refilled)
+		resA.Take(ctx)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var st fuse.StatfsOut
+		nodeA.Statfs(ctx, &st)
+		if err := nodeA.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+			t.Error(err)
+			return
+		}
+		resA.Untake(held[0])
+		resA.TakeReady()
+		_ = resA.Logged(held[1:], func() error { return nil })
+		nodeA.release(lock.LockTypeInode, uint64(f.inodeNum), "inode")
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("statfs or an inode-lock holder waited for the refill")
+	}
+	nodeB.release(lock.LockTypeBlockBitmap, 0, "bitmap")
+	<-refilled
+}
+
 // Node B finds the bitmap full while node A holds blocks in reserve. B asks for
 // them back and waits; A gives them back, and B's write gets a block instead of
 // failing with ENOSPC.
@@ -227,7 +281,7 @@ func TestFullBitmapWaitsForPeersReserve(t *testing.T) {
 	resA := withReserve(t, nodeA, 4, time.Hour)
 	resB := withReserve(t, nodeB, 4, time.Hour)
 	defer expectRefills(t, resA)
-	resB.SetBroadcast(func() { go resA.ReturnAll(context.Background()) })
+	resB.SetBroadcast(resA.AskReturn)
 	writeAt(t, createFile(t, nodeA, "a"), pattern(1, 4096), 0)
 	if resA.Stats().Blocks == 0 {
 		t.Fatal("node A holds no reserve")

@@ -597,7 +597,7 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	totalBlocks := f.bitmapMgr.TotalBlocks()
 	freeBlocks := f.bitmapMgr.FreeCount()
 	if f.reserve != nil {
-		freeBlocks += uint64(f.reserve.Stats().Blocks)
+		freeBlocks = min(totalBlocks, freeBlocks+uint64(f.reserve.Stats().Blocks))
 	}
 
 	out.Blocks = totalBlocks
@@ -2059,14 +2059,17 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return err
 			}
 			var err error
-			seq, err = f.fs.journal.Commit(txn)
+			if seq, err = f.fs.journal.Commit(txn); err != nil {
+				f.fs.journal.Abort(txn)
+			}
 			return err
 		})
+		used := len(reserveOut)
+		reserveOut = nil
 		if err != nil {
-			logging.Debugf("Write inode %d: logging the use of %d reserved blocks failed: %v", f.inodeNum, len(reserveOut), err)
+			logging.Debugf("Write inode %d: logging the use of %d reserved blocks failed, leaving them allocated: %v", f.inodeNum, used, err)
 			return syscall.EIO
 		}
-		reserveOut = nil
 		intents = append(intents, seq)
 		return nil
 	}
@@ -2584,9 +2587,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				intentSeq, err = f.fs.journal.Commit(txn)
 				return err
 			})
-			if commitErr == nil {
-				reserveOut = nil
-			}
+			reserveOut = nil
 		} else {
 			intentSeq, commitErr = f.fs.journal.Commit(txn)
 		}

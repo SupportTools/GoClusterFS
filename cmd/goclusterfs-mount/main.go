@@ -443,7 +443,7 @@ func main() {
 			return len(active)
 		})
 		res.SetBroadcast(cacheMgr.BroadcastReturnReserves)
-		cacheMgr.OnReturnReserves(func() { res.ReturnAll(context.Background()) })
+		cacheMgr.OnReturnReserves(res.AskReturn)
 		bm.SetNoSpaceWait(res)
 		j.SetCheckpointHook(func() { res.Refresh(context.Background()) })
 		gfs.SetReserve(res)

@@ -3121,25 +3121,95 @@ scenarios:
       go: internal/reserve/reserve_test.go::TestReturnEndsRecordBeforeFreeing
 
   - id: reserve-return-handed-out
-    name: Returned reserve keeps handed-out blocks recorded
-    description: Blocks a write took and has not logged stay in a new record when the reserve is given back, and go back later
+    name: Block handed back after a return is freed
+    description: Returning the reserve while a write holds one of its blocks ends the record; the block the write later hands back is freed without a record
     priority: go_only
     environments:
-      go: internal/reserve/reserve_test.go::TestReturnKeepsHandedOutBlocksRecorded
+      go: internal/reserve/reserve_test.go::TestBlockHandedBackAfterReturnIsFreed
 
   - id: reserve-failed-log
-    name: Failed commit keeps reserved blocks
-    description: A write whose commit fails keeps its reserved blocks to put back
+    name: Failed commit leaves its reserved blocks allocated
+    description: A block whose use commit failed may be mapped on disk, so it goes neither back to the reserve nor to the bitmap
     priority: go_only
     environments:
-      go: internal/reserve/reserve_test.go::TestFailedLogKeepsBlocksOut
+      go: internal/reserve/reserve_test.go::TestFailedLogLeavesBlockAllocated
+
+  - id: reserve-failed-end
+    name: Failed record end keeps its blocks
+    description: When ending a reserve record fails, its blocks stay reserved, and a later return ends it and frees them
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFailedEndKeepsBlocks
 
   - id: reserve-refresh
     name: Old reserve record is renewed
-    description: The reserve record is written again once it is a quarter of the journal behind the tail
+    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record and ends; if the old record cannot end, nothing is freed until it does
     priority: go_only
     environments:
       go: internal/reserve/reserve_test.go::TestRefreshRenewsAnOldRecord
+
+  - id: reserve-refresh-handed-out
+    name: Old record of handed-out blocks ends
+    description: A record whose blocks are all handed out ends once it is far behind the tail, so a write stuck on a lock cannot hold the journal head back
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefreshEndsRecordOfHandedOutBlocks
+
+  - id: reserve-used-record-ends
+    name: Fully used reserve record ends
+    description: A record whose blocks were all used ends at the next tidy
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestUsedRecordEnds
+
+  - id: reserve-refill-record-failure
+    name: Refill whose record fails
+    description: A refill whose record hit a full journal marks nothing; any other commit error leaves the blocks allocated, and the transaction is aborted either way
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefillRecordFailure
+
+  - id: reserve-writers-never-wait-for-bitmap
+    name: Writers never wait for the bitmap lock through the reserve
+    description: TakeReady, Untake, Logged and Stats return while a refill or a return waits for the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestWritersDoNotWaitForBitmapLock
+
+  - id: reserve-inode-lock-holders-skip-refill
+    name: Inode-lock holders and statfs do not wait for a refill
+    description: While another node holds the bitmap lock and a refill waits for it, statfs and a write holding an inode lock still use the reserve
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestInodeLockHoldersDoNotWaitForRefill
+
+  - id: reserve-peer-requests-coalesce
+    name: Peer return requests coalesce
+    description: A flood of peer requests gives the reserve back at most once per tick while a writer keeps refilling it
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestPeerRequestsCoalesce
+
+  - id: reserve-statfs-own-reserve
+    name: Statfs counts the node's own reserve as free
+    description: A one-block write lowers statfs by one block although it took a whole reserve from the bitmap
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestStatfsCountsOwnReserveAsFree
+
+  - id: bitmap-reserve-restores-on-write-failure
+    name: Failed reserve sector write ends the record, then restores
+    description: A reserve whose second sector write fails ends its record and restores the first sector; if the record cannot end, the sectors stay as they are
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestReserveRestoresSectorsWhenAWriteFails
+
+  - id: journal-durable-intent-completion
+    name: Durable intent completion survives a failed write
+    description: CompleteIntentDurable keeps the intent pending when the completion cannot be written, so a retry writes it and replay skips the intent
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteIntentDurableRetriesAfterFailure
 
   - id: reserve-writes
     name: Writes take blocks from the reserve

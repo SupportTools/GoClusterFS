@@ -560,7 +560,30 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	return j.appendCompletionLocked(intentSeq)
+}
 
+// CompleteIntentDurable returns only after the completion record is synced,
+// and keeps the intent pending on error, so a retry writes the record.
+func (j *Journal) CompleteIntentDurable(intentSeq uint64) error {
+	j.mu.Lock()
+	_, pending := j.pendingIntents[intentSeq]
+	var err error
+	if pending {
+		err = j.appendCompletionLocked(intentSeq)
+	}
+	j.mu.Unlock()
+	if !pending || err != nil {
+		return err
+	}
+	if err := j.region.Sync(); err != nil {
+		return fmt.Errorf("failed to sync intent completion: %w", err)
+	}
+	j.dropIntent(intentSeq)
+	return nil
+}
+
+func (j *Journal) appendCompletionLocked(intentSeq uint64) error {
 	need := sectorAligned(completionLength)
 	if need > j.region.AvailableSpace() {
 		if err := j.forceCheckpoint(); err != nil || need > j.region.AvailableSpace() {

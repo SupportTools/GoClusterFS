@@ -191,12 +191,12 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
 
 	case TypeReturnReserves:
 		if fn := b.onReturnReserves.Load(); fn != nil {
-			go (*fn)()
+			(*fn)()
 		}
 	}
 }
 
-// OnReturnReserves sets what runs when a peer asks for reserved blocks back.
+// OnReturnReserves sets what runs, on the receive loop, when a peer asks for reserved blocks back; fn must not block.
 func (b *Broadcaster) OnReturnReserves(fn func()) {
 	b.onReturnReserves.Store(&fn)
 }
