@@ -307,6 +307,19 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 
 // WaitForMount waits until the filesystem is mounted and accessible.
 // It checks /proc/mounts to verify the FUSE mount is active.
+// processExited reports whether p has exited, without waiting for it: an exited child stays a zombie until reaped.
+func processExited(p *os.Process) bool {
+	if p == nil {
+		return false
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", p.Pid))
+	if err != nil {
+		return true
+	}
+	_, after, ok := strings.Cut(string(stat), ") ")
+	return ok && strings.HasPrefix(after, "Z")
+}
+
 // mountWait is how long a mount may take: one whose -skip-recovery names
 // another host's slot watches it for about 12 seconds before taking it.
 const mountWait = 30 * time.Second
@@ -325,9 +338,8 @@ func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 			}
 		}
 
-		// Check if mount command exited unexpectedly
-		if m.MountCmd != nil && m.MountCmd.ProcessState != nil {
-			return fmt.Errorf("mount process exited unexpectedly: %v", m.MountCmd.ProcessState)
+		if m.MountCmd != nil && (m.MountCmd.ProcessState != nil || processExited(m.MountCmd.Process)) {
+			return fmt.Errorf("mount process exited unexpectedly")
 		}
 
 		time.Sleep(100 * time.Millisecond)
