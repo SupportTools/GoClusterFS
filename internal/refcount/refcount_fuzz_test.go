@@ -90,7 +90,7 @@ func FuzzRefcountSector(f *testing.F) {
 		}
 		model := refModel{badSector: -1}
 		stored := binary.LittleEndian.Uint32(raw[SectorSize-ChecksumSize:])
-		if stored != storage.CRC32C(raw[:SectorSize-ChecksumSize]) && !(stored == 0 && isZero(raw[:SectorSize-ChecksumSize])) {
+		if stored != storage.CRC32C(raw[:SectorSize-ChecksumSize]) && (stored != 0 || !isZero(raw[:SectorSize-ChecksumSize])) {
 			model.badSector = s
 		} else {
 			for i := range EntriesPerSector {
