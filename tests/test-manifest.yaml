@@ -756,13 +756,6 @@ scenarios:
     environments:
       go: internal/node/clock_skew_test.go::TestRenewedRecoveryLeaseIsHeldWhateverTheReplayersClock
 
-  - id: register-takes-empty-slot-first
-    name: Register takes an empty slot before another host's silent one
-    description: Another host's slot whose heartbeat looks old by this node's clock is not taken while a slot is empty, and taking an empty slot reports no previous owner
-    priority: go_only
-    environments:
-      go: internal/node/registry_test.go::TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne
-
   - id: hostile-storage-short-stalls
     name: Short storage stalls on one node
     description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
@@ -3808,7 +3801,7 @@ scenarios:
     description: Register reports the node whose failed slot it took, from any host, so mount keeps that node's lock claims through the replay
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlotWhenNoneIsEmpty
+      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlot
 
   - id: storage-write-gate-refuses-writes
     name: Device write gate refuses writes

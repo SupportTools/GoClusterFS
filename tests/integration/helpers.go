@@ -263,7 +263,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}
@@ -296,7 +296,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}
@@ -307,6 +307,10 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 
 // WaitForMount waits until the filesystem is mounted and accessible.
 // It checks /proc/mounts to verify the FUSE mount is active.
+// mountWait is how long a mount may take: one that finds another host's slot
+// with an old heartbeat watches it for about 12 seconds before taking it.
+const mountWait = 30 * time.Second
+
 func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
@@ -604,7 +608,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}
@@ -638,7 +642,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}

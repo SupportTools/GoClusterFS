@@ -289,27 +289,30 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	if i, err := r.claimFirst(append(r.awaitOtherNamespaceSlots(), allSlots()...), ownFailed); i >= 0 || err != nil {
 		return i, err
 	}
-	if i, err := r.claimFirst(allSlots(), func(slot *Slot) bool { return slot.State == NodeStateEmpty }); i >= 0 || err != nil {
+	// Another host's heartbeat that looks old by this clock may be a live node's whose clock is behind, so its slot is
+	// taken only once the heartbeat has not changed for silentSlotWatch by this node's clock.
+	if i, err := r.claimFirst(r.awaitSilentSlots(r.otherHostSlots(), silentSlotWatch), func(*Slot) bool { return true }); i >= 0 || err != nil {
 		return i, err
 	}
-	// Other hosts' clocks may disagree with this one, so a node there counts as gone only once its heartbeat stops.
-	i, err := r.claimFirst(r.awaitSilentSlots(r.otherHostSlots(), silentSlotWatch), func(*Slot) bool { return true })
+	i, err := r.claimFirst(allSlots(), func(slot *Slot) bool { return slot.State == NodeStateEmpty })
 	if i < 0 && err == nil {
 		err = ErrNoFreeSlots
 	}
 	return i, err
 }
 
-// silentSlotWatch is how long Register watches other hosts' slots, when no slot
-// is empty, before it takes one whose heartbeat never changed. Tests shorten it.
-var silentSlotWatch = deadAfter
+// silentSlotWatch is how long Register watches another host's slot before it
+// takes it, if its heartbeat never changed: past HeartbeatTimeout, so a node
+// that only stalled checks its slot before its next write. Tests shorten it.
+var silentSlotWatch = HeartbeatTimeout + 2*HeartbeatInterval
 
-// otherHostSlots returns the slots of live-looking nodes on other hosts.
+// otherHostSlots returns the slots of other hosts' nodes whose heartbeat looks old by this node's clock.
 func (r *Registry) otherHostSlots() []int {
 	var slots []int
 	for i := 0; i < MaxNodes; i++ {
 		_, slot, err := r.readSlotRaw(i)
-		if err == nil && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) && !r.sameHost(slot) {
+		if err == nil && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) && !r.sameHost(slot) &&
+			heartbeatOlderThan(slot, HeartbeatTimeout) {
 			slots = append(slots, i)
 		}
 	}

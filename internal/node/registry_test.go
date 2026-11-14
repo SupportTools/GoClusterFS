@@ -1269,17 +1269,6 @@ func TestOccupantAnswersFromLastReadUnlessFresh(t *testing.T) {
 	}
 }
 
-// fillWithReplays marks every slot from first on as dead and under another node's recovery, so none is empty.
-func fillWithReplays(t *testing.T, reg *Registry, first int) {
-	t.Helper()
-	for i := first; i < MaxNodes; i++ {
-		dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{byte(100 + i)}, RecoveryOwner: [16]byte{7}, RecoveryStart: time.Now().Unix()}
-		if err := reg.writeSlot(i, dead); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
 func shortenSilentSlotWatch(t *testing.T) {
 	t.Helper()
 	old := silentSlotWatch
@@ -1287,30 +1276,12 @@ func shortenSilentSlotWatch(t *testing.T) {
 	silentSlotWatch = 2 * time.Second
 }
 
-func TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-	reg := NewRegistry(dev, 0)
-	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix()}
-	copy(gone.Hostname[:], "elsewhere")
-	if err := reg.writeSlot(0, gone); err != nil {
-		t.Fatal(err)
-	}
-	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 1 {
-		t.Fatalf("Register = %d, %v; want the empty slot 1", slot, err)
-	}
-	if owner, ok := reg.PreviousOwner(); ok {
-		t.Errorf("PreviousOwner = %x after taking an empty slot, want none", owner)
-	}
-}
-
-func TestRegisterTakesAnotherHostsSilentSlotWhenNoneIsEmpty(t *testing.T) {
+func TestRegisterTakesAnotherHostsSilentSlot(t *testing.T) {
 	shortenSilentSlotWatch(t)
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 	reg := NewRegistry(dev, 0)
-	fillWithReplays(t, reg, 1)
-	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix()}
 	copy(gone.Hostname[:], "elsewhere")
 	if err := reg.writeSlot(0, gone); err != nil {
 		t.Fatal(err)
