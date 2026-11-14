@@ -604,6 +604,7 @@ test_reserve_returned_after_crash() {
     free_kb() { ssh_run "$vm_b" "df -k /mnt/goclusterfs | awk 'NR==2 {print \$4}'"; }
 
     local before
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     before=$(free_kb)
     ssh_run "$vm_a" "dd if=/dev/urandom of=$file bs=1M count=1 conv=fsync 2>/dev/null" || return 1
     local sum
@@ -1917,6 +1918,9 @@ statfs_free_blocks_on_vm() {
     ssh_run "$1" "stat -f -c %f /mnt/goclusterfs"
 }
 
+# statfs counts other nodes' unused block reserves as used; they go back within 1.5 x the 10s idle time.
+RESERVE_IDLE_RETURN_SECS=16
+
 # Writes 5 blocks, remounts on a restarted VM, and checks that statfs reports
 # the same free blocks as before the restart, not the whole volume.
 test_statfs_after_remount() {
@@ -1925,6 +1929,7 @@ test_statfs_after_remount() {
 
     local file=/mnt/goclusterfs/statfs_remount.bin
     local before written remounted
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     before=$(statfs_free_blocks_on_vm 1)
     ssh_run 1 "dd if=/dev/urandom of=$file bs=1M count=5 2>/dev/null"
     written=$(statfs_free_blocks_on_vm 1)
@@ -1959,8 +1964,10 @@ test_statfs_multinode() {
 
     local file=/mnt/goclusterfs/statfs_multinode.bin
     local start on_writer on_remover
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     start=$(statfs_free_blocks_on_vm 2)
     ssh_run 1 "dd if=/dev/urandom of=$file bs=1M count=5 2>/dev/null"
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     on_writer=$(statfs_free_blocks_on_vm 1)
     on_remover=$(statfs_free_blocks_on_vm 2)
     if [[ "$on_writer" != "$on_remover" ]] || (( start - on_remover < 5 )); then
@@ -3711,6 +3718,7 @@ test_snapshot_delete_after_overwrite() {
 
     ssh_run 1 "rm -f $file"
     ssh_run 1 "head -c 2097152 /dev/urandom > $file" || return 1
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     free_before=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
     ssh_run 1 "setfattr -n user.snapshot -v snap_delete_temp $file" || {
         log_error "snapshot failed"

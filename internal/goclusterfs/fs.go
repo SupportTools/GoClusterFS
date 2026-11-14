@@ -596,6 +596,9 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 
 	totalBlocks := f.bitmapMgr.TotalBlocks()
 	freeBlocks := f.bitmapMgr.FreeCount()
+	if f.reserve != nil {
+		freeBlocks += uint64(f.reserve.Stats().Blocks)
+	}
 
 	out.Blocks = totalBlocks
 	out.Bfree = freeBlocks

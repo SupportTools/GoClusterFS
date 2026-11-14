@@ -167,7 +167,11 @@ func (s *Sampler) sampleCounters() {
 func (s *Sampler) sampleDevice() {
 	s.lastDevice = time.Now()
 	if s.src.Blocks != nil {
-		s.capacity.Store(capacityInfo(s.src.Blocks.TotalBlocks(), s.src.Blocks.FreeCount(), s.src.BlockSize))
+		free := s.src.Blocks.FreeCount()
+		if s.src.Reserve != nil {
+			free += uint64(s.src.Reserve.Stats().Blocks)
+		}
+		s.capacity.Store(capacityInfo(s.src.Blocks.TotalBlocks(), free, s.src.BlockSize))
 	}
 	if s.src.Nodes != nil {
 		slots, _ := s.src.Nodes.Slots()

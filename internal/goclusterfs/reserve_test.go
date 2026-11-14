@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/reserve"
@@ -95,6 +97,26 @@ func TestWritesTakeBlocksFromReserve(t *testing.T) {
 		t.Errorf("%d free blocks after unmount, want %d: the reserve was not given back", got, free-10)
 	}
 	expectCleanFsck(t, after)
+}
+
+// statfs counts the node's unused reserve as free, so a one-block write lowers
+// it by one block even though the write took a whole reserve from the bitmap.
+func TestStatfsCountsOwnReserveAsFree(t *testing.T) {
+	fsys, _, _, _ := reserveFS(t)
+	f := createFile(t, fsys, "one")
+	var before, after fuse.StatfsOut
+	if errno := fsys.Statfs(context.Background(), &before); errno != 0 {
+		t.Fatal(errno)
+	}
+	res := withReserve(t, fsys, 64, time.Hour)
+	writeAt(t, f, pattern(1, 4096), 0)
+	expectRefills(t, res)
+	if errno := fsys.Statfs(context.Background(), &after); errno != 0 {
+		t.Fatal(errno)
+	}
+	if after.Bfree != before.Bfree-1 || after.Bavail != after.Bfree {
+		t.Errorf("statfs Bfree %d, Bavail %d after a one-block write, want both %d", after.Bfree, after.Bavail, before.Bfree-1)
+	}
 }
 
 // A reserve nobody takes from goes back to the bitmap after the idle time.
