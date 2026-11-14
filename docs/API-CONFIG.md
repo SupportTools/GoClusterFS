@@ -25,14 +25,14 @@ These are the `goclusterfs-mount` flags:
 
 | Flag | Type | Description |
 |------|------|-------------|
-| `-device` | string | Path to block device or image file |
-| `-mount` | string | Mount point directory |
+| `-device` | string | Block device, or image file on a filesystem that supports O_DIRECT |
+| `-mount` | string | Directory to mount the filesystem on |
 
 ### General Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-format` | bool | `false` | Format the device (destroys all data) |
+| `-format` | bool | `false` | Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first |
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
 | `-debug` | bool | `false` | Print `[DEBUG]` log lines |
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
@@ -42,9 +42,9 @@ These are the `goclusterfs-mount` flags:
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-cache-strict` | bool | `false` | Enable strict cache mode (always validate against disk) |
-| `-cache-ttl` | duration | `5s` | Cache entry TTL before revalidation required |
-| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries |
+| `-cache-strict` | bool | `false` | Check every cached inode against the device before using it; slower, but other nodes' changes show at once |
+| `-cache-ttl` | duration | `5s` | How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost |
+| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries; `stat` and `ls` can show another node's change this late, while opening a file always sees it |
 | `-cache-inodes` | int | `10000` | Most inodes the inode cache holds, about 480 bytes each (5 MB). `0` turns it off |
 | `-cache-extents` | int | `50000` | Most block mappings the extent cache holds, about 120 bytes each (6 MB). `0` turns it off |
 | `-cache-negative` | int | `1000` | Most not-found inode lookups the negative cache holds, about 40 bytes each. `0` turns it off |
@@ -60,28 +60,28 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-journal` | bool | `true` | Enable write-ahead journal for crash consistency |
+| `-journal` | bool | `true` | Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only |
 | `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data) |
 
 ### Network Broadcast Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-broadcast` | bool | `true` | Enable network cache invalidation |
-| `-mcast-group` | string | `239.192.74.75` | Multicast group IP address |
-| `-mcast-port` | int | `31337` | UDP port for multicast |
+| `-broadcast` | bool | `true` | Send and receive cache invalidations over UDP so other nodes see changes sooner; correctness does not depend on it |
+| `-mcast-group` | string | `239.192.74.75` | Multicast group for broadcast messages; the same on every node |
+| `-mcast-port` | int | `31337` | UDP port for multicast messages; the same on every node |
 | `-unicast-port` | int | `31338` | UDP port for unicast; must differ from `-mcast-port` |
-| `-broadcast-secret` | string | (empty) | HMAC secret for message authentication |
-| `-broadcast-iface` | string | (auto) | Network interface for multicast |
+| `-broadcast-secret` | string | (empty) | Secret that signs broadcast messages, the same on every node; visible to local users in `ps`. Empty leaves them unauthenticated |
+| `-broadcast-iface` | string | (empty) | Network interface for multicast; empty lets the kernel choose |
 | `-broadcast-max-peers` | int | `256` | Most nodes the unicast peer table and the lost-message tracking hold. When either is full, the node heard from longest ago is dropped |
 
 ### TRIM Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-trim` | bool | `true` | Enable batched TRIM/BLKDISCARD |
-| `-trim-batch` | int | `256` | Number of blocks per TRIM batch |
-| `-trim-age` | duration | `5s` | Maximum age before forcing TRIM flush |
+| `-trim` | bool | `true` | Discard freed blocks on the device (`BLKDISCARD`) in batches; does nothing on image files |
+| `-trim-batch` | int | `256` | Freed blocks to collect before a discard |
+| `-trim-age` | duration | `5s` | Longest a freed block waits for its discard |
 
 ### Feature Flags
 
