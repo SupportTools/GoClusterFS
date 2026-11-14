@@ -431,6 +431,10 @@ func (m *Manager) LogStats() {
 // concurrent FUSE operations from the same node to share locks efficiently
 // while still providing cross-node serialization.
 //
+// Exclusive therefore means exclusive per node: it never keeps two goroutines
+// on this node apart, so a caller that changes shared state needs its own local
+// lock for that.
+//
 // Resources that hash to the same record share it: a node holding the record
 // for one resource excludes other nodes from every resource in that record.
 //

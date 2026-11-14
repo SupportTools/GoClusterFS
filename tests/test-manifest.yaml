@@ -969,6 +969,13 @@ scenarios:
     environments:
       go: internal/journal/cross_node_recovery_test.go::TestApplyExtentAddSkipsChangedInode
 
+  - id: replay-keeps-inode-written-during-it
+    name: Replay keeps an inode written while it runs
+    description: Another goroutine on the replaying node writes the inode between the replay's read and its write; the replay skips the record instead of overwriting that write
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayKeepsInodeWrittenDuringIt
+
   - id: dir-entry-replay-skips-removed-parent
     name: Directory entry replay skips a removed parent
     description: DirAddEntry and DirRemoveEntry replay into a parent slot that is no longer a directory skip the record instead of failing the replay
