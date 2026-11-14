@@ -66,6 +66,18 @@ type Region struct {
 	lockMgr     *lock.Manager // For distributed locking (optional)
 	nodeUUID    [16]byte      // This node's UUID for locking
 	trimMgr     TrimQueuer    // Optional TRIM manager for batched discards
+	noSpace     NoSpaceWait
+}
+
+// NoSpaceWait lets Alloc wait for blocks that other nodes hold in reserve.
+type NoSpaceWait interface {
+	WaitForPeers(ctx context.Context, waited time.Duration) bool
+	Waited(d time.Duration)
+}
+
+// SetNoSpaceWait makes Alloc wait on w instead of failing when no block is free.
+func (r *Region) SetNoSpaceWait(w NoSpaceWait) {
+	r.noSpace = w
 }
 
 // NewRegion creates a new bitmap region manager.
@@ -89,6 +101,28 @@ func NewRegion(dev *storage.Device, offset, totalBlocks uint64, lockMgr *lock.Ma
 // Alloc allocates the requested number of blocks.
 // Returns the allocated block numbers, or an error if not enough free blocks.
 func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
+	var start time.Time
+	for {
+		blocks, err := r.allocOnce(ctx, count)
+		if !errors.Is(err, ErrNoFreeBlocks) || r.noSpace == nil {
+			if err == nil && !start.IsZero() {
+				r.noSpace.Waited(time.Since(start))
+			}
+			return blocks, err
+		}
+		waited := time.Duration(0)
+		if start.IsZero() {
+			start = time.Now()
+		} else {
+			waited = time.Since(start)
+		}
+		if !r.noSpace.WaitForPeers(ctx, waited) {
+			return nil, err
+		}
+	}
+}
+
+func (r *Region) allocOnce(ctx context.Context, count int) ([]uint64, error) {
 	if count <= 0 {
 		return nil, nil
 	}
@@ -330,6 +364,82 @@ func (r *Region) releaseReserved(ctx context.Context, blocks []uint64) {
 		log.Printf("[WARN] bitmap: freeing %d blocks reserved for TRIM failed (attempt %d), retrying: %v", len(blocks), attempt, err)
 		time.Sleep(time.Second)
 	}
+}
+
+// Reserve picks up to n free blocks under one lock hold and calls record with
+// them. Only if record reports keep does it mark them allocated. If a sector
+// write then fails, it calls end and restores the sectors it changed; if end
+// fails, it writes the rest again, so no block a pending record lists stays free on disk.
+func (r *Region) Reserve(ctx context.Context, n int, record func([]uint64) (keep bool), end func() error) ([]uint64, error) {
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+			return nil, fmt.Errorf("failed to acquire bitmap lock: %w", err)
+		}
+		defer r.unlock()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	numSectors := (r.totalBlocks + BitsPerSector - 1) / BitsPerSector
+	var picked, changed []uint64
+	sectors, originals := make(map[uint64][]byte), make(map[uint64][]byte)
+	for sectorIdx := uint64(0); sectorIdx < numSectors && len(picked) < n; sectorIdx++ {
+		data, err := r.readSector(sectorIdx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+		}
+		original := slices.Clone(data)
+		before := len(picked)
+		for bit := uint64(0); bit < BitsPerSector && len(picked) < n; bit++ {
+			block := sectorIdx*BitsPerSector + bit
+			if block >= r.totalBlocks {
+				break
+			}
+			if data[bit/8]&(1<<(bit%8)) == 0 {
+				data[bit/8] |= 1 << (bit % 8)
+				picked = append(picked, block)
+			}
+		}
+		if len(picked) > before {
+			sectors[sectorIdx], originals[sectorIdx] = data, original
+			changed = append(changed, sectorIdx)
+		}
+	}
+	if len(picked) == 0 {
+		return nil, ErrNoFreeBlocks
+	}
+	if !record(picked) {
+		return nil, errors.New("reserve not recorded")
+	}
+	for i, sectorIdx := range changed {
+		err := r.writeSector(sectorIdx, sectors[sectorIdx])
+		if err == nil {
+			continue
+		}
+		if eerr := end(); eerr != nil {
+			if rerr := r.writeSectors(changed[i:], sectors); rerr != nil {
+				log.Printf("[ERROR] bitmap: reserved blocks %v may be free on disk while their record is pending: %v, %v", picked, eerr, rerr)
+				return nil, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+			}
+			return picked, nil
+		}
+		for _, done := range changed[:i+1] {
+			if rerr := r.writeSector(done, originals[done]); rerr != nil {
+				log.Printf("[WARN] bitmap: restoring sector %d after a failed reserve failed, its picked blocks stay allocated: %v", done, rerr)
+			}
+		}
+		return nil, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+	}
+	return picked, nil
+}
+
+func (r *Region) writeSectors(idx []uint64, sectors map[uint64][]byte) error {
+	for _, sectorIdx := range idx {
+		if err := r.writeSector(sectorIdx, sectors[sectorIdx]); err != nil {
+			return fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+		}
+	}
+	return nil
 }
 
 // HoldAllocated takes the bitmap lock and returns the blocks of blocks that are

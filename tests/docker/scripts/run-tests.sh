@@ -2471,6 +2471,9 @@ statfs_free_blocks() {
     exec_on_node "$1" stat -f -c %f /mnt/goclusterfs
 }
 
+# statfs counts other nodes' unused block reserves as used; they go back within 1.5 x the 10s idle time.
+RESERVE_IDLE_RETURN_SECS=16
+
 # Writes 5 blocks, restarts the node, and checks that statfs reports the same
 # free blocks as before the restart, not the whole volume.
 test_statfs_after_remount() {
@@ -2481,6 +2484,7 @@ test_statfs_after_remount() {
     exec_on_node "$node" rm -f "$file"
 
     local before written remounted
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     before=$(statfs_free_blocks "$node")
     exec_on_node "$node" dd if=/dev/urandom of="$file" bs=1M count=5 2>/dev/null
     written=$(statfs_free_blocks "$node")
@@ -2518,8 +2522,10 @@ test_statfs_multinode() {
     exec_on_node "$writer" rm -f "$file"
 
     local start on_writer on_remover
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     start=$(statfs_free_blocks "$remover")
     exec_on_node "$writer" dd if=/dev/urandom of="$file" bs=1M count=5 2>/dev/null
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     on_writer=$(statfs_free_blocks "$writer")
     on_remover=$(statfs_free_blocks "$remover")
     if [[ "$on_writer" != "$on_remover" ]] || (( start - on_remover < 5 )); then
@@ -3114,6 +3120,7 @@ test_snapshot_delete_after_overwrite() {
 
     exec_on_node "$node" rm -f "$file"
     exec_on_node "$node" sh -c "head -c 2097152 /dev/urandom > $file" || return 1
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     free_before=$(exec_on_node "$node" stat -f -c %f /mnt/goclusterfs)
     exec_on_node "$node" setfattr -n user.snapshot -v snap_delete_temp "$file" || {
         log "ERROR: snapshot failed"

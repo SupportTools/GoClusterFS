@@ -662,6 +662,10 @@ func (m *Manager) ReserveTreeBlocks(ctx context.Context, ino *inode.Inode) (cont
 	return context.WithValue(ctx, reservationKey{}, r), release, nil
 }
 
+func (m *Manager) TreeBlocksForInsert(ino *inode.Inode) (int, error) {
+	return m.treeBlocksForInsert(ino)
+}
+
 func (m *Manager) treeBlocksForInsert(ino *inode.Inode) (int, error) {
 	leaves, err := m.layout(ino)
 	if err != nil {

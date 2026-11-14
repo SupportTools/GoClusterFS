@@ -33,6 +33,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
+	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -128,6 +129,7 @@ type FS struct {
 	dirMgr      *dir.Manager
 	cacheMgr    *cache.Manager     // Inode cache for read optimization
 	journal     *journal.Journal   // Per-node journal for crash consistency (WAL)
+	reserve     *reserve.Manager   // this node's batch of data blocks; nil without a journal
 	trimMgr     *trim.Manager      // TRIM manager for batched block discards
 	sfbMgr      *sfb.Manager       // SFB manager for small file storage (optional)
 	refcountReg *refcount.Region   // Reference count table for CoW/snapshots (optional)
@@ -298,11 +300,23 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 	return nil
 }
 
+// SetReserve makes writes take data blocks from r. It needs the journal.
+func (f *FS) SetReserve(r *reserve.Manager) {
+	if f.journal != nil {
+		f.reserve = r
+	}
+}
+
 // Close closes the filesystem and releases resources.
 func (f *FS) Close() error {
 	// Stop snapshot worker first to complete pending jobs
 	if f.snapshotWkr != nil {
 		ShutdownStep("snapshot worker stop", f.snapshotWkr.Stop)
+	}
+
+	// Unused reserved blocks go back before TRIM and the journal stop.
+	if f.reserve != nil {
+		ShutdownStep("block reserve return", func() { f.reserve.Stop(context.Background()) })
 	}
 
 	// Stop TRIM manager to flush pending discards
@@ -582,6 +596,9 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 
 	totalBlocks := f.bitmapMgr.TotalBlocks()
 	freeBlocks := f.bitmapMgr.FreeCount()
+	if f.reserve != nil {
+		freeBlocks = min(totalBlocks, freeBlocks+uint64(f.reserve.Stats().Blocks))
+	}
 
 	out.Blocks = totalBlocks
 	out.Bfree = freeBlocks
@@ -1896,39 +1913,76 @@ var testHookBeforeInodeCommit func() error
 // testHookBeforeFreeingUnused, when set by a test, runs after a failed write closes its intent and before it frees blocks.
 var testHookBeforeFreeingUnused func()
 
+// mapReadyBlockLocked lets a write keep the inode lock when the reserve has a block and the tree needs none.
+func (f *File) mapReadyBlockLocked(ctx context.Context, ino *inode.Inode, blockNum uint64, lockHeld bool) (*extent.Extent, bool) {
+	if f.fs.reserve == nil || !lockHeld {
+		return nil, false
+	}
+	if need, err := f.fs.extentMgr.TreeBlocksForInsert(ino); err != nil || need > 0 {
+		return nil, false
+	}
+	b, ok := f.fs.reserve.TakeReady()
+	if !ok {
+		return nil, false
+	}
+	ext := &extent.Extent{LogicalBlock: blockNum, PhysicalBlock: b, Length: 1, Flags: extent.FlagAllocated}
+	if err := f.fs.extentMgr.Insert(ctx, ino, ext); err != nil {
+		f.fs.reserve.Untake(b)
+		return nil, false
+	}
+	ino.AllocatedBlocks += ext.Length
+	ino.WrittenBlocks += ext.Length
+	return ext, true
+}
+
 // allocateBlockLocked maps a new data block at blockNum and returns the inode
 // re-read under the inode lock, which stays held on success. The bitmap comes
 // before the inode in lock order, so the data block and any extent-tree blocks
 // are allocated before the lock is taken. Call the returned release after
 // dropping the inode lock.
-func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockNum uint64) (*inode.Inode, *extent.Extent, func(), error) {
-	blocks, err := f.fs.bitmapMgr.Alloc(ctx, 1)
-	if err != nil {
-		logging.Debugf("Write inode %d: allocating block %d failed: %v", f.inodeNum, blockNum, err)
-		return nil, nil, nil, allocErrno(err)
+func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockNum uint64) (*inode.Inode, *extent.Extent, func(), bool, error) {
+	physBlock, reserved := uint64(0), false
+	if f.fs.reserve != nil {
+		physBlock, reserved = f.fs.reserve.Take(ctx)
 	}
-	ext := &extent.Extent{LogicalBlock: blockNum, PhysicalBlock: blocks[0], Length: 1, Flags: extent.FlagAllocated}
+	if !reserved {
+		blocks, err := f.fs.bitmapMgr.Alloc(ctx, 1)
+		if err != nil {
+			logging.Debugf("Write inode %d: allocating block %d failed: %v", f.inodeNum, blockNum, err)
+			return nil, nil, nil, false, allocErrno(err)
+		}
+		physBlock = blocks[0]
+	}
+	// A reserved block goes back to the reserve: its record still lists it.
+	giveBack := func() {
+		if reserved {
+			f.fs.reserve.Untake(physBlock)
+		} else {
+			f.fs.freeUnused(ctx, f.inodeNum, physBlock)
+		}
+	}
+	ext := &extent.Extent{LogicalBlock: blockNum, PhysicalBlock: physBlock, Length: 1, Flags: extent.FlagAllocated}
 	treeCtx, releaseTree, err := f.fs.extentMgr.ReserveTreeBlocks(ctx, ino)
 	if err != nil {
 		logging.Debugf("Write inode %d: reserving extent-tree blocks failed: %v", f.inodeNum, err)
-		f.fs.freeUnused(ctx, f.inodeNum, ext.PhysicalBlock)
-		return nil, nil, nil, allocErrno(err)
+		giveBack()
+		return nil, nil, nil, false, allocErrno(err)
 	}
 
 	if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-		f.fs.freeUnused(ctx, f.inodeNum, ext.PhysicalBlock)
+		giveBack()
 		releaseTree()
-		return nil, nil, nil, syscall.EIO
+		return nil, nil, nil, false, syscall.EIO
 	}
 	var fresh *inode.Inode
-	fail := func(errno error) (*inode.Inode, *extent.Extent, func(), error) {
+	fail := func(errno error) (*inode.Inode, *extent.Extent, func(), bool, error) {
 		f.fs.release(lock.LockTypeInode, uint64(f.inodeNum), "inode")
 		if fresh != nil {
 			f.fs.extentMgr.DiscardPending(ctx, fresh)
 		}
-		f.fs.freeUnused(ctx, f.inodeNum, ext.PhysicalBlock)
+		giveBack()
 		releaseTree()
-		return nil, nil, nil, errno
+		return nil, nil, nil, false, errno
 	}
 	fresh, err = f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
@@ -1947,7 +2001,7 @@ func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockN
 	}
 	fresh.AllocatedBlocks += ext.Length
 	fresh.WrittenBlocks += ext.Length
-	return fresh, ext, releaseTree, nil
+	return fresh, ext, releaseTree, reserved, nil
 }
 
 // writeInternal performs the actual write operation.
@@ -1985,6 +2039,40 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	var cowDone []*extent.CoWResult
 	// How many of allocatedExtents and cowDone a mid-write persist already put on disk.
 	committedAllocs, committedCoW := 0, 0
+	// No inode write may map these until their use is logged.
+	var reserveOut []uint64
+	var intents []uint64
+	defer func() {
+		for _, seq := range intents {
+			f.fs.closeIntent(seq)
+		}
+	}()
+	logReserveUse := func() error {
+		if len(reserveOut) == 0 {
+			return nil
+		}
+		var seq uint64
+		err := f.fs.reserve.Logged(reserveOut, func() error {
+			txn := f.fs.journal.Begin()
+			if err := txn.LogBlockUse(reserveOut); err != nil {
+				f.fs.journal.Abort(txn)
+				return err
+			}
+			var err error
+			if seq, err = f.fs.journal.Commit(txn); err != nil {
+				f.fs.journal.Abort(txn)
+			}
+			return err
+		})
+		used := len(reserveOut)
+		reserveOut = nil
+		if err != nil {
+			logging.Debugf("Write inode %d: logging the use of %d reserved blocks failed, leaving them allocated: %v", f.inodeNum, used, err)
+			return syscall.EIO
+		}
+		intents = append(intents, seq)
+		return nil
+	}
 	// An inode write that failed may still have reached the disk, so copies it
 	// carried can no longer be freed.
 	copiesMayBeOnDisk := false
@@ -2009,6 +2097,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			return nil
 		}
 		if inoDirty {
+			if err := logReserveUse(); err != nil {
+				releaseInodeLock()
+				f.fs.extentMgr.DiscardPending(ctx, ino)
+				return err
+			}
 			copiesMayBeOnDisk = true
 			if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 				logging.Debugf("Write inode %d: persisting inode before unlocking failed: %v", f.inodeNum, err)
@@ -2029,6 +2122,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			// Discarding frees tree blocks, which needs the bitmap lock: drop the inode lock first.
 			releaseInodeLock()
 			f.fs.extentMgr.DiscardPending(ctx, ino)
+			if len(reserveOut) > 0 {
+				f.fs.reserve.Untake(reserveOut...)
+			}
 			if !copiesMayBeOnDisk {
 				for _, cow := range cowDone[committedCoW:] {
 					if err := f.fs.extentMgr.FreePhysicalBlock(ctx, cow.NewPhysBlock); err != nil {
@@ -2105,16 +2201,23 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				}
 			}
 
-			// The inode is re-read after allocation, so persist changes made under the lock first.
-			if err := persistAndUnlock(); err != nil {
-				return 0, err
-			}
-
-			if f.fs.lockMgr != nil {
-				freshIno, newExt, releaseTree, allocErr := f.allocateBlockLocked(ctx, ino, blockNum)
+			if newExt, ok := f.mapReadyBlockLocked(ctx, ino, blockNum, lockHeld); ok {
+				reserveOut = append(reserveOut, newExt.PhysicalBlock)
+				inoDirty = true
+				ext = newExt
+				newBlock = true
+			} else if f.fs.lockMgr != nil {
+				// The inode is re-read after allocation, so persist changes made under the lock first.
+				if err := persistAndUnlock(); err != nil {
+					return 0, err
+				}
+				freshIno, newExt, releaseTree, reserved, allocErr := f.allocateBlockLocked(ctx, ino, blockNum)
 				if allocErr != nil {
 					logging.Debugf("Write inode %d: allocating block %d failed: %v", f.inodeNum, blockNum, allocErr)
 					return 0, allocErr
+				}
+				if reserved {
+					reserveOut = append(reserveOut, newExt.PhysicalBlock)
 				}
 				lockHeld = true
 				releaseReservations = append(releaseReservations, releaseTree)
@@ -2478,7 +2581,16 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
 		var commitErr error
-		intentSeq, commitErr = f.fs.journal.Commit(txn)
+		if len(reserveOut) > 0 {
+			commitErr = f.fs.reserve.Logged(reserveOut, func() error {
+				var err error
+				intentSeq, err = f.fs.journal.Commit(txn)
+				return err
+			})
+			reserveOut = nil
+		} else {
+			intentSeq, commitErr = f.fs.journal.Commit(txn)
+		}
 		if commitErr != nil {
 			logging.Debugf("Write inode %d: journal commit failed: %v", f.inodeNum, commitErr)
 			return 0, syscall.EIO

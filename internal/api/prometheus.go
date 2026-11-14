@@ -97,6 +97,12 @@ type fsCollector struct {
 	lockBlockedDesc          *prometheus.Desc
 	lockWaitSecondsDesc      *prometheus.Desc
 
+	reserveBlocksDesc          *prometheus.Desc
+	reserveRefillsDesc         *prometheus.Desc
+	reserveReturnsDesc         *prometheus.Desc
+	reservePeerWaitsDesc       *prometheus.Desc
+	reservePeerWaitSecondsDesc *prometheus.Desc
+
 	// SFB (Sparse File Bitmap) metrics
 	sfbTotalBlocksDesc        *prometheus.Desc
 	sfbAllocatedBlocksDesc    *prometheus.Desc
@@ -395,6 +401,31 @@ func newFSCollector(s *Server) *fsCollector {
 			"Time blocked lock acquires spent waiting, by lock type",
 			[]string{"type"}, nil,
 		),
+		reserveBlocksDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "reserve", "blocks"),
+			"Data blocks this node holds in reserve and has not handed out",
+			nil, nil,
+		),
+		reserveRefillsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "reserve", "refills_total"),
+			"Reserves this node took from the bitmap",
+			nil, nil,
+		),
+		reserveReturnsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "reserve", "returns_total"),
+			"Reserves this node gave back to the bitmap",
+			nil, nil,
+		),
+		reservePeerWaitsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "reserve", "peer_waits_total"),
+			"Allocations that found the bitmap full and waited for other nodes to give back reserved blocks",
+			nil, nil,
+		),
+		reservePeerWaitSecondsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "reserve", "peer_wait_seconds_total"),
+			"Time allocations waited for other nodes' reserved blocks",
+			nil, nil,
+		),
 
 		// SFB (Sparse File Bitmap)
 		sfbTotalBlocksDesc: prometheus.NewDesc(
@@ -535,6 +566,11 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.lockAcquiresDesc
 	ch <- c.lockBlockedDesc
 	ch <- c.lockWaitSecondsDesc
+	ch <- c.reserveBlocksDesc
+	ch <- c.reserveRefillsDesc
+	ch <- c.reserveReturnsDesc
+	ch <- c.reservePeerWaitsDesc
+	ch <- c.reservePeerWaitSecondsDesc
 
 	// SFB
 	ch <- c.sfbTotalBlocksDesc
@@ -593,6 +629,14 @@ func (c *fsCollector) Collect(ch chan<- prometheus.Metric) {
 	// Collect lock stats
 	if lock := provider.LockStats(); lock != nil {
 		c.collectLockStats(ch, lock)
+	}
+	if all := provider.AllStats(); all != nil && all.Reserve != nil {
+		r := all.Reserve
+		ch <- prometheus.MustNewConstMetric(c.reserveBlocksDesc, prometheus.GaugeValue, float64(r.Blocks))
+		ch <- prometheus.MustNewConstMetric(c.reserveRefillsDesc, prometheus.CounterValue, float64(r.Refills))
+		ch <- prometheus.MustNewConstMetric(c.reserveReturnsDesc, prometheus.CounterValue, float64(r.Returns))
+		ch <- prometheus.MustNewConstMetric(c.reservePeerWaitsDesc, prometheus.CounterValue, float64(r.PeerWaits))
+		ch <- prometheus.MustNewConstMetric(c.reservePeerWaitSecondsDesc, prometheus.CounterValue, r.PeerWaitSeconds)
 	}
 
 	// Collect SFB stats

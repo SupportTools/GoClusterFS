@@ -64,6 +64,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 |------|------|---------|-------------|
 | `-journal` | bool | `true` | Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only |
 | `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data) |
+| `-block-reserve` | int | `64` | Data blocks each node takes from the bitmap at once and hands out to writes without the cluster-wide bitmap lock; `0` turns reserves off. Needs `-journal`. See [Block Reserves](OPERATIONS.md#block-reserves) |
 
 ### Network Broadcast Flags
 
@@ -166,7 +167,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
 | `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |
 
-`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*` (including `lock_acquires_total`, `lock_blocked_total` and `lock_wait_seconds_total`, labeled by lock `type`), `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
+`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*` (including `lock_acquires_total`, `lock_blocked_total` and `lock_wait_seconds_total`, labeled by lock `type`), `reserve_blocks`, `reserve_refills_total`, `reserve_returns_total`, `reserve_peer_waits_total` and `reserve_peer_wait_seconds_total` (with block reserves on), `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
 

@@ -3106,6 +3106,239 @@ scenarios:
     environments:
       go: internal/goclusterfs/reserve_crash_test.go::TestFsckRepairFreesCrashedNodesReserveOnce
 
+  - id: reserve-size
+    name: Reserve size and low-space cutoff
+    description: A reserve holds at most the configured size and a sixteenth of the free blocks per node, and none below two reserves per node or 1% of the blocks
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReserveSize
+
+  - id: reserve-return-order
+    name: Reserve return ends its record first
+    description: Giving the reserve back ends its journal record before freeing blocks, so a crash in between leaks rather than double-frees
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReturnEndsRecordBeforeFreeing
+
+  - id: reserve-return-handed-out
+    name: Block handed back after a return is freed
+    description: Returning the reserve while a write holds one of its blocks ends the record; the block the write later hands back is freed without a record
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestBlockHandedBackAfterReturnIsFreed
+
+  - id: reserve-failed-log
+    name: Failed commit leaves its reserved blocks allocated
+    description: A block whose use commit failed may be mapped on disk, so it goes neither back to the reserve nor to the bitmap
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFailedLogLeavesBlockAllocated
+
+  - id: reserve-failed-end
+    name: Failed record end keeps its blocks
+    description: When ending a reserve record fails, its blocks stay reserved, and a later return ends it and frees them
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFailedEndKeepsBlocks
+
+  - id: reserve-refresh
+    name: Old reserve record is renewed
+    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record and ends; if the old record cannot end, nothing is freed until it does
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefreshRenewsAnOldRecord
+
+  - id: reserve-refresh-handed-out
+    name: Old record of handed-out blocks ends
+    description: A record whose blocks are all handed out ends once it is far behind the tail, so a write stuck on a lock cannot hold the journal head back
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefreshEndsRecordOfHandedOutBlocks
+
+  - id: reserve-used-record-ends
+    name: Fully used reserve record ends
+    description: A record whose blocks were all used ends at the next tidy
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestUsedRecordEnds
+
+  - id: reserve-refill-record-failure
+    name: Refill whose record fails
+    description: A refill whose record hit a full journal marks nothing; any other commit error leaves the blocks allocated, and the transaction is aborted either way
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefillRecordFailure
+
+  - id: reserve-writers-never-wait-for-bitmap
+    name: Writers never wait for the bitmap lock through the reserve
+    description: TakeReady, Untake, Logged and Stats return while a refill or a return waits for the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestWritersDoNotWaitForBitmapLock
+
+  - id: reserve-inode-lock-holders-skip-refill
+    name: Inode-lock holders and statfs do not wait for a refill
+    description: While another node holds the bitmap lock and a refill waits for it, statfs and a write holding an inode lock still use the reserve
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestInodeLockHoldersDoNotWaitForRefill
+
+  - id: reserve-peer-requests-coalesce
+    name: Peer return requests coalesce
+    description: A flood of peer requests gives the reserve back at most once per tick while a writer keeps refilling it
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestPeerRequestsCoalesce
+
+  - id: reserve-statfs-own-reserve
+    name: Statfs counts the node's own reserve as free
+    description: A one-block write lowers statfs by one block although it took a whole reserve from the bitmap
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestStatfsCountsOwnReserveAsFree
+
+  - id: bitmap-reserve-restores-on-write-failure
+    name: Failed reserve sector write ends the record, then restores
+    description: A reserve whose second sector write fails ends its record and restores the first sector; if the record cannot end, it writes the failed sector again and keeps the blocks
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestReserveRestoresSectorsWhenAWriteFails
+
+  - id: journal-durable-end-full-ring
+    name: Durable end of the oldest intent in a full ring
+    description: A reserve record that pins a ring too full for a completion record still ends, because the head moves past it; replay then frees none of its blocks and commits work again
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteIntentDurableEndsOldestIntentInFullRing
+
+  - id: journal-failed-head-move
+    name: Failed head move keeps replay whole
+    description: When moving the head past a full ring's oldest intent fails after the head moved in memory, the intent stays ended, the next checkpoint stays consistent and replay runs every pending intent; a retry writes the moved head
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestFailedHeadMoveKeepsReplayWhole
+
+  - id: reserve-journal-full-log
+    name: Journal-full use commit puts blocks back
+    description: A use commit that hit a full journal wrote nothing, so its blocks go back to the reserve
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestJournalFullLogPutsBlockBack
+
+  - id: reserve-free-count-saturates
+    name: Cached free count never wraps
+    description: Subtracting a refill from a free count that already left it out stops at zero
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFreeCountNeverWraps
+
+  - id: reserve-reopened-record-ends
+    name: Record reopened after a failed refresh ends
+    description: A refresh that fails after a write used a record's last blocks reopens the record, which then ends as fully used
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRecordReopenedAfterFailedRefreshEnds
+
+  - id: reserve-ends-skip-frees
+    name: Record ends and peer waits never wait for frees
+    description: While a return's free waits for the bitmap lock, tidy, refresh and WaitForPeers (even with endMu held) all finish
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestWaitForPeersAndEndsDoNotWaitForFrees
+
+  - id: journal-durable-intent-completion
+    name: Durable intent completion survives a failed write
+    description: CompleteIntentDurable keeps the intent pending when the completion cannot be written, so a retry writes it and replay skips the intent
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteIntentDurableRetriesAfterFailure
+
+  - id: reserve-writes
+    name: Writes take blocks from the reserve
+    description: Ten one-block writes take the bitmap lock once, and unmount gives the rest of the reserve back; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestWritesTakeBlocksFromReserve
+
+  - id: reserve-idle-return
+    name: Idle reserve goes back
+    description: A reserve nobody takes from goes back to the bitmap after the idle time
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestIdleReserveGoesBack
+
+  - id: reserve-replay-used-freed-retaken
+    name: Replay keeps a reserved block used, freed and retaken
+    description: Node A writes a reserved block, truncates it and node B allocates it; replaying A's journal frees A's unused reserve and leaves B's block alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsReservedBlockUsedFreedAndRetaken
+
+  - id: reserve-full-waits-for-peers
+    name: Full bitmap waits for peers' reserves
+    description: Node B finds the bitmap full while node A holds a reserve; B asks for it back and its write gets a block instead of ENOSPC
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestFullBitmapWaitsForPeersReserve
+
+  - id: reserve-full-enospc
+    name: Full bitmap without reserves is ENOSPC
+    description: With no blocks in any reserve, a write on a full device fails with ENOSPC after the wait for other nodes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestFullBitmapWithoutReservesIsENOSPC
+
+  - id: reserve-concurrent-writers
+    name: Concurrent writers share a reserve
+    description: Four writers share one reserve while it refills and goes back when idle; every file keeps its data and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestConcurrentWritersShareReserve
+
+  - id: power-cut-reserve-refill
+    name: Power cut during a reserve refill
+    description: Power fails at every write of a write that takes the first reserve and maps a block; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReserveRefill
+
+  - id: power-cut-write-from-reserve
+    name: Power cut during a write from the reserve
+    description: Power fails at every write of a write that maps a block the reserve holds; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringWriteFromReserve
+
+  - id: power-cut-two-block-reserve
+    name: Power cut during a two-block reserved write
+    description: Power fails at every write of a write that maps two reserved blocks; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringTwoBlockWriteFromReserve
+
+  - id: power-cut-reserve-return
+    name: Power cut during a reserve return
+    description: Power fails at every write of giving the reserve back; files keep their data and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReserveReturn
+
+  - id: power-cut-reserved-write-copies
+    name: Power cut during a reserved write that copies
+    description: Power fails at every write of a write that maps a reserved block and copies a shared one; the file and its snapshot keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReservedWriteThatCopies
+
+  - id: reserve-returned-after-crash
+    name: Killed node's reserve is returned and its written blocks kept
+    description: A node writes from its block reserve and is killed; the survivor replays its journal, the unused reserved blocks come back, and the written file keeps its data and blocks through later allocations
+    priority: high
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsMappedBlocksOfCrashedNodesReserve
+      docker: TODO - Docker kills containers but the harness has no df comparison across nodes; the Go replay test and the VM test cover it
+      vm: run-vm-tests.sh::test_reserve_returned_after_crash
+
   # ===========================================================================
   # DISTRIBUTED LOCK SAFETY (internal/lock)
   # Two or three lock managers share one device to act as separate nodes.

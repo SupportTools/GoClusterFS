@@ -306,6 +306,16 @@ If a node did stall for 15 seconds or more while mounted (hung-task warnings in 
 
 What is safe today: a node that crashes or is killed and stays down, and a clean unmount. Other nodes take over a crashed node's locks as described under [Node Requirements](#node-requirements).
 
+### Block Reserves
+
+Each node takes up to 64 free blocks from the block bitmap at once (`-block-reserve`), under one hold of the cluster-wide bitmap lock, and hands them to its writes without that lock. Without reserves, every new data block takes the bitmap lock, and with four nodes writing at once about 60% of their time went to waiting for it. Only new data blocks of writes come from the reserve. Extent-tree blocks, directory blocks, copy-on-write copies and `fallocate` still take the bitmap lock.
+
+- **Size.** A reserve holds at most `-block-reserve` blocks, and at most 1/16 of the free blocks per mounted node. There are no reserves while fewer blocks are free than 1% of the device or two reserves per mounted node.
+- **Going back.** A node gives its unused reserve back within 11 seconds of its last write, at a clean unmount, and when a write finds free space below that line.
+- **Full device.** A node that finds no free block gives back its own reserve, asks the other nodes over broadcast to give back theirs, once a second, and retries for up to 12 seconds before it fails with `ENOSPC`. It logs the wait at INFO, and `goclusterfs_reserve_peer_waits_total` and `goclusterfs_reserve_peer_wait_seconds_total` count it. Without broadcast, other nodes still give back idle reserves within 11 seconds. A node answers at most one request a second.
+- **`df`.** A node counts its own unused reserve as free, since its writes can use it. Other nodes' reserves count as used until they give them back, so `df` on two nodes can differ by up to 64 MB per node at the default.
+- **Crash.** Each reserve is a journal record. When the node's journal is replayed, by the node at its next mount or by another node, the blocks it reserved and never used go back to the bitmap. fsck reports them as "reserved by node N and never used", which is not an error, and `fsck -repair -force` frees them after it marks the reserve done in that node's journal, so a later replay does not free them again. A crash in a few narrow windows leaks a few blocks instead, and `fsck -repair` reclaims them: between ending a reserve and freeing it, and while a write holds a block whose reserve the node ended early, to give it back or because the journal ring was filling up.
+
 ### Handling Node Failure
 
 When a node fails unexpectedly:
