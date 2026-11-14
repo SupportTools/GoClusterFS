@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('X')
+bool(false)
+[]byte("\xf0\x92\x92𒒒")
