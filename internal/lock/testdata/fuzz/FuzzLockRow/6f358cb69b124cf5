@@ -1,0 +1,6 @@
+go test fuzz v1
+byte(';')
+byte('\x14')
+bool(false)
+byte('\x02')
+[]byte("20002")

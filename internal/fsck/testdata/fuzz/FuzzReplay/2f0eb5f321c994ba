@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("8110001081)01")
+byte('4')
+[]byte("")

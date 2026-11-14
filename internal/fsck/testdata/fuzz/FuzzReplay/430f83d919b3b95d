@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("20002")
+byte('\x1d')
+[]byte("0")

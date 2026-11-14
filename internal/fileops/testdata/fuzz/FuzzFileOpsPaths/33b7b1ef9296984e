@@ -1,0 +1,4 @@
+go test fuzz v1
+string("0")
+string("\x7f\u05c8ꖣ\ue5d7荗\x7f\x7f檸\x7f/\x7f\x7f랽")
+string("/0")

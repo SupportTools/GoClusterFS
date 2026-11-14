@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('Q')
+bool(true)
+[]byte("\x00a\xbe\xbe9X")

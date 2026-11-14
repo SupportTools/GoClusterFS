@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('L')
+bool(true)
+[]byte("0")
+[]byte("82001820")

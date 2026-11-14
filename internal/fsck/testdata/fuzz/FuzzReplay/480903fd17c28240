@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("8X1020108X%27")
+byte('ð')
+[]byte("0")

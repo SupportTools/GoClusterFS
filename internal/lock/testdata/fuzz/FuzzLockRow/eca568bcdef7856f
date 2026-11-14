@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('(')
+byte('\x00')
+bool(false)
+byte('\x05')
+[]byte("10000200020001000020001")

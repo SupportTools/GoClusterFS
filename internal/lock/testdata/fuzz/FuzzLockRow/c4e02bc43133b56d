@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x14')
+byte('@')
+bool(true)
+byte('I')
+[]byte("80008000800080008000800080008")
