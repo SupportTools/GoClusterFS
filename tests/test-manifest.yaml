@@ -1535,6 +1535,34 @@ scenarios:
     environments:
       go: internal/snapshot/snapshot_test.go::TestDescriptorKeepsTargetBirth
 
+  - id: reads-never-show-stale-bytes
+    name: Reads never show bytes nobody wrote to the file
+    description: A file of marker data is deleted, then another file reuses its blocks through a sparse write, a write that grows within a new block, truncate down then up or then a sparse write, fallocate, copy-on-write of a partial block, a clone and a clone of a snapshot of a truncated file; no read shows the marker or the file's own truncated data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestReadsNeverShowStaleBytes
+
+  - id: reserved-block-never-shows-stale-bytes
+    name: A block from the node's reserve reads zeros where the write did not cover it
+    description: The reserve holds blocks a deleted file freed; a partial write into one shows zeros, never the deleted file's data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestReservedBlockNeverShowsStaleBytes
+
+  - id: truncate-into-block-power-failure
+    name: Power failure during a truncate into the middle of a block
+    description: Power fails at each write of the truncate; after the file grows again, bytes past the cut are zeros, or the file's own bytes only where an unacknowledged truncate had not zeroed them
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestPowerCutDuringTruncateIntoABlock
+
+  - id: first-write-into-reused-block-power-failure
+    name: Power failure during a first write into a block a deleted file freed
+    description: Power fails at each write of a partial write into a reused block, with and without the reserve; the file is empty or holds zeros and the data, never the deleted file's bytes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestPowerCutDuringFirstWriteIntoAReusedBlock
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run

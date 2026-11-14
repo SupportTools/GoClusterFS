@@ -2228,6 +2228,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			} else {
 				// Allocate block (acquires bitmap lock internally, then releases it)
 				ext, err = f.fs.extentMgr.AllocateBlocks(ctx, ino, blockNum, 1)
+				newBlock = true
 				if err != nil {
 					logging.Debugf("Write inode %d: AllocateBlocks at block %d failed: %v", f.inodeNum, blockNum, err)
 					switch {
@@ -2258,6 +2259,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 
 	handleExtent:
+		// A new block may hold a freed file's data; the write zeroes what it does not cover.
+		zeroFirst = newBlock
 		// A shared block is copied before the write, so its other owners keep their data.
 		if ext.Flags&extent.FlagShared != 0 && f.fs.refcountReg != nil {
 			// Refcounts and the bitmap come before the inode in lock order.
@@ -2873,6 +2876,11 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	ctx = detach(ctx)
+	if size, ok := in.GetSize(); ok {
+		if errno := f.zeroPastEnd(ctx, size); errno != 0 {
+			return errno
+		}
+	}
 	for attempt := 0; ; attempt++ {
 		unlock := f.fs.lockInode(f.inodeNum)
 		errno, err := f.setattr(ctx, fh, in, out)
@@ -2885,6 +2893,31 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		}
 		conflictBackoff(attempt)
 	}
+}
+
+// zeroPastEnd zeroes the bytes a shrink to size leaves in its last block, before the size changes, so growing the
+// file later reads zeros there instead of the old data. It writes through Write, which copies a shared block first.
+func (f *File) zeroPastEnd(ctx context.Context, size uint64) syscall.Errno {
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		return syscall.EIO
+	}
+	end := min(ino.Size, (size/BlockSize+1)*BlockSize)
+	if size%BlockSize == 0 || size >= end || ino.IsSFBBacked() {
+		return 0
+	}
+	ext, _, err := f.fs.extentMgr.Lookup(ino, size/BlockSize)
+	if errors.Is(err, extent.ErrExtentNotFound) || err == nil && ext.Flags&extent.FlagUnwritten != 0 {
+		return 0
+	}
+	if err != nil {
+		return syscall.EIO
+	}
+	n, errno := f.Write(ctx, nil, make([]byte, end-size), int64(size))
+	if errno == 0 && uint64(n) != end-size {
+		errno = syscall.EIO
+	}
+	return errno
 }
 
 // setattr applies one Setattr attempt. A non-nil error means another node
