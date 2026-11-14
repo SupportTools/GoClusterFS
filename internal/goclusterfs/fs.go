@@ -1690,6 +1690,10 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	}
 
 	logging.Debugf("File.Getattr: inode=%d Size=%d AllocatedBlocks=%d", f.inodeNum, ino.Size, ino.AllocatedBlocks)
+	// Reads use the cached inode; they must not stop at an older size than stat shows.
+	if ino.Magic == inode.InodeMagic {
+		f.fs.cacheInode(ino)
+	}
 
 	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0

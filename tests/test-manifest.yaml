@@ -484,6 +484,74 @@ scenarios:
       docker: run-tests.sh::test_network_partition
       vm: run-vm-tests.sh::test_network_partition
 
+  - id: open-file-growth-without-broadcast
+    name: Open file reads growth without broadcast
+    description: A node with broadcast off and a long cache TTL holds a file open while another node grows it; once stat shows the new size, a read at the new end returns the data
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOpenFileSeesGrowthWithoutBroadcast
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  # Staleness under network faults. Each test has node 1 rewrite a file while
+  # node 2 reads it through an open handle, node 3 stats it and node 4 opens it
+  # afresh, and checks how late each sees every version. Integration tests run
+  # every node in one network namespace, so tc and iptables cannot fault one
+  # node's traffic there.
+  - id: staleness-packet-loss
+    name: Staleness under packet loss
+    description: 30% loss on the writer's traffic; open, stat and fresh-open reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_packet_loss
+      vm: TODO
+
+  - id: staleness-duplication-reordering
+    name: Staleness under duplication and reordering
+    description: 30% duplicated and 50% reordered writer traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_duplication_and_reordering
+      vm: TODO
+
+  - id: staleness-delay
+    name: Staleness under delay
+    description: Writer traffic delayed 0 to 2 seconds; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_delay
+      vm: TODO
+
+  - id: staleness-one-way-partition
+    name: Staleness under a one-way partition
+    description: The reader hears nothing from the writer, which still hears the reader; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_one_way_partition
+      vm: TODO
+
+  - id: staleness-multicast-dropped
+    name: Staleness with multicast dropped
+    description: The reader drops all multicast while unicast works; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  - id: staleness-flood-under-loss
+    name: Staleness during an invalidation flood under loss
+    description: A third node floods invalidations while the writer and reader lose 10% of their traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_flood_under_loss
+      vm: TODO
+
   - id: rolling-restart
     name: Rolling restart
     description: Nodes can be restarted one at a time
@@ -654,6 +722,57 @@ scenarios:
       go: lock_reclaim_test.go::TestStalledNodesWritesStopAtWriteGate
       docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
       vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
+
+  - id: hostile-storage-short-stalls
+    name: Short storage stalls on one node
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_stalls
+
+  - id: hostile-storage-long-stall
+    name: Long storage stall fences the node
+    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_stall
+
+  - id: hostile-storage-short-eio
+    name: Short EIO burst on one node
+    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_eio
+
+  - id: hostile-storage-long-eio
+    name: Long EIO burst fences the node
+    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_eio
+
+  - id: hostile-storage-flaky-eio
+    name: Flaky EIO on one node
+    description: One node's path fails every I/O for 1s in every 4s, for 40s; the node keeps running, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_flaky_eio
+
+  - id: partitioned-nodes-fall-back-to-cache-ttl
+    name: Partitioned nodes fall back to the cache TTL
+    description: Two nodes with different broadcast secrets receive none of each other's messages; each sees the other's creates, overwrites, growth, new directories, deletes and concurrent writes within the cache TTL plus the attribute timeout, and fsck is clean
+    priority: high
+    environments:
+      go: partition_test.go::TestPartitionedNodesFallBackToCacheTTL
+      docker: TODO  # would need per-container broadcast secrets in the compose file; covered on host mounts
+      vm: SKIPPED  # VMs share one user-mode network address and never exchange broadcasts
+
+  - id: one-failed-write-keeps-acknowledged-results
+    name: One failed write keeps acknowledged results
+    description: One device write fails with EIO in a workload that creates, writes, overwrites, truncates and unlinks; by default the last inode write of each step with a crash after it, and the first and last write to each region with the node running on (GOCLUSTERFS_EIO_SWEEP=metadata or full for more). Every acknowledged result holds, and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestOneFailedWriteKeepsAcknowledgedResults
 
   - id: lock-adopt-owner
     name: Replaying node takes over a dead node's exclusive locks
@@ -3797,6 +3916,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
+
+  - id: snapshot-unreadable-sector-not-rewritten
+    name: An unreadable snapshot registry sector is not rewritten
+    description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
 
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
