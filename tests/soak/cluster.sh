@@ -23,13 +23,18 @@ source "${SOAK_DIR}/../vm/vm-test-harness.sh" >&2
 
 reply() { echo "$*"; }
 
+# Matches goclusterfs-mount by its command line: the kernel cuts process names to 15
+# characters, so pidof and pkill -x never match it. The bracket keeps the pattern from
+# matching the shell that runs it.
+MOUNT_PATTERN="'^/usr/local/bin/goclusterfs-moun[t]'"
+
 mount_pid() {
-    ssh_run "$1" "pidof goclusterfs-mount" 2>/dev/null
+    ssh_run "$1" "pgrep -f $MOUNT_PATTERN" 2>/dev/null
 }
 
 # Kills a node's mount process and clears its mount point, as a crash leaves it.
 kill_mount() {
-    ssh_run "$1" "pkill -9 -x goclusterfs-mount; sleep 1; fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
+    ssh_run "$1" "pkill -9 -f $MOUNT_PATTERN; sleep 1; fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
 }
 
 remount() {
@@ -39,7 +44,7 @@ remount() {
 unmount_node() {
     local vm_id=$1 waited=0
     ssh_run "$vm_id" "fusermount3 -u ${GOCLUSTERFS_MOUNT}" || true
-    while ssh_run "$vm_id" "pidof goclusterfs-mount > /dev/null"; do
+    while ssh_run "$vm_id" "pgrep -f $MOUNT_PATTERN > /dev/null"; do
         if [[ $waited -ge 30 ]]; then
             log_warn "VM $vm_id: goclusterfs-mount still running 30s after unmount, killing it"
             kill_mount "$vm_id"
