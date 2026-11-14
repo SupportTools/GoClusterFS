@@ -1312,23 +1312,36 @@ func TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne(t *testing.T) {
 }
 
 // A host that rebooted after a crash takes back the slot it held under the same
-// hostname once the slot proves silent, so its mount replays that journal.
+// hostname once the slot proves silent, so its mount replays that journal. A
+// live host that shares the name beats during the watch and keeps its slot.
 func TestRegisterTakesBackSlotOfItsEarlierBoot(t *testing.T) {
-	shortenSilentSlotWatch(t)
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-	reg := NewRegistry(dev, 0)
-	earlier := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 3,
-		HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix(), BootID: [16]byte{0xEE}}
-	copy(earlier.Hostname[:], "node")
-	if err := reg.writeSlot(0, earlier); err != nil {
-		t.Fatal(err)
-	}
-	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 0 {
-		t.Fatalf("Register = %d, %v; want slot 0, held by this hostname before a reboot", slot, err)
-	}
-	if owner, ok := reg.PreviousOwner(); !ok || owner != earlier.UUID {
-		t.Errorf("PreviousOwner = %x, %v; want the earlier boot's node %x", owner, ok, earlier.UUID)
+	for _, beating := range []bool{false, true} {
+		t.Run(map[bool]string{false: "silent", true: "another host with the name"}[beating], func(t *testing.T) {
+			shortenSilentSlotWatch(t)
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			reg := NewRegistry(dev, 0)
+			earlier := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 3,
+				HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix(), BootID: [16]byte{0xEE}}
+			copy(earlier.Hostname[:], "node")
+			if err := reg.writeSlot(0, earlier); err != nil {
+				t.Fatal(err)
+			}
+			if beating {
+				defer keepWriting(t, reg, 0, earlier, 3*HeartbeatTimeout)()
+			}
+			slot, err := reg.Register(context.Background(), "node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner, ok := reg.PreviousOwner()
+			switch {
+			case beating && slot == 0:
+				t.Error("Register took the slot of a live host that shares this hostname")
+			case !beating && (slot != 0 || !ok || owner != earlier.UUID):
+				t.Errorf("Register = %d, previous owner %x %v; want slot 0 of this hostname's earlier boot, node %x", slot, owner, ok, earlier.UUID)
+			}
+		})
 	}
 }
 
