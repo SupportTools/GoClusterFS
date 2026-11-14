@@ -3202,6 +3202,276 @@ test_fsck_repair_after_power_failure() {
 }
 
 # =============================================================================
+# Power failures during copy-on-write, snapshots and TRIM
+# =============================================================================
+# A workload script runs on the victim and prints a line after each step it
+# finished with fsync. The victim loses power mid-workload; every step it
+# acknowledged must survive replay, and fsck may find nothing but leaks.
+
+# Prints the letter round $1 of a workload writes.
+round_letter() {
+    printf "\\$(printf %03o $((65 + $1 % 26)))"
+}
+
+install_power_failure_scripts() {
+    local vm_id=$1
+    ssh_run "$vm_id" "cat > /tmp/pf_letters.sh && chmod +x /tmp/pf_letters.sh" <<'EOF'
+#!/bin/sh
+# Prints, for each 64KB chunk of $1 from byte $2 for $3 chunks, its letter, or the distinct bytes of a mixed chunk
+# in parentheses.
+for L in a A B C D E F G H I J K L M N O P Q R S T U V W X Y Z; do
+    echo "$(head -c 65536 /dev/zero | tr '\0' "$L" | md5sum | cut -c1-32) $L"
+done > /tmp/pf_letter_md5s
+k=0
+while [ "$k" -lt "$3" ]; do
+    chunk="dd if=$1 bs=65536 skip=$(($2 / 65536 + k)) count=1"
+    m=$($chunk 2>/dev/null | md5sum | cut -c1-32)
+    L=$(grep "^$m " /tmp/pf_letter_md5s | cut -c34)
+    if [ -z "$L" ]; then
+        L="($($chunk 2>/dev/null | od -An -c -v | tr -s ' ' '\n' | grep -v '^$' | sort -u | tr -d '\n'))"
+    fi
+    printf %s "$L"
+    k=$((k + 1))
+done
+echo
+EOF
+    ssh_run "$vm_id" "cat > /tmp/pf_cow.sh && chmod +x /tmp/pf_cow.sh" <<'EOF'
+#!/bin/sh
+# Rewrites block (round % 4) of $1 with the round's letter, with fsync, and acknowledges each round.
+i=0
+while :; do
+    i=$((i + 1))
+    c=$(printf "\\$(printf %03o $((65 + i % 26)))")
+    head -c 1048576 /dev/zero | tr '\0' "$c" | dd of="$1" bs=1M seek=$((i % 4)) conv=notrunc,fsync 2>/dev/null || exit 1
+    echo "ack $i"
+done
+EOF
+    ssh_run "$vm_id" "cat > /tmp/pf_snap.sh && chmod +x /tmp/pf_snap.sh" <<'EOF'
+#!/bin/sh
+# Creates snapshot pf_s<round> of $1 and deletes the one from two rounds back, acknowledging each step.
+i=0
+while :; do
+    i=$((i + 1))
+    setfattr -n user.snapshot -v "pf_s$i" "$1" || exit 1
+    echo "created $i"
+    if [ "$i" -gt 2 ]; then
+        setfattr -x "user.snapshot.pf_s$((i - 2))" "$1" || exit 1
+        echo "deleted $((i - 2))"
+    fi
+done
+EOF
+    ssh_run "$vm_id" "cat > /tmp/pf_trim.sh && chmod +x /tmp/pf_trim.sh" <<'EOF'
+#!/bin/sh
+# Writes a 2MB file of the round's letter in $1 with fsync after removing the file from three rounds back, so new
+# files reuse blocks TRIM has queued, and acknowledges each round.
+i=0
+while :; do
+    i=$((i + 1))
+    rm -f "$1/trim_pf_$((i - 3)).bin"
+    c=$(printf "\\$(printf %03o $((65 + i % 26)))")
+    head -c 2097152 /dev/zero | tr '\0' "$c" | dd of="$1/trim_pf_$i.bin" bs=1M conv=fsync 2>/dev/null || exit 1
+    echo "ack $i"
+done
+EOF
+}
+
+# Cuts power to VM $1 while it runs workload $2 for $3 seconds, writing its acknowledgements to file $4.
+power_fail_during() {
+    local victim=$1 workload=$2 seconds=$3 acks=$4
+    ssh_run "$victim" "$workload" > "$acks" 2>/dev/null &
+    local runner=$!
+    sleep "$seconds"
+    log_info "Simulating power failure on VM $victim after $(wc -l < "$acks") acknowledged steps..."
+    kill_vm "$victim"
+    wait "$runner" 2>/dev/null || true
+}
+
+# Restarts VM $1 with journal replay, then requires fsck to find nothing but leaks and -repair to fix them.
+restart_and_expect_only_leaks() {
+    local victim=$1 fsck=/usr/local/bin/goclusterfs-fsck vm_id out problems
+    start_vm "$victim" false
+    wait_vm_healthy "$victim" || return 1
+    setup_goclusterfs "$victim" false || return 1
+    sleep 3  # snapshot recovery jobs finish in the background after mount
+    for vm_id in $(seq 1 "$NODE_COUNT"); do
+        if ! unmount_goclusterfs "$vm_id"; then
+            log_error "VM $vm_id: GoClusterFS did not unmount"
+            return 1
+        fi
+    done
+
+    out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
+    problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]')
+    if echo "$problems" | grep -v -e '^$' -e 'leaked' -e 'will never be freed' -e 'unnamed: no directory names it' -e 'belongs to no snapshot' | grep -q .; then
+        log_error "fsck after the power failure found more than leaks:"
+        echo "$problems" | head -20 >&2
+        return 1
+    fi
+    if [[ -n "$problems" ]]; then
+        log_info "fsck found $(echo "$problems" | wc -l) leaks; repairing"
+        ssh_run 1 "$fsck -repair /dev/vda > /dev/null 2>&1"
+        out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
+        if echo "$out" | grep -qE '^ *\[(WARN|ERROR)\]'; then
+            log_error "fsck after repair still finds problems:"
+            echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | head -20 >&2
+            return 1
+        fi
+    fi
+    for vm_id in $(seq 1 "$NODE_COUNT"); do
+        setup_goclusterfs "$vm_id" false || return 1
+    done
+}
+
+test_cow_write_power_failure() {
+    log_info "Testing a power failure during copy-on-write writes to a snapshotted file..."
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: Need at least 2 VMs for this test"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+    local victim=2 f=${GOCLUSTERFS_MOUNT}/cow_pf.bin acks
+    acks=$(mktemp)
+    install_power_failure_scripts "$victim"
+    install_power_failure_scripts 1
+    ssh_run "$victim" "head -c 4194304 /dev/zero | tr '\\0' a > $f && sync && setfattr -n user.snapshot -v cow_pf_snap $f" || return 1
+
+    power_fail_during "$victim" "/tmp/pf_cow.sh $f" 6 "$acks"
+    local last
+    last=$(awk '/^ack/ {n = $2} END {print n + 0}' "$acks")
+    restart_and_expect_only_leaks "$victim" || return 1
+
+    local b r letters want maybe
+    for b in 0 1 2 3; do
+        want=a
+        for ((r = last; r > 0; r--)); do
+            if (( r % 4 == b )); then want=$(round_letter "$r"); break; fi
+        done
+        maybe=$want
+        for r in $((last + 1)) $((last + 2)); do
+            (( r % 4 == b )) && maybe="$maybe$(round_letter "$r")"
+        done
+        letters=$(ssh_run 1 "/tmp/pf_letters.sh $f $((b * 1048576)) 16")
+        # A write in flight may stop partway through a chunk, but only old and new bytes may show.
+        if [[ ! "$letters" =~ ^([$maybe]|\([$maybe]+\)){16}$ ]]; then
+            log_error "block $b after $last acknowledged writes holds '$letters', want only '$maybe'"
+            return 1
+        fi
+    done
+    ssh_run 1 "setfattr -n user.snapshot.clone -v cow_pf_snap:/cow_pf_snap_check.bin $f" || return 1
+    letters=$(ssh_run 1 "/tmp/pf_letters.sh ${GOCLUSTERFS_MOUNT}/cow_pf_snap_check.bin 0 64")
+    if [[ "$letters" != "$(printf 'a%.0s' $(seq 64))" ]]; then
+        log_error "snapshot cow_pf_snap changed: '$letters'"
+        return 1
+    fi
+    log_info "$last acknowledged copy-on-write writes and the snapshot survived the power failure"
+    rm -f "$acks"
+}
+
+test_snapshot_create_delete_power_failure() {
+    log_info "Testing a power failure while snapshots are created and deleted..."
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: Need at least 2 VMs for this test"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+    local victim=2 f=${GOCLUSTERFS_MOUNT}/snap_pf.bin acks
+    acks=$(mktemp)
+    install_power_failure_scripts "$victim"
+    ssh_run "$victim" "dd if=/dev/urandom of=$f bs=1M count=3 2>/dev/null && sync" || return 1
+    local base
+    base=$(ssh_run "$victim" "md5sum $f | cut -d' ' -f1")
+
+    power_fail_during "$victim" "/tmp/pf_snap.sh $f" 6 "$acks"
+    local created deleted
+    created=$(awk '/^created/ {n = $2} END {print n + 0}' "$acks")
+    deleted=$(awk '/^deleted/ {n = $2} END {print n + 0}' "$acks")
+    restart_and_expect_only_leaks "$victim" || return 1
+
+    if [[ "$(ssh_run 1 "md5sum $f | cut -d' ' -f1")" != "$base" ]]; then
+        log_error "snap_pf.bin changed"
+        return 1
+    fi
+    # Recovery finishes snapshots left creating or deleting in the background after mount. Entries are name:state.
+    local listed waited=0
+    while listed=$(ssh_run 1 "getfattr --only-values -n user.snapshots $f 2>/dev/null" | tr ',' '\n'); \
+        [[ $waited -lt 20 ]] && echo "$listed" | awk -F: -v d="$deleted" \
+            '$1 ~ /^pf_s/ && ($2 != "active" || substr($1, 5) + 0 <= d) {found = 1} END {exit !found}'; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    listed=$(echo "$listed" | cut -d: -f1)
+    local i name
+    for ((i = 1; i <= created + 1; i++)); do
+        name=pf_s$i
+        if ! echo "$listed" | tr ',' '\n' | grep -qx "$name"; then
+            if (( i <= created && i > deleted + 1 )); then
+                log_error "snapshot $name was acknowledged and not deleted, but is gone (listed: $listed)"
+                return 1
+            fi
+            continue
+        fi
+        if (( i <= deleted )); then
+            log_error "snapshot $name was acknowledged as deleted, but is still listed"
+            return 1
+        fi
+        ssh_run 1 "setfattr -n user.snapshot.clone -v $name:/${name}_check.bin $f" || return 1
+        if [[ "$(ssh_run 1 "md5sum ${GOCLUSTERFS_MOUNT}/${name}_check.bin | cut -d' ' -f1")" != "$base" ]]; then
+            log_error "snapshot $name changed"
+            return 1
+        fi
+    done
+    log_info "$created snapshots created and $deleted deleted before the power failure; the survivors are intact"
+    rm -f "$acks"
+}
+
+test_trim_reuse_power_failure() {
+    log_info "Testing a power failure while freed blocks wait for TRIM and new files reuse them..."
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: Need at least 2 VMs for this test"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+    local victim=2 acks
+    acks=$(mktemp)
+    install_power_failure_scripts "$victim"
+    install_power_failure_scripts 1
+    ssh_run "$victim" "dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/trim_keep.bin bs=1M count=4 2>/dev/null && sync" || return 1
+    local keep
+    keep=$(ssh_run "$victim" "md5sum ${GOCLUSTERFS_MOUNT}/trim_keep.bin | cut -d' ' -f1")
+
+    # TRIM flushes freed blocks after 5s, so the workload runs through several flushes.
+    power_fail_during "$victim" "/tmp/pf_trim.sh ${GOCLUSTERFS_MOUNT}" 12 "$acks"
+    local last
+    last=$(awk '/^ack/ {n = $2} END {print n + 0}' "$acks")
+    restart_and_expect_only_leaks "$victim" || return 1
+
+    if [[ "$(ssh_run 1 "md5sum ${GOCLUSTERFS_MOUNT}/trim_keep.bin | cut -d' ' -f1")" != "$keep" ]]; then
+        log_error "trim_keep.bin changed"
+        return 1
+    fi
+    local i letters
+    for ((i = 1; i <= last; i++)); do
+        letters=$(ssh_run 1 "test -e ${GOCLUSTERFS_MOUNT}/trim_pf_$i.bin && /tmp/pf_letters.sh ${GOCLUSTERFS_MOUNT}/trim_pf_$i.bin 0 32")
+        if [[ -z "$letters" ]]; then
+            if (( i == last )); then
+                log_error "trim_pf_$last.bin was acknowledged and never removed, but is gone"
+                return 1
+            fi
+            continue
+        fi
+        if [[ "$letters" != "$(printf "$(round_letter "$i")%.0s" $(seq 32))" ]]; then
+            log_error "trim_pf_$i.bin was acknowledged but holds '$letters'"
+            return 1
+        fi
+    done
+    if ! grep -q "\[trim\] .*flushing" "$(get_vm_mount_log "$victim")" "$(get_vm_mount_log 1)"; then
+        log_warn "no TRIM flush ran during the test"
+    fi
+    log_info "$last acknowledged files survived the power failure and every TRIM flush"
+    rm -f "$acks"
+}
+
+# =============================================================================
 # Main Test Execution
 # =============================================================================
 
@@ -3671,6 +3941,9 @@ main() {
     run_test "Reversed Write Order" test_reversed_write_order
     run_test "Concurrent Writes Power Failure" test_concurrent_writes_power_failure
     run_test "fsck Repair After Power Failure" test_fsck_repair_after_power_failure
+    run_test "Copy-on-Write Power Failure" test_cow_write_power_failure
+    run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure
+    run_test "TRIM Reuse Power Failure" test_trim_reuse_power_failure
     run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
 
     # Summary

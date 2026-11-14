@@ -57,6 +57,12 @@ func crashAfterCommit(t *testing.T, fsys *FS, op string) <-chan struct{} {
 func remountAndReplay(t *testing.T, path string, offset, size uint64) *FS {
 	t.Helper()
 	fsys := openFormattedFS(t, path)
+	replayCrashedJournal(t, fsys, offset, size)
+	return fsys
+}
+
+func replayCrashedJournal(t *testing.T, fsys *FS, offset, size uint64) {
+	t.Helper()
 	region, err := journal.OpenRegionForRecovery(fsys.dev, offset, size)
 	if err != nil {
 		t.Fatalf("open the crashed node's journal: %v", err)
@@ -77,7 +83,6 @@ func remountAndReplay(t *testing.T, path string, offset, size uint64) *FS {
 	if err := fsys.lockMgr.ReleaseAdopted(adopted); err != nil {
 		t.Fatalf("release the crashed node's locks: %v", err)
 	}
-	return fsys
 }
 
 func expectCleanFsck(t *testing.T, fsys *FS) {

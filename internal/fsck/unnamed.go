@@ -70,11 +70,17 @@ func (c *Checker) checkUnnamed() error {
 		} else {
 			why = c.keepUnnamed(num, ino)
 		}
+		if why != "" || !reclaim {
+			c.setUnrepairable(c.orphanData, num)
+		}
 		if why != "" {
 			if kept++; kept <= reportedLeaks {
 				c.addProblem(PhaseCrossValidation, Warning, loc, "unnamed: no directory names it; kept, because "+why, false)
 			}
 			continue
+		}
+		if i, ok := c.orphanData[num]; ok {
+			problems = append(problems, i)
 		}
 		if free = append(free, ino); len(free) <= reportedLeaks {
 			c.addProblem(PhaseCrossValidation, Warning, loc, "unnamed: no directory names it", reclaim)

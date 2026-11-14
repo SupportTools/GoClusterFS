@@ -23,6 +23,17 @@ func (c *Checker) lastProblem() int {
 	return len(c.result.Problems) - 1
 }
 
+// setUnrepairable marks the problem recorded for num, if any, as one repair cannot fix.
+func (c *Checker) setUnrepairable(problems map[uint32]int, num uint32) {
+	i, ok := problems[num]
+	if !ok {
+		return
+	}
+	c.result.mu.Lock()
+	defer c.result.mu.Unlock()
+	c.result.Problems[i].Repairable = false
+}
+
 // write writes a repaired sector and marks problems repaired. A dry run only
 // marks them as ones repair would fix.
 func (c *Checker) write(buf []byte, offset uint64, problems ...int) error {

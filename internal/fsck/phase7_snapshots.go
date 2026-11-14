@@ -207,8 +207,9 @@ func (c *Checker) checkSnapshots() error {
 	for num := range c.snapshotData {
 		if !dataInodes[num] {
 			c.addProblem(PhaseSnapshots, Warning, fmt.Sprintf("inode %d", num),
-				"snapshot data inode belongs to no snapshot (left by a crash during snapshot creation)",
-				false)
+				"snapshot data inode belongs to no snapshot, as a crash while a snapshot is created or deleted leaves it",
+				true)
+			c.orphanData[num] = c.lastProblem()
 		}
 	}
 

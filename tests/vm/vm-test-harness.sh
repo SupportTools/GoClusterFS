@@ -398,7 +398,7 @@ boot_vm() {
         -smp ${VM_CPUS} \
         -cdrom "${ISO_PATH}" \
         -boot d \
-        -drive "file=${SHARED_DISK_PATH},format=raw,if=virtio,cache=none,file.locking=off" \
+        -drive "file=${SHARED_DISK_PATH},format=raw,if=virtio,cache=none,discard=unmap,file.locking=off" \
         -drive "file=${VM_RUN_DIR}/setup.img,format=raw,if=virtio,readonly=on" \
         -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22" \
         -device "virtio-net-pci,netdev=net0" \

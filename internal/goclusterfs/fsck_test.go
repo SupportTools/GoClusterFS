@@ -57,7 +57,25 @@ func newFormattedImageOfSize(t *testing.T, size int64) string {
 // goclusterfs-mount does.
 func openFormattedFS(t *testing.T, path string) *FS {
 	t.Helper()
-	ctx := context.Background()
+	fsys := openFormattedComponents(t, path)
+	startSnapshots(t, fsys)
+	return fsys
+}
+
+func startSnapshots(t *testing.T, fsys *FS) {
+	t.Helper()
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.InitSnapshots(context.Background(), sb.SnapshotRegOffset, sb.SnapshotRegSize, fsys.lockMgr, int(fsys.nodeUUID[15])); err != nil {
+		t.Fatalf("InitSnapshots: %v", err)
+	}
+	t.Cleanup(fsys.snapshotWkr.Stop)
+}
+
+func openFormattedComponents(t *testing.T, path string) *FS {
+	t.Helper()
 	dev, err := storage.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -79,12 +97,7 @@ func openFormattedFS(t *testing.T, path string) *FS {
 	inodeTbl.SetTreeFlusher(extentMgr)
 	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
-	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
-	if err := fsys.InitSnapshots(ctx, sb.SnapshotRegOffset, sb.SnapshotRegSize, locks, slot); err != nil {
-		t.Fatalf("InitSnapshots: %v", err)
-	}
-	t.Cleanup(fsys.snapshotWkr.Stop)
-	return fsys
+	return NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
 }
 
 // createFile adds a regular file to the root directory as Create does.
