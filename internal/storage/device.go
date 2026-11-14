@@ -48,10 +48,13 @@ type Device struct {
 	closeMu  sync.RWMutex            // Protects close; held shared during I/O
 	// writeGate, when set, runs before every write and can refuse it.
 	writeGate atomic.Pointer[func(offset int64) error]
-	file      *os.File
-	path      string
-	size      int64
-	lastErr   atomic.Pointer[error]
+	// writeObserver and syncObserver let tests model a volatile write cache.
+	writeObserver atomic.Pointer[func(offset int64, n int)]
+	syncObserver  atomic.Pointer[func()]
+	file          *os.File
+	path          string
+	size          int64
+	lastErr       atomic.Pointer[error]
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -230,6 +233,9 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if err := d.CheckWrite(offset); err != nil {
 		return 0, err
 	}
+	if observe := d.writeObserver.Load(); observe != nil {
+		(*observe)(offset, len(buf))
+	}
 
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
@@ -251,6 +257,20 @@ func (d *Device) SetWriteGate(gate func(offset int64) error) {
 	d.writeGate.Store(&gate)
 }
 
+// SetWriteObserver makes every write call observe with its range before it writes; nil removes it.
+func (d *Device) SetWriteObserver(observe func(offset int64, n int)) {
+	if observe == nil {
+		d.writeObserver.Store(nil)
+		return
+	}
+	d.writeObserver.Store(&observe)
+}
+
+// SetSyncObserver makes every Sync that succeeds call synced afterwards.
+func (d *Device) SetSyncObserver(synced func()) {
+	d.syncObserver.Store(&synced)
+}
+
 // CheckWrite runs the write gate for a write at offset. Callers that change the
 // device without WriteAt, such as a discard, call it first.
 func (d *Device) CheckWrite(offset int64) error {
@@ -269,6 +289,9 @@ func (d *Device) Sync() error {
 
 	err := d.file.Sync()
 	d.record(err)
+	if synced := d.syncObserver.Load(); err == nil && synced != nil {
+		(*synced)()
+	}
 	return err
 }
 

@@ -159,6 +159,7 @@ var (
 	_ fs.NodeUnlinker  = (*FS)(nil)
 	_ fs.NodeRmdirer   = (*FS)(nil)
 	_ fs.NodeSetattrer = (*FS)(nil)
+	_ fs.NodeFsyncer   = (*FS)(nil)
 )
 
 // Config holds filesystem configuration.
@@ -1140,6 +1141,7 @@ var (
 	_ fs.NodeUnlinker  = (*Dir)(nil)
 	_ fs.NodeRmdirer   = (*Dir)(nil)
 	_ fs.NodeSetattrer = (*Dir)(nil)
+	_ fs.NodeFsyncer   = (*Dir)(nil)
 )
 
 // Getattr returns directory attributes.
@@ -2949,7 +2951,23 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 // Fsync flushes file data to disk.
 func (f *File) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
-	if err := f.fs.dev.Sync(); err != nil {
+	return f.fs.syncDevice()
+}
+
+// Fsync makes the directory's entries durable, as an application's fsync of a directory after a create or unlink
+// expects. Without a journal, or with an async one, nothing else flushes them.
+func (d *Dir) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
+	return d.fs.syncDevice()
+}
+
+// Fsync makes the root directory's entries durable.
+func (f *FS) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) syscall.Errno {
+	return f.syncDevice()
+}
+
+// syncDevice flushes every completed write, including those in the device's write cache.
+func (f *FS) syncDevice() syscall.Errno {
+	if err := f.dev.Sync(); err != nil {
 		return syscall.EIO
 	}
 	return 0
