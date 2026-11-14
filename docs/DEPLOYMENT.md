@@ -293,7 +293,7 @@ Use identical mount options and the same GoClusterFS version on all nodes:
     -broadcast-secret "your-shared-secret"
 ```
 
-Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) first. Node clocks must agree, and nodes must not stall.
+Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) first. Nodes must not stall, and storage must fail I/O rather than queue it.
 
 ### Step 4: Verify Cluster Communication
 

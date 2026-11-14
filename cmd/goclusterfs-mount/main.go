@@ -283,7 +283,7 @@ func main() {
 	}
 	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
 		failf("Node registry slot %d is no longer this node's (owner %x); stopping so two nodes never share a journal. "+
-			"Check that the device is reachable and that node clocks agree within a few seconds, then mount again", slot, owner[:8])
+			"Check that the device is reachable and that this node did not stall, then mount again", slot, owner[:8])
 	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)

@@ -182,9 +182,9 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 
 ### Node Requirements
 
-- **Clocks:** Nodes judge each other's heartbeats by wall clock. A node that mounts with its clock more than about 10 seconds ahead treats live peers as failed, and can take a live peer's registry slot and replay that peer's journal. Run NTP on every node.
+- **Clocks:** A node judges another node by whether its heartbeat keeps changing, timed on its own clock, so failover works even when node clocks disagree. File times use each node's clock, and `goclusterfs-fsck -release-slot` compares a slot's lease with the clock of the host it runs on. Run NTP on every node.
 - **Restarts:** A restarted mount takes back the registry slot of a mount that exited on the same host (same hostname and kernel boot ID) and replays its journal before serving. In the same PID namespace it checks the old process ID; across PID namespaces it waits for the old slot's heartbeat to go stale.
-- **Crashed node's locks:** Once a node is proven dead, the node replaying its journal takes over its exclusive locks and frees them after the replay, so no other node uses them mid-replay. Proven dead means its mount process is gone (same host and PID namespace), or its heartbeat is more than 20 seconds old and has not changed for 15 seconds by the observing node's own clock. A node paused for more than about 20 seconds therefore counts as dead; it exits on its next heartbeat. The dead node's read locks are freed at once. Until a failed node is replayed, other nodes wait for its locks however long that takes. Failover takes about 3 to 6 seconds when a surviving mount runs on the same host and in the same PID namespace, and up to about 35 seconds otherwise. A mount that takes a failed node's registry slot keeps that node's locks until it has replayed the slot's journal.
+- **Crashed node's locks:** Once a node is proven dead, the node replaying its journal takes over its exclusive locks and frees them after the replay, so no other node uses them mid-replay. Proven dead means its mount process is gone (same host and PID namespace), or the observing node has read the same heartbeat for 20 seconds by its own clock. A node paused for more than about 20 seconds therefore counts as dead; it exits on its next heartbeat. The dead node's read locks are freed at once. Until a failed node is replayed, other nodes wait for its locks however long that takes. Failover takes about 3 to 6 seconds when a surviving mount runs on the same host and in the same PID namespace, and up to about 35 seconds otherwise. A mount that takes a failed node's registry slot keeps that node's locks until it has replayed the slot's journal.
 - **Node count:** The device has 64 registry slots, each with its own 4 MB journal. A crashed node's slot frees once another node replays its journal, or when the same host mounts again.
 
 ### Known Gaps in Slot Ownership
@@ -297,7 +297,7 @@ Lock slot reads and writes do not take the device's per-region I/O lock, so a no
 
 | Limit | Why |
 |-------|-----|
-| Keep node clocks within 1 second (chrony or NTP) | Nodes judge each other's heartbeats by wall clock |
+| Run chrony or NTP on every node | File times and `fsck -release-slot` use the wall clock; failover does not |
 | No node may stall for 15 seconds or more while mounted | Peers prove a node dead after about 20 seconds of silence and take its locks |
 | Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
 | Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |

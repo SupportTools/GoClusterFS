@@ -11,17 +11,25 @@ import (
 // recoveryLease is how long a peer may hold a dead slot's recovery before others take it over.
 const recoveryLease = 60 * time.Second
 
-// deathMargin is added to HeartbeatTimeout before this node's own clock counts
-// an unchanged heartbeat as proof that its node is dead rather than slow.
-const deathMargin = HeartbeatTimeout / 2
+// deadAfter is how long this node must read the same heartbeat in a slot before
+// it counts the slot's node as dead rather than slow, and replays it.
+const deadAfter = 2 * HeartbeatTimeout
 
-// sighting is what failure detection last saw in a slot, timed by this node's monotonic clock.
+// sighting is what this node last read in a slot: the fields a live node keeps
+// changing, and since when this node's monotonic clock has seen them unchanged.
 type sighting struct {
-	uuid      [16]byte
-	seq       uint64
-	beat      int64
-	since     time.Time
-	changedAt time.Time
+	uuid          [16]byte
+	state         NodeState
+	seq           uint64
+	beat          int64
+	recoveryOwner [16]byte
+	recoveryStart int64
+	since         time.Time
+}
+
+func sightingOf(slot *Slot) sighting {
+	return sighting{uuid: slot.UUID, state: slot.State, seq: slot.HeartbeatSeq, beat: slot.HeartbeatTime,
+		recoveryOwner: slot.RecoveryOwner, recoveryStart: slot.RecoveryStart}
 }
 
 var processStart = time.Now().UnixNano()
@@ -70,16 +78,26 @@ func (r *Registry) deadLocalOwner(slot *Slot) bool {
 	return syscall.Kill(int(slot.PID), 0) == syscall.ESRCH
 }
 
-// failed reports whether a slot's node is gone: its heartbeat is older than timeout, it is a
-// mount process on this host that has exited, or the peer replaying its journal let the lease lapse.
-func (r *Registry) failed(slot *Slot, timeout time.Duration) bool {
+// stale reports whether a slot's node is gone: it is a mount process on this
+// host that has exited, or this node has read the same heartbeat in the slot for
+// longer than timeout, or for a dead slot the same recovery lease for longer than
+// recoveryLease. Silence is timed on this node's clock, so node clocks need not
+// agree. A slot this node has not watched yet is not stale. Called with r.mu held
+// after observe.
+func (r *Registry) stale(slotIdx int, slot *Slot, timeout time.Duration) bool {
 	switch slot.State {
 	case NodeStateActive, NodeStateLeaving:
-		return time.Since(time.Unix(slot.HeartbeatTime, 0)) > timeout || r.deadLocalOwner(slot)
+		return r.deadLocalOwner(slot) || r.silentFor(slotIdx, slot) > timeout
 	case NodeStateDead:
-		return time.Since(time.Unix(slot.RecoveryStart, 0)) > recoveryLease
+		return r.silentFor(slotIdx, slot) > recoveryLease
 	}
 	return false
+}
+
+// heartbeatOlderThan compares a heartbeat with this node's wall clock. Only a
+// slot this host wrote may be judged so, since only then did the same clock write it.
+func heartbeatOlderThan(slot *Slot, d time.Duration) bool {
+	return time.Since(time.Unix(slot.HeartbeatTime, 0)) > d
 }
 
 // LeaseExpiry returns when the slot's node stops counting as alive: its last
@@ -95,37 +113,28 @@ func (s *Slot) LeaseExpiry() time.Time {
 	return time.Time{}
 }
 
-// observe records a slot's heartbeat as failure detection sees it. Called with r.mu held.
+// observe records what this node read in a slot. Called with r.mu held.
 func (r *Registry) observe(slotIdx int, slot *Slot) {
-	last, seen := r.sightings[slotIdx]
-	if seen && last.uuid == slot.UUID && last.seq == slot.HeartbeatSeq && last.beat == slot.HeartbeatTime {
+	next := sightingOf(slot)
+	if last, seen := r.sightings[slotIdx]; seen && last.sinceless() == next {
 		return
 	}
-	now := time.Now()
-	next := sighting{uuid: slot.UUID, seq: slot.HeartbeatSeq, beat: slot.HeartbeatTime, since: now}
-	if seen && last.uuid == slot.UUID {
-		next.changedAt = now
-	}
+	next.since = time.Now()
 	r.sightings[slotIdx] = next
 }
 
-// recentlyAlive reports whether this node saw the slot's heartbeat advance within
-// HeartbeatTimeout, whatever the heartbeat's wall-clock time says. Called with r.mu held.
-func (r *Registry) recentlyAlive(slotIdx int) bool {
-	last, seen := r.sightings[slotIdx]
-	return seen && !last.changedAt.IsZero() && time.Since(last.changedAt) < HeartbeatTimeout
+func (s sighting) sinceless() sighting {
+	s.since = time.Time{}
+	return s
 }
 
-// provenDead reports whether a slot's node is dead, not merely slow: its mount
-// process is gone, this node has seen the same heartbeat for longer than
-// HeartbeatTimeout plus deathMargin, or the slot is marked dead, which a node
-// does only after proving it or fsck after releasing it. Called with r.mu held.
-func (r *Registry) provenDead(slotIdx int, slot *Slot) bool {
-	if slot.State == NodeStateDead || r.deadLocalOwner(slot) {
-		return true
-	}
+// silentFor returns how long this node has read slot unchanged. Called with r.mu held after observe.
+func (r *Registry) silentFor(slotIdx int, slot *Slot) time.Duration {
 	last, seen := r.sightings[slotIdx]
-	return seen && last.uuid == slot.UUID && time.Since(last.since) >= HeartbeatTimeout+deathMargin
+	if !seen || last.sinceless() != sightingOf(slot) {
+		return 0
+	}
+	return time.Since(last.since)
 }
 
 // Occupancy is how the node in a registry slot stands.
@@ -160,16 +169,17 @@ func (r *Registry) Occupant(slotIdx int, fresh bool) ([16]byte, Occupancy) {
 		r.remember(slotIdx, read)
 		slot = read
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.observe(slotIdx, slot)
 	switch {
 	case slot.State == NodeStateEmpty:
 		return slot.UUID, Unoccupied
-	case slot.State == NodeStateDead && r.failed(slot, HeartbeatTimeout):
+	case slot.State == NodeStateDead && r.stale(slotIdx, slot, HeartbeatTimeout):
 		return slot.UUID, OccupiedLapsed
 	case slot.State == NodeStateDead:
 		return slot.UUID, OccupiedReplaying
-	case r.failed(slot, HeartbeatTimeout):
+	case r.stale(slotIdx, slot, HeartbeatTimeout):
 		return slot.UUID, OccupiedFailing
 	}
 	return slot.UUID, OccupiedLive
