@@ -338,9 +338,10 @@ func main() {
 		}
 		// Use per-transaction handler for self-recovery
 		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
+		releaseReserved := recoveryCtx.ReleaseReserved(lock.ForReplay(context.Background()))
 
 		// Replay a dirty journal left in this slot's region by its previous owner
-		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, slotIdx)
+		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, releaseReserved, slotIdx)
 		if err != nil {
 			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}
@@ -679,10 +680,10 @@ var ownReplayRetry = time.Second
 // previous owner. A replay that gave up waiting for another node's lock is
 // retried with backoff. Any other failure, such as a record that does not
 // decode or an I/O error, cannot get better by waiting, so it stops the mount.
-func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal.RecoveryHandler, slot int) (*journal.ScanRecoveryResult, error) {
+func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal.RecoveryHandler, release func([]uint64) error, slot int) (*journal.ScanRecoveryResult, error) {
 	delay := ownReplayRetry
 	for {
-		result, err := journal.ScanAndRecover(dev, offset, size, handler)
+		result, err := journal.ScanAndRecover(dev, offset, size, handler, release)
 		if err == nil {
 			return result, nil
 		}

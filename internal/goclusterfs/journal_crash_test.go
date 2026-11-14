@@ -12,6 +12,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
@@ -73,11 +74,12 @@ func replayCrashedJournal(t *testing.T, fsys *FS, offset, size uint64) {
 	if err != nil {
 		t.Fatalf("take over the crashed node's locks: %v", err)
 	}
-	replay := journal.CreateTxnRecoveryHandler(&journal.RecoveryContext{
+	rctx := &journal.RecoveryContext{
 		Dev: fsys.dev, InodeTbl: fsys.inodeTbl, BitmapMgr: fsys.bitmapMgr,
 		DirMgr: fsys.dirMgr, ExtentMgr: fsys.extentMgr,
-	})
-	if _, err := journal.ScanAndRecover(fsys.dev, offset, size, replay); err != nil {
+	}
+	replay := journal.CreateTxnRecoveryHandler(rctx)
+	if _, err := journal.ScanAndRecover(fsys.dev, offset, size, replay, rctx.ReleaseReserved(lock.ForReplay(context.Background()))); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	if err := fsys.lockMgr.ReleaseAdopted(adopted); err != nil {

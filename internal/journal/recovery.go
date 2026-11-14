@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -21,6 +22,8 @@ type RecoveredTxn struct {
 	Header  *TxnHeader
 	Entries []*RecoveredEntry
 	RawData []byte
+	// Completed is set when an IntentCompletion follows it; only scans that ask for completed transactions see them.
+	Completed bool
 }
 
 // RecoveredEntry represents an entry from a recovered transaction.
@@ -39,6 +42,7 @@ type RecoveryStats struct {
 	Errors            int
 	IntentCompletions int // Number of intent completion records found
 	IntentsSkipped    int // Number of intents skipped (already completed)
+	ReservedFreed     int // Unused reserved blocks given back after replay
 }
 
 // RecoveryHandler is called for each committed transaction during replay.
@@ -68,8 +72,23 @@ func Recover(region *Region, handler RecoveryHandler) (*RecoveryStats, error) {
 // soon as check fails; cross-node replay uses it to stop once it loses the
 // slot's recovery lease.
 func RecoverChecked(region *Region, handler RecoveryHandler, check func() error) (*RecoveryStats, error) {
+	return RecoverReleasing(region, handler, check, nil)
+}
+
+// RecoverReleasing is RecoverChecked that also passes release, after the last
+// transaction and before the reset, the blocks pending reserve records hold
+// that no later record used. They are found before replay moves the head, so
+// a replay that fails part way leaks them for fsck rather than freeing them twice.
+func RecoverReleasing(region *Region, handler RecoveryHandler, check func() error, release func([]uint64) error) (*RecoveryStats, error) {
 	if !region.NeedsRecovery() {
 		return &RecoveryStats{}, nil
+	}
+	var reserved []uint64
+	if release != nil {
+		var err error
+		if reserved, _, err = ReservedUnused(region); err != nil {
+			return nil, fmt.Errorf("failed to find unused reserved blocks: %w", err)
+		}
 	}
 
 	// Mark as recovering
@@ -86,7 +105,7 @@ func RecoverChecked(region *Region, handler RecoveryHandler, check func() error)
 		}
 		return region.Checkpoint(seq, next)
 	}
-	if err := scanJournal(region, handler, stats, check, advance); err != nil {
+	if err := scanJournal(region, handler, stats, check, advance, false); err != nil {
 		// Leave the journal Recovering so the next attempt resumes it
 		return stats, fmt.Errorf("recovery failed: %w", err)
 	}
@@ -94,6 +113,12 @@ func RecoverChecked(region *Region, handler RecoveryHandler, check func() error)
 		if err := check(); err != nil {
 			return stats, fmt.Errorf("recovery stopped before reset: %w", err)
 		}
+	}
+	if len(reserved) > 0 {
+		if err := release(reserved); err != nil {
+			return stats, fmt.Errorf("failed to free %d unused reserved blocks: %w", len(reserved), err)
+		}
+		stats.ReservedFreed = len(reserved)
 	}
 
 	// Success - reset the journal
@@ -175,7 +200,7 @@ func ringSpan(head, tail, dataAreaSize uint32) uint32 {
 // each one and before recording it; advance, when set, records progress after
 // each one is applied, once its writes are flushed.
 func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
-	check func() error, advance func(seq uint64, next uint32) error) error {
+	check func() error, advance func(seq uint64, next uint32) error, includeCompleted bool) error {
 	sb := region.Superblock()
 	head := sb.HeadOffset
 	tail := sb.TailOffset
@@ -283,7 +308,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 
 			// Check if this intent has already been completed
 			// (has a matching IntentCompletion record)
-			if completedIntents[txnHeader.Seq] {
+			if completedIntents[txnHeader.Seq] && !includeCompleted {
 				stats.IntentsSkipped++
 				// Skip to next record without replaying
 				alignedLen := ((txnHeader.TotalLength + storage.SectorSize - 1) / storage.SectorSize) * storage.SectorSize
@@ -298,6 +323,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 				stats.Errors++
 				return fmt.Errorf("failed to parse txn entries: %w", err)
 			}
+			recoveredTxn.Completed = completedIntents[txnHeader.Seq]
 
 			if check != nil {
 				if err := check(); err != nil {
@@ -469,9 +495,90 @@ func DryRunRecover(region *Region) ([]*RecoveredTxn, *RecoveryStats, error) {
 	}
 
 	// Don't mark as recovering for dry run
-	if err := scanJournal(region, handler, stats, nil, nil); err != nil {
+	if err := scanJournal(region, handler, stats, nil, nil, false); err != nil {
 		return nil, stats, err
 	}
 
 	return txns, stats, nil
+}
+
+// ReservedUnused returns the blocks that reserve records whose intents have not
+// completed hold, less those a later committed record used: a BlockUse, or an
+// ExtentAdd whether or not its intent completed. A use logged before a reserve
+// record is of an earlier occupant of the block and does not count. It also
+// returns the sequence numbers of those reserve records.
+func ReservedUnused(region *Region) (blocks, reserves []uint64, err error) {
+	if !region.NeedsRecovery() {
+		return nil, nil, nil
+	}
+	reserved := make(map[uint64]bool)
+	use := func(used ...uint64) {
+		for _, b := range used {
+			delete(reserved, b)
+		}
+	}
+	err = scanJournal(region, func(txn *RecoveredTxn) error {
+		for _, e := range txn.Entries {
+			switch e.Entry.OpType {
+			case TxnOpBlockReserve:
+				if txn.Completed {
+					continue
+				}
+				if !slices.Contains(reserves, txn.Header.Seq) {
+					reserves = append(reserves, txn.Header.Seq)
+				}
+				blocks, err := DeserializeBlockRuns(e.Payload)
+				if err != nil {
+					return err
+				}
+				for _, b := range blocks {
+					reserved[b] = true
+				}
+			case TxnOpBlockUse:
+				blocks, err := DeserializeBlockRuns(e.Payload)
+				if err != nil {
+					return err
+				}
+				use(blocks...)
+			case TxnOpExtentAdd:
+				p, err := DeserializeExtentAdd(e.Payload)
+				if err != nil {
+					return err
+				}
+				for i := range uint64(p.Length) {
+					use(p.DiskBlock + i)
+				}
+			}
+		}
+		return nil
+	}, &RecoveryStats{}, nil, nil, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	for b := range reserved {
+		blocks = append(blocks, b)
+	}
+	slices.Sort(blocks)
+	return blocks, reserves, nil
+}
+
+// CompleteReserves marks reserve intents completed in a journal no node has
+// open, so replay no longer frees their blocks. fsck calls it before it frees
+// the blocks itself.
+func CompleteReserves(region *Region, seqs []uint64) error {
+	sb := region.Superblock()
+	for _, seq := range seqs {
+		if _, _, _, err := region.Append(func(next uint64) ([]byte, error) {
+			return completionRecord(next, sb.NodeUUID, sb.NodeGeneration, seq)
+		}); err != nil {
+			return fmt.Errorf("complete reserve %d: %w", seq, err)
+		}
+	}
+	if err := region.Sync(); err != nil {
+		return err
+	}
+	if err := region.FlushSuperblock(); err != nil {
+		return err
+	}
+	return region.Sync()
 }

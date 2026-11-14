@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -56,14 +57,26 @@ func (c *Checker) reclaimBlockers() []string {
 // them when reclaimBlockers finds a reason. Leaked blocks in bitmap sectors
 // with a bad checksum are kept and reported apart.
 func (c *Checker) checkLeaks() error {
+	reserves := c.reserves()
+	reserved := make(map[uint64]bool)
+	for _, r := range reserves {
+		for _, b := range r.blocks {
+			reserved[b] = true
+		}
+	}
 	var leaked []uint64
 	badSector := 0
 	for _, block := range c.leakedBlocks() {
-		if c.badBitmap[block/BitmapBitsPerSector] {
+		switch {
+		case reserved[block]:
+		case c.badBitmap[block/BitmapBitsPerSector]:
 			badSector++
-		} else {
+		default:
 			leaked = append(leaked, block)
 		}
+	}
+	if err := c.checkReserves(reserves); err != nil {
+		return err
 	}
 	if badSector > 0 {
 		c.addProblem(PhaseCrossValidation, Warning, "bitmap",
@@ -137,6 +150,80 @@ func (c *Checker) freeBlocks(blocks []uint64) error {
 	}
 	if err := c.dev.Sync(); err != nil {
 		return fmt.Errorf("sync bitmap: %w", err)
+	}
+	return nil
+}
+
+// slotReserve is what a crashed node reserved and never used: the blocks it
+// marked allocated, and the journal records that hold them.
+type slotReserve struct {
+	slot   int
+	blocks []uint64
+	seqs   []uint64
+}
+
+// reserves reads every journal that needs replay for the blocks its node
+// reserved and never used. Replay frees those, so they are not leaks.
+func (c *Checker) reserves() []slotReserve {
+	var out []slotReserve
+	for i := 0; i < int(c.sbData.MaxNodes); i++ {
+		if c.journalNeedsReplay(i) == "" {
+			continue
+		}
+		region, err := c.slotJournal(i)
+		if err != nil {
+			continue
+		}
+		blocks, seqs, err := journal.ReservedUnused(region)
+		_ = region.Close()
+		if err == nil && len(blocks) > 0 {
+			out = append(out, slotReserve{slot: i, blocks: blocks, seqs: seqs})
+		}
+	}
+	return out
+}
+
+// checkReserves reports the blocks crashed nodes reserved and never used. In
+// repair mode, which refuses while nodes are mounted, it marks their reserves
+// done in the node's journal, so replay does not free them again, and then
+// frees them.
+func (c *Checker) checkReserves(reserves []slotReserve) error {
+	repairable := len(c.referenceGaps()) == 0
+	for _, r := range reserves {
+		var free []uint64
+		for _, b := range r.blocks {
+			if c.isLeaked(b) && !c.badBitmap[b/BitmapBitsPerSector] {
+				free = append(free, b)
+			}
+		}
+		if len(free) == 0 {
+			continue
+		}
+		c.addProblem(PhaseCrossValidation, Info, fmt.Sprintf("node %d", r.slot),
+			fmt.Sprintf("%d blocks reserved by node %d and never used; replaying its journal frees them", len(free), r.slot), repairable)
+		problem := c.lastProblem()
+		if c.opts.Mode != Repair || !repairable {
+			continue
+		}
+		if err := c.beforeWrites(); err != nil {
+			return err
+		}
+		if !c.opts.DryRun {
+			region, err := c.slotJournal(r.slot)
+			if err == nil {
+				err = journal.CompleteReserves(region, r.seqs)
+				_ = region.Close()
+			}
+			if err != nil {
+				c.addProblem(PhaseCrossValidation, Warning, fmt.Sprintf("node %d", r.slot),
+					fmt.Sprintf("its %d reserved blocks are kept: marking its reserve done in its journal failed: %v", len(free), err), false)
+				continue
+			}
+		}
+		if err := c.freeBlocks(free); err != nil {
+			return err
+		}
+		c.markRepaired(problem)
 	}
 	return nil
 }
