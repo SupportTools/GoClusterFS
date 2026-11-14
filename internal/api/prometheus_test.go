@@ -57,6 +57,7 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 
 	// Set up mock provider with all stats
 	server.SetStatsProvider(&mockStatsProvider{
+		all: &AllStatsResponse{Reserve: &ReserveStatsResponse{Blocks: 7, Refills: 3, Returns: 2, PeerWaits: 1, PeerWaitSeconds: 0.5}},
 		cache: &CacheStatsResponse{
 			InodeCache: CacheHitRateInfo{
 				Size:     1000,
@@ -203,6 +204,11 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 		`goclusterfs_lock_wait_seconds_total{type="bitmap"} 16.5`,
 		`goclusterfs_lock_acquires_total{type="refcount"} 40`,
 		`goclusterfs_lock_blocked_total{type="refcount"} 0`,
+		"goclusterfs_reserve_blocks 7",
+		"goclusterfs_reserve_refills_total 3",
+		"goclusterfs_reserve_returns_total 2",
+		"goclusterfs_reserve_peer_waits_total 1",
+		"goclusterfs_reserve_peer_wait_seconds_total 0.5",
 
 		// SFB metrics
 		"goclusterfs_sfb_total_blocks 1000",

@@ -11,6 +11,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
@@ -22,6 +23,9 @@ const (
 type CacheSource interface{ Stats() cache.Stats }
 
 type LockSource interface{ Stats() lock.Stats }
+
+// ReserveSource reports the node's block reserve.
+type ReserveSource interface{ Stats() reserve.Stats }
 
 type DirSource interface{ IndexStats() dir.IndexStats }
 
@@ -50,6 +54,7 @@ type Sources struct {
 	Trim      TrimSource
 	Blocks    BlockSource
 	Nodes     NodeSource
+	Reserve   ReserveSource
 	BlockSize uint64
 }
 
@@ -143,6 +148,11 @@ func (s *Sampler) sampleCounters() {
 	}
 	if s.src.Journal != nil {
 		s.current.Journal = journalResponse(s.src.Journal.Stats())
+	}
+	if s.src.Reserve != nil {
+		r := s.src.Reserve.Stats()
+		s.current.Reserve = &api.ReserveStatsResponse{Blocks: r.Blocks, Refills: r.Refills, Returns: r.Returns,
+			PeerWaits: r.Waits, PeerWaitSeconds: time.Duration(r.WaitNanos).Seconds()}
 	}
 	s.current.Trim = &api.TrimStatsResponse{}
 	if s.src.Trim != nil {

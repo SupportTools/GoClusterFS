@@ -33,6 +33,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
+	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/stats"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -111,6 +112,7 @@ func main() {
 		// TRIM configuration
 		trimEnabled   = flag.Bool("trim", true, "Discard freed blocks on the device (BLKDISCARD) in batches; does nothing on image files")
 		trimBatchSize = flag.Int("trim-batch", 256, "Freed blocks to collect before a discard")
+		blockReserve  = flag.Int("block-reserve", reserve.DefaultSize, "Data blocks each node takes from the bitmap at once and hands out without the cluster-wide bitmap lock; 0 turns reserves off. Needs the journal")
 		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Longest a freed block waits for its discard")
 
 		// SFB configuration (Sub-File Block containers for small files)
@@ -434,6 +436,20 @@ func main() {
 
 	// Create filesystem with journal, TRIM, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nil, refcountReg, lockMgr, nodeUUID, dataOffset)
+	var res *reserve.Manager
+	if j != nil && *blockReserve > 0 {
+		res = reserve.New(reserve.Config{Size: *blockReserve}, bm, j, extentMgr.ReleaseBlocks, func() int {
+			active, _ := nodeReg.GetActiveNodes()
+			return len(active)
+		})
+		res.SetBroadcast(cacheMgr.BroadcastReturnReserves)
+		cacheMgr.OnReturnReserves(func() { res.ReturnAll(context.Background()) })
+		bm.SetNoSpaceWait(res)
+		j.SetCheckpointHook(func() { res.Refresh(context.Background()) })
+		gfs.SetReserve(res)
+		res.Start()
+		log.Printf("Block reserve: up to %d blocks per node", *blockReserve)
+	}
 
 	// Set up cross-node recovery handler for failed node journal replay
 	recoveryCtx := &journal.RecoveryContext{
@@ -506,7 +522,7 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Failed to create the API server: %v; the mount continues without it", err)
 		} else {
-			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg))
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
@@ -653,8 +669,11 @@ func usageFailf(format string, args ...any) {
 	os.Exit(cli.ExitUsage)
 }
 
-func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry) stats.Sources {
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager) stats.Sources {
 	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
+	if res != nil {
+		src.Reserve = res
+	}
 	if j != nil {
 		src.Journal = j
 	}

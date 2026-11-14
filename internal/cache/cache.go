@@ -327,6 +327,20 @@ func (m *Manager) BroadcastInvalidateExtent(inodeNum uint32, dataGen uint64) {
 	}
 }
 
+// BroadcastReturnReserves asks peer nodes to give back their reserved blocks.
+func (m *Manager) BroadcastReturnReserves() {
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastReturnReserves()
+	}
+}
+
+// OnReturnReserves must be called after StartBroadcast.
+func (m *Manager) OnReturnReserves(fn func()) {
+	if m.broadcaster != nil {
+		m.broadcaster.OnReturnReserves(fn)
+	}
+}
+
 // BroadcastInvalidateAll clears all caches locally AND broadcasts
 // a full invalidation to peer nodes. Use this after events that
 // might invalidate many entries (fsck, network partition recovery, etc).

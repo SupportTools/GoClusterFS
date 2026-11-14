@@ -3106,6 +3106,127 @@ scenarios:
     environments:
       go: internal/goclusterfs/reserve_crash_test.go::TestFsckRepairFreesCrashedNodesReserveOnce
 
+  - id: reserve-size
+    name: Reserve size and low-space cutoff
+    description: A reserve holds at most the configured size and a sixteenth of the free blocks per node, and none below two reserves per node or 1% of the blocks
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReserveSize
+
+  - id: reserve-return-order
+    name: Reserve return ends its record first
+    description: Giving the reserve back ends its journal record before freeing blocks, so a crash in between leaks rather than double-frees
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReturnEndsRecordBeforeFreeing
+
+  - id: reserve-return-handed-out
+    name: Returned reserve keeps handed-out blocks recorded
+    description: Blocks a write took and has not logged stay in a new record when the reserve is given back, and go back later
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReturnKeepsHandedOutBlocksRecorded
+
+  - id: reserve-failed-log
+    name: Failed commit keeps reserved blocks
+    description: A write whose commit fails keeps its reserved blocks to put back
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFailedLogKeepsBlocksOut
+
+  - id: reserve-refresh
+    name: Old reserve record is renewed
+    description: The reserve record is written again once it is a quarter of the journal behind the tail
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefreshRenewsAnOldRecord
+
+  - id: reserve-writes
+    name: Writes take blocks from the reserve
+    description: Ten one-block writes take the bitmap lock once, and unmount gives the rest of the reserve back; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestWritesTakeBlocksFromReserve
+
+  - id: reserve-idle-return
+    name: Idle reserve goes back
+    description: A reserve nobody takes from goes back to the bitmap after the idle time
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestIdleReserveGoesBack
+
+  - id: reserve-replay-used-freed-retaken
+    name: Replay keeps a reserved block used, freed and retaken
+    description: Node A writes a reserved block, truncates it and node B allocates it; replaying A's journal frees A's unused reserve and leaves B's block alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsReservedBlockUsedFreedAndRetaken
+
+  - id: reserve-full-waits-for-peers
+    name: Full bitmap waits for peers' reserves
+    description: Node B finds the bitmap full while node A holds a reserve; B asks for it back and its write gets a block instead of ENOSPC
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestFullBitmapWaitsForPeersReserve
+
+  - id: reserve-full-enospc
+    name: Full bitmap without reserves is ENOSPC
+    description: With no blocks in any reserve, a write on a full device fails with ENOSPC after the wait for other nodes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestFullBitmapWithoutReservesIsENOSPC
+
+  - id: reserve-concurrent-writers
+    name: Concurrent writers share a reserve
+    description: Four writers share one reserve while it refills and goes back when idle; every file keeps its data and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestConcurrentWritersShareReserve
+
+  - id: power-cut-reserve-refill
+    name: Power cut during a reserve refill
+    description: Power fails at every write of a write that takes the first reserve and maps a block; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReserveRefill
+
+  - id: power-cut-write-from-reserve
+    name: Power cut during a write from the reserve
+    description: Power fails at every write of a write that maps a block the reserve holds; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringWriteFromReserve
+
+  - id: power-cut-two-block-reserve
+    name: Power cut during a two-block reserved write
+    description: Power fails at every write of a write that maps two reserved blocks; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringTwoBlockWriteFromReserve
+
+  - id: power-cut-reserve-return
+    name: Power cut during a reserve return
+    description: Power fails at every write of giving the reserve back; files keep their data and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReserveReturn
+
+  - id: power-cut-reserved-write-copies
+    name: Power cut during a reserved write that copies
+    description: Power fails at every write of a write that maps a reserved block and copies a shared one; the file and its snapshot keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReservedWriteThatCopies
+
+  - id: reserve-returned-after-crash
+    name: Killed node's reserve is returned
+    description: A node takes a block reserve, writes one block from it and is killed; the survivor replays its journal and the unused reserved blocks come back, so free space ends one block below where it started
+    priority: high
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsReservedBlockUsedFreedAndRetaken
+      docker: TODO - Docker kills containers but the harness has no df comparison across nodes; the Go replay test and the VM test cover it
+      vm: run-vm-tests.sh::test_reserve_returned_after_crash
+
   # ===========================================================================
   # DISTRIBUTED LOCK SAFETY (internal/lock)
   # Two or three lock managers share one device to act as separate nodes.

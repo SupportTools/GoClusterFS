@@ -93,6 +93,8 @@ type Journal struct {
 
 	activeTxns     map[*Transaction]*ActiveTxn
 	pendingIntents map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
+	checkpointHook atomic.Pointer[func()]
+	hookRunning    atomic.Bool
 
 	// Checkpoint tracking
 	lastCheckpointSeq  uint64
@@ -225,7 +227,47 @@ func (j *Journal) checkpointLoop() {
 // periodicCheckpoint advances the head pointer for completed transactions.
 // A failed checkpoint is retried on the next tick.
 func (j *Journal) periodicCheckpoint() {
+	if hook := j.checkpointHook.Load(); hook != nil {
+		(*hook)()
+	}
 	_, _ = j.Checkpoint()
+}
+
+// SetCheckpointHook also runs fn early when the oldest intent is half a ring behind, since bursts fill the ring.
+func (j *Journal) SetCheckpointHook(fn func()) {
+	j.checkpointHook.Store(&fn)
+}
+
+func (j *Journal) runHookAsync() {
+	hook := j.checkpointHook.Load()
+	if hook == nil || !j.hookRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer j.hookRunning.Store(false)
+		(*hook)()
+	}()
+}
+
+func (j *Journal) oldestIntentLagLocked() uint32 {
+	size, tail := j.region.DataAreaSize(), j.region.TailOffset()
+	var oldest uint32
+	for _, start := range j.pendingIntents {
+		oldest = max(oldest, (tail+size-start)%size)
+	}
+	return oldest
+}
+
+// IntentLag reports in bytes how far intent seq starts behind the tail, and the ring size.
+func (j *Journal) IntentLag(seq uint64) (lag, size uint32, ok bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	start, ok := j.pendingIntents[seq]
+	if !ok {
+		return 0, 0, false
+	}
+	size = j.region.DataAreaSize()
+	return (j.region.TailOffset() + size - start) % size, size, true
 }
 
 // Checkpoint advances the head now instead of at the next interval. It reports false when the head could not move.
@@ -348,11 +390,15 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// The operation runs after Commit, so the head must not pass this transaction until CompleteIntent.
 	delete(j.activeTxns, txn)
 	j.pendingIntents[seq] = start
+	pressed := j.oldestIntentLagLocked() > j.region.DataAreaSize()/2
 
 	// Release lock BEFORE sync operations to avoid deadlock
 	// The sync operations (CommitSync/CommitBatch) may need to acquire
 	// other locks, so we must not hold j.mu during sync.
 	j.mu.Unlock()
+	if pressed {
+		j.runHookAsync()
+	}
 
 	// COMMIT POINT - sync to disk
 	// After this barrier, the transaction is guaranteed durable.

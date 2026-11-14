@@ -33,6 +33,8 @@ type Broadcaster struct {
 
 	sendMu sync.Mutex
 
+	onReturnReserves atomic.Pointer[func()]
+
 	sendersMu sync.Mutex
 	senders   map[[16]byte]*senderSeq
 
@@ -186,6 +188,26 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
 
 	case TypePeerAnnounce:
 		b.handlePeerAnnounce(msg, addr)
+
+	case TypeReturnReserves:
+		if fn := b.onReturnReserves.Load(); fn != nil {
+			go (*fn)()
+		}
+	}
+}
+
+// OnReturnReserves sets what runs when a peer asks for reserved blocks back.
+func (b *Broadcaster) OnReturnReserves(fn func()) {
+	b.onReturnReserves.Store(&fn)
+}
+
+// A lost message only makes the asker wait: peers also return idle reserves on their own.
+func (b *Broadcaster) BroadcastReturnReserves() {
+	if !b.running.Load() {
+		return
+	}
+	if err := b.send(b.builder.ReturnReserves); err != nil {
+		log.Printf("[broadcast] failed to send ReturnReserves: %v", err)
 	}
 }
 

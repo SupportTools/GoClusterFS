@@ -586,6 +586,61 @@ test_journal_recovery_multinode() {
     return 0
 }
 
+# VM A takes a block reserve, writes one block from it and is killed. VM B
+# replays VM A's journal, which gives the unused reserved blocks back: VM B's
+# free space ends one block below where it started.
+test_reserve_returned_after_crash() {
+    log_info "Testing that a killed node's unused block reserve is returned..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_info "SKIP: Need at least 2 VMs"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+
+    local vm_a=1 vm_b=2
+    local file=/mnt/goclusterfs/reserve-crash.bin
+    local free_kb
+    free_kb() { ssh_run "$vm_b" "df -k /mnt/goclusterfs | awk 'NR==2 {print \$4}'"; }
+
+    local before
+    before=$(free_kb)
+    ssh_run "$vm_a" "dd if=/dev/urandom of=$file bs=1M count=1 conv=fsync 2>/dev/null" || return 1
+    local reserved
+    reserved=$(free_kb)
+    log_info "free on VM B: ${before}KB before, ${reserved}KB while VM A holds its reserve"
+    if (( reserved > before - 2048 )); then
+        log_error "VM A's write took less than its block and a reserve (${before}KB -> ${reserved}KB)"
+        return 1
+    fi
+
+    log_info "Hard-killing VM A while it holds its reserve..."
+    kill_vm "$vm_a"
+    local want=$((before - 1024)) now=0 waited=0
+    while (( waited < 90 )); do
+        now=$(free_kb)
+        [[ "$now" -eq "$want" ]] && break
+        sleep 3
+        waited=$((waited + 3))
+    done
+    if [[ "$now" -ne "$want" ]]; then
+        log_error "VM B shows ${now}KB free after VM A's replay, want ${want}KB: the reserve was not returned"
+        return 1
+    fi
+    if [[ "$(ssh_run "$vm_b" "stat -c %s $file")" != "1048576" ]]; then
+        log_error "VM A's file is not whole on VM B after the replay"
+        return 1
+    fi
+    log_info "VM A's unused reserve came back after ${waited}s"
+
+    start_vm "$vm_a" false
+    wait_vm_healthy "$vm_a"
+    setup_goclusterfs "$vm_a" false
+    ssh_run "$vm_b" "rm -f $file"
+    log_info "Reserve returned after crash test passed"
+    return 0
+}
+
 # VM A's mount restarts while VM B keeps creating files.
 # Matches Go test: TestMultiNodeRestartKeepsPeerJournal in journal_slots_test.go
 test_restart_keeps_peer_journal() {
@@ -3896,6 +3951,7 @@ main() {
     run_test "Concurrent File Creation" test_concurrent_file_creation
     run_test "VM Kill Recovery" test_vm_kill_recovery
     run_test "Journal Recovery Multi-Node" test_journal_recovery_multinode
+    run_test "Reserve Returned After Crash" test_reserve_returned_after_crash
     run_test "Restart Keeps Peer Journal" test_restart_keeps_peer_journal
     run_test "Journal Recovery Multiple Files" test_journal_recovery_multiple_files
     run_test "Journal Recovery Large File" test_journal_recovery_large_file
