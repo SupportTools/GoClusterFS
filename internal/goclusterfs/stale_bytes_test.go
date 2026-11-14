@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/supporttools/GoClusterFS/internal/sfb"
 )
 
 const staleMarker = "FILE-A-DATA!"
@@ -221,4 +223,16 @@ func TestPowerCutDuringFirstWriteIntoAReusedBlock(t *testing.T) {
 			})
 		})
 	}
+}
+
+// A truncate moves a small file older versions kept in an SFB slot into a block of its own. Growing it again must
+// read zeros past the cut, not the bytes the move copied.
+func TestSFBFileTruncatedThenGrownReadsZeros(t *testing.T) {
+	fsys := openTreeFS(t, newTreeFSImage(t))
+	container := newSFBContainer(t, fsys, sfb.Tier16KB)
+	data := pattern(5, 10000)
+	f := newSFBFile(t, fsys, container, sfb.Tier16KB, 1, data)
+	truncateFile(t, f, 10)
+	truncateFile(t, f, 10000)
+	expectContent(t, f, append(slices.Clone(data[:10]), make([]byte, 9990)...))
 }

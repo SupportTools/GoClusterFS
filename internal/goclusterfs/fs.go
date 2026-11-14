@@ -8,6 +8,7 @@ package goclusterfs
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -2876,17 +2877,23 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	ctx = detach(ctx)
-	if size, ok := in.GetSize(); ok {
-		if errno := f.zeroPastEnd(ctx, size); errno != 0 {
-			return errno
-		}
-	}
+	size, resizing := in.GetSize()
 	for attempt := 0; ; attempt++ {
-		unlock := f.fs.lockInode(f.inodeNum)
-		errno, err := f.setattr(ctx, fh, in, out)
-		unlock()
+		var zeroedAt uint64
+		var errno syscall.Errno
+		var err error
+		if resizing {
+			if zeroedAt, errno, err = f.zeroPastEnd(ctx, size); err == nil && errno != 0 {
+				return errno
+			}
+		}
 		if err == nil {
-			return errno
+			unlock := f.fs.lockInode(f.inodeNum)
+			errno, err = f.setattr(ctx, fh, in, out, zeroedAt)
+			unlock()
+			if err == nil {
+				return errno
+			}
 		}
 		if attempt == maxConflictRetries-1 {
 			return syscall.EAGAIN
@@ -2897,32 +2904,39 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 // zeroPastEnd zeroes the bytes a shrink to size leaves in its last block, before the size changes, so growing the
 // file later reads zeros there instead of the old data. It writes through Write, which copies a shared block first.
-func (f *File) zeroPastEnd(ctx context.Context, size uint64) syscall.Errno {
+// It returns the MetaGeneration its decision rests on; setattr starts over if the inode changed since.
+func (f *File) zeroPastEnd(ctx context.Context, size uint64) (uint64, syscall.Errno, error) {
+	f.fs.invalidateInode(f.inodeNum)
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
-		return syscall.EIO
+		return 0, syscall.EIO, nil
 	}
 	end := min(ino.Size, (size/BlockSize+1)*BlockSize)
 	if size%BlockSize == 0 || size >= end || ino.IsSFBBacked() {
-		return 0
+		return ino.MetaGeneration, 0, nil
 	}
 	ext, _, err := f.fs.extentMgr.Lookup(ino, size/BlockSize)
-	if errors.Is(err, extent.ErrExtentNotFound) || err == nil && ext.Flags&extent.FlagUnwritten != 0 {
-		return 0
+	switch {
+	case errors.Is(err, extent.ErrStaleTree):
+		return 0, 0, errRetryWrite
+	case errors.Is(err, extent.ErrExtentNotFound), err == nil && ext.Flags&extent.FlagUnwritten != 0:
+		return ino.MetaGeneration, 0, nil
+	case err != nil:
+		return 0, syscall.EIO, nil
 	}
-	if err != nil {
-		return syscall.EIO
+	if n, errno := f.Write(ctx, nil, make([]byte, end-size), int64(size)); errno != 0 || uint64(n) != end-size {
+		return 0, cmp.Or(errno, syscall.EIO), nil
 	}
-	n, errno := f.Write(ctx, nil, make([]byte, end-size), int64(size))
-	if errno == 0 && uint64(n) != end-size {
-		errno = syscall.EIO
+	f.fs.invalidateInode(f.inodeNum)
+	if ino, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
+		return 0, syscall.EIO, nil
 	}
-	return errno
+	return ino.MetaGeneration, 0, nil
 }
 
 // setattr applies one Setattr attempt. A non-nil error means another node
 // changed the inode's extent tree first and the attempt should be redone.
-func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) (syscall.Errno, error) {
+func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut, zeroedAt uint64) (syscall.Errno, error) {
 	// Invalidate cache before modifying - ensures we read fresh data
 	f.fs.invalidateInode(f.inodeNum)
 
@@ -2947,6 +2961,10 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		}
 	}
 	readGen := ino.MetaGeneration
+	// Another change since zeroPastEnd looked, such as an SFB migration, may have mapped bytes past the new end again.
+	if zeroedAt != 0 && readGen != zeroedAt {
+		return 0, errRetryWrite
+	}
 
 	now := time.Now().UnixNano()
 
