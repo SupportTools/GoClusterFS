@@ -358,13 +358,21 @@ func (d *driver) finishOp(op *Op, resp response, err error) {
 	d.check(op)
 }
 
+// matches reports whether an operation that returned got did what the model expected.
+func matches(want, got int) bool {
+	if want == anyErrno {
+		return got != 0
+	}
+	return want == got
+}
+
 // check logs a finished operation, compares its errno with the model, applies it and checks every node shows it.
 func (d *driver) check(op *Op) {
 	d.logRecord(record{Type: "op", Op: *op})
 	d.ops.Add(1)
 	count, _ := d.opsByKind.LoadOrStore(op.Kind, new(atomic.Int64))
 	count.(*atomic.Int64).Add(1)
-	if !(op.Want == anyErrno && op.Got != 0 || op.Want == op.Got) {
+	if !matches(op.Want, op.Got) {
 		d.unexpected.Add(1)
 		d.fail("op %d %s %s on node %d: errno %d (%s), want %d", op.Seq, op.Kind, op.Path, op.Node, op.Got, op.Err, op.Want)
 		return
