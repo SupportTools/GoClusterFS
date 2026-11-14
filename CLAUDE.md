@@ -33,8 +33,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 
 | Path | What it does |
 |------|--------------|
-| `cmd/mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
-| `cmd/fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
+| `cmd/goclusterfs-mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
+| `cmd/goclusterfs-fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
 | `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics) |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
@@ -53,8 +53,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/sfb` | Small-file containers (4/8/16/64 KB slots in a 1 MB block). Disabled: nothing allocates slots, `goclusterfs` only reads and migrates files older builds stored there |
 | `internal/trim` | Batched `BLKDISCARD` for freed blocks |
 | `internal/fsck` | The fsck phases |
-| `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
-| `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
+| `internal/metrics` | Atomic counters, not used by `goclusterfs-mount` yet |
+| `internal/api` | HTTP API served by `goclusterfs-mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
 | `internal/cli` | Exit codes, flag parsing and error hints shared by the three commands |
 | `internal/logging` | The `-debug` switch: `logging.Debugf` prints only with `-debug` |

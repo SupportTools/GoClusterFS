@@ -46,7 +46,7 @@ for platform in $platforms; do
 
 	for cmd in mount fsck; do
 		CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-			go build -trimpath -ldflags "$ldflags" -o "$dir/goclusterfs-$cmd" "./cmd/$cmd"
+			go build -trimpath -ldflags "$ldflags" -o "$dir/goclusterfs-$cmd" "./cmd/goclusterfs-$cmd"
 	done
 	CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
 		go build -trimpath -ldflags "$ldflags" -o "$dir/gfsctl" ./cmd/gfsctl

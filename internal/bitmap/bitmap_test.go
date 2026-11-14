@@ -656,7 +656,7 @@ func BenchmarkFree(b *testing.B) {
 }
 
 func BenchmarkFreeCountFullBitmap(b *testing.B) {
-	const sectors = 256 // the 1MB bitmap region cmd/mount reserves
+	const sectors = 256 // the 1MB bitmap region goclusterfs-mount reserves
 	dev, cleanup := createTestDevice(b, sectors*SectorSize)
 	defer cleanup()
 
