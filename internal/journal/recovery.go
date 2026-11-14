@@ -398,7 +398,7 @@ func currentRecord(region *Region, sb JournalSuperblock, pos, remaining uint32, 
 	switch {
 	case err != nil:
 		return nil, err
-	case header.TotalLength < TxnHeaderSize || sectorAligned(header.TotalLength) > remaining:
+	case header.TotalLength < TxnHeaderSize || header.TotalLength > remaining || sectorAligned(header.TotalLength) > remaining:
 		return nil, fmt.Errorf("length %d", header.TotalLength)
 	case header.OwnerNodeUUID != sb.NodeUUID || header.OwnerGeneration != sb.NodeGeneration:
 		return nil, fmt.Errorf("record from node %x generation %d", header.OwnerNodeUUID[:4], header.OwnerGeneration)
