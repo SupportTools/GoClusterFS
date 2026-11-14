@@ -701,7 +701,7 @@ scenarios:
 
   - id: one-failed-write-keeps-acknowledged-results
     name: One failed write keeps acknowledged results
-    description: One device write fails with EIO, at an even spread of points in a workload that creates, writes, overwrites, truncates and unlinks; every acknowledged result holds while the node keeps running and after it crashes and is replayed, and fsck finds nothing but leaks
+    description: One device write fails with EIO in a workload that creates, writes, overwrites, truncates and unlinks; by default the last inode write of each step with a crash after it, and the first and last write to each region with the node running on (GOCLUSTERFS_EIO_SWEEP=metadata or full for more). Every acknowledged result holds, and fsck finds nothing but leaks
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestOneFailedWriteKeepsAcknowledgedResults

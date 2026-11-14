@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -20,8 +21,9 @@ import (
 )
 
 type eioRun struct {
-	fsys *FS
-	ok   map[string]bool
+	fsys  *FS
+	ok    map[string]bool
+	steps *atomic.Int32
 }
 
 func (r *eioRun) file(dirNum uint32, name string) *File {
@@ -37,12 +39,14 @@ func (r *eioRun) file(dirNum uint32, name string) *File {
 }
 
 func (r *eioRun) step(name string, op func() syscall.Errno) {
+	r.steps.Add(1)
 	r.ok[name] = op() == 0
 }
 
-func eioWorkload(fsys *FS) map[string]bool {
+// eioWorkload runs the workload and counts its steps in steps, so writes can be told apart by step.
+func eioWorkload(fsys *FS, steps *atomic.Int32) map[string]bool {
 	ctx := context.Background()
-	r := &eioRun{fsys: fsys, ok: map[string]bool{}}
+	r := &eioRun{fsys: fsys, ok: map[string]bool{}, steps: steps}
 	var sub *Dir
 	create := func(dir uint32, name string) syscall.Errno {
 		if dir == inode.InodeRoot {
@@ -213,10 +217,27 @@ func failedSteps(ok map[string]bool) string {
 	return fmt.Sprint(failed)
 }
 
+// region returns the index of the on-disk region that holds off: superblock, registry, lock records, snapshot
+// registry, journals, bitmap, refcounts, inode table or data.
+func region(sb *superblock.Superblock, off uint64) int {
+	starts := []uint64{0, sb.NodeRegistryOffset, sb.LockBitmapOffset, sb.SnapshotRegOffset, sb.JournalRegionOffset,
+		sb.BlockBitmapOffset, sb.RefCountTableOffset, sb.InodeTableOffset, sb.DataRegionOffset}
+	in := 0
+	for i, start := range starts {
+		if off >= start && start >= starts[in] {
+			in = i
+		}
+	}
+	return in
+}
+
+// eioWrite is where a write of the workload went and which step made it.
+type eioWrite struct{ region, step int }
+
 // runEIO fails write n of the workload with EIO and lets everything else land. With crash set the node then stops
-// as if it crashed and a new node replays its journal; otherwise the same node keeps running. It returns whether
-// each write went to the data region.
-func runEIO(t *testing.T, n int64, crash bool) []bool {
+// as if it crashed and a new node replays its journal; otherwise the same node keeps running. It returns every
+// write's region and step.
+func runEIO(t *testing.T, n int64, crash bool) []eioWrite {
 	fsys, path, offset, size := journaledFS(t)
 	withBridge(fsys)
 	sb, err := superblock.Read(fsys.dev)
@@ -224,19 +245,20 @@ func runEIO(t *testing.T, n int64, crash bool) []bool {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
-	var data []bool
+	var steps atomic.Int32
+	var writes []eioWrite
 	fsys.dev.SetWriteGate(func(off int64) error {
 		mu.Lock()
 		defer mu.Unlock()
-		data = append(data, uint64(off) >= sb.DataRegionOffset)
-		if int64(len(data)-1) == n {
+		writes = append(writes, eioWrite{region(sb, uint64(off)), int(steps.Load())})
+		if int64(len(writes)-1) == n {
 			return syscall.EIO
 		}
 		return nil
 	})
-	ok := eioWorkload(fsys)
+	ok := eioWorkload(fsys, &steps)
 	mu.Lock()
-	written := slices.Clone(data)
+	written := slices.Clone(writes)
 	mu.Unlock()
 	if n < int64(len(written)) {
 		t.Logf("failed steps: %s", failedSteps(ok))
@@ -251,9 +273,55 @@ func runEIO(t *testing.T, n int64, crash bool) []bool {
 	return written
 }
 
-// The workload makes thousands of writes, most of them file data. Every write outside the data region fails in turn,
-// and an even spread of eioDataSamples data writes; GOCLUSTERFS_EIO_SWEEP=full fails every write.
-const eioDataSamples = 20
+// eioPoints picks which writes to fail. By default, so the test stays short under the race detector, it fails the
+// last inode table write of each step, where a step commits, after which the node crashes, and the first and last
+// write to each region, after which the node keeps running. GOCLUSTERFS_EIO_SWEEP=metadata fails every write outside
+// the data region and 20 data writes, and GOCLUSTERFS_EIO_SWEEP=full fails every write.
+func eioPoints(writes []eioWrite, crash bool) []int {
+	const inodeTable, dataRegion = 7, 8
+	var points []int
+	switch os.Getenv("GOCLUSTERFS_EIO_SWEEP") {
+	case "full":
+		for n := range writes {
+			points = append(points, n)
+		}
+	case "metadata":
+		var data []int
+		for n, w := range writes {
+			if w.region == dataRegion {
+				data = append(data, n)
+			} else {
+				points = append(points, n)
+			}
+		}
+		for i := 0; i < len(data); i += max(1, len(data)/20) {
+			points = append(points, data[i])
+		}
+	default:
+		last := map[int]int{}
+		first := map[int]int{}
+		for n, w := range writes {
+			key := w.region
+			if crash {
+				if w.region != inodeTable {
+					continue
+				}
+				key = w.step
+			} else if _, ok := first[key]; !ok {
+				first[key] = n
+			}
+			last[key] = n
+		}
+		for _, n := range first {
+			points = append(points, n)
+		}
+		for _, n := range last {
+			points = append(points, n)
+		}
+	}
+	slices.Sort(points)
+	return slices.Compact(points)
+}
 
 // One write fails with EIO, at each point that matters in a workload that creates, writes, overwrites, truncates and unlinks.
 // Every result the workload acknowledged must hold, while the node keeps running and after it crashes and is
@@ -261,13 +329,8 @@ const eioDataSamples = 20
 func TestOneFailedWriteKeepsAcknowledgedResults(t *testing.T) {
 	for _, crash := range []bool{false, true} {
 		t.Run("crash="+strconv.FormatBool(crash), func(t *testing.T) {
-			data := runEIO(t, math.MaxInt64, crash)
-			step := max(1, len(data)/eioDataSamples)
-			full := os.Getenv("GOCLUSTERFS_EIO_SWEEP") == "full"
-			for n, isData := range data {
-				if full || !isData || n%step == 0 {
-					t.Run(fmt.Sprintf("eio_at_write_%d", n), func(t *testing.T) { runEIO(t, int64(n), crash) })
-				}
+			for _, n := range eioPoints(runEIO(t, math.MaxInt64, crash), crash) {
+				t.Run(fmt.Sprintf("eio_at_write_%d", n), func(t *testing.T) { runEIO(t, int64(n), crash) })
 			}
 		})
 	}
