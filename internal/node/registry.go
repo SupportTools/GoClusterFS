@@ -447,18 +447,35 @@ func (r *Registry) took(i int, slot *Slot) {
 }
 
 // awaitOtherNamespaceSlots watches the live-looking slots of this host in
-// another PID namespace until each heartbeats or goes stale, and returns the stale ones.
+// another PID namespace until each heartbeats or goes stale, and returns the
+// stale ones. The slots share this host's clock, so wall time judges them.
 func (r *Registry) awaitOtherNamespaceSlots() []int {
-	var watch []int
+	type beat struct {
+		seq  uint64
+		time int64
+	}
+	watch := map[int]beat{}
 	for i := 0; i < MaxNodes; i++ {
 		_, slot, err := r.readSlotRaw(i)
 		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !heartbeatOlderThan(slot, HeartbeatTimeout) {
-			watch = append(watch, i)
+			watch[i] = beat{slot.HeartbeatSeq, slot.HeartbeatTime}
 		}
 	}
+
 	var stale []int
-	for _, w := range r.awaitSilentSlots(watch, HeartbeatTimeout+2*HeartbeatInterval) {
-		stale = append(stale, w.slot)
+	deadline := time.Now().Add(HeartbeatTimeout + 2*HeartbeatInterval)
+	for len(watch) > 0 && time.Now().Before(deadline) {
+		time.Sleep(HeartbeatInterval / 4)
+		for i, last := range watch {
+			_, slot, err := r.readSlotRaw(i)
+			switch {
+			case err != nil || beat{slot.HeartbeatSeq, slot.HeartbeatTime} != last:
+				delete(watch, i)
+			case heartbeatOlderThan(slot, HeartbeatTimeout):
+				stale = append(stale, i)
+				delete(watch, i)
+			}
+		}
 	}
 	return stale
 }
