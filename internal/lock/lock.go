@@ -150,6 +150,8 @@ type Manager struct {
 	contested map[uint64]time.Time
 	// claims tracks the Acquire calls waiting for a record this node does not hold.
 	claims map[uint64]*pendingClaim
+	// unreleased holds records whose slot this node failed to clear; the watcher clears them again.
+	unreleased map[uint64]bool
 	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
 	adopted map[uint64]adoptedSlot
 	// ownerView, when set, says which node holds each registry slot.
@@ -297,6 +299,7 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		contested:  make(map[uint64]time.Time),
 		claims:     make(map[uint64]*pendingClaim),
 		adopted:    make(map[uint64]adoptedSlot),
+		unreleased: make(map[uint64]bool),
 		tornSince:  make(map[slotRef]tornSighting),
 	}
 }

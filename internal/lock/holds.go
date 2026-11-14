@@ -14,6 +14,10 @@ import (
 // never released lasts until unmount.
 var longHold = time.Minute
 
+// releaseRetry is how often the watcher clears again a slot whose release write
+// failed. Other nodes wait for the record until it is cleared.
+var releaseRetry = time.Second
+
 // Start runs a watcher that logs a warning for each record this node has held
 // for more than longHold. Stop ends it.
 func (m *Manager) Start() {
@@ -42,12 +46,16 @@ func (m *Manager) watchHolds(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	tick := time.NewTicker(longHold / 6)
 	defer tick.Stop()
+	retry := time.NewTicker(releaseRetry)
+	defer retry.Stop()
 	for {
 		select {
 		case <-stop:
 			return
 		case <-tick.C:
 			m.warnLongHolds()
+		case <-retry.C:
+			m.retryReleases()
 		}
 	}
 }
