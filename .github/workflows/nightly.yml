@@ -92,7 +92,7 @@ jobs:
     with:
       groups: "[1, 2, 3, 4]"
       run-concurrent: true
-      publish-report: false
+      skip-report: true
 
   race:
     name: Race x3 (lock, journal, inode, dir)
@@ -171,8 +171,6 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.fuzz-targets.outputs.targets) }}
     env:
-      TMPDIR: /dev/shm/gcfs-fuzz
-      GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-fuzz
       CORPUS_KEY: fuzz-corpus-${{ matrix.pkg }}-${{ matrix.target }}-
     steps:
       - name: Checkout code
@@ -192,8 +190,12 @@ jobs:
           key: ${{ env.CORPUS_KEY }}${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ${{ env.CORPUS_KEY }}
 
+      # Test images go on tmpfs; TMPDIR is set only here, since setup-go's go env needs it to exist.
       - name: Fuzz for ${{ env.FUZZTIME }}
         shell: bash
+        env:
+          TMPDIR: /dev/shm/gcfs-fuzz
+          GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-fuzz
         run: |
           mkdir -p "$TMPDIR" fuzz-corpus
           corpus="$(go env GOCACHE)/fuzz/${{ matrix.pkg }}/${{ matrix.target }}"
