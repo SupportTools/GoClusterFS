@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('\a')
+bool(false)
+[]byte("0")
+[]byte("7007007007")

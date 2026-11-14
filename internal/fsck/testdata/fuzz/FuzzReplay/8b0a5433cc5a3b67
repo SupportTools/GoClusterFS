@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("81%2101")
+byte('\x00')
+[]byte("0")

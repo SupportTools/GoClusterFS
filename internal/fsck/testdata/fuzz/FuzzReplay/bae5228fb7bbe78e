@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("8120101\xffA")
+byte('\x14')
+[]byte("0")

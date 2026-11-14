@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("7)1\xa3\x13\")s\xbc-\xfe070101")
+byte('ð')
+[]byte("701\xa3\x13")

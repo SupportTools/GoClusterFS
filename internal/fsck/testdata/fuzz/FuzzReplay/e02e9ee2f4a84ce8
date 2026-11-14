@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("\x0692%\x03")
+byte('\n')
+[]byte("zZ")

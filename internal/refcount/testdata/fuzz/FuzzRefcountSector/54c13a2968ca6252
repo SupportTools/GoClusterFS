@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('\x00')
+bool(false)
+[]byte("0")
+[]byte("y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1y1")

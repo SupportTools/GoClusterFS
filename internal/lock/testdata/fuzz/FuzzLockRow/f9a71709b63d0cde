@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('"')
+byte('\x05')
+bool(false)
+byte(';')
+[]byte("8000800080008B008B008\xf6008B000")

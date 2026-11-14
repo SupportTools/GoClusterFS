@@ -1,0 +1,4 @@
+go test fuzz v1
+string("ЌΨʀ蝭ƽ\b˺Ę\bޛȝࢮġӹ䆞̫ݝˋף緛ߠۆ\bѥȱڀӲ̔\bֽԣƝƐ")
+string("0")
+string("0")

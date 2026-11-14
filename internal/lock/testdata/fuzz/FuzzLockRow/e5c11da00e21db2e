@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\'')
+byte('R')
+bool(true)
+byte('É')
+[]byte("8A009A0008A009A0008A008A009A0008A0")

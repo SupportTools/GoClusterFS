@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("\x0677A2")
+byte('0')
+[]byte("21z")

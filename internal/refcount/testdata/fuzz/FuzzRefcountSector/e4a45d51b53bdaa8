@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('c')
+bool(true)
+[]byte("0")
+[]byte("72020720208202081208201")

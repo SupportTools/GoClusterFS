@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('Q')
+bool(false)
+[]byte("\x00B")

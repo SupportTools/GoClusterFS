@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("PB!1C01")
+byte('\x0e')
+[]byte("2")

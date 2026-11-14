@@ -32,6 +32,12 @@ func FuzzParseTreeNode(f *testing.F) {
 				binary.LittleEndian.PutUint32(buf[60:64], nodeChecksum(buf, count))
 			}
 		}
+		if ext, err := DeserializeExtent(buf); err == nil {
+			again, err := DeserializeExtent(SerializeExtent(ext))
+			if err != nil || *again != *ext {
+				t.Fatalf("extent changed after an encode/decode round trip: %+v != %+v (%v)", again, ext, err)
+			}
+		}
 		n, err := parseTreeNode(buf)
 		if err != nil {
 			return
