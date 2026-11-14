@@ -122,6 +122,10 @@ make test-parity         # Validate test coverage across environments
 make test-parity-report  # Detailed coverage report
 ```
 
+### Nightly Workflow
+
+`.github/workflows/nightly.yml` runs at 03:17 UTC what pull request CI skips: the integration suite without `-short` (grouped by `tests/scripts/integration-timings-full.txt`), the Docker suite with its concurrent tests (group 4 of `run-tests.sh`), `-race -count=3` on lock, journal, inode and dir, and every `FuzzXxx` for 25 minutes with its corpus cached between nights. New fuzz targets join automatically. A failure fails the run; the Summary job lists failed tests and uploads them as the `nightly-failures` artifact. It posts nothing to issues.
+
 ### Test Parity System (IMPORTANT)
 
 All test scenarios are tracked in `tests/test-manifest.yaml`. This manifest is the **single source of truth** for test coverage.
