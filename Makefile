@@ -22,7 +22,7 @@ DASHBOARD_DIST=internal/webui/build/dist
 GOLANGCI_LINT_VERSION=v2.15.0
 GOVULNCHECK_VERSION=v1.9.0
 COVER_PROFILE=coverage.out
-UNIT_PKGS ?= ./internal/...
+UNIT_PKGS ?= ./internal/... ./tests/soak
 UNIT_TIMEOUT ?= 20m
 
 # Default target
