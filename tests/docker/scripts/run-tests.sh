@@ -738,6 +738,21 @@ test_delete_directory() {
     return 0
 }
 
+# Git, SQLite and Postgres fsync a directory after creating or removing an entry in it; each fsync must succeed.
+test_dir_fsync() {
+    log "Testing directory fsync..."
+
+    local node="${NODE_ARRAY[0]}"
+    local dir=/mnt/goclusterfs/dirfsync_test
+    if ! exec_on_node "$node" sh -c "mkdir -p $dir && sync /mnt/goclusterfs && touch $dir/created && sync $dir && rm $dir/created && sync $dir"; then
+        log "ERROR: fsync of a directory failed"
+        return 1
+    fi
+    exec_on_node "$node" rm -rf "$dir"
+    log "Directory fsync test passed"
+    return 0
+}
+
 # Test: Truncate file
 # Creates a file and truncates it to a smaller size, verifying the operation
 test_truncate_file() {
@@ -3279,6 +3294,7 @@ run_test "Large File" test_large_file
 run_test "Many Files" test_many_files
 run_test "Nested Directories" test_nested_directories
 run_test "Delete Directory" test_delete_directory
+run_test "Directory Fsync" test_dir_fsync
 run_test "Truncate File" test_truncate_file
 run_test "Append File" test_append_file
 run_test "Rename File" test_rename_file

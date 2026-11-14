@@ -111,6 +111,22 @@ scenarios:
       docker: run-tests.sh::test_delete_directory
       vm: run-vm-tests.sh::test_delete_directory
 
+  - id: directory-fsync
+    name: Directory fsync
+    description: An application fsyncs a directory after creating, making and removing entries in it, as git, SQLite and Postgres do; each fsync succeeds
+    priority: high
+    environments:
+      go: dir_fsync_test.go::TestDirectoryFsync
+      docker: run-tests.sh::test_dir_fsync
+      vm: run-vm-tests.sh::test_dir_fsync
+
+  - id: directory-fsync-power-cut
+    name: Entries survive a power cut once their directory is fsynced
+    description: Without a journal, a power cut loses every write since the last flush; the entries made and removed before a directory fsync survive it, and a create after the last fsync does not
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/dir_fsync_test.go::TestDirFsyncSurvivesPowerCut
+
   - id: delete-non-empty-directory
     name: Delete non-empty directory fails
     description: Cannot delete directory with contents
