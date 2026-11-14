@@ -1,7 +1,8 @@
 # Runs what pull request CI cannot: the integration suite without -short, the
 # Docker suite with its concurrent tests, repeated race runs of the lock,
-# journal, inode and dir packages, and every fuzz target. A failure fails the
-# run; the Summary job lists the failed tests and uploads them as nightly-failures.
+# journal, inode and dir packages, the wider EIO sweep, and every fuzz target.
+# A failure fails the run; the Summary job lists the failed tests and uploads
+# them as nightly-failures.
 name: Nightly
 
 on:
@@ -10,8 +11,8 @@ on:
   workflow_dispatch:
     inputs:
       fuzztime:
-        description: How long to fuzz each target
-        default: 25m
+        description: Fuzz every target this long instead of its budget in tests/scripts/fuzz-budgets.txt
+        default: ""
   # A short run checks the wiring when the workflow or its scripts change.
   pull_request:
     branches: [main, master]
@@ -19,6 +20,7 @@ on:
       - .github/workflows/nightly.yml
       - .github/workflows/docker-integration.yml
       - tests/scripts/failed-tests.sh
+      - tests/scripts/fuzz-budgets.txt
       - tests/scripts/integration-groups.sh
       - tests/scripts/integration-timings-full.txt
 
@@ -31,7 +33,6 @@ concurrency:
 
 env:
   GO_VERSION: "1.26"
-  FUZZTIME: ${{ github.event_name == 'pull_request' && '1m' || inputs.fuzztime || '25m' }}
 
 jobs:
   integration:
@@ -127,6 +128,50 @@ jobs:
           path: race.log
           retention-days: 14
 
+  eio-sweep:
+    name: EIO sweep (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    strategy:
+      fail-fast: false
+      matrix:
+        # GOCLUSTERFS_EIO_SWEEP in internal/goclusterfs/eio_sweep_test.go. Under -race,
+        # metadata took 19 min on a Linux host; full ran past 2 hours.
+        mode: [metadata]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      # A -run that matches nothing passes, so the step also checks the test ran.
+      - name: Fail each chosen write once
+        shell: bash
+        env:
+          TMPDIR: /dev/shm/gcfs-eio
+          GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-eio
+          GOCLUSTERFS_EIO_SWEEP: ${{ matrix.mode }}
+        run: |
+          mkdir -p "$TMPDIR"
+          go test -race -count=1 -timeout 70m -v -run '^TestOneFailedWriteKeepsAcknowledgedResults$' ./internal/goclusterfs/ 2>&1 | tee eio-sweep.log
+          if ! grep -q '^--- PASS: TestOneFailedWriteKeepsAcknowledgedResults ' eio-sweep.log; then
+            echo "::error::TestOneFailedWriteKeepsAcknowledgedResults did not run"
+            exit 1
+          fi
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-eio-sweep-${{ matrix.mode }}
+          path: eio-sweep.log
+          retention-days: 14
+
   fuzz-targets:
     name: Find fuzz targets
     runs-on: ubuntu-latest
@@ -147,14 +192,18 @@ jobs:
         id: list
         shell: bash
         run: |
-          targets=$(go test -list '^Fuzz' ./... | awk '
+          targets=$(go test -list '^Fuzz' ./... | awk -v def=25m '
+            NR == FNR { if ($1 !~ /^#/ && NF == 2) budget[$1] = $2; next }
             /^Fuzz/ { names[++n] = $1; next }
             /^ok[ \t]/ {
               k = split($2, parts, "/")
-              for (i = 1; i <= n; i++) printf "{\"pkg\":\"%s\",\"target\":\"%s\",\"name\":\"%s-%s\"}\n", $2, names[i], parts[k], names[i]
+              for (i = 1; i <= n; i++) {
+                t = names[i]
+                printf "{\"pkg\":\"%s\",\"target\":\"%s\",\"name\":\"%s-%s\",\"fuzztime\":\"%s\"}\n", $2, t, parts[k], t, (t in budget ? budget[t] : def)
+              }
               n = 0
-            }' | jq -s -c .)
-          echo "$targets" | jq -r '.[].name'
+            }' tests/scripts/fuzz-budgets.txt - | jq -s -c .)
+          echo "$targets" | jq -r '.[] | .name + " " + .fuzztime'
           if [ "$targets" = "[]" ]; then
             echo "::error::found no fuzz targets"
             exit 1
@@ -165,12 +214,13 @@ jobs:
     name: Fuzz ${{ matrix.name }}
     needs: fuzz-targets
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.fuzz-targets.outputs.targets) }}
     env:
+      FUZZTIME: ${{ github.event_name == 'pull_request' && '1m' || inputs.fuzztime || matrix.fuzztime }}
       CORPUS_KEY: fuzz-corpus-${{ matrix.pkg }}-${{ matrix.target }}-
     steps:
       - name: Checkout code
@@ -239,7 +289,7 @@ jobs:
   summary:
     name: Summary
     if: always()
-    needs: [integration, docker, race, fuzz-targets, fuzz]
+    needs: [integration, docker, race, eio-sweep, fuzz-targets, fuzz]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -259,6 +309,7 @@ jobs:
           {
             for f in artifacts/nightly-integration-*/*.log; do tests/scripts/failed-tests.sh go integration "$f"; done
             for f in artifacts/nightly-race/*.log; do tests/scripts/failed-tests.sh go race "$f"; done
+            for f in artifacts/nightly-eio-sweep-*/*.log; do tests/scripts/failed-tests.sh go eio-sweep "$f"; done
             for f in artifacts/nightly-fuzz-*/fuzz.log; do tests/scripts/failed-tests.sh go fuzz "$f"; done
             for f in artifacts/docker-test-results-*/results.txt; do tests/scripts/failed-tests.sh docker docker "$f"; done
           } | sort -u >nightly-failures.tsv
