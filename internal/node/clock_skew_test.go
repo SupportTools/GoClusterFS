@@ -20,7 +20,7 @@ func keepWriting(t *testing.T, reg *Registry, idx int, slot *Slot, lag time.Dura
 			case <-time.After(250 * time.Millisecond):
 			}
 			if slot.State == NodeStateDead {
-				slot.RecoveryStart = time.Now().Add(-lag).Unix()
+				slot.RecoveryStart = max(time.Now().Add(-lag).Unix(), slot.RecoveryStart+1)
 			} else {
 				slot.HeartbeatSeq++
 				slot.HeartbeatTime = time.Now().Add(-lag).Unix()

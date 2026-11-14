@@ -9,7 +9,14 @@ import (
 )
 
 // recoveryLease is how long a peer may hold a dead slot's recovery before others take it over.
-const recoveryLease = 60 * time.Second
+var recoveryLease = 60 * time.Second
+
+// SetRecoveryLease shortens the recovery lease for tests in other packages, and returns a func that restores it.
+func SetRecoveryLease(d time.Duration) (restore func()) {
+	old := recoveryLease
+	recoveryLease = d
+	return func() { recoveryLease = old }
+}
 
 // deadAfter is how long this node must read the same heartbeat in a slot before
 // it counts the slot's node as dead rather than slow, and replays it.
