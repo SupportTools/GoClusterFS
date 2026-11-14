@@ -240,22 +240,28 @@ func analyze(args []string) {
 			maxVersion = max(maxVersion, v)
 		}
 	})
+	if maxVersion == 0 {
+		fail("writer log has no versions")
+	}
+	failed := false
 	changes := map[string][]change{}
 	for _, readerLog := range strings.Split(*readerLog, ",") {
+		looks := 0
 		scan(readerLog, func(f []string) {
 			if f[0] == "R" && len(f) == 5 {
 				at, _ := strconv.ParseInt(f[1], 10, 64)
 				size, _ := strconv.Atoi(f[3])
 				data, _ := strconv.Atoi(f[4])
 				changes[f[2]] = append(changes[f[2]], change{at, observation{size, data}})
+				looks++
 			}
 		})
-	}
-	if maxVersion == 0 {
-		fail("writer log has no versions")
+		if looks == 0 {
+			fmt.Printf("%s has no looks: the reader never opened the file or failed\n", readerLog)
+			failed = true
+		}
 	}
 
-	failed := false
 	for _, mode := range []string{"reopen", "stat", "open"} {
 		cs, ok := changes[mode]
 		if !ok {
@@ -308,11 +314,14 @@ func analyze(args []string) {
 		if regressions > 0 {
 			verdict = "WENT BACKWARDS"
 		}
+		// Readers watch until well after the writer's last version, so each
+		// must reach it.
+		if len(lags) < maxVersion {
+			verdict = fmt.Sprintf("NEVER SAW %d VERSIONS", maxVersion-len(lags))
+			failed = true
+		}
 		fmt.Printf("%-6s versions seen %d/%d  median %v  worst %v (v%d)  bound %v  unreadable looks %d  regressions %d  %s\n",
 			mode, len(lags), maxVersion, median.Round(time.Millisecond), worst.Round(time.Millisecond), worstVersion, *bounds[mode], bad, regressions, verdict)
-		if len(lags) < maxVersion-1 {
-			fmt.Printf("%-6s missed %d versions entirely\n", mode, maxVersion-len(lags))
-		}
 	}
 	if failed {
 		os.Exit(1)
