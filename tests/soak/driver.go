@@ -33,6 +33,7 @@ type config struct {
 	fsckEvery    time.Duration
 	barrierEvery time.Duration
 	window       time.Duration
+	coherence    time.Duration
 	stopFor      time.Duration
 	opTimeout    time.Duration
 	sshBasePort  int
@@ -72,11 +73,13 @@ type driver struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	failMu  sync.Mutex
-	failure string
+	// stopping is set when the run's time is up, so the operations it cuts short are not failures.
+	stopping atomic.Bool
+	failure  string
 
-	ops, unexpected, faults, fscks, barriers atomic.Int64
-	slowestMs                                atomic.Int64
-	opsByKind                                sync.Map
+	ops, unexpected, faults, fscks, barriers, slow atomic.Int64
+	slowestMs                                      atomic.Int64
+	opsByKind                                      sync.Map
 }
 
 func (d *driver) logRecord(r record) {
@@ -95,7 +98,7 @@ func (d *driver) logRecord(r record) {
 func (d *driver) fail(format string, args ...any) {
 	d.failMu.Lock()
 	defer d.failMu.Unlock()
-	if d.failure != "" {
+	if d.failure != "" || d.stopping.Load() {
 		return
 	}
 	d.failure = fmt.Sprintf(format, args...)
@@ -157,14 +160,20 @@ func (d *driver) upNodes() []*node {
 	return up
 }
 
-// converge retries check until it passes or the coherence window ends. The caller holds the node.
-func (d *driver) converge(check func() error) error {
+// converge retries check until it passes or the window ends. The caller holds the node. A check that passes only
+// after the documented coherence window is logged for review: during a fault, reads can wait out the failure detection.
+func (d *driver) converge(what string, check func() error) error {
 	start := time.Now()
 	for {
 		err := check()
 		if err == nil {
-			if ms := time.Since(start).Milliseconds(); ms > d.slowestMs.Load() {
+			took := time.Since(start)
+			if ms := took.Milliseconds(); ms > d.slowestMs.Load() {
 				d.slowestMs.Store(ms)
+			}
+			if took > d.cfg.coherence {
+				d.slow.Add(1)
+				d.logRecord(record{Type: "slow", Detail: fmt.Sprintf("%s took %s", what, took.Round(time.Millisecond))})
 			}
 			return nil
 		}
@@ -281,7 +290,7 @@ func (d *driver) verifyAll(n *node, content bool) error {
 	sort.Strings(dirs)
 	sort.Strings(files)
 	for _, dir := range dirs {
-		if err := d.converge(func() error { return d.compareDir(n, dir) }); err != nil {
+		if err := d.converge(fmt.Sprintf("node %d dir %s", n.id, dir), func() error { return d.compareDir(n, dir) }); err != nil {
 			return err
 		}
 	}
@@ -289,10 +298,10 @@ func (d *driver) verifyAll(n *node, content bool) error {
 		return nil
 	}
 	for _, p := range files {
-		if err := d.converge(func() error { return d.comparePath(n, p) }); err != nil {
+		if err := d.converge(fmt.Sprintf("node %d %s", n.id, p), func() error { return d.comparePath(n, p) }); err != nil {
 			return err
 		}
-		if err := d.converge(func() error { return d.compareSnaps(n, p) }); err != nil {
+		if err := d.converge(fmt.Sprintf("node %d snapshots of %s", n.id, p), func() error { return d.compareSnaps(n, p) }); err != nil {
 			return err
 		}
 	}
@@ -379,12 +388,12 @@ func (d *driver) check(op *Op) {
 
 func (d *driver) checkOp(m *node, op *Op, paths []string) error {
 	for _, p := range paths {
-		if err := d.converge(func() error { return d.comparePath(m, p) }); err != nil {
+		if err := d.converge(fmt.Sprintf("node %d %s after op %d", m.id, p, op.Seq), func() error { return d.comparePath(m, p) }); err != nil {
 			return err
 		}
 	}
 	if slices.Contains([]string{"snapshot", "snapdelete", "snapclone"}, op.Kind) {
-		return d.converge(func() error { return d.compareSnaps(m, op.Path) })
+		return d.converge(fmt.Sprintf("node %d snapshots of %s after op %d", m.id, op.Path, op.Seq), func() error { return d.compareSnaps(m, op.Path) })
 	}
 	return nil
 }
@@ -532,8 +541,8 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d faults=%d fscks=%d barriers=%d slowest_converge_ms=%d files=%d snapshots=%d blocks=%d [%s]",
-		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.fscks.Load(), d.barriers.Load(), d.slowestMs.Load(),
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d files=%d snapshots=%d blocks=%d [%s]",
+		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(),
 		files, snaps, blocks, strings.Join(kinds, " "))
 }
 
@@ -614,6 +623,7 @@ func run(cfg config) error {
 	wg.Go(func() { every(ctx, cfg.barrierEvery, d.barrier) })
 	wg.Go(func() { every(ctx, time.Minute, func() { log.Print(d.report()) }) })
 	<-ctx.Done()
+	d.stopping.Store(true)
 	d.cancel()
 	wg.Wait()
 	log.Print(d.report())

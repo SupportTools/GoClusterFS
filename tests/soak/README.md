@@ -4,7 +4,10 @@
 
 - **Operations:** create, write (overwrite, append, sparse), truncate, unlink, mkdir, rmdir, rename, snapshot, clone, clone from a snapshot, and snapshot delete. Rename is not supported, so each rename must fail and change nothing.
 - **Lanes:** several lanes run at once, each on its own files and snapshots, in directories they share.
-- **Checks:** after every operation, each node must show its result, through a fresh open, within `-window` (10s). That covers `-attr-timeout` and `-cache-ttl`, because broadcast cannot cross the VMs' separate networks.
+- **Checks:** after every operation, each node must show its result, through a fresh open, within `-window` (30s).
+  - The window covers `-attr-timeout` and `-cache-ttl`, because broadcast cannot cross the VMs' separate networks.
+  - It also covers waiting out a failed node's 10s detection.
+  - A check that needs longer than `-coherence` (6s) is logged as a `slow` record for review.
 - **Faults:** every `-fault-every`, one node is hit, picked at random from these:
   - power is cut (QEMU is killed);
   - goclusterfs-mount gets SIGKILL;
