@@ -3866,6 +3866,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
 
+  - id: lock-failed-release-retried
+    name: A failed release write is retried
+    description: A node's write clearing its claim fails once; the node clears it again, and another node gets the record within a few seconds instead of after the first node unmounts
+    priority: go_only
+    environments:
+      go: internal/lock/release_retry_test.go::TestFailedReleaseWriteIsRetried
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it

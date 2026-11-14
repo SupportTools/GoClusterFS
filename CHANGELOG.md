@@ -78,6 +78,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- One failed write while a node released a lock left its claim on the device, and the node forgot it: other nodes timed out with `EIO` on every resource in that lock record until the node unmounted. The node now clears such a claim again every second until the write succeeds.
 - A node in a higher registry slot could wait 30 seconds and fail with `EIO` for a lock that a node in a lower slot kept releasing and claiming again every few milliseconds. A node that loses a claim to a lower slot now leaves a waiting mark in its own slot, and the holder gives the lock up 250 ms after it first sees a live node's mark.
 - `chmod`, `chown` and `touch` could undo another node's concurrent change to the same inode: on a directory, a create's link count or mtime; on a file, the size an append inside an allocated block set. Directory attribute changes now hold the inode lock from read to write, and file attribute changes retry when the inode changed since they read it.
 - After 3 failed multicast sends in total, counted over the whole mount, a node sent cache invalidations only to unicast peers until it unmounted. Now only failures in a row count: a successful send resets them, and after 3 in a row the node tries multicast again 30 seconds later.
