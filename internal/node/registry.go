@@ -100,6 +100,7 @@ type Registry struct {
 
 	localUUID   [16]byte
 	localSlot   int // -1 if not registered
+	preferred   int // slot Register tries first, or -1
 	stopCh      chan struct{}
 	heartbeatWg sync.WaitGroup
 
@@ -173,6 +174,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		dev:                  dev,
 		offset:               registryOffset,
 		localSlot:            -1,
+		preferred:            -1,
 		stopCh:               make(chan struct{}),
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
@@ -278,9 +280,26 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	copy(name[:], hostname)
 	r.hostname = string(bytes.TrimRight(name[:], "\x00"))
 
+	empty := func(slot *Slot) bool { return slot.State == NodeStateEmpty }
 	ownFailed := func(slot *Slot) bool {
 		return r.sameHost(slot) && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) &&
 			(r.deadLocalOwner(slot) || heartbeatOlderThan(slot, HeartbeatTimeout))
+	}
+	// The slot -skip-recovery names comes first: the operator chose it.
+	if r.preferred >= 0 {
+		if i, err := r.claimFirst([]int{r.preferred}, func(slot *Slot) bool { return empty(slot) || ownFailed(slot) }); i >= 0 || err != nil {
+			return i, err
+		}
+		// A slot under another node's recovery is taken only once its lease has lapsed unrenewed.
+		if _, slot, err := r.readSlotRaw(r.preferred); err == nil && slot.State != NodeStateEmpty {
+			watch := silentSlotWatch
+			if slot.State == NodeStateDead {
+				watch = recoveryLease
+			}
+			if i, err := r.claimWatched(r.awaitSilentSlots([]int{r.preferred}, watch)); i >= 0 || err != nil {
+				return i, err
+			}
+		}
 	}
 	if i, err := r.claimFirst(allSlots(), ownFailed); i >= 0 || err != nil {
 		return i, err
@@ -289,16 +308,27 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	if i, err := r.claimFirst(append(r.awaitOtherNamespaceSlots(), allSlots()...), ownFailed); i >= 0 || err != nil {
 		return i, err
 	}
-	// Another host's heartbeat that looks old by this clock may be a live node's whose clock is behind, so its slot is
-	// taken only once the heartbeat has not changed for silentSlotWatch by this node's clock.
-	if i, err := r.claimFirst(r.awaitSilentSlots(r.otherHostSlots(), silentSlotWatch), func(*Slot) bool { return true }); i >= 0 || err != nil {
+	if i, err := r.claimFirst(allSlots(), empty); i >= 0 || err != nil {
 		return i, err
 	}
-	i, err := r.claimFirst(allSlots(), func(slot *Slot) bool { return slot.State == NodeStateEmpty })
+	// Another host's heartbeat that looks old by this clock may be a live node's whose clock is behind, so its slot is
+	// taken only once the heartbeat has not changed for silentSlotWatch by this node's clock.
+	i, err := r.claimWatched(r.awaitSilentSlots(r.otherHostSlots(), silentSlotWatch))
 	if i < 0 && err == nil {
 		err = ErrNoFreeSlots
 	}
 	return i, err
+}
+
+// PreferSlot makes Register try slot first: it takes it if it is empty, or if
+// what it watches in the slot stays unchanged: a node's heartbeat for
+// silentSlotWatch, or a recovery lease for recoveryLease. Mount passes the slot
+// -skip-recovery names, so the mount can take a crashed node's slot and discard
+// its journal.
+func (r *Registry) PreferSlot(slot int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.preferred = slot
 }
 
 // silentSlotWatch is how long Register watches another host's slot before it
@@ -319,9 +349,38 @@ func (r *Registry) otherHostSlots() []int {
 	return slots
 }
 
+// watchedSlot is a slot and the bytes awaitSilentSlots read in it throughout its watch.
+type watchedSlot struct {
+	slot int
+	raw  []byte
+}
+
+// afterSilentWatch, when a test sets it, runs after awaitSilentSlots ends its watch.
+var afterSilentWatch func()
+
+// claimWatched claims the first slot that still holds the bytes watched in it,
+// so a slot a peer marked dead, or whose node beat again, since is left alone.
+func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
+	for _, w := range slots {
+		if err := r.claimSlot(w.slot, w.raw); err != nil {
+			if errors.Is(err, ErrSlotTaken) {
+				continue
+			}
+			return -1, err
+		}
+		slot, err := deserializeSlot(w.raw)
+		if err != nil {
+			return -1, err
+		}
+		r.took(w.slot, slot)
+		return w.slot, nil
+	}
+	return -1, nil
+}
+
 // awaitSilentSlots reads slots until each has changed or for d, and returns the
-// ones that never changed. It times the wait on this node's clock.
-func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []int {
+// ones that never changed with the bytes they held. It times the wait on this node's clock.
+func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []watchedSlot {
 	first := map[int][]byte{}
 	for _, i := range slots {
 		if raw, _, err := r.readSlotRaw(i); err == nil {
@@ -337,10 +396,13 @@ func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []int {
 			}
 		}
 	}
-	var silent []int
+	if afterSilentWatch != nil {
+		afterSilentWatch()
+	}
+	var silent []watchedSlot
 	for _, i := range slots {
-		if _, ok := first[i]; ok {
-			silent = append(silent, i)
+		if raw, ok := first[i]; ok {
+			silent = append(silent, watchedSlot{i, raw})
 		}
 	}
 	return silent
@@ -367,16 +429,21 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 			}
 			return -1, err
 		}
-		r.localSlot = i
-		r.beatSeq = 1
-		now := time.Now()
-		r.lastBeat.Store(&now)
-		if slot.State != NodeStateEmpty {
-			r.previousOwner = &slot.UUID
-		}
+		r.took(i, slot)
 		return i, nil
 	}
 	return -1, nil
+}
+
+// took records that this node registered in slot i, which held slot. Called with r.mu held.
+func (r *Registry) took(i int, slot *Slot) {
+	r.localSlot = i
+	r.beatSeq = 1
+	now := time.Now()
+	r.lastBeat.Store(&now)
+	if slot.State != NodeStateEmpty {
+		r.previousOwner = &slot.UUID
+	}
 }
 
 // awaitOtherNamespaceSlots watches the live-looking slots of this host in
@@ -389,7 +456,11 @@ func (r *Registry) awaitOtherNamespaceSlots() []int {
 			watch = append(watch, i)
 		}
 	}
-	return r.awaitSilentSlots(watch, HeartbeatTimeout+2*HeartbeatInterval)
+	var stale []int
+	for _, w := range r.awaitSilentSlots(watch, HeartbeatTimeout+2*HeartbeatInterval) {
+		stale = append(stale, w.slot)
+	}
+	return stale
 }
 
 // Unregister gracefully releases the node's slot.
@@ -917,8 +988,8 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		err = r.replay(handler, i, info)
 		done(err == nil)
 		if err != nil {
-			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v",
-				i, info.UUID[:8], err, recoveryLease)
+			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v. To discard its journal instead, mount a node with -skip-recovery=%d",
+				i, info.UUID[:8], err, recoveryLease, i)
 			r.mu.Lock()
 			delete(r.recoveryInProgress, i)
 			r.mu.Unlock()

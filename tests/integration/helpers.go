@@ -307,8 +307,8 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 
 // WaitForMount waits until the filesystem is mounted and accessible.
 // It checks /proc/mounts to verify the FUSE mount is active.
-// mountWait is how long a mount may take: one that finds another host's slot
-// with an old heartbeat watches it for about 12 seconds before taking it.
+// mountWait is how long a mount may take: one whose -skip-recovery names
+// another host's slot watches it for about 12 seconds before taking it.
 const mountWait = 30 * time.Second
 
 func (m *MountedFS) WaitForMount(timeout time.Duration) error {

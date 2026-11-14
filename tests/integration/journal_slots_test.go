@@ -216,9 +216,9 @@ func TestMountRefusesDamagedJournal(t *testing.T) {
 }
 
 // TestSkipRecoveryDiscardsOnlyNamedSlot damages the journal of another host's
-// crashed node, whose slot the mount then takes. -skip-recovery naming a
-// different slot must not discard it, also on a retry, when the slot already
-// carries this host's name from the failed mount. Naming the slot does.
+// crashed node. A mount takes an empty slot instead, and -skip-recovery naming
+// a different slot leaves the damaged journal alone. Naming the crashed slot
+// makes the mount take it, once its heartbeat has not changed, and discard it.
 func TestSkipRecoveryDiscardsOnlyNamedSlot(t *testing.T) {
 	cluster := NewMultiNodeCluster(t, 1, 50)
 	mfs := cluster.Node(0)
@@ -240,25 +240,20 @@ func TestSkipRecoveryDiscardsOnlyNamedSlot(t *testing.T) {
 	if slot == other {
 		other = "2"
 	}
-	for attempt := 1; attempt <= 2; attempt++ {
-		out := &syncBuffer{}
-		mfs.Log = out
-		mfs.ExtraArgs = []string{"-skip-recovery=" + other}
-		if err := cluster.StartNode(0, false); err == nil {
-			t.Fatalf("attempt %d: -skip-recovery=%s mounted over slot %s's damaged journal", attempt, other, slot)
-		}
-		for _, want := range []string{
-			"ignoring -skip-recovery=" + other + ": this mount took slot " + slot,
-			"Journal recovery for slot " + slot + " failed",
-			"mount with -skip-recovery=" + slot,
-		} {
-			if !strings.Contains(out.String(), want) {
-				t.Errorf("attempt %d: mount output lacks %q:\n%s", attempt, want, out.String())
-			}
-		}
-		if !bytes.Equal(readImageSector(t, cluster.ImagePath, offset), damaged) {
-			t.Fatalf("attempt %d: slot %s's journal changed", attempt, slot)
-		}
+	out := &syncBuffer{}
+	mfs.Log = out
+	mfs.ExtraArgs = []string{"-skip-recovery=" + other}
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount with -skip-recovery=%s: %v", other, err)
+	}
+	if got := mustMatch(t, slotRe, out, "registration"); got == slot {
+		t.Errorf("a mount took slot %s of another host's crashed node, which -skip-recovery did not name", slot)
+	}
+	if !bytes.Equal(readImageSector(t, cluster.ImagePath, offset), damaged) {
+		t.Fatalf("slot %s's journal changed although -skip-recovery named slot %s", slot, other)
+	}
+	if err := cluster.StopNode(0); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
 
 	named := &syncBuffer{}
@@ -266,6 +261,9 @@ func TestSkipRecoveryDiscardsOnlyNamedSlot(t *testing.T) {
 	mfs.ExtraArgs = []string{"-skip-recovery=" + slot}
 	if err := cluster.StartNode(0, false); err != nil {
 		t.Fatalf("mount with -skip-recovery=%s: %v", slot, err)
+	}
+	if got := mustMatch(t, slotRe, named, "registration"); got != slot {
+		t.Errorf("-skip-recovery=%s: the mount took slot %s", slot, got)
 	}
 	if got := mustMatch(t, journalInitRe, named, "journal init"); got != offset {
 		t.Errorf("-skip-recovery=%s started a journal at offset %s, want %s", slot, got, offset)

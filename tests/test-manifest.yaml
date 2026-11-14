@@ -749,6 +749,27 @@ scenarios:
       docker: TODO  # containers share the host clock; covered in Go and VM
       vm: run-vm-tests.sh::test_clock_ahead_crash_recovered
 
+  - id: register-takes-empty-slot-first
+    name: Register takes an empty slot before another host's silent one
+    description: A mount takes an empty slot without waiting, and leaves another host's slot whose heartbeat looks old to failure detection unless -skip-recovery names it or no slot is empty
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne
+
+  - id: register-takes-named-slot-under-recovery-once-lapsed
+    name: A named slot under recovery is taken once its lease lapses
+    description: -skip-recovery naming a slot that another node marked dead takes it only after its recovery lease stays unrenewed for the lease term
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesNamedSlotUnderRecoveryOnlyOnceItsLeaseLapses
+
+  - id: register-leaves-watched-slot-that-changes
+    name: Register leaves a watched slot that changed
+    description: A slot Register watched stay silent is not taken if a peer marks it dead or its node beats again before the claim
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterLeavesWatchedSlotThatChanges
+
   - id: renewed-lease-held-whatever-clock
     name: A renewed recovery lease is held whatever the replayer's clock
     description: A lease unchanged past recoveryLease counts as lapsed; once the replayer renews it, peers count it as held although its start time is 2 minutes in the past
@@ -3801,7 +3822,7 @@ scenarios:
     description: Register reports the node whose failed slot it took, from any host, so mount keeps that node's lock claims through the replay
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlot
+      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlotWhenNamedOrNoneIsEmpty
 
   - id: storage-write-gate-refuses-writes
     name: Device write gate refuses writes

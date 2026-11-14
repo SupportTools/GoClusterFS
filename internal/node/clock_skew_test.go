@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -38,6 +39,7 @@ func TestRegisterLeavesLiveSlotOfNodeWithSlowClock(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 	reg := NewRegistry(dev, 0)
+	fillWithReplays(t, reg, 1)
 
 	live := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 1, HeartbeatTime: time.Now().Add(-2 * time.Minute).Unix()}
 	copy(live.Hostname[:], "other-host")
@@ -47,8 +49,8 @@ func TestRegisterLeavesLiveSlotOfNodeWithSlowClock(t *testing.T) {
 	defer keepWriting(t, reg, 0, live, 2*time.Minute)()
 	time.Sleep(time.Second)
 
-	if slot, err := reg.Register(context.Background(), "new-host"); err != nil || slot == 0 {
-		t.Errorf("Register = %d, %v; want an empty slot, not slot 0 of a live node whose clock is 2 minutes behind", slot, err)
+	if slot, err := reg.Register(context.Background(), "new-host"); !errors.Is(err, ErrNoFreeSlots) {
+		t.Errorf("Register = %d, %v; want ErrNoFreeSlots: the only slot not empty or under recovery holds a live node whose clock is 2 minutes behind", slot, err)
 	}
 }
 
