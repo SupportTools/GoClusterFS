@@ -34,7 +34,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
 - **fsck repairs little.** `-repair` rebuilds refcounts, frees leaked blocks and inodes no directory names, and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
-- **Cluster safety limits.** Node clocks, node stalls, and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
+- **Cluster safety limits.** Node stalls and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
 
 ## Quick Start
 
@@ -195,7 +195,7 @@ For clustered deployments:
 1. **Shared Storage**: All nodes must access the same block device (SAN, iSCSI, NVMe-oF)
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
-4. **Limits**: At most 64 nodes mount a device at once, and node clocks must agree within a few seconds (run NTP)
+4. **Limits**: At most 64 nodes mount a device at once; run NTP so file times agree
 5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
 6. **Stalled nodes**: Other nodes declare a node dead after about 20 seconds of silence, for example a paused VM, and replay its journal. The stalled node checks its registry slot before each write, so when it resumes it refuses new writes and exits. A write it started before the stall can still land. Only storage fencing closes that gap, such as SCSI-3 persistent reservations, which GoClusterFS does not use. See [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits)
 

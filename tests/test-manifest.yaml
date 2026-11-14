@@ -723,6 +723,68 @@ scenarios:
       docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
       vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
 
+  - id: hostile-storage-latency-spikes
+    name: Storage latency spikes on one node
+    description: One node's path to the shared disk takes 100ms, 500ms, 1s and 2s per I/O for 15s each while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      go: internal/node/clock_skew_test.go::TestSlowRegistryReadsDoNotStarveHeartbeat
+      vm: run-vm-tests.sh::test_storage_latency_spikes
+
+  - id: clock-ahead-mount-keeps-live-slot
+    name: A node with a fast clock does not take a live node's slot
+    description: A node that never mounted the volume mounts with its clock 2 minutes ahead; it takes a free slot, and the mounted node keeps running
+    priority: high
+    environments:
+      go: internal/node/clock_skew_test.go::TestRegisterLeavesLiveSlotOfNodeWithSlowClock
+      docker: TODO  # containers share the host clock; covered in Go and VM
+      vm: run-vm-tests.sh::test_clock_ahead_mount
+
+  - id: clock-ahead-crash-replayed
+    name: A crashed node with a fast clock is replayed on time
+    description: A node whose clock is 3 minutes ahead crashes; its peer replays it within the usual failover time, judging silence on its own clock
+    priority: high
+    environments:
+      go: internal/node/clock_skew_test.go::TestCrashedNodeWithFastClockIsReplayed
+      docker: TODO  # containers share the host clock; covered in Go and VM
+      vm: run-vm-tests.sh::test_clock_ahead_crash_recovered
+
+  - id: register-takes-empty-slot-first
+    name: Register takes an empty slot before another host's silent one
+    description: A mount takes an empty slot without waiting, and leaves another host's slot whose heartbeat looks old to failure detection unless -skip-recovery names it or no slot is empty
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne
+
+  - id: register-takes-named-slot-under-recovery-once-lapsed
+    name: A named slot under recovery is taken once its lease lapses
+    description: -skip-recovery naming a slot that another node marked dead takes it only after its recovery lease stays unrenewed for the lease term
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesNamedSlotUnderRecoveryOnlyOnceItsLeaseLapses
+
+  - id: register-takes-back-earlier-boot-slot
+    name: A rebooted host takes back its slot
+    description: A mount takes back the slot its hostname held in an earlier kernel boot, once the slot's heartbeat proves silent, before any empty slot, so it replays that journal before serving
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesBackSlotOfItsEarlierBoot
+      vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
+
+  - id: register-leaves-watched-slot-that-changes
+    name: Register leaves a watched slot that changed
+    description: A slot Register watched stay silent is not taken if a peer marks it dead or its node beats again before the claim
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterLeavesWatchedSlotThatChanges
+
+  - id: renewed-lease-held-whatever-clock
+    name: A renewed recovery lease is held whatever the replayer's clock
+    description: A lease unchanged past recoveryLease counts as lapsed; once the replayer renews it, peers count it as held although its start time is 2 minutes in the past
+    priority: go_only
+    environments:
+      go: internal/node/clock_skew_test.go::TestRenewedRecoveryLeaseIsHeldWhateverTheReplayersClock
+
   - id: hostile-storage-short-stalls
     name: Short storage stalls on one node
     description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
@@ -3824,7 +3886,7 @@ scenarios:
     description: Register reports the node whose failed slot it took, from any host, so mount keeps that node's lock claims through the replay
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestRegisterReportsPreviousOwnerOfAnyTakenSlot
+      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlotWhenNamedOrNoneIsEmpty
 
   - id: storage-write-gate-refuses-writes
     name: Device write gate refuses writes
