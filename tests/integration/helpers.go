@@ -332,23 +332,38 @@ func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 	return fmt.Errorf("timeout waiting for mount after %v", timeout)
 }
 
-// Unmount unmounts the filesystem using fusermount.
+// unmountBusyTimeout is how long Unmount retries fusermount while the mount is
+// busy: a FUSE release still in flight after close, or a desktop indexer
+// crawling the mount, keeps it busy for a moment.
+const unmountBusyTimeout = 10 * time.Second
+
+// Unmount unmounts the filesystem and waits for the mount process to run its
+// clean shutdown. If the mount stays busy, it kills the process and detaches
+// the dead mount, so a later Mount at the same path can work, and returns an
+// error.
 func (m *MountedFS) Unmount() error {
-	// Use fusermount to unmount FIRST.
-	// This triggers the go-fuse server to exit cleanly, allowing
-	// the mount command to run its shutdown code (journal checkpoint, etc.)
-	// Do NOT cancel the context first - that would SIGKILL the process
-	// and skip the clean shutdown path where journal checkpointing happens.
-	cmd := exec.Command("fusermount", "-u", m.MountPoint)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// May fail if already unmounted
-		m.t.Logf("fusermount output: %s", output)
+	var unmountErr error
+	start := time.Now()
+	for busy := 0; ; busy++ {
+		output, err := exec.Command("fusermount", "-u", m.MountPoint).CombinedOutput()
+		if err == nil || !m.IsMounted() {
+			unmountErr = nil
+			if busy > 0 {
+				m.t.Logf("fusermount -u succeeded after the mount was busy for %v", time.Since(start).Round(time.Millisecond))
+			}
+			break
+		}
+		unmountErr = fmt.Errorf("fusermount -u %s: %v: %s", m.MountPoint, err, strings.TrimSpace(string(output)))
+		if !strings.Contains(string(output), "busy") || time.Since(start) > unmountBusyTimeout {
+			m.t.Log(unmountErr)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Wait for mount process to exit cleanly
+	// Do not cancel the context first: that kills the process before its
+	// clean shutdown checkpoints the journal.
 	if m.MountCmd != nil && m.MountCmd.Process != nil {
-		// Give it time to run clean shutdown (journal checkpoint, etc.)
 		done := make(chan error, 1)
 		go func() {
 			done <- m.MountCmd.Wait()
@@ -360,7 +375,6 @@ func (m *MountedFS) Unmount() error {
 				m.t.Logf("mount process exited: %v", err)
 			}
 		case <-time.After(10 * time.Second):
-			// Force kill only as last resort after generous timeout
 			m.t.Log("Warning: mount process did not exit in time, force killing")
 			if m.cancel != nil {
 				m.cancel()
@@ -369,6 +383,14 @@ func (m *MountedFS) Unmount() error {
 		}
 	}
 
+	if m.IsMounted() {
+		if output, err := exec.Command("fusermount", "-uz", m.MountPoint).CombinedOutput(); err != nil {
+			m.t.Logf("fusermount -uz %s: %v: %s", m.MountPoint, err, output)
+		}
+	}
+	if unmountErr != nil {
+		return unmountErr
+	}
 	m.t.Log("Unmounted successfully")
 	return nil
 }
