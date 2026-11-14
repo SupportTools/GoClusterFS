@@ -749,8 +749,8 @@ func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 	if m.refs != nil {
 		uncounted = m.refs.Uncounted
 	}
-	// Only Share raises a count, and only under the bitmap lock, so a block with
-	// no count under that lock has this one owner and needs no refcount lock.
+	// Only Share raises a count, and only under the bitmap lock, so a count of 0
+	// read under that lock stays 0 while the block is freed.
 	counted, err := m.bitmap.FreeIf(ctx, blocks, uncounted)
 	switch {
 	case errors.Is(err, lock.ErrDeadlockRisk):

@@ -116,7 +116,10 @@ type Region struct {
 
 // AllocationGuard is the block bitmap as Share needs it. A block with no count
 // is freed under the bitmap lock alone, so Share counts blocks only while
-// holding that lock, and only blocks that are still allocated.
+// holding that lock, and only blocks that are still allocated. An allocated
+// block may still be on its way out, between Release and the bitmap free or
+// while TRIM holds it, so Share's caller checks afterwards that the file still
+// maps every block it counted.
 type AllocationGuard interface {
 	HoldAllocated(ctx context.Context, blocks []uint64) (allocated []uint64, release func(), err error)
 }
@@ -186,6 +189,7 @@ func (r *Region) Get(ctx context.Context, blockNum uint64) (Entry, error) {
 
 // Increment increases the reference count for a block.
 // Returns the new count after incrementing.
+// It skips the bitmap guard that Share takes, so only offline repair and tests may call it.
 func (r *Region) Increment(ctx context.Context, blockNum uint64) (uint32, error) {
 	if blockNum >= r.totalBlocks {
 		return 0, ErrBlockOutOfRange
@@ -259,6 +263,7 @@ func (r *Region) Decrement(ctx context.Context, blockNum uint64) (uint32, error)
 
 // Set directly sets the reference count for a block.
 // Used during initialization or recovery. For normal operations, use Increment/Decrement.
+// It skips the bitmap guard that Share takes, so only offline repair and tests may call it.
 func (r *Region) Set(ctx context.Context, blockNum uint64, count uint32, flags EntryFlags) error {
 	if blockNum >= r.totalBlocks {
 		return ErrBlockOutOfRange
@@ -283,6 +288,7 @@ func (r *Region) Set(ctx context.Context, blockNum uint64, count uint32, flags E
 }
 
 // SetFlags updates the flags for a block without changing the reference count.
+// It skips the bitmap guard that Share takes, so only offline repair and tests may call it.
 func (r *Region) SetFlags(ctx context.Context, blockNum uint64, flags EntryFlags) error {
 	if blockNum >= r.totalBlocks {
 		return ErrBlockOutOfRange
@@ -311,6 +317,7 @@ func (r *Region) SetFlags(ctx context.Context, blockNum uint64, flags EntryFlags
 // IncrementBatch increments reference counts for multiple blocks atomically.
 // This is more efficient than calling Increment individually for each block.
 // Returns the new counts after incrementing.
+// It skips the bitmap guard that Share takes, so only offline repair and tests may call it.
 func (r *Region) IncrementBatch(ctx context.Context, blockNums []uint64) ([]uint32, error) {
 	results := make([]uint32, len(blockNums))
 	err := r.updateBatch(ctx, blockNums, func(i int, e *Entry) (bool, error) {

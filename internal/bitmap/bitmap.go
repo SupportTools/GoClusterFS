@@ -332,10 +332,9 @@ func (r *Region) releaseReserved(ctx context.Context, blocks []uint64) {
 	}
 }
 
-// flipBits marks each block allocated (or free) whose bit says otherwise, under
-// the bitmap lock, and returns the blocks it changed, even on error.
 // HoldAllocated takes the bitmap lock and returns the blocks of blocks that are
 // allocated. The lock stays held, so none of them can be freed, until release.
+// A block past the end of the volume is an error.
 func (r *Region) HoldAllocated(ctx context.Context, blocks []uint64) ([]uint64, func(), error) {
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
@@ -353,7 +352,8 @@ func (r *Region) HoldAllocated(ctx context.Context, blocks []uint64) ([]uint64, 
 	var allocated []uint64
 	for _, b := range blocks {
 		if b >= r.totalBlocks {
-			continue
+			release()
+			return nil, nil, fmt.Errorf("block %d: %w", b, ErrBlockOutOfRange)
 		}
 		sectorIdx := b / BitsPerSector
 		data, ok := sectors[sectorIdx]
@@ -412,7 +412,7 @@ func (r *Region) FreeIf(ctx context.Context, blocks []uint64, which func([]uint6
 			bit := b % BitsPerSector
 			mask := byte(1) << (bit % 8)
 			if data[bit/8]&mask == 0 {
-				logging.Debugf("bitmap.FreeIf: block %d already free", b)
+				log.Printf("[WARN] bitmap: freeing block %d, which is already free", b)
 				continue
 			}
 			data[bit/8] &^= mask
@@ -439,6 +439,8 @@ func (r *Region) FreeBatch(ctx context.Context, blocks []uint64) error {
 	return err
 }
 
+// flipBits marks each block allocated (or free) whose bit says otherwise, under
+// the bitmap lock, and returns the blocks it changed, even on error.
 func (r *Region) flipBits(ctx context.Context, blocks []uint64, allocated bool) ([]uint64, error) {
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
