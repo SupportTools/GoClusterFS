@@ -75,60 +75,60 @@ func apiConfig(addr, token, corsList string, rateLimit float64) api.Config {
 
 func main() {
 	var (
-		devicePath = flag.String("device", "", "Path to block device or image file")
-		mountPoint = flag.String("mount", "", "Mount point directory")
-		format     = flag.Bool("format", false, "Format the device (WARNING: destroys data)")
+		devicePath = flag.String("device", "", "Block device, or image file on a filesystem that supports O_DIRECT, to mount; required")
+		mountPoint = flag.String("mount", "", "Directory to mount the filesystem on; required")
+		format     = flag.Bool("format", false, "Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first")
 		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
-			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes)", superblock.MinInodes, superblock.MaxInodes))
+			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes); fixed until the next format", superblock.MinInodes, superblock.MaxInodes))
 		debug     = flag.Bool("debug", false, "Print [DEBUG] log lines")
 		fuseDebug = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
 		showVer   = flag.Bool("version", false, "Print version and exit")
 
 		// Cache configuration
-		cacheStrict   = flag.Bool("cache-strict", false, "Enable strict cache mode (always validate)")
-		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "Cache TTL before validation")
-		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries")
+		cacheStrict   = flag.Bool("cache-strict", false, "Check every cached inode against the device before using it; slower, but other nodes' changes show at once")
+		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost")
+		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries; stat and ls can show another node's change this late, while opening a file always sees it")
 		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
 		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
 		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")
 		dirIndex      = flag.Int("dir-index-entries", dir.DefaultIndexEntries, "Names kept in in-memory directory indexes, about 100 bytes each; 0 turns them off")
 
 		// Journal configuration
-		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
-		skipRecovery   = flag.Int("skip-recovery", -1, "Discard the journal of registry slot N instead of replaying it, if this mount takes slot N (emergency maintenance only)")
+		journalEnabled = flag.Bool("journal", true, "Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only")
+		skipRecovery   = flag.Int("skip-recovery", -1, "Emergency use only: discard the journal of registry slot N instead of replaying it, if this mount takes slot N, losing the writes it holds; -1 replays as normal")
 
 		// Network broadcast configuration
-		broadcastEnabled = flag.Bool("broadcast", true, "Enable network cache invalidation broadcast")
-		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group address")
-		multicastPort    = flag.Int("mcast-port", 31337, "UDP port for multicast messages")
+		broadcastEnabled = flag.Bool("broadcast", true, "Send and receive cache invalidations over UDP so other nodes see changes sooner; correctness does not depend on it")
+		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group for broadcast messages; the same on every node")
+		multicastPort    = flag.Int("mcast-port", 31337, "UDP port for multicast messages; the same on every node")
 		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
-		broadcastSecret  = flag.String("broadcast-secret", "", "Shared secret for HMAC authentication")
-		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast")
+		broadcastSecret  = flag.String("broadcast-secret", "", "Secret that signs broadcast messages, the same on every node; visible to local users in ps. Empty leaves them unauthenticated: any host that can reach the UDP ports can make this node drop its caches")
+		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast; empty lets the kernel choose")
 		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
 
 		// TRIM configuration
-		trimEnabled   = flag.Bool("trim", true, "Enable batched TRIM for freed blocks")
-		trimBatchSize = flag.Int("trim-batch", 256, "TRIM batch size (blocks before flush)")
-		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Max age before TRIM flush")
+		trimEnabled   = flag.Bool("trim", true, "Discard freed blocks on the device (BLKDISCARD) in batches; does nothing on image files")
+		trimBatchSize = flag.Int("trim-batch", 256, "Freed blocks to collect before a discard")
+		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Longest a freed block waits for its discard")
 
 		// SFB configuration (Sub-File Block containers for small files)
 		_ = flag.Bool("sfb", true, "Ignored: SFB containers are disabled, and every file uses full 1MB blocks")
 
 		// Snapshot configuration
-		snapshotsEnabled = flag.Bool("snapshots", true, "Enable O(1) file snapshots via xattr")
+		snapshotsEnabled = flag.Bool("snapshots", true, "File snapshots and clones through extended attributes (user.snapshot, user.clone)")
 
 		// API server configuration
-		apiEnabled   = flag.Bool("api", true, "Enable HTTP API server for management")
+		apiEnabled   = flag.Bool("api", true, "Serve the HTTP API: health, metrics, status and statistics")
 		apiAddr      = flag.String("api-addr", "127.0.0.1:8080", "API server listen address; any non-loopback address needs a token")
 		apiTokenFile = flag.String("api-token-file", "", "File (mode 0600) holding the API bearer token; a token also turns on API writes. Or set "+apiTokenEnv)
 		apiToken     = flag.String("api-token", "", "API bearer token; visible to all local users in ps, prefer -api-token-file")
-		apiCORS      = flag.String("api-cors", "", "Comma-separated CORS allowed origins (empty=disabled)")
-		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that (0=off)")
+		apiCORS      = flag.String("api-cors", "", "Comma-separated origins that browsers may call the API from, or *; empty allows none")
+		apiRate      = flag.Float64("api-rate-limit", 0, "API requests per second per client IP, with bursts of twice that; 0 turns the limit off")
 		dashboard    = flag.Bool("dashboard", true, "Serve the web dashboard on the API server under /ui/")
 	)
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [-format] [-debug]\n\n", os.Args[0])
-		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "Usage: %s -device <path> -mount <mountpoint> [flags]\n\nTurn off a flag that defaults to true with -flag=false.\n\n", os.Args[0])
+		cli.PrintFlags(os.Stderr, flag.CommandLine)
 		fmt.Fprint(os.Stderr, exitCodesHelp)
 	}
 	if code, ok := cli.ParseFlags(flag.CommandLine, os.Args[1:]); !ok {

@@ -16,7 +16,7 @@ RUN go mod download
 COPY . .
 
 # Build the mount binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o goclusterfs-mount ./cmd/mount
+RUN CGO_ENABLED=0 GOOS=linux go build -o goclusterfs-mount ./cmd/goclusterfs-mount
 
 # =============================================================================
 # Stage 2: Runtime - Minimal image with FUSE and network tools

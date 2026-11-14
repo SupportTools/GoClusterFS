@@ -48,6 +48,8 @@ make build
 
 This builds `goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` in the repo root. To include the web dashboard, run `make dashboard build` instead; it needs Node 22 and npm. Release archives include it.
 
+Or install all three into `$(go env GOPATH)/bin`, without the dashboard, with `go install github.com/supporttools/GoClusterFS/cmd/...@latest`.
+
 ### Format and Mount
 
 Use a file as the block device. Keep it on a filesystem that supports O_DIRECT.
@@ -85,7 +87,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 |------|---------|-------------|
 | `-device` | (required) | Path to block device or image file |
 | `-mount` | (required) | Mount point directory (must exist) |
-| `-format` | `false` | Format the device, then mount it (destroys data) |
+| `-format` | `false` | Erase the device, create an empty filesystem, then mount it. Does not check for other nodes: unmount every node first |
 | `-bytes-per-inode` | `1048576` | With `-format`: one inode per this many bytes of device (4096 to 16,777,216 inodes) |
 | `-debug` | `false` | Print `[DEBUG]` log lines: file operations, locks, allocation |
 | `-fuse-debug` | `false` | Log every FUSE request and reply |
@@ -95,27 +97,27 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-cache-strict` | `false` | Always validate cache against disk |
-| `-cache-ttl` | `5s` | Time before cache entries need revalidation |
+| `-cache-strict` | `false` | Check every cached inode against the device before using it |
+| `-cache-ttl` | `5s` | How long a cached inode is used before it is checked against the device |
 | `-attr-timeout` | `1s` | How long the kernel caches file attributes and directory entries |
 
 ### Journal Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-journal` | `true` | Enable write-ahead journal |
+| `-journal` | `true` | Write-ahead journal; turn it off for testing only, since a crash can then leave the filesystem inconsistent |
 | `-skip-recovery=N` | `-1` (off) | Emergency only: discard the journal of registry slot N instead of replaying it, if the mount takes slot N. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot) |
 
 ### Network Broadcast Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-broadcast` | `true` | Enable network cache invalidation |
+| `-broadcast` | `true` | Send cache invalidations over UDP so other nodes see changes sooner |
 | `-mcast-group` | `239.192.74.75` | Multicast group address |
 | `-mcast-port` | `31337` | UDP port for multicast |
 | `-unicast-port` | `31338` | UDP port for unicast; must differ from `-mcast-port` |
-| `-broadcast-secret` | (empty) | HMAC secret for message authentication |
-| `-broadcast-iface` | (auto) | Network interface for multicast |
+| `-broadcast-secret` | (empty) | Secret that signs broadcast messages; the same on every node |
+| `-broadcast-iface` | (empty) | Network interface for multicast; empty lets the kernel choose |
 
 With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-broadcast=false` to run without broadcast. With no `-broadcast-secret`, mount logs a `WARNING` line at startup: any host that can send to those ports can make nodes drop their caches. Set the same secret on every node.
 
@@ -123,9 +125,9 @@ With `-broadcast` on, the mount fails if it cannot bind both UDP ports; pass `-b
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-trim` | `true` | Enable batched TRIM/discard |
-| `-trim-batch` | `256` | Number of blocks per TRIM batch |
-| `-trim-age` | `5s` | Maximum age before forcing TRIM flush |
+| `-trim` | `true` | Discard freed blocks on the device in batches; does nothing on image files |
+| `-trim-batch` | `256` | Freed blocks to collect before a discard |
+| `-trim-age` | `5s` | Longest a freed block waits for its discard |
 
 ### Feature Flags
 

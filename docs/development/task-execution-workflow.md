@@ -85,7 +85,7 @@ Clear summary aligned with project architecture
 #### Design Approach
 Technical strategy following established patterns:
 - Block-level operations (1MB blocks)
-- On-disk layout as defined in `cmd/mount/main.go`
+- On-disk layout as defined in `internal/superblock` (`calculateLayout`)
 - FUSE handler patterns
 - Thread-safe concurrent access
 
