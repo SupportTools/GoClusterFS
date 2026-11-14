@@ -250,7 +250,9 @@ func TestInodeLockHoldersDoNotWaitForRefill(t *testing.T) {
 	go func() {
 		defer close(done)
 		var st fuse.StatfsOut
-		nodeA.Statfs(ctx, &st)
+		if errno := nodeA.Statfs(ctx, &st); errno != 0 {
+			t.Error(errno)
+		}
 		if err := nodeA.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
 			t.Error(err)
 			return
