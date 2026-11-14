@@ -22,6 +22,8 @@ import (
 
 var errPowerCut = errors.New("power cut")
 
+const maxRaceCuts = 48
+
 type power struct {
 	limit  int64
 	writes atomic.Int64
@@ -61,7 +63,12 @@ func runPowerCuts(t *testing.T, c powerCutCase) {
 		t.Fatal("the operation wrote nothing")
 	}
 	t.Logf("the operation makes %d writes", total)
-	for n := range total {
+	step := int64(1)
+	// The race detector makes each cut many times slower, so it checks an even spread of them.
+	if raceDetector && total > maxRaceCuts {
+		step = (total + maxRaceCuts - 1) / maxRaceCuts
+	}
+	for n := int64(0); n < total; n += step {
 		t.Run(fmt.Sprintf("cut_after_%d_writes", n), func(t *testing.T) { runPowerCut(t, c, n) })
 	}
 }
@@ -134,7 +141,7 @@ func attachHolePunchingTrim(t *testing.T, fsys *FS, path string) {
 	}
 	const keepSize, punchHole = 0x01, 0x02
 	tm := trim.NewManager(fsys.dev, trim.Config{
-		BatchSize:  math.MaxInt32,
+		BatchSize:  1 << 16,
 		MaxAge:     time.Hour,
 		DataOffset: sb.DataRegionOffset,
 		Enabled:    true,
