@@ -155,7 +155,8 @@ jobs:
         env:
           TMPDIR: /dev/shm/gcfs-eio
           GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-eio
-          GOCLUSTERFS_EIO_SWEEP: ${{ matrix.mode }}
+          # On pull requests any other value runs the short default sample, to check the wiring.
+          GOCLUSTERFS_EIO_SWEEP: ${{ github.event_name == 'pull_request' && 'sample' || matrix.mode }}
         run: |
           mkdir -p "$TMPDIR"
           go test -race -count=1 -timeout 70m -v -run '^TestOneFailedWriteKeepsAcknowledgedResults$' ./internal/goclusterfs/ 2>&1 | tee eio-sweep.log
