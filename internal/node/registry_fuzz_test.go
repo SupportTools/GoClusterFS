@@ -58,20 +58,25 @@ func checkSlot(t *testing.T, buf []byte, slot *Slot) {
 
 	r := NewRegistry(nil, 0)
 	_, _ = slot.Host(), slot.State.String()
-	failed := r.failed(slot, HeartbeatTimeout)
+	r.observe(0, slot)
+	if r.stale(0, slot, HeartbeatTimeout) && !r.deadLocalOwner(slot) {
+		t.Fatalf("state %s: a slot seen for the first time counted as stale", slot.State)
+	}
 	expiry := slot.LeaseExpiry()
 	switch slot.State {
-	case NodeStateActive, NodeStateLeaving, NodeStateDead:
-		if r.deadLocalOwner(slot) {
-			return
+	case NodeStateActive, NodeStateLeaving:
+		old := heartbeatOlderThan(slot, HeartbeatTimeout)
+		if gap := time.Until(expiry); (gap > time.Second && old) || (gap < -time.Second && !old) {
+			t.Fatalf("state %s: heartbeat old is %v but the lease ends %s from now (heartbeat %d)",
+				slot.State, old, gap, slot.HeartbeatTime)
 		}
-		if gap := time.Until(expiry); (gap > time.Second && failed) || (gap < -time.Second && !failed) {
-			t.Fatalf("state %s: failed is %v but the lease ends %s from now (heartbeat %d, recovery start %d)",
-				slot.State, failed, gap, slot.HeartbeatTime, slot.RecoveryStart)
+	case NodeStateDead:
+		if want := time.Unix(slot.RecoveryStart, 0).Add(recoveryLease); !expiry.Equal(want) {
+			t.Fatalf("dead slot: lease ends %v, want recovery start %d plus the lease", expiry, slot.RecoveryStart)
 		}
 	default:
-		if failed || !expiry.IsZero() {
-			t.Fatalf("state %s: failed %v, lease ends %v", slot.State, failed, expiry)
+		if !expiry.IsZero() {
+			t.Fatalf("state %s: lease ends %v", slot.State, expiry)
 		}
 	}
 }
