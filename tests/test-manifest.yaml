@@ -3917,6 +3917,13 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
 
+  - id: lock-failed-release-retried
+    name: A failed release write is retried
+    description: A node's write clearing its claim fails once; the node clears it again, and another node gets the record within a few seconds instead of after the first node unmounts
+    priority: go_only
+    environments:
+      go: internal/lock/release_retry_test.go::TestFailedReleaseWriteIsRetried
+
   - id: snapshot-unreadable-sector-not-rewritten
     name: An unreadable snapshot registry sector is not rewritten
     description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
