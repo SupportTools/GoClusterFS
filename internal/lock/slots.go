@@ -20,11 +20,15 @@ import (
 // This holds whatever the I/O delays.
 //
 // When claims collide, the claimant in the lower slot keeps its slot and waits;
-// any claimant that sees a conflict in a lower slot clears its own and retries.
-// Waits only point from lower to higher slots, so they never form a cycle. A
-// claimant that cleared its slot reads the row before writing again, and waits
-// without writing while the lower slot is still there, so it does not get in
-// the way of that slot's claim.
+// any claimant that sees a conflict in a lower slot replaces its claim with a
+// waiting mark and retries. A mark conflicts with no claim, so waits only point
+// from lower to higher slots and never form a cycle. A claimant that lost reads
+// the row before writing again, and waits without writing while the lower slot
+// is still there, so it does not get in the way of that slot's claim.
+//
+// A node that wins a claim and sees a live node's mark ends its turn holdTurn
+// after it first saw one, even if it keeps claiming the record again, so a
+// higher slot gets the record while a lower one keeps using it.
 const (
 	SlotsPerRecord = 64
 	SlotSize       = storage.SectorSize
@@ -165,7 +169,7 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 			torn = rowSlot(row, slot)
 		}
 		tornTooLong := m.tornTooLong(slotRef{recordID, slot}, torn)
-		if err == nil && (s == nil || (mode != LockModeExclusive && s.mode != LockModeExclusive)) {
+		if err == nil && (s == nil || s.mode == modeWaiting || (mode != LockModeExclusive && s.mode != LockModeExclusive)) {
 			continue
 		}
 		adopted := s != nil && s.adopted
@@ -191,6 +195,49 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 		}
 	}
 	return conflict, lower, by
+}
+
+// othersWaiting reports whether row holds a waiting mark of a live node other
+// than this one. With an owner view a mark counts while its writer holds its
+// registry slot alive; without one, until it is older than StaleThreshold.
+func (m *Manager) othersWaiting(row []byte) bool {
+	m.mu.Lock()
+	view := m.ownerView
+	m.mu.Unlock()
+	for slot := range SlotsPerRecord {
+		if slot == m.nodeSlot {
+			continue
+		}
+		s, err := decodeSlot(rowSlot(row, slot))
+		if err != nil || s == nil || s.mode != modeWaiting {
+			continue
+		}
+		if view == nil {
+			if !s.stale() {
+				return true
+			}
+			continue
+		}
+		if occupant, state := view(slot, false); state == OwnerAlive && occupant == s.owner {
+			return true
+		}
+	}
+	return false
+}
+
+// markWaiting replaces this node's claim on recordID with a waiting mark and
+// returns when it wrote it, or keeps an adoption there as releaseRecord does.
+// It runs under the record gate.
+func (m *Manager) markWaiting(recordID uint64, key lockKey) (time.Time, error) {
+	m.mu.Lock()
+	adopted := m.ownAdoptedLocked(recordID)
+	m.mu.Unlock()
+	if adopted {
+		return time.Time{}, m.releaseRecord(recordID)
+	}
+	now := time.Now()
+	mark := &claimSlot{mode: modeWaiting, lockType: key.Type, resourceID: key.ResourceID, owner: m.nodeUUID, acquireTime: now.UnixNano()}
+	return now, m.writeSlot(recordID, m.nodeSlot, mark)
 }
 
 // tornTooLong reports whether ref has read torn, with the same bytes, for
@@ -249,7 +296,7 @@ func (m *Manager) addClaimWaiterLocked(recordID uint64) {
 }
 
 // dropClaimWaiter ends one Acquire call's wait. The last waiter to leave
-// clears a slot this node wrote for the record but never won.
+// clears a claim or mark this node wrote for the record but never won.
 func (m *Manager) dropClaimWaiter(recordID uint64) {
 	m.mu.Lock()
 	c := m.claims[recordID]
@@ -258,7 +305,7 @@ func (m *Manager) dropClaimWaiter(recordID uint64) {
 		m.mu.Unlock()
 		return
 	}
-	if c.written.IsZero() {
+	if c.written.IsZero() && c.marked.IsZero() {
 		delete(m.claims, recordID)
 		m.mu.Unlock()
 		return
@@ -276,7 +323,7 @@ func (m *Manager) dropClaimWaiter(recordID uint64) {
 	}
 	delete(m.claims, recordID)
 	m.mu.Unlock()
-	if !c.written.IsZero() {
+	if !c.written.IsZero() || !c.marked.IsZero() {
 		_ = m.releaseRecord(recordID)
 	}
 }
@@ -292,7 +339,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 	if a, ok := m.adopted[recordID]; ok {
 		ignore = a.slot
 	}
-	behindLower := c.behindLower
+	behindLower, marked := c.behindLower, c.marked
 	m.mu.Unlock()
 
 	if behindLower {
@@ -302,6 +349,15 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 		}
 		if _, lower, by := m.rowConflicts(recordID, row, mode, ignore); lower {
 			m.deferred.Add(1)
+			if !marked.IsZero() && age(marked) > renewAfter {
+				at, err := m.markWaiting(recordID, key)
+				m.mu.Lock()
+				c.marked = at
+				m.mu.Unlock()
+				if err != nil {
+					return time.Time{}, false, by, err
+				}
+			}
 			return time.Time{}, false, by, nil
 		}
 		m.mu.Lock()
@@ -313,7 +369,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 	if rewrite {
 		err := m.writeSlot(recordID, m.nodeSlot, m.ownClaim(recordID, key, mode, start))
 		m.mu.Lock()
-		c.written, c.mode = start, mode
+		c.written, c.mode, c.marked = start, mode, time.Time{}
 		m.mu.Unlock()
 		if err != nil {
 			return time.Time{}, false, blocker{}, err
@@ -330,19 +386,26 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 	conflict, lower, by := m.rowConflicts(recordID, row, mode, ignore)
 	switch {
 	case !conflict:
+		waited := m.othersWaiting(row)
 		m.mu.Lock()
 		written = c.written
 		c.written = time.Time{}
+		if _, seen := m.contested[recordID]; waited && !seen {
+			m.contested[recordID] = time.Now()
+		} else if !waited {
+			delete(m.contested, recordID)
+		}
 		m.mu.Unlock()
 		return written, true, blocker{}, nil
 	case lower:
 		m.conflicts.Add(1)
-		if err := m.releaseRecord(recordID); err != nil {
+		at, err := m.markWaiting(recordID, key)
+		m.mu.Lock()
+		c.written, c.marked, c.behindLower = time.Time{}, at, true
+		m.mu.Unlock()
+		if err != nil {
 			return time.Time{}, false, by, err
 		}
-		m.mu.Lock()
-		c.written, c.behindLower = time.Time{}, true
-		m.mu.Unlock()
 		return time.Time{}, false, by, nil
 	default:
 		m.waits.Add(1)
@@ -387,6 +450,9 @@ func (m *Manager) describeHolder(recordID uint64) string {
 		switch {
 		case err != nil:
 			holders = append(holders, fmt.Sprintf("slot %d (torn)", slot))
+		case s != nil && s.mode == modeWaiting:
+			holders = append(holders, fmt.Sprintf("slot %d node %x waiting, marked %v ago",
+				slot, s.owner[:8], time.Since(time.Unix(0, s.acquireTime)).Round(time.Millisecond)))
 		case s != nil:
 			adopted := ""
 			if s.adopted {
