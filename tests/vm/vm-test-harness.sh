@@ -514,6 +514,8 @@ setup_goclusterfs() {
     local format_disk="${2:-false}"
     # Extra environment for the mount process, such as a test failpoint
     local mount_env="${3:-}"
+    # Block device to mount, such as a device-mapper device over the shared disk
+    local device="${4:-/dev/vda}"
     local ssh_port=$(get_vm_ssh_port "$vm_id")
 
     log_info "Setting up GoClusterFS on VM $vm_id (format=$format_disk)..."
@@ -527,7 +529,7 @@ setup_goclusterfs() {
         "${binaries[@]}" "${SSH_USER}@127.0.0.1:/usr/local/bin/"
 
     # Mount GoClusterFS
-    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device /dev/vda"
+    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device}"
     if [[ "$format_disk" == "true" ]]; then
         log_info "Formatting shared disk on VM $vm_id..."
         # One inode per 64 KB gives the 1 GB disk 16384 inodes, enough for test_more_than_4096_files
