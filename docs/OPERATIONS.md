@@ -172,6 +172,8 @@ setfattr -n user.clone -v /data.db.copy /mnt/fs/data.db
 setfattr -x user.snapshot.snap1 /mnt/fs/data.db
 ```
 
+A snapshot stays with the file it was taken of. When you delete the file, its snapshots become orphans: `getfattr` on any file no longer lists them, and `GET /api/v1/snapshots` lists them with `orphan: true`. Delete an orphan with `DELETE /api/v1/snapshots/<name>` and no `path`. Snapshots made by older versions are orphans after an upgrade, because they do not record which file they were taken of. `goclusterfs-fsck` warns about each orphan.
+
 Snapshots and clones share blocks with the file and copy a block on its first write. A block is freed when no file, snapshot, or clone uses it. Before you mount an image with snapshots or clones using a newer build, read the upgrade notes in [CHANGELOG.md](../CHANGELOG.md).
 
 ---

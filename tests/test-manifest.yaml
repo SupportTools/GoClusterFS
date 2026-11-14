@@ -1507,6 +1507,34 @@ scenarios:
     environments:
       go: internal/journal/record_order_test.go::TestRecoverReplaysVersion1Journal
 
+  - id: snapshot-stays-with-its-file
+    name: A snapshot stays with the file it was taken of
+    description: A file is snapshotted and deleted, and a new file takes its inode slot; the new file lists, clones and deletes none of the old file's snapshots, which fsck reports as orphans
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotStaysWithItsFile
+
+  - id: orphan-snapshot-listed-and-deletable
+    name: Orphan snapshots are listed and deleted without their file
+    description: The full listing marks a deleted file's snapshot as an orphan and the new file's as not; only the orphan can be deleted without a file
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestOrphanSnapshotListedAndDeletable
+
+  - id: snapshot-without-birth-is-orphan
+    name: A snapshot without its file's birth generation is an orphan
+    description: A descriptor as older versions wrote it cannot prove which file it belongs to; the file does not list it, the full listing marks it an orphan, and fsck reports it
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotWithoutBirthIsOrphan
+
+  - id: snapshot-descriptor-target-birth
+    name: A snapshot descriptor keeps its file's birth generation
+    description: A descriptor read back from disk belongs to its file and to no other inode number or birth generation
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestDescriptorKeepsTargetBirth
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run

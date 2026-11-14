@@ -817,11 +817,12 @@ func TestOldSnapshotAndCloneNeverFreeSharedBlocks(t *testing.T) {
 
 	writeAt(t, clone, pattern(6, 100), 10)
 	stillAllocated("writing the old clone")
-	if errno := src.Setxattr(ctx, "user.snapshot.clone", []byte("old-snap:/x"), 0); errno != syscall.ENOTSUP {
-		t.Fatalf("clone of a snapshot without data: errno %v, want ENOTSUP", errno)
+	// An older version's snapshot does not record its file, so it is an orphan.
+	if errno := src.Setxattr(ctx, "user.snapshot.clone", []byte("old-snap:/x"), 0); errno != syscall.ENOENT {
+		t.Fatalf("clone of an orphan snapshot through the file: errno %v, want ENOENT", errno)
 	}
-	if errno := src.Removexattr(ctx, "user.snapshot.old-snap"); errno != 0 {
-		t.Fatalf("delete old snapshot: %v", errno)
+	if err := fsys.DeleteOrphanSnapshot(ctx, "old-snap"); err != nil {
+		t.Fatalf("delete old snapshot: %v", err)
 	}
 	waitSnapshotGone(t, fsys, "old-snap")
 	stillAllocated("deleting the old snapshot")

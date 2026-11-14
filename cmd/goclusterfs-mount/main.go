@@ -519,7 +519,11 @@ func main() {
 				broadcastOn:      cacheMgr.BroadcastEnabled(),
 				broadcastProblem: cacheMgr.BroadcastProblem,
 			})
-			apiServer.SetFileService(fileops.New(*mountPoint, gfs.SnapshotRegistry()))
+			var snaps fileops.Snapshots
+			if gfs.SnapshotRegistry() != nil {
+				snaps = gfs
+			}
+			apiServer.SetFileService(fileops.New(*mountPoint, snaps))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start the API server: %v; the mount continues without it. Choose a free -api-addr, or pass -api=false", err)

@@ -3300,8 +3300,9 @@ restart_and_expect_only_leaks() {
         fi
     done
 
+    # Snapshots of files earlier tests deleted are orphans, which is not damage.
     out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
-    problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]')
+    problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
     if echo "$problems" | grep -v -e '^$' -e 'leaked' -e 'will never be freed' -e 'unnamed: no directory names it' -e 'belongs to no snapshot' | grep -q .; then
         log_error "fsck after the power failure found more than leaks:"
         echo "$problems" | head -20 >&2
@@ -3310,10 +3311,10 @@ restart_and_expect_only_leaks() {
     if [[ -n "$problems" ]]; then
         log_info "fsck found $(echo "$problems" | wc -l) leaks; repairing"
         ssh_run 1 "$fsck -repair /dev/vda > /dev/null 2>&1"
-        out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
-        if echo "$out" | grep -qE '^ *\[(WARN|ERROR)\]'; then
+        out=$(ssh_run 1 "$fsck /dev/vda 2>&1" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
+        if [[ -n "$out" ]]; then
             log_error "fsck after repair still finds problems:"
-            echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | head -20 >&2
+            echo "$out" | head -20 >&2
             return 1
         fi
     fi
