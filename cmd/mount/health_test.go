@@ -58,7 +58,7 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if err := srv.Start(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			defer srv.Stop()
+			defer func() { _ = srv.Stop() }()
 			resp := api.AggregateHealth(context.Background(), srv.GetHealthCheckers()...)
 			if resp.Status != tt.want {
 				t.Errorf("status = %s, want %s: %+v", resp.Status, tt.want, resp.Checks)
@@ -79,7 +79,7 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer got.Body.Close()
+			defer func() { _ = got.Body.Close() }()
 			var body api.HealthResponse
 			if err := json.NewDecoder(got.Body).Decode(&body); err != nil {
 				t.Fatal(err)

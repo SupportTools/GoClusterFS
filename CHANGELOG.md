@@ -50,11 +50,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Mount logs a `WARNING` line at startup when `-broadcast` is on without `-broadcast-secret`.
 - Design, deployment, operations, and troubleshooting docs in `docs/`.
 - Apache License 2.0.
+- A shutdown step that takes longer than 2 seconds logs its name and duration, and a shutdown still running after 8 seconds logs every goroutine's stack.
 
 - `-cache-inodes`, `-cache-extents`, `-cache-negative` and `-broadcast-max-peers` set the cache and broadcast table sizes, and `/metrics` reports each limit next to its size.
 
 ### Changed
 
+- Each node keeps the directories it reads in an in-memory index, so a lookup no longer reads and decodes the whole directory. A lookup checks the directory inode's generation on disk before it uses the index, so other nodes' changes show on the next lookup without broadcast. Removing an entry now writes the directory inode before the child is freed. `-dir-index-entries` caps the names held (default 1,048,576, about 100 MB), and `/metrics` counts hits, misses and rebuilds. In one test with two nodes, `ls -l` of 4,000 files went from 65 s to 1 s, a `stat` from 3.8 ms to 0.25 ms, and a create from 14 ms to 6 ms.
 - `-format` now writes a superblock with the volume layout and zeroes all metadata regions, even on a device that already holds a filesystem. Mount reads every region offset from the superblock.
 - At most 64 nodes mount a volume at once, one per node registry slot.
 - Moved the FUSE library from `bazil.org/fuse` to `hanwen/go-fuse` v2.

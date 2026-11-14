@@ -22,8 +22,9 @@ const (
 	// JournalMagic identifies a valid journal superblock.
 	JournalMagic = "GCLSJOURNAL\x00"
 
-	// JournalVersion is the current journal format version.
-	JournalVersion uint32 = 1
+	// JournalVersion is the current journal format version. Version 2 records carry consecutive seqs in the order
+	// they are written, and completions are headed records, so recovery can tell a stale record from the next one.
+	JournalVersion uint32 = 2
 
 	// DefaultJournalSlotSize is the default size per node (4MB).
 	DefaultJournalSlotSize = 4 * 1024 * 1024

@@ -48,12 +48,13 @@ These are the `goclusterfs-mount` flags:
 | `-cache-inodes` | int | `10000` | Most inodes the inode cache holds, about 480 bytes each (5 MB). `0` turns it off |
 | `-cache-extents` | int | `50000` | Most block mappings the extent cache holds, about 120 bytes each (6 MB). `0` turns it off |
 | `-cache-negative` | int | `1000` | Most not-found inode lookups the negative cache holds, about 40 bytes each. `0` turns it off |
+| `-dir-index-entries` | int | `1048576` | Names this mount keeps in in-memory directory indexes, about 100 bytes each (about 100 MB at the default); `0` turns the indexes off |
 
 Each cache splits its limit evenly over 16 shards, so it holds a multiple of 16 entries: `-cache-negative 1000` holds 992, and a limit from 1 to 15 holds 16. A full cache drops the entry used longest ago.
 
 The kernel caches file attributes and directory entries for `-attr-timeout`. For that long after another node changes a file, `stat` and path lookups on this node can return the old size. Opening a file reads its inode from disk and makes the kernel fetch its size again, so a read after `open` sees the other node's completed writes. Reads through a file that is already open use the inode cache and can use the old size and block mappings for up to `-cache-ttl`, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
 
-`-attr-timeout=0` makes `stat` and path lookups always current, but each `stat` and path step then reads the directory from disk under a cluster lock. In one test on a single mount, 2000 `stat` calls on one file took 13.9s at 0 and 0.01s at 1s, and `ls -l` of 300 files took 11.8s and 3.7s.
+`-attr-timeout=0` makes `stat` and path lookups always current, but each `stat` and path step is then a lookup that reads the directory's and the file's inodes from disk: about 0.7 ms per `stat` on the test host, against well under 0.1 ms from the kernel cache.
 
 ### Journal Flags
 
@@ -154,7 +155,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 |----------|---------|
 | `/api/v1/status` | Version, uptime, mount and device paths, and `capacity`: total, used and free blocks and bytes of the data region, for the whole volume |
 | `/api/v1/stats` | `cache` and `journal`, as below |
-| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks) and `max_peers` |
+| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks) and `max_peers` `dir_index` has `dirs` and `entries` (names) held, `limit`, `hits` (lookups an index answered), `misses`, `rebuilds` (full reads of a directory) and `hit_rate`. |
 | `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
 | `/api/v1/stats/trim` | `trim_enabled`, false with `-trim=false` or after the device refused a discard as unsupported (image files always do). With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges, plus flushes skipped because the freed blocks could not be reserved), `last_trim_at` and `batch_size` |
 | `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate`, which are always 0 |
@@ -162,7 +163,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
 | `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |
 
-`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
+`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
 

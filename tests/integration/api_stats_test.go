@@ -21,7 +21,7 @@ func getAPI(t *testing.T, url string, into any) int {
 	if err != nil {
 		return 0
 	}
-	defer resp.Body.Close()
+	defer mustClose(t, resp.Body)
 	if resp.StatusCode == http.StatusOK && into != nil {
 		if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
 			t.Fatalf("GET %s: %v", url, err)
@@ -126,7 +126,7 @@ func TestAPIStatsReportLiveValues(t *testing.T) {
 		t.Fatalf("GET /metrics: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	mustClose(t, resp.Body)
 	metrics := string(body)
 	for _, name := range []string{"goclusterfs_journal_commits_total", "goclusterfs_journal_bytes_written_total", "goclusterfs_cache_inode_size", "goclusterfs_fs_size_bytes", "goclusterfs_fs_free_bytes", "goclusterfs_cluster_size"} {
 		if v, ok := metricValue(metrics, name); !ok || v <= 0 {

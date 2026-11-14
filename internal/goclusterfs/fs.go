@@ -302,29 +302,37 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 func (f *FS) Close() error {
 	// Stop snapshot worker first to complete pending jobs
 	if f.snapshotWkr != nil {
-		f.snapshotWkr.Stop()
+		ShutdownStep("snapshot worker stop", f.snapshotWkr.Stop)
 	}
 
 	// Stop TRIM manager to flush pending discards
 	if f.trimMgr != nil {
-		if err := f.trimMgr.Stop(); err != nil {
-			log.Printf("Warning: failed to stop TRIM manager cleanly: %v", err)
-		}
+		ShutdownStep("TRIM stop", func() {
+			if err := f.trimMgr.Stop(); err != nil {
+				log.Printf("Warning: failed to stop TRIM manager cleanly: %v", err)
+			}
+		})
 	}
 
 	// Stop journal to ensure clean shutdown
 	if f.journal != nil {
-		if err := f.journal.Stop(); err != nil {
-			log.Printf("Warning: failed to stop journal cleanly: %v", err)
-		}
+		ShutdownStep("journal stop", func() {
+			if err := f.journal.Stop(); err != nil {
+				log.Printf("Warning: failed to stop journal cleanly: %v", err)
+			}
+		})
 	}
 	// Other nodes would otherwise wait for these holds to go stale.
 	if f.lockMgr != nil {
-		f.lockMgr.Stop()
-		f.lockMgr.ReleaseCached()
+		ShutdownStep("lock release", func() {
+			f.lockMgr.Stop()
+			f.lockMgr.ReleaseCached()
+		})
 		f.lockMgr.LogStats()
 	}
-	return f.dev.Close()
+	var err error
+	ShutdownStep("device close", func() { err = f.dev.Close() })
+	return err
 }
 
 // getInode retrieves an inode, using the cache when available.
@@ -350,6 +358,17 @@ func (f *FS) lockInode(num uint32) func() {
 	mu := &f.inodeMu[num%inodeMuStripes]
 	mu.Lock()
 	return mu.Unlock
+}
+
+// release releases a cluster lock and logs a failure; kind names the resource, such as "inode".
+func (f *FS) release(lockType lock.LockType, id uint64, kind string) {
+	err := f.lockMgr.Release(lockType, id)
+	switch {
+	case errors.Is(err, lock.ErrNotLockOwner):
+		log.Printf("[ERROR] released the lock on %s %d that this node does not hold (double release or lock bookkeeping bug)", kind, id)
+	case err != nil:
+		log.Printf("[WARN] releasing the lock on %s %d failed: %v", kind, id, err)
+	}
 }
 
 // updateInode re-reads an inode, applies update, and writes it back, starting
@@ -391,7 +410,7 @@ func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*
 		if err := f.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
 		}
-		defer f.lockMgr.Release(lock.LockTypeInode, uint64(num))
+		defer f.release(lock.LockTypeInode, uint64(num), "inode")
 	}
 
 	ino, err := f.inodeTbl.Read(num)
@@ -404,6 +423,21 @@ func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*
 	if err := f.inodeTbl.WriteWithLockHeld(ino); err != nil {
 		return nil, err
 	}
+	return ino, nil
+}
+
+// updateDirLocked is updateInodeLocked for directory num, under the directory lock that keeps this node's entry changes out, so its index can follow the write.
+func (f *FS) updateDirLocked(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
+	defer f.dirMgr.LockDir(num)()
+	var readGen uint64
+	ino, err := f.updateUnderInodeLock(ctx, num, func(ino *inode.Inode) error {
+		readGen = ino.MetaGeneration
+		return update(ino)
+	})
+	if err != nil {
+		return nil, err
+	}
+	f.dirMgr.KeepIndex(num, readGen, ino.MetaGeneration)
 	return ino, nil
 }
 
@@ -758,7 +792,7 @@ func (f *FS) unmapped(num uint32, blocks []uint64) []uint64 {
 	return unused
 }
 
-func (f *FS) freeUnused(ctx context.Context, num uint32, blocks []uint64) {
+func (f *FS) freeUnused(ctx context.Context, num uint32, blocks ...uint64) {
 	for _, b := range blocks {
 		if err := f.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
 			log.Printf("[WARN] inode %d: freeing unused block %d failed: %v", num, b, err)
@@ -772,11 +806,19 @@ func (f *FS) dropNewInode(ctx context.Context, ino *inode.Inode) {
 	if err != nil {
 		log.Printf("[WARN] inode %d: blocks of the failed new inode unknown, they may leak: %v", ino.InodeNum, err)
 	}
-	if err := f.inodeTbl.Free(ctx, ino.InodeNum); err != nil {
-		log.Printf("[WARN] inode %d: freeing the failed new inode failed: %v", ino.InodeNum, err)
+	if !f.freeNewInode(ctx, ino.InodeNum) {
 		return
 	}
-	f.freeUnused(ctx, ino.InodeNum, f.unmapped(ino.InodeNum, blocks))
+	f.freeUnused(ctx, ino.InodeNum, f.unmapped(ino.InodeNum, blocks)...)
+}
+
+// freeNewInode frees an inode that a failed operation claimed before anything referenced it.
+func (f *FS) freeNewInode(ctx context.Context, num uint32) bool {
+	if err := f.inodeTbl.Free(ctx, num); err != nil {
+		log.Printf("[WARN] inode %d: freeing the failed new inode failed: %v", num, err)
+		return false
+	}
+	return true
 }
 
 // testHookBeforeMkdirInodeWrite, when set by a test, fails a mkdir's inode write with its error.
@@ -875,7 +917,7 @@ func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32
 // touchParent sets the mtime of directory num, adds links to its link count, and tells other nodes.
 func (f *FS) touchParent(ctx context.Context, num uint32, links uint32, now int64) {
 	// dirMgr.Add may have changed the directory's extents, so update it from disk.
-	dirIno, err := f.updateInodeLocked(ctx, num, func(ino *inode.Inode) error {
+	dirIno, err := f.updateDirLocked(ctx, num, func(ino *inode.Inode) error {
 		ino.LinkCount += links
 		ino.Mtime = now
 		return nil
@@ -957,7 +999,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	childIno.Ctime = now
 	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
 		logging.Debugf("Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
-		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		f.freeNewInode(ctx, childIno.InodeNum)
 		return nil, syscall.EIO
 	}
 	if afterCommit != nil {
@@ -966,7 +1008,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 
 	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
 		logging.Debugf("Create %q: dirMgr.Add failed: %v", name, err)
-		f.inodeTbl.Free(ctx, childIno.InodeNum)
+		f.freeNewInode(ctx, childIno.InodeNum)
 		return nil, nameErrno(err)
 	}
 	f.cacheInode(childIno)
@@ -1151,7 +1193,7 @@ func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) sys
 		return syscall.EISDIR
 	}
 	now := time.Now().UnixNano()
-	updated, err := f.updateInodeLocked(ctx, num, func(ino *inode.Inode) error {
+	updated, err := f.updateDirLocked(ctx, num, func(ino *inode.Inode) error {
 		if testHookAfterSetattrRead != nil {
 			testHookAfterSetattrRead()
 		}
@@ -1525,7 +1567,9 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 				afterCommit("unlink: inode freed")
 			}
 			sfbBacked, sfbSlot := freed.IsSFBBacked(), freed.InlineExtents[0].PhysicalBlock
-			d.fs.extentMgr.Delete(ctx, freed)
+			if err := d.fs.extentMgr.Delete(ctx, freed); err != nil {
+				log.Printf("[WARN] removeEntry %q: freeing the blocks of inode %d failed, some may leak: %v", name, childInodeNum, err)
+			}
 			if sfbBacked {
 				d.fs.freeSFBSlot(ctx, sfbSlot)
 			}
@@ -1542,7 +1586,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 
 	// Update directory mtime, and its link count for directory removal
 	now := time.Now().UnixNano()
-	if updated, err := d.fs.updateInodeLocked(ctx, d.inodeNum, func(ino *inode.Inode) error {
+	if updated, err := d.fs.updateDirLocked(ctx, d.inodeNum, func(ino *inode.Inode) error {
 		if isDir {
 			ino.LinkCount--
 		}
@@ -1793,9 +1837,7 @@ func (f *File) waitOutReplay(ctx context.Context, physBlock uint64) error {
 		log.Printf("[WARN] Write inode %d: waiting for block %d after its holder's replay failed: %v", f.inodeNum, physBlock, err)
 		return syscall.EIO
 	}
-	if err := f.fs.lockMgr.ReleaseExtent(physBlock); err != nil {
-		logging.Debugf("Write inode %d: releasing block %d after the replay wait failed: %v", f.inodeNum, physBlock, err)
-	}
+	f.fs.release(lock.LockTypeExtent, physBlock, "block")
 	return errRetryWrite
 }
 
@@ -1869,22 +1911,22 @@ func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockN
 	treeCtx, releaseTree, err := f.fs.extentMgr.ReserveTreeBlocks(ctx, ino)
 	if err != nil {
 		logging.Debugf("Write inode %d: reserving extent-tree blocks failed: %v", f.inodeNum, err)
-		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
+		f.fs.freeUnused(ctx, f.inodeNum, ext.PhysicalBlock)
 		return nil, nil, nil, allocErrno(err)
 	}
 
 	if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
-		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
+		f.fs.freeUnused(ctx, f.inodeNum, ext.PhysicalBlock)
 		releaseTree()
 		return nil, nil, nil, syscall.EIO
 	}
 	var fresh *inode.Inode
 	fail := func(errno error) (*inode.Inode, *extent.Extent, func(), error) {
-		f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+		f.fs.release(lock.LockTypeInode, uint64(f.inodeNum), "inode")
 		if fresh != nil {
 			f.fs.extentMgr.DiscardPending(ctx, fresh)
 		}
-		f.fs.bitmapMgr.Free(ctx, ext.PhysicalBlock)
+		f.fs.freeUnused(ctx, f.inodeNum, ext.PhysicalBlock)
 		releaseTree()
 		return nil, nil, nil, errno
 	}
@@ -1921,7 +1963,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	var releaseReservations []func()
 	releaseInodeLock := func() {
 		if lockHeld && f.fs.lockMgr != nil {
-			f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+			f.fs.release(lock.LockTypeInode, uint64(f.inodeNum), "inode")
 			lockHeld = false
 		}
 	}
@@ -2142,7 +2184,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				dropCopy := func() {
 					releaseInodeLock()
 					f.fs.extentMgr.DiscardPending(ctx, ino)
-					f.fs.extentMgr.FreePhysicalBlock(ctx, cowResult.NewPhysBlock)
+					f.fs.freeUnused(ctx, f.inodeNum, cowResult.NewPhysBlock)
 				}
 				if beforeCoWCommit != nil {
 					beforeCoWCommit()
@@ -2248,9 +2290,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		inPlaceLockHeld := false
 		releaseInPlaceLock := func() {
 			if inPlaceLockHeld {
-				if err := f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum)); err != nil {
-					logging.Debugf("Write inode %d: releasing the shared inode lock failed: %v", f.inodeNum, err)
-				}
+				f.fs.release(lock.LockTypeInode, uint64(f.inodeNum), "inode")
 				inPlaceLockHeld = false
 			}
 		}
@@ -2305,7 +2345,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if err := f.fs.zeroBlock(physBlock); err != nil {
 				logging.Debugf("Write inode %d: zeroing block %d failed: %v", f.inodeNum, physBlock, err)
 				if extentLockHeld {
-					f.fs.lockMgr.ReleaseExtent(physBlock)
+					f.fs.release(lock.LockTypeExtent, physBlock, "block")
 				}
 				releaseInPlaceLock()
 				return 0, syscall.EIO
@@ -2344,7 +2384,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				logging.Debugf("Write inode %d: WriteAt offset %d failed: %v", f.inodeNum, alignedOffset, err)
 				storage.PutBuffer(buf)
 				if extentLockHeld {
-					f.fs.lockMgr.ReleaseExtent(physBlock)
+					f.fs.release(lock.LockTypeExtent, physBlock, "block")
 				}
 				releaseInPlaceLock()
 				return 0, syscall.EIO
@@ -2358,7 +2398,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Release extent lock after completing write to this block
 		if extentLockHeld {
-			f.fs.lockMgr.ReleaseExtent(physBlock)
+			f.fs.release(lock.LockTypeExtent, physBlock, "block")
 		}
 		releaseInPlaceLock()
 
@@ -2508,7 +2548,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			testHookBeforeFreeingUnused()
 		}
 		if !conflict {
-			f.fs.freeUnused(ctx, f.inodeNum, unused)
+			f.fs.freeUnused(ctx, f.inodeNum, unused...)
 			cowDone = cowDone[:committedCoW]
 			return syscall.EIO
 		}
@@ -2608,7 +2648,7 @@ func (f *FS) freeSFBSlot(ctx context.Context, packed uint64) {
 			log.Printf("[WARN] Free SFB slot %d:%d: container lock failed: %v", container, slot, err)
 			return
 		}
-		defer f.lockMgr.Release(lock.LockTypeSFBContainer, container)
+		defer f.release(lock.LockTypeSFBContainer, container, "SFB container")
 	}
 
 	buf := storage.GetBuffer(storage.SectorSize)
@@ -2662,7 +2702,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	_, err = f.fs.dev.WriteAt(buf.Bytes()[:BlockSize], int64(f.fs.dataOffset+newBlock*BlockSize))
 	storage.PutBuffer(buf)
 	if err != nil {
-		_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+		f.fs.freeUnused(ctx, f.inodeNum, newBlock)
 		return fmt.Errorf("failed to write migrated data: %w", err)
 	}
 
@@ -2677,14 +2717,14 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 			NewBlock:     newBlock,
 		}); err != nil {
 			f.fs.journal.Abort(txn)
-			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+			f.fs.freeUnused(ctx, f.inodeNum, newBlock)
 			return err
 		}
 		// === COMMIT POINT ===
 		var commitErr error
 		intentSeq, commitErr = f.fs.journal.Commit(txn)
 		if commitErr != nil {
-			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+			f.fs.freeUnused(ctx, f.inodeNum, newBlock)
 			return commitErr
 		}
 		defer f.fs.closeIntent(intentSeq)
@@ -2698,7 +2738,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 		// Only a conflict proves the inode on disk does not map newBlock.
 		if errors.Is(err, extent.ErrTreeConflict) {
-			_ = f.fs.bitmapMgr.Free(ctx, newBlock)
+			f.fs.freeUnused(ctx, f.inodeNum, newBlock)
 		}
 		return retryOnTreeConflict(err)
 	}
@@ -2883,7 +2923,9 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		if errors.Is(err, extent.ErrTreeConflict) {
 			// Nothing was applied, so close the intent before the retry logs a new one.
 			if f.fs.journal != nil && intentSeq > 0 {
-				f.fs.journal.CompleteIntent(intentSeq)
+				if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
+					log.Printf("[WARN] Setattr inode %d: closing intent %d before the retry failed: %v", f.inodeNum, intentSeq, err)
+				}
 			}
 			return 0, err
 		}
@@ -2956,9 +2998,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 	defer func() {
 		if !committed {
 			f.fs.extentMgr.DiscardPending(ctx, ino)
-			for _, b := range newBlocks {
-				f.fs.extentMgr.FreePhysicalBlock(ctx, b)
-			}
+			f.fs.freeUnused(ctx, f.inodeNum, newBlocks...)
 		}
 	}()
 
@@ -3032,7 +3072,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 			logging.Debugf("Allocate inode %d: lock failed: %v", f.inodeNum, err)
 			return syscall.EIO, nil
 		}
-		defer f.fs.lockMgr.Release(lock.LockTypeInode, uint64(f.inodeNum))
+		defer f.fs.release(lock.LockTypeInode, uint64(f.inodeNum), "inode")
 
 		// ino holds the new extents, so keep it only if no node wrote the inode since it was read.
 		fresh, err := f.fs.inodeTbl.Read(f.inodeNum)
@@ -3338,7 +3378,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		data.InodeNum, src.AllocatedBlocks, src.Size, snapshot.FlagReadOnly)
 	if err != nil {
 		log.Printf("[snapshot] Failed to add '%s' to the registry: %v", name, err)
-		f.fs.inodeTbl.Free(ctx, data.InodeNum)
+		f.fs.freeNewInode(ctx, data.InodeNum)
 		if errors.Is(err, snapshot.ErrSnapshotExists) {
 			return syscall.EEXIST
 		}

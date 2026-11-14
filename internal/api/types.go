@@ -102,6 +102,18 @@ type CacheStatsResponse struct {
 	NegativeCache CacheHitRateInfo `json:"negative_cache"`
 	LockHintCache CacheHitRateInfo `json:"lock_hint_cache,omitempty"`
 	Broadcast     *BroadcastTables `json:"broadcast,omitempty"`
+	DirIndex      *DirIndexInfo    `json:"dir_index,omitempty"`
+}
+
+// DirIndexInfo counts lookups the directory indexes answered (hits) or not (misses), and full directory reads (rebuilds).
+type DirIndexInfo struct {
+	Dirs     int     `json:"dirs"`
+	Entries  int     `json:"entries"`
+	Limit    int     `json:"limit"`
+	Hits     uint64  `json:"hits"`
+	Misses   uint64  `json:"misses"`
+	Rebuilds uint64  `json:"rebuilds"`
+	HitRate  float64 `json:"hit_rate"`
 }
 
 // BroadcastTables reports how full the broadcast peer tables are.

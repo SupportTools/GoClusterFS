@@ -62,6 +62,7 @@ func (c *cloneChain) remove(t *testing.T, fsys *FS, name string) {
 // writing and deleting its own share. Every block must be freed exactly once,
 // no refcount may stay above 0, and fsck must find nothing.
 func TestDeepCloneChainDeletedFromTwoNodes(t *testing.T) {
+	t.Parallel()
 	const depth = 8
 	const blocks = depth + 1
 	// More seeds pass too; one keeps the package under CI's time limit.

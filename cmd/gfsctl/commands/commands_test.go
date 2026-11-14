@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,12 +26,16 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	os.Setenv("XDG_CONFIG_HOME", dir)
+	if err := os.Setenv("XDG_CONFIG_HOME", dir); err != nil {
+		panic(err)
+	}
 	for _, name := range []string{"GFSCTL_HOST", "GFSCTL_PORT", "GFSCTL_TOKEN", "GFSCTL_OUTPUT", "GFSCTL_TIMEOUT", "NO_COLOR"} {
-		os.Unsetenv(name)
+		if err := os.Unsetenv(name); err != nil {
+			panic(err)
+		}
 	}
 	code := m.Run()
-	os.RemoveAll(dir)
+	_ = os.RemoveAll(dir)
 	os.Exit(code)
 }
 
@@ -63,11 +68,11 @@ func startFakeAPI(t *testing.T, routes map[string]any) *fakeAPI {
 			http.NotFound(w, r)
 		case int:
 			w.WriteHeader(v)
-			json.NewEncoder(w).Encode(api.ErrorResponse{Error: "stats not available", Code: v, Details: "no stats provider configured"})
+			_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "stats not available", Code: v, Details: "no stats provider configured"})
 		case string:
-			w.Write([]byte(v))
+			_, _ = w.Write([]byte(v))
 		default:
-			json.NewEncoder(w).Encode(v)
+			_ = json.NewEncoder(w).Encode(v)
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -81,7 +86,9 @@ func startFakeAPI(t *testing.T, routes map[string]any) *fakeAPI {
 
 func resetFlags(c *cobra.Command) {
 	reset := func(fl *pflag.Flag) {
-		fl.Value.Set(fl.DefValue)
+		if err := fl.Value.Set(fl.DefValue); err != nil {
+			panic(fmt.Sprintf("reset flag %s to %q: %v", fl.Name, fl.DefValue, err))
+		}
 		fl.Changed = false
 	}
 	c.Flags().VisitAll(reset)
@@ -228,7 +235,7 @@ func writeConfig(t *testing.T, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { _ = os.Remove(path) })
 }
 
 func TestSettingsPrecedence(t *testing.T) {
@@ -273,7 +280,7 @@ func TestBadSettingsAreRefused(t *testing.T) {
 			t.Errorf("%s=%q %v: err=%v stderr=%q", tc.env, tc.value, tc.args, err, stderr)
 		}
 		if tc.env != "" {
-			os.Unsetenv(tc.env)
+			_ = os.Unsetenv(tc.env)
 		}
 	}
 }

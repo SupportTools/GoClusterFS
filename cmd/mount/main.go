@@ -91,6 +91,7 @@ func main() {
 		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
 		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
 		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")
+		dirIndex      = flag.Int("dir-index-entries", dir.DefaultIndexEntries, "Names kept in in-memory directory indexes, about 100 bytes each; 0 turns them off")
 
 		// Journal configuration
 		journalEnabled = flag.Bool("journal", true, "Enable write-ahead journal for crash consistency")
@@ -294,6 +295,7 @@ func main() {
 	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
+	dirMgr.SetIndexLimit(*dirIndex)
 
 	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write, and replay frees shared blocks through them.
 	refcountReg := refcount.NewRegion(dev, refcountOffset, sb.RefCountTableSize, totalBlocks, lockMgr)
@@ -486,7 +488,7 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Failed to create the API server: %v; the mount continues without it", err)
 		} else {
-			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, j, trimMgr, bm, nodeReg))
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
@@ -504,7 +506,9 @@ func main() {
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start the API server: %v; the mount continues without it. Choose a free -api-addr, or pass -api=false", err)
-				apiServer.Stop()
+				if err := apiServer.Stop(); err != nil && !errors.Is(err, api.ErrServerNotStarted) {
+					log.Printf("Warning: Failed to stop the API server: %v", err)
+				}
 				apiServer = nil
 				sampler.Stop()
 				sampler = nil
@@ -538,6 +542,8 @@ func main() {
 	// The API stops before the unmount: its snapshot and clone requests go
 	// through the mount, and the unmount fails while they hold files open.
 	var unmounted atomic.Bool
+	// The watch runs from the signal, or from an unmount another tool started, to the exit.
+	watch := &goclusterfs.ShutdownWatch{Limit: 8 * time.Second}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -547,27 +553,34 @@ func main() {
 				continue
 			}
 			log.Println("Received signal, unmounting...")
-			stopAPI()
-			if err := server.Unmount(); err != nil {
-				log.Printf("Unmount of %s failed: %v. Close the files and shells that use it, then send the signal again or run fusermount3 -u %s", *mountPoint, err, *mountPoint)
-			}
+			watch.Start()
+			goclusterfs.ShutdownStep("API server stop", stopAPI)
+			goclusterfs.ShutdownStep("unmount", func() {
+				if err := server.Unmount(); err != nil {
+					log.Printf("Unmount of %s failed: %v. Close the files and shells that use it, then send the signal again or run fusermount3 -u %s", *mountPoint, err, *mountPoint)
+					watch.End()
+				}
+			})
 		}
 	}()
 
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
 	server.Wait()
 	unmounted.Store(true)
-	stopAPI()
+	watch.Start()
+	goclusterfs.ShutdownStep("API server stop", stopAPI)
 
 	exit := cli.ExitOK
-	nodeReg.Stop()
+	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
 	if err := gfs.Close(); err != nil {
 		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)
 		exit = cli.ExitFailure
 	}
-	if err := cacheMgr.StopBroadcast(); err != nil {
-		log.Printf("Warning: Failed to stop broadcast: %v", err)
-	}
+	goclusterfs.ShutdownStep("broadcast stop", func() {
+		if err := cacheMgr.StopBroadcast(); err != nil {
+			log.Printf("Warning: Failed to stop broadcast: %v", err)
+		}
+	})
 
 	// Print final TRIM stats
 	if trimMgr != nil {
@@ -594,6 +607,7 @@ func main() {
 
 	log.Println("Filesystem unmounted.")
 	_ = dev.Close()
+	watch.End()
 	os.Exit(exit)
 }
 
@@ -617,8 +631,8 @@ func usageFailf(format string, args ...any) {
 	os.Exit(cli.ExitUsage)
 }
 
-func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry) stats.Sources {
-	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry) stats.Sources {
+	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
 	if j != nil {
 		src.Journal = j
 	}

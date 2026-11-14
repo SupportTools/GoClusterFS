@@ -104,10 +104,12 @@ func assertJournalOwner(t *testing.T, imagePath, offset, uuidPrefix string) {
 	if err != nil {
 		t.Fatalf("open image: %v", err)
 	}
-	defer dev.Close()
+	defer mustClose(t, dev)
 
 	var off uint64
-	fmt.Sscan(offset, &off)
+	if _, err := fmt.Sscan(offset, &off); err != nil {
+		t.Fatal(err)
+	}
 	region, err := journal.OpenRegionForRecovery(dev, off, journal.DefaultJournalSlotSize)
 	if err != nil {
 		t.Fatalf("read node B's journal at offset %d: %v", off, err)
@@ -482,7 +484,7 @@ func TestMountRefusesLegacyLayout(t *testing.T) {
 	rootInode := make([]byte, 4)
 	binary.LittleEndian.PutUint32(rootInode, inode.InodeMagic)
 	_, err = img.WriteAt(rootInode, 2<<20+2*inode.InodeSize)
-	img.Close()
+	err = errors.Join(err, img.Close())
 	if err != nil {
 		t.Fatal(err)
 	}

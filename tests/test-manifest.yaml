@@ -462,6 +462,15 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: multinode-dir-index-coherency
+    name: Directory lookups follow another node's changes
+    description: A node that has read a directory sees another node's creates, removes and replaced names on its next lookup, without broadcast
+    priority: high
+    environments:
+      go: dir_index_test.go::TestMultiNodeDirIndexWithoutBroadcast
+      docker: run-tests.sh::test_dir_index_follows_other_node
+      vm: run-vm-tests.sh::test_dir_index_follows_other_node
+
   # ===========================================================================
   # NETWORK AND RESILIENCE TESTS
   # ===========================================================================
@@ -1455,6 +1464,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/torn_tail_test.go::TestRecoverStopsAtTornLastTransaction
+
+  - id: journal-stale-record-after-tail
+    name: Recovery ignores a stale record where a lost one should be
+    description: The superblock covering a new record lands but the record does not, leaving a record from the previous mount or the previous lap in its place; recovery must not replay it
+    priority: go_only
+    environments:
+      go: internal/journal/stale_record_test.go::TestRecoverIgnoresRecordFromEarlierMount
+
+  - id: journal-stale-record-previous-lap
+    name: Recovery ignores a same-size record from the journal's previous lap
+    description: The record a lost one should replace is a transaction of the same size from the same mount's previous lap; only its seq tells it apart, and recovery must not replay it
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverIgnoresSameSizeRecordFromEarlierLap
+
+  - id: journal-stale-completion
+    name: Recovery ignores a completion from an earlier mount
+    description: An intent's completion is lost, and the previous mount's completion of the intent with the same seq is in its place; recovery still replays the intent
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverIgnoresCompletionFromEarlierMount
+
+  - id: journal-commit-order
+    name: Recovery replays transactions committed out of Begin order
+    description: A transaction that began later commits first; both are replayed, since a record's seq is the order it was written in
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverReplaysCommitsOutOfBeginOrder
+
+  - id: journal-version-1-replay
+    name: Recovery reads a version 1 journal as older builds wrote it
+    description: A dirty version 1 journal numbers records in Begin order and uses IntentCompletion records; recovery replays its incomplete transactions
+    priority: go_only
+    environments:
+      go: internal/journal/record_order_test.go::TestRecoverReplaysVersion1Journal
 
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
@@ -3758,3 +3802,73 @@ scenarios:
     priority: go_only
     environments:
       go: internal/logging/guard_test.go::TestDebugLinesGoThroughDebugf
+
+  - id: dir-index-other-node-changes
+    name: Directory index follows another node's adds and removes
+    description: Node A's cached index answers for node B's add and remove on the next lookup, with no message between the nodes
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestLookupSeesOtherNodesChanges
+
+  - id: dir-index-remove-generation
+    name: Remove bumps the directory generation before returning
+    description: After RemoveIf returns and before the child is freed, no node's cached index still names the child
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestRemoveIfWritesDirectoryInodeBeforeReturning
+
+  - id: dir-index-add-validates
+    name: Add checks a cached index against the disk
+    description: Node A's add under the directory lock sees node B's entry in the same chunk; the duplicate fails and the new entry does not overwrite it
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestAddValidatesIndexAgainstDisk
+
+  - id: dir-index-limit
+    name: Directory indexes stay under the name limit
+    description: Indexes past the limit drop the least recently used directory, lookups there still work, and a limit of 0 keeps none
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestIndexLimitEvictsLeastRecentlyUsed
+
+  - id: dir-index-torn-inode
+    name: An unreadable directory inode never validates an index
+    description: When the directory inode fails its checksum, as a torn read would, the cached index does not answer
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestCachedLookupRejectsUnreadableInode
+
+  - id: dir-index-keep
+    name: Directory index survives inode-only writes
+    description: After an mtime or link count write under the directory lock, the index answers without a rebuild; any other write still forces one
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestKeepIndexFollowsInodeOnlyWrites
+
+  - id: dir-same-node-edits
+    name: Same-node entry changes keep every entry
+    description: Goroutines on one node add and remove names in one directory at once; the disk and the node's index agree and lose nothing
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestSameNodeEditsKeepEveryEntry
+
+  - id: shutdown-slow-step-logged
+    name: Slow shutdown step is logged
+    description: A shutdown step that takes longer than the limit logs its name and duration, and a quick one logs nothing
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/shutdown_test.go::TestOnlySlowShutdownStepsAreLogged
+
+  - id: shutdown-stall-dumps-goroutines
+    name: Stalled shutdown dumps goroutines
+    description: A shutdown still running past the limit logs every goroutine's stack once, and one that ends first logs nothing
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/shutdown_test.go::TestStalledShutdownLogsGoroutines
+
+  - id: shutdown-watch-ends-on-failed-unmount
+    name: Shutdown watch ends when an unmount fails
+    description: An ended shutdown watch logs no goroutine dump, and the next shutdown starts a new watch that dumps once
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/shutdown_test.go::TestEndedShutdownWatchDoesNotDump

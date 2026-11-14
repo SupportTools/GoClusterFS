@@ -84,12 +84,6 @@ func TestJournalBeginCommit(t *testing.T) {
 		t.Fatal("Begin returned nil")
 	}
 
-	// Check sequence number
-	seq := txn.Seq()
-	if seq != 1 {
-		t.Errorf("First txn seq = %d, want 1", seq)
-	}
-
 	// Check active transaction tracking
 	stats := j.Stats()
 	if stats.ActiveTxnCount != 1 {
@@ -101,9 +95,8 @@ func TestJournalBeginCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Commit
-	if _, err := j.Commit(txn); err != nil {
-		t.Fatalf("Commit failed: %v", err)
+	if seq, err := j.Commit(txn); err != nil || seq != 1 {
+		t.Fatalf("Commit = seq %d, %v; want seq 1", seq, err)
 	}
 
 	// Check state after commit
@@ -148,14 +141,11 @@ func TestJournalMultipleTransactions(t *testing.T) {
 	// Commit several transactions
 	for i := uint64(1); i <= 10; i++ {
 		txn := j.Begin()
-		if txn.Seq() != i {
-			t.Errorf("Transaction %d seq = %d, want %d", i, txn.Seq(), i)
-		}
 		if err := txn.LogInodeCreate(testInodePayload(100 + i)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := j.Commit(txn); err != nil {
-			t.Fatalf("Commit %d failed: %v", i, err)
+		if seq, err := j.Commit(txn); err != nil || seq != i {
+			t.Fatalf("Commit %d = seq %d, %v", i, seq, err)
 		}
 	}
 
@@ -492,8 +482,11 @@ func TestJournalOpen(t *testing.T) {
 
 	// Should be able to continue
 	txn2 := j2.Begin()
-	if txn2.Seq() != 2 {
-		t.Errorf("After reopen, seq = %d, want 2", txn2.Seq())
+	if err := txn2.LogInodeCreate(testInodePayload(200)); err != nil {
+		t.Fatal(err)
+	}
+	if seq, err := j2.Commit(txn2); err != nil || seq != 2 {
+		t.Errorf("Commit after reopen = seq %d, %v; want seq 2", seq, err)
 	}
 }
 

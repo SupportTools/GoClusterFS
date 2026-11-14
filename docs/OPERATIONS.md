@@ -520,7 +520,7 @@ tcpdump -i eth0 -c 10 udp port 31337 or udp port 31338
 
 | Symptom | Likely Cause | Where to Look |
 |---------|-------------|---------------|
-| Slow `ls -l` or `stat` | Each name lookup reads the whole directory from disk | Keep directories small; see [README limits](../README.md#limits-and-status) |
+| Slow `ls -l` or `stat` | Each name lookup reads two inodes from disk, and `ls -l` repeats its lookups once it runs longer than `-attr-timeout`. A directory left out of the index (past `-dir-index-entries`) is read whole on every lookup | A higher `-attr-timeout`; `goclusterfs_dir_index_rebuilds_total` growing with lookups means directories don't fit `-dir-index-entries` |
 | Slow reads | Cache misses | `gfsctl stats cache`, or `Cache stats` at unmount |
 | Slow metadata | Lock contention | `lock.Acquire` lines with high `retries` |
 | Slow writes | Synchronous journal commits and per-block extent locks | Storage latency |
@@ -531,12 +531,13 @@ The flags set how many entries each cache holds and how long cached data may be 
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `-attr-timeout` | `1s` | How long the kernel caches attributes and directory entries. `stat` and `ls` can show another node's change up to this late. `0` makes every `stat` and path step read the directory under a cluster lock, which is much slower. |
+| `-attr-timeout` | `1s` | How long the kernel caches attributes and directory entries. `stat` and `ls` can show another node's change up to this late. `0` makes every `stat` and path step a lookup that reads the directory's and the file's inodes from disk. |
 | `-cache-ttl` | `5s` | How long the mount trusts a cached inode before it checks the disk. Open files can lag another node's change by up to this long. |
 | `-cache-strict` | `false` | Check the disk on every cache hit |
 | `-cache-inodes` | `10000` | Inodes kept in memory, about 480 bytes each |
 | `-cache-extents` | `50000` | Block mappings kept in memory, about 120 bytes each |
 | `-cache-negative` | `1000` | Not-found inode lookups kept in memory |
+| `-dir-index-entries` | `1048576` | Names kept in directory indexes, about 100 bytes each. Past it, the least recently used directories are dropped and read whole again on their next lookup. `0` turns indexes off |
 
 When `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity` (or the extent pair does), the cache is full and drops entries it may need again; a larger limit trades memory for fewer disk reads.
 
@@ -547,6 +548,8 @@ goclusterfs-mount ... -cache-ttl 30s
 # Every node sees other nodes' changes as soon as possible, at a cost
 goclusterfs-mount ... -cache-strict -attr-timeout 0
 ```
+
+**Directory indexes.** Each node keeps the directories it reads in memory, as an index from name to inode. A lookup reads the directory inode first and uses the index only while the inode's generation is the one the index was built at. Every change to a directory's entries writes the directory inode before the entries, so another node's create or remove shows on the next lookup, with or without broadcast. Such a change costs this node one full read of the directory on its next lookup there.
 
 ### Journal Tuning
 

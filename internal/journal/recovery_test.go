@@ -82,7 +82,7 @@ func TestRecoveryOneTransaction(t *testing.T) {
 	}
 
 	// Create and write a transaction
-	seq := region.NextSeq()
+	seq := nextSeq(region)
 	txn := NewTransaction(seq, nodeUUID, 1)
 	if err := txn.LogInodeCreate(&InodeCreatePayload{
 		InodeNum:       100,
@@ -167,7 +167,7 @@ func TestRecoveryMultipleTransactions(t *testing.T) {
 
 	// Write 5 transactions
 	for i := 0; i < 5; i++ {
-		seq := region.NextSeq()
+		seq := nextSeq(region)
 		txn := NewTransaction(seq, nodeUUID, 1)
 		if err := txn.LogInodeCreate(&InodeCreatePayload{
 			InodeNum:       uint64(100 + i),
@@ -242,7 +242,7 @@ func TestRecoveryHandlerError(t *testing.T) {
 		t.Fatalf("MarkDirty failed: %v", err)
 	}
 
-	seq := region.NextSeq()
+	seq := nextSeq(region)
 	txn := NewTransaction(seq, nodeUUID, 1)
 	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100}); err != nil {
 		t.Fatal(err)
@@ -291,7 +291,7 @@ func TestDryRunRecover(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		seq := region.NextSeq()
+		seq := nextSeq(region)
 		txn := NewTransaction(seq, nodeUUID, 1)
 		if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(100 + i)}); err != nil {
 			t.Fatal(err)
@@ -387,7 +387,7 @@ func TestRecoveryVerifiesChecksum(t *testing.T) {
 		t.Fatalf("MarkDirty failed: %v", err)
 	}
 
-	seq := region.NextSeq()
+	seq := nextSeq(region)
 	txn := NewTransaction(seq, nodeUUID, 1)
 	if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: 100}); err != nil {
 		t.Fatal(err)
