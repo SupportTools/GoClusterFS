@@ -3211,6 +3211,13 @@ scenarios:
     environments:
       go: internal/journal/reserve_test.go::TestCompleteIntentDurableEndsOldestIntentInFullRing
 
+  - id: journal-failed-head-move
+    name: Failed head move keeps replay whole
+    description: When moving the head past a full ring's oldest intent fails after the head moved in memory, the intent stays ended, the next checkpoint stays consistent and replay runs every pending intent; a retry writes the moved head
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestFailedHeadMoveKeepsReplayWhole
+
   - id: reserve-journal-full-log
     name: Journal-full use commit puts blocks back
     description: A use commit that hit a full journal wrote nothing, so its blocks go back to the reserve

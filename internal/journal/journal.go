@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log"
@@ -93,6 +94,7 @@ type Journal struct {
 
 	activeTxns     map[*Transaction]*ActiveTxn
 	pendingIntents map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
+	unsyncedEnds   map[uint64]bool   // intents the in-memory head passed before the superblock was synced
 	checkpointHook atomic.Pointer[func()]
 	hookRunning    atomic.Bool
 
@@ -138,6 +140,7 @@ func Open(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		config:            config,
 		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
+		unsyncedEnds:      make(map[uint64]bool),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: region.Superblock().LastCheckpointSeq,
 	}
@@ -160,6 +163,7 @@ func Init(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		config:            config,
 		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
+		unsyncedEnds:      make(map[uint64]bool),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: 0,
 	}
@@ -569,27 +573,37 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 func (j *Journal) CompleteIntentDurable(intentSeq uint64) error {
 	j.mu.Lock()
 	start, pending := j.pendingIntents[intentSeq]
+	unsynced := j.unsyncedEnds[intentSeq]
 	var err error
-	if pending {
+	switch {
+	case unsynced:
+		err = j.region.FlushSuperblock()
+	case pending:
 		err = j.appendCompletionLocked(intentSeq)
 		if errors.Is(err, ErrJournalFull) && j.oldestIntentLocked(intentSeq) {
+			head := j.region.HeadOffset()
 			delete(j.pendingIntents, intentSeq)
-			if _, err = j.advanceHead(); err != nil {
+			_, err = j.advanceHead()
+			// Once the head moved past the intent, putting it back would checkpoint a seq the head no longer matches.
+			if j.region.HeadOffset() != head {
+				j.unsyncedEnds[intentSeq], unsynced = true, true
+			} else {
 				j.pendingIntents[intentSeq] = start
+				err = cmp.Or(err, ErrJournalFull)
 			}
 		}
 	}
 	j.mu.Unlock()
-	if !pending || err != nil {
+	if (!pending && !unsynced) || err != nil {
 		return err
 	}
 	if err := j.region.Sync(); err != nil {
-		j.mu.Lock()
-		j.pendingIntents[intentSeq] = start
-		j.mu.Unlock()
 		return fmt.Errorf("failed to sync intent end: %w", err)
 	}
-	j.dropIntent(intentSeq)
+	j.mu.Lock()
+	delete(j.pendingIntents, intentSeq)
+	delete(j.unsyncedEnds, intentSeq)
+	j.mu.Unlock()
 	return nil
 }
 

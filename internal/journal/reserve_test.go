@@ -246,3 +246,64 @@ func TestCompleteIntentDurableEndsOldestIntentInFullRing(t *testing.T) {
 		t.Errorf("commit after ending the record: %v", err)
 	}
 }
+
+// fillRingBehindReserve commits a reserve record and then completed intents
+// until the ring is full, so the reserve record pins the head.
+func fillRingBehindReserve(t *testing.T, r *reserveJournal) uint64 {
+	t.Helper()
+	j := r.j
+	reserveSeq := r.reserve(false, 100, 101)
+	for i := 0; ; i++ {
+		txn := j.Begin()
+		if err := txn.LogBlockUse([]uint64{uint64(200 + i)}); err != nil {
+			t.Fatal(err)
+		}
+		seq, err := j.Commit(txn)
+		if errors.Is(err, ErrJournalFull) {
+			j.Abort(txn)
+			return reserveSeq
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = j.CompleteIntent(seq)
+	}
+}
+
+// When moving the head past a full ring's oldest intent fails after the head
+// moved in memory, the intent does not come back as pending, so the next
+// checkpoint stays consistent and replay still runs every pending intent. A
+// retry then writes the moved head before it reports the record ended.
+func TestFailedHeadMoveKeepsReplayWhole(t *testing.T) {
+	r := newReserveJournal(t)
+	j := r.j
+	reserveSeq := fillRingBehindReserve(t, r)
+	j.region.dev.SetWriteGate(func(int64) error { return errors.New("injected write error") })
+	err := j.CompleteIntentDurable(reserveSeq)
+	j.region.dev.SetWriteGate(func(int64) error { return nil })
+	if err == nil {
+		t.Fatal("ending the record succeeded although no write could reach the disk")
+	}
+
+	pending := commitIntents(t, j, true, false)[1]
+	if _, err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if got := replayedAfterCrash(t, j); !slices.Contains(got, pending) {
+		t.Fatalf("replay after a crash ran %v and skipped the pending intent %d", got, pending)
+	}
+
+	if err := j.CompleteIntentDurable(reserveSeq); err != nil {
+		t.Fatalf("retrying the end: %v", err)
+	}
+	onDisk, err := OpenRegionForRecovery(j.region.dev, j.region.regionOffset, j.region.regionSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := onDisk.Superblock().HeadOffset, j.region.HeadOffset(); got != want {
+		t.Errorf("head on disk %d after the retried end, want %d", got, want)
+	}
+	if got := r.unused(); len(got) != 0 {
+		t.Errorf("replay would free %v of the ended record", got)
+	}
+}
