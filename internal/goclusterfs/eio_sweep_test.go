@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"slices"
 	"strconv"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 type eioRun struct {
@@ -212,19 +214,31 @@ func failedSteps(ok map[string]bool) string {
 }
 
 // runEIO fails write n of the workload with EIO and lets everything else land. With crash set the node then stops
-// as if it crashed and a new node replays its journal; otherwise the same node keeps running.
-func runEIO(t *testing.T, n int64, crash bool) int64 {
+// as if it crashed and a new node replays its journal; otherwise the same node keeps running. It returns whether
+// each write went to the data region.
+func runEIO(t *testing.T, n int64, crash bool) []bool {
 	fsys, path, offset, size := journaledFS(t)
 	withBridge(fsys)
-	var writes atomic.Int64
-	fsys.dev.SetWriteGate(func(int64) error {
-		if writes.Add(1)-1 == n {
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var data []bool
+	fsys.dev.SetWriteGate(func(off int64) error {
+		mu.Lock()
+		defer mu.Unlock()
+		data = append(data, uint64(off) >= sb.DataRegionOffset)
+		if int64(len(data)-1) == n {
 			return syscall.EIO
 		}
 		return nil
 	})
 	ok := eioWorkload(fsys)
-	if n < writes.Load() {
+	mu.Lock()
+	written := slices.Clone(data)
+	mu.Unlock()
+	if n < int64(len(written)) {
 		t.Logf("failed steps: %s", failedSteps(ok))
 	}
 	if crash {
@@ -234,26 +248,26 @@ func runEIO(t *testing.T, n int64, crash bool) int64 {
 	}
 	checkEIOResults(t, fsys, ok)
 	expectOnlyLeaks(t, fsys)
-	return writes.Load()
+	return written
 }
 
-// The workload makes thousands of writes; GOCLUSTERFS_EIO_SWEEP=full fails each of them in turn instead of an even
-// spread of eioSamples.
-const eioSamples = 40
+// The workload makes thousands of writes, most of them file data. Every write outside the data region fails in turn,
+// and an even spread of eioDataSamples data writes; GOCLUSTERFS_EIO_SWEEP=full fails every write.
+const eioDataSamples = 20
 
-// One write fails with EIO, at each point of a workload that creates, writes, overwrites, truncates and unlinks.
+// One write fails with EIO, at each point that matters in a workload that creates, writes, overwrites, truncates and unlinks.
 // Every result the workload acknowledged must hold, while the node keeps running and after it crashes and is
 // replayed, and fsck may find nothing but leaks.
 func TestOneFailedWriteKeepsAcknowledgedResults(t *testing.T) {
 	for _, crash := range []bool{false, true} {
 		t.Run("crash="+strconv.FormatBool(crash), func(t *testing.T) {
-			total := runEIO(t, math.MaxInt64, crash)
-			step := max(1, total/eioSamples)
-			if os.Getenv("GOCLUSTERFS_EIO_SWEEP") == "full" {
-				step = 1
-			}
-			for n := int64(0); n < total; n += step {
-				t.Run(fmt.Sprintf("eio_at_write_%d", n), func(t *testing.T) { runEIO(t, n, crash) })
+			data := runEIO(t, math.MaxInt64, crash)
+			step := max(1, len(data)/eioDataSamples)
+			full := os.Getenv("GOCLUSTERFS_EIO_SWEEP") == "full"
+			for n, isData := range data {
+				if full || !isData || n%step == 0 {
+					t.Run(fmt.Sprintf("eio_at_write_%d", n), func(t *testing.T) { runEIO(t, int64(n), crash) })
+				}
 			}
 		})
 	}
