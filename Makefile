@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount build-fsck build-gfsctl completions dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
+.PHONY: build build-mount build-fsck build-gfsctl soak completions dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
 
 # Go parameters
 GOCMD=go
@@ -40,6 +40,10 @@ build-fsck:
 	@echo "Building $(FSCK_BINARY)..."
 	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/goclusterfs-fsck
 	@echo "Built $(FSCK_BINARY) successfully"
+
+# Static, so the same binary runs on the host as the driver and in the Alpine VMs as the agent
+soak: build-mount build-fsck
+	CGO_ENABLED=0 $(GOBUILD) -o goclusterfs-soak ./tests/soak
 
 build-gfsctl:
 	@echo "Building $(GFSCTL_BINARY)..."
