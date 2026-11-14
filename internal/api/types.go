@@ -168,11 +168,20 @@ type TrimStatsResponse struct {
 
 // LockStatsResponse is returned by GET /api/v1/stats/lock.
 type LockStatsResponse struct {
-	HintCacheHits    uint64  `json:"hint_cache_hits"`
-	HintCacheMisses  uint64  `json:"hint_cache_misses"`
-	HintCacheHitRate float64 `json:"hint_cache_hit_rate"`
-	ActiveLocks      int     `json:"active_locks,omitempty"`
-	PendingLocks     int     `json:"pending_locks,omitempty"`
+	HintCacheHits    uint64          `json:"hint_cache_hits"`
+	HintCacheMisses  uint64          `json:"hint_cache_misses"`
+	HintCacheHitRate float64         `json:"hint_cache_hit_rate"`
+	ActiveLocks      int             `json:"active_locks,omitempty"`
+	PendingLocks     int             `json:"pending_locks,omitempty"`
+	Types            []LockTypeStats `json:"types,omitempty"`
+}
+
+// LockTypeStats counts one lock type's acquires on this node since it mounted.
+type LockTypeStats struct {
+	Type        string  `json:"type"`
+	Acquires    uint64  `json:"acquires"`
+	Blocked     uint64  `json:"blocked"`
+	WaitSeconds float64 `json:"wait_seconds"`
 }
 
 // SFBStatsResponse is returned by GET /api/v1/stats/sfb.

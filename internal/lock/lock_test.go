@@ -403,3 +403,48 @@ func BenchmarkLockRepeatedAcquire(b *testing.B) {
 		release(b, mgr, LockTypeInode, 100)
 	}
 }
+
+// An acquire that waits for another node's hold counts as blocked for its lock
+// type, with at least the time it waited; one that finds the lock free does not.
+func TestStatsCountBlockedAcquires(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	var uuid1, uuid2 [16]byte
+	copy(uuid1[:], "test-node-uuid01")
+	copy(uuid2[:], "test-node-uuid02")
+	mgr1 := NewManager(dev, 0, 10<<20, uuid1, 0)
+	mgr2 := NewManager(dev, 0, 10<<20, uuid2, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := mgr1.Acquire(ctx, LockTypeBlockBitmap, 0, LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	acquired := make(chan error, 1)
+	go func() { acquired <- mgr2.Acquire(ctx, LockTypeBlockBitmap, 0, LockModeExclusive) }()
+	for mgr2.Stats().Waiting == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	const held = 200 * time.Millisecond
+	time.Sleep(held)
+	release(t, mgr1, LockTypeBlockBitmap, 0)
+	if err := <-acquired; err != nil {
+		t.Fatal(err)
+	}
+	release(t, mgr2, LockTypeBlockBitmap, 0)
+
+	bitmap := func(m *Manager) TypeStats {
+		for _, ts := range m.Stats().Types {
+			if ts.Name == "bitmap" {
+				return ts
+			}
+		}
+		return TypeStats{}
+	}
+	if got := bitmap(mgr1); got.Acquires != 1 || got.Blocked != 0 || got.Wait != 0 {
+		t.Errorf("node 1 bitmap stats = %+v, want 1 acquire, none blocked", got)
+	}
+	if got := bitmap(mgr2); got.Acquires != 1 || got.Blocked != 1 || got.Wait < held {
+		t.Errorf("node 2 bitmap stats = %+v, want 1 acquire, 1 blocked, a wait of at least %v", got, held)
+	}
+}

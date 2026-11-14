@@ -177,6 +177,29 @@ type Stats struct {
 	HintCacheSize int
 	HintHits      uint64
 	HintMisses    uint64
+	Types         []TypeStats // lock types this node has acquired or waited for
+}
+
+// TypeStats counts one lock type's acquires on this node since it started.
+type TypeStats struct {
+	Name     string
+	Acquires uint64        // acquires served
+	Blocked  uint64        // acquires whose first try found the lock taken, served or not
+	Wait     time.Duration // time the blocked acquires spent in Acquire
+}
+
+var typeNames = [numLockTypes]string{
+	LockTypeVolume:       "volume",
+	LockTypeSnapshotReg:  "snapshot_registry",
+	LockTypeSnapshot:     "snapshot",
+	LockTypeJournal:      "journal",
+	LockTypeRefCount:     "refcount",
+	LockTypeLockRegion:   "lock_region",
+	LockTypeBlockBitmap:  "bitmap",
+	LockTypeSFBContainer: "sfb_container",
+	LockTypeInode:        "inode",
+	LockTypeExtent:       "extent",
+	LockTypeInodeSector:  "inode_sector",
 }
 
 type lockKey struct {
@@ -285,7 +308,20 @@ func (m *Manager) Stats() Stats {
 	m.mu.Lock()
 	held := len(m.heldLocks)
 	m.mu.Unlock()
-	return Stats{Held: held, Waiting: int(m.waiting.Load())}
+	stats := Stats{Held: held, Waiting: int(m.waiting.Load())}
+	for typ := range m.acquires {
+		c := &m.acquires[typ]
+		ts := TypeStats{
+			Name:     typeNames[typ],
+			Acquires: c.held.Load() + c.joined.Load() + c.cached.Load() + c.claimed.Load(),
+			Blocked:  c.blocked.Load(),
+			Wait:     time.Duration(c.waitNanos.Load()),
+		}
+		if ts.Acquires > 0 || ts.Blocked > 0 {
+			stats.Types = append(stats.Types, ts)
+		}
+	}
+	return stats
 }
 
 const numLockTypes = int(LockTypeInodeSector) + 1
@@ -317,14 +353,22 @@ var typeFirstRow = func() (first [numLockTypes]uint64) {
 
 // acquireCounts says how one lock type's acquires on this node were served:
 // a key this node already held, a join of a held record, a cached record, a
-// claim won on disk, and tries that had to wait.
+// claim won on disk. retries counts tries that found the lock taken, blocked
+// the acquires that had at least one, and waitNanos their time in Acquire.
 type acquireCounts struct {
-	held, joined, cached, claimed, blocked atomic.Uint64
+	held, joined, cached, claimed, retries, blocked, waitNanos atomic.Uint64
 }
 
 func (m *Manager) countAcquire(lockType LockType, pick func(*acquireCounts) *atomic.Uint64) {
 	if int(lockType) < numLockTypes {
 		pick(&m.acquires[lockType]).Add(1)
+	}
+}
+
+func (m *Manager) countBlocked(lockType LockType, wait time.Duration) {
+	if int(lockType) < numLockTypes {
+		m.acquires[lockType].blocked.Add(1)
+		m.acquires[lockType].waitNanos.Add(uint64(wait))
 	}
 }
 
@@ -360,9 +404,9 @@ func (m *Manager) LogStats() {
 		m.slotWrites.Load(), m.rowReads.Load(), m.conflicts.Load(), m.waits.Load(), m.deferred.Load())
 	for typ := range m.acquires {
 		c := &m.acquires[typ]
-		counts := []uint64{c.held.Load(), c.joined.Load(), c.cached.Load(), c.claimed.Load(), c.blocked.Load()}
+		counts := []uint64{c.held.Load(), c.joined.Load(), c.cached.Load(), c.claimed.Load(), c.retries.Load()}
 		if slices.Max(counts) > 0 {
-			log.Printf("lock: type %d acquires: held=%d joined=%d cached=%d claimed=%d blocked=%d",
+			log.Printf("lock: type %d acquires: held=%d joined=%d cached=%d claimed=%d retries=%d",
 				typ, counts[0], counts[1], counts[2], counts[3], counts[4])
 		}
 	}
@@ -420,6 +464,11 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 
 	retryCount := 0
 	startTime := time.Now()
+	defer func() {
+		if retryCount > 0 {
+			m.countBlocked(lockType, time.Since(startTime))
+		}
+	}()
 	var liveWait time.Duration
 	var lastFailingLog time.Time
 
@@ -451,7 +500,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		}
 
 		retryCount++
-		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.blocked })
+		m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.retries })
 		if retryCount == 1 {
 			m.waiting.Add(1)
 			defer m.waiting.Add(-1)

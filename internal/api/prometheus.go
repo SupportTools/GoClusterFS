@@ -93,6 +93,9 @@ type fsCollector struct {
 	lockHintCacheHitRateDesc *prometheus.Desc
 	lockActiveLocksDesc      *prometheus.Desc
 	lockPendingLocksDesc     *prometheus.Desc
+	lockAcquiresDesc         *prometheus.Desc
+	lockBlockedDesc          *prometheus.Desc
+	lockWaitSecondsDesc      *prometheus.Desc
 
 	// SFB (Sparse File Bitmap) metrics
 	sfbTotalBlocksDesc        *prometheus.Desc
@@ -377,6 +380,21 @@ func newFSCollector(s *Server) *fsCollector {
 			"Number of pending lock requests",
 			nil, nil,
 		),
+		lockAcquiresDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "lock", "acquires_total"),
+			"Lock acquires this node served, by lock type",
+			[]string{"type"}, nil,
+		),
+		lockBlockedDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "lock", "blocked_total"),
+			"Lock acquires whose first try found the lock taken, by lock type",
+			[]string{"type"}, nil,
+		),
+		lockWaitSecondsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "lock", "wait_seconds_total"),
+			"Time blocked lock acquires spent waiting, by lock type",
+			[]string{"type"}, nil,
+		),
 
 		// SFB (Sparse File Bitmap)
 		sfbTotalBlocksDesc: prometheus.NewDesc(
@@ -514,6 +532,9 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.lockHintCacheHitRateDesc
 	ch <- c.lockActiveLocksDesc
 	ch <- c.lockPendingLocksDesc
+	ch <- c.lockAcquiresDesc
+	ch <- c.lockBlockedDesc
+	ch <- c.lockWaitSecondsDesc
 
 	// SFB
 	ch <- c.sfbTotalBlocksDesc
@@ -664,6 +685,11 @@ func (c *fsCollector) collectLockStats(ch chan<- prometheus.Metric, stats *LockS
 	ch <- prometheus.MustNewConstMetric(c.lockHintCacheHitRateDesc, prometheus.GaugeValue, stats.HintCacheHitRate)
 	ch <- prometheus.MustNewConstMetric(c.lockActiveLocksDesc, prometheus.GaugeValue, float64(stats.ActiveLocks))
 	ch <- prometheus.MustNewConstMetric(c.lockPendingLocksDesc, prometheus.GaugeValue, float64(stats.PendingLocks))
+	for _, t := range stats.Types {
+		ch <- prometheus.MustNewConstMetric(c.lockAcquiresDesc, prometheus.CounterValue, float64(t.Acquires), t.Type)
+		ch <- prometheus.MustNewConstMetric(c.lockBlockedDesc, prometheus.CounterValue, float64(t.Blocked), t.Type)
+		ch <- prometheus.MustNewConstMetric(c.lockWaitSecondsDesc, prometheus.CounterValue, t.WaitSeconds, t.Type)
+	}
 }
 
 func (c *fsCollector) collectSFBStats(ch chan<- prometheus.Metric, stats *SFBStatsResponse) {
