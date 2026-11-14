@@ -1,0 +1,284 @@
+# Runs what pull request CI cannot: the integration suite without -short, the
+# Docker suite with its concurrent tests, repeated race runs of the lock,
+# journal, inode and dir packages, and every fuzz target. A failure fails the
+# run; the Summary job lists the failed tests and uploads them as nightly-failures.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: How long to fuzz each target
+        default: 25m
+  # A short run checks the wiring when the workflow or its scripts change.
+  pull_request:
+    branches: [main, master]
+    paths:
+      - .github/workflows/nightly.yml
+      - .github/workflows/docker-integration.yml
+      - tests/scripts/failed-tests.sh
+      - tests/scripts/integration-groups.sh
+      - tests/scripts/integration-timings-full.txt
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.26"
+  FUZZTIME: ${{ github.event_name == 'pull_request' && '1m' || inputs.fuzztime || '25m' }}
+
+jobs:
+  integration:
+    name: Integration, full (group ${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # tests/scripts/integration-groups.sh splits the tests by their run time without -short
+        group: [1, 2, 3]
+    env:
+      INTEGRATION_TIMINGS: tests/scripts/integration-timings-full.txt
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          sudo modprobe fuse
+          which fusermount || which fusermount3
+
+      - name: Build
+        run: make build
+
+      - name: Check test groups
+        run: tests/scripts/integration-groups.sh check ${{ strategy.job-total }}
+
+      - name: Integration tests without -short
+        shell: bash
+        run: |
+          tests=$(tests/scripts/integration-groups.sh regex ${{ strategy.job-total }} ${{ matrix.group }})
+          go test -v -timeout 30m -run "$tests" ./tests/integration/... 2>&1 | tee integration-${{ matrix.group }}.log
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-integration-${{ matrix.group }}
+          path: integration-${{ matrix.group }}.log
+          retention-days: 14
+
+  docker:
+    name: Docker
+    uses: ./.github/workflows/docker-integration.yml
+    permissions:
+      contents: read
+      checks: write
+    with:
+      groups: "[1, 2, 3, 4]"
+      run-concurrent: true
+      publish-report: false
+
+  race:
+    name: Race x3 (lock, journal, inode, dir)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      # Test images go on tmpfs, as in ci.yml's unit tests.
+      - name: Race tests, three runs each
+        shell: bash
+        env:
+          TMPDIR: /dev/shm/gcfs-race
+          GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-race
+        run: |
+          mkdir -p "$TMPDIR"
+          go test -race -count=3 -timeout 50m ./internal/lock/ ./internal/journal/ ./internal/inode/ ./internal/dir/ 2>&1 | tee race.log
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-race
+          path: race.log
+          retention-days: 14
+
+  fuzz-targets:
+    name: Find fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.list.outputs.targets }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: List every FuzzXxx
+        id: list
+        shell: bash
+        run: |
+          targets=$(go test -list '^Fuzz' ./... | awk '
+            /^Fuzz/ { names[++n] = $1; next }
+            /^ok[ \t]/ {
+              k = split($2, parts, "/")
+              for (i = 1; i <= n; i++) printf "{\"pkg\":\"%s\",\"target\":\"%s\",\"name\":\"%s-%s\"}\n", $2, names[i], parts[k], names[i]
+              n = 0
+            }' | jq -s -c .)
+          echo "$targets" | jq -r '.[].name'
+          if [ "$targets" = "[]" ]; then
+            echo "::error::found no fuzz targets"
+            exit 1
+          fi
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: Fuzz ${{ matrix.name }}
+    needs: fuzz-targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.fuzz-targets.outputs.targets) }}
+    env:
+      TMPDIR: /dev/shm/gcfs-fuzz
+      GOCLUSTERFS_TEST_DIR: /dev/shm/gcfs-fuzz
+      CORPUS_KEY: fuzz-corpus-${{ matrix.pkg }}-${{ matrix.target }}-
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Restore the corpus from earlier nights
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz-corpus
+          key: ${{ env.CORPUS_KEY }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CORPUS_KEY }}
+
+      - name: Fuzz for ${{ env.FUZZTIME }}
+        shell: bash
+        run: |
+          mkdir -p "$TMPDIR" fuzz-corpus
+          corpus="$(go env GOCACHE)/fuzz/${{ matrix.pkg }}/${{ matrix.target }}"
+          mkdir -p "$corpus"
+          cp -R fuzz-corpus/. "$corpus/"
+          echo "starting from $(find "$corpus" -type f | wc -l) corpus entries"
+          go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime "$FUZZTIME" "${{ matrix.pkg }}" 2>&1 | tee fuzz.log
+
+      # A failed night keeps its corpus too; the input that failed goes to testdata, not the cache.
+      - name: Collect the corpus and any failing input
+        if: always()
+        shell: bash
+        run: |
+          corpus="$(go env GOCACHE)/fuzz/${{ matrix.pkg }}/${{ matrix.target }}"
+          rm -rf fuzz-corpus
+          mkdir -p fuzz-corpus failing-input
+          if [ -d "$corpus" ]; then cp -R "$corpus/." fuzz-corpus/; fi
+          echo "keeping $(find fuzz-corpus -type f | wc -l) corpus entries"
+          testdata="$(go list -f '{{.Dir}}' "${{ matrix.pkg }}")/testdata/fuzz/${{ matrix.target }}"
+          git status --porcelain --untracked-files=all -- "$testdata" | awk '{ print $2 }' | xargs -r cp -t failing-input/
+
+      - name: Save the corpus
+        if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz-corpus
+          key: ${{ env.CORPUS_KEY }}${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload the log and any failing input
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-fuzz-${{ matrix.name }}
+          path: |
+            fuzz.log
+            failing-input/
+          retention-days: 14
+
+  summary:
+    name: Summary
+    if: always()
+    needs: [integration, docker, race, fuzz-targets, fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download logs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+
+      - name: List failed tests
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          shopt -s nullglob
+          {
+            for f in artifacts/nightly-integration-*/*.log; do tests/scripts/failed-tests.sh go integration "$f"; done
+            for f in artifacts/nightly-race/*.log; do tests/scripts/failed-tests.sh go race "$f"; done
+            for f in artifacts/nightly-fuzz-*/fuzz.log; do tests/scripts/failed-tests.sh go fuzz "$f"; done
+            for f in artifacts/docker-test-results-*/results.txt; do tests/scripts/failed-tests.sh docker docker "$f"; done
+          } | sort -u >nightly-failures.tsv
+          {
+            echo "## Nightly results"
+            echo
+            echo "| Job | Result |"
+            echo "| --- | --- |"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"$NEEDS"
+            echo
+            if [ -s nightly-failures.tsv ]; then
+              echo "### Failed tests"
+              echo
+              echo "| Suite | Test |"
+              echo "| --- | --- |"
+              awk -F'\t' '{ printf "| %s | `%s` |\n", $1, $2 }' nightly-failures.tsv
+            else
+              echo "The logs name no failed test."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the failed test list
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-failures
+          path: nightly-failures.tsv
+          retention-days: 30

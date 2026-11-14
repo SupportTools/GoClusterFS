@@ -141,6 +141,13 @@ jobs:
             echo "::error file=go.mod::go.mod requires Go $gomod but CI uses Go $GO_VERSION. Update GO_VERSION in .github/workflows/ci.yml."
             exit 1
           fi
+          for f in .github/workflows/*.yml; do
+            v=$(sed -n 's/^  GO_VERSION: "\(.*\)"$/\1/p' "$f")
+            if [ -n "$v" ] && [ "$v" != "$GO_VERSION" ]; then
+              echo "::error file=$f::GO_VERSION is $v here but $GO_VERSION in ci.yml; keep them the same."
+              exit 1
+            fi
+          done
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0

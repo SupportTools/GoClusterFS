@@ -268,7 +268,8 @@ md5_portion() {
 test_passed=0
 test_failed=0
 
-# CI runs the suite as two parallel jobs. TEST_GROUP=1 or 2 runs one half; empty runs everything.
+# CI runs groups 1 to 3 as parallel jobs; the nightly workflow adds group 4, the
+# tests SKIP_CONCURRENT_TESTS skips. An empty TEST_GROUP runs everything.
 in_test_group() {
     [[ -z "$TEST_GROUP" ]] && return 0
     local group=1
@@ -278,6 +279,8 @@ in_test_group() {
         # Takes about 14 minutes in CI, so it runs alone.
         "More Than 4096 Files")
             group=3 ;;
+        "Concurrent Writes"|"Concurrent File Creation"|"Concurrent Same-File Writes"*|"Mixed Size Writes"|"Overlapping Block Writes"|"Concurrent Write Stress"|"Reversed Write Order")
+            group=4 ;;
     esac
     [[ "$group" == "$TEST_GROUP" ]]
 }

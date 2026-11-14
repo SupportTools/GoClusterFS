@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Splits the Go integration tests into CI groups of about equal run time,
-# using integration-timings.txt.
+# using integration-timings.txt, or the file INTEGRATION_TIMINGS names.
 #
 #   integration-groups.sh regex <groups> <group>   -run regex for one group
 #   integration-groups.sh check <groups>           fail unless every test is in exactly one group
@@ -8,7 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 pkg=./tests/integration
-timings=tests/scripts/integration-timings.txt
+timings="${INTEGRATION_TIMINGS:-tests/scripts/integration-timings.txt}"
 default_seconds=3
 
 list_tests() {
