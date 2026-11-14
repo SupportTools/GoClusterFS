@@ -3199,10 +3199,45 @@ scenarios:
 
   - id: bitmap-reserve-restores-on-write-failure
     name: Failed reserve sector write ends the record, then restores
-    description: A reserve whose second sector write fails ends its record and restores the first sector; if the record cannot end, the sectors stay as they are
+    description: A reserve whose second sector write fails ends its record and restores the first sector; if the record cannot end, it writes the failed sector again and keeps the blocks
     priority: go_only
     environments:
       go: internal/bitmap/bitmap_test.go::TestReserveRestoresSectorsWhenAWriteFails
+
+  - id: journal-durable-end-full-ring
+    name: Durable end of the oldest intent in a full ring
+    description: A reserve record that pins a ring too full for a completion record still ends, because the head moves past it; replay then frees none of its blocks and commits work again
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteIntentDurableEndsOldestIntentInFullRing
+
+  - id: reserve-journal-full-log
+    name: Journal-full use commit puts blocks back
+    description: A use commit that hit a full journal wrote nothing, so its blocks go back to the reserve
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestJournalFullLogPutsBlockBack
+
+  - id: reserve-free-count-saturates
+    name: Cached free count never wraps
+    description: Subtracting a refill from a free count that already left it out stops at zero
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFreeCountNeverWraps
+
+  - id: reserve-reopened-record-ends
+    name: Record reopened after a failed refresh ends
+    description: A refresh that fails after a write used a record's last blocks reopens the record, which then ends as fully used
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRecordReopenedAfterFailedRefreshEnds
+
+  - id: reserve-ends-skip-frees
+    name: Record ends and peer waits never wait for frees
+    description: While a return's free waits for the bitmap lock, tidy, refresh and WaitForPeers (even with endMu held) all finish
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestWaitForPeersAndEndsDoNotWaitForFrees
 
   - id: journal-durable-intent-completion
     name: Durable intent completion survives a failed write

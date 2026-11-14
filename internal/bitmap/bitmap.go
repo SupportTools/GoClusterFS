@@ -368,8 +368,8 @@ func (r *Region) releaseReserved(ctx context.Context, blocks []uint64) {
 
 // Reserve picks up to n free blocks under one lock hold and calls record with
 // them. Only if record reports keep does it mark them allocated. If a sector
-// write then fails, it calls end and, only if end succeeds, restores the sectors
-// it changed, so no block a pending record lists is free on disk.
+// write then fails, it calls end and restores the sectors it changed; if end
+// fails, it writes the rest again, so no block a pending record lists stays free on disk.
 func (r *Region) Reserve(ctx context.Context, n int, record func([]uint64) (keep bool), end func() error) ([]uint64, error) {
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
@@ -417,8 +417,11 @@ func (r *Region) Reserve(ctx context.Context, n int, record func([]uint64) (keep
 			continue
 		}
 		if eerr := end(); eerr != nil {
-			log.Printf("[ERROR] bitmap: reserved blocks %v may be free on disk while their record is pending: %v", picked, eerr)
-			return nil, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+			if rerr := r.writeSectors(changed[i:], sectors); rerr != nil {
+				log.Printf("[ERROR] bitmap: reserved blocks %v may be free on disk while their record is pending: %v, %v", picked, eerr, rerr)
+				return nil, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+			}
+			return picked, nil
 		}
 		for _, done := range changed[:i+1] {
 			if rerr := r.writeSector(done, originals[done]); rerr != nil {
@@ -428,6 +431,15 @@ func (r *Region) Reserve(ctx context.Context, n int, record func([]uint64) (keep
 		return nil, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
 	}
 	return picked, nil
+}
+
+func (r *Region) writeSectors(idx []uint64, sectors map[uint64][]byte) error {
+	for _, sectorIdx := range idx {
+		if err := r.writeSector(sectorIdx, sectors[sectorIdx]); err != nil {
+			return fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+		}
+	}
+	return nil
 }
 
 // HoldAllocated takes the bitmap lock and returns the blocks of blocks that are

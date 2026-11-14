@@ -732,7 +732,7 @@ func TestFreeIfAndHoldAllocated(t *testing.T) {
 
 // A reserve whose second sector write fails ends its record and then restores
 // the first sector, so no picked block stays allocated. If the record cannot be
-// ended, the sectors stay as they are.
+// ended, it writes the failed sector again and keeps the blocks.
 func TestReserveRestoresSectorsWhenAWriteFails(t *testing.T) {
 	for _, endErr := range []error{nil, errors.New("journal failed")} {
 		dev, cleanup := createTestDevice(t, 10<<20)
@@ -756,12 +756,15 @@ func TestReserveRestoresSectorsWhenAWriteFails(t *testing.T) {
 			ended = true
 			return endErr
 		})
-		if err == nil || !ended {
-			t.Fatalf("end error %v: Reserve returned %v, %v and ended=%v after the failed sector write", endErr, blocks, err, ended)
+		if !ended {
+			t.Fatalf("end error %v: Reserve did not end the record after the failed sector write", endErr)
 		}
-		want := free
+		want, wantBlocks := free, 0
 		if endErr != nil {
-			want = free - 8
+			want, wantBlocks = free-16, 16
+		}
+		if (err == nil) != (endErr != nil) || len(blocks) != wantBlocks {
+			t.Errorf("end error %v: Reserve returned %d blocks, error %v", endErr, len(blocks), err)
 		}
 		if got := region.FreeCount(); got != want {
 			t.Errorf("end error %v: %d free blocks after the failed reserve, want %d", endErr, got, want)

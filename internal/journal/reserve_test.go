@@ -205,3 +205,44 @@ func TestCompleteIntentDurableRetriesAfterFailure(t *testing.T) {
 		t.Errorf("replayed %v after a crash, want nothing", got)
 	}
 }
+
+// A reserve record that is the oldest intent in a ring too full for a completion
+// record still ends: the head moves past it, replay no longer frees its blocks,
+// and commits work again.
+func TestCompleteIntentDurableEndsOldestIntentInFullRing(t *testing.T) {
+	r := newReserveJournal(t)
+	j := r.j
+	reserveSeq := r.reserve(false, 100, 101)
+	var others []uint64
+	for i := 0; ; i++ {
+		txn := j.Begin()
+		if err := txn.LogBlockUse([]uint64{uint64(200 + i)}); err != nil {
+			t.Fatal(err)
+		}
+		seq, err := j.Commit(txn)
+		if errors.Is(err, ErrJournalFull) {
+			j.Abort(txn)
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		others = append(others, seq)
+	}
+	for _, s := range others {
+		_ = j.CompleteIntent(s)
+	}
+	if err := j.CompleteIntentDurable(reserveSeq); err != nil {
+		t.Fatalf("ending the record that pins a full ring: %v", err)
+	}
+	if got := r.unused(); len(got) != 0 {
+		t.Errorf("replay would free %v of the ended record", got)
+	}
+	txn := j.Begin()
+	if err := txn.LogBlockUse([]uint64{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Commit(txn); err != nil {
+		t.Errorf("commit after ending the record: %v", err)
+	}
+}

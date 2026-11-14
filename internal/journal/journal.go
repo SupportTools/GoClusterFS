@@ -563,24 +563,51 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 	return j.appendCompletionLocked(intentSeq)
 }
 
-// CompleteIntentDurable returns only after the completion record is synced,
-// and keeps the intent pending on error, so a retry writes the record.
+// CompleteIntentDurable returns only after the intent's end is synced, and keeps
+// the intent pending on error, so a retry ends it. When the intent is the oldest
+// and the ring is too full for a completion record, the head moves past it instead.
 func (j *Journal) CompleteIntentDurable(intentSeq uint64) error {
 	j.mu.Lock()
-	_, pending := j.pendingIntents[intentSeq]
+	start, pending := j.pendingIntents[intentSeq]
 	var err error
 	if pending {
 		err = j.appendCompletionLocked(intentSeq)
+		if errors.Is(err, ErrJournalFull) && j.oldestIntentLocked(intentSeq) {
+			delete(j.pendingIntents, intentSeq)
+			if _, err = j.advanceHead(); err != nil {
+				j.pendingIntents[intentSeq] = start
+			}
+		}
 	}
 	j.mu.Unlock()
 	if !pending || err != nil {
 		return err
 	}
 	if err := j.region.Sync(); err != nil {
-		return fmt.Errorf("failed to sync intent completion: %w", err)
+		j.mu.Lock()
+		j.pendingIntents[intentSeq] = start
+		j.mu.Unlock()
+		return fmt.Errorf("failed to sync intent end: %w", err)
 	}
 	j.dropIntent(intentSeq)
 	return nil
+}
+
+func (j *Journal) oldestIntentLocked(intentSeq uint64) bool {
+	head, size := j.region.HeadOffset(), j.region.DataAreaSize()
+	after := func(pos uint32) uint32 {
+		if pos >= head {
+			return pos - head
+		}
+		return pos + size - head
+	}
+	mine := after(j.pendingIntents[intentSeq])
+	for seq, pos := range j.pendingIntents {
+		if seq != intentSeq && after(pos) < mine {
+			return false
+		}
+	}
+	return true
 }
 
 func (j *Journal) appendCompletionLocked(intentSeq uint64) error {

@@ -172,9 +172,14 @@ func (m *Manager) Untake(blocks ...uint64) {
 }
 
 // Logged runs log, which commits the use of blocks. They leave the reserve even
-// if log fails, since a failed commit may still be on disk.
+// if log fails, since a failed commit may still be on disk, unless the journal
+// was full and wrote nothing.
 func (m *Manager) Logged(blocks []uint64, log func() error) error {
 	err := log()
+	if errors.Is(err, journal.ErrJournalFull) {
+		m.Untake(blocks...)
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, b := range blocks {
@@ -195,13 +200,21 @@ func (m *Manager) Logged(blocks []uint64, log func() error) error {
 
 // ReturnAll gives the untaken blocks back. Each record ends before its blocks are
 // freed, so a crash in between leaks them instead of replay freeing them twice.
+// The frees run after endMu is dropped, so its holders wait only for the journal.
 func (m *Manager) ReturnAll(ctx context.Context) {
+	freed, ended := m.endForReturn()
+	m.free(ctx, freed)
+	if ended {
+		m.returns.Add(1)
+	}
+}
+
+func (m *Manager) endForReturn() (freed []uint64, ended bool) {
 	m.endMu.Lock()
 	defer m.endMu.Unlock()
-	ctx = context.WithoutCancel(ctx)
 	m.endUsed()
 	if !m.endStale() {
-		return
+		return nil, false
 	}
 	groups := m.takeUntaken(func(*record) bool { return true }, false)
 	for r, blocks := range groups {
@@ -211,15 +224,9 @@ func (m *Manager) ReturnAll(ctx context.Context) {
 			continue
 		}
 		m.finishEnd(r)
-		if len(blocks) > 0 {
-			m.release(ctx, blocks)
-			m.freeCount.Add(uint64(len(blocks)))
-		}
+		freed, ended = append(freed, blocks...), true
 	}
-	if len(groups) > 0 {
-		m.returns.Add(1)
-	}
-	m.freeOrphans(ctx)
+	return append(freed, m.takeOrphans()...), ended
 }
 
 // Refresh moves the untaken blocks of records far behind the journal tail into a
@@ -277,7 +284,7 @@ func (m *Manager) WaitForPeers(ctx context.Context, waited time.Duration) bool {
 	}
 	if waited == 0 {
 		log.Printf("[INFO] [reserve] the bitmap is full; asking other nodes to give back their reserved blocks")
-		m.ReturnAll(ctx)
+		m.AskReturn()
 	}
 	if now := time.Now(); m.broadcast != nil && now.Sub(time.Unix(0, m.askedAt.Load())) >= tick {
 		m.askedAt.Store(now.UnixNano())
@@ -390,7 +397,7 @@ func (m *Manager) refill(ctx context.Context) bool {
 		return false
 	}
 	m.add(seq, blocks)
-	m.freeCount.Add(^uint64(len(blocks) - 1))
+	m.adjustFree(-len(blocks))
 	m.refills.Add(1)
 	return true
 }
@@ -455,6 +462,10 @@ func (m *Manager) reopen(r *record, blocks []uint64) {
 	m.untaken = append(m.untaken, r.back...)
 	r.back = nil
 	slices.Sort(m.untaken)
+	if r.live == 0 {
+		r.state = ending
+		m.used = append(m.used, r)
+	}
 }
 
 func (m *Manager) finishEnd(r *record) {
@@ -509,25 +520,41 @@ func (m *Manager) endStale() bool {
 	return len(m.stale) == 0
 }
 
-func (m *Manager) freeOrphans(ctx context.Context) {
+func (m *Manager) takeOrphans() []uint64 {
 	m.mu.Lock()
-	if len(m.stale) > 0 || len(m.orphans) == 0 {
-		m.mu.Unlock()
-		return
+	defer m.mu.Unlock()
+	if len(m.stale) > 0 {
+		return nil
 	}
 	orphans := m.orphans
 	m.orphans = nil
-	m.mu.Unlock()
-	m.release(ctx, orphans)
-	m.freeCount.Add(uint64(len(orphans)))
+	return orphans
+}
+
+func (m *Manager) free(ctx context.Context, blocks []uint64) {
+	if len(blocks) == 0 {
+		return
+	}
+	m.release(context.WithoutCancel(ctx), blocks)
+	m.adjustFree(len(blocks))
+}
+
+func (m *Manager) adjustFree(delta int) {
+	for {
+		old := m.freeCount.Load()
+		if m.freeCount.CompareAndSwap(old, uint64(max(0, int64(old)+int64(delta)))) {
+			return
+		}
+	}
 }
 
 func (m *Manager) tidy(ctx context.Context) {
 	m.endMu.Lock()
-	defer m.endMu.Unlock()
 	m.endUsed()
 	m.endStale()
-	m.freeOrphans(ctx)
+	orphans := m.takeOrphans()
+	m.endMu.Unlock()
+	m.free(ctx, orphans)
 }
 
 func (m *Manager) idle() bool {

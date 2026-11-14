@@ -241,6 +241,110 @@ func TestFailedLogLeavesBlockAllocated(t *testing.T) {
 	}
 }
 
+// A commit that hit a full journal wrote nothing, so its blocks go back to the reserve.
+func TestJournalFullLogPutsBlockBack(t *testing.T) {
+	bm, j := newFakeBitmap(10000, 0), &fakeJournal{}
+	m := newManager(8, bm, j)
+	b := take(t, m)
+	if err := m.Logged([]uint64{b}, func() error { return journal.ErrJournalFull }); !errors.Is(err, journal.ErrJournalFull) {
+		t.Fatalf("Logged returned %v, want the journal-full error", err)
+	}
+	if got := m.Stats().Blocks; got != 8 {
+		t.Errorf("%d blocks in reserve, want 8", got)
+	}
+}
+
+// The cached free count stops at zero instead of wrapping when a refill
+// subtracts blocks a fresh count already left out.
+func TestFreeCountNeverWraps(t *testing.T) {
+	m := newManager(8, newFakeBitmap(10000, 0), &fakeJournal{})
+	m.freeCount.Store(3)
+	m.adjustFree(-8)
+	if got := m.freeCount.Load(); got != 0 {
+		t.Errorf("free count %d after subtracting more than it held, want 0", got)
+	}
+}
+
+// hookJournal runs onCommit before each commit.
+type hookJournal struct {
+	*fakeJournal
+	onCommit func() error
+}
+
+func (h *hookJournal) Commit(txn *journal.Transaction) (uint64, error) {
+	if h.onCommit != nil {
+		if err := h.onCommit(); err != nil {
+			return 0, err
+		}
+	}
+	return h.fakeJournal.Commit(txn)
+}
+
+// A refresh that fails after a write used the last blocks of a record it was
+// ending reopens the record, which then ends as fully used.
+func TestRecordReopenedAfterFailedRefreshEnds(t *testing.T) {
+	ctx := context.Background()
+	bm, fj := newFakeBitmap(1000, 0), &fakeJournal{}
+	j := &hookJournal{fakeJournal: fj}
+	m := New(Config{Size: 2}, bm, j, func(_ context.Context, blocks []uint64) { bm.give(blocks) }, func() int { return 1 })
+	if !m.refill(ctx) {
+		t.Fatal("first refill failed")
+	}
+	a1, _ := m.TakeReady()
+	a2, _ := m.TakeReady()
+	seqA := fj.seq
+	if !m.refill(ctx) {
+		t.Fatal("second refill failed")
+	}
+	fj.set(func(j *fakeJournal) { j.lag = 500 })
+	j.onCommit = func() error {
+		j.onCommit = nil
+		if err := m.Logged([]uint64{a1, a2}, func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		return journal.ErrJournalFull
+	}
+	m.Refresh(ctx)
+	fj.set(func(j *fakeJournal) { j.lag = 0 })
+	m.tidy(ctx)
+	if _, _, pending := fj.IntentLag(seqA); pending {
+		t.Fatalf("record %d, all of whose blocks were used, never ends", seqA)
+	}
+}
+
+// An allocation waiting for peers' reserves never waits for endMu, and record
+// ends never wait for frees: a holder of either may be stuck on the bitmap lock.
+func TestWaitForPeersAndEndsDoNotWaitForFrees(t *testing.T) {
+	bm, j := newFakeBitmap(10000, 0), &fakeJournal{}
+	m := newManager(8, bm, j)
+	m.Untake(take(t, m))
+
+	j.freeingBlock = make(chan struct{})
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		m.ReturnAll(context.Background())
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.tidy(context.Background())
+		m.Refresh(context.Background())
+		m.endMu.Lock()
+		m.WaitForPeers(context.Background(), 0)
+		m.endMu.Unlock()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a record end or WaitForPeers waited for a free")
+	}
+	close(j.freeingBlock)
+	<-returned
+}
+
 // When ending a record fails, its blocks stay reserved, and a later return ends it and frees them.
 func TestFailedEndKeepsBlocks(t *testing.T) {
 	bm, j := newFakeBitmap(10000, 0), &fakeJournal{}
