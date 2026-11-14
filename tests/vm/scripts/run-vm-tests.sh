@@ -3191,6 +3191,159 @@ test_stalled_node_writes_stop_at_write_gate() {
     return $result
 }
 
+# =============================================================================
+# Hostile storage
+# =============================================================================
+# VM 1 mounts through a device-mapper device over the shared disk, so its path
+# alone can be slowed, stalled or failed. Both nodes create small files and
+# record each one their create acknowledged; every acknowledged file must read
+# back, and fsck may find nothing but leaks.
+HOSTILE_DM=gcfs-path
+
+hostile_dm_load() {
+    ssh_run 1 "sz=\$(blockdev --getsz /dev/vda) && dmsetup suspend $HOSTILE_DM && dmsetup load $HOSTILE_DM --table \"0 \$sz $1\" && dmsetup resume $HOSTILE_DM"
+}
+
+hostile_setup() {
+    ensure_cluster_healthy 2 || return 1
+    unmount_goclusterfs 1 || { log_error "VM 1: unmount failed"; return 1; }
+    if ! ssh_run 1 "apk add --no-cache device-mapper > /dev/null && modprobe dm-delay && modprobe dm-flakey && { dmsetup remove $HOSTILE_DM 2>/dev/null; dmsetup create $HOSTILE_DM --table \"0 \$(blockdev --getsz /dev/vda) linear /dev/vda 0\"; }"; then
+        log_error "VM 1: device-mapper setup failed"
+        return 1
+    fi
+    setup_goclusterfs 1 false "" "/dev/mapper/$HOSTILE_DM"
+}
+
+hostile_writers_start() {
+    local vm
+    for vm in 1 2; do
+        ssh_run "$vm" "rm -f /tmp/hostile.stop /tmp/hostile.acked; nohup sh -c 'i=0; while [ ! -e /tmp/hostile.stop ]; do i=\$((i+1)); n=h$vm-\$i; if echo \$n > ${GOCLUSTERFS_MOUNT}/\$n 2>/dev/null; then echo \$n >> /tmp/hostile.acked; fi; sleep 0.1; done' < /dev/null > /dev/null 2>&1 &"
+    done
+}
+
+hostile_writers_stop() {
+    ssh_run 1 "touch /tmp/hostile.stop" || true
+    ssh_run 2 "touch /tmp/hostile.stop" || true
+    sleep 8
+}
+
+# Every file either node acknowledged must read back on VM $1 with its name as its content.
+hostile_check_acked() {
+    local reader=$1 vm acked bad result=0
+    for vm in 1 2; do
+        acked=$(ssh_run "$vm" "cat /tmp/hostile.acked 2>/dev/null" | wc -l)
+        bad=$(ssh_run "$vm" "cat /tmp/hostile.acked 2>/dev/null" | ssh_run "$reader" "n=0; while read f; do [ \"\$(cat ${GOCLUSTERFS_MOUNT}/\$f 2>/dev/null)\" = \"\$f\" ] || { n=\$((n+1)); [ \$n -le 5 ] && echo \"  \$f missing or wrong\" >&2; }; done; echo \$n")
+        log_info "VM $vm acknowledged $acked files; $bad of them are missing or wrong on VM $reader"
+        if [[ "$acked" -eq 0 || "$bad" != 0 ]]; then
+            result=1
+        fi
+    done
+    return $result
+}
+
+hostile_replayed_since() {
+    sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
+}
+
+# Unmounts both nodes, removes the device-mapper device, checks the disk with fsck -repair then fsck, and remounts both.
+hostile_fsck_and_restore() {
+    local result=0 out rc
+    if [[ -n "$(mount_pids 1)" ]]; then
+        unmount_goclusterfs 1 || crash_goclusterfs 1 || true
+    fi
+    ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove $HOSTILE_DM" || true
+    if [[ -n "$(mount_pids 2)" ]]; then
+        unmount_goclusterfs 2 || { log_error "VM 2: unmount failed"; result=1; }
+    fi
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -repair /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    log_info "fsck -repair exit $rc, $(echo "$out" | grep -c 'leaked') leaked-block lines"
+    echo "$out" | grep '^\[' | grep -v leaked | head -10
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    if [[ "$rc" != 0 ]]; then
+        echo "$out" | grep '^\[' | head -20
+        log_error "fsck after repair: exit $rc"
+        result=1
+    fi
+    setup_goclusterfs 1 false || result=1
+    setup_goclusterfs 2 false || result=1
+    return $result
+}
+
+# Runs one scenario: $1 names it, $2 is a function that disturbs VM 1's path,
+# and $3 is "survives" when VM 1 must keep running unreplayed or "fenced" when
+# it must stop and VM 2 must replay it.
+hostile_scenario() {
+    local name=$1 disturb=$2 expect=$3 result=0
+    hostile_setup || return 1
+    local marker="hostile: $name $(date +%s)"
+    mark_vm_logs "$marker"
+    hostile_writers_start
+    sleep 5
+    "$disturb"
+    sleep 5
+    hostile_writers_stop
+    if [[ "$expect" == fenced ]]; then
+        local waited=0
+        while ! hostile_replayed_since "$marker" && [[ $waited -lt 90 ]]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if ! hostile_replayed_since "$marker"; then
+            log_error "VM 2 did not replay VM 1 within 90s"
+            result=1
+        fi
+        if [[ -n "$(mount_pids 1)" ]]; then
+            log_error "VM 1 is still mounted after it lost its path for longer than the heartbeat timeout"
+            result=1
+        fi
+    else
+        if hostile_replayed_since "$marker"; then
+            log_error "VM 2 declared VM 1 dead although VM 1 was only slowed"
+            result=1
+        fi
+        if [[ -z "$(mount_pids 1)" ]]; then
+            log_error "VM 1 stopped although its path recovered"
+            sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|WARN' | head -10
+            result=1
+        fi
+    fi
+    hostile_check_acked 2 || result=1
+    hostile_fsck_and_restore || result=1
+    return $result
+}
+
+hostile_stall() {
+    log_info "VM 1 path: stalled for ${HOSTILE_STALL}s"
+    ssh_run 1 "dmsetup suspend $HOSTILE_DM"
+    sleep "$HOSTILE_STALL"
+    ssh_run 1 "dmsetup resume $HOSTILE_DM"
+}
+
+hostile_eio() {
+    log_info "VM 1 path: every I/O fails with EIO for ${HOSTILE_EIO}s"
+    hostile_dm_load "error" || return 1
+    sleep "$HOSTILE_EIO"
+    hostile_dm_load "linear /dev/vda 0"
+}
+
+hostile_flaky() {
+    log_info "VM 1 path: 1s of EIO every 4s, for 40s"
+    hostile_dm_load "flakey /dev/vda 0 3 1" || return 1
+    sleep 40
+    hostile_dm_load "linear /dev/vda 0"
+}
+
+test_storage_short_stalls() {
+    HOSTILE_STALL=5 hostile_scenario "5s stall" hostile_stall survives || return 1
+    HOSTILE_STALL=12 hostile_scenario "12s stall" hostile_stall survives
+}
+test_storage_long_stall() { HOSTILE_STALL=30 hostile_scenario "30s stall" hostile_stall fenced; }
+test_storage_short_eio() { HOSTILE_EIO=2 hostile_scenario "2s of EIO" hostile_eio survives; }
+test_storage_long_eio() { HOSTILE_EIO=10 hostile_scenario "10s of EIO" hostile_eio fenced; }
+test_storage_flaky_eio() { hostile_scenario "flaky EIO" hostile_flaky survives; }
+
 # A power failure while files are written may leave blocks that no file maps.
 # With every node unmounted, fsck -repair frees any it finds, the check after
 # it is clean, and no file changes.
@@ -4020,6 +4173,11 @@ main() {
     run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure
     run_test "TRIM Reuse Power Failure" test_trim_reuse_power_failure
     run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
+    run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
+    run_test "Hostile: Long Storage Stall" test_storage_long_stall
+    run_test "Hostile: Short EIO Burst" test_storage_short_eio
+    run_test "Hostile: Long EIO Burst" test_storage_long_eio
+    run_test "Hostile: Flaky EIO" test_storage_flaky_eio
 
     # Summary
     log_info "=========================================="
