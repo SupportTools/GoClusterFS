@@ -202,6 +202,8 @@ jobs:
           mkdir -p "$corpus"
           cp -R fuzz-corpus/. "$corpus/"
           echo "starting from $(find "$corpus" -type f | wc -l) corpus entries"
+          # 6 GiB per process: an input that allocates without bound kills its worker, which records it, not the runner.
+          ulimit -v 6291456
           go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime "$FUZZTIME" "${{ matrix.pkg }}" 2>&1 | tee fuzz.log
 
       # A failed night keeps its corpus too; the input that failed goes to testdata, not the cache.
