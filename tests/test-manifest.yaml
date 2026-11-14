@@ -723,6 +723,57 @@ scenarios:
       docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
       vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
 
+  - id: hostile-storage-short-stalls
+    name: Short storage stalls on one node
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_stalls
+
+  - id: hostile-storage-long-stall
+    name: Long storage stall fences the node
+    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_stall
+
+  - id: hostile-storage-short-eio
+    name: Short EIO burst on one node
+    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_eio
+
+  - id: hostile-storage-long-eio
+    name: Long EIO burst fences the node
+    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_eio
+
+  - id: hostile-storage-flaky-eio
+    name: Flaky EIO on one node
+    description: One node's path fails every I/O for 1s in every 4s, for 40s; the node keeps running, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_flaky_eio
+
+  - id: partitioned-nodes-fall-back-to-cache-ttl
+    name: Partitioned nodes fall back to the cache TTL
+    description: Two nodes with different broadcast secrets receive none of each other's messages; each sees the other's creates, overwrites, growth, new directories, deletes and concurrent writes within the cache TTL plus the attribute timeout, and fsck is clean
+    priority: high
+    environments:
+      go: partition_test.go::TestPartitionedNodesFallBackToCacheTTL
+      docker: TODO  # would need per-container broadcast secrets in the compose file; covered on host mounts
+      vm: SKIPPED  # VMs share one user-mode network address and never exchange broadcasts
+
+  - id: one-failed-write-keeps-acknowledged-results
+    name: One failed write keeps acknowledged results
+    description: One device write fails with EIO in a workload that creates, writes, overwrites, truncates and unlinks; by default the last inode write of each step with a crash after it, and the first and last write to each region with the node running on (GOCLUSTERFS_EIO_SWEEP=metadata or full for more). Every acknowledged result holds, and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestOneFailedWriteKeepsAcknowledgedResults
+
   - id: lock-adopt-owner
     name: Replaying node takes over a dead node's exclusive locks
     description: AdoptOwner holds the dead node's exclusive records through the replay and ReleaseAdopted frees them; shared records and other nodes' records stay
