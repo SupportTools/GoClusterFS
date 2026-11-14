@@ -1280,6 +1280,56 @@ func TestMultiNodeOpenRefreshesCachedSize(t *testing.T) {
 	expectContent(t, reader, name, want)
 }
 
+// TestMultiNodeOpenFileSeesGrowthWithoutBroadcast checks that a file held open
+// on a node that gets no broadcast reads another node's growth once its stat
+// shows it. With -cache-ttl at a minute, only the stat refreshing the cached
+// inode makes the new end of the file readable in time.
+func TestMultiNodeOpenFileSeesGrowthWithoutBroadcast(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false", "-cache-ttl=1m"}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	writer, reader := cluster.Node(0), cluster.Node(1)
+
+	const name = "held.bin"
+	writeOrFail(t, writer, name, bytes.Repeat([]byte("a"), 8<<10), 0)
+	f, err := os.Open(reader.Path(name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, 8)
+	if _, err := f.ReadAt(buf, 8<<10-8); err != nil {
+		t.Fatalf("reading the first version: %v", err)
+	}
+
+	const grown = 2<<20 + 100
+	writeOrFail(t, writer, name, []byte("tailtail"), grown-8)
+	start := time.Now()
+	for {
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() == grown {
+			n, err := f.ReadAt(buf, grown-8)
+			if n == 8 && string(buf) == "tailtail" {
+				t.Logf("read the new end %v after the write", time.Since(start).Round(time.Millisecond))
+				return
+			}
+			t.Logf("stat shows %d bytes, read at the end: %d bytes, %v", fi.Size(), n, err)
+		}
+		if time.Since(start) > 3*time.Second {
+			t.Fatalf("could not read the new end of %s 3s after the write; stat shows %d bytes", name, fi.Size())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func expectSize(t *testing.T, m *MountedFS, name string, want int64) {
 	t.Helper()
 	fi, err := m.Stat(name)

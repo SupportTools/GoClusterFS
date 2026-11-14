@@ -484,6 +484,74 @@ scenarios:
       docker: run-tests.sh::test_network_partition
       vm: run-vm-tests.sh::test_network_partition
 
+  - id: open-file-growth-without-broadcast
+    name: Open file reads growth without broadcast
+    description: A node with broadcast off and a long cache TTL holds a file open while another node grows it; once stat shows the new size, a read at the new end returns the data
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOpenFileSeesGrowthWithoutBroadcast
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  # Staleness under network faults. Each test has node 1 rewrite a file while
+  # node 2 reads it through an open handle, node 3 stats it and node 4 opens it
+  # afresh, and checks how late each sees every version. Integration tests run
+  # every node in one network namespace, so tc and iptables cannot fault one
+  # node's traffic there.
+  - id: staleness-packet-loss
+    name: Staleness under packet loss
+    description: 30% loss on the writer's traffic; open, stat and fresh-open reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_packet_loss
+      vm: TODO
+
+  - id: staleness-duplication-reordering
+    name: Staleness under duplication and reordering
+    description: 30% duplicated and 50% reordered writer traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_duplication_and_reordering
+      vm: TODO
+
+  - id: staleness-delay
+    name: Staleness under delay
+    description: Writer traffic delayed 0 to 2 seconds; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_delay
+      vm: TODO
+
+  - id: staleness-one-way-partition
+    name: Staleness under a one-way partition
+    description: The reader hears nothing from the writer, which still hears the reader; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_one_way_partition
+      vm: TODO
+
+  - id: staleness-multicast-dropped
+    name: Staleness with multicast dropped
+    description: The reader drops all multicast while unicast works; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  - id: staleness-flood-under-loss
+    name: Staleness during an invalidation flood under loss
+    description: A third node floods invalidations while the writer and reader lose 10% of their traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_flood_under_loss
+      vm: TODO
+
   - id: rolling-restart
     name: Rolling restart
     description: Nodes can be restarted one at a time

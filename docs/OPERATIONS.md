@@ -544,7 +544,7 @@ The flags set how many entries each cache holds and how long cached data may be 
 | Flag | Default | Effect |
 |------|---------|--------|
 | `-attr-timeout` | `1s` | How long the kernel caches attributes and directory entries. `stat` and `ls` can show another node's change up to this late. `0` makes every `stat` and path step a lookup that reads the directory's and the file's inodes from disk. |
-| `-cache-ttl` | `5s` | How long the mount trusts a cached inode before it checks the disk. Open files can lag another node's change by up to this long. |
+| `-cache-ttl` | `5s` | How long the mount trusts a cached inode before it checks the disk. Directory lookups can lag another node's change by up to this long; open files catch up within about twice `-attr-timeout`. |
 | `-cache-strict` | `false` | Check the disk on every cache hit |
 | `-cache-inodes` | `10000` | Inodes kept in memory, about 480 bytes each |
 | `-cache-extents` | `50000` | Block mappings kept in memory, about 120 bytes each |
