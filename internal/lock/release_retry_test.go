@@ -4,7 +4,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
-	"time"
 )
 
 // A node whose write clearing its claim fails clears it again later, so other
@@ -29,10 +28,8 @@ func TestFailedReleaseWriteIsRetried(t *testing.T) {
 		}
 		return a.dev.WriteAt(buf, offset)
 	}
-	defer func(d time.Duration) { holdTurn = d }(holdTurn)
-	holdTurn = 0
 	failNext.Store(true)
-	_ = a.Release(LockTypeInode, 3)
+	release(t, a, LockTypeInode, 3)
 
 	if err := acquireWithin(b, 5*releaseRetry, LockTypeInode, 3, LockModeExclusive); err != nil {
 		t.Fatalf("the other node is still kept out after one failed release write: %v", err)
