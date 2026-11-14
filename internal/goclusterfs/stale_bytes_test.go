@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -235,4 +237,33 @@ func TestSFBFileTruncatedThenGrownReadsZeros(t *testing.T) {
 	truncateFile(t, f, 10)
 	truncateFile(t, f, 10000)
 	expectContent(t, f, append(slices.Clone(data[:10]), make([]byte, 9990)...))
+}
+
+// Truncates to 0 and into the first block, as logrotate's copytruncate does, succeed while this node keeps appending.
+func TestTruncateWhileAppending(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	f := createFile(t, fsys, "log")
+	line := pattern(4, 4096)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for !stop.Load() {
+			if ino, err := fsys.inodeTbl.Read(f.inodeNum); err == nil {
+				_, _ = f.Write(context.Background(), nil, line, int64(ino.Size))
+			}
+		}
+	})
+	failed := 0
+	for i := range 200 {
+		in := &fuse.SetAttrIn{}
+		in.Valid, in.Size = fuse.FATTR_SIZE, uint64(i%2)*1000
+		if errno := f.Setattr(context.Background(), nil, in, &fuse.AttrOut{}); errno != 0 {
+			failed++
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+	if failed > 0 {
+		t.Fatalf("%d of 200 truncates failed while the file was appended to", failed)
+	}
 }

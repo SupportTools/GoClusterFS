@@ -2879,21 +2879,20 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	ctx = detach(ctx)
 	size, resizing := in.GetSize()
 	for attempt := 0; ; attempt++ {
+		// Holding the inode lock from the zeroing through the size change keeps this node's writes out between them.
+		unlock := f.fs.lockInode(f.inodeNum)
 		var zeroedAt uint64
 		var errno syscall.Errno
 		var err error
 		if resizing {
-			if zeroedAt, errno, err = f.zeroPastEnd(ctx, size); err == nil && errno != 0 {
-				return errno
-			}
+			zeroedAt, errno, err = f.zeroPastEnd(ctx, size)
 		}
-		if err == nil {
-			unlock := f.fs.lockInode(f.inodeNum)
+		if err == nil && errno == 0 {
 			errno, err = f.setattr(ctx, fh, in, out, zeroedAt)
-			unlock()
-			if err == nil {
-				return errno
-			}
+		}
+		unlock()
+		if err == nil {
+			return errno
 		}
 		if attempt == maxConflictRetries-1 {
 			return syscall.EAGAIN
@@ -2904,7 +2903,8 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 // zeroPastEnd zeroes the bytes a shrink to size leaves in its last block, before the size changes, so growing the
 // file later reads zeros there instead of the old data. It writes through Write, which copies a shared block first.
-// It returns the MetaGeneration its decision rests on; setattr starts over if the inode changed since.
+// It returns the MetaGeneration its decision rests on, or 0 when no shrink into a block needs it; setattr starts over
+// if the inode changed since. The caller holds the inode lock.
 func (f *File) zeroPastEnd(ctx context.Context, size uint64) (uint64, syscall.Errno, error) {
 	f.fs.invalidateInode(f.inodeNum)
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
@@ -2912,7 +2912,10 @@ func (f *File) zeroPastEnd(ctx context.Context, size uint64) (uint64, syscall.Er
 		return 0, syscall.EIO, nil
 	}
 	end := min(ino.Size, (size/BlockSize+1)*BlockSize)
-	if size%BlockSize == 0 || size >= end || ino.IsSFBBacked() {
+	if size%BlockSize == 0 || size >= end {
+		return 0, 0, nil
+	}
+	if ino.IsSFBBacked() {
 		return ino.MetaGeneration, 0, nil
 	}
 	ext, _, err := f.fs.extentMgr.Lookup(ino, size/BlockSize)
@@ -2924,8 +2927,12 @@ func (f *File) zeroPastEnd(ctx context.Context, size uint64) (uint64, syscall.Er
 	case err != nil:
 		return 0, syscall.EIO, nil
 	}
-	if n, errno := f.Write(ctx, nil, make([]byte, end-size), int64(size)); errno != 0 || uint64(n) != end-size {
-		return 0, cmp.Or(errno, syscall.EIO), nil
+	n, err := f.writeInternal(ctx, make([]byte, end-size), size)
+	if err == errRetryWrite {
+		return 0, 0, err
+	}
+	if err != nil || uint64(n) != end-size {
+		return 0, cmp.Or(errToErrno(err), syscall.EIO), nil
 	}
 	f.fs.invalidateInode(f.inodeNum)
 	if ino, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {

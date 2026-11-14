@@ -1563,6 +1563,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/stale_bytes_test.go::TestPowerCutDuringFirstWriteIntoAReusedBlock
 
+  - id: sfb-file-truncated-then-grown
+    name: A small file from an older version reads zeros past a cut after it grows
+    description: Truncating an SFB file moves it to a block of its own; truncated down and grown again, it reads zeros past the cut, not the bytes the move copied
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestSFBFileTruncatedThenGrownReadsZeros
+
+  - id: truncate-while-appending
+    name: Truncate succeeds while the file is appended to
+    description: Truncates to 0 and into the first block, as logrotate's copytruncate does, all succeed while the same node keeps appending
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestTruncateWhileAppending
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
