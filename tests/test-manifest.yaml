@@ -2275,6 +2275,41 @@ scenarios:
     environments:
       go: internal/lock/lock_test.go::TestStatsCountBlockedAcquires
 
+  - id: share-waits-for-uncounted-free
+    name: Share waits for a free of an uncounted block
+    description: Node A frees a block with no count under the bitmap lock while node B shares it; B's Share waits for the bitmap lock, skips the freed block, and no free block keeps a count
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestShareWaitsForUncountedFree
+
+  - id: bitmap-free-if
+    name: Bitmap frees chosen blocks in one hold
+    description: FreeIf frees the blocks the caller picks, keeps the rest and skips blocks already free; HoldAllocated reports only allocated blocks
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestFreeIfAndHoldAllocated
+
+  - id: unshared-delete-no-refcount-lock
+    name: Deleting unshared files skips the refcount lock
+    description: Deleting files no snapshot or clone shared frees their blocks with one bitmap lock hold per file and no refcount lock
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestDeletingUnsharedFilesTakesNoRefcountLock
+
+  - id: release-refused-under-bitmap-lock
+    name: Refcount lock refused under the bitmap lock
+    description: Share takes the refcount lock and then the bitmap lock, so the lock-order checker refuses the refcount lock to a goroutine holding the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestReleaseRefusedUnderBitmapLock
+
+  - id: counted-frees-and-shares-across-nodes
+    name: Clone deletes and clones on two nodes
+    description: Node B clones a file while node A deletes the previous clone, 20 rounds; neither waits on the other, every block of the deleted clones is freed, and the source's counts come back to 1
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestCountedFreesAndSharesAcrossNodes
+
   - id: locks-no-wait-other-types
     name: Locks never wait on records of another type
     description: With one node holding a lock in every inode record, another node takes locks of every other type without waiting

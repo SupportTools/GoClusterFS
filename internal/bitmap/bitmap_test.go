@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -679,6 +680,52 @@ func BenchmarkIsFree(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if _, err := region.IsFree(uint64(i % 10000)); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// FreeIf frees the blocks the caller picks, keeps the rest, and skips blocks
+// already free; HoldAllocated reports only allocated blocks.
+func TestFreeIfAndHoldAllocated(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	var uuid [16]byte
+	region := NewRegion(dev, 0, 1000, nil, uuid)
+	ctx := context.Background()
+	blocks, err := region.Alloc(ctx, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.Free(ctx, blocks[3]); err != nil {
+		t.Fatal(err)
+	}
+
+	allocated, release, err := region.HoldAllocated(ctx, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if want := blocks[:3]; !slices.Equal(allocated, want) {
+		t.Errorf("HoldAllocated = %v, want %v", allocated, want)
+	}
+
+	pick := map[uint64]bool{blocks[0]: true, blocks[2]: true, blocks[3]: true}
+	kept, err := region.FreeIf(ctx, blocks, func([]uint64) func(uint64) bool {
+		return func(b uint64) bool { return pick[b] }
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint64{blocks[1]}; !slices.Equal(kept, want) {
+		t.Errorf("FreeIf kept %v, want %v", kept, want)
+	}
+	for i, b := range blocks {
+		free, err := region.IsFree(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := i != 1; free != want {
+			t.Errorf("block %d free = %v, want %v", b, free, want)
 		}
 	}
 }

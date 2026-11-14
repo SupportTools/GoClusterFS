@@ -3213,31 +3213,33 @@ func (f *FS) shareSource(ctx context.Context, srcNum uint32) (*inode.Inode, []ui
 		if err := f.refcountReg.CheckCovered(blocks); err != nil {
 			return nil, nil, err
 		}
-		if err := f.refcountReg.Share(ctx, blocks); err != nil {
+		counted, err := f.refcountReg.Share(ctx, blocks)
+		if err != nil {
 			return nil, nil, err
 		}
+		marked, err := src, error(nil)
 		// A snapshot's data inode is marked shared when it is created and never written again.
-		if src.Flags&inode.FlagSnapshotData != 0 {
-			return src, blocks, nil
-		}
-		if beforeShareMark != nil {
-			beforeShareMark()
-		}
-		// Setxattr holds lockInode(srcNum).
-		marked, err := f.updateUnderInodeLock(ctx, srcNum, func(ino *inode.Inode) error {
-			if duringShareMark != nil {
-				duringShareMark()
+		if src.Flags&inode.FlagSnapshotData == 0 {
+			if beforeShareMark != nil {
+				beforeShareMark()
 			}
-			return f.markShared(ino)
-		})
+			// Setxattr holds lockInode(srcNum).
+			marked, err = f.updateUnderInodeLock(ctx, srcNum, func(ino *inode.Inode) error {
+				if duringShareMark != nil {
+					duringShareMark()
+				}
+				return f.markShared(ino)
+			})
+		}
 		var now []uint64
 		if err == nil {
 			now, err = f.extentMgr.DataBlocks(marked)
 		}
-		if err == nil && slices.Equal(now, blocks) {
-			return marked, blocks, nil
+		// Share skips blocks already freed, so a file that lost blocks is shared again.
+		if err == nil && slices.Equal(now, blocks) && len(counted) == len(blocks) {
+			return marked, counted, nil
 		}
-		f.extentMgr.ReleaseBlocks(ctx, blocks)
+		f.extentMgr.ReleaseBlocks(ctx, counted)
 		if err != nil {
 			return nil, nil, err
 		}

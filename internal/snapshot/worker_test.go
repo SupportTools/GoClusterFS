@@ -163,7 +163,7 @@ func (env *workerEnv) snapshot(file *inode.Inode, name string, state State) *Des
 	if err != nil {
 		env.t.Fatal(err)
 	}
-	if err := env.refs.Share(env.ctx, blocks); err != nil {
+	if _, err := env.refs.Share(env.ctx, blocks); err != nil {
 		env.t.Fatal(err)
 	}
 	if err := env.ext.CopyExtentsForClone(env.ctx, file, data); err != nil {
