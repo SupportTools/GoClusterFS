@@ -37,6 +37,8 @@ npm --prefix web/dashboard ls --omit=dev --all --parseable | tail -n +2 | sort -
 		done
 	done
 
+scripts/completions.sh dist/completions
+
 for platform in $platforms; do
 	goos="${platform%/*}"
 	goarch="${platform#*/}"
@@ -52,6 +54,7 @@ for platform in $platforms; do
 		go build -trimpath -ldflags "$ldflags" -o "$dir/gfsctl" ./cmd/gfsctl
 
 	cp LICENSE README.md "$dir/"
+	cp -R dist/completions "$dir/"
 	cp "$go_license" "$dir/licenses/go/"
 	cp -R dist/npm-licenses "$dir/licenses/npm"
 	go version -m "$dir"/goclusterfs-* "$dir"/gfsctl | awk '$1 == "dep" { print $2 }' | sort -u |
@@ -64,7 +67,7 @@ for platform in $platforms; do
 	rm -rf "$dir"
 done
 
-rm -rf dist/npm-licenses
+rm -rf dist/npm-licenses dist/completions
 cd dist
 if command -v sha256sum >/dev/null; then
 	sha256sum goclusterfs_*.tar.gz >checksums.txt

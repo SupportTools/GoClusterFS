@@ -72,6 +72,14 @@ jobs:
           fi
           ls "$RUNNER_TEMP"/goclusterfs_*_linux_amd64/licenses/npm/react
 
+      - name: Check the archive ships shell completions
+        run: |
+          dir="$(echo "$RUNNER_TEMP"/goclusterfs_*_linux_amd64)"
+          for cmd in goclusterfs-mount goclusterfs-fsck gfsctl; do
+            bash -n "$dir/completions/bash/$cmd"
+            grep -q "^#compdef $cmd\$" "$dir/completions/zsh/_$cmd"
+          done
+
       - name: List artifacts
         run: |
           for f in dist/*.tar.gz; do

@@ -80,10 +80,11 @@ func main() {
 		format     = flag.Bool("format", false, "Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first")
 		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
 			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes); fixed until the next format", superblock.MinInodes, superblock.MaxInodes))
-		debug     = flag.Bool("debug", false, "Print [DEBUG] log lines")
-		fuseDebug = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
-		showVer   = flag.Bool("version", false, "Print version and exit")
-		preflight = flag.Bool("preflight", false, "Check that this host can mount -device on -mount: FUSE, the device, the mount point and the ports. Prints PASS, WARN or FAIL with a fix for each, changes nothing, and exits 8 if a check fails")
+		debug      = flag.Bool("debug", false, "Print [DEBUG] log lines")
+		fuseDebug  = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
+		showVer    = flag.Bool("version", false, "Print version and exit")
+		completion = flag.String("completion", "", "Print a bash or zsh completion script for goclusterfs-mount and exit")
+		preflight  = flag.Bool("preflight", false, "Check that this host can mount -device on -mount: FUSE, the device, the mount point and the ports. Prints PASS, WARN or FAIL with a fix for each, changes nothing, and exits 8 if a check fails")
 
 		// Cache configuration
 		cacheStrict   = flag.Bool("cache-strict", false, "Check every cached inode against the device before using it; slower, but other nodes' changes show at once")
@@ -139,6 +140,13 @@ func main() {
 
 	if *showVer {
 		fmt.Println("goclusterfs-mount", version.String())
+		os.Exit(cli.ExitOK)
+	}
+	if *completion != "" {
+		spec := cli.CompletionSpec{Values: map[string]string{"device": cli.CompleteFile, "mount": cli.CompleteDir, "api-token-file": cli.CompleteFile}}
+		if err := cli.WriteCompletion(os.Stdout, *completion, "goclusterfs-mount", flag.CommandLine, spec); err != nil {
+			usageFailf("-completion: %v", err)
+		}
 		os.Exit(cli.ExitOK)
 	}
 

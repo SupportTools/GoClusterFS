@@ -50,6 +50,17 @@ This builds `goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` in the repo roo
 
 Or install all three into `$(go env GOPATH)/bin`, without the dashboard, with `go install github.com/supporttools/GoClusterFS/cmd/...@latest`.
 
+### Shell Completions
+
+Release archives include bash and zsh completions in `completions/`:
+
+```bash
+sudo cp completions/bash/* /usr/share/bash-completion/completions/
+sudo cp completions/zsh/_* /usr/local/share/zsh/site-functions/
+```
+
+`make completions` writes the same files from a checkout. Each command also prints its own script: `goclusterfs-mount -completion bash`, `goclusterfs-fsck -completion zsh`, `gfsctl completion bash`.
+
 ### Format and Mount
 
 Use a file as the block device. Keep it on a filesystem that supports O_DIRECT.

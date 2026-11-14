@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount build-fsck build-gfsctl dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
+.PHONY: build build-mount build-fsck build-gfsctl completions dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
 
 # Go parameters
 GOCMD=go
@@ -45,6 +45,10 @@ build-gfsctl:
 	@echo "Building $(GFSCTL_BINARY)..."
 	$(GOBUILD) -o $(GFSCTL_BINARY) ./cmd/gfsctl
 	@echo "Built $(GFSCTL_BINARY) successfully"
+
+# Shell completions for the three commands into completions/bash and completions/zsh
+completions:
+	scripts/completions.sh completions
 
 # Builds the web dashboard into $(DASHBOARD_DIST), which goclusterfs-mount embeds; run before build
 dashboard:
@@ -185,7 +189,7 @@ vuln:
 clean:
 	@echo "Cleaning build artifacts..."
 	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(GFSCTL_BINARY) $(COVER_PROFILE)
-	rm -rf $(DASHBOARD_DIST)
+	rm -rf $(DASHBOARD_DIST) completions
 	rm -f *.img
 	@echo "Clean complete"
 
@@ -213,6 +217,7 @@ help:
 	@echo "    build-mount    - Build goclusterfs-mount binary"
 	@echo "    build-fsck     - Build goclusterfs-fsck binary"
 	@echo "    build-gfsctl   - Build gfsctl binary"
+	@echo "    completions    - Write bash and zsh completions into completions/ (mount and fsck on Linux only)"
 	@echo "    dashboard      - Build the web dashboard (npm ci) for build to embed; run make dashboard build"
 	@echo ""
 	@echo "  Test:"
