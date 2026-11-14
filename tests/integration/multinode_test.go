@@ -1301,7 +1301,7 @@ func TestMultiNodeOpenFileSeesGrowthWithoutBroadcast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	buf := make([]byte, 8)
 	if _, err := f.ReadAt(buf, 8<<10-8); err != nil {
 		t.Fatalf("reading the first version: %v", err)

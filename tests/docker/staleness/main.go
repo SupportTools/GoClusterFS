@@ -76,8 +76,6 @@ func write(args []string) {
 	maxGap := fs.Duration("max", 600*time.Millisecond, "longest pause between versions")
 	_ = fs.Parse(args)
 
-	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
 	for v := 1; v <= *versions; v++ {
 		f, err := os.OpenFile(*file, os.O_RDWR|os.O_CREATE, 0o644)
 		if err != nil {
@@ -92,8 +90,7 @@ func write(args []string) {
 		if err := f.Close(); err != nil {
 			fail("close v%d: %v", v, err)
 		}
-		fmt.Fprintf(out, "W %d %d\n", time.Now().UnixNano(), v)
-		out.Flush()
+		fmt.Printf("W %d %d\n", time.Now().UnixNano(), v)
 		gap := *minGap + time.Duration(rand.Int64N(int64(*maxGap-*minGap)+1))
 		time.Sleep(gap)
 	}
@@ -112,12 +109,9 @@ func read(args []string) {
 	_ = fs.Parse(args)
 
 	var mu sync.Mutex
-	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
 	logChange := func(mode string, o observation) {
 		mu.Lock()
-		fmt.Fprintf(out, "R %d %s %d %d\n", time.Now().UnixNano(), mode, o.size, o.data)
-		out.Flush()
+		fmt.Printf("R %d %s %d %d\n", time.Now().UnixNano(), mode, o.size, o.data)
 		mu.Unlock()
 	}
 	watch := func(mode string, look func() observation) {
@@ -146,7 +140,7 @@ func read(args []string) {
 			fail("open %s: %v", *file, err)
 		}
 	}
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 
 	looks := map[string]func() observation{
 		"open": func() observation {
@@ -168,7 +162,7 @@ func read(args []string) {
 			if err != nil {
 				return observation{-1, -1}
 			}
-			defer f.Close()
+			defer func() { _ = f.Close() }()
 			fi, err := f.Stat()
 			if err != nil {
 				return observation{-1, -1}
@@ -207,7 +201,7 @@ func flood(args []string) {
 		if err != nil {
 			fail("open: %v", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		handles[i] = f
 	}
 	buf := make([]byte, 512)
@@ -330,7 +324,7 @@ func scan(path string, each func([]string)) {
 	if err != nil {
 		fail("%v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		if fields := strings.Fields(s.Text()); len(fields) > 0 {
