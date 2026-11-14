@@ -111,6 +111,19 @@ type Region struct {
 	capacity    uint64        // Blocks the region has entries for
 	totalBlocks uint64        // Total number of data blocks tracked
 	lockMgr     *lock.Manager // For distributed locking (optional)
+	guard       AllocationGuard
+}
+
+// AllocationGuard is the block bitmap as Share needs it. A block with no count
+// is freed under the bitmap lock alone, so Share counts blocks only while
+// holding that lock, and only blocks that are still allocated.
+type AllocationGuard interface {
+	HoldAllocated(ctx context.Context, blocks []uint64) (allocated []uint64, release func(), err error)
+}
+
+// SetAllocationGuard makes Share count only blocks the guard reports allocated.
+func (r *Region) SetAllocationGuard(g AllocationGuard) {
+	r.guard = g
 }
 
 // NewRegion creates a new reference count region manager.
@@ -333,17 +346,76 @@ func (r *Region) DecrementBatch(ctx context.Context, blockNums []uint64) ([]uint
 	return results, nil
 }
 
-// Share adds one owner, such as a snapshot or a clone, to each block. Blocks
-// are allocated with a count of 0, which like 1 means a single owner, so the
-// first share of a block sets its count to 2.
-func (r *Region) Share(ctx context.Context, blockNums []uint64) error {
-	return r.updateBatch(ctx, blockNums, func(_ int, e *Entry) (bool, error) {
+// Share adds one owner, such as a snapshot or a clone, to each block that is
+// still allocated, and returns the blocks it counted. Blocks are allocated
+// with a count of 0, which like 1 means a single owner, so the first share of
+// a block sets its count to 2.
+func (r *Region) Share(ctx context.Context, blockNums []uint64) ([]uint64, error) {
+	if len(blockNums) == 0 {
+		return nil, nil
+	}
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
+			return nil, fmt.Errorf("failed to acquire refcount lock: %w", err)
+		}
+		defer r.unlock()
+	}
+	counted := blockNums
+	if r.guard != nil {
+		allocated, release, err := r.guard.HoldAllocated(ctx, blockNums)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+		counted = allocated
+	}
+	err := r.updateLocked(counted, func(_ int, e *Entry) (bool, error) {
 		if e.RefCount == 0xFFFFFFFF {
 			return false, ErrRefCountOverflow
 		}
 		e.RefCount = max(e.RefCount, 1) + 1
 		return true, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return counted, nil
+}
+
+// Uncounted reports which of blocks have no count, reading each sector once.
+// A block whose sector cannot be read counts as counted.
+func (r *Region) Uncounted(blockNums []uint64) func(uint64) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	sectors := make(map[uint64][]byte)
+	unreadable := make(map[uint64]bool)
+	none := make(map[uint64]bool)
+	for _, b := range blockNums {
+		switch {
+		case b >= r.totalBlocks:
+			continue
+		case b >= r.capacity:
+			none[b] = true
+			continue
+		}
+		sectorIdx := b / EntriesPerSector
+		if unreadable[sectorIdx] {
+			continue
+		}
+		data, ok := sectors[sectorIdx]
+		if !ok {
+			var err error
+			if data, err = r.readSector(sectorIdx); err != nil {
+				unreadable[sectorIdx] = true
+				continue
+			}
+			sectors[sectorIdx] = data
+		}
+		if decodeEntry(data, b%EntriesPerSector) == (Entry{}) {
+			none[b] = true
+		}
+	}
+	return func(b uint64) bool { return none[b] }
 }
 
 // Release drops one owner from each block and returns the blocks that no
@@ -387,7 +459,16 @@ func (r *Region) updateBatch(ctx context.Context, blockNums []uint64, fn func(i 
 		}
 		defer r.unlock()
 	}
+	return r.updateLocked(blockNums, fn)
+}
 
+// updateLocked is updateBatch for a caller that holds the refcount lock.
+func (r *Region) updateLocked(blockNums []uint64, fn func(i int, e *Entry) (bool, error)) error {
+	for _, blockNum := range blockNums {
+		if blockNum >= r.totalBlocks {
+			return ErrBlockOutOfRange
+		}
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 

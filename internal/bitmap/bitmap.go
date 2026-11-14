@@ -334,6 +334,111 @@ func (r *Region) releaseReserved(ctx context.Context, blocks []uint64) {
 
 // flipBits marks each block allocated (or free) whose bit says otherwise, under
 // the bitmap lock, and returns the blocks it changed, even on error.
+// HoldAllocated takes the bitmap lock and returns the blocks of blocks that are
+// allocated. The lock stays held, so none of them can be freed, until release.
+func (r *Region) HoldAllocated(ctx context.Context, blocks []uint64) ([]uint64, func(), error) {
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+			return nil, nil, fmt.Errorf("failed to acquire bitmap lock: %w", err)
+		}
+	}
+	r.mu.Lock()
+	release := func() {
+		r.mu.Unlock()
+		if r.lockMgr != nil {
+			r.unlock()
+		}
+	}
+	sectors := make(map[uint64][]byte)
+	var allocated []uint64
+	for _, b := range blocks {
+		if b >= r.totalBlocks {
+			continue
+		}
+		sectorIdx := b / BitsPerSector
+		data, ok := sectors[sectorIdx]
+		if !ok {
+			var err error
+			if data, err = r.readSector(sectorIdx); err != nil {
+				release()
+				return nil, nil, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+			}
+			sectors[sectorIdx] = data
+		}
+		bit := b % BitsPerSector
+		if data[bit/8]&(1<<(bit%8)) != 0 {
+			allocated = append(allocated, b)
+		}
+	}
+	return allocated, release, nil
+}
+
+// FreeIf takes the bitmap lock, asks which of blocks to free, and frees those
+// in one hold. It returns the blocks it left allocated. Freed blocks are
+// queued for TRIM.
+func (r *Region) FreeIf(ctx context.Context, blocks []uint64, which func([]uint64) func(uint64) bool) ([]uint64, error) {
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+			return nil, fmt.Errorf("failed to acquire bitmap lock: %w", err)
+		}
+		defer r.unlock()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	free := which(blocks)
+	var kept []uint64
+	bySector := make(map[uint64][]uint64)
+	for _, b := range blocks {
+		switch {
+		case !free(b):
+			kept = append(kept, b)
+		case b >= r.totalBlocks:
+			logging.Debugf("bitmap.FreeIf: block %d out of range", b)
+		default:
+			bySector[b/BitsPerSector] = append(bySector[b/BitsPerSector], b)
+		}
+	}
+	for sectorIdx, sectorBlocks := range bySector {
+		data, err := r.readSector(sectorIdx)
+		if err != nil {
+			return kept, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+		}
+		var freed []uint64
+		for _, b := range sectorBlocks {
+			bit := b % BitsPerSector
+			mask := byte(1) << (bit % 8)
+			if data[bit/8]&mask == 0 {
+				logging.Debugf("bitmap.FreeIf: block %d already free", b)
+				continue
+			}
+			data[bit/8] &^= mask
+			freed = append(freed, b)
+		}
+		if len(freed) == 0 {
+			continue
+		}
+		if err := r.writeSector(sectorIdx, data); err != nil {
+			return kept, fmt.Errorf("failed to write bitmap sector %d: %w", sectorIdx, err)
+		}
+		if r.trimMgr != nil {
+			for _, b := range freed {
+				r.trimMgr.Queue(b)
+			}
+		}
+	}
+	return kept, nil
+}
+
+// FreeBatch frees blocks in one bitmap lock hold.
+func (r *Region) FreeBatch(ctx context.Context, blocks []uint64) error {
+	_, err := r.FreeIf(ctx, blocks, func([]uint64) func(uint64) bool { return func(uint64) bool { return true } })
+	return err
+}
+
 func (r *Region) flipBits(ctx context.Context, blocks []uint64, allocated bool) ([]uint64, error) {
 	if r.lockMgr != nil {
 		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {

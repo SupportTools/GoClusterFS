@@ -742,27 +742,41 @@ func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 	m.deferred = nil
 	m.deferredMu.Unlock()
 
-	if m.refs != nil && len(blocks) > 0 {
-		free, err := m.refs.Release(ctx, blocks)
-		switch {
-		case errors.Is(err, lock.ErrDeadlockRisk):
-			m.deferFree(blocks...)
-			return
-		case err != nil:
-			log.Printf("[extent] release %d blocks: %v; leaving them allocated", len(blocks), err)
-			return
-		}
-		blocks = free
+	if len(blocks) == 0 {
+		return
+	}
+	uncounted := func([]uint64) func(uint64) bool { return func(uint64) bool { return true } }
+	if m.refs != nil {
+		uncounted = m.refs.Uncounted
+	}
+	// Only Share raises a count, and only under the bitmap lock, so a block with
+	// no count under that lock has this one owner and needs no refcount lock.
+	counted, err := m.bitmap.FreeIf(ctx, blocks, uncounted)
+	switch {
+	case errors.Is(err, lock.ErrDeadlockRisk):
+		m.deferFree(blocks...)
+		return
+	case err != nil:
+		log.Printf("[extent] free %d blocks: %v; leaving the rest allocated", len(blocks), err)
+		return
+	case len(counted) == 0:
+		return
 	}
 
-	for _, b := range blocks {
-		err := m.bitmap.Free(ctx, b)
-		switch {
-		case errors.Is(err, lock.ErrDeadlockRisk):
-			m.deferFree(b)
-		case err != nil:
-			log.Printf("[extent] free block %d: %v", b, err)
-		}
+	free, err := m.refs.Release(ctx, counted)
+	switch {
+	case errors.Is(err, lock.ErrDeadlockRisk):
+		m.deferFree(counted...)
+		return
+	case err != nil:
+		log.Printf("[extent] release %d blocks: %v; leaving them allocated", len(counted), err)
+		return
+	}
+	switch err := m.bitmap.FreeBatch(ctx, free); {
+	case errors.Is(err, lock.ErrDeadlockRisk):
+		m.deferFree(free...)
+	case err != nil:
+		log.Printf("[extent] free %d released blocks: %v", len(free), err)
 	}
 }
 

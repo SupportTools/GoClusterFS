@@ -604,7 +604,7 @@ func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
 		}
 		inPlace = true
 		// Node B's snapshot counts the block before it marks the file shared.
-		if err := nodeB.refcountReg.Share(ctx, []uint64{shared}); err != nil {
+		if _, err := nodeB.refcountReg.Share(ctx, []uint64{shared}); err != nil {
 			t.Error(err)
 		}
 		go func() {
@@ -739,6 +739,9 @@ func TestSnapshotRetriesWhenFileChangesWhileSharing(t *testing.T) {
 				}
 				if free, err := nodeA.bitmapMgr.IsFree(b); err != nil || !free {
 					t.Errorf("block %d is unmapped but still allocated (refcount %d, err=%v)", b, refcountOf(t, nodeA, b), err)
+				}
+				if got := refcountOf(t, nodeA, b); got != 0 {
+					t.Errorf("block %d is free but counts %d owners", b, got)
 				}
 			}
 		})
@@ -996,4 +999,94 @@ func TestStaleCopyCannotUndoCopyOnWrite(t *testing.T) {
 	checkFile(t, f, overwritten(original, 10, pattern(2, 100)))
 	setxattr(t, f, "user.snapshot.clone", "before:/before-clone")
 	checkFile(t, lookupFile(t, fsys, "before-clone"), original)
+}
+
+// Deleting files no snapshot or clone ever shared frees their blocks under the
+// bitmap lock alone, one hold per file, without the refcount lock.
+func TestDeletingUnsharedFilesTakesNoRefcountLock(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	ctx := context.Background()
+	for i := range 3 {
+		writeAt(t, createFile(t, fsys, fmt.Sprintf("f%d", i)), pattern(byte(i), 3*BlockSize), 0)
+	}
+	free := fsys.bitmapMgr.FreeCount()
+	before := lockAcquires(fsys)
+	for i := range 3 {
+		if errno := fsys.Unlink(ctx, fmt.Sprintf("f%d", i)); errno != 0 {
+			t.Fatalf("unlink f%d: %v", i, errno)
+		}
+	}
+	after := lockAcquires(fsys)
+	if got := after["refcount"] - before["refcount"]; got != 0 {
+		t.Errorf("deleting 3 unshared files took the refcount lock %d times, want 0", got)
+	}
+	if got := after["bitmap"] - before["bitmap"]; got != 3 {
+		t.Errorf("deleting 3 files of 3 blocks took the bitmap lock %d times, want 3", got)
+	}
+	if got := fsys.bitmapMgr.FreeCount(); got != free+9 {
+		t.Errorf("%d free blocks after the deletes, want %d", got, free+9)
+	}
+}
+
+func lockAcquires(fsys *FS) map[string]uint64 {
+	out := map[string]uint64{}
+	for _, ts := range fsys.lockMgr.Stats().Types {
+		out[ts.Name] = ts.Acquires
+	}
+	return out
+}
+
+// Node B clones a file while node A deletes the clone before it. Deleting a
+// clone releases counted blocks under the refcount lock and then frees them
+// under the bitmap lock, while cloning holds the refcount lock and then the
+// bitmap lock. Neither may wait on the other, and every count must come out
+// exact.
+func TestCountedFreesAndSharesAcrossNodes(t *testing.T) {
+	path := newFormattedImageOfSize(t, superblock.MinDeviceSize+128<<20)
+	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
+	ctx := context.Background()
+	content := pattern(1, 2*BlockSize)
+	src := createFile(t, nodeA, "src")
+	writeAt(t, src, content, 0)
+	free := nodeA.bitmapMgr.FreeCount()
+
+	const rounds = 20
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := range rounds {
+			wg.Go(func() {
+				if errno := (&File{fs: nodeB, inodeNum: src.inodeNum}).Setxattr(ctx, "user.clone", []byte(fmt.Sprintf("/c%d", i)), 0); errno != 0 {
+					t.Errorf("clone %d: %v", i, errno)
+				}
+			})
+			if i > 0 {
+				wg.Go(func() {
+					if errno := nodeA.Unlink(ctx, fmt.Sprintf("c%d", i-1)); errno != 0 && errno != syscall.ENOENT {
+						t.Errorf("unlink c%d: %v", i-1, errno)
+					}
+				})
+			}
+			wg.Wait()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Minute):
+		t.Fatalf("cloning and deleting clones did not finish: lock stats A %+v, B %+v", nodeA.lockMgr.Stats(), nodeB.lockMgr.Stats())
+	}
+	for i := range rounds {
+		_ = nodeA.Unlink(ctx, fmt.Sprintf("c%d", i))
+	}
+
+	checkFile(t, src, content)
+	for logical := uint64(0); logical < 2; logical++ {
+		if got := refcountOf(t, nodeA, physicalBlock(t, nodeA, src.inodeNum, logical)); got > 1 {
+			t.Errorf("block %d of src counts %d owners after every clone is gone, want 1", logical, got)
+		}
+	}
+	if got := nodeA.bitmapMgr.FreeCount(); got != free {
+		t.Errorf("%d free blocks after deleting every clone, want %d", got, free)
+	}
 }
