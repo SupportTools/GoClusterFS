@@ -24,9 +24,10 @@ source "${SOAK_DIR}/../vm/vm-test-harness.sh" >&2
 reply() { echo "$*"; }
 
 # Matches goclusterfs-mount by its command line: the kernel cuts process names to 15
-# characters, so pidof and pkill -x never match it. The bracket keeps the pattern from
-# matching the shell that runs it.
-MOUNT_PATTERN="'^/usr/local/bin/goclusterfs-moun[t]'"
+# characters, and in the VMs the binary runs under gcompat's loader, whose command line
+# starts with ld-linux-x86-64.so.2. The bracket keeps the pattern from matching the shell
+# that runs it.
+MOUNT_PATTERN="'goclusterfs-moun[t] -mount'"
 
 mount_pid() {
     ssh_run "$1" "pgrep -f $MOUNT_PATTERN" 2>/dev/null
