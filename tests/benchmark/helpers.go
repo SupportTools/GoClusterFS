@@ -53,7 +53,7 @@ func findBinary() (string, error) {
 		return path, nil
 	}
 
-	return "", fmt.Errorf("goclusterfs-mount binary not found; run 'go build -o goclusterfs-mount ./cmd/mount' first")
+	return "", fmt.Errorf("goclusterfs-mount binary not found; run 'go build -o goclusterfs-mount ./cmd/goclusterfs-mount' first")
 }
 
 // allocateImage creates a sparse image file with sizeMB of data space after the metadata regions.

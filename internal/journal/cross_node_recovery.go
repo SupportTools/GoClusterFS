@@ -517,9 +517,11 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pa
 	})
 }
 
+// beforeReplayWrite, when a test sets it, runs between a replay's read of an inode and its write.
+var beforeReplayWrite func(inodeNum uint32)
+
 // updateExtents reads an inode, applies change, and writes it back when change
-// reports an update, starting over if another node changed the inode's extent
-// tree in between.
+// reports an update. If any write landed since the read, it starts over.
 func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, inodeNum uint32, change func(*inode.Inode) (bool, error)) (bool, error) {
 	const attempts = 5
 	for attempt := 1; ; attempt++ {
@@ -527,12 +529,16 @@ func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, ino
 		if err != nil {
 			return false, fmt.Errorf("inode %d not found", inodeNum)
 		}
+		readGen := ino.MetaGeneration
 		changed, err := change(ino)
 		if err != nil || !changed {
 			rctx.ExtentMgr.DiscardPending(ctx, ino)
 			return false, err
 		}
-		err = rctx.InodeTbl.Write(ctx, ino)
+		if beforeReplayWrite != nil {
+			beforeReplayWrite(inodeNum)
+		}
+		err = rctx.InodeTbl.WriteIfUnchanged(ctx, ino, readGen)
 		if err == nil {
 			r.wrote[inodeNum] = ino.MetaGeneration
 			return true, nil

@@ -969,6 +969,13 @@ scenarios:
     environments:
       go: internal/journal/cross_node_recovery_test.go::TestApplyExtentAddSkipsChangedInode
 
+  - id: replay-keeps-inode-written-during-it
+    name: Replay keeps an inode written while it runs
+    description: Another goroutine on the replaying node writes the inode between the replay's read and its write; the replay skips the record instead of overwriting that write
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayKeepsInodeWrittenDuringIt
+
   - id: dir-entry-replay-skips-removed-parent
     name: Directory entry replay skips a removed parent
     description: DirAddEntry and DirRemoveEntry replay into a parent slot that is no longer a directory skip the record instead of failing the replay
@@ -2261,6 +2268,13 @@ scenarios:
     environments:
       go: internal/lock/type_records_test.go::TestLockTypesHaveTheirOwnRecords
 
+  - id: lock-stats-blocked-acquires
+    name: Lock stats count blocked acquires per type
+    description: An acquire that waits for another node's hold counts as blocked for its lock type with at least the time it waited; one that finds the lock free counts only as an acquire. /metrics exports these as goclusterfs_lock_acquires_total, blocked_total and wait_seconds_total by type
+    priority: go_only
+    environments:
+      go: internal/lock/lock_test.go::TestStatsCountBlockedAcquires
+
   - id: locks-no-wait-other-types
     name: Locks never wait on records of another type
     description: With one node holding a lock in every inode record, another node takes locks of every other type without waiting
@@ -3276,14 +3290,14 @@ scenarios:
     description: A mount whose own journal replay gives up waiting for another node's lock retries with backoff and replays the transaction once the lock frees
     priority: go_only
     environments:
-      go: cmd/mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
+      go: cmd/goclusterfs-mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
 
   - id: mount-own-replay-stops-at-bad-record
     name: Mount stops at a journal record that does not decode
     description: Any own-journal replay failure other than a lock wait returns at once without a retry, and mount fails with the -skip-recovery hint
     priority: go_only
     environments:
-      go: cmd/mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
+      go: cmd/goclusterfs-mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
 
   - id: registry-occupant-states
     name: Registry reports how each slot's node stands
@@ -3759,7 +3773,7 @@ scenarios:
     description: A peer journal replay or broadcast trouble reports degraded with 200; a failing device or corrupt journal reports unhealthy with 503; -journal=false and -broadcast=false stay ok
     priority: go_only
     environments:
-      go: cmd/mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+      go: cmd/goclusterfs-mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
 
   - id: storage-last-error
     name: Device remembers its last I/O failure
@@ -3900,3 +3914,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/shutdown_test.go::TestEndedShutdownWatchDoesNotDump
+
+  - id: mount-preflight
+    name: Mount preflight checks
+    description: goclusterfs-mount -preflight reports PASS, WARN or FAIL with a fix for FUSE, fusermount, the mount point, the device, the broadcast ports and the API address, changes nothing, and exits 8 when a check fails
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightNamesAFixForEachFailure

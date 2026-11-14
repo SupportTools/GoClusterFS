@@ -33,12 +33,12 @@ build: build-mount build-fsck build-gfsctl
 
 build-mount:
 	@echo "Building $(MOUNT_BINARY)..."
-	$(GOBUILD) -o $(MOUNT_BINARY) ./cmd/mount
+	$(GOBUILD) -o $(MOUNT_BINARY) ./cmd/goclusterfs-mount
 	@echo "Built $(MOUNT_BINARY) successfully"
 
 build-fsck:
 	@echo "Building $(FSCK_BINARY)..."
-	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/fsck
+	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/goclusterfs-fsck
 	@echo "Built $(FSCK_BINARY) successfully"
 
 build-gfsctl:
