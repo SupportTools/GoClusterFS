@@ -3255,14 +3255,14 @@ scenarios:
     description: A mount whose own journal replay gives up waiting for another node's lock retries with backoff and replays the transaction once the lock frees
     priority: go_only
     environments:
-      go: cmd/mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
+      go: cmd/goclusterfs-mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
 
   - id: mount-own-replay-stops-at-bad-record
     name: Mount stops at a journal record that does not decode
     description: Any own-journal replay failure other than a lock wait returns at once without a retry, and mount fails with the -skip-recovery hint
     priority: go_only
     environments:
-      go: cmd/mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
+      go: cmd/goclusterfs-mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
 
   - id: registry-occupant-states
     name: Registry reports how each slot's node stands
@@ -3738,7 +3738,7 @@ scenarios:
     description: A peer journal replay or broadcast trouble reports degraded with 200; a failing device or corrupt journal reports unhealthy with 503; -journal=false and -broadcast=false stay ok
     priority: go_only
     environments:
-      go: cmd/mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+      go: cmd/goclusterfs-mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
 
   - id: storage-last-error
     name: Device remembers its last I/O failure
