@@ -1,7 +1,9 @@
 package inode
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -1046,5 +1048,53 @@ func TestStaleCopyCannotUndoInlineExtentChange(t *testing.T) {
 	got.Mode = S_IFREG | 0o600
 	if err := tbl.Write(ctx, got); err != nil {
 		t.Fatalf("fresh copy: %v", err)
+	}
+}
+
+// An inode rewrite writes a changed Holders and keeps the reserved bytes
+// after it as they were on disk.
+func TestRewriteChangesHoldersAndKeepsReservedBytes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+	table := NewTable(dev, 0, 10<<20, nil, [16]byte{1})
+	ino, err := table.ClaimSlot(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino.LinkCount, ino.Holders = 0, 1<<3
+	if err := table.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+
+	sector := storage.NewAlignedBuffer(SectorSize)
+	at := int64(20/InodesPerSector) * SectorSize
+	slot := sector.Bytes()[20%InodesPerSector*InodeSize:][:InodeSize]
+	if _, err := dev.ReadAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+	newer := bytes.Repeat([]byte{0xa5}, InodeSize-216)
+	copy(slot[212:], newer)
+	binary.LittleEndian.PutUint32(slot[InodeSize-4:], storage.CRC32C(slot[:InodeSize-4]))
+	if _, err := dev.WriteAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+
+	ino, err = table.Read(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ino.Holders = 1 << 7
+	if err := table.Write(ctx, ino); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dev.ReadAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint64(slot[204:212]); got != 1<<7 {
+		t.Errorf("holders on disk %#x after the rewrite, want %#x", got, uint64(1<<7))
+	}
+	if !bytes.Equal(slot[212:InodeSize-4], newer) {
+		t.Errorf("rewrite changed reserved bytes 212-251: %x", slot[212:InodeSize-4])
 	}
 }

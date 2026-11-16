@@ -4123,6 +4123,13 @@ scenarios:
     environments:
       go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
 
+  - id: inode-rewrite-keeps-reserved-bytes
+    name: An inode rewrite writes Holders and keeps the reserved bytes
+    description: Rewriting an inode read from disk writes its changed Holders at bytes 204-211 and writes back reserved bytes 212-251 as they were read
+    priority: go_only
+    environments:
+      go: internal/inode/inode_test.go::TestRewriteChangesHoldersAndKeepsReservedBytes
+
   - id: fsck-repair-snapshot-sector
     name: fsck repair rewrites a snapshot registry sector that fails its checksum
     description: Repair keeps the descriptors that pass their own checksum, clears the damaged one and reports it, snapshot creates work again, and the next repair frees the lost snapshot's data

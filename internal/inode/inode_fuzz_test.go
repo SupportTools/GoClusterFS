@@ -50,6 +50,11 @@ func FuzzDeserializeInode(f *testing.F) {
 		f.Add(serializeInode(ino))
 	}
 	valid := serializeInode(&file)
+	newer := bytes.Clone(valid)
+	binary.LittleEndian.PutUint64(newer[204:212], 1<<3|1<<40)
+	copy(newer[212:InodeSize-4], bytes.Repeat([]byte{0xa5}, InodeSize-216))
+	binary.LittleEndian.PutUint32(newer[InodeSize-4:], storage.CRC32C(newer[:InodeSize-4]))
+	f.Add(newer)
 	f.Add(valid[:InodeSize-1])
 	f.Add(valid[:4])
 	f.Add(make([]byte, InodeSize))
@@ -72,12 +77,7 @@ func checkInodeDecode(t *testing.T, data []byte) {
 	}
 	_ = ino.IsSFBBacked()
 
-	again, err := deserializeInode(serializeInode(ino))
-	if err != nil {
-		t.Fatalf("decoding a re-encoded inode: %v", err)
-	}
-	again.Checksum, ino.Checksum = 0, 0
-	if *again != *ino {
-		t.Fatalf("inode changed after an encode/decode round trip")
+	if out := serializeInode(ino); !bytes.Equal(out, data[:InodeSize]) {
+		t.Fatalf("re-encoding an inode changed its bytes:\nread  %x\nwrote %x", data[:InodeSize], out)
 	}
 }
