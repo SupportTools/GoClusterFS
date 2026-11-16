@@ -4107,6 +4107,13 @@ scenarios:
     environments:
       go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
 
+  - id: snapshot-unreadable-sector-eio
+    name: An unreadable snapshot registry sector makes lookups and listings fail with EIO
+    description: With a registry sector that fails its checksum, a lookup that finds nothing and every listing fail with EIO instead of not found or a partial list; a snapshot in a readable sector is still found and the mount scan still succeeds
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestUnreadableSectorFailsLookupsWithEIO
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
