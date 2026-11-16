@@ -11,19 +11,17 @@ import (
 )
 
 func TestLongHoldIsLoggedOnce(t *testing.T) {
-	old := longHold
-	t.Cleanup(func() { longHold = old })
-	longHold = 120 * time.Millisecond
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	holder := newTestNode(dev, 0, 1<<20, 1)
+	holder.timing.longHold = 120 * time.Millisecond
 
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 	holder.Start()
 	requireAcquired(t, holder, LockTypeInode, 2, LockModeExclusive)
-	time.Sleep(5 * longHold)
+	time.Sleep(5 * holder.timing.longHold)
 	holder.Stop()
 	log.SetOutput(os.Stderr)
 

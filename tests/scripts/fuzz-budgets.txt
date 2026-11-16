@@ -1,0 +1,17 @@
+# Fuzz time per night for targets that need other than nightly.yml's 25m default.
+# From 2h runs on a 16-core host (2026-11-14): short for targets that stopped finding
+# new coverage within minutes, long for those still finding it at 2h. The corpus is
+# cached between nights, so each night continues where the last one stopped.
+FuzzDeserializeInode 10m
+FuzzJournalSuperblock 10m
+FuzzDecodeDescriptor 10m
+FuzzRegistrySlot 10m
+FuzzReplay 45m
+FuzzCheck 45m
+FuzzLockRow 45m
+FuzzRefcountSector 45m
+FuzzWriteRequests 45m
+FuzzFileOpsPaths 45m
+FuzzParseRecords 45m
+FuzzTxnRecord 45m
+FuzzParseTreeNode 45m

@@ -43,11 +43,10 @@ func (f *fakeRegistry) view(slot int, fresh bool) ([16]byte, OwnerState) {
 	return [16]byte{}, OwnerReleased
 }
 
-func shortenAcquireTimeout(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := acquireTimeout
-	t.Cleanup(func() { acquireTimeout = old })
-	acquireTimeout = d
+// shortenAcquireTimeout sets d as the acquire timeout of ms and returns it.
+func shortenAcquireTimeout(d time.Duration, ms ...*Manager) time.Duration {
+	setTimings(func(t *timings) { t.acquireTimeout = d }, ms...)
+	return d
 }
 
 // acquireInBackground starts an Acquire with no deadline and returns its result.
@@ -96,29 +95,29 @@ func TestFailingHoldersOldClaimBlocksUntilRegistrySlotEmpties(t *testing.T) {
 }
 
 func TestWaitForFailingHolderOutlastsTimeout(t *testing.T) {
-	shortenAcquireTimeout(t, 300*time.Millisecond)
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	holder := newTestNode(dev, 0, 1<<20, 1)
 	waiter := newTestNode(dev, 0, 1<<20, 2)
+	timeout := shortenAcquireTimeout(300*time.Millisecond, holder, waiter)
 	reg := newFakeRegistry()
 	reg.set(1, OwnerFailing)
 	waiter.SetOwnerView(reg.view)
 
 	requireAcquired(t, holder, LockTypeInode, 2, LockModeExclusive)
 	result := acquireInBackground(waiter, LockTypeInode, 2)
-	requireWaiting(t, result, 3*acquireTimeout)
+	requireWaiting(t, result, 3*timeout)
 
 	reg.set(1, OwnerReleased)
 	requireResult(t, result, nil)
 }
 
 func TestWaitForLiveHolderStillTimesOut(t *testing.T) {
-	shortenAcquireTimeout(t, 300*time.Millisecond)
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	holder := newTestNode(dev, 0, 1<<20, 1)
 	waiter := newTestNode(dev, 0, 1<<20, 2)
+	shortenAcquireTimeout(300*time.Millisecond, holder, waiter)
 	reg := newFakeRegistry()
 	reg.set(1, OwnerAlive)
 	waiter.SetOwnerView(reg.view)
@@ -179,12 +178,12 @@ func TestTornSlotFreesWhenItsRegistrySlotEmpties(t *testing.T) {
 // while it replays that journal at mount. Peers wait for the replay, however
 // long, though the node itself is alive.
 func TestPeersWaitOutLiveNodesReplayOfItsPredecessor(t *testing.T) {
-	shortenAcquireTimeout(t, 300*time.Millisecond)
 	dev, cleanup := createTestDevice(t, reclaimRegion)
 	defer cleanup()
 	predecessor := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
 	successor := NewManager(dev, 0, reclaimRegion, [16]byte{5}, 1)
 	waiter := NewManager(dev, 0, reclaimRegion, [16]byte{2}, 2)
+	timeout := shortenAcquireTimeout(300*time.Millisecond, predecessor, successor, waiter)
 	reg := newFakeRegistry()
 	reg.set(1, OwnerAlive)
 	waiter.SetOwnerView(reg.view)
@@ -195,7 +194,7 @@ func TestPeersWaitOutLiveNodesReplayOfItsPredecessor(t *testing.T) {
 		t.Fatalf("AdoptOwner = %v, %v; want the predecessor's record", adopted, err)
 	}
 	result := acquireInBackground(waiter, LockTypeInode, 2)
-	requireWaiting(t, result, 3*acquireTimeout)
+	requireWaiting(t, result, 3*timeout)
 
 	if err := successor.ReleaseAdopted(adopted); err != nil {
 		t.Fatal(err)
@@ -247,12 +246,12 @@ func TestReplaysSharingRecordTakeTurns(t *testing.T) {
 // gives up after the timeout and lets Y go, and the replay, which waits without
 // a limit, takes Y and can finish.
 func TestNestedWaitOnReplayingNodeYieldsToReplay(t *testing.T) {
-	shortenAcquireTimeout(t, 300*time.Millisecond)
 	dev, cleanup := createTestDevice(t, reclaimRegion)
 	defer cleanup()
 	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
 	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
 	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	timeout := shortenAcquireTimeout(300*time.Millisecond, dead, replayer, peer)
 	reg := newFakeRegistry()
 	reg.set(1, OwnerFailing)
 	reg.set(3, OwnerAlive)
@@ -294,13 +293,13 @@ func TestNestedWaitOnReplayingNodeYieldsToReplay(t *testing.T) {
 	go func() {
 		replayResult <- replayer.Acquire(ForReplay(context.Background()), LockTypeInode, inodeY, LockModeExclusive)
 	}()
-	time.Sleep(acquireTimeout / 2)
+	time.Sleep(timeout / 2)
 	close(askX)
 
 	requireResult(t, peerResult, ErrLockTimeout)
 	requireResult(t, replayResult, nil)
-	if waited := time.Since(replayStart); waited <= acquireTimeout {
-		t.Errorf("replay waited %v, want longer than the %v timeout", waited, acquireTimeout)
+	if waited := time.Since(replayStart); waited <= timeout {
+		t.Errorf("replay waited %v, want longer than the %v timeout", waited, timeout)
 	}
 	log.SetOutput(os.Stderr)
 	if want := fmt.Sprintf("held by node %x (slot 1)", [8]byte{1}); !strings.Contains(logs.String(), want) {
@@ -345,11 +344,11 @@ func TestReplayDoesNotPassOverLiveNodesReplayClaims(t *testing.T) {
 // A caller that can release its locks and retry gets ErrReplayBlocked at once,
 // instead of holding them for the timeout while a replay may need one.
 func TestRetryableNestedWaitOnFailingHolderReturnsAtOnce(t *testing.T) {
-	shortenAcquireTimeout(t, 5*time.Second)
 	dev, cleanup := createTestDevice(t, reclaimRegion)
 	defer cleanup()
 	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
 	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	shortenAcquireTimeout(5*time.Second, dead, peer)
 	reg := newFakeRegistry()
 	reg.set(1, OwnerFailing)
 	reg.set(4, OwnerAlive)
