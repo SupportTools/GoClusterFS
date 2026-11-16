@@ -368,3 +368,24 @@ func TestFsckRepairFreesUnnamedSymlink(t *testing.T) {
 	}
 	expectCleanFsck(t, fsys)
 }
+
+// With another node mounted, unlinking a symlink frees it at once instead of listing it as an orphan.
+func TestUnlinkSymlinkWithPeerFreesAtOnce(t *testing.T) {
+	cluster := newFakeCluster(0, 1)
+	fsys := cluster.join(t, symlinkFS(t), 0)
+	free := fsys.bitmapMgr.FreeCount()
+	l := makeSymlink(t, fsys, "l", linkTarget(inode.MaxInlineTarget+1))
+	if errno := fsys.Unlink(context.Background(), "l"); errno != 0 {
+		t.Fatal(errno)
+	}
+	if ino := readInode(t, fsys, l.inodeNum); ino.Magic != 0 {
+		t.Errorf("symlink inode %d still in use, holders %#b", l.inodeNum, ino.Holders)
+	}
+	if orphans := cluster.list(0); len(orphans) != 0 {
+		t.Errorf("unlinking a symlink listed orphans %v", orphans)
+	}
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Errorf("%d free blocks after the unlink, want %d", got, free)
+	}
+}
+

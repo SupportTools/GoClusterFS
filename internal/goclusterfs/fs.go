@@ -1548,7 +1548,8 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	// Rmdir removes only empty directories, whose link count also counts their own "." entry.
 	willFreeInode := isDir
 	var live uint64
-	if !isDir && childIno.LinkCount == 1 {
+	// No node can hold a symlink open, so its last unlink frees it at once.
+	if !isDir && childIno.LinkCount == 1 && !childIno.IsSymlink() {
 		if live, err = d.fs.reserveOrphan(childIno); err != nil {
 			if errors.Is(err, errOrphansFull) {
 				log.Printf("[WARN] unlink %q: %v", name, err)

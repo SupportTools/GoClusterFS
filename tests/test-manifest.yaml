@@ -4911,3 +4911,11 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/symlink_test.go::TestFsckRepairFreesUnnamedSymlink
+
+  - id: symlink-unlink-with-peer
+    name: Unlinking a symlink with a peer mounted frees it at once
+    description: No node can hold a symlink open, so its last unlink frees it and its block at once instead of listing it as an orphan
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestUnlinkSymlinkWithPeerFreesAtOnce
+
