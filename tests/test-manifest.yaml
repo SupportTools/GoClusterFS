@@ -4137,6 +4137,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
 
+  - id: fsck-snapshot-parents
+    name: fsck checks snapshot parents
+    description: fsck reports a snapshot whose parent snapshot is missing, is itself, or was taken of another file, and accepts a parent of the same file
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckChecksSnapshotParents
+
   - id: snapshot-unreadable-sector-eio
     name: An unreadable snapshot registry sector makes lookups and listings fail with EIO
     description: With a registry sector that fails its checksum, a lookup that finds nothing and every listing fail with EIO instead of not found or a partial list; a snapshot in a readable sector is still found and the mount scan still succeeds

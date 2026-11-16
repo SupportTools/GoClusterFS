@@ -81,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `goclusterfs-fsck` never checked a snapshot's parent: the check was an empty block. It now warns about a snapshot whose parent snapshot does not exist, is the snapshot itself, or was taken of another file. Deleting a snapshot hands its children to its parent.
 - A file node that outlived its file, such as an O_PATH descriptor or a name another node had just removed, could open, read, write and truncate the next file to take its inode slot. It now fails with ESTALE.
 - Snapshot lookups and listings skipped a snapshot registry sector they could not read: `getfattr -n user.snapshots` and `GET /api/v1/snapshots` returned part of the list, and a delete, clone or lookup of a snapshot in that sector reported it missing. A snapshot delete job took such a snapshot for already deleted. They now fail with `EIO`, and the API answers 500 with the sector and what to run. A snapshot in a readable sector is still found, and mount still succeeds and logs a warning naming the sector.
 - A file unlinked while open, on this node or another, was freed at once: its descriptors read and wrote whatever file took the inode next. The file now keeps its inode and blocks until every node has closed it. A node that dies holding it lets go when a peer replays its journal. While other nodes are mounted, each node tracks up to 487 unlinked files that other nodes have not yet let go of. An unlink beyond that waits, and fails with EBUSY only when live nodes keep holding them for 20 s.
