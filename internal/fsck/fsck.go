@@ -391,15 +391,16 @@ type Checker struct {
 	inodeBlocks     map[uint64]int  // block -> reference count from inodes
 	inodeUsed       map[uint32]bool // inode numbers that are in use
 	inodeBirth      map[uint32]uint64
-	dirEntryRefs    map[uint32]int  // inode -> names in directories, not counting "." and ".."
-	dirNames        map[uint32]int  // directory inode -> names it holds
-	namesIncomplete []string        // why dirEntryRefs may miss names
-	unnamed         []uint32        // inodes other than root that no directory names
-	snapshotInodes  map[uint32]bool // inodes referenced by snapshots
-	snapshotData    map[uint32]bool // inodes holding a snapshot's captured extents
-	orphanData      map[uint32]int  // phase 7's problem for each data inode no snapshot refers to
-	snapsIncomplete []string        // why snapshotInodes may miss references
-	sfbContainers   map[uint64]bool // blocks holding small files of older versions
+	entryType       map[uint32]uint8 // the directory entry type each inode in use should have
+	dirEntryRefs    map[uint32]int   // inode -> names in directories, not counting "." and ".."
+	dirNames        map[uint32]int   // directory inode -> names it holds
+	namesIncomplete []string         // why dirEntryRefs may miss names
+	unnamed         []uint32         // inodes other than root that no directory names
+	snapshotInodes  map[uint32]bool  // inodes referenced by snapshots
+	snapshotData    map[uint32]bool  // inodes holding a snapshot's captured extents
+	orphanData      map[uint32]int   // phase 7's problem for each data inode no snapshot refers to
+	snapsIncomplete []string         // why snapshotInodes may miss references
+	sfbContainers   map[uint64]bool  // blocks holding small files of older versions
 	extentTrees     map[uint32]*extentTree
 	uncounted       map[uint32]int  // inodes an older version shared -> problem index
 	uncountedRefs   map[uint64]int  // block -> references from extents an older version shared
@@ -477,6 +478,7 @@ func New(dev *storage.Device, opts Options) *Checker {
 		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
 		inodeBirth:      make(map[uint32]uint64),
+		entryType:       make(map[uint32]uint8),
 		dirEntryRefs:    make(map[uint32]int),
 		dirNames:        make(map[uint32]int),
 		snapshotInodes:  make(map[uint32]bool),
