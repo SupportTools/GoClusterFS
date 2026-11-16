@@ -4940,3 +4940,10 @@ scenarios:
     environments:
       go: internal/goclusterfs/symlink_test.go::TestUnlinkSymlinkWithPeerFreesAtOnce
 
+  - id: symlink-stale-node-after-reuse
+    name: A stale symlink node does not reach the next symlink in its slot
+    description: After a symlink is unlinked and another symlink takes its inode, readlink and lchown through the old node return ESTALE and leave the new link alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestStaleLinkNodeAfterSlotReuse
+
