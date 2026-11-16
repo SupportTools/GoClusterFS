@@ -2,6 +2,7 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
 
@@ -106,6 +107,26 @@ func TestStaleFileNodeNeverReachesTheNextFileInItsSlot(t *testing.T) {
 		if errno := c.call(); errno != syscall.ESTALE {
 			t.Errorf("%s through the old file's node: %v, want ESTALE", c.op, errno)
 		}
+	}
+	checkAt(t, next, pattern(2, 4096), 0)
+}
+
+// A write's last check under the lock must catch a new file in the slot that maps the freed block at the same place.
+func TestInPlaceWriteRefusesTheNextFileInItsSlot(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	old := createFile(t, fsys, "old")
+	writeAt(t, old, pattern(1, 4096), 0)
+	block := physicalBlock(t, fsys, old.inodeNum, 0)
+	if errno := fsys.Unlink(context.Background(), "old"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	next := createFile(t, fsys, "next")
+	writeAt(t, next, pattern(2, 4096), 0)
+	if next.inodeNum != old.inodeNum || physicalBlock(t, fsys, next.inodeNum, 0) != block {
+		t.Fatalf("the new file is inode %d at block %d; the test needs inode %d at block %d", next.inodeNum, physicalBlock(t, fsys, next.inodeNum, 0), old.inodeNum, block)
+	}
+	if err := old.stillWritableInPlace(0, block); !errors.Is(err, syscall.ESTALE) {
+		t.Errorf("in-place check for the old file's node: %v, want ESTALE", err)
 	}
 	checkAt(t, next, pattern(2, 4096), 0)
 }

@@ -1977,13 +1977,16 @@ func (f *File) waitOutReplay(ctx context.Context, physBlock uint64) error {
 	return errRetryWrite
 }
 
-// stillWritableInPlace checks, under the inode lock, that logical block
-// blockNum still maps to physBlock and that no other file shares it.
+// stillWritableInPlace checks, under the inode lock, that the slot still holds this file, that logical block
+// blockNum still maps to physBlock, and that no other file shares it.
 func (f *File) stillWritableInPlace(blockNum, physBlock uint64) error {
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
 		logging.Debugf("Write inode %d: re-read for in-place write failed: %v", f.inodeNum, err)
 		return syscall.EIO
+	}
+	if !f.current(ino) {
+		return syscall.ESTALE
 	}
 	ext, off, err := f.fs.extentMgr.Lookup(ino, blockNum)
 	switch {
