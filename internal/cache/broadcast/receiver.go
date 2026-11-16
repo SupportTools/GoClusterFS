@@ -38,10 +38,11 @@ type Broadcaster struct {
 	sendersMu sync.Mutex
 	senders   map[[16]byte]*senderSeq
 
-	started  time.Time
-	expected atomic.Pointer[func() ([]ExpectedPeer, error)]
-	silentMu sync.Mutex
-	silent   map[[16]byte]ExpectedPeer
+	started     time.Time
+	expected    atomic.Pointer[func() ([]ExpectedPeer, error)]
+	silentMu    sync.Mutex
+	silent      map[[16]byte]ExpectedPeer
+	firstListed map[[16]byte]time.Time
 
 	lossLogMu    sync.Mutex
 	lossLoggedAt time.Time

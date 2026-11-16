@@ -12,16 +12,15 @@ const silentAfter = 3
 
 // ExpectedPeer is a node that should be sending this node broadcasts.
 type ExpectedPeer struct {
-	UUID    [16]byte
-	Name    string
-	Mounted time.Time
+	UUID [16]byte
+	Name string
 }
 
 // WatchPeers has the broadcaster check, every heartbeat interval, that it
 // hears from each node that expected lists. A node silent for silentAfter
-// intervals since it mounted or this node started is reported: dropped
-// multicast is otherwise invisible, because a node that hears nothing from a
-// peer finds no gap in its sequence numbers either.
+// intervals since this node first saw it listed, by this node's clock, is
+// reported: dropped multicast is otherwise invisible, because a node that
+// hears nothing from a peer finds no gap in its sequence numbers either.
 func (b *Broadcaster) WatchPeers(expected func() ([]ExpectedPeer, error)) {
 	b.expected.Store(&expected)
 }
@@ -70,17 +69,23 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 	}
 
 	quiet := b.silenceThreshold()
-	mounted := map[[16]byte]bool{}
+	b.silentMu.Lock()
+	defer b.silentMu.Unlock()
+	listed := make(map[[16]byte]time.Time, len(peers))
 	silent := map[[16]byte]ExpectedPeer{}
 	b.sendersMu.Lock()
 	for _, p := range peers {
 		if p.UUID == b.localUUID {
 			continue
 		}
-		mounted[p.UUID] = true
+		first, ok := b.firstListed[p.UUID]
+		if !ok {
+			first = now
+		}
+		listed[p.UUID] = first
 		last := b.started
-		if p.Mounted.After(last) {
-			last = p.Mounted
+		if first.After(last) {
+			last = first
 		}
 		if s, ok := b.senders[p.UUID]; ok && s.heard.After(last) {
 			last = s.heard
@@ -91,8 +96,6 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 	}
 	b.sendersMu.Unlock()
 
-	b.silentMu.Lock()
-	defer b.silentMu.Unlock()
 	for id, p := range silent {
 		if _, ok := b.silent[id]; !ok {
 			log.Printf("[broadcast] WARN: no broadcast heard from node %s for over %v, though the registry shows it mounted; this node sees its changes only after -cache-ttl. Multicast may not reach this node, or that node runs with -broadcast=false or another -mcast-group or -mcast-port",
@@ -100,9 +103,11 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 		}
 	}
 	for id, p := range b.silent {
-		if _, ok := silent[id]; !ok && mounted[id] {
-			log.Printf("[broadcast] heard from node %s again", p.Name)
+		if _, ok := silent[id]; !ok {
+			if _, still := listed[id]; still {
+				log.Printf("[broadcast] heard from node %s again", p.Name)
+			}
 		}
 	}
-	b.silent = silent
+	b.silent, b.firstListed = silent, listed
 }

@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
 	"github.com/supporttools/GoClusterFS/internal/node"
@@ -21,9 +20,8 @@ func expectedPeers(reg *node.Registry) func() ([]broadcast.ExpectedPeer, error) 
 		for _, s := range slots {
 			host := strings.TrimRight(string(s.Hostname[:]), "\x00")
 			peers = append(peers, broadcast.ExpectedPeer{
-				UUID:    s.UUID,
-				Name:    fmt.Sprintf("%s (%x)", host, s.UUID[:4]),
-				Mounted: time.Unix(s.MountTime, 0),
+				UUID: s.UUID,
+				Name: fmt.Sprintf("%s (%x)", host, s.UUID[:4]),
 			})
 		}
 		return peers, nil
