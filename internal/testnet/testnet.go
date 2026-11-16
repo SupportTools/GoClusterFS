@@ -50,32 +50,39 @@ func LoopbackAddr() (string, error) {
 	return addr, ln.Close()
 }
 
-// UDPPorts returns n distinct ports, free on all interfaces, that datagrams
-// sent to 127.0.0.1 reach.
-func UDPPorts(n int) ([]int, error) {
-	var held, unreachable []*net.UDPConn
+// ListenUDP is net.ListenUDP that binds again until a datagram sent to the
+// bound port on 127.0.0.1 reaches the new socket.
+func ListenUDP(laddr *net.UDPAddr) (*net.UDPConn, error) {
+	var unreachable []*net.UDPConn
 	defer func() {
-		for _, c := range append(held, unreachable...) {
+		for _, c := range unreachable {
 			_ = c.Close()
 		}
 	}()
-	for len(held) < n && len(unreachable) < tries {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	for range tries {
+		conn, err := net.ListenUDP("udp", laddr)
 		if err != nil {
 			return nil, err
 		}
 		if receives(conn) {
-			held = append(held, conn)
-		} else {
-			unreachable = append(unreachable, conn)
+			return conn, nil
 		}
+		unreachable = append(unreachable, conn)
 	}
-	if len(held) < n {
-		return nil, fmt.Errorf("found %d of %d UDP ports that datagrams reach after %d misses", len(held), n, tries)
-	}
-	ports := make([]int, n)
-	for i, c := range held {
-		ports[i] = c.LocalAddr().(*net.UDPAddr).Port
+	return nil, fmt.Errorf("no UDP port for %v that datagrams reach after %d tries", laddr, tries)
+}
+
+// UDPPorts returns n distinct ports, free on all interfaces, that datagrams
+// sent to 127.0.0.1 reach.
+func UDPPorts(n int) ([]int, error) {
+	ports := make([]int, 0, n)
+	for range n {
+		conn, err := ListenUDP(&net.UDPAddr{})
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = conn.Close() }()
+		ports = append(ports, conn.LocalAddr().(*net.UDPAddr).Port)
 	}
 	return ports, nil
 }
