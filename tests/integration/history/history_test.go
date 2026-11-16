@@ -94,6 +94,27 @@ func TestTornRead(t *testing.T) {
 	expect(t, b, "torn read")
 }
 
+func TestTearDuringALocalWriteIsAllowedAtWordBoundaries(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Write, Name: "a", Value: 2, Node: 1}, 20, 40)
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: []Piece{{0, 1}, {968, 2}, {1032, 1}}}, 25, 30)
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: []Piece{{0, 1}, {965, 2}}}, 25, 30)
+	expect(t, b, "torn read")
+}
+
+// The page cache can split a copy inside a word, leaving one word whose bytes come from the values on either side.
+func TestTearInsideAWordDuringALocalWriteIsAllowed(t *testing.T) {
+	b := &builder{}
+	b.write("a", 0x4000014ce, 0, 10)
+	b.add(Op{Kind: Write, Name: "a", Value: 0x600001486, Node: 1}, 20, 40)
+	mixed := []Piece{{0, 0x4000014ce}, {5760, 0x600001486}, {5784, 0x400001486}, {5792, 0x4000014ce}}
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: mixed}, 25, 30)
+	notMixed := []Piece{{0, 0x4000014ce}, {5760, 0x600001486}, {5784, 0x777777777}, {5792, 0x4000014ce}}
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: notMixed}, 25, 30)
+	expect(t, b, "torn read")
+}
+
 func TestSectorTearDuringALocalWriteIsAllowed(t *testing.T) {
 	b := &builder{}
 	b.write("a", 1, 0, 10)
@@ -175,4 +196,38 @@ func TestRenameShowsExactlyOneName(t *testing.T) {
 	b.list(2005, 2015, "a", "b")
 	b.list(2005, 2015, "b")
 	expect(t, b, "listing shows both names of a rename")
+}
+
+func TestStaleOpenOnlyWhenTheNameLostItsFileTwice(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 100, 200)
+	expect(t, b, "ESTALE while its name kept its file")
+
+	b = &builder{}
+	b.write("a", 1, 0, 10)
+	b.unlink("a", 110, 120)
+	b.write("a", 2, 130, 140)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 100, 200)
+	expect(t, b, "ESTALE while its name kept its file")
+
+	b.unlink("a", 150, 160)
+	b.write("a", 3, 170, 180)
+	expect(t, b)
+
+	b = &builder{}
+	b.write("a", 1, 0, 10)
+	b.unlink("a", 1500, 1510)
+	b.write("a", 2, 1520, 1530)
+	b.unlink("a", 2050, 2060)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 2000, 2100)
+	expect(t, b)
+
+	b = &builder{}
+	b.write("a", 1, 0, 10)
+	b.unlink("a", 500, 510)
+	b.write("a", 2, 520, 530)
+	b.unlink("a", 2050, 2060)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 2000, 2100)
+	expect(t, b, "ESTALE while its name kept its file")
 }

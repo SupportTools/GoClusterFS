@@ -34,10 +34,11 @@ const (
 	Exists             // EEXIST
 	Unsupported        // the call is not implemented; it changed nothing
 	Failed             // any other error: the call may or may not have taken effect
+	Stale              // open failed with ESTALE; it changed nothing
 )
 
 func (r Result) String() string {
-	return [...]string{"ok", "ENOENT", "EEXIST", "unsupported", "failed"}[r]
+	return [...]string{"ok", "ENOENT", "EEXIST", "unsupported", "failed", "ESTALE"}[r]
 }
 
 // Content is what a successful Read saw.
@@ -212,10 +213,12 @@ func Check(ops []Op, r Rules) []Violation {
 		switch {
 		case o.Result == Failed:
 			out = append(out, Violation{What: o.Kind.String() + " failed", Op: o, Allowed: "success, ENOENT or EEXIST", History: []Op{o}})
+		case o.Result == Stale && !churned(o, logs[o.Name], r):
+			out = append(out, Violation{What: "open failed with ESTALE while its name kept its file", Op: o, Allowed: "ESTALE only when the name lost its file at least twice during the call", History: []Op{o}})
 		case o.Kind == Write && o.Result == Exists:
 			out = append(out, Violation{What: "open with O_CREAT and no O_EXCL failed with EEXIST", Op: o, Allowed: "the file opened", History: []Op{o}})
 		case o.Result != OK && o.Result != NotFound && o.Result != Exists:
-		case o.Kind == Read && o.Content == Torn && sectorTear(o, logs[o.Name], r):
+		case o.Kind == Read && o.Content == Torn && localWriteTear(o, logs[o.Name], r):
 		case o.Kind == Read || o.Kind == Stat:
 			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], r); bad {
 				out = append(out, v)
@@ -345,17 +348,33 @@ func (l *nameLog) during(from, to time.Duration, fn func(mutation)) {
 	}
 }
 
-// sectorTear reports whether a torn read only mixes values split at 4 KB
-// boundaries while a write on the reader's node overlapped it, as Linux local
-// filesystems allow, and every piece is a value the read may see.
-func sectorTear(o Op, l *nameLog, r Rules) bool {
+// churned reports whether o's name lost its file twice: once while the kernel may still cache the old entry, and again during o after the retry's lookup.
+func churned(o Op, l *nameLog, r Rules) bool {
+	if l == nil {
+		return false
+	}
+	before, during := 0, 0
+	l.during(o.Start-r.Window, o.End, func(m mutation) {
+		switch {
+		case m.after.present:
+		case m.op.End >= o.Start:
+			during++
+		default:
+			before++
+		}
+	})
+	return during >= 1 && before+during >= 2
+}
+
+// localWriteTear reports whether a torn read overlapped a write on its own node and, apart from words the page cache split, saw only values it may see.
+func localWriteTear(o Op, l *nameLog, r Rules) bool {
 	if o.Size != r.WriteSize || len(o.Pieces) < 2 || l == nil {
 		return false
 	}
 	allowed, _ := possible(o, l, o.Start-r.Window)
 	overlapping := false
-	for _, p := range o.Pieces {
-		if p.At%4096 != 0 || p.Value == 0 || !slices.Contains(allowed, state{present: true, value: p.Value}) {
+	for _, p := range wholeWords(o.Pieces) {
+		if p.At%8 != 0 || p.Value == 0 || !slices.Contains(allowed, state{present: true, value: p.Value}) {
 			return false
 		}
 		l.during(o.Start, o.End, func(m mutation) {
@@ -363,6 +382,26 @@ func sectorTear(o Op, l *nameLog, r Rules) bool {
 		})
 	}
 	return overlapping
+}
+
+// wholeWords drops each 8-byte piece whose bytes all come from the pieces either side: the page cache can split a copy inside a word.
+func wholeWords(pieces []Piece) []Piece {
+	var out []Piece
+	for i, p := range pieces {
+		if i == 0 || i == len(pieces)-1 || pieces[i+1].At-p.At != 8 || !byteMix(p.Value, pieces[i-1].Value, pieces[i+1].Value) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func byteMix(v, a, b uint64) bool {
+	for shift := 0; shift < 64; shift += 8 {
+		if x := v >> shift & 0xff; x != a>>shift&0xff && x != b>>shift&0xff {
+			return false
+		}
+	}
+	return true
 }
 
 // stableName reports whether name kept one file for a whole window before o
