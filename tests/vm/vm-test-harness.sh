@@ -208,6 +208,8 @@ write_setup_disk() {
 set -x
 setup-interfaces -a
 ifup eth0
+# goclusterfs-mount serves its API on 127.0.0.1, which needs loopback up.
+ip link set lo up
 printf '%s\n' "$repo/main" "$repo/community" > /etc/apk/repositories
 tries=0
 until apk add --no-cache openssh fuse3 gcompat attr; do
