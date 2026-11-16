@@ -1098,7 +1098,8 @@ func TestRegistryIDsAfterOlderImagesAndSlotReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for slot, d := range old.descriptors() {
+	descs, _ := old.descriptors()
+	for slot, d := range descs {
 		if d.IsFree() {
 			continue
 		}

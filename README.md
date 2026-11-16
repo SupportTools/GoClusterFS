@@ -171,6 +171,7 @@ The API only listens on this host by default. Mount refuses to start when `-api-
 ./gfsctl health              # exits 1 when degraded, 4 when unhealthy
 ./gfsctl stats               # overview; also: cache, journal, trim, lock, sfb, cluster, all
 ./gfsctl metrics             # Prometheus text from /metrics
+./gfsctl snapshots           # every snapshot, orphans marked; needs the API token
 ./gfsctl status -w -i 5s     # refresh every 5 s
 ./gfsctl stats all -o json   # JSON for scripts
 ```
