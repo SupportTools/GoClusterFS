@@ -62,8 +62,7 @@ func expectTarget(t *testing.T, l *Link, want string) {
 	}
 }
 
-// Targets at the inline limit, just past it and at PATH_MAX read back exactly,
-// from the new node and from a fresh lookup, with lstat showing their length.
+// Targets at the inline limit, just past it and at PATH_MAX read back exactly, with lstat showing their length.
 func TestSymlinkTargetsReadBack(t *testing.T) {
 	fsys := symlinkFS(t)
 	for _, n := range []int{1, inode.MaxInlineTarget, inode.MaxInlineTarget + 1, inode.MaxSymlinkTarget} {
@@ -117,8 +116,7 @@ func TestSymlinkInDirectoryListing(t *testing.T) {
 	expectCleanFsck(t, fsys)
 }
 
-// Linux refuses an empty target and one past PATH_MAX, an existing name stays,
-// and a volume formatted before symlinks refuses them all.
+// Empty and over-long targets, existing names and volumes formatted before symlinks are refused.
 func TestSymlinkRefusals(t *testing.T) {
 	fsys := symlinkFS(t)
 	ctx := context.Background()
@@ -161,8 +159,7 @@ func TestUnlinkSymlinkFreesBlock(t *testing.T) {
 	expectCleanFsck(t, fsys)
 }
 
-// lchown and lutimes change a symlink; chmod and truncate do not apply to one,
-// and it takes no xattrs, so a snapshot or clone can never start from one.
+// lchown and lutimes change a symlink; chmod, truncate and xattrs do not apply to one.
 func TestSymlinkSetattr(t *testing.T) {
 	fsys := symlinkFS(t)
 	l := makeSymlink(t, fsys, "l", "x")
@@ -245,8 +242,7 @@ func TestSymlinkReplaySkipsReusedSlot(t *testing.T) {
 	}
 }
 
-// Power fails before each write of a symlink create: afterwards the name is
-// either missing or holds the whole target, and no block leaks.
+// After a power cut during a symlink create, the name is missing or holds the whole target, and nothing leaks.
 func TestPowerCutDuringSymlink(t *testing.T) {
 	for _, n := range []int{inode.MaxInlineTarget, inode.MaxInlineTarget + 1} {
 		target := linkTarget(n)

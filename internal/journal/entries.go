@@ -821,8 +821,7 @@ func DeserializeRefCountUpdate(buf []byte) (*RefCountUpdatePayload, error) {
 // Transaction Builder Convenience Methods
 // ============================================================================
 
-// SymlinkTargetPayload is a new symlink's target: inline in the inode when
-// DiskBlock is 0, otherwise in that block, which was written before the commit.
+// SymlinkTargetPayload is a new symlink's target, inline when DiskBlock is 0, else in that already-written block.
 type SymlinkTargetPayload struct {
 	InodeNum  uint64
 	DiskBlock uint64

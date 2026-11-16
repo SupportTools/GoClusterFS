@@ -1099,8 +1099,7 @@ func TestRewriteChangesHoldersAndKeepsReservedBytes(t *testing.T) {
 	}
 }
 
-// An inline target fills the extent area on disk and comes back with no
-// extents, so nothing that walks extents reads target bytes as blocks.
+// An inline target fills the extent area on disk and decodes with no extents.
 func TestInlineSymlinkTargetRoundTrip(t *testing.T) {
 	for _, n := range []int{1, MaxInlineTarget} {
 		target := bytes.Repeat([]byte{'/'}, n)
@@ -1119,8 +1118,7 @@ func TestInlineSymlinkTargetRoundTrip(t *testing.T) {
 	}
 }
 
-// The flag means an inline target only on a symlink, so a regular file with
-// that bit set keeps its extents.
+// The inline-target flag only applies to symlinks: a regular file with it keeps its extents.
 func TestInlineTargetFlagOnlyMarksSymlinks(t *testing.T) {
 	ino := &Inode{Magic: InodeMagic, InodeNum: 8, Mode: S_IFREG | 0o644, Flags: FlagInlineTarget, LinkCount: 1, ExtentCount: 1}
 	ino.InlineExtents[0] = InlineExtent{PhysicalBlock: 50, Length: 1, Flags: 1}

@@ -19,8 +19,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-// Link is a symlink's node. It has no xattr ops: the kernel refuses user
-// xattrs on symlinks, so snapshots and clones never reach one.
+// Link is a symlink's node; it has no xattr ops, so no snapshot or clone starts from one.
 type Link struct {
 	fs.Inode
 
@@ -173,8 +172,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	return f.linkNode(ctx, parent, childIno, out), 0
 }
 
-// symlinkBlock takes a data block for a target too long for the inode and
-// writes the target into it, zeroing the rest of the block.
+// symlinkBlock writes a long target into a new data block, zeroing the rest of the block.
 func (f *FS) symlinkBlock(ctx context.Context, target []byte) (uint64, bool, syscall.Errno) {
 	var b uint64
 	reserved := false
