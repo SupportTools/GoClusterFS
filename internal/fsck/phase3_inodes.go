@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 
+	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -164,6 +165,7 @@ func (c *Checker) checkInodes() error {
 			usedInodes++
 			c.inodeUsed[inodeNum] = true
 			c.inodeBirth[inodeNum] = inode.BirthGeneration
+			c.entryType[inodeNum] = dir.FileTypeFromMode(inode.Mode)
 
 			// Validate inode number matches position
 			if inode.InodeNum != inodeNum {

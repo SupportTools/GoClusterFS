@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// listen opens the server's socket; tests replace it.
+var listen = net.Listen
+
 // Server is the HTTP API server for GoClusterFS.
 type Server struct {
 	mu     sync.RWMutex
@@ -114,7 +117,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	// Create listener
-	ln, err := net.Listen("tcp", s.config.ListenAddr)
+	ln, err := listen("tcp", s.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", s.config.ListenAddr, err)
 	}

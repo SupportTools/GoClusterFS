@@ -81,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `goclusterfs-fsck` checked a directory entry's type only when the entry's inode number was below the count of inodes in use, and then only that the type was a valid value. It now reports every entry whose type differs from its inode's, which lookup, unlink and rmdir trust: an unlink could remove a directory that its entry calls a file. It also reports an entry whose inode number is past the inode table; before, a number past 2^32 wrapped and could pass as an inode in use.
 - `goclusterfs-fsck` never checked a snapshot's parent: the check was an empty block. It now warns about a snapshot whose parent snapshot does not exist, is the snapshot itself, or was taken of another file. Deleting a snapshot hands its children to its parent.
 - A file node that outlived its file, such as an O_PATH descriptor or a name another node had just removed, could open, read, write and truncate the next file to take its inode slot. It now fails with ESTALE.
 - Snapshot lookups and listings skipped a snapshot registry sector they could not read: `getfattr -n user.snapshots` and `GET /api/v1/snapshots` returned part of the list, and a delete, clone or lookup of a snapshot in that sector reported it missing. A snapshot delete job took such a snapshot for already deleted. They now fail with `EIO`, and the API answers 500 with the sector and what to run. A snapshot in a readable sector is still found, and mount still succeeds and logs a warning naming the sector.
