@@ -4662,6 +4662,27 @@ scenarios:
     environments:
       go: history/history_test.go::TestNameChangesMayLagTheWindow
 
+  - id: history-checker-local-tear
+    name: Coherence checker allows page-cache tears during a local write
+    description: A torn read split at 8-byte boundaries while a write on the reader's node overlapped it is allowed; a split at any other offset is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTearDuringALocalWriteIsAllowedAtWordBoundaries
+
+  - id: history-checker-word-tear
+    name: Coherence checker allows a tear inside one word during a local write
+    description: A torn read whose boundary word mixes bytes of the values on either side is allowed during a write on the reader's node; a word with bytes from neither side is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTearInsideAWordDuringALocalWriteIsAllowed
+
+  - id: history-checker-stale-open
+    name: Coherence checker allows ESTALE on open only under name churn
+    description: An open that fails with ESTALE is allowed only when its name lost its file during the call and once more within the cache window before it or during it; otherwise it is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestStaleOpenOnlyWhenTheNameLostItsFileTwice
+
   - id: history-checker-torn-read
     name: Coherence checker flags torn reads
     description: A read that mixes values mid-sector, or with no write on its node overlapping, is a violation
@@ -4933,4 +4954,11 @@ scenarios:
     priority: go_only
     environments:
       go: tests/soak/model_test.go::TestModelFollowsTheFilesystemRules
+
+  - id: symlink-stale-node-after-reuse
+    name: A stale symlink node does not reach the next symlink in its slot
+    description: After a symlink is unlinked and another symlink takes its inode, readlink and lchown through the old node return ESTALE and leave the new link alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestStaleLinkNodeAfterSlotReuse
 

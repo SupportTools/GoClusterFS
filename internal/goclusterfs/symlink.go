@@ -25,6 +25,7 @@ type Link struct {
 
 	fs       *FS
 	inodeNum uint32
+	birth    uint64
 }
 
 var (
@@ -35,7 +36,7 @@ var (
 	_ = (fs.NodeSymlinker)((*FS)(nil))
 )
 
-var errNotSymlink = errors.New("inode is no longer a symlink")
+var errNotSymlink = errors.New("inode no longer holds this symlink")
 
 // SetSymlinks lets the FS create symlinks; only volumes formatted with RequiredSymlinks allow them.
 func (f *FS) SetSymlinks(enabled bool) {
@@ -117,7 +118,17 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 			}
 			return nil, syscall.EIO
 		}
-		defer f.closeIntent(seq)
+		// Replay must not map a block this node already freed, so a failure ends the intent durably before freeing it.
+		defer func() {
+			if giveBack == nil || block == 0 {
+				f.closeIntent(seq)
+				return
+			}
+			if err := f.journal.CompleteIntentDurable(seq); err != nil {
+				log.Printf("[WARN] symlink %q: leaving block %d allocated, since ending intent %d failed: %v", name, block, seq, err)
+				giveBack = nil
+			}
+		}()
 		if block != 0 {
 			giveBack = freeBlock
 		}
@@ -233,10 +244,16 @@ func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid uint32, tar
 
 func (f *FS) linkNode(ctx context.Context, parent *fs.Inode, ino *inode.Inode, out *fuse.EntryOut) *fs.Inode {
 	fillLinkAttr(&out.Attr, ino)
-	return parent.NewPersistentInode(ctx, &Link{fs: f, inodeNum: ino.InodeNum}, fs.StableAttr{
+	return parent.NewPersistentInode(ctx, &Link{fs: f, inodeNum: ino.InodeNum, birth: ino.BirthGeneration}, fs.StableAttr{
 		Mode: fuse.S_IFLNK,
 		Ino:  uint64(ino.InodeNum),
+		Gen:  ino.BirthGeneration,
 	})
+}
+
+// current reports whether the slot still holds this node's symlink; birth 0, from older versions, matches any.
+func (l *Link) current(ino *inode.Inode) bool {
+	return ino.Magic == inode.InodeMagic && ino.IsSymlink() && (l.birth == 0 || ino.BirthGeneration == l.birth)
 }
 
 func fillLinkAttr(out *fuse.Attr, ino *inode.Inode) {
@@ -260,7 +277,7 @@ func (l *Link) readLink() (*inode.Inode, syscall.Errno) {
 		logging.Debugf("Link inode %d: read failed: %v", l.inodeNum, err)
 		return nil, syscall.EIO
 	}
-	if ino.Magic != inode.InodeMagic || !ino.IsSymlink() {
+	if !l.current(ino) {
 		return nil, syscall.ESTALE
 	}
 	return ino, 0
@@ -316,7 +333,7 @@ func (l *Link) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 	now := time.Now().UnixNano()
 	updated, err := l.fs.updateInodeLocked(ctx, l.inodeNum, func(ino *inode.Inode) error {
-		if ino.Magic != inode.InodeMagic || !ino.IsSymlink() {
+		if !l.current(ino) {
 			return errNotSymlink
 		}
 		if uid, ok := in.GetUID(); ok {

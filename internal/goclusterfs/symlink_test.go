@@ -388,3 +388,28 @@ func TestUnlinkSymlinkWithPeerFreesAtOnce(t *testing.T) {
 		t.Errorf("%d free blocks after the unlink, want %d", got, free)
 	}
 }
+
+// A symlink node whose inode another symlink took reads and changes nothing of the new link.
+func TestStaleLinkNodeAfterSlotReuse(t *testing.T) {
+	fsys := symlinkFS(t)
+	ctx := context.Background()
+	old := makeSymlink(t, fsys, "l", "/etc/old-target")
+	if errno := fsys.Unlink(ctx, "l"); errno != 0 {
+		t.Fatal(errno)
+	}
+	reused := makeSymlink(t, fsys, "m", "/secret/new-target")
+	if old.inodeNum != reused.inodeNum {
+		t.Fatalf("the new symlink took inode %d, not the freed %d, so the test checks nothing", reused.inodeNum, old.inodeNum)
+	}
+	if got, errno := old.Readlink(ctx); errno != syscall.ESTALE {
+		t.Errorf("readlink through the stale node: %q, %v; want ESTALE", got, errno)
+	}
+	in := &fuse.SetAttrIn{SetAttrInCommon: fuse.SetAttrInCommon{Valid: fuse.FATTR_UID, Owner: fuse.Owner{Uid: 4242}}}
+	if errno := old.Setattr(ctx, nil, in, &fuse.AttrOut{}); errno != syscall.ESTALE {
+		t.Errorf("lchown through the stale node: %v, want ESTALE", errno)
+	}
+	if ino := readInode(t, fsys, reused.inodeNum); ino.UID == 4242 {
+		t.Error("lchown through the stale node changed the new symlink's owner")
+	}
+	expectTarget(t, lookupLink(t, fsys, "m"), "/secret/new-target")
+}

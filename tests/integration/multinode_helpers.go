@@ -35,7 +35,7 @@ func NewMultiNodeCluster(t *testing.T, nodeCount, sizeMB int) *MultiNodeCluster 
 	}
 
 	// Create shared image file
-	imgFile, err := os.CreateTemp("", "goclusterfs_multinode_*.img")
+	imgFile, err := os.CreateTemp(os.Getenv("GCFS_IMAGE_DIR"), "goclusterfs_multinode_*.img")
 	if err != nil {
 		t.Fatalf("Failed to create temp image: %v", err)
 	}
