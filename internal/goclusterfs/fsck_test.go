@@ -300,7 +300,7 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 	}
 
 	fsys = openFormattedFS(t, path)
-	src, tree = &File{fs: fsys, inodeNum: src.inodeNum}, &File{fs: fsys, inodeNum: tree.inodeNum}
+	src, tree = fileNode(fsys, src.inodeNum), fileNode(fsys, tree.inodeNum)
 	setxattr(t, src, "user.snapshot", "after-repair")
 	setxattr(t, tree, "user.clone", "/tree-clone.bin")
 	srcBlocks, err := fsys.extentMgr.DataBlocks(srcIno)
@@ -312,9 +312,9 @@ func TestFsckRepairsOlderSharing(t *testing.T) {
 			t.Fatalf("block %d: refcount %d with src, an old clone and a snapshot as owners, want 3", b, got)
 		}
 	}
-	writeAt(t, &File{fs: fsys, inodeNum: clone.inodeNum}, pattern(7, 100), 10)
+	writeAt(t, fileNode(fsys, clone.inodeNum), pattern(7, 100), 10)
 	writeAt(t, src, pattern(8, 100), BlockSize+10)
-	checkFile(t, &File{fs: fsys, inodeNum: clone.inodeNum}, overwritten(srcData, 10, pattern(7, 100)))
+	checkFile(t, fileNode(fsys, clone.inodeNum), overwritten(srcData, 10, pattern(7, 100)))
 	checkFile(t, src, overwritten(srcData, BlockSize+10, pattern(8, 100)))
 	setxattr(t, src, "user.snapshot.clone", "after-repair:/snap-clone.bin")
 	checkFile(t, lookupFile(t, fsys, "snap-clone.bin"), srcData)

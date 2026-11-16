@@ -23,7 +23,7 @@ func TestWriteFinishesAfterInterruptDuringLockWait(t *testing.T) {
 	path := newFormattedImage(t)
 	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
 	fileA := newRegularFile(t, nodeA)
-	fileB := &File{fs: nodeB, inodeNum: fileA.inodeNum}
+	fileB := fileNode(nodeB, fileA.inodeNum)
 
 	held, released := make(chan error, 1), make(chan struct{})
 	go func() {
@@ -62,7 +62,7 @@ func TestWriteFailsWhenLockIsNotFreed(t *testing.T) {
 	path := newFormattedImage(t)
 	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
 	fileA := newRegularFile(t, nodeA)
-	fileB := &File{fs: nodeB, inodeNum: fileA.inodeNum}
+	fileB := fileNode(nodeB, fileA.inodeNum)
 
 	release := holdLock(t, nodeA, lock.LockTypeInode, uint64(fileA.inodeNum))
 	ctx, interrupt := context.WithCancel(context.Background())

@@ -196,7 +196,7 @@ func TestUnlinkSucceedsWhilePeerWrites(t *testing.T) {
 	a, path, _, _ := journaledFS(t)
 	b := openFormattedFS(t, path)
 	victim := createFile(t, a, "victim")
-	writer := &File{fs: b, inodeNum: victim.inodeNum}
+	writer := fileNode(b, victim.inodeNum)
 	writes := 0
 	afterCommit = func(op string) {
 		if op == "unlink" {

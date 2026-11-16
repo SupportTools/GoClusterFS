@@ -2,6 +2,7 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
 
@@ -70,4 +71,62 @@ func TestCreateWithoutExclOpensTheFileItFinds(t *testing.T) {
 	if ino, err := fsys.inodeTbl.Read(truncated.inodeNum); err != nil || ino.Size != 0 {
 		t.Errorf("after create with O_TRUNC: size %d, err %v; want 0", ino.Size, err)
 	}
+}
+
+// A node can also outlive its file when a new file takes the slot; nothing through the old node may reach the new file.
+func TestStaleFileNodeNeverReachesTheNextFileInItsSlot(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	ctx := context.Background()
+	old := createFile(t, fsys, "old")
+	writeAt(t, old, pattern(1, 4096), 0)
+	if errno := fsys.Unlink(ctx, "old"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	next := createFile(t, fsys, "next")
+	if next.inodeNum != old.inodeNum {
+		t.Fatalf("the new file got inode %d; the test needs it in the freed slot %d", next.inodeNum, old.inodeNum)
+	}
+	writeAt(t, next, pattern(2, 4096), 0)
+
+	truncate := &fuse.SetAttrIn{}
+	truncate.Valid, truncate.Size = fuse.FATTR_SIZE, 0
+	// Open goes last: before the fix it reaches go-fuse, which panics without a mounted server.
+	for _, c := range []struct {
+		op   string
+		call func() syscall.Errno
+	}{
+		{"getattr", func() syscall.Errno { return old.Getattr(ctx, nil, &fuse.AttrOut{}) }},
+		{"read", func() syscall.Errno { _, errno := old.Read(ctx, nil, make([]byte, 4096), 0); return errno }},
+		{"write", func() syscall.Errno { _, errno := old.Write(ctx, nil, pattern(3, 4096), 0); return errno }},
+		{"truncate", func() syscall.Errno { return old.Setattr(ctx, nil, truncate, &fuse.AttrOut{}) }},
+		{"allocate", func() syscall.Errno { return old.Allocate(ctx, nil, 0, BlockSize, 0) }},
+		{"snapshot", func() syscall.Errno { return old.Setxattr(ctx, "user.snapshot", []byte("s"), 0) }},
+		{"getxattr", func() syscall.Errno { _, errno := old.Getxattr(ctx, "user.snapshots", make([]byte, 64)); return errno }},
+		{"open", func() syscall.Errno { _, _, errno := old.Open(ctx, syscall.O_RDONLY); return errno }},
+	} {
+		if errno := c.call(); errno != syscall.ESTALE {
+			t.Errorf("%s through the old file's node: %v, want ESTALE", c.op, errno)
+		}
+	}
+	checkAt(t, next, pattern(2, 4096), 0)
+}
+
+// A write's last check under the lock must catch a new file in the slot that maps the freed block at the same place.
+func TestInPlaceWriteRefusesTheNextFileInItsSlot(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	old := createFile(t, fsys, "old")
+	writeAt(t, old, pattern(1, 4096), 0)
+	block := physicalBlock(t, fsys, old.inodeNum, 0)
+	if errno := fsys.Unlink(context.Background(), "old"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	next := createFile(t, fsys, "next")
+	writeAt(t, next, pattern(2, 4096), 0)
+	if next.inodeNum != old.inodeNum || physicalBlock(t, fsys, next.inodeNum, 0) != block {
+		t.Fatalf("the new file is inode %d at block %d; the test needs inode %d at block %d", next.inodeNum, physicalBlock(t, fsys, next.inodeNum, 0), old.inodeNum, block)
+	}
+	if err := old.stillWritableInPlace(0, block); !errors.Is(err, syscall.ESTALE) {
+		t.Errorf("in-place check for the old file's node: %v, want ESTALE", err)
+	}
+	checkAt(t, next, pattern(2, 4096), 0)
 }

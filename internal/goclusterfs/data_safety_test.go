@@ -61,7 +61,7 @@ func TestFallocatedBlocksReadZerosAfterPartialWrite(t *testing.T) {
 		checkAt(t, f, make([]byte, BlockSize), 2*BlockSize)
 	}
 	verify(f)
-	verify(&File{fs: openTreeFS(t, path), inodeNum: f.inodeNum})
+	verify(fileNode(openTreeFS(t, path), f.inodeNum))
 }
 
 // Physical block 0 is an ordinary data block, not a hole.
@@ -177,7 +177,7 @@ func TestSFBMigrationKeepsData(t *testing.T) {
 	tail := pattern(9, 4096)
 	writeAt(t, f, tail, 70000)
 
-	reopened := &File{fs: openTreeFS(t, path), inodeNum: f.inodeNum}
+	reopened := fileNode(openTreeFS(t, path), f.inodeNum)
 	checkAt(t, reopened, data, 0)
 	checkAt(t, reopened, make([]byte, 70000-len(data)), int64(len(data)))
 	checkAt(t, reopened, tail, 70000)

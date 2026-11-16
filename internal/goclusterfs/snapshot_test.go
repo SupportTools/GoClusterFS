@@ -101,7 +101,7 @@ func lookupFile(t *testing.T, fsys *FS, name string) *File {
 	if err != nil {
 		t.Fatalf("lookup %s: %v", name, err)
 	}
-	return &File{fs: fsys, inodeNum: uint32(num)}
+	return fileNode(fsys, uint32(num))
 }
 
 func truncateFile(t *testing.T, f *File, size uint64) {
@@ -155,7 +155,7 @@ func TestSnapshotKeepsDataThroughWrites(t *testing.T) {
 		live := overwritten(original[:BlockSize+BlockSize/2], BlockSize+100, pattern(2, 4096))
 		for _, fsys := range []*FS{fsys, openSnapshotFS(t, path)} {
 			checkFile(t, lookupFile(t, fsys, "before-clone"), original)
-			checkFile(t, &File{fs: fsys, inodeNum: f.inodeNum}, live)
+			checkFile(t, fileNode(fsys, f.inodeNum), live)
 		}
 	})
 
@@ -169,8 +169,8 @@ func TestSnapshotKeepsDataThroughWrites(t *testing.T) {
 		writeAt(t, src, pattern(5, 100), BlockSize+10)
 
 		for _, fsys := range []*FS{fsys, openSnapshotFS(t, path)} {
-			checkFile(t, &File{fs: fsys, inodeNum: src.inodeNum}, overwritten(original[:2*BlockSize], BlockSize+10, pattern(5, 100)))
-			checkFile(t, &File{fs: fsys, inodeNum: clone.inodeNum}, overwritten(original[:2*BlockSize], 10, pattern(4, 100)))
+			checkFile(t, fileNode(fsys, src.inodeNum), overwritten(original[:2*BlockSize], BlockSize+10, pattern(5, 100)))
+			checkFile(t, fileNode(fsys, clone.inodeNum), overwritten(original[:2*BlockSize], 10, pattern(4, 100)))
 		}
 	})
 
@@ -416,7 +416,7 @@ func TestSnapshotRecoveryAfterCrash(t *testing.T) {
 	}
 
 	// With no other owner left, a write goes in place.
-	g := &File{fs: remounted, inodeNum: f.inodeNum}
+	g := fileNode(remounted, f.inodeNum)
 	writeAt(t, g, pattern(4, 100), 10)
 	if got := physicalBlock(t, remounted, f.inodeNum, 0); got != blocks[0] {
 		t.Errorf("write after recovery moved block 0 from %d to %d", blocks[0], got)
@@ -445,7 +445,7 @@ func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
 		beforeCoWCommit = nil
 		writeAt(t, f, pattern(2, 100), 0)
 	}
-	writeAt(t, &File{fs: nodeB, inodeNum: f.inodeNum}, pattern(3, 100), 200)
+	writeAt(t, fileNode(nodeB, f.inodeNum), pattern(3, 100), 200)
 	if beforeCoWCommit != nil {
 		t.Fatal("node B's write never reached a copy-on-write commit")
 	}
@@ -468,8 +468,8 @@ func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
 		t.Fatalf("%d blocks allocated with the file on block %d (old %d); want 3 and a copy", allocated, current, old)
 	}
 	want := overwritten(overwritten(original, 0, pattern(2, 100)), 200, pattern(3, 100))
-	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
-	setxattr(t, &File{fs: after, inodeNum: f.inodeNum}, "user.snapshot.clone", "race:/race-clone")
+	checkFile(t, fileNode(after, f.inodeNum), want)
+	setxattr(t, fileNode(after, f.inodeNum), "user.snapshot.clone", "race:/race-clone")
 	checkFile(t, lookupFile(t, after, "race-clone"), original)
 }
 
@@ -500,15 +500,15 @@ func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
 			t.Cleanup(func() { beforeInPlaceWrite = nil })
 			beforeInPlaceWrite = func() {
 				beforeInPlaceWrite = nil
-				setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+				setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot", "mid")
 			}
 			writeAt(t, f, pattern(2, 4096), 0)
 			if beforeInPlaceWrite != nil {
 				t.Fatal("node A's write never reached an in-place write")
 			}
 
-			checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, overwritten(original, 0, pattern(2, 4096)))
-			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			checkFile(t, fileNode(nodeB, f.inodeNum), overwritten(original, 0, pattern(2, 4096)))
+			setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot.clone", "mid:/mid-clone")
 			checkFile(t, lookupFile(t, nodeB, "mid-clone"), original)
 		})
 	}
@@ -549,13 +549,13 @@ func TestSnapshotMarkKeepsConcurrentAppend(t *testing.T) {
 			}
 		}
 	}
-	setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "snap")
+	setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot", "snap")
 	if errno := <-appendDone; errno != 0 {
 		t.Fatalf("append on node A: %v", errno)
 	}
 
-	checkFile(t, &File{fs: nodeB, inodeNum: f.inodeNum}, append(slices.Clone(original), appended...))
-	setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "snap:/snap-clone")
+	checkFile(t, fileNode(nodeB, f.inodeNum), append(slices.Clone(original), appended...))
+	setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot.clone", "snap:/snap-clone")
 	checkFile(t, lookupFile(t, nodeB, "snap-clone"), original)
 }
 
@@ -608,7 +608,7 @@ func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
 			t.Error(err)
 		}
 		go func() {
-			_, errno := (&File{fs: nodeC, inodeNum: f.inodeNum}).Write(ctx, nil, pattern(3, 4096), BlockSize/2)
+			_, errno := (fileNode(nodeC, f.inodeNum)).Write(ctx, nil, pattern(3, 4096), BlockSize/2)
 			cDone <- errno
 		}()
 		<-copying
@@ -623,7 +623,7 @@ func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
 		t.Fatal("node C wrote in place instead of copying the block it saw shared")
 	}
 	want := overwritten(overwritten(original, 0, pattern(2, 4096)), BlockSize/2, pattern(3, 4096))
-	checkFile(t, &File{fs: after, inodeNum: f.inodeNum}, want)
+	checkFile(t, fileNode(after, f.inodeNum), want)
 }
 
 // A write that copied a shared block and then fails before any inode write
@@ -707,11 +707,11 @@ func TestSnapshotRetriesWhenFileChangesWhileSharing(t *testing.T) {
 				beforeShareMark = nil
 				tc.change(t, f)
 			}
-			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot", "mid")
+			setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot", "mid")
 			if beforeShareMark != nil {
 				t.Fatal("the snapshot never reached the point between counting and marking")
 			}
-			setxattr(t, &File{fs: nodeB, inodeNum: f.inodeNum}, "user.snapshot.clone", "mid:/mid-clone")
+			setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot.clone", "mid:/mid-clone")
 			clone := lookupFile(t, nodeB, "mid-clone")
 			checkFile(t, clone, tc.want(original))
 
@@ -1058,7 +1058,7 @@ func TestCountedFreesAndSharesAcrossNodes(t *testing.T) {
 		var wg sync.WaitGroup
 		for i := range rounds {
 			wg.Go(func() {
-				if errno := (&File{fs: nodeB, inodeNum: src.inodeNum}).Setxattr(ctx, "user.clone", []byte(fmt.Sprintf("/c%d", i)), 0); errno != 0 {
+				if errno := (fileNode(nodeB, src.inodeNum)).Setxattr(ctx, "user.clone", []byte(fmt.Sprintf("/c%d", i)), 0); errno != 0 {
 					t.Errorf("clone %d: %v", i, errno)
 				}
 			})

@@ -4728,6 +4728,23 @@ scenarios:
     environments:
       go: internal/goclusterfs/open_errors_test.go::TestStaleFileNodeOpensAsStale
 
+  - id: stale-node-reused-slot
+    name: A stale file node never reaches the next file in its slot
+    description: After a file is unlinked and a new file takes its inode slot, open, getattr, read, write, truncate, allocate and xattr calls through the old node return ESTALE and leave the new file untouched
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/open_errors_test.go::TestStaleFileNodeNeverReachesTheNextFileInItsSlot
+
+  - id: stale-handle-reused-slot
+    name: An O_PATH handle never sees the next file in its slot
+    description: An O_PATH descriptor kept across unlink and a new file in the same inode slot cannot be reopened through /proc/self/fd, and fstat does not show the new file
+    priority: high
+    # Docker/VM: the Go test covers it; the shell suites have no O_PATH helper.
+    environments:
+      go: stale_handle_test.go::TestStaleHandleNeverSeesTheNextFileInItsSlot
+      docker: TODO
+      vm: TODO
+
   - id: create-without-excl-opens-existing
     name: Create without O_EXCL opens a name made since the lookup
     description: A CREATE that finds its name taken opens that file without O_EXCL, truncates it with O_TRUNC, and fails with EEXIST only under O_EXCL
