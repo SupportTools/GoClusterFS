@@ -2466,9 +2466,8 @@ test_rename_file() {
 
     # Attempt to rename
     if ! ssh_run "$vm_id" "mv /mnt/goclusterfs/$oldname /mnt/goclusterfs/$newname" 2>/dev/null; then
-        # Rename not implemented - this is expected for now
-        log_info "SKIP: Rename operation not yet implemented in GoClusterFS"
-        return 0
+        log_error "mv $oldname $newname failed"
+        return 1
     fi
 
     # If rename succeeded, verify old name doesn't exist

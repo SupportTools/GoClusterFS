@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Older binaries read a newer node's waiting mark in a lock record as a held lock.
   - Older binaries free a file unlinked while open at once, even when a newer node still has it open.
   - Older binaries cannot replay a journal this version wrote, because they do not know its link-drop records. After a crash, let this version replay the journal before you downgrade.
+  - Older binaries skip rename records when they replay a journal this version wrote, but still apply the replaced file's link drop, which can free a file whose name remains. Upgrade every node before anyone renames.
 - Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
 - Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
 - Snapshots now record the birth generation of the file they were taken of, so a later file that reuses the inode number cannot list, clone or delete them. Snapshots older versions made do not record it, and some captured no data, so after the upgrade they are orphans: `getfattr -n user.snapshots` no longer lists them, `GET /api/v1/snapshots` lists them with `orphan: true`, and `DELETE /api/v1/snapshots/<name>` without `path` deletes them. Older binaries keep the birth generation in inode bytes 196–203 only while they do not rewrite the inode, so upgrade all nodes together.
@@ -59,6 +60,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `-cache-inodes`, `-cache-extents`, `-cache-negative` and `-broadcast-max-peers` set the cache and broadcast table sizes, and `/metrics` reports each limit next to its size.
 - A node that hears no broadcasts from a node the registry shows mounted, for 3 `-broadcast-heartbeat` intervals (90 seconds by default), logs a warning naming it, reports `broadcast-peers` as degraded on `/health`, and counts it in `goclusterfs_broadcast_silent_peers`. A network that silently drops multicast was invisible before.
+- Rename of files and directories, in one directory or between two, with `RENAME_NOREPLACE`. A rename over a file or an empty directory replaces it; a file another node has open stays readable there until its last close. `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
 
 ### Changed
 

@@ -1,6 +1,7 @@
 package journal
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -362,30 +363,22 @@ func TestDirRenamePayloadRoundTrip(t *testing.T) {
 		NewParentInodeNum: 20,
 		InodeNum:          100,
 		EntryType:         DirEntryDirectory,
+		TargetType:        DirEntryDirectory,
+		Flags:             1,
+		OldParentGen:      7,
+		NewParentGen:      8,
+		MetaGeneration:    9,
+		TargetInodeNum:    200,
+		TargetGen:         11,
 		OldName:           "oldname",
-		NewName:           "newname",
+		NewName:           strings.Repeat("n", 255),
 	}
-
-	data := original.Serialize()
-	restored, err := DeserializeDirRename(data)
+	restored, err := DeserializeDirRename(original.Serialize())
 	if err != nil {
 		t.Fatalf("DeserializeDirRename failed: %v", err)
 	}
-
-	if restored.OldParentInodeNum != original.OldParentInodeNum {
-		t.Errorf("OldParentInodeNum = %d, want %d", restored.OldParentInodeNum, original.OldParentInodeNum)
-	}
-	if restored.NewParentInodeNum != original.NewParentInodeNum {
-		t.Errorf("NewParentInodeNum = %d, want %d", restored.NewParentInodeNum, original.NewParentInodeNum)
-	}
-	if restored.InodeNum != original.InodeNum {
-		t.Errorf("InodeNum = %d, want %d", restored.InodeNum, original.InodeNum)
-	}
-	if restored.OldName != original.OldName {
-		t.Errorf("OldName = %q, want %q", restored.OldName, original.OldName)
-	}
-	if restored.NewName != original.NewName {
-		t.Errorf("NewName = %q, want %q", restored.NewName, original.NewName)
+	if *restored != *original {
+		t.Errorf("round trip: got %+v, want %+v", restored, original)
 	}
 }
 
