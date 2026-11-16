@@ -41,6 +41,19 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 	step(t, m, &Op{Kind: "snapclone", Path: f, Name: "l0-s1", Path2: "/l0-c1"}, int(syscall.ENOENT))
 	step(t, m, &Op{Kind: "snapdelete", Path: f, Name: "l0-s1"}, int(syscall.ENOENT))
 	step(t, m, &Op{Kind: "rename", Path: f, Path2: "/soak/d0/l0-r1"}, anyErrno)
+
+	link := "/soak/d0/l0-d1/l0-ln1"
+	step(t, m, &Op{Kind: "symlink", Path: link, Path2: "../l0-f1"}, 0)
+	step(t, m, &Op{Kind: "symlink", Path: link, Path2: "l0-x"}, int(syscall.EEXIST))
+	step(t, m, &Op{Kind: "create", Path: link}, int(syscall.EEXIST))
+	step(t, m, &Op{Kind: "symlink", Path: "/soak/d0/l0-gone/l0-ln2", Path2: "l0-x"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "unlink", Path: "/soak/d0/l0-d1/l0-f2"}, 0)
+	step(t, m, &Op{Kind: "rmdir", Path: "/soak/d0/l0-d1"}, int(syscall.ENOTEMPTY))
+	if got := m.listing("/soak/d0/l0-d1"); len(got) != 1 || got[0] != "l:l0-ln1:../l0-f1" {
+		t.Fatalf("listing with a symlink: %v", got)
+	}
+	step(t, m, &Op{Kind: "unlink", Path: link}, 0)
+	step(t, m, &Op{Kind: "rmdir", Path: "/soak/d0/l0-d1"}, 0)
 }
 
 // A lane only names and touches its own files, directories and snapshots, the same way for the same seed.

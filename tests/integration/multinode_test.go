@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -2081,5 +2082,53 @@ func TestMultiNodeStatfsFreeBlocks(t *testing.T) {
 		if _, ok := waitFor(peerReleaseWait, func() bool { return statfs(t, cluster.Node(i)).Bfree == start }); !ok {
 			t.Errorf("node %d: Bfree %v after node 1 removed the file = %d, want %d", i, peerReleaseWait, statfs(t, cluster.Node(i)).Bfree, start)
 		}
+	}
+}
+
+// TestMultiNodeSymlinks checks that symlinks made on one node read back, and unlink, on the other.
+func TestMultiNodeSymlinks(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("Failed to format and start first node: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("Failed to start second node: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatalf("Nodes failed to mount: %v", err)
+	}
+
+	maker, reader := cluster.Node(0), cluster.Node(1)
+	targets := map[string]string{"short": "target/short", "long": strings.Repeat("d/", 1000) + "end", "tofile": "real"}
+	if err := maker.WriteFile("real", []byte("through the link")); err != nil {
+		t.Fatal(err)
+	}
+	for name, target := range targets {
+		if err := os.Symlink(target, maker.Path(name)); err != nil {
+			t.Fatalf("symlink %s on node 0: %v", name, err)
+		}
+	}
+	for name, target := range targets {
+		got, err := os.Readlink(reader.Path(name))
+		if err != nil || got != target {
+			t.Errorf("readlink %s on node 1: %d bytes, %v; want the %d-byte target", name, len(got), err, len(target))
+		}
+		fi, err := os.Lstat(reader.Path(name))
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 || fi.Size() != int64(len(target)) {
+			t.Errorf("lstat %s on node 1: %v, %v", name, fi, err)
+		}
+	}
+	if data, err := os.ReadFile(reader.Path("tofile")); err != nil || string(data) != "through the link" {
+		t.Errorf("reading a file through a symlink on node 1: %q, %v", data, err)
+	}
+
+	if err := os.Remove(reader.Path("short")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := waitFor(10*time.Second, func() bool {
+		_, err := os.Lstat(maker.Path("short"))
+		return errors.Is(err, os.ErrNotExist)
+	}); !ok {
+		t.Error("node 0 still sees the symlink node 1 removed")
 	}
 }

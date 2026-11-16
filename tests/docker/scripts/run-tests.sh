@@ -2668,6 +2668,61 @@ test_statfs_after_remount() {
     return 0
 }
 
+# Symlinks made on one node read back, and unlink, on another.
+test_symlink_cross_node() {
+    log "Testing symlinks across nodes..."
+
+    local maker="${NODE_ARRAY[0]}"
+    local reader="${NODE_ARRAY[1]:-}"
+    if [[ -z "$reader" ]]; then
+        log "Skipping symlink cross-node test (requires 2+ nodes)"
+        return 0
+    fi
+    local d=/mnt/goclusterfs long
+    long="$(printf 'd/%.0s' $(seq 1 1000))end"
+    exec_on_node "$maker" rm -f "$d/sl_short" "$d/sl_long" "$d/sl_real" "$d/sl_tofile"
+    exec_on_node "$maker" ln -s target/short "$d/sl_short" || return 1
+    exec_on_node "$maker" ln -s "$long" "$d/sl_long" || return 1
+    exec_on_node "$maker" sh -c "echo through > $d/sl_real && ln -s sl_real $d/sl_tofile" || return 1
+
+    local failed=0
+    if [[ "$(exec_on_node "$reader" readlink "$d/sl_short")" != target/short ]]; then
+        log "ERROR: $reader reads the wrong short target"
+        failed=1
+    fi
+    if [[ "$(exec_on_node "$reader" readlink "$d/sl_long")" != "$long" ]]; then
+        log "ERROR: $reader reads the wrong long target"
+        failed=1
+    fi
+    if [[ "$(exec_on_node "$reader" stat -c %F "$d/sl_long")" != "symbolic link" ]]; then
+        log "ERROR: $reader does not see sl_long as a symlink"
+        failed=1
+    fi
+    if [[ "$(exec_on_node "$reader" cat "$d/sl_tofile")" != through ]]; then
+        log "ERROR: $reader cannot read a file through a symlink"
+        failed=1
+    fi
+
+    exec_on_node "$reader" rm "$d/sl_short" || return 1
+    local tries=0
+    while exec_on_node "$maker" test -L "$d/sl_short"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            log "ERROR: $maker still sees the symlink $reader removed"
+            failed=1
+            break
+        fi
+        sleep 0.2
+    done
+    exec_on_node "$maker" rm -f "$d/sl_long" "$d/sl_real" "$d/sl_tofile"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log "Symlink cross-node test passed"
+    return 0
+}
+
 # Writes 5 blocks on one node and removes the file on another, checking after
 # each step that both nodes report the same free blocks.
 test_statfs_multinode() {
@@ -3510,6 +3565,7 @@ run_test "Extent Cache Coherency" test_extent_cache_coherency
 run_test "Directory Lookup Coherency" test_dir_index_follows_other_node
 run_test "Statfs After Remount" test_statfs_after_remount
 run_test "Statfs Multi-Node" test_statfs_multinode
+run_test "Symlink Cross Node" test_symlink_cross_node
 run_test "Rolling Restart" test_rolling_restart
 run_test "Stress Random Failures" test_stress_random_failures
 
