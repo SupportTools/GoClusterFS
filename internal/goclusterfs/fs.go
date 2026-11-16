@@ -1061,6 +1061,8 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		logging.Debugf("Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
 		return nil, claimErrno(err)
 	}
+	// Counted before the name appears: a peer may unlink it at once, and this node must hold the file for its caller.
+	f.addOpen(childIno.InodeNum, 1)
 	now := time.Now().UnixNano()
 	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
 	childIno.UID = uid
@@ -1071,6 +1073,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	childIno.Ctime = now
 	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
 		logging.Debugf("Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
+		f.addOpen(childIno.InodeNum, -1)
 		f.freeNewInode(ctx, childIno.InodeNum)
 		return nil, syscall.EIO
 	}
@@ -1080,13 +1083,16 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 
 	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
 		logging.Debugf("Create %q: dirMgr.Add failed: %v", name, err)
+		f.addOpen(childIno.InodeNum, -1)
 		f.freeNewInode(ctx, childIno.InodeNum)
 		return nil, nameErrno(err)
+	}
+	if afterCommit != nil {
+		afterCommit("create: named")
 	}
 	f.cacheInode(childIno)
 	f.touchParent(ctx, parentNum, 0, now)
 
-	f.addOpen(childIno.InodeNum, 1)
 	ch := parent.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  uint64(childIno.InodeNum),

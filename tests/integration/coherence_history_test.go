@@ -29,7 +29,7 @@ var historyNames = []string{"n0", "n1", "n2", "n3", "n4"}
 // documented cross-node guarantees. It runs only with GCFS_HISTORY=1; -short
 // runs 2 nodes for 20s. For a long run set GCFS_HISTORY_MINUTES,
 // GCFS_HISTORY_NODES (2 to 4) and GCFS_HISTORY_OUT, a directory for each round's
-// history.
+// history. Set GCFS_IMAGE_DIR to keep the image off tmpfs, which tears writes inside a sector.
 func TestCoherenceHistory(t *testing.T) {
 	if os.Getenv("GCFS_HISTORY") != "1" {
 		t.Skip("set GCFS_HISTORY=1 to run the coherence history checker")
@@ -46,7 +46,7 @@ func TestCoherenceHistory(t *testing.T) {
 	}
 	out := os.Getenv("GCFS_HISTORY_OUT")
 
-	cluster := NewMultiNodeCluster(t, nodes, 256)
+	cluster := NewMultiNodeCluster(t, nodes, 1024)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("format and start node 0: %v", err)
 	}
@@ -219,6 +219,10 @@ func classify(err error) history.Result {
 	case errors.Is(err, syscall.ENOSYS), errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.EXDEV):
 		return history.Unsupported
 	}
+	var path *fs.PathError
+	if errors.Is(err, syscall.ESTALE) && errors.As(err, &path) && path.Op == "open" {
+		return history.Stale
+	}
 	return history.Failed
 }
 
@@ -229,7 +233,7 @@ func summarize(ops []history.Op) string {
 	}
 	var parts []string
 	for _, k := range []history.Kind{history.Write, history.Read, history.Stat, history.Readdir, history.Create, history.Unlink, history.Rename} {
-		for _, r := range []history.Result{history.OK, history.NotFound, history.Exists, history.Unsupported, history.Failed} {
+		for _, r := range []history.Result{history.OK, history.NotFound, history.Exists, history.Unsupported, history.Stale, history.Failed} {
 			if n := counts[k.String()+" "+r.String()]; n > 0 {
 				parts = append(parts, fmt.Sprintf("%s %s %d", k, r, n))
 			}

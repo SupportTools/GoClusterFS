@@ -4144,6 +4144,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
 
+  - id: fsck-checks-every-dir-entry
+    name: fsck checks every directory entry's type and inode range
+    description: fsck reports an entry whose type does not match its inode whatever the inode number, and an entry whose inode number is past the inode table, including one that would wrap to a used inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_dir_test.go::TestFsckChecksEveryDirectoryEntry
+
   - id: snapshot-unreadable-sector-eio
     name: An unreadable snapshot registry sector makes lookups and listings fail with EIO
     description: With a registry sector that fails its checksum, a lookup that finds nothing and every listing fail with EIO instead of not found or a partial list; a snapshot in a readable sector is still found and the mount scan still succeeds
@@ -4668,6 +4675,27 @@ scenarios:
     priority: go_only
     environments:
       go: history/history_test.go::TestNameChangesMayLagTheWindow
+
+  - id: history-checker-local-tear
+    name: Coherence checker allows page-cache tears during a local write
+    description: A torn read split at 8-byte boundaries while a write on the reader's node overlapped it is allowed; a split at any other offset is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTearDuringALocalWriteIsAllowedAtWordBoundaries
+
+  - id: history-checker-word-tear
+    name: Coherence checker allows a tear inside one word during a local write
+    description: A torn read whose boundary word mixes bytes of the values on either side is allowed during a write on the reader's node; a word with bytes from neither side is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTearInsideAWordDuringALocalWriteIsAllowed
+
+  - id: history-checker-stale-open
+    name: Coherence checker allows ESTALE on open only under name churn
+    description: An open that fails with ESTALE is allowed only when its name lost its file during the call and once more within the cache window before it or during it; otherwise it is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestStaleOpenOnlyWhenTheNameLostItsFileTwice
 
   - id: history-checker-torn-read
     name: Coherence checker flags torn reads

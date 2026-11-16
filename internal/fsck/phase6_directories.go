@@ -71,6 +71,7 @@ func (c *Checker) checkDirectories() error {
 	dirCount := 0
 	entryCount := 0
 	invalidEntries := 0
+	totalInodes := sb.InodeTableSize / InodeSize
 
 	// Find all directory inodes and validate their entries
 	inodeTableOffset := sb.InodeTableOffset
@@ -126,8 +127,17 @@ func (c *Checker) checkDirectories() error {
 					continue // Deleted entry
 				}
 
+				if entry.InodeNum >= totalInodes {
+					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
+						fmt.Sprintf("entry %q references inode %d, past the inode table's %d inodes", entry.Name, entry.InodeNum, totalInodes),
+						false)
+					invalidEntries++
+					continue
+				}
+				target := uint32(entry.InodeNum)
+
 				// Check if referenced inode exists
-				if !c.inodeUsed[uint32(entry.InodeNum)] {
+				if !c.inodeUsed[target] {
 					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
 						fmt.Sprintf("entry %q references non-existent inode %d", entry.Name, entry.InodeNum),
 						false)
@@ -136,19 +146,16 @@ func (c *Checker) checkDirectories() error {
 				}
 
 				if entry.Name != "." && entry.Name != ".." {
-					c.dirEntryRefs[uint32(entry.InodeNum)]++
+					c.dirEntryRefs[target]++
 					c.dirNames[inodeNum]++
 				}
 
-				// Validate file type matches inode mode
-				if entry.InodeNum < uint64(len(c.inodeUsed)) {
-					// We would need to read the target inode to verify type
-					// For now, just validate the type is valid
-					if !isValidDirEntryType(entry.FileType) {
-						c.addProblem(PhaseDirectories, Warning, fmt.Sprintf("inode %d", inodeNum),
-							fmt.Sprintf("entry %q has invalid file type %d", entry.Name, entry.FileType),
-							false)
-					}
+				// Phase 3 reports an inode whose mode has no valid type.
+				if want := c.entryType[target]; want != DT_UNKNOWN && entry.FileType != want {
+					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
+						fmt.Sprintf("entry %q has file type %d, but inode %d has type %d: lookup, unlink and rmdir go by the entry's type",
+							entry.Name, entry.FileType, entry.InodeNum, want),
+						false)
 				}
 			}
 		}
@@ -273,14 +280,4 @@ func parseDirChunk(chunk []byte, base int) ([]*DirEntryData, []string) {
 		pos += recLen
 	}
 	return entries, errors
-}
-
-// isValidDirEntryType checks if a directory entry file type is valid.
-func isValidDirEntryType(ft uint8) bool {
-	switch ft {
-	case DT_UNKNOWN, DT_REG, DT_DIR, DT_LNK, DT_BLK, DT_CHR, DT_FIFO, DT_SOCK:
-		return true
-	default:
-		return false
-	}
 }
