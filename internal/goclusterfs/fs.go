@@ -1725,7 +1725,7 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	unlock := f.fs.lockInode(f.inodeNum)
 	reopen := f.fs.addOpen(f.inodeNum, 1) > 1
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if err != nil || !liveFile(ino) && !(reopen && f.fs.holdsOrphan(ino)) {
+	if usable := err == nil && (liveFile(ino) || reopen && f.fs.holdsOrphan(ino)); !usable {
 		f.fs.addOpen(f.inodeNum, -1)
 		unlock()
 		if err != nil {
