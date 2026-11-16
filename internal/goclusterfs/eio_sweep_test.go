@@ -267,6 +267,9 @@ func runEIO(t *testing.T, n int64, crash bool) []eioWrite {
 		fsys.snapshotWkr.Stop()
 		fsys.dev.SetWriteGate(func(int64) error { return errPowerCut })
 		fsys = mountAfterPowerCut(t, path, offset, size, false)
+	} else {
+		// A write the workload never reached must not fail fsck's repair instead.
+		fsys.dev.SetWriteGate(func(int64) error { return nil })
 	}
 	checkEIOResults(t, fsys, ok)
 	expectOnlyLeaks(t, fsys)
