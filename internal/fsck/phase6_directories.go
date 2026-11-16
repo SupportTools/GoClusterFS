@@ -150,6 +150,17 @@ func (c *Checker) checkDirectories() error {
 							false)
 					}
 				}
+
+				switch link := c.symlinks[uint32(entry.InodeNum)]; {
+				case link && entry.FileType != DT_LNK:
+					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
+						fmt.Sprintf("entry %q has file type %d, but inode %d is a symlink", entry.Name, entry.FileType, entry.InodeNum),
+						false)
+				case !link && entry.FileType == DT_LNK:
+					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
+						fmt.Sprintf("entry %q is typed as a symlink, but inode %d is not one", entry.Name, entry.InodeNum),
+						false)
+				}
 			}
 		}
 	}

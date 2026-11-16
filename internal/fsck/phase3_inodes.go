@@ -40,6 +40,10 @@ const (
 	FlagHasSnapshot   uint16 = 1 << 1
 	FlagDeleted       uint16 = 1 << 2
 	FlagSnapshotData  uint16 = 1 << 6
+	FlagInlineTarget  uint16 = 1 << 7
+
+	MaxInlineTarget  = 92
+	MaxSymlinkTarget = 4095
 )
 
 // InodeData holds parsed inode information.
@@ -69,6 +73,9 @@ type InodeData struct {
 
 	BirthGeneration uint64
 	Holders         uint64
+
+	// Target is an inline symlink's target, which takes the place of the extent fields.
+	Target [MaxInlineTarget]byte
 
 	// Checksum
 	Checksum uint32
@@ -220,6 +227,10 @@ func (c *Checker) checkInodes() error {
 			if inode.Flags&FlagSnapshotData != 0 {
 				c.snapshotData[inodeNum] = true
 			}
+			if fileType == S_IFLNK {
+				c.symlinks[inodeNum] = true
+				c.checkSymlink(inodeNum, inode)
+			}
 
 			// Record extents for cross-validation
 			c.recordInodeExtents(inodeNum, inode)
@@ -264,6 +275,14 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 
 	// Skip DataGeneration, MetaGeneration, LastModifierUUID (72-104)
 
+	inode.BirthGeneration = binary.LittleEndian.Uint64(buf[196:204])
+	inode.Holders = binary.LittleEndian.Uint64(buf[204:212])
+	inode.Checksum = binary.LittleEndian.Uint32(buf[252:256])
+	if inode.Mode&S_IFMT == S_IFLNK && inode.Flags&FlagInlineTarget != 0 {
+		copy(inode.Target[:], buf[104:196])
+		return inode
+	}
+
 	// Parse inline extents (offset 104-167, 32 bytes each)
 	for i := 0; i < 2; i++ {
 		extOffset := 104 + i*32
@@ -280,11 +299,6 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 	inode.ExtentCount = binary.LittleEndian.Uint64(buf[176:184])
 	inode.ExtentDepth = binary.LittleEndian.Uint32(buf[184:188])
 	inode.ExtentTreeGen = binary.LittleEndian.Uint64(buf[188:196])
-	inode.BirthGeneration = binary.LittleEndian.Uint64(buf[196:204])
-	inode.Holders = binary.LittleEndian.Uint64(buf[204:212])
-
-	// Checksum (last 4 bytes)
-	inode.Checksum = binary.LittleEndian.Uint32(buf[252:256])
 
 	return inode
 }

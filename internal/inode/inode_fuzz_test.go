@@ -46,7 +46,10 @@ func FuzzDeserializeInode(f *testing.F) {
 
 	root := Inode{Magic: InodeMagic, InodeNum: InodeRoot, Mode: S_IFDIR | 0o755, LinkCount: 2}
 
-	for _, ino := range []*Inode{&file, &tree, &sfb, &root} {
+	link := Inode{Magic: InodeMagic, InodeNum: 43, Mode: S_IFLNK | 0o777, LinkCount: 1}
+	link.SetInlineTarget([]byte("../lib/libfoo.so.1"))
+
+	for _, ino := range []*Inode{&file, &tree, &sfb, &root, &link} {
 		f.Add(serializeInode(ino))
 	}
 	valid := serializeInode(&file)

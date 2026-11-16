@@ -1,8 +1,11 @@
 package journal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/supporttools/GoClusterFS/internal/inode"
 )
 
 // TxnOpType represents the type of operation in a transaction entry.
@@ -14,6 +17,8 @@ const (
 	TxnOpInodeUpdate TxnOpType = 0x0101
 	TxnOpInodeDelete TxnOpType = 0x0102
 	TxnOpLinkDrop    TxnOpType = 0x0103
+	// TxnOpSymlinkTarget gives an inode created in the same transaction its symlink target.
+	TxnOpSymlinkTarget TxnOpType = 0x0105
 
 	// Directory Operations (0x02xx)
 	TxnOpDirAddEntry    TxnOpType = 0x0200
@@ -54,6 +59,8 @@ func (op TxnOpType) String() string {
 		return "InodeDelete"
 	case TxnOpLinkDrop:
 		return "LinkDrop"
+	case TxnOpSymlinkTarget:
+		return "SymlinkTarget"
 	case TxnOpDirAddEntry:
 		return "DirAddEntry"
 	case TxnOpDirRemoveEntry:
@@ -813,6 +820,41 @@ func DeserializeRefCountUpdate(buf []byte) (*RefCountUpdatePayload, error) {
 // ============================================================================
 // Transaction Builder Convenience Methods
 // ============================================================================
+
+// SymlinkTargetPayload is a new symlink's target: inline in the inode when
+// DiskBlock is 0, otherwise in that block, which was written before the commit.
+type SymlinkTargetPayload struct {
+	InodeNum  uint64
+	DiskBlock uint64
+	Target    []byte
+}
+
+func (p *SymlinkTargetPayload) Serialize() []byte {
+	buf := make([]byte, 16+len(p.Target))
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.DiskBlock)
+	copy(buf[16:], p.Target)
+	return buf
+}
+
+func DeserializeSymlinkTarget(buf []byte) (*SymlinkTargetPayload, error) {
+	if len(buf) < 17 {
+		return nil, ErrTxnTooSmall
+	}
+	if len(buf) > 16+inode.MaxSymlinkTarget {
+		return nil, fmt.Errorf("symlink target of %d bytes", len(buf)-16)
+	}
+	return &SymlinkTargetPayload{
+		InodeNum:  binary.LittleEndian.Uint64(buf[0:8]),
+		DiskBlock: binary.LittleEndian.Uint64(buf[8:16]),
+		Target:    bytes.Clone(buf[16:]),
+	}, nil
+}
+
+// LogSymlinkTarget adds a new symlink's target to the transaction.
+func (txn *Transaction) LogSymlinkTarget(payload *SymlinkTargetPayload) error {
+	return txn.addEntry(TxnOpSymlinkTarget, payload.Serialize())
+}
 
 // LogInodeCreate adds an inode creation entry to the transaction.
 func (txn *Transaction) LogInodeCreate(payload *InodeCreatePayload) error {

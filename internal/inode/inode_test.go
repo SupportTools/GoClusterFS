@@ -1098,3 +1098,37 @@ func TestRewriteChangesHoldersAndKeepsReservedBytes(t *testing.T) {
 		t.Errorf("rewrite changed reserved bytes 212-251: %x", slot[212:InodeSize-4])
 	}
 }
+
+// An inline target fills the extent area on disk and comes back with no
+// extents, so nothing that walks extents reads target bytes as blocks.
+func TestInlineSymlinkTargetRoundTrip(t *testing.T) {
+	for _, n := range []int{1, MaxInlineTarget} {
+		target := bytes.Repeat([]byte{'/'}, n)
+		ino := &Inode{Magic: InodeMagic, InodeNum: 7, Mode: S_IFLNK | 0o777, LinkCount: 1, BirthGeneration: 3}
+		ino.SetInlineTarget(target)
+		got, err := deserializeInode(serializeInode(ino))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.HasInlineTarget() || !bytes.Equal(got.InlineTarget(), target) || got.Size != uint64(n) {
+			t.Errorf("%d-byte target came back as %q (inline=%v, size %d)", n, got.InlineTarget(), got.HasInlineTarget(), got.Size)
+		}
+		if got.InlineExtents != ([MaxInlineExtents]InlineExtent{}) || got.ExtentCount != 0 || got.ExtentTreeRoot != 0 || got.BirthGeneration != 3 {
+			t.Errorf("%d-byte target: extents %+v, count %d, root %d, birth %d", n, got.InlineExtents, got.ExtentCount, got.ExtentTreeRoot, got.BirthGeneration)
+		}
+	}
+}
+
+// The flag means an inline target only on a symlink, so a regular file with
+// that bit set keeps its extents.
+func TestInlineTargetFlagOnlyMarksSymlinks(t *testing.T) {
+	ino := &Inode{Magic: InodeMagic, InodeNum: 8, Mode: S_IFREG | 0o644, Flags: FlagInlineTarget, LinkCount: 1, ExtentCount: 1}
+	ino.InlineExtents[0] = InlineExtent{PhysicalBlock: 50, Length: 1, Flags: 1}
+	got, err := deserializeInode(serializeInode(ino))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HasInlineTarget() || got.InlineExtents[0].PhysicalBlock != 50 {
+		t.Errorf("a regular file with the flag decoded as inline=%v, extent %+v", got.HasInlineTarget(), got.InlineExtents[0])
+	}
+}

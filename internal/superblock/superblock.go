@@ -43,11 +43,13 @@ const (
 
 	// RequiredTypedLockRecords means each lock type has its own lock records; builds without it hash every type over all of them.
 	RequiredTypedLockRecords uint64 = 1 << 4
+	// RequiredSymlinks means symlink inodes may keep their target in the inode's extent area.
+	RequiredSymlinks uint64 = 1 << 5
 )
 
 // FlagsWeSupport defines which required flags this version understands.
 // Update this as new features are implemented.
-var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredTypedLockRecords
+var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredTypedLockRecords | RequiredSymlinks
 
 // Errors
 var (

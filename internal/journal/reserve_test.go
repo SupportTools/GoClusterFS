@@ -4,6 +4,8 @@ import (
 	"errors"
 	"slices"
 	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/inode"
 )
 
 type reserveJournal struct {
@@ -305,5 +307,21 @@ func TestFailedHeadMoveKeepsReplayWhole(t *testing.T) {
 	}
 	if got := r.unused(); len(got) != 0 {
 		t.Errorf("replay would free %v of the ended record", got)
+	}
+}
+
+// A symlink target round trips, and one longer than PATH_MAX allows is refused.
+func TestSymlinkTargetPayload(t *testing.T) {
+	p := &SymlinkTargetPayload{InodeNum: 9, DiskBlock: 40, Target: []byte("../lib/libfoo.so.1")}
+	got, err := DeserializeSymlinkTarget(p.Serialize())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InodeNum != 9 || got.DiskBlock != 40 || string(got.Target) != string(p.Target) {
+		t.Errorf("payload came back as %+v", got)
+	}
+	long := &SymlinkTargetPayload{InodeNum: 9, Target: make([]byte, inode.MaxSymlinkTarget+1)}
+	if _, err := DeserializeSymlinkTarget(long.Serialize()); err == nil {
+		t.Error("a target longer than PATH_MAX decoded")
 	}
 }

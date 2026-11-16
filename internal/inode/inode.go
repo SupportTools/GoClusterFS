@@ -46,6 +46,10 @@ const (
 
 	// MaxInlineExtents is the number of extents stored directly in the inode.
 	MaxInlineExtents = 2
+	// MaxInlineTarget is how many target bytes fit where the inline extents and tree fields go.
+	MaxInlineTarget = 92
+	// MaxSymlinkTarget is PATH_MAX without its NUL.
+	MaxSymlinkTarget = 4095
 )
 
 // File types (match Linux S_IF* values)
@@ -69,6 +73,7 @@ const (
 	FlagImmutable     uint16 = 1 << 4 // Cannot be modified
 	FlagAppend        uint16 = 1 << 5 // Append-only
 	FlagSnapshotData  uint16 = 1 << 6 // Holds a snapshot's frozen extents; in no directory
+	FlagInlineTarget  uint16 = 1 << 7 // Symlink whose target fills the extent area instead of extents
 )
 
 // Errors
@@ -128,6 +133,9 @@ type Inode struct {
 	Holders          uint64          // with LinkCount 0: one bit per registry slot that may still have the file open
 	Reserved         [40]byte        // Bytes 212-251, unused here; written back as read so newer versions' fields survive
 	Checksum         uint32          // CRC32C checksum
+
+	// Target is a FlagInlineTarget symlink's target, decoded from where the extent fields go.
+	Target [MaxInlineTarget]byte
 
 	// PendingTree holds extent-tree changes owned by package extent that are
 	// not on disk yet. It is never serialized; Table writes it via its TreeFlusher.
@@ -774,6 +782,24 @@ func (inode *Inode) IsSymlink() bool {
 	return (inode.Mode & S_IFMT) == S_IFLNK
 }
 
+// HasInlineTarget reports whether the inode is a symlink whose target is in the inode.
+func (inode *Inode) HasInlineTarget() bool {
+	return inode.IsSymlink() && inode.Flags&FlagInlineTarget != 0
+}
+
+// InlineTarget returns an inline symlink's target.
+func (inode *Inode) InlineTarget() []byte {
+	return inode.Target[:min(inode.Size, MaxInlineTarget)]
+}
+
+// SetInlineTarget stores a symlink target of at most MaxInlineTarget bytes in the inode.
+func (inode *Inode) SetInlineTarget(target []byte) {
+	inode.Flags |= FlagInlineTarget
+	inode.Target = [MaxInlineTarget]byte{}
+	copy(inode.Target[:], target)
+	inode.Size = uint64(len(target))
+}
+
 // HasExtentTree returns true if the inode uses an overflow extent tree.
 func (inode *Inode) HasExtentTree() bool {
 	return (inode.Flags & FlagHasExtentTree) != 0
@@ -826,21 +852,22 @@ func serializeInode(inode *Inode) []byte {
 	// Last modifier UUID
 	copy(buf[88:104], inode.LastModifierUUID[:])
 
-	// Inline extents (2 × 32 bytes = 64 bytes)
-	for i, ext := range inode.InlineExtents {
-		offset := 104 + i*32
-		binary.LittleEndian.PutUint64(buf[offset:offset+8], ext.LogicalBlock)
-		binary.LittleEndian.PutUint64(buf[offset+8:offset+16], ext.PhysicalBlock)
-		binary.LittleEndian.PutUint64(buf[offset+16:offset+24], ext.Length)
-		binary.LittleEndian.PutUint32(buf[offset+24:offset+28], ext.Flags)
-		binary.LittleEndian.PutUint32(buf[offset+28:offset+32], ext.Reserved)
+	if inode.HasInlineTarget() {
+		copy(buf[104:196], inode.Target[:])
+	} else {
+		for i, ext := range inode.InlineExtents {
+			offset := 104 + i*32
+			binary.LittleEndian.PutUint64(buf[offset:offset+8], ext.LogicalBlock)
+			binary.LittleEndian.PutUint64(buf[offset+8:offset+16], ext.PhysicalBlock)
+			binary.LittleEndian.PutUint64(buf[offset+16:offset+24], ext.Length)
+			binary.LittleEndian.PutUint32(buf[offset+24:offset+28], ext.Flags)
+			binary.LittleEndian.PutUint32(buf[offset+28:offset+32], ext.Reserved)
+		}
+		binary.LittleEndian.PutUint64(buf[168:176], inode.ExtentTreeRoot)
+		binary.LittleEndian.PutUint64(buf[176:184], inode.ExtentCount)
+		binary.LittleEndian.PutUint32(buf[184:188], inode.ExtentDepth)
+		binary.LittleEndian.PutUint64(buf[188:196], inode.ExtentTreeGen)
 	}
-
-	// Extent tree info
-	binary.LittleEndian.PutUint64(buf[168:176], inode.ExtentTreeRoot)
-	binary.LittleEndian.PutUint64(buf[176:184], inode.ExtentCount)
-	binary.LittleEndian.PutUint32(buf[184:188], inode.ExtentDepth)
-	binary.LittleEndian.PutUint64(buf[188:196], inode.ExtentTreeGen)
 	binary.LittleEndian.PutUint64(buf[196:204], inode.BirthGeneration)
 	binary.LittleEndian.PutUint64(buf[204:212], inode.Holders)
 	copy(buf[212:252], inode.Reserved[:])
@@ -889,10 +916,6 @@ func deserializeInode(buf []byte) (*Inode, error) {
 		Ctime:           int64(binary.LittleEndian.Uint64(buf[64:72])),
 		DataGeneration:  binary.LittleEndian.Uint64(buf[72:80]),
 		MetaGeneration:  binary.LittleEndian.Uint64(buf[80:88]),
-		ExtentTreeRoot:  binary.LittleEndian.Uint64(buf[168:176]),
-		ExtentCount:     binary.LittleEndian.Uint64(buf[176:184]),
-		ExtentDepth:     binary.LittleEndian.Uint32(buf[184:188]),
-		ExtentTreeGen:   binary.LittleEndian.Uint64(buf[188:196]),
 		BirthGeneration: binary.LittleEndian.Uint64(buf[196:204]),
 		Holders:         binary.LittleEndian.Uint64(buf[204:212]),
 		Checksum:        stored,
@@ -902,7 +925,14 @@ func deserializeInode(buf []byte) (*Inode, error) {
 	copy(inode.LastModifierUUID[:], buf[88:104])
 	copy(inode.Reserved[:], buf[212:252])
 
-	// Deserialize inline extents
+	if inode.HasInlineTarget() {
+		copy(inode.Target[:], buf[104:196])
+		return inode, nil
+	}
+	inode.ExtentTreeRoot = binary.LittleEndian.Uint64(buf[168:176])
+	inode.ExtentCount = binary.LittleEndian.Uint64(buf[176:184])
+	inode.ExtentDepth = binary.LittleEndian.Uint32(buf[184:188])
+	inode.ExtentTreeGen = binary.LittleEndian.Uint64(buf[188:196])
 	for i := range inode.InlineExtents {
 		offset := 104 + i*32
 		inode.InlineExtents[i] = InlineExtent{

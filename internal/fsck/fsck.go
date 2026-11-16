@@ -391,6 +391,7 @@ type Checker struct {
 	inodeBlocks     map[uint64]int  // block -> reference count from inodes
 	inodeUsed       map[uint32]bool // inode numbers that are in use
 	inodeBirth      map[uint32]uint64
+	symlinks        map[uint32]bool // symlink inodes, to match against DT_LNK entries
 	dirEntryRefs    map[uint32]int  // inode -> names in directories, not counting "." and ".."
 	dirNames        map[uint32]int  // directory inode -> names it holds
 	namesIncomplete []string        // why dirEntryRefs may miss names
@@ -477,6 +478,7 @@ func New(dev *storage.Device, opts Options) *Checker {
 		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
 		inodeBirth:      make(map[uint32]uint64),
+		symlinks:        make(map[uint32]bool),
 		dirEntryRefs:    make(map[uint32]int),
 		dirNames:        make(map[uint32]int),
 		snapshotInodes:  make(map[uint32]bool),
