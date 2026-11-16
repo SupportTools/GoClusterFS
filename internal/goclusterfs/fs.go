@@ -1754,7 +1754,7 @@ func (f *File) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	}
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err == nil && ino.Magic == inode.InodeMagic && ino.LinkCount == 0 && ino.Holders&f.fs.slotBit() != 0 {
-		if err := f.fs.clearHolder(detach(ctx), orphanOf(ino), 0); err != nil {
+		if err := f.fs.clearHolder(detach(ctx), orphanOf(ino), 0); err != nil && !errors.Is(err, errStillLinked) {
 			log.Printf("[WARN] inode %d: letting go of it at its last close failed: %v", f.inodeNum, err)
 		}
 	}

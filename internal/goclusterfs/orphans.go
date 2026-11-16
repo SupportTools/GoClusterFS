@@ -33,7 +33,11 @@ type openFiles struct {
 
 var orphanDrainWait = node.HeartbeatTimeout + 2*node.FailureCheckInterval
 
-var errNotHeld = errors.New("orphan is not held by this node")
+var (
+	errNotHeld = errors.New("orphan is not held by this node")
+	// The unlinking node lists a file before its last link goes, so a peer may see it while still linked.
+	errStillLinked = errors.New("listed file still has a link")
+)
 
 // SetOrphanRegistry connects orphan handling to the node registry; without one this node is alone in slot 0.
 func (f *FS) SetOrphanRegistry(r orphanRegistry) {
@@ -106,7 +110,7 @@ func (f *FS) reserveOrphan(ino *inode.Inode) (uint64, error) {
 		}
 		f.notifyOrphans()
 		switch {
-		case f.pruneOwnOrphans() > 0:
+		case f.pruneOwnOrphans(false) > 0:
 			progress = time.Now()
 			continue
 		case f.orphanReg.PeersFailing():
@@ -172,7 +176,10 @@ func (f *FS) clearHolder(ctx context.Context, o node.Orphan, gone uint64) error 
 		clear |= f.slotBit()
 	}
 	ino, err := f.updateUnderInodeLock(ctx, o.Inode, func(ino *inode.Inode) error {
-		if ino.Magic != inode.InodeMagic || ino.LinkCount != 0 || orphanOf(ino) != o || ino.Holders&clear == 0 {
+		switch {
+		case ino.Magic == inode.InodeMagic && orphanOf(ino) == o && ino.LinkCount != 0:
+			return errStillLinked
+		case ino.Magic != inode.InodeMagic || ino.LinkCount != 0 || orphanOf(ino) != o || ino.Holders&clear == 0:
 			return errNotHeld
 		}
 		ino.Holders &^= clear
@@ -252,18 +259,20 @@ func (f *FS) LearnOrphans(slot int, list []node.Orphan) {
 		if f.opened(o.Inode) || f.alreadyCleared(o) {
 			continue
 		}
-		if err := f.clearHolder(ctx, o, 0); err != nil {
+		switch err := f.clearHolder(ctx, o, 0); {
+		case errors.Is(err, errStillLinked):
+		case err != nil:
 			log.Printf("[WARN] orphan inode %d: letting go of it failed: %v", o.Inode, err)
-			continue
+		default:
+			f.markCleared(o)
 		}
-		f.markCleared(o)
 	}
 	if f.orphanReg != nil && slot == f.orphanReg.LocalSlot() {
-		f.pruneOwnOrphans()
+		f.pruneOwnOrphans(false)
 	}
 }
 
-// ForgetSlot adopts the orphan list of dead slot k and clears bit k on every listed orphan.
+// ForgetSlot adopts dead slot k's orphans and clears bit k on all; for this node's own slot it also drops entries a crash left linked.
 func (f *FS) ForgetSlot(ctx context.Context, k int, dead []node.Orphan) error {
 	if f.orphanReg == nil {
 		return nil
@@ -278,17 +287,21 @@ func (f *FS) ForgetSlot(ctx context.Context, k int, dead []node.Orphan) error {
 		return err
 	}
 	for _, o := range append(all, dead...) {
-		if err := f.clearHolder(ctx, o, 1<<k); err != nil {
+		if err := f.clearHolder(ctx, o, 1<<k); err != nil && !errors.Is(err, errStillLinked) {
 			return fmt.Errorf("orphan inode %d: clearing dead slot %d: %w", o.Inode, k, err)
 		}
+	}
+	if k == f.orphanReg.LocalSlot() {
+		f.pruneOwnOrphans(true)
 	}
 	return nil
 }
 
-func (f *FS) pruneOwnOrphans() (dropped int) {
+// pruneOwnOrphans drops freed orphans. An entry still linked may be an unlink between reserveOrphan and dropLink.
+func (f *FS) pruneOwnOrphans(dropLinked bool) (dropped int) {
 	err := f.orphanReg.DropOrphans(func(o node.Orphan) bool {
 		ino, err := f.inodeTbl.Read(o.Inode)
-		done := err == nil && (ino.Magic != inode.InodeMagic || ino.LinkCount != 0 || orphanOf(ino) != o)
+		done := err == nil && (ino.Magic != inode.InodeMagic || orphanOf(ino) != o || ino.LinkCount != 0 && dropLinked)
 		if done {
 			dropped++
 		}

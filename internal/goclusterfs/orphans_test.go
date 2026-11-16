@@ -296,3 +296,50 @@ func TestFailingPeerKeepsAFullListWaiting(t *testing.T) {
 		t.Fatalf("unlink: %v after %v; want EBUSY only after the peer stopped failing (%v)", errno, time.Since(start), failingFor)
 	}
 }
+
+// The unlinking node lists a file before its last link goes; a peer that looks in between must still let go after.
+func TestPeerReleasesAnOrphanItSawBeforeTheDrop(t *testing.T) {
+	path := newFormattedImage(t)
+	cluster := newFakeCluster(0, 1)
+	nodeA := cluster.join(t, openFormattedFS(t, path), 0)
+	nodeB := cluster.join(t, openFormattedFS(t, path), 1)
+	ctx := context.Background()
+	f := createFile(t, nodeB, "f")
+
+	live, err := nodeB.reserveOrphan(readInode(t, nodeB, f.inodeNum))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeA.LearnOrphans(1, cluster.list(1))
+	if err := nodeB.dropLink(ctx, f.inodeNum, live); err != nil {
+		t.Fatal(err)
+	}
+	if ino := readInode(t, nodeA, f.inodeNum); ino.LinkCount != 0 || ino.Holders != 1 {
+		t.Fatalf("after the drop: links %d, holders %#b; want an orphan node A holds", ino.LinkCount, ino.Holders)
+	}
+	nodeA.LearnOrphans(1, cluster.list(1))
+	if ino := readInode(t, nodeA, f.inodeNum); ino.Magic != 0 {
+		t.Fatalf("node A never let go: magic %#x, holders %#b", ino.Magic, ino.Holders)
+	}
+}
+
+// A node's own pass keeps an entry whose unlink sits between reserveOrphan and dropLink; ForgetSlot of its slot drops it.
+func TestOwnPassKeepsAReservedOrphan(t *testing.T) {
+	cluster := newFakeCluster(0, 1)
+	fsys := cluster.join(t, openFormattedFS(t, newFormattedImage(t)), 0)
+	f := createFile(t, fsys, "f")
+	o := orphanOf(readInode(t, fsys, f.inodeNum))
+	if _, err := fsys.reserveOrphan(readInode(t, fsys, f.inodeNum)); err != nil {
+		t.Fatal(err)
+	}
+	fsys.LearnOrphans(0, cluster.list(0))
+	if !slices.Contains(cluster.list(0), o) {
+		t.Fatalf("this node's own pass dropped %v before the drop", o)
+	}
+	if err := fsys.ForgetSlot(context.Background(), 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := cluster.list(0); len(got) != 0 {
+		t.Errorf("ForgetSlot of this node's slot kept %v, a still-linked entry no unlink is working on", got)
+	}
+}

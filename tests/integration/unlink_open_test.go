@@ -115,7 +115,7 @@ func TestKilledHolderLetsGoOfAnUnlinkedFile(t *testing.T) {
 }
 
 // Removing more files than one orphan list holds, faster than the failure scan, must not fail with EBUSY,
-// and the unmount must leave no orphan behind.
+// and peers must free every file while still mounted.
 func TestPeerRemovesManyFilesQuickly(t *testing.T) {
 	cluster := NewMultiNodeCluster(t, 2, 400)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
@@ -125,6 +125,7 @@ func TestPeerRemovesManyFilesQuickly(t *testing.T) {
 		t.Fatalf("start node 1: %v", err)
 	}
 	const files = 1000
+	freeInodes := statfs(t, cluster.Node(0)).Ffree
 	for i := range files {
 		if err := os.WriteFile(cluster.Node(0).Path(fmt.Sprintf("f%d", i)), nil, 0o644); err != nil {
 			t.Fatal(err)
@@ -137,6 +138,9 @@ func TestPeerRemovesManyFilesQuickly(t *testing.T) {
 		}
 	}
 	t.Logf("node 1 removed %d files in %v", files, time.Since(start))
+	if _, ok := waitFor(peerReleaseWait, func() bool { return statfs(t, cluster.Node(0)).Ffree == freeInodes }); !ok {
+		t.Errorf("%v after the removes, %d free inodes, want %d: some removed files were never freed", peerReleaseWait, statfs(t, cluster.Node(0)).Ffree, freeInodes)
+	}
 	cluster.StopAllNodes()
 	if code, out := runFsck(t, cluster.ImagePath); code != 0 {
 		t.Errorf("fsck: exit %d:\n%s", code, strings.Join(problemLines(out), "\n"))
