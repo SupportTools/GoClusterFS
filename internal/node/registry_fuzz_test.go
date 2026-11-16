@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ func checkSlot(t *testing.T, buf []byte, slot *Slot) {
 		t.Fatalf("decoding a re-encoded slot: %v", err)
 	}
 	again.Checksum = slot.Checksum
-	if *again != *slot {
+	if !reflect.DeepEqual(again, slot) {
 		t.Fatalf("slot changed after an encode/decode round trip: %+v != %+v", again, slot)
 	}
 

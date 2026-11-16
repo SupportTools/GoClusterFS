@@ -156,6 +156,7 @@ func (m *Manager) Stats() Stats {
 		stats.MulticastEnabled = bstats.Transport.MulticastEnabled
 		stats.PeerCount = bstats.Transport.PeerCount
 		stats.BroadcastSenders = bstats.TrackedSenders
+		stats.BroadcastSilentPeers = bstats.SilentPeers
 		stats.BroadcastMaxPeers = bstats.MaxPeers
 	}
 
@@ -201,6 +202,7 @@ type Stats struct {
 	MulticastEnabled      bool
 	PeerCount             int
 	BroadcastSenders      int
+	BroadcastSilentPeers  int
 	BroadcastMaxPeers     int
 }
 
@@ -292,6 +294,23 @@ func (m *Manager) BroadcastProblem() string {
 	return m.broadcaster.Problem()
 }
 
+// WatchBroadcastPeers has the broadcaster report expected nodes it does not
+// hear from. It does nothing with broadcast off.
+func (m *Manager) WatchBroadcastPeers(expected func() ([]broadcast.ExpectedPeer, error)) {
+	if m.broadcaster != nil {
+		m.broadcaster.WatchPeers(expected)
+	}
+}
+
+// SilentBroadcastPeers names the expected nodes this node has not heard on
+// broadcast for the returned time.
+func (m *Manager) SilentBroadcastPeers() ([]string, time.Duration) {
+	if m.broadcaster == nil {
+		return nil, 0
+	}
+	return m.broadcaster.SilentPeers()
+}
+
 // BroadcastInvalidateInode invalidates an inode locally AND broadcasts
 // the invalidation to peer nodes. Call this after modifying an inode, and
 // cache the new inode after this call, since it drops the local entry.
@@ -338,6 +357,19 @@ func (m *Manager) BroadcastReturnReserves() {
 func (m *Manager) OnReturnReserves(fn func()) {
 	if m.broadcaster != nil {
 		m.broadcaster.OnReturnReserves(fn)
+	}
+}
+
+func (m *Manager) BroadcastOrphans() {
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastOrphans()
+	}
+}
+
+// OnOrphans must be called after StartBroadcast.
+func (m *Manager) OnOrphans(fn func()) {
+	if m.broadcaster != nil {
+		m.broadcaster.OnOrphans(fn)
 	}
 }
 

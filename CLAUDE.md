@@ -35,7 +35,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 |------|--------------|
 | `cmd/goclusterfs-mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
 | `cmd/goclusterfs-fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
-| `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics) |
+| `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics, snapshots) |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
 | `internal/superblock` | Superblock format and the on-disk layout; `-format` writes it, mount reads it |
@@ -96,7 +96,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
 - At most 64 nodes mount a volume at once, one per registry slot. A node judges another by whether its heartbeat changes, timed on its own clock, so failover does not need clocks to agree.
-- `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, and the superblock checksum. It reports every other problem without fixing it.
+- `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. Every `statfs` (`df`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - No rename, symlinks, or hard links.

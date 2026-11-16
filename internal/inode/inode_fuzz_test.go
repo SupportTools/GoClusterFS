@@ -51,7 +51,8 @@ func FuzzDeserializeInode(f *testing.F) {
 	}
 	valid := serializeInode(&file)
 	newer := bytes.Clone(valid)
-	copy(newer[204:InodeSize-4], bytes.Repeat([]byte{0xa5}, InodeSize-208))
+	binary.LittleEndian.PutUint64(newer[204:212], 1<<3|1<<40)
+	copy(newer[212:InodeSize-4], bytes.Repeat([]byte{0xa5}, InodeSize-216))
 	binary.LittleEndian.PutUint32(newer[InodeSize-4:], storage.CRC32C(newer[:InodeSize-4]))
 	f.Add(newer)
 	f.Add(valid[:InodeSize-1])

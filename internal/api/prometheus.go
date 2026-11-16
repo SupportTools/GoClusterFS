@@ -45,6 +45,7 @@ type fsCollector struct {
 	broadcastPeersDesc        *prometheus.Desc
 	broadcastSendersDesc      *prometheus.Desc
 	broadcastMaxPeersDesc     *prometheus.Desc
+	broadcastSilentPeersDesc  *prometheus.Desc
 	cacheInodeSizeDesc        *prometheus.Desc
 	cacheInodeHitsDesc        *prometheus.Desc
 	cacheInodeMissesDesc      *prometheus.Desc
@@ -159,6 +160,11 @@ func newFSCollector(s *Server) *fsCollector {
 		broadcastSendersDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "broadcast", "senders"),
 			"Nodes whose broadcast sequence numbers this node tracks",
+			nil, nil,
+		),
+		broadcastSilentPeersDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "broadcast", "silent_peers"),
+			"Mounted nodes this node has not heard on broadcast for 3 heartbeat intervals",
 			nil, nil,
 		),
 		broadcastMaxPeersDesc: prometheus.NewDesc(
@@ -516,6 +522,7 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.broadcastPeersDesc
 	ch <- c.broadcastSendersDesc
 	ch <- c.broadcastMaxPeersDesc
+	ch <- c.broadcastSilentPeersDesc
 	ch <- c.cacheInodeSizeDesc
 	ch <- c.cacheInodeHitsDesc
 	ch <- c.cacheInodeMissesDesc
@@ -658,6 +665,7 @@ func (c *fsCollector) collectCacheStats(ch chan<- prometheus.Metric, stats *Cach
 		ch <- prometheus.MustNewConstMetric(c.broadcastPeersDesc, prometheus.GaugeValue, float64(b.Peers))
 		ch <- prometheus.MustNewConstMetric(c.broadcastSendersDesc, prometheus.GaugeValue, float64(b.Senders))
 		ch <- prometheus.MustNewConstMetric(c.broadcastMaxPeersDesc, prometheus.GaugeValue, float64(b.MaxPeers))
+		ch <- prometheus.MustNewConstMetric(c.broadcastSilentPeersDesc, prometheus.GaugeValue, float64(b.SilentPeers))
 	}
 
 	// Inode cache

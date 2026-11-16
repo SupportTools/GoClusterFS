@@ -45,6 +45,8 @@ services:
       - MOUNT_POINT=/mnt/goclusterfs
       - FORMAT_ON_START=true
       - DEBUG=${DEBUG:-false}
+      # Short, so a node no longer heard on broadcast is reported within seconds
+      - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.11
@@ -77,6 +79,7 @@ services:
       - MOUNT_POINT=/mnt/goclusterfs
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
+      - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.12
@@ -109,6 +112,7 @@ services:
       - MOUNT_POINT=/mnt/goclusterfs
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
+      - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.13
@@ -141,6 +145,7 @@ services:
       - MOUNT_POINT=/mnt/goclusterfs
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
+      - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.14

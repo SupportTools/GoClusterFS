@@ -2360,6 +2360,22 @@ scenarios:
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestTrackedSendersBounded
 
+  - id: broadcast-silent-peers
+    name: Silent broadcast peers are reported
+    description: A node the registry shows mounted but not heard for 3 heartbeat intervals counts as silent until it is heard again or unmounts; this node is never listed
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/silence_test.go::TestSilentPeers
+
+  - id: broadcast-silent-peer-reported
+    name: A node reports peers it hears no broadcasts from
+    description: A node next to one that sends no broadcasts (Go) or that hears no multicast (Docker) reports its peers on /health and /metrics, and recovers when they are heard again
+    priority: high
+    environments:
+      go: broadcast_test.go::TestBroadcastReportsSilentPeer
+      docker: run-tests.sh::test_broadcast_silent_peer_reported
+      vm: TODO
+
   - id: broadcast-loss-drops-caches
     name: Broadcast loss drops caches
     description: A gap in a peer's sequence numbers clears the inode and extent caches once; a late message does not clear them again
@@ -4107,6 +4123,34 @@ scenarios:
     environments:
       go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
 
+  - id: inode-rewrite-keeps-reserved-bytes
+    name: An inode rewrite writes Holders and keeps the reserved bytes
+    description: Rewriting an inode read from disk writes its changed Holders at bytes 204-211 and writes back reserved bytes 212-251 as they were read
+    priority: go_only
+    environments:
+      go: internal/inode/inode_test.go::TestRewriteChangesHoldersAndKeepsReservedBytes
+
+  - id: fsck-repair-snapshot-sector
+    name: fsck repair rewrites a snapshot registry sector that fails its checksum
+    description: Repair keeps the descriptors that pass their own checksum, clears the damaged one and reports it, snapshot creates work again, and the next repair frees the lost snapshot's data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
+
+  - id: snapshot-unreadable-sector-eio
+    name: An unreadable snapshot registry sector makes lookups and listings fail with EIO
+    description: With a registry sector that fails its checksum, a lookup that finds nothing and every listing fail with EIO instead of not found or a partial list; a snapshot in a readable sector is still found and the mount scan still succeeds
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestUnreadableSectorFailsLookupsWithEIO
+
+  - id: snapshot-recover-around-unreadable-sector
+    name: Mount recovery rolls back snapshots around an unreadable registry sector
+    description: With one registry sector unreadable, RecoverIncompleteJobs still rolls back the creating snapshots in the other sectors instead of recovering none
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestRecoverAroundUnreadableSector
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
@@ -4471,6 +4515,20 @@ scenarios:
     environments:
       go: cmd/gfsctl/commands/errors_test.go::TestExitCodesAndHints
 
+  - id: gfsctl-snapshots
+    name: gfsctl snapshots lists snapshots
+    description: gfsctl snapshots sends the token, marks orphans, and prints the API's details and exits 8 when the registry cannot be read
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/commands_test.go::TestSnapshots
+
+  - id: api-snapshot-list-unreadable-sector
+    name: Snapshot listing names an unreadable registry sector
+    description: GET /api/v1/snapshots answers 500 with a JSON body naming the sector and goclusterfs-fsck -repair
+    priority: go_only
+    environments:
+      go: internal/api/writes_test.go::TestSnapshotListNamesUnreadableSector
+
   - id: gfsctl-debug
     name: gfsctl --debug logs requests
     description: --debug logs each API request with its status; without it nothing is logged
@@ -4676,3 +4734,60 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/open_errors_test.go::TestCreateWithoutExclOpensTheFileItFinds
+
+  - id: unlink-while-open
+    name: An unlinked file stays until its last close
+    description: A descriptor opened before the unlink keeps reading and writing the file, a new file never takes its inode, and the last close frees it with fsck clean
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck, which this test uses to check the last close freed everything.
+    environments:
+      go: unlink_open_test.go::TestFileUnlinkedWhileOpenKeepsItsData
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-while-open-on-peer
+    name: A file a peer unlinks stays until the holder closes it
+    description: Node 1 unlinks a file node 0 has open; node 0 keeps its data, node 1's new file gets another inode, and node 0's last close frees the file
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck, and the check reads the inode table from the image.
+    environments:
+      go: unlink_open_test.go::TestFileUnlinkedByAPeerWhileOpenKeepsItsData
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-while-open-holder-dies
+    name: A dead holder lets go of an unlinked file
+    description: Node 0 dies holding a file node 1 unlinked; node 1 frees it after replaying node 0's journal
+    priority: high
+    # Docker/VM: the check reads the inode table from the image, which their scripts cannot do.
+    environments:
+      go: unlink_open_test.go::TestKilledHolderLetsGoOfAnUnlinkedFile
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-many-on-peer
+    name: A node removes more files than one orphan list holds
+    description: With a peer mounted, removing 1000 files in a row never fails with EBUSY, and fsck is clean once failure scans have run
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck.
+    environments:
+      go: unlink_open_test.go::TestPeerRemovesManyFilesQuickly
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-many-with-stopped-peer
+    name: A bulk remove waits out a stopped peer
+    description: With node 1 stopped by SIGSTOP, node 0 removes 2000 files without EBUSY; the removes wait until node 1 is replayed, and fsck is clean
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck.
+    environments:
+      go: unlink_open_test.go::TestBulkRemoveWaitsOutAStoppedPeer
+      docker: TODO
+      vm: TODO
+
+  - id: orphan-holders-unit
+    name: Orphan holder bits and lists
+    description: A peer's unlink leaves an orphan only the holder keeps; a forgotten dead slot frees it; a full orphan list fails the unlink with EBUSY before anything changes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/orphans_test.go::TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose

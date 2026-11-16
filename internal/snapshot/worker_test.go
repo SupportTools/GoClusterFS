@@ -398,6 +398,34 @@ func TestRecoverIncompleteSnapshots(t *testing.T) {
 	}
 }
 
+// With a registry sector that cannot be read, recovery still rolls back the
+// snapshots in the other sectors. Their delete jobs then fail and wait, since
+// the bad sector may hold their children.
+func TestRecoverAroundUnreadableSector(t *testing.T) {
+	env := newWorkerEnv(t)
+	file, _ := env.file(1)
+	env.snapshot(file, "in-bad-sector", StateCreating)
+	env.reg.SetNodeSlot(1)
+	creating := env.snapshot(file, "creating", StateCreating)
+
+	buf := storage.NewAlignedBuffer(SectorSize)
+	if _, err := env.reg.dev.ReadAt(buf.Bytes(), int64(env.reg.offset)); err != nil {
+		t.Fatal(err)
+	}
+	buf.Bytes()[SectorSize-1] ^= 0xFF
+	if _, err := env.reg.dev.WriteAt(buf.Bytes(), int64(env.reg.offset)); err != nil {
+		t.Fatal(err)
+	}
+	env.start()
+
+	if err := env.w.RecoverIncompleteJobs(env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := env.reg.Get(env.ctx, creating.SnapshotID); err != nil || got.State != StateDeleting {
+		t.Fatalf("snapshot creating in a readable sector after recovery: %+v, %v; want it rolled back", got, err)
+	}
+}
+
 // TestMiddleSnapshotDeletionMergeUp tests deleting a snapshot that has children.
 // Expected behavior:
 // - Children are re-parented to grandparent (merge-up)

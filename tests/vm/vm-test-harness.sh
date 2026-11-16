@@ -208,6 +208,8 @@ write_setup_disk() {
 set -x
 setup-interfaces -a
 ifup eth0
+# goclusterfs-mount serves its API on 127.0.0.1, which needs loopback up.
+ip link set lo up
 printf '%s\n' "$repo/main" "$repo/community" > /etc/apk/repositories
 tries=0
 until apk add --no-cache openssh fuse3 gcompat attr; do
@@ -328,6 +330,34 @@ is_vm_running() {
     return 1
 }
 
+port_owner() {
+    command -v ss > /dev/null || return 0
+    ss -Htlnp "sport = :$1" | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2
+}
+
+# A QEMU this checkout lost track of keeps its VM's SSH port and fails every later boot of that VM.
+free_vm_port() {
+    local vm_id="$1" port="$2"
+    local pid=$(port_owner "$port")
+    [[ -n "$pid" ]] || return 0
+    local cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+    if [[ "$cmdline" != *"-name goclusterfs-vm${vm_id} "* || "$cmdline" != *"${VM_DIR}/"* ]]; then
+        log_error "VM $vm_id: SSH port $port is held by pid $pid (${cmdline:-unknown}); pick another base port"
+        return 1
+    fi
+    log_warn "VM $vm_id: QEMU pid $pid from an earlier boot still holds port $port, killing it"
+    kill -9 "$pid" 2>/dev/null
+    local waited=0
+    while [[ -n "$(port_owner "$port")" ]]; do
+        if [[ $waited -ge 50 ]]; then
+            log_error "VM $vm_id: port $port still held 10s after killing pid $pid"
+            return 1
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+}
+
 mark_vm_log() {
     local vm_id="$1"
     local text="$2"
@@ -382,6 +412,7 @@ boot_vm() {
 
     # Clean up old sockets before starting (avoids "Address already in use")
     rm -f "$monitor_socket" "$serial_socket"
+    free_vm_port "$vm_id" "$ssh_port" || return 1
 
     log_info "Starting VM $vm_id (SSH port: $ssh_port)..."
     log_info "Using accelerator: $accelerator, cpu: $cpu_type"

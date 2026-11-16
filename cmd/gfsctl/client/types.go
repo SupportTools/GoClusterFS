@@ -183,3 +183,21 @@ type IOStatsResponse struct {
 	AvgReadLatUs  float64 `json:"avg_read_latency_us"`
 	AvgWriteLatUs float64 `json:"avg_write_latency_us"`
 }
+
+// SnapshotInfo is one snapshot in a SnapshotListResponse.
+type SnapshotInfo struct {
+	ID        uint64 `json:"id"`
+	Name      string `json:"name"`
+	Inode     uint32 `json:"inode"`
+	State     string `json:"state"`
+	SizeBytes uint64 `json:"size_bytes"`
+	Blocks    uint64 `json:"blocks"`
+	CreatedAt string `json:"created_at,omitempty"`
+	Orphan    bool   `json:"orphan,omitempty"`
+}
+
+// SnapshotListResponse is returned by GET /api/v1/snapshots.
+type SnapshotListResponse struct {
+	Snapshots []SnapshotInfo `json:"snapshots"`
+	Total     int            `json:"total"`
+}

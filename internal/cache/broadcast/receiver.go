@@ -34,9 +34,16 @@ type Broadcaster struct {
 	sendMu sync.Mutex
 
 	onReturnReserves atomic.Pointer[func()]
+	onOrphans        atomic.Pointer[func()]
 
 	sendersMu sync.Mutex
 	senders   map[[16]byte]*senderSeq
+
+	started     time.Time
+	expected    atomic.Pointer[func() ([]ExpectedPeer, error)]
+	silentMu    sync.Mutex
+	silent      map[[16]byte]ExpectedPeer
+	firstListed map[[16]byte]time.Time
 
 	lossLogMu    sync.Mutex
 	lossLoggedAt time.Time
@@ -113,6 +120,7 @@ func (b *Broadcaster) Start(ctx context.Context) error {
 	}
 
 	b.ctx, b.cancel = context.WithCancel(ctx)
+	b.started = time.Now()
 
 	// Start transport with our message handler
 	if err := b.transport.Start(b.ctx, b.handleMessage); err != nil {
@@ -121,9 +129,10 @@ func (b *Broadcaster) Start(ctx context.Context) error {
 	}
 
 	// Start background tasks
-	b.wg.Add(2)
+	b.wg.Add(3)
 	go b.heartbeatLoop()
 	go b.cleanupLoop()
+	go b.watchLoop()
 
 	// Announce ourselves
 	b.announcePresence()
@@ -193,6 +202,11 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
 		if fn := b.onReturnReserves.Load(); fn != nil {
 			(*fn)()
 		}
+
+	case TypeOrphans:
+		if fn := b.onOrphans.Load(); fn != nil {
+			(*fn)()
+		}
 	}
 }
 
@@ -208,6 +222,21 @@ func (b *Broadcaster) BroadcastReturnReserves() {
 	}
 	if err := b.send(b.builder.ReturnReserves); err != nil {
 		log.Printf("[broadcast] failed to send ReturnReserves: %v", err)
+	}
+}
+
+// OnOrphans sets what runs, on the receive loop, when a peer's orphan list changed; fn must not block.
+func (b *Broadcaster) OnOrphans(fn func()) {
+	b.onOrphans.Store(&fn)
+}
+
+// A lost message only delays freeing: peers also check orphan lists on every failure scan.
+func (b *Broadcaster) BroadcastOrphans() {
+	if !b.running.Load() {
+		return
+	}
+	if err := b.send(b.builder.Orphans); err != nil {
+		log.Printf("[broadcast] failed to send Orphans: %v", err)
 	}
 }
 
@@ -492,8 +521,12 @@ func (b *Broadcaster) Stats() BroadcasterStats {
 	b.sendersMu.Lock()
 	senders := len(b.senders)
 	b.sendersMu.Unlock()
+	b.silentMu.Lock()
+	silent := b.silent
+	b.silentMu.Unlock()
 	return BroadcasterStats{
 		TrackedSenders:        senders,
+		SilentPeers:           len(silent),
 		MaxPeers:              b.transport.config.maxPeers(),
 		InvalidationsReceived: atomic.LoadUint64(&b.invalidationsReceived),
 		InvalidationsSent:     atomic.LoadUint64(&b.invalidationsSent),
@@ -512,6 +545,7 @@ type BroadcasterStats struct {
 	MessagesIgnored       uint64
 	MessagesLost          uint64
 	TrackedSenders        int
+	SilentPeers           int
 	MaxPeers              int
 	Transport             TransportStats
 }

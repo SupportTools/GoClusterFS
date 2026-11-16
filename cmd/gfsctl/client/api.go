@@ -105,6 +105,16 @@ func (c *Client) ClusterInfo(ctx context.Context) (*ClusterInfoResponse, error) 
 	return &resp, nil
 }
 
+// Snapshots returns every snapshot, orphans included, from /api/v1/snapshots.
+// The API answers only with the token.
+func (c *Client) Snapshots(ctx context.Context) (*SnapshotListResponse, error) {
+	var resp SnapshotListResponse
+	if err := c.Get(ctx, "/api/v1/snapshots", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Metrics returns the Prometheus text from /metrics.
 func (c *Client) Metrics(ctx context.Context) ([]byte, error) {
 	return c.GetRaw(ctx, "/metrics")

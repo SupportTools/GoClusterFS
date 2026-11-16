@@ -20,6 +20,7 @@ import (
 	"iter"
 	"log"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -145,6 +146,22 @@ var (
 	ErrNameTooLong          = errors.New("snapshot name too long")
 	ErrInvalidID            = errors.New("invalid snapshot ID")
 )
+
+// UnreadableSectorError is a registry sector that cannot be read. It is an
+// EIO error, and the operations that needed the sector fail with it.
+type UnreadableSectorError struct {
+	Sector uint64
+	Err    error
+}
+
+func (e *UnreadableSectorError) Error() string {
+	if errors.Is(e.Err, ErrChecksumMismatch) {
+		return fmt.Sprintf("snapshot registry sector %d fails its checksum; unmount the filesystem on every node and run goclusterfs-fsck -repair", e.Sector)
+	}
+	return fmt.Sprintf("snapshot registry sector %d cannot be read: %v; check the device, then run goclusterfs-fsck", e.Sector, e.Err)
+}
+
+func (e *UnreadableSectorError) Unwrap() []error { return []error{syscall.EIO, e.Err} }
 
 // Descriptor represents a snapshot on disk (128 bytes).
 //
@@ -396,14 +413,8 @@ func (r *Registry) Get(ctx context.Context, snapshotID uint64) (*Descriptor, err
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Scan for the descriptor (linear search for now)
-	for _, desc := range r.descriptors() {
-		if desc.IsValid() && desc.SnapshotID == snapshotID {
-			return desc, nil
-		}
-	}
-
-	return nil, ErrSnapshotNotFound
+	_, desc, err := r.find(func(d *Descriptor) bool { return d.SnapshotID == snapshotID })
+	return desc, err
 }
 
 // GetByName retrieves a snapshot descriptor by name.
@@ -411,13 +422,8 @@ func (r *Registry) GetByName(ctx context.Context, name string) (*Descriptor, err
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	for _, desc := range r.descriptors() {
-		if desc.IsValid() && desc.GetName() == name {
-			return desc, nil
-		}
-	}
-
-	return nil, ErrSnapshotNotFound
+	_, desc, err := r.find(func(d *Descriptor) bool { return d.GetName() == name })
+	return desc, err
 }
 
 // List returns all active snapshots.
@@ -425,14 +431,7 @@ func (r *Registry) List(ctx context.Context) ([]*Descriptor, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var snapshots []*Descriptor
-	for _, desc := range r.descriptors() {
-		if desc.IsValid() && (desc.Flags&FlagHidden) == 0 {
-			snapshots = append(snapshots, desc)
-		}
-	}
-
-	return snapshots, nil
+	return r.collect(func(d *Descriptor) bool { return d.Flags&FlagHidden == 0 })
 }
 
 // ListForInode returns all snapshots for a specific inode.
@@ -440,14 +439,7 @@ func (r *Registry) ListForInode(ctx context.Context, inodeNum uint32) ([]*Descri
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var snapshots []*Descriptor
-	for _, desc := range r.descriptors() {
-		if desc.IsValid() && desc.TargetInode == inodeNum {
-			snapshots = append(snapshots, desc)
-		}
-	}
-
-	return snapshots, nil
+	return r.collect(func(d *Descriptor) bool { return d.TargetInode == inodeNum })
 }
 
 // ListForTarget returns the snapshots taken of target.
@@ -455,13 +447,7 @@ func (r *Registry) ListForTarget(ctx context.Context, target Target) ([]*Descrip
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var snapshots []*Descriptor
-	for _, desc := range r.descriptors() {
-		if desc.IsValid() && desc.BelongsTo(target) {
-			snapshots = append(snapshots, desc)
-		}
-	}
-	return snapshots, nil
+	return r.collect(func(d *Descriptor) bool { return d.BelongsTo(target) })
 }
 
 // GetChildren returns all snapshots whose ParentID matches the given snapshot ID.
@@ -474,14 +460,7 @@ func (r *Registry) GetChildren(ctx context.Context, snapshotID uint64) ([]*Descr
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	var children []*Descriptor
-	for _, desc := range r.descriptors() {
-		if desc.IsValid() && desc.ParentID == snapshotID {
-			children = append(children, desc)
-		}
-	}
-
-	return children, nil
+	return r.collect(func(d *Descriptor) bool { return d.ParentID == snapshotID })
 }
 
 // UpdateParentID updates the parent ID of a snapshot.
@@ -503,14 +482,12 @@ func (r *Registry) UpdateParentID(ctx context.Context, snapshotID, newParentID u
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for slot, desc := range r.descriptors() {
-		if desc.IsValid() && desc.SnapshotID == snapshotID {
-			desc.ParentID = newParentID
-			return r.writeDescriptor(slot, desc)
-		}
+	slot, desc, err := r.find(func(d *Descriptor) bool { return d.SnapshotID == snapshotID })
+	if err != nil {
+		return err
 	}
-
-	return ErrSnapshotNotFound
+	desc.ParentID = newParentID
+	return r.writeDescriptor(slot, desc)
 }
 
 // UpdateState updates the state of a snapshot.
@@ -549,21 +526,18 @@ func (r *Registry) updateState(ctx context.Context, snapshotID uint64, newState,
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Find and update the descriptor
-	for slot, desc := range r.descriptors() {
-		if desc.IsValid() && desc.SnapshotID == snapshotID {
-			if from != StateInvalid && desc.State != from {
-				return ErrSnapshotInvalidState
-			}
-			desc.State = newState
-			if newState == StateDeleting {
-				desc.DeleteTime = time.Now().Unix()
-			}
-			return r.writeDescriptor(slot, desc)
-		}
+	slot, desc, err := r.find(func(d *Descriptor) bool { return d.SnapshotID == snapshotID })
+	if err != nil {
+		return err
 	}
-
-	return ErrSnapshotNotFound
+	if from != StateInvalid && desc.State != from {
+		return ErrSnapshotInvalidState
+	}
+	desc.State = newState
+	if newState == StateDeleting {
+		desc.DeleteTime = time.Now().Unix()
+	}
+	return r.writeDescriptor(slot, desc)
 }
 
 // SetRefCountJobID sets the background refcount job ID for a snapshot.
@@ -583,14 +557,12 @@ func (r *Registry) SetRefCountJobID(ctx context.Context, snapshotID, jobID uint6
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for slot, desc := range r.descriptors() {
-		if desc.IsValid() && desc.SnapshotID == snapshotID {
-			desc.RefCountJobID = jobID
-			return r.writeDescriptor(slot, desc)
-		}
+	slot, desc, err := r.find(func(d *Descriptor) bool { return d.SnapshotID == snapshotID })
+	if err != nil {
+		return err
 	}
-
-	return ErrSnapshotNotFound
+	desc.RefCountJobID = jobID
+	return r.writeDescriptor(slot, desc)
 }
 
 // Delete marks a snapshot for deletion.
@@ -617,22 +589,18 @@ func (r *Registry) Remove(ctx context.Context, snapshotID uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for slot, desc := range r.descriptors() {
-		if desc.IsValid() && desc.SnapshotID == snapshotID {
-			if desc.State != StateDeleting {
-				return ErrSnapshotInvalidState
-			}
-			// Clear the slot
-			emptyDesc := &Descriptor{}
-			if err := r.writeDescriptor(slot, emptyDesc); err != nil {
-				return err
-			}
-			r.descriptorCount--
-			return nil
-		}
+	slot, desc, err := r.find(func(d *Descriptor) bool { return d.SnapshotID == snapshotID })
+	if err != nil {
+		return err
 	}
-
-	return ErrSnapshotNotFound
+	if desc.State != StateDeleting {
+		return ErrSnapshotInvalidState
+	}
+	if err := r.writeDescriptor(slot, &Descriptor{}); err != nil {
+		return err
+	}
+	r.descriptorCount--
+	return nil
 }
 
 // Count returns the number of active snapshots.
@@ -676,7 +644,8 @@ func (r *Registry) Scan(ctx context.Context) (ScanStats, error) {
 	var stats ScanStats
 	var maxID uint64
 
-	for _, desc := range r.descriptors() {
+	all, unreadable := r.descriptors()
+	for _, desc := range all {
 		if desc.IsFree() {
 			stats.FreeSlots++
 			continue
@@ -703,6 +672,8 @@ func (r *Registry) Scan(ctx context.Context) (ScanStats, error) {
 		stats.TotalBlocks += desc.TotalBlocks
 	}
 
+	stats.Unreadable = unreadable()
+
 	// Update cached values
 	r.nextID = maxID + 1
 	r.descriptorCount = stats.CreatingCount + stats.ActiveCount + stats.DeletingCount
@@ -718,6 +689,7 @@ type ScanStats struct {
 	ActiveCount   uint64 // Active snapshots
 	DeletingCount uint64 // Snapshots being deleted
 	TotalBlocks   uint64 // Total blocks referenced by all snapshots
+	Unreadable    error  // First sector the scan could not read; lookups and listings fail with EIO while it stays so
 }
 
 // freeSlotAndMaxID returns a free slot, preferring sectors this node owns, and
@@ -732,7 +704,7 @@ func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
 		data, err := r.readSector(sector)
 		if err != nil {
-			return 0, 0, fmt.Errorf("snapshot registry sector %d: %w", sector, err)
+			return 0, 0, err
 		}
 		for i := uint64(0); i < DescriptorsPerSector; i++ {
 			slot := sector*DescriptorsPerSector + i
@@ -762,12 +734,18 @@ func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	return free, maxID, nil
 }
 
-// descriptors yields every readable descriptor and its slot, reading each sector once.
-func (r *Registry) descriptors() iter.Seq2[uint64, *Descriptor] {
-	return func(yield func(uint64, *Descriptor) bool) {
+// descriptors yields every readable descriptor and its slot, reading each
+// sector once. After the loop, unreadable returns an EIO error for the first
+// sector it could not read, whose descriptors the loop missed.
+func (r *Registry) descriptors() (all iter.Seq2[uint64, *Descriptor], unreadable func() error) {
+	var readErr error
+	all = func(yield func(uint64, *Descriptor) bool) {
 		for sector := range r.maxDescriptors / DescriptorsPerSector {
 			data, err := r.readSector(sector)
 			if err != nil {
+				if readErr == nil {
+					readErr = err
+				}
 				continue
 			}
 			for i := range uint64(DescriptorsPerSector) {
@@ -781,6 +759,55 @@ func (r *Registry) descriptors() iter.Seq2[uint64, *Descriptor] {
 			}
 		}
 	}
+	return all, func() error { return readErr }
+}
+
+// find returns the valid descriptor match accepts and its slot. It fails with
+// ErrSnapshotNotFound, or with EIO when a sector it could not read may hold it.
+func (r *Registry) find(match func(*Descriptor) bool) (uint64, *Descriptor, error) {
+	all, unreadable := r.descriptors()
+	for slot, desc := range all {
+		if desc.IsValid() && match(desc) {
+			return slot, desc, nil
+		}
+	}
+	if err := unreadable(); err != nil {
+		return 0, nil, err
+	}
+	return 0, nil, ErrSnapshotNotFound
+}
+
+// readable returns the valid descriptors keep accepts in the sectors it can
+// read, and the error of the first sector it cannot read.
+func (r *Registry) readable(keep func(*Descriptor) bool) ([]*Descriptor, error) {
+	all, unreadable := r.descriptors()
+	var out []*Descriptor
+	for _, desc := range all {
+		if desc.IsValid() && keep(desc) {
+			out = append(out, desc)
+		}
+	}
+	return out, unreadable()
+}
+
+// collect is readable failing with EIO rather than return part of the list.
+func (r *Registry) collect(keep func(*Descriptor) bool) ([]*Descriptor, error) {
+	out, err := r.readable(keep)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// unfinished returns the snapshots still creating or deleting in the sectors
+// it can read, and the error of the first sector it cannot read, so that
+// mount recovery goes on around a damaged sector.
+func (r *Registry) unfinished() ([]*Descriptor, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readable(func(d *Descriptor) bool {
+		return d.Flags&FlagHidden == 0 && (d.State == StateCreating || d.State == StateDeleting)
+	})
 }
 
 // writeDescriptor writes a descriptor to a slot.
@@ -794,7 +821,7 @@ func (r *Registry) writeDescriptor(slot uint64, desc *Descriptor) error {
 
 	sectorData, err := r.readSector(sectorIdx)
 	if err != nil {
-		return fmt.Errorf("snapshot registry sector %d: %w", sectorIdx, err)
+		return err
 	}
 
 	encodeDescriptor(sectorData, descOffset, desc)
@@ -809,7 +836,7 @@ func (r *Registry) readSector(sectorIdx uint64) ([]byte, error) {
 	defer storage.PutBuffer(buf)
 
 	if _, err := r.dev.ReadAt(buf.Bytes(), offset); err != nil {
-		return nil, err
+		return nil, &UnreadableSectorError{Sector: sectorIdx, Err: err}
 	}
 
 	data := buf.Bytes()
@@ -834,7 +861,7 @@ func (r *Registry) readSector(sectorIdx uint64) ([]byte, error) {
 	}
 
 	if storedChecksum != computedChecksum {
-		return nil, ErrChecksumMismatch
+		return nil, &UnreadableSectorError{Sector: sectorIdx, Err: ErrChecksumMismatch}
 	}
 
 	// Return a copy of the data portion
