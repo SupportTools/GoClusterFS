@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/snapshot"
 )
 
 type fakeFiles struct {
@@ -167,6 +170,21 @@ func TestWriteErrorsMapToStatus(t *testing.T) {
 		if status, _ := call(t, srv, "POST", "/api/v1/snapshots", "secret", `{"path":"/f","name":"s"}`); status != tc.want {
 			t.Errorf("%v: status %d, want %d", tc.err, status, tc.want)
 		}
+	}
+}
+
+// A snapshot registry sector the mount cannot read fails the listing with a
+// JSON body that names the sector and says what to run.
+func TestSnapshotListNamesUnreadableSector(t *testing.T) {
+	srv, files, _ := startWriteServer(t, "secret")
+	files.err = &snapshot.UnreadableSectorError{Sector: 3, Err: snapshot.ErrChecksumMismatch}
+	status, body := call(t, srv, "GET", "/api/v1/snapshots", "secret", "")
+	var resp ErrorResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("status %d, body %q is not JSON: %v", status, body, err)
+	}
+	if status != http.StatusInternalServerError || !strings.Contains(resp.Details, "sector 3") || !strings.Contains(resp.Details, "goclusterfs-fsck -repair") {
+		t.Errorf("status %d, body %s; want 500 naming sector 3 and goclusterfs-fsck -repair", status, body)
 	}
 }
 

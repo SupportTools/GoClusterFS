@@ -4478,6 +4478,20 @@ scenarios:
     environments:
       go: cmd/gfsctl/commands/errors_test.go::TestExitCodesAndHints
 
+  - id: gfsctl-snapshots
+    name: gfsctl snapshots lists snapshots
+    description: gfsctl snapshots sends the token, marks orphans, and prints the API's details and exits 8 when the registry cannot be read
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/commands_test.go::TestSnapshots
+
+  - id: api-snapshot-list-unreadable-sector
+    name: Snapshot listing names an unreadable registry sector
+    description: GET /api/v1/snapshots answers 500 with a JSON body naming the sector and goclusterfs-fsck -repair
+    priority: go_only
+    environments:
+      go: internal/api/writes_test.go::TestSnapshotListNamesUnreadableSector
+
   - id: gfsctl-debug
     name: gfsctl --debug logs requests
     description: --debug logs each API request with its status; without it nothing is logged

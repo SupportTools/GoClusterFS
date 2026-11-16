@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -113,6 +114,11 @@ func TestUnreadableSectorFailsLookupsWithEIO(t *testing.T) {
 		if !errors.Is(err, syscall.EIO) {
 			t.Errorf("%s with an unreadable sector: %v, want EIO", name, err)
 		}
+	}
+	_, err = reg.List(ctx)
+	var bad *UnreadableSectorError
+	if !errors.As(err, &bad) || bad.Sector != 0 || !strings.Contains(err.Error(), "run goclusterfs-fsck -repair") {
+		t.Errorf("list error %q does not name sector 0 and say to run goclusterfs-fsck -repair", err)
 	}
 	stats, err := reg.Scan(ctx)
 	if err != nil || !errors.Is(stats.Unreadable, syscall.EIO) {

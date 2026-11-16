@@ -147,6 +147,22 @@ var (
 	ErrInvalidID            = errors.New("invalid snapshot ID")
 )
 
+// UnreadableSectorError is a registry sector that cannot be read. It is an
+// EIO error, and the operations that needed the sector fail with it.
+type UnreadableSectorError struct {
+	Sector uint64
+	Err    error
+}
+
+func (e *UnreadableSectorError) Error() string {
+	if errors.Is(e.Err, ErrChecksumMismatch) {
+		return fmt.Sprintf("snapshot registry sector %d fails its checksum; unmount the filesystem on every node and run goclusterfs-fsck -repair", e.Sector)
+	}
+	return fmt.Sprintf("snapshot registry sector %d cannot be read: %v; check the device, then run goclusterfs-fsck", e.Sector, e.Err)
+}
+
+func (e *UnreadableSectorError) Unwrap() []error { return []error{syscall.EIO, e.Err} }
+
 // Descriptor represents a snapshot on disk (128 bytes).
 //
 // Snapshots form a tree structure where each snapshot references its parent.
@@ -688,7 +704,7 @@ func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
 		data, err := r.readSector(sector)
 		if err != nil {
-			return 0, 0, fmt.Errorf("snapshot registry sector %d: %w", sector, err)
+			return 0, 0, err
 		}
 		for i := uint64(0); i < DescriptorsPerSector; i++ {
 			slot := sector*DescriptorsPerSector + i
@@ -728,7 +744,7 @@ func (r *Registry) descriptors() (all iter.Seq2[uint64, *Descriptor], unreadable
 			data, err := r.readSector(sector)
 			if err != nil {
 				if readErr == nil {
-					readErr = fmt.Errorf("snapshot registry sector %d: %w: %w", sector, syscall.EIO, err)
+					readErr = err
 				}
 				continue
 			}
@@ -788,7 +804,7 @@ func (r *Registry) writeDescriptor(slot uint64, desc *Descriptor) error {
 
 	sectorData, err := r.readSector(sectorIdx)
 	if err != nil {
-		return fmt.Errorf("snapshot registry sector %d: %w", sectorIdx, err)
+		return err
 	}
 
 	encodeDescriptor(sectorData, descOffset, desc)
@@ -803,7 +819,7 @@ func (r *Registry) readSector(sectorIdx uint64) ([]byte, error) {
 	defer storage.PutBuffer(buf)
 
 	if _, err := r.dev.ReadAt(buf.Bytes(), offset); err != nil {
-		return nil, err
+		return nil, &UnreadableSectorError{Sector: sectorIdx, Err: err}
 	}
 
 	data := buf.Bytes()
@@ -828,7 +844,7 @@ func (r *Registry) readSector(sectorIdx uint64) ([]byte, error) {
 	}
 
 	if storedChecksum != computedChecksum {
-		return nil, ErrChecksumMismatch
+		return nil, &UnreadableSectorError{Sector: sectorIdx, Err: ErrChecksumMismatch}
 	}
 
 	// Return a copy of the data portion
