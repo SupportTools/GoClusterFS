@@ -2861,6 +2861,69 @@ test_concurrent_same_file_writes() {
     return 0
 }
 
+# The tear scripts run on each node with sh -s: one node overwrites a 1 MB file
+# with one 1 MB write of a single letter at a time, while readers read it whole
+# with O_DIRECT and count reads that hold more than one letter.
+TEAR_PATTERNS='for c in A B C D E F G H; do head -c 1048576 /dev/zero | tr "\000" "$c" > /tmp/tear_$c; done'
+TEAR_WRITER='end=$(( $(date +%s) + $2 ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    for c in A B C D E F G H; do
+        dd if=/tmp/tear_$c of="$1" bs=1048576 count=1 conv=notrunc 2>/dev/null || exit 1
+    done
+done'
+TEAR_READER='end=$(( $(date +%s) + $2 )); reads=0; torn=0
+while [ "$(date +%s)" -lt "$end" ]; do
+    dd if="$1" of=/tmp/tear_read bs=1048576 count=1 iflag=direct 2>/dev/null || exit 1
+    c=$(head -c 1 /tmp/tear_read)
+    cmp -s /tmp/tear_read "/tmp/tear_$c" || torn=$((torn + 1))
+    reads=$((reads + 1))
+done
+echo "$reads $torn"'
+
+# Test: a read on any VM never returns parts of two 1 MB writes from VM 1
+test_reads_never_see_part_of_a_write() {
+    log_info "Testing that whole-file reads never mix two writes..."
+    ensure_cluster_healthy 2
+
+    local file=/mnt/goclusterfs/tear.bin seconds=10 vm
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        ssh_run "$vm" "$TEAR_PATTERNS" || return 1
+    done
+    ssh_run 1 "cp /tmp/tear_A $file" || return 1
+    sleep 2
+
+    local out
+    out=$(mktemp -d)
+    ssh_run 1 "sh -s -- $file $seconds" <<< "$TEAR_WRITER" &
+    local writer=$! readers=()
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        ssh_run "$vm" "sh -s -- $file $seconds" <<< "$TEAR_READER" > "$out/$vm" &
+        readers+=($!)
+    done
+    local failed=0 pid
+    wait "$writer" || { log_error "VM 1's writes failed"; failed=1; }
+    for pid in "${readers[@]}"; do
+        wait "$pid" || { log_error "a reader failed"; failed=1; }
+    done
+
+    local reads torn
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        read -r reads torn < "$out/$vm" || { reads=0; torn=0; }
+        log_info "VM $vm: $torn of $reads reads mixed two writes"
+        if [ "${torn:-0}" -ne 0 ]; then
+            log_error "VM $vm: $torn of $reads reads returned parts of two writes"
+            failed=1
+        fi
+        if [ "${reads:-0}" -lt 5 ]; then
+            log_error "VM $vm made only ${reads:-0} reads"
+            failed=1
+        fi
+    done
+    rm -rf "$out"
+    [ "$failed" -eq 0 ] || return 1
+    log_info "Whole-file reads never mixed two writes"
+}
+
 # Test 11: Three VMs write to same file at different offsets
 test_concurrent_same_file_writes_3vms() {
     log_info "Testing concurrent same-file writes (3 VMs)..."
@@ -4305,6 +4368,7 @@ main() {
     run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
     run_test "Concurrent Same-File Writes (2 VMs)" test_concurrent_same_file_writes
     run_test "Concurrent Same-File Writes (3 VMs)" test_concurrent_same_file_writes_3vms
+    run_test "Reads Never See Part Of A Write" test_reads_never_see_part_of_a_write
     run_test "Mixed Size Writes" test_mixed_size_writes
     run_test "Overlapping Block Writes" test_overlapping_block_writes
     run_test "Concurrent Write Stress" test_concurrent_write_stress

@@ -13,8 +13,8 @@ import (
 )
 
 // A write into a block whose lock a failed node held lets go of its inode lock
-// and waits holding nothing, so the failed node's replay can take the inode
-// lock and finish; the write then completes without EIO.
+// and waits holding only its file I/O lock, so the failed node's replay can take
+// the inode lock and finish; the write then completes without EIO.
 func TestInPlaceWriteStepsAsideForReplay(t *testing.T) {
 	path, lockPath := newTreeFSImage(t), newLockImage(t)
 	fsys := openLockedTreeFSNode(t, path, lockPath, 1)
@@ -62,9 +62,10 @@ func TestInPlaceWriteStepsAsideForReplay(t *testing.T) {
 		written <- errno
 	}()
 	deadline := time.Now().Add(5 * time.Second)
-	for st := fsys.lockMgr.Stats(); st.Held != 0 || st.Waiting != 1; st = fsys.lockMgr.Stats() {
+	// The write keeps its file I/O lock, which replays never take.
+	for st := fsys.lockMgr.Stats(); st.Held != 1 || st.Waiting != 1; st = fsys.lockMgr.Stats() {
 		if time.Now().After(deadline) {
-			t.Fatalf("the write still holds %d locks while it waits on the failed node's block", st.Held)
+			t.Fatalf("the write still holds %d locks besides its file I/O lock while it waits on the failed node's block", st.Held-1)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

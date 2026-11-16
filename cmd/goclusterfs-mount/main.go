@@ -92,6 +92,7 @@ func main() {
 		cacheStrict   = flag.Bool("cache-strict", false, "Check every cached inode against the device before using it; slower, but other nodes' changes show at once")
 		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost")
 		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries; stat and ls can show another node's change this late, while opening a file always sees it")
+		directIO      = flag.Bool("direct-io", false, "Send every read and write of file data to the filesystem instead of the kernel page cache, so a read never returns cached pages older than another node's write. Slower for small and repeated reads, and shared mmap of files fails")
 		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
 		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
 		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")
@@ -283,7 +284,11 @@ func main() {
 	if *skipRecovery >= 0 {
 		nodeReg.PreferSlot(*skipRecovery)
 	}
+	nodeReg.SetLockLayout(lock.LayoutID())
 	slotIdx, err := nodeReg.Register(ctx, hostname)
+	if errors.Is(err, node.ErrLockLayout) {
+		failf("Cannot join the cluster: %v. Nodes of different GoClusterFS versions would not lock each other out: unmount that node, then mount every node with one version", err)
+	}
 	if errors.Is(err, node.ErrNoFreeSlots) {
 		failf("Cannot join the cluster: all %d node slots are taken. List them with goclusterfs-fsck -list-slots %s, and free the slot of a node that will not come back with -release-slot", node.MaxNodes, *devicePath)
 	}
@@ -502,6 +507,7 @@ func main() {
 		return gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
 	})
 	gfs.SetOrphanRegistry(nodeReg)
+	gfs.SetDirectIO(*directIO)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
 	cacheMgr.OnOrphans(nodeReg.KickOrphans)
 	// Nothing is open here yet: let go of what this slot held before a crash.
@@ -546,7 +552,8 @@ func main() {
 			FsName:        "goclusterfs",
 			Name:          "goclusterfs",
 			Debug:         *fuseDebug,
-			MaxReadAhead:  128 * 1024, // 128KB readahead
+			MaxWrite:      1 << 20,
+			MaxReadAhead:  1 << 20,
 			DisableXAttrs: false,
 			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
 		},

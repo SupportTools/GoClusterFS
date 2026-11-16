@@ -88,6 +88,7 @@ TestMultiNodeMixedSizeWrites 1.74
 TestMultiNodeNeighborInodeWrites 7.78
 TestMultiNodeOpenRefreshesCachedSize 0.50
 TestMultiNodeOverlappingBlockWrites 1.75
+TestMultiNodeReadsNeverSeePartOfAWrite 17.6
 TestMultiNodeRecoveryIdempotency 43.71
 TestMultiNodeRecoveryWithLargeFile 37.48
 TestMultiNodeRecoveryWithMultipleFiles 36.49

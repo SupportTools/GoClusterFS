@@ -11,8 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The default broadcast ports moved from UDP 31337 and 31338 to UDP 24730 (`-mcast-port`) and 24731 (`-unicast-port`), out of Kubernetes' NodePort range 30000-32767, where kube-proxy can send their traffic to a service. Open the new ports in your firewall, or pass `-mcast-port 31337 -unicast-port 31338` on every node to keep the old ones.
 - The on-disk format is now version 3. Mount refuses devices formatted by earlier builds. Version 1 kept one journal for all nodes. Version 2 had room for 4096 inodes, and on devices over 128 GB its refcounts overwrote the snapshot registry and then data blocks. Copy the data off with the old build, reformat with `-format`, and copy it back.
 - Devices must be at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
-- Mount also refuses version 3 devices formatted before lock records had one claim slot per node, or before each lock type had its own lock records. Older builds refuse devices this version formats. Copy the data off with the build that formatted them and reformat.
-- Volumes this version formats carry the `RequiredSymlinks` flag, and older builds refuse them with `unknown required flags 0x20`. On version 3 volumes formatted before it, creating a symlink returns EOPNOTSUPP; reformat to use symlinks.
+- Mount also refuses version 3 devices formatted before lock records had one claim slot per node, before each lock type had its own lock records, or before reads and writes took file I/O locks. Older builds refuse devices this version formats. Copy the data off with the build that formatted them and reformat.
+- Volumes this version formats carry the `RequiredSymlinks` and `RequiredFileIOLocks` flags. Older builds refuse them with `unknown required flags 0x40`, or `0x60` before symlinks, or `0x70` before per-type lock records. On version 3 volumes formatted before symlinks but after file I/O locks, creating a symlink returns EOPNOTSUPP; reformat to use symlinks.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
@@ -32,7 +32,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `goclusterfs-mount`: a FUSE filesystem that several Linux nodes can mount from one shared block device.
 - `-format` sizes the block bitmap, refcount table and inode table from the device. `-bytes-per-inode` sets the inode count (default one per MB of device, 4096 to 16,777,216).
 - `O_DIRECT` device I/O, split into shards so requests can run in parallel.
-- Distributed locks on the shared device for block allocation, inode updates, and directory changes. Each node writes its claim into its own slot of a lock record and then reads the record, so two nodes cannot both take a write lock however slow the storage is. File writes do not take these locks yet, so two nodes extending the same file can lose each other's data.
+- Distributed locks on the shared device for block allocation, inode updates, directory changes, and file reads and writes. Each node writes its claim into its own slot of a lock record and then reads the record, so two nodes cannot both take a write lock however slow the storage is.
+- File I/O locks: each read request takes its file's lock shared and each write, truncate and `fallocate` takes it exclusive, on every node, so a read request never returns part of a write request from any node. Writes to one file from several nodes now run one at a time. A node waiting to write goes before new readers for up to 500 ms. Reads through the page cache can still mix cached pages with newer data until the next open or attribute refresh; OPERATIONS.md has the details and the costs.
+- `-direct-io` sends every read and write of file data to the filesystem instead of the kernel page cache, so a `read()` of up to 1 MB never mixes two writes. A shared `mmap` of a file fails with it.
+- Each node records its lock record layout in its registry slot, and mount refuses to join while a live node's slot shows another layout, naming that node.
 - Write-ahead journal with batch commits and a recovery check on mount.
 - Intent logging for multi-step operations.
 - Inode cache with generation-based coherency checks, and an extent cache.
@@ -78,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `make build` builds `goclusterfs-fsck` as well as `goclusterfs-mount`.
 - `make test-integration` now allows 30 minutes, since the full suite takes about 15.
 - Mount no longer creates an SFB manager, which nothing used, and logs that SFB is disabled instead of `SFB: enabled`.
+- FUSE read and write requests carry up to 1 MB, up from 128 KB, and readahead is 1 MB.
 - Reads use the inode cache, a node keeps a released lock for 10 ms so back-to-back operations take it again without disk I/O and yields a lock it has reused for 250 ms, and the inode and extent caches are split into 16 shards.
 
 ### Removed

@@ -30,6 +30,7 @@ package lock
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -107,6 +108,8 @@ const (
 	LockTypeInode        LockType = 8
 	LockTypeExtent       LockType = 9
 	LockTypeInodeSector  LockType = 10
+	// LockTypeFileIO covers one file's data for a whole read or write request. It ranks before every other type.
+	LockTypeFileIO LockType = 11
 )
 
 // LockMode indicates shared (read) or exclusive (write) access.
@@ -210,6 +213,7 @@ var typeNames = [numLockTypes]string{
 	LockTypeInode:        "inode",
 	LockTypeExtent:       "extent",
 	LockTypeInodeSector:  "inode_sector",
+	LockTypeFileIO:       "file_io",
 }
 
 type lockKey struct {
@@ -356,7 +360,7 @@ func (m *Manager) Stats() Stats {
 	return stats
 }
 
-const numLockTypes = int(LockTypeInodeSector) + 1
+const numLockTypes = int(LockTypeFileIO) + 1
 
 // layoutRows is how many records a volume's lock region has; typeRows divides them among the types.
 const layoutRows = 256
@@ -370,10 +374,21 @@ var typeRows = [numLockTypes]uint64{
 	LockTypeRefCount:     1,
 	LockTypeLockRegion:   1,
 	LockTypeBlockBitmap:  1,
-	LockTypeSFBContainer: 8,
-	LockTypeInode:        128,
+	LockTypeSFBContainer: 1,
+	LockTypeInode:        96,
 	LockTypeExtent:       97,
 	LockTypeInodeSector:  16,
+	LockTypeFileIO:       39,
+}
+
+// LayoutID identifies how lock keys map to records. Nodes whose IDs differ do
+// not exclude each other.
+func LayoutID() uint32 {
+	buf := binary.LittleEndian.AppendUint64(nil, layoutRows)
+	for _, rows := range typeRows {
+		buf = binary.LittleEndian.AppendUint64(buf, rows)
+	}
+	return storage.CRC32C(buf)
 }
 
 var typeFirstRow = func() (first [numLockTypes]uint64) {
@@ -658,7 +673,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	}
 	m.mu.Unlock()
 
-	written, won, by, err := m.claim(recordID, key, mode)
+	written, won, by, err := m.claim(recordID, key, mode, waited < 2*m.timing.holdTurn)
 	if err != nil || !won {
 		return false, false, by, err
 	}
@@ -722,9 +737,12 @@ func (m *Manager) addHeldKeyLocked(key lockKey, recordID uint64, mode LockMode, 
 	}
 }
 
+// goroutineHoldsAnyLocked reports whether gid holds a lock that another wait
+// or a journal replay may need: any but a file I/O lock, which ranks first and
+// which replays never take.
 func (m *Manager) goroutineHoldsAnyLocked(gid uint64) bool {
-	for _, held := range m.heldLocks {
-		if held.goroutines[gid] > 0 {
+	for key, held := range m.heldLocks {
+		if key.Type != LockTypeFileIO && held.goroutines[gid] > 0 {
 			return true
 		}
 	}
@@ -872,13 +890,21 @@ func (m *Manager) ReleaseCached() {
 	wg.Wait()
 }
 
+// orderRank is a type's place in the lock order.
+func orderRank(t LockType) int {
+	if t == LockTypeFileIO {
+		return -1
+	}
+	return int(t)
+}
+
 // checkLockOrder refuses a lock below one this goroutine holds: a lower type, or a lower record of the same type.
 func (m *Manager) checkLockOrder(key lockKey, recordID, gid uint64) error {
 	for heldKey, held := range m.heldLocks {
 		if heldKey == key || held.goroutines[gid] == 0 {
 			continue
 		}
-		if heldKey.Type > key.Type {
+		if orderRank(heldKey.Type) > orderRank(key.Type) {
 			return fmt.Errorf("%w: cannot acquire %v while holding %v",
 				ErrDeadlockRisk, key.Type, heldKey.Type)
 		}
@@ -914,4 +940,17 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 // SameRecord reports whether two locks map to one record, so one goroutine holding both holds the record in the stronger mode.
 func (m *Manager) SameRecord(aType LockType, aID uint64, bType LockType, bID uint64) bool {
 	return m.hashToRecord(aType, aID) == m.hashToRecord(bType, bID)
+}
+
+// HeldSince returns when this node claimed, from disk, the record that holds
+// a key it holds. No other node held the record in a conflicting mode since
+// then. It returns the zero time if this node does not hold the key.
+func (m *Manager) HeldSince(lockType LockType, resourceID uint64) time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	held, ok := m.heldLocks[lockKey{Type: lockType, ResourceID: resourceID}]
+	if !ok {
+		return time.Time{}
+	}
+	return m.records[held.RecordID].since
 }

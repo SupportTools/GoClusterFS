@@ -121,24 +121,33 @@ head -c 16 /dev/device | hexdump -C
 - Pre-v2 device: copy the data off with the old build, reformat with `goclusterfs-mount -format` (this destroys the data), and copy the data back. There is no in-place migration.
 - Version 2 device: do not run an old build on it; it would read the wrong layout. There is no tool to rebuild the superblock, so restore from backup.
 
-### "superblock version too old" or "formatted before each lock type had its own lock records"
+### "superblock version too old" or "formatted before ... lock records" or "file I/O locks"
 
 **Symptom**: Mount exits with one of:
 
 - `Cannot use <device>: superblock version too old: volume is v2, this version mounts v3. ...`
 - `Cannot use <device>: superblock layout is not supported by this version: the volume was formatted before each lock type had its own lock records, so its nodes would not exclude this version's. ...`
+- `Cannot use <device>: superblock layout is not supported by this version: the volume was formatted before reads and writes took file I/O locks, so its nodes would not exclude this version's. ...`
 
-**Cause**: An older build formatted the volume. Version 2 has fixed 1 MB regions. A version 3 volume formatted before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) uses lock records that this version's nodes would not exclude.
+**Cause**: An older build formatted the volume. Version 2 has fixed 1 MB regions. A version 3 volume formatted before [#85](https://github.com/SupportTools/GoClusterFS/pull/85), or before file I/O locks, maps locks to records that this version uses for other locks, so the two builds' nodes would not exclude each other.
 
 **Solution**: Copy the data off with the build that formatted the volume, reformat with `goclusterfs-mount -format`, and copy the data back. For a version 2 volume over 128 GB, run that build's `goclusterfs-fsck` first. There is no in-place migration.
 
-### "unknown required flags 0x10"
+### "unknown required flags 0x10", "0x20", "0x40" or a sum of them
 
-**Symptom**: Mount exits with `Cannot use <device>: superblock requires features this version doesn't support: unknown required flags 0x10`.
+**Symptom**: Mount exits with `Cannot use <device>: superblock requires features this version doesn't support: unknown required flags 0x40` (or `0x10`, `0x20`, or a sum such as `0x60` or `0x70`).
 
-**Cause**: This build is older than [#85](https://github.com/SupportTools/GoClusterFS/pull/85), and a newer build formatted the volume.
+**Cause**: A newer build formatted the volume. `0x10` means per-type lock records ([#85](https://github.com/SupportTools/GoClusterFS/pull/85)), `0x20` symlinks ([#172](https://github.com/SupportTools/GoClusterFS/pull/172)) and `0x40` file I/O locks; this build lacks the ones the message names.
 
 **Solution**: Upgrade this node. Every node must run the same version.
+
+### "a live node maps locks to lock records differently from this build"
+
+**Symptom**: Mount exits with `Cannot join the cluster: a live node maps locks to lock records differently from this build: node <host> in slot <n> (<uuid>) has lock layout <id>, this build <id>. ...`
+
+**Cause**: The named node runs another GoClusterFS version, and the two versions use lock records differently, so they would not lock each other out. Mount checks this before it takes a registry slot. A node whose heartbeat stays unchanged for about 12 seconds, such as one that crashed, does not count.
+
+**Solution**: Unmount the named node, then mount every node with one version.
 
 ### "device has GoClusterFS node slots but no superblock"
 

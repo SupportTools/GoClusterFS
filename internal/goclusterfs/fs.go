@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -149,6 +150,10 @@ type FS struct {
 	gid uint32
 
 	inodeMu [inodeMuStripes]sync.Mutex
+	ioMu    [inodeMuStripes]sync.RWMutex
+
+	// openFlags are the FOPEN flags every open and create of a file returns.
+	openFlags uint32
 
 	orphanReg orphanRegistry
 	opens     openFiles
@@ -311,6 +316,15 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 	return nil
 }
 
+// SetDirectIO makes the kernel send every read and write of file data to this
+// filesystem instead of serving or keeping it in its page cache.
+func (f *FS) SetDirectIO(on bool) {
+	f.openFlags = 0
+	if on {
+		f.openFlags = fuse.FOPEN_DIRECT_IO
+	}
+}
+
 // SetReserve makes writes take data blocks from r. It needs the journal.
 func (f *FS) SetReserve(r *reserve.Manager) {
 	if f.journal != nil {
@@ -383,6 +397,32 @@ func (f *FS) lockInode(num uint32) func() {
 	mu := &f.inodeMu[num%inodeMuStripes]
 	mu.Lock()
 	return mu.Unlock
+}
+
+// lockFileIO keeps a file's data still for one whole read (shared) or changes
+// it alone (exclusive): against this node's requests through a local stripe,
+// against other nodes' through the cluster file I/O lock. Take it before
+// lockInode and any other lock, and hold one at a time.
+func (f *FS) lockFileIO(ctx context.Context, num uint32, mode lock.LockMode) (func(), error) {
+	mu := &f.ioMu[num%inodeMuStripes]
+	unlockLocal := mu.RUnlock
+	if mode == lock.LockModeExclusive {
+		mu.Lock()
+		unlockLocal = mu.Unlock
+	} else {
+		mu.RLock()
+	}
+	if f.lockMgr == nil {
+		return unlockLocal, nil
+	}
+	if err := f.lockMgr.Acquire(ctx, lock.LockTypeFileIO, uint64(num), mode); err != nil {
+		unlockLocal()
+		return nil, err
+	}
+	return func() {
+		f.release(lock.LockTypeFileIO, uint64(num), "file I/O")
+		unlockLocal()
+	}, nil
 }
 
 // release releases a cluster lock and logs a failure; kind names the resource, such as "inode".
@@ -998,7 +1038,7 @@ func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32,
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
-	return node, fileHandle{}, 0, 0
+	return node, fileHandle{}, f.openFlags, 0
 }
 
 // openExisting opens name in parent for a create without O_EXCL that found the
@@ -1722,6 +1762,8 @@ type File struct {
 	fs       *FS
 	inodeNum uint32
 	birth    uint64
+	// readFrom is when a read last started reading this file's inode from disk.
+	readFrom atomic.Pointer[time.Time]
 }
 
 func newFile(fsys *FS, ino *inode.Inode) *File {
@@ -1771,7 +1813,7 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if errno := f.NotifyContent(-1, 0); errno != 0 && errno != syscall.ENOSYS {
 		logging.Debugf("File.Open: inode %d: expiring kernel attributes failed: %v", f.inodeNum, errno)
 	}
-	return fileHandle{}, 0, 0
+	return fileHandle{}, f.fs.openFlags, 0
 }
 
 // Release lets go of an unlinked file at its last close on this node.
@@ -1847,15 +1889,13 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 
 // Read reads file data.
 func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	// Use cached inode with validation for better performance.
-	// The cache manager handles TTL-based staleness checks and generation
-	// counter validation, automatically refreshing stale entries from disk.
-	// This is safe in multi-node scenarios because:
-	// - Cache entries have TTL-based expiry (default 5s)
-	// - Generation counters detect modifications by other nodes
-	// - Lock acquisition triggers cache invalidation
-	// - Broadcast invalidation propagates changes between nodes
-	ino, err := f.fs.getInode(f.inodeNum)
+	unlockIO, err := f.fs.lockFileIO(detach(ctx), f.inodeNum, lock.LockModeShared)
+	if err != nil {
+		log.Printf("[ERROR] Read inode %d: %v", f.inodeNum, err)
+		return nil, syscall.EIO
+	}
+	defer unlockIO()
+	ino, err := f.inodeForRead()
 	if err != nil {
 		logging.Debugf("Read inode %d: Read failed: %v", f.inodeNum, err)
 		return nil, syscall.EIO
@@ -1953,10 +1993,37 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 	return fuse.ReadResultData(data), 0
 }
 
+// inodeForRead returns this file's inode to a read that holds its file I/O
+// lock. Another node may have written the file before this node claimed the
+// lock from disk, so the first read after each claim reads the inode from disk.
+func (f *File) inodeForRead() (*inode.Inode, error) {
+	if f.fs.lockMgr == nil {
+		return f.fs.getInode(f.inodeNum)
+	}
+	claimed := f.fs.lockMgr.HeldSince(lock.LockTypeFileIO, uint64(f.inodeNum))
+	if from := f.readFrom.Load(); from != nil && !from.Before(claimed) {
+		return f.fs.getInode(f.inodeNum)
+	}
+	start := time.Now()
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err != nil || !f.current(ino) {
+		return ino, err
+	}
+	f.fs.cacheInode(ino)
+	f.readFrom.Store(&start)
+	return ino, nil
+}
+
 // Write writes file data.
 // Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	ctx = detach(ctx)
+	unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeExclusive)
+	if err != nil {
+		log.Printf("[ERROR] Write inode %d: %v", f.inodeNum, err)
+		return 0, errToErrno(err)
+	}
+	defer unlockIO()
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to extend the same file simultaneously, they may race
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
@@ -3027,6 +3094,14 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	ctx = detach(ctx)
 	size, resizing := in.GetSize()
+	if resizing {
+		unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeExclusive)
+		if err != nil {
+			log.Printf("[ERROR] Setattr inode %d: %v", f.inodeNum, err)
+			return errToErrno(err)
+		}
+		defer unlockIO()
+	}
 	for attempt := 0; ; attempt++ {
 		// Holding the inode lock from the zeroing through the size change keeps this node's writes out between them.
 		unlock := f.fs.lockInode(f.inodeNum)
@@ -3305,6 +3380,12 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 		logging.Debugf("Allocate inode %d: unsupported mode %d", f.inodeNum, mode)
 		return syscall.EOPNOTSUPP
 	}
+	unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeExclusive)
+	if err != nil {
+		log.Printf("[ERROR] Allocate inode %d: %v", f.inodeNum, err)
+		return errToErrno(err)
+	}
+	defer unlockIO()
 
 	for attempt := 0; ; attempt++ {
 		unlock := f.fs.lockInode(f.inodeNum)
@@ -3461,6 +3542,14 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 // Used for snapshot creation via user.snapshot attribute and clone creation via user.clone.
 func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	ctx = detach(ctx)
+	if attr == "user.snapshot" || attr == "user.clone" {
+		unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeShared)
+		if err != nil {
+			log.Printf("[ERROR] Setxattr %s inode %d: %v", attr, f.inodeNum, err)
+			return errToErrno(err)
+		}
+		defer unlockIO()
+	}
 	defer f.fs.lockInode(f.inodeNum)()
 	// A snapshot or clone spans several writes; an interrupted caller must not stop it halfway.
 	ctx = context.WithoutCancel(ctx)
