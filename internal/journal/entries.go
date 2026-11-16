@@ -2,6 +2,7 @@ package journal
 
 import (
 	"encoding/binary"
+	"fmt"
 )
 
 // TxnOpType represents the type of operation in a transaction entry.
@@ -883,6 +884,10 @@ func (txn *Transaction) LogSFBMigrate(payload *SFBMigratePayload) error {
 	return txn.addEntry(TxnOpSFBMigrate, payload.Serialize())
 }
 
+// MaxRecordBlocks bounds the blocks one BlockReserve or BlockUse record holds,
+// so a damaged record cannot make replay allocate gigabytes.
+const MaxRecordBlocks = 1 << 20
+
 // serializeBlockRuns stores blocks as runs of consecutive numbers: a run count,
 // then a start block and length per run.
 func serializeBlockRuns(blocks []uint64) []byte {
@@ -912,7 +917,13 @@ func DeserializeBlockRuns(buf []byte) ([]uint64, error) {
 	if len(buf) < 4+12*n {
 		return nil, ErrTxnTooSmall
 	}
-	var blocks []uint64
+	total := 0
+	for i := range n {
+		if total += int(binary.LittleEndian.Uint32(buf[12+12*i:])); total > MaxRecordBlocks {
+			return nil, fmt.Errorf("%w: block runs hold more than %d blocks", ErrCorruptTxn, MaxRecordBlocks)
+		}
+	}
+	blocks := make([]uint64, 0, total)
 	for i := range n {
 		start := binary.LittleEndian.Uint64(buf[4+12*i:])
 		for j := range uint64(binary.LittleEndian.Uint32(buf[12+12*i:])) {

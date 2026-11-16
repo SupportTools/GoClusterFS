@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("c21c0110")
+byte('p')
+[]byte("")

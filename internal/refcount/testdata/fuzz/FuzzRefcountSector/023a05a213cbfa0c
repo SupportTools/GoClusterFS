@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('\u009d')
+bool(false)
+[]byte("0")
+[]byte("11y1y11y1711y1")

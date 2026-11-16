@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("@0000000\x10\x00\x0000000\xe900000000")
+string("@")
+uint64(76)
+string("\xb0")

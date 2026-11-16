@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('F')
+string(" 000000b77717'y\xe2Z00//")
+bool(true)
+string("0")
+string("\xf8A@b")
+[]byte("")

@@ -1,0 +1,4 @@
+go test fuzz v1
+string("0")
+string("\ue5a3\ue5d7/")
+string("/0")

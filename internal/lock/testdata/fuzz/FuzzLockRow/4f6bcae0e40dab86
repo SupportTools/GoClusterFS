@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\u008a')
+byte('\u009b')
+bool(false)
+byte('Ð')
+[]byte("200020008200200020002000200082")

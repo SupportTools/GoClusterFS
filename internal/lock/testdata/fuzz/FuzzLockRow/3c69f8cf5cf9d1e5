@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('"')
+byte('\x7f')
+bool(true)
+byte('&')
+[]byte("800020008000800080000")

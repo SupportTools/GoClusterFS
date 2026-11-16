@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte(",AB8$B218z21719")
+byte('`')
+[]byte("B")

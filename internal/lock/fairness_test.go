@@ -80,11 +80,10 @@ func TestHolderYieldsOnlyToLiveWaiters(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			defer func(d time.Duration) { holdTurn = d }(holdTurn)
-			holdTurn = 50 * time.Millisecond
 			dev, cleanup := createTestDevice(t, 1<<20)
 			defer cleanup()
 			holder := newTestNode(dev, 0, 1<<20, 1)
+			holder.timing.holdTurn = 50 * time.Millisecond
 			if tc.view {
 				reg := newFakeRegistry()
 				reg.set(5, tc.state)
@@ -98,7 +97,7 @@ func TestHolderYieldsOnlyToLiveWaiters(t *testing.T) {
 			stop := make(chan struct{})
 			var wg sync.WaitGroup
 			wg.Go(func() { reclaimAfterExpiry(t, holder, LockTypeInode, 3, stop) })
-			time.Sleep(4 * holdTurn)
+			time.Sleep(4 * holder.timing.holdTurn)
 			close(stop)
 			wg.Wait()
 

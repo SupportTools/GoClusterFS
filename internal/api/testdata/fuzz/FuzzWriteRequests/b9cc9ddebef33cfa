@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('\x01')
+string("api/v1?\x800\xa60\xc50\x80")
+bool(true)
+string("0")
+string("")
+[]byte("")

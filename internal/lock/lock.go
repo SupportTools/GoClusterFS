@@ -150,6 +150,8 @@ type Manager struct {
 	contested map[uint64]time.Time
 	// claims tracks the Acquire calls waiting for a record this node does not hold.
 	claims map[uint64]*pendingClaim
+	// unreleased holds records whose slot this node failed to clear; the watcher clears them again.
+	unreleased map[uint64]bool
 	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
 	adopted map[uint64]adoptedSlot
 	// ownerView, when set, says which node holds each registry slot.
@@ -168,6 +170,7 @@ type Manager struct {
 	onAcquire OnAcquireFunc
 
 	waiting atomic.Int64
+	timing  timings
 
 	slotWrites, rowReads, conflicts, waits, deferred atomic.Uint64
 	// claimTimes is a histogram of the time from a claim's slot write to the end of its row read.
@@ -248,22 +251,39 @@ func covers(held, want LockMode) bool {
 	return held == LockModeExclusive || held == want
 }
 
-// renewAfter is the age of a slot after which this node writes it again before
-// relying on it, so other nodes never see a slot in use as stale.
-var renewAfter = StaleThreshold / 3
+// timings are a manager's timing settings. Tests shorten them on the manager
+// they test, before using it, so no test changes what another test's timers read.
+type timings struct {
+	cacheGrace, holdTurn, yieldGap time.Duration
+	// renewAfter is the age of a slot after which this node writes it again
+	// before relying on it, so other nodes never see a slot in use as stale.
+	renewAfter time.Duration
+	// acquireTimeout is how long Acquire waits at most.
+	acquireTimeout time.Duration
+	// tornExpiry is how long a slot must keep failing its checksum before other
+	// nodes ignore it. A live node rewrites its slot within renewAfter.
+	tornExpiry time.Duration
+	// longHold is how long a node holds a record before it warns that the hold
+	// may have leaked. Under an owner view a claim never goes stale, so a hold
+	// that is never released lasts until unmount.
+	longHold time.Duration
+	// releaseRetry is how often the watcher clears again a slot whose release
+	// write failed. Other nodes wait for the record until it is cleared.
+	releaseRetry time.Duration
+}
 
-// acquireTimeout is how long Acquire waits at most; tests shorten it.
-var acquireTimeout = DefaultTimeout
-
-// tornExpiry is how long a slot must keep failing its checksum before other
-// nodes ignore it. A live node rewrites its slot within renewAfter.
-var tornExpiry = StaleThreshold
-
-var (
-	cacheGrace = CacheGrace
-	holdTurn   = HoldTurn
-	yieldGap   = YieldGap
-)
+func defaultTimings() timings {
+	return timings{
+		cacheGrace:     CacheGrace,
+		holdTurn:       HoldTurn,
+		yieldGap:       YieldGap,
+		renewAfter:     StaleThreshold / 3,
+		acquireTimeout: DefaultTimeout,
+		tornExpiry:     StaleThreshold,
+		longHold:       time.Minute,
+		releaseRetry:   time.Second,
+	}
+}
 
 // releaseParallelism is how many kept records ReleaseCached frees at once.
 const releaseParallelism = 8
@@ -297,7 +317,9 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		contested:  make(map[uint64]time.Time),
 		claims:     make(map[uint64]*pendingClaim),
 		adopted:    make(map[uint64]adoptedSlot),
+		unreleased: make(map[uint64]bool),
 		tornSince:  make(map[slotRef]tornSighting),
+		timing:     defaultTimings(),
 	}
 }
 
@@ -530,7 +552,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 			return m.giveUp(ErrLockTimeout, lockType, resourceID, mode, startTime, fmt.Sprintf(
 				"the journal replay of node %x (slot %d), which holds record %d, failed or was abandoned", by.occupant[:8], by.slot, recordID))
 		}
-		if by.failing() && time.Since(lastFailingLog) >= acquireTimeout {
+		if by.failing() && time.Since(lastFailingLog) >= m.timing.acquireTimeout {
 			lastFailingLog = time.Now()
 			log.Printf("[WARN] lock: type=%d res=%d mode=%d has waited %v for node %x (slot %d), which holds it and is failing or being recovered; waiting until its journal replay ends",
 				lockType, resourceID, mode, time.Since(startTime).Round(time.Millisecond), by.occupant[:8], by.slot)
@@ -539,7 +561,7 @@ func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uin
 		// Check context cancellation, but allow at least 3 retries. A wait gives
 		// up after acquireTimeout of waiting for live holders, or for failing ones
 		// while this goroutine holds other locks; a replay's wait never does.
-		if retryCount >= 3 && (ctx.Err() != nil || !replay && liveWait > acquireTimeout) {
+		if retryCount >= 3 && (ctx.Err() != nil || !replay && liveWait > m.timing.acquireTimeout) {
 			if failingWhileNested {
 				return m.giveUp(ErrReplayBlocked, lockType, resourceID, mode, startTime, fmt.Sprintf(
 					"this goroutine holds other locks, and record %d is held by node %x (slot %d), which is failing or being recovered and whose replay may need one of them",
@@ -578,7 +600,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	defer gate.Unlock()
 
 	m.mu.Lock()
-	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (!covers(rec.mode, mode) || age(rec.renewed) > renewAfter) {
+	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (!covers(rec.mode, mode) || age(rec.renewed) > m.timing.renewAfter) {
 		// A cached hold too weak for this request, or old enough that another node
 		// may soon ignore it as stale, is claimed afresh over this node's slot.
 		delete(m.records, recordID)
@@ -593,7 +615,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			return false, false, blocker{}, nil
 		}
 		if m.turnOverLocked(recordID, rec) && !m.goroutineHoldsRecordLocked(recordID, gid) &&
-			(waited < holdTurn || !m.goroutineHoldsAnyLocked(gid)) {
+			(waited < m.timing.holdTurn || !m.goroutineHoldsAnyLocked(gid)) {
 			if rec.keys > 0 {
 				m.mu.Unlock()
 				return false, false, blocker{}, nil
@@ -602,7 +624,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			m.mu.Unlock()
 			return false, false, blocker{}, m.releaseRecord(recordID)
 		}
-		renew := age(rec.renewed) > renewAfter
+		renew := age(rec.renewed) > m.timing.renewAfter
 		m.mu.Unlock()
 		if renew {
 			if err := m.renewRecord(recordID, key, rec); err != nil {
@@ -662,7 +684,7 @@ func (m *Manager) giveUp(err error, lockType LockType, resourceID uint64, mode L
 // saw another node waiting.
 func (m *Manager) turnOverLocked(recordID uint64, rec *heldRecord) bool {
 	seen, waited := m.contested[recordID]
-	return age(rec.since) > holdTurn || waited && age(seen) > holdTurn
+	return age(rec.since) > m.timing.holdTurn || waited && age(seen) > m.timing.holdTurn
 }
 
 // endTurnLocked drops this node's hold on recordID, which the caller releases
@@ -671,7 +693,7 @@ func (m *Manager) turnOverLocked(recordID uint64, rec *heldRecord) bool {
 func (m *Manager) endTurnLocked(recordID uint64) {
 	delete(m.records, recordID)
 	delete(m.contested, recordID)
-	m.yieldUntil[recordID] = time.Now().Add(yieldGap)
+	m.yieldUntil[recordID] = time.Now().Add(m.timing.yieldGap)
 }
 
 func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) bool {
@@ -680,7 +702,7 @@ func (m *Manager) reuseHeldKeyLocked(key lockKey, mode LockMode, gid uint64) boo
 		return false
 	}
 	rec := m.records[held.RecordID]
-	if !covers(rec.mode, mode) || age(rec.renewed) > renewAfter {
+	if !covers(rec.mode, mode) || age(rec.renewed) > m.timing.renewAfter {
 		return false
 	}
 	if m.turnOverLocked(held.RecordID, rec) && !m.goroutineHoldsRecordLocked(held.RecordID, gid) {
@@ -792,7 +814,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 	gen := rec.cacheGen
 	m.mu.Unlock()
 
-	time.AfterFunc(cacheGrace, func() { m.expireCached(recordID, gen) })
+	time.AfterFunc(m.timing.cacheGrace, func() { m.expireCached(recordID, gen) })
 	return nil
 }
 

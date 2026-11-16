@@ -3192,7 +3192,7 @@ test_stalled_node_writes_stop_at_write_gate() {
 }
 
 # =============================================================================
-# Hostile storage
+# Hostile storage and clocks
 # =============================================================================
 # VM 1 mounts through a device-mapper device over the shared disk, so its path
 # alone can be slowed, stalled or failed. Both nodes create small files and
@@ -3314,6 +3314,16 @@ hostile_scenario() {
     return $result
 }
 
+hostile_delay_spikes() {
+    local ms
+    for ms in 100 500 1000 2000; do
+        log_info "VM 1 path: ${ms}ms per I/O for 15s"
+        hostile_dm_load "delay /dev/vda 0 $ms" || return 1
+        sleep 15
+    done
+    hostile_dm_load "linear /dev/vda 0"
+}
+
 hostile_stall() {
     log_info "VM 1 path: stalled for ${HOSTILE_STALL}s"
     ssh_run 1 "dmsetup suspend $HOSTILE_DM"
@@ -3335,6 +3345,7 @@ hostile_flaky() {
     hostile_dm_load "linear /dev/vda 0"
 }
 
+test_storage_latency_spikes() { hostile_scenario "latency spikes" hostile_delay_spikes survives; }
 test_storage_short_stalls() {
     HOSTILE_STALL=5 hostile_scenario "5s stall" hostile_stall survives || return 1
     HOSTILE_STALL=12 hostile_scenario "12s stall" hostile_stall survives
@@ -3343,6 +3354,63 @@ test_storage_long_stall() { HOSTILE_STALL=30 hostile_scenario "30s stall" hostil
 test_storage_short_eio() { HOSTILE_EIO=2 hostile_scenario "2s of EIO" hostile_eio survives; }
 test_storage_long_eio() { HOSTILE_EIO=10 hostile_scenario "10s of EIO" hostile_eio fenced; }
 test_storage_flaky_eio() { hostile_scenario "flaky EIO" hostile_flaky survives; }
+
+# A node that never mounted the volume, with its clock 2 minutes ahead, must
+# take a free slot, not the slot of a node that is mounted and alive.
+test_clock_ahead_mount() {
+    ensure_cluster_healthy 2 || return 1
+    unmount_goclusterfs 2 || { log_error "VM 2: unmount failed"; return 1; }
+    local marker="hostile: clock ahead $(date +%s)" result=0
+    mark_vm_logs "$marker"
+    ssh_run 2 "hostname newnode; date -u -s '$(date -u -d @$(( $(date +%s) + 120 )) '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    setup_goclusterfs 2 false || result=1
+    sleep 5
+    local slot1 slot2
+    slot1=$(grep -o 'Registered as node [0-9]*' "$(get_vm_mount_log 1)" | tail -1)
+    slot2=$(sed -n "/$marker/,\$p" "$(get_vm_mount_log 2)" | grep -o 'Registered as node [0-9]*' | tail -1)
+    log_info "VM 1: $slot1; VM 2 with its clock 2 minutes ahead: $slot2"
+    if [[ -z "$(mount_pids 1)" ]]; then
+        log_error "VM 1 stopped after VM 2 mounted with a fast clock"
+        sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|slot' | head -5
+        result=1
+    fi
+    if [[ "$slot1" == "$slot2" ]]; then
+        log_error "VM 2 took VM 1's registry slot"
+        result=1
+    fi
+    ssh_run 2 "hostname localhost; date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    if [[ -z "$(mount_pids 1)" ]]; then
+        ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
+        setup_goclusterfs 1 false || result=1
+    fi
+    unmount_goclusterfs 2 || crash_goclusterfs 2 || true
+    setup_goclusterfs 2 false || result=1
+    return $result
+}
+
+# A node whose clock jumped 3 minutes ahead and then crashed must still be
+# replayed within the usual failover time.
+test_clock_ahead_crash_recovered() {
+    ensure_cluster_healthy 2 || return 1
+    local marker="hostile: clock ahead crash $(date +%s)" result=0 waited=0
+    mark_vm_logs "$marker"
+    ssh_run 1 "date -u -s '$(date -u -d @$(( $(date +%s) + 180 )) '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    sleep 3
+    crash_goclusterfs 1 || result=1
+    while ! hostile_replayed_since "$marker" && [[ $waited -lt 60 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! hostile_replayed_since "$marker"; then
+        log_error "VM 2 did not replay crashed VM 1 within 60s; VM 1's clock was 3 minutes ahead"
+        result=1
+    else
+        log_info "VM 2 replayed VM 1 ${waited}s after the crash"
+    fi
+    ssh_run 1 "date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null; fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
+    setup_goclusterfs 1 false || result=1
+    return $result
+}
 
 # A power failure while files are written may leave blocks that no file maps.
 # With every node unmounted, fsck -repair frees any it finds, the check after
@@ -4173,11 +4241,14 @@ main() {
     run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure
     run_test "TRIM Reuse Power Failure" test_trim_reuse_power_failure
     run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
+    run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall
     run_test "Hostile: Short EIO Burst" test_storage_short_eio
     run_test "Hostile: Long EIO Burst" test_storage_long_eio
     run_test "Hostile: Flaky EIO" test_storage_flaky_eio
+    run_test "Hostile: Clock Ahead Mount" test_clock_ahead_mount
+    run_test "Hostile: Clock Ahead Crash Recovered" test_clock_ahead_crash_recovered
 
     # Summary
     log_info "=========================================="

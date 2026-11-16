@@ -9,11 +9,6 @@ import (
 	"time"
 )
 
-// longHold is how long a node holds a record before it warns that the hold may
-// have leaked. Under an owner view a claim never goes stale, so a hold that is
-// never released lasts until unmount.
-var longHold = time.Minute
-
 // Start runs a watcher that logs a warning for each record this node has held
 // for more than longHold. Stop ends it.
 func (m *Manager) Start() {
@@ -40,14 +35,18 @@ func (m *Manager) Stop() {
 
 func (m *Manager) watchHolds(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
-	tick := time.NewTicker(longHold / 6)
+	tick := time.NewTicker(m.timing.longHold / 6)
 	defer tick.Stop()
+	retry := time.NewTicker(m.timing.releaseRetry)
+	defer retry.Stop()
 	for {
 		select {
 		case <-stop:
 			return
 		case <-tick.C:
 			m.warnLongHolds()
+		case <-retry.C:
+			m.retryReleases()
 		}
 	}
 }
@@ -58,7 +57,7 @@ func (m *Manager) warnLongHolds() {
 	m.mu.Lock()
 	var warnings []string
 	for recordID, rec := range m.records {
-		if rec.keys == 0 || rec.warnedLong || age(rec.since) <= longHold {
+		if rec.keys == 0 || rec.warnedLong || age(rec.since) <= m.timing.longHold {
 			continue
 		}
 		rec.warnedLong = true

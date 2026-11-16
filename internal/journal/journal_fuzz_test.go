@@ -81,6 +81,18 @@ func FuzzTxnRecord(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(empty)
+	reserve := NewTransaction(7, fuzzNode, 1)
+	if err := reserve.LogBlockReserve([]uint64{7, 8, 9, 20}); err != nil {
+		f.Fatal(err)
+	}
+	if err := reserve.LogBlockUse([]uint64{8}); err != nil {
+		f.Fatal(err)
+	}
+	reserveTxn, err := reserve.Serialize()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(reserveTxn)
 	f.Add(NewIntentCompletion(5).Serialize())
 	f.Add([]byte{})
 
@@ -238,6 +250,7 @@ func decodeAllPayloads(p []byte) {
 	_, _ = DeserializeSnapshotCreate(p)
 	_, _ = DeserializeSnapshotDelete(p)
 	_, _ = DeserializeRefCountUpdate(p)
+	_, _ = DeserializeBlockRuns(p)
 }
 
 func heapAllocBytes() uint64 {

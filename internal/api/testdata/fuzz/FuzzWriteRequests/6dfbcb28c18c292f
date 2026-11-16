@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('\x0f')
+string("api/v1/clones")
+bool(true)
+string("0")
+string("")
+[]byte("\"\xf1\x97\xae\xf1\xae\xab\xf1\x97\xae0\"")

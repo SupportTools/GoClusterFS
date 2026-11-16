@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("9A108A101")
+byte('`')
+[]byte("0")

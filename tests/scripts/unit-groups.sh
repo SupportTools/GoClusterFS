@@ -12,7 +12,7 @@ default_seconds=5
 
 list_packages() {
 	local out
-	out=$(go list ./internal/...)
+	out=$(go list ./internal/... ./tests/soak ./tests/integration/history)
 	echo "$out"
 }
 

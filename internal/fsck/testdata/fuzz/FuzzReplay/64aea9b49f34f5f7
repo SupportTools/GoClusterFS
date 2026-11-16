@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("#71111#7")
+byte('û')
+[]byte("0")
