@@ -58,7 +58,11 @@ func (c *cacheLoss) cutPower(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dev.Close()
+	defer func() {
+		if err := dev.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	for _, w := range slices.Backward(undo) {
 		buf := storage.GetBuffer(len(w.old))
 		copy(buf.Bytes(), w.old)

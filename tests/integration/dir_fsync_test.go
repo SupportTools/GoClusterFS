@@ -1,9 +1,6 @@
 package integration
 
-import (
-	"os"
-	"testing"
-)
+import "testing"
 
 // Git, SQLite and Postgres fsync a directory after they create or remove an entry in it. Each such fsync succeeds.
 func TestDirectoryFsync(t *testing.T) {
@@ -13,12 +10,7 @@ func TestDirectoryFsync(t *testing.T) {
 	}
 	fsyncDir := func(name string) {
 		t.Helper()
-		d, err := os.Open(mfs.Path(name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer d.Close()
-		if err := d.Sync(); err != nil {
+		if err := syncPath(mfs.Path(name)); err != nil {
 			t.Errorf("fsync of directory %q: %v", name, err)
 		}
 	}
