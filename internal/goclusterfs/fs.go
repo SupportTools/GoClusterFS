@@ -2024,7 +2024,7 @@ func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockN
 // Returns errRetryWrite if a concurrent modification is detected and the caller should retry.
 func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (int, error) {
 	bytesWritten := 0
-	requested := len(data)
+	requested, writeStart := len(data), offset
 	// writtenEnd is the end of the data this write has put on disk so far; oldEnd is the file's size it started from.
 	writtenEnd, oldEnd := uint64(0), uint64(0)
 
@@ -2597,6 +2597,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		logging.Debugf("Write inode %d: re-read inode failed: %v", f.inodeNum, err)
 		return 0, syscall.EIO
 	}
+	onDisk := freshIno.Size
 	// ino was read before the lock, so it can miss another node's extents.
 	if acquiredLockForSize {
 		ino = freshIno
@@ -2735,6 +2736,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		releaseCopied(cowDone[:committedCoW])
 		cowDone = cowDone[:committedCoW]
 		return errRetryWrite
+	}
+
+	// A peer resized the file after growthSegments chose what to zero; the retry zeroes from the new size.
+	if onDisk < writeStart && onDisk != oldEnd && onDisk%BlockSize != 0 {
+		return 0, writeFailed(fmt.Errorf("%w: inode %d is %d bytes, not %d as the write planned", extent.ErrTreeConflict, f.inodeNum, onDisk, oldEnd))
 	}
 
 	if testHookBeforeInodeCommit != nil {

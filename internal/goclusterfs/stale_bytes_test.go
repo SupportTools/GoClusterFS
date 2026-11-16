@@ -359,3 +359,44 @@ func TestSequentialWriteWritesDataOnce(t *testing.T) {
 		t.Fatalf("writing %d MiB wrote %.2fx its size, want about 1x", total>>20, ratio)
 	}
 }
+
+// A write below the end of the file plans no gap, then a peer truncates before the write sets its size. The write must
+// not grow the file back over the truncated bytes without zeroing them.
+func TestWriteAfterPeerTruncateShowsNoOldBytes(t *testing.T) {
+	path := newFormattedImage(t)
+	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
+	ctx := context.Background()
+	a := createFile(t, nodeA, "f")
+	writeAt(t, a, pattern(3, 10000), 0)
+	b := &File{fs: nodeB, inodeNum: a.inodeNum}
+
+	var once sync.Once
+	truncated := make(chan struct{})
+	beforeSizeUpdate = func(*File) {
+		once.Do(func() {
+			go func() {
+				defer close(truncated)
+				in := &fuse.SetAttrIn{}
+				in.Valid, in.Size = fuse.FATTR_SIZE, 100
+				if errno := b.Setattr(ctx, nil, in, &fuse.AttrOut{}); errno != 0 {
+					t.Errorf("peer truncate: %v", errno)
+				}
+			}()
+			select {
+			case <-truncated:
+			case <-time.After(3 * time.Second):
+				t.Error("the peer's truncate did not land while the write waited to set its size")
+			}
+		})
+	}
+	t.Cleanup(func() { beforeSizeUpdate = nil })
+
+	data := pattern(9, 10)
+	if _, errno := a.Write(ctx, nil, data, 5000); errno != 0 {
+		t.Fatalf("write: %v", errno)
+	}
+	<-truncated
+	beforeSizeUpdate = nil
+	want := append(append(pattern(3, 100), make([]byte, 4900)...), data...)
+	expectContent(t, &File{fs: openFormattedFS(t, path), inodeNum: a.inodeNum}, want)
+}
