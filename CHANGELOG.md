@@ -77,6 +77,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Reads no longer show bytes nobody wrote to the file. A partial write into a newly allocated block left the rest of that block as the disk held it, often a deleted file's data, readable as soon as the file covered it; such writes now zero the block first, which doubles the bytes written for new data until a later change zeroes only what can become readable. A truncate into the middle of a block left the old bytes after the cut, and growing the file later showed them; truncate now zeroes them before it shrinks the file.
 - A damaged block reserve record in a journal could make journal replay and `goclusterfs-fsck` allocate up to 32 GB. A reserve record now holds at most 1,048,576 blocks, and a larger `-block-reserve` acts as 1,048,576.
 - A damaged journal record that claimed a length within 4 KB of 4 GB crashed journal recovery with a panic. Recovery now treats it as corrupt.
 - A node registry slot with a zero checksum was accepted whatever it held, so a slot torn or zeroed at its end read as valid. Now only an all-zero slot, which no node has written, skips the checksum.
