@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -140,6 +141,7 @@ func main() {
 		os.Exit(code)
 	}
 	logging.SetDebug(*debug)
+	dumpGoroutinesOnSIGUSR1()
 
 	if *showVer {
 		fmt.Println("goclusterfs-mount", version.String())
@@ -743,4 +745,17 @@ func adoptLocks(locks *lock.Manager, owner [16]byte, slot int) func(replayed boo
 			log.Printf("Warning: Failed to release the locks taken over from dead node %x: %v", owner[:8], err)
 		}
 	}
+}
+
+// dumpGoroutinesOnSIGUSR1 writes every goroutine's stack to the log on SIGUSR1 and keeps the mount running.
+func dumpGoroutinesOnSIGUSR1() {
+	dumps := make(chan os.Signal, 1)
+	signal.Notify(dumps, syscall.SIGUSR1)
+	go func() {
+		for range dumps {
+			log.Println("goroutine dump begins")
+			_ = pprof.Lookup("goroutine").WriteTo(log.Writer(), 2)
+			log.Println("goroutine dump ends")
+		}
+	}()
 }

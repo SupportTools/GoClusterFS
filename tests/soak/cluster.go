@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // controller drives tests/soak/cluster.sh, which owns the VMs.
@@ -103,6 +104,9 @@ type agentConn struct {
 	stdin   io.WriteCloser
 	done    chan struct{}
 	err     error
+	// stalled runs once for a call still waiting after stallAfter.
+	stallAfter time.Duration
+	stalled    func(req request)
 }
 
 var errAgentGone = errors.New("agent connection closed")
@@ -171,14 +175,25 @@ func (a *agentConn) call(ctx context.Context, req request) (response, error) {
 	if err != nil {
 		return response{}, fmt.Errorf("%w: %v", errAgentGone, err)
 	}
-	select {
-	case resp, ok := <-ch:
-		if !ok {
-			return response{}, a.err
+	var stall <-chan time.Time
+	if a.stalled != nil && a.stallAfter > 0 {
+		timer := time.NewTimer(a.stallAfter)
+		defer timer.Stop()
+		stall = timer.C
+	}
+	for {
+		select {
+		case resp, ok := <-ch:
+			if !ok {
+				return response{}, a.err
+			}
+			return resp, nil
+		case <-ctx.Done():
+			return response{}, ctx.Err()
+		case <-stall:
+			stall = nil
+			go a.stalled(req)
 		}
-		return resp, nil
-	case <-ctx.Done():
-		return response{}, ctx.Err()
 	}
 }
 

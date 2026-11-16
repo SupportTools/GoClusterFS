@@ -14,6 +14,13 @@
   - goclusterfs-mount is stopped past the 10s heartbeat timeout and resumed.
 
   The node comes back, mounts again and must show the model. The other nodes keep working through the fault.
+- **Stalls:** when a call waits longer than `-stall-capture` (20s), the soak saves from every node:
+  - each mount thread's kernel stack;
+  - the lock and reserve wait totals from `/metrics`;
+  - the FUSE requests queued;
+  - every goroutine's stack, which goclusterfs-mount writes to its log on SIGUSR1.
+
+  The files go to `stalls/`, at most once a minute and never during a fault, which stalls calls on purpose.
 - **fsck:** every `-fsck-every`, all operations stop, every node unmounts and goclusterfs-fsck runs. Anything other than leaks and orphan snapshots is a failure. Leaks are repaired.
 
 The first failure stops the run. `result.txt` says what failed, `ops.jsonl` logs every operation, fault and fsck, and `cluster.img` keeps the shared disk.
