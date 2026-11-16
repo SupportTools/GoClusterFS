@@ -155,8 +155,8 @@ func TestFsckRepairReclaimsLeakedBlocks(t *testing.T) {
 	if got := refcountOf(t, fsys, pairBlock); got != 0 {
 		t.Fatalf("freed block %d keeps refcount %d", pairBlock, got)
 	}
-	checkFile(t, &File{fs: fsys, inodeNum: grow.inodeNum}, pattern(9, BlockSize))
-	src = &File{fs: fsys, inodeNum: src.inodeNum}
+	checkFile(t, fileNode(fsys, grow.inodeNum), pattern(9, BlockSize))
+	src = fileNode(fsys, src.inodeNum)
 	checkFile(t, src, data)
 	setxattr(t, src, "user.snapshot.clone", "before:/from-snapshot.bin")
 	fromSnapshot := lookupFile(t, fsys, "from-snapshot.bin")

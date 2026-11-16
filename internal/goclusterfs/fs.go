@@ -715,10 +715,10 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
 	out.Attr.Blksize = BlockSize
 
-	childFile := &File{fs: f, inodeNum: uint32(childInodeNum)}
-	ch := f.NewPersistentInode(ctx, childFile, fs.StableAttr{
+	ch := f.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  childInodeNum,
+		Gen:  childIno.BirthGeneration,
 	})
 	logging.Debugf("FS.Lookup: returning file inode %d, size=%d", childInodeNum, childIno.Size)
 	return ch, 0
@@ -1006,7 +1006,7 @@ func (f *FS) openExisting(ctx context.Context, parent *fs.Inode, name string, fl
 	unlock := f.lockInode(file.inodeNum)
 	f.addOpen(file.inodeNum, 1)
 	ino, err := f.inodeTbl.Read(file.inodeNum)
-	if err != nil || !liveFile(ino) {
+	if err != nil || !file.current(ino) || ino.LinkCount == 0 {
 		f.addOpen(file.inodeNum, -1)
 		unlock()
 		if err != nil {
@@ -1087,9 +1087,10 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	f.touchParent(ctx, parentNum, 0, now)
 
 	f.addOpen(childIno.InodeNum, 1)
-	ch := parent.NewPersistentInode(ctx, &File{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
+	ch := parent.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  uint64(childIno.InodeNum),
+		Gen:  childIno.BirthGeneration,
 	})
 	fillEntryOut(out, childIno)
 	return ch, 0
@@ -1368,10 +1369,10 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
 	out.Attr.Blksize = BlockSize
 
-	childFile := &File{fs: d.fs, inodeNum: uint32(childInodeNum)}
-	ch := d.NewPersistentInode(ctx, childFile, fs.StableAttr{
+	ch := d.NewPersistentInode(ctx, newFile(d.fs, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  childInodeNum,
+		Gen:  childIno.BirthGeneration,
 	})
 	logging.Debugf("Lookup: returning file inode %d, size=%d", childInodeNum, childIno.Size)
 	return ch, 0
@@ -1703,6 +1704,11 @@ type File struct {
 
 	fs       *FS
 	inodeNum uint32
+	birth    uint64
+}
+
+func newFile(fsys *FS, ino *inode.Inode) *File {
+	return &File{fs: fsys, inodeNum: ino.InodeNum, birth: ino.BirthGeneration}
 }
 
 // Verify interface compliance at compile time
@@ -1729,7 +1735,7 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	unlock := f.fs.lockInode(f.inodeNum)
 	reopen := f.fs.addOpen(f.inodeNum, 1) > 1
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if usable := err == nil && (liveFile(ino) || reopen && f.fs.holdsOrphan(ino)); !usable {
+	if usable := err == nil && f.current(ino) && (ino.LinkCount > 0 || reopen && f.fs.holdsOrphan(ino)); !usable {
 		f.fs.addOpen(f.inodeNum, -1)
 		unlock()
 		if err != nil {
@@ -1765,11 +1771,20 @@ func (f *File) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	return 0
 }
 
-// liveFile reports whether ino is a regular file some name still holds, so a new
-// open may use it. A node can outlive its file: another caller unlinks it, or the
-// slot goes to a new inode. ESTALE makes the kernel look the name up again.
-func liveFile(ino *inode.Inode) bool {
-	return ino.Magic == inode.InodeMagic && ino.IsFile() && ino.LinkCount > 0
+// current reports whether the slot still holds this node's file; birth 0, from older versions, matches any since a snapshot may assign one.
+func (f *File) current(ino *inode.Inode) bool {
+	return ino.Magic == inode.InodeMagic && ino.IsFile() && (f.birth == 0 || ino.BirthGeneration == f.birth)
+}
+
+func (f *File) stillCurrent() syscall.Errno {
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	switch {
+	case err != nil:
+		return syscall.EIO
+	case !f.current(ino):
+		return syscall.ESTALE
+	}
+	return 0
 }
 
 // Getattr returns file attributes.
@@ -1782,7 +1797,7 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 		logging.Debugf("File.Getattr: read failed: %v", err)
 		return syscall.EIO
 	}
-	if ino.Magic != inode.InodeMagic || !ino.IsFile() {
+	if !f.current(ino) {
 		return syscall.ESTALE
 	}
 
@@ -1827,6 +1842,9 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 	if err != nil {
 		logging.Debugf("Read inode %d: Read failed: %v", f.inodeNum, err)
 		return nil, syscall.EIO
+	}
+	if !f.current(ino) {
+		return nil, syscall.ESTALE
 	}
 
 	logging.Debugf("Read inode %d: Size=%d AllocatedBlocks=%d Extents=[%+v, %+v]",
@@ -2190,6 +2208,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	if err != nil {
 		logging.Debugf("Write inode %d: Read failed: %v", f.inodeNum, err)
 		return 0, syscall.EIO
+	}
+	if !f.current(ino) {
+		return 0, syscall.ESTALE
 	}
 	// persistAndUnlock writes changes made under the inode lock and drops it, so
 	// the bitmap lock, which comes first in lock order, can be taken next.
@@ -3059,6 +3080,9 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	if err != nil {
 		return syscall.EIO, nil
 	}
+	if !f.current(ino) {
+		return syscall.ESTALE, nil
+	}
 	if testHookAfterSetattrRead != nil {
 		testHookAfterSetattrRead()
 	}
@@ -3285,6 +3309,9 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 		logging.Debugf("Allocate inode %d: read failed: %v", f.inodeNum, err)
 		return syscall.EIO, nil
 	}
+	if !f.current(ino) {
+		return syscall.ESTALE, nil
+	}
 
 	// Until the inode write commits them, blocks allocated here belong to nobody.
 	var newBlocks []uint64
@@ -3417,7 +3444,13 @@ func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uin
 	defer f.fs.lockInode(f.inodeNum)()
 	// A snapshot or clone spans several writes; an interrupted caller must not stop it halfway.
 	ctx = context.WithoutCancel(ctx)
-	if ino, err := f.fs.inodeTbl.Read(f.inodeNum); err == nil && ino.LinkCount == 0 && attr != "user.snapshot.delete" {
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	switch {
+	case err != nil:
+		return syscall.EIO
+	case !f.current(ino):
+		return syscall.ESTALE
+	case ino.LinkCount == 0 && attr != "user.snapshot.delete":
 		return syscall.ENOENT
 	}
 	switch attr {
@@ -3438,6 +3471,9 @@ func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uin
 func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
 	ctx = detach(ctx)
 	logging.Debugf("File.Getxattr: inode=%d attr=%s", f.inodeNum, attr)
+	if errno := f.stillCurrent(); errno != 0 {
+		return 0, errno
+	}
 
 	switch attr {
 	case "user.snapshots":
@@ -3452,6 +3488,9 @@ func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, 
 func (f *File) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	ctx = detach(ctx)
 	logging.Debugf("File.Removexattr: inode=%d attr=%s", f.inodeNum, attr)
+	if errno := f.stillCurrent(); errno != 0 {
+		return errno
+	}
 
 	// Handle user.snapshot.<name> for snapshot deletion
 	const snapshotPrefix = "user.snapshot."

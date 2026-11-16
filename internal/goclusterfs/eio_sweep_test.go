@@ -35,7 +35,7 @@ func (r *eioRun) file(dirNum uint32, name string) *File {
 	if err != nil {
 		return nil
 	}
-	return &File{fs: r.fsys, inodeNum: uint32(num)}
+	return fileNode(r.fsys, uint32(num))
 }
 
 func (r *eioRun) step(name string, op func() syscall.Errno) {

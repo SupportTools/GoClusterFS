@@ -149,7 +149,7 @@ func TestReaderNeverSeesUncommittedBlocks(t *testing.T) {
 		storage.PutBuffer(buf)
 	}
 	fileA := newRegularFile(t, fsA)
-	fileB := &File{fs: fsB, inodeNum: fileA.inodeNum}
+	fileB := fileNode(fsB, fileA.inodeNum)
 
 	const blocks, chunk = 16, 256 * 1024
 	data := make([]byte, blocks*BlockSize)
@@ -344,7 +344,7 @@ func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
 	fsA := openLockedTreeFSNode(t, path, lockPath, 1)
 	fsB := openLockedTreeFSNode(t, path, lockPath, 2)
 	fileA := newRegularFile(t, fsA)
-	fileB := &File{fs: fsB, inodeNum: fileA.inodeNum}
+	fileB := fileNode(fsB, fileA.inodeNum)
 	writeAt(t, fileA, make([]byte, BlockSize), 0)
 	ino, err := fsA.inodeTbl.Read(fileA.inodeNum)
 	if err != nil {

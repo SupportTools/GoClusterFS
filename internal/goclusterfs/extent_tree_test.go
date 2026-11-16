@@ -73,7 +73,7 @@ func newRegularFile(t *testing.T, fsys *FS) *File {
 	if err := fsys.inodeTbl.Write(context.Background(), ino); err != nil {
 		t.Fatalf("write inode: %v", err)
 	}
-	return &File{fs: fsys, inodeNum: ino.InodeNum}
+	return fileNode(fsys, ino.InodeNum)
 }
 
 func pattern(seed byte, n int) []byte {
@@ -126,15 +126,15 @@ func TestWriteBeyondTwoExtents(t *testing.T) {
 
 	verify := func(fsys *FS) {
 		t.Helper()
-		sparse := &File{fs: fsys, inodeNum: sparse.inodeNum}
+		sparse := fileNode(fsys, sparse.inodeNum)
 		for i, off := range sparseOffsets {
 			checkAt(t, sparse, pattern(byte(i+1), 4096), off)
 		}
 		checkAt(t, sparse, make([]byte, 4096), 7*BlockSize)
 
 		for blk := int64(0); blk < appendBlocks; blk++ {
-			checkAt(t, &File{fs: fsys, inodeNum: a.inodeNum}, pattern(byte(blk+10), BlockSize), blk*BlockSize)
-			checkAt(t, &File{fs: fsys, inodeNum: b.inodeNum}, pattern(byte(blk+40), BlockSize), blk*BlockSize)
+			checkAt(t, fileNode(fsys, a.inodeNum), pattern(byte(blk+10), BlockSize), blk*BlockSize)
+			checkAt(t, fileNode(fsys, b.inodeNum), pattern(byte(blk+40), BlockSize), blk*BlockSize)
 		}
 		for _, num := range []uint32{sparse.inodeNum, a.inodeNum, b.inodeNum} {
 			ino, err := fsys.inodeTbl.Read(num)
@@ -184,4 +184,12 @@ func TestUpdateInodeRetriesTreeConflict(t *testing.T) {
 		t.Fatalf("Mtime = %d, want 12345", updated.Mtime)
 	}
 	checkAt(t, f, pattern(9, 4096), 20*BlockSize)
+}
+
+// fileNode makes the File node a lookup of inode num would.
+func fileNode(fsys *FS, num uint32) *File {
+	if ino, err := fsys.inodeTbl.Read(num); err == nil {
+		return newFile(fsys, ino)
+	}
+	return &File{fs: fsys, inodeNum: num}
 }

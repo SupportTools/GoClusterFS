@@ -96,7 +96,7 @@ func TestFileSetattrKeepsOtherNodesSize(t *testing.T) {
 	fA := newRegularFile(t, nodeA)
 	first := pattern(1, 100)
 	writeAt(t, fA, first, 0)
-	fB := &File{fs: nodeB, inodeNum: fA.inodeNum}
+	fB := fileNode(nodeB, fA.inodeNum)
 	appended := pattern(2, 100)
 
 	wrote := raceSetattr(t, func() syscall.Errno {

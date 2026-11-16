@@ -228,7 +228,7 @@ func expectSnapshot(t *testing.T, fsys *FS, name string, want []byte) bool {
 	if desc.State != snapshot.StateActive {
 		t.Fatalf("snapshot %s is %s after recovery", name, desc.State)
 	}
-	if !bytes.Equal(readWhole(t, &File{fs: fsys, inodeNum: desc.DataInode}), want) {
+	if !bytes.Equal(readWhole(t, fileNode(fsys, desc.DataInode)), want) {
 		t.Fatalf("snapshot %s changed", name)
 	}
 	return true
@@ -244,7 +244,7 @@ func lookupMaybe(t *testing.T, fsys *FS, name string) *File {
 	if err != nil {
 		return nil
 	}
-	return &File{fs: fsys, inodeNum: uint32(num)}
+	return fileNode(fsys, uint32(num))
 }
 
 // waitForSnapshotDelete waits until the delete job freed the snapshot's data inode or power failed.
