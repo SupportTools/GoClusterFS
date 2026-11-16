@@ -341,6 +341,19 @@ func (m *Manager) OnReturnReserves(fn func()) {
 	}
 }
 
+func (m *Manager) BroadcastOrphans() {
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastOrphans()
+	}
+}
+
+// OnOrphans must be called after StartBroadcast.
+func (m *Manager) OnOrphans(fn func()) {
+	if m.broadcaster != nil {
+		m.broadcaster.OnOrphans(fn)
+	}
+}
+
 // BroadcastInvalidateAll clears all caches locally AND broadcasts
 // a full invalidation to peer nodes. Use this after events that
 // might invalidate many entries (fsck, network partition recovery, etc).

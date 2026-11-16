@@ -32,6 +32,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/logging"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
@@ -145,6 +146,9 @@ type FS struct {
 	gid uint32
 
 	inodeMu [inodeMuStripes]sync.Mutex
+
+	orphanReg orphanRegistry
+	opens     openFiles
 }
 
 // Verify interface compliance at compile time
@@ -975,7 +979,10 @@ func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32,
 		}
 		return errno
 	})
-	return node, nil, 0, errno
+	if errno != 0 {
+		return nil, nil, 0, errno
+	}
+	return node, fileHandle{}, 0, 0
 }
 
 // openExisting opens name in parent for a create without O_EXCL that found the
@@ -992,19 +999,25 @@ func (f *FS) openExisting(ctx context.Context, parent *fs.Inode, name string, fl
 	if !ok {
 		return nil, syscall.EISDIR
 	}
+	unlock := f.lockInode(file.inodeNum)
+	f.addOpen(file.inodeNum, 1)
 	ino, err := f.inodeTbl.Read(file.inodeNum)
-	switch {
-	case err != nil:
-		return nil, syscall.EIO
-	case !liveFile(ino):
+	if err != nil || !liveFile(ino) {
+		f.addOpen(file.inodeNum, -1)
+		unlock()
+		if err != nil {
+			return nil, syscall.EIO
+		}
 		return nil, syscall.EAGAIN
 	}
+	unlock()
 	f.cacheInode(ino)
 	if flags&syscall.O_TRUNC != 0 && ino.Size > 0 {
 		in := &fuse.SetAttrIn{}
 		in.Valid, in.Size = fuse.FATTR_SIZE, 0
 		var attr fuse.AttrOut
 		if errno := file.Setattr(ctx, nil, in, &attr); errno != 0 {
+			f.addOpen(file.inodeNum, -1)
 			return nil, errno
 		}
 		out.Attr = attr.Attr
@@ -1069,6 +1082,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	f.cacheInode(childIno)
 	f.touchParent(ctx, parentNum, 0, now)
 
+	f.addOpen(childIno.InodeNum, 1)
 	ch := parent.NewPersistentInode(ctx, &File{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  uint64(childIno.InodeNum),
@@ -1501,7 +1515,24 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	}
 
 	// Rmdir removes only empty directories, whose link count also counts their own "." entry.
-	willFreeInode := isDir || childIno.LinkCount == 1
+	willFreeInode := isDir
+	var live uint64
+	if !isDir && childIno.LinkCount == 1 {
+		if live, err = d.fs.reserveOrphan(childIno); err != nil {
+			if errors.Is(err, errOrphansFull) {
+				log.Printf("[WARN] unlink %q: %v", name, err)
+				return syscall.EBUSY
+			}
+			return syscall.EIO
+		}
+	}
+	reserved := live != 0
+	defer func() {
+		if reserved && d.fs.orphanReg != nil {
+			o := orphanOf(childIno)
+			_ = d.fs.orphanReg.DropOrphans(func(x node.Orphan) bool { return x == o })
+		}
+	}()
 
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
@@ -1542,15 +1573,12 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 				d.fs.journal.Abort(txn)
 				return syscall.EIO
 			}
-		} else {
-			// Log inode update for link count decrement
-			if err := txn.LogInodeUpdate(&journal.InodeUpdatePayload{
-				InodeNum:   uint64(childInodeNum),
-				UpdateMask: journal.InodeUpdateNlink,
-			}); err != nil {
-				d.fs.journal.Abort(txn)
-				return syscall.EIO
-			}
+		} else if err := txn.LogLinkDrop(&journal.LinkDropPayload{
+			InodeNum:       uint64(childInodeNum),
+			MetaGeneration: childIno.MetaGeneration,
+		}); err != nil {
+			d.fs.journal.Abort(txn)
+			return syscall.EIO
 		}
 
 		// Log parent directory inode update (mtime change, and link count for rmdir)
@@ -1633,11 +1661,10 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 				afterCommit("unlink: blocks freed")
 			}
 		}
-	} else if updated, err := d.fs.updateInodeLocked(ctx, uint32(childInodeNum), func(ino *inode.Inode) error { ino.LinkCount--; return nil }); err != nil {
-		log.Printf("[WARN] removeEntry %q: link count of inode %d not updated: %v", name, childInodeNum, err)
+	} else if err := d.fs.dropLink(ctx, uint32(childInodeNum), live); err != nil {
+		log.Printf("[WARN] removeEntry %q: link of inode %d not dropped: %v", name, childInodeNum, err)
 	} else {
-		// Cache the updated child inode
-		d.fs.cacheInode(updated)
+		reserved = false
 	}
 
 	// Update directory mtime, and its link count for directory removal
@@ -1689,20 +1716,26 @@ var (
 	_ fs.NodeRemovexattrer = (*File)(nil)
 )
 
-// Open opens the file for reading/writing.
-// Returns nil FileHandle to indicate the File node itself should be used as the handle.
+// fileHandle is empty because the File node serves all I/O, but go-fuse calls Release only for an open that returned a handle.
+type fileHandle struct{}
+
 func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	logging.Debugf("File.Open: inode=%d flags=%d", f.inodeNum, flags)
-	// Verify the inode exists and is a regular file
+	// Counted before the check, so a peer's last unlink sees this open and keeps the file.
+	unlock := f.fs.lockInode(f.inodeNum)
+	f.fs.addOpen(f.inodeNum, 1)
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if err != nil {
-		logging.Debugf("File.Open: read failed: %v", err)
-		return nil, 0, syscall.EIO
-	}
-	if !liveFile(ino) {
+	if err != nil || !liveFile(ino) {
+		f.fs.addOpen(f.inodeNum, -1)
+		unlock()
+		if err != nil {
+			logging.Debugf("File.Open: read failed: %v", err)
+			return nil, 0, syscall.EIO
+		}
 		logging.Debugf("File.Open: inode %d is no longer this file", f.inodeNum)
 		return nil, 0, syscall.ESTALE
 	}
+	unlock()
 	logging.Debugf("File.Open: success, Size=%d", ino.Size)
 	// Close-to-open consistency: reads through this handle start from the on-disk inode.
 	f.fs.cacheInode(ino)
@@ -1711,10 +1744,21 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	if errno := f.NotifyContent(-1, 0); errno != 0 && errno != syscall.ENOSYS {
 		logging.Debugf("File.Open: inode %d: expiring kernel attributes failed: %v", f.inodeNum, errno)
 	}
-	// Return nil FileHandle - the File node itself implements Read/Write/etc.
-	// The fuse.FOPEN_KEEP_CACHE flag tells the kernel to keep cached data valid
-	// (we don't use it in cluster mode since other nodes may modify the file).
-	return nil, 0, 0
+	return fileHandle{}, 0, 0
+}
+
+// Release lets go of an unlinked file at its last close on this node.
+func (f *File) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	if f.fs.addOpen(f.inodeNum, -1) > 0 {
+		return 0
+	}
+	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	if err == nil && ino.Magic == inode.InodeMagic && ino.LinkCount == 0 && ino.Holders&f.fs.slotBit() != 0 {
+		if err := f.fs.clearHolder(detach(ctx), orphanOf(ino), 0); err != nil {
+			log.Printf("[WARN] inode %d: letting go of it at its last close failed: %v", f.inodeNum, err)
+		}
+	}
+	return 0
 }
 
 // liveFile reports whether ino is a regular file some name still holds, so a new
@@ -3427,6 +3471,9 @@ func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uin
 	defer f.fs.lockInode(f.inodeNum)()
 	// A snapshot or clone spans several writes; an interrupted caller must not stop it halfway.
 	ctx = context.WithoutCancel(ctx)
+	if ino, err := f.fs.inodeTbl.Read(f.inodeNum); err == nil && ino.LinkCount == 0 && attr != "user.snapshot.delete" {
+		return syscall.ENOENT
+	}
 	switch attr {
 	case "user.snapshot":
 		return f.createSnapshot(ctx, string(data))

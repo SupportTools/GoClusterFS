@@ -61,6 +61,9 @@ const (
 
 	// TypeReturnReserves asks peers to give their reserved blocks back to the bitmap.
 	TypeReturnReserves MessageType = 6
+
+	// TypeOrphans tells peers an orphan list changed, so they check it now instead of at their next failure scan.
+	TypeOrphans MessageType = 7
 )
 
 // String returns a human-readable message type name.
@@ -78,6 +81,8 @@ func (t MessageType) String() string {
 		return "PeerAnnounce"
 	case TypeReturnReserves:
 		return "ReturnReserves"
+	case TypeOrphans:
+		return "Orphans"
 	default:
 		return fmt.Sprintf("Unknown(%d)", t)
 	}
@@ -422,6 +427,17 @@ func (b *MessageBuilder) ReturnReserves() *Message {
 	return &Message{
 		Version:    ProtocolVersion,
 		Type:       TypeReturnReserves,
+		Flags:      FlagUrgent,
+		SenderUUID: b.senderUUID,
+		Sequence:   b.seqGen.Next(),
+		Timestamp:  time.Now().UnixNano(),
+	}
+}
+
+func (b *MessageBuilder) Orphans() *Message {
+	return &Message{
+		Version:    ProtocolVersion,
+		Type:       TypeOrphans,
 		Flags:      FlagUrgent,
 		SenderUUID: b.senderUUID,
 		Sequence:   b.seqGen.Next(),

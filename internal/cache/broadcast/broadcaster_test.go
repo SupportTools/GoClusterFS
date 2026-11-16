@@ -228,6 +228,31 @@ func TestBroadcasterHandleInvalidateAll(t *testing.T) {
 	}
 }
 
+func TestBroadcasterHandleOrphans(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Enabled = false
+	b, err := NewBroadcaster(cfg, [16]byte{1}, 0, newMockHandler())
+	if err != nil {
+		t.Fatalf("NewBroadcaster failed: %v", err)
+	}
+	var calls atomic.Int32
+	b.OnOrphans(func() { calls.Add(1) })
+
+	msg := NewMessageBuilder([16]byte{2}).Orphans()
+	wire, err := msg.Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Unmarshal(wire, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.handleMessage(got, nil)
+	if calls.Load() != 1 || got.Type.String() != "Orphans" {
+		t.Errorf("handled %s message: %d OnOrphans calls, want 1", got.Type, calls.Load())
+	}
+}
+
 func TestBroadcasterIgnoresOwnMessages(t *testing.T) {
 	handler := newMockHandler()
 	uuid := [16]byte{1, 2, 3, 4}
