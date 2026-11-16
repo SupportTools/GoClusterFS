@@ -23,6 +23,13 @@ func newTestNode(dev *storage.Device, offset, size uint64, n int) *Manager {
 	return NewManager(dev, offset, size, uuid, n)
 }
 
+// setTimings changes the timings of ms. Call it before ms are used.
+func setTimings(set func(*timings), ms ...*Manager) {
+	for _, m := range ms {
+		set(&m.timing)
+	}
+}
+
 func acquireWithin(m *Manager, d time.Duration, lt LockType, id uint64, mode LockMode) error {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
@@ -142,8 +149,7 @@ func TestConcurrentAcquireOnOneNodeKeepsOtherNodesOut(t *testing.T) {
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
 	// The workers wait for each other while holding, so all must join the hold, however late the scheduler starts them.
-	defer func(d time.Duration) { holdTurn = d }(holdTurn)
-	holdTurn = time.Minute
+	setTimings(func(t *timings) { t.holdTurn = time.Minute }, a, b)
 
 	const workers = 4
 	for iter := 0; iter < 30; iter++ {
@@ -274,8 +280,7 @@ func TestJoiningKeyRenewsBusyRecord(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, RowSize, 1)
 	b := newTestNode(dev, 0, RowSize, 2)
-	defer func(d time.Duration) { renewAfter = d }(renewAfter)
-	renewAfter = 0
+	setTimings(func(t *timings) { t.renewAfter = 0 }, a, b)
 
 	requireAcquired(t, a, LockTypeInode, 1, LockModeExclusive)
 	ageSlot(t, a, LockTypeInode, 1, pastStale)
@@ -314,7 +319,7 @@ func TestPausedHolderReleaseKeepsReclaimedLock(t *testing.T) {
 	requireAcquired(t, b, LockTypeInode, 3, LockModeExclusive)
 
 	release(t, a, LockTypeInode, 3)
-	time.Sleep(cacheGrace + 50*time.Millisecond)
+	time.Sleep(a.timing.cacheGrace + 50*time.Millisecond)
 	requireBlocked(t, c, LockTypeInode, 3, LockModeExclusive)
 }
 
@@ -327,8 +332,6 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 	)
 	dev, cleanup := createTestDevice(t, guard+regionSize+guard)
 	defer cleanup()
-	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
-	cacheGrace = time.Millisecond
 
 	sentinel := storage.NewAlignedBuffer(guard)
 	for i := range sentinel.Bytes() {
@@ -344,6 +347,7 @@ func TestLockRegionStaysBoundedAcrossCycles(t *testing.T) {
 		newTestNode(dev, guard, regionSize, 1),
 		newTestNode(dev, guard, regionSize, 2),
 	}
+	setTimings(func(t *timings) { t.cacheGrace = time.Millisecond }, nodes...)
 	var wg sync.WaitGroup
 	errs := make(chan error, len(nodes))
 	for n, m := range nodes {
@@ -396,8 +400,7 @@ func TestReleasedHoldIsCachedForGrace(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
-	cacheGrace = 200 * time.Millisecond
+	setTimings(func(t *timings) { t.cacheGrace = 200 * time.Millisecond }, a, b)
 
 	requireAcquired(t, a, LockTypeInode, 6, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 6); err != nil {
@@ -407,8 +410,8 @@ func TestReleasedHoldIsCachedForGrace(t *testing.T) {
 
 	start := time.Now()
 	requireAcquired(t, b, LockTypeInode, 6, LockModeExclusive)
-	if waited := time.Since(start); waited > cacheGrace+4*RetryMaxDelay {
-		t.Fatalf("other node waited %v for a cached hold, want at most about the %v grace", waited, cacheGrace)
+	if waited := time.Since(start); waited > a.timing.cacheGrace+4*RetryMaxDelay {
+		t.Fatalf("other node waited %v for a cached hold, want at most about the %v grace", waited, a.timing.cacheGrace)
 	}
 }
 
@@ -424,8 +427,8 @@ func TestIdleCachedHoldFreesBeforeTurnEnds(t *testing.T) {
 	}
 	start := time.Now()
 	requireAcquired(t, b, LockTypeInode, 7, LockModeExclusive)
-	if waited := time.Since(start); waited >= holdTurn {
-		t.Fatalf("other node waited %v for an idle hold, want less than the %v turn a busy holder gets", waited, holdTurn)
+	if waited := time.Since(start); waited >= a.timing.holdTurn {
+		t.Fatalf("other node waited %v for an idle hold, want less than the %v turn a busy holder gets", waited, a.timing.holdTurn)
 	}
 }
 
@@ -434,9 +437,7 @@ func TestPausedNodeDropsCachedHoldTakenOver(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	defer func(d time.Duration) { renewAfter = d }(renewAfter)
-	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
-	cacheGrace = time.Minute
+	setTimings(func(t *timings) { t.cacheGrace = time.Minute }, a, b)
 
 	requireAcquired(t, a, LockTypeInode, 8, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 8); err != nil {
@@ -445,7 +446,7 @@ func TestPausedNodeDropsCachedHoldTakenOver(t *testing.T) {
 	// A pauses past StaleThreshold with the write hold cached, and B takes the record over.
 	ageSlot(t, a, LockTypeInode, 8, pastStale)
 	requireAcquired(t, b, LockTypeInode, 8, LockModeExclusive)
-	renewAfter = 0
+	a.timing.renewAfter = 0
 
 	requireBlocked(t, a, LockTypeInode, 8, LockModeExclusive)
 }
@@ -455,8 +456,7 @@ func TestReleaseCachedFreesHoldsAtOnce(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
-	cacheGrace = time.Minute
+	setTimings(func(t *timings) { t.cacheGrace = time.Minute }, a, b)
 
 	requireAcquired(t, a, LockTypeInode, 9, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 9); err != nil {
@@ -575,8 +575,7 @@ func TestReleaseCachedWithSlowWritesRunsInParallel(t *testing.T) {
 	dev, cleanup := createTestDevice(t, region)
 	defer cleanup()
 	a := newTestNode(dev, 0, region, 1)
-	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
-	cacheGrace = time.Minute
+	a.timing.cacheGrace = time.Minute
 
 	records := map[uint64]bool{}
 	for id := uint64(100); len(records) < 16; id++ {
@@ -622,8 +621,7 @@ func TestAcquireWithoutDeadlineGivesUp(t *testing.T) {
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
 	b := newTestNode(dev, 0, 1<<20, 2)
-	defer func(d time.Duration) { acquireTimeout = d }(acquireTimeout)
-	acquireTimeout = 200 * time.Millisecond
+	b.timing.acquireTimeout = 200 * time.Millisecond
 	requireAcquired(t, a, LockTypeInode, 40, LockModeExclusive)
 
 	errc := make(chan error, 1)
@@ -768,13 +766,12 @@ func TestTornSlotCountsAsClaim(t *testing.T) {
 func TestTornSlotExpires(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	defer func(d time.Duration) { tornExpiry = d }(tornExpiry)
-	tornExpiry = 200 * time.Millisecond
 	a := newTestNode(dev, 0, 1<<20, 1)
+	a.timing.tornExpiry = 200 * time.Millisecond
 	tearSlot(t, a, LockTypeInode, 51, 2)
 	requireBlocked(t, a, LockTypeInode, 51, LockModeExclusive)
 
-	time.Sleep(tornExpiry)
+	time.Sleep(a.timing.tornExpiry)
 	requireAcquired(t, a, LockTypeInode, 51, LockModeExclusive)
 }
 
@@ -784,13 +781,12 @@ func TestTornSlotExpires(t *testing.T) {
 func TestTornSlotWaitRestartsWhenBytesChange(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
-	defer func(d time.Duration) { tornExpiry = d }(tornExpiry)
-	tornExpiry = 200 * time.Millisecond
 	a := newTestNode(dev, 0, 1<<20, 1)
+	a.timing.tornExpiry = 200 * time.Millisecond
 	tearSlot(t, a, LockTypeInode, 51, 2)
 	requireBlocked(t, a, LockTypeInode, 51, LockModeExclusive)
 
-	time.Sleep(tornExpiry)
+	time.Sleep(a.timing.tornExpiry)
 	tearSlot(t, a, LockTypeInode, 51, 2)
 	requireBlocked(t, a, LockTypeInode, 51, LockModeExclusive)
 }
@@ -968,8 +964,7 @@ func TestCachedHoldRejoinNeedsNoDiskIO(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	defer cleanup()
 	a := newTestNode(dev, 0, 1<<20, 1)
-	defer func(g time.Duration) { cacheGrace = g }(cacheGrace)
-	cacheGrace = time.Minute
+	a.timing.cacheGrace = time.Minute
 	requireAcquired(t, a, LockTypeInode, 7, LockModeExclusive)
 	if err := a.Release(LockTypeInode, 7); err != nil {
 		t.Fatalf("Release: %v", err)

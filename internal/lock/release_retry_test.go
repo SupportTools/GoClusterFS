@@ -31,7 +31,7 @@ func TestFailedReleaseWriteIsRetried(t *testing.T) {
 	failNext.Store(true)
 	release(t, a, LockTypeInode, 3)
 
-	if err := acquireWithin(b, 5*releaseRetry, LockTypeInode, 3, LockModeExclusive); err != nil {
+	if err := acquireWithin(b, 5*a.timing.releaseRetry, LockTypeInode, 3, LockModeExclusive); err != nil {
 		t.Fatalf("the other node is still kept out after one failed release write: %v", err)
 	}
 	release(t, b, LockTypeInode, 3)
