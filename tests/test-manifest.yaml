@@ -4727,3 +4727,60 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/open_errors_test.go::TestCreateWithoutExclOpensTheFileItFinds
+
+  - id: unlink-while-open
+    name: An unlinked file stays until its last close
+    description: A descriptor opened before the unlink keeps reading and writing the file, a new file never takes its inode, and the last close frees it with fsck clean
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck, which this test uses to check the last close freed everything.
+    environments:
+      go: unlink_open_test.go::TestFileUnlinkedWhileOpenKeepsItsData
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-while-open-on-peer
+    name: A file a peer unlinks stays until the holder closes it
+    description: Node 1 unlinks a file node 0 has open; node 0 keeps its data, node 1's new file gets another inode, and node 0's last close frees the file
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck, and the check reads the inode table from the image.
+    environments:
+      go: unlink_open_test.go::TestFileUnlinkedByAPeerWhileOpenKeepsItsData
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-while-open-holder-dies
+    name: A dead holder lets go of an unlinked file
+    description: Node 0 dies holding a file node 1 unlinked; node 1 frees it after replaying node 0's journal
+    priority: high
+    # Docker/VM: the check reads the inode table from the image, which their scripts cannot do.
+    environments:
+      go: unlink_open_test.go::TestKilledHolderLetsGoOfAnUnlinkedFile
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-many-on-peer
+    name: A node removes more files than one orphan list holds
+    description: With a peer mounted, removing 1000 files in a row never fails with EBUSY, and fsck is clean once failure scans have run
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck.
+    environments:
+      go: unlink_open_test.go::TestPeerRemovesManyFilesQuickly
+      docker: TODO
+      vm: TODO
+
+  - id: unlink-many-with-stopped-peer
+    name: A bulk remove waits out a stopped peer
+    description: With node 1 stopped by SIGSTOP, node 0 removes 2000 files without EBUSY; the removes wait until node 1 is replayed, and fsck is clean
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck.
+    environments:
+      go: unlink_open_test.go::TestBulkRemoveWaitsOutAStoppedPeer
+      docker: TODO
+      vm: TODO
+
+  - id: orphan-holders-unit
+    name: Orphan holder bits and lists
+    description: A peer's unlink leaves an orphan only the holder keeps; a forgotten dead slot frees it; a full orphan list fails the unlink with EBUSY before anything changes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/orphans_test.go::TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose

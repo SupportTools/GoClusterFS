@@ -34,6 +34,7 @@ type Broadcaster struct {
 	sendMu sync.Mutex
 
 	onReturnReserves atomic.Pointer[func()]
+	onOrphans        atomic.Pointer[func()]
 
 	sendersMu sync.Mutex
 	senders   map[[16]byte]*senderSeq
@@ -201,6 +202,11 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
 		if fn := b.onReturnReserves.Load(); fn != nil {
 			(*fn)()
 		}
+
+	case TypeOrphans:
+		if fn := b.onOrphans.Load(); fn != nil {
+			(*fn)()
+		}
 	}
 }
 
@@ -216,6 +222,21 @@ func (b *Broadcaster) BroadcastReturnReserves() {
 	}
 	if err := b.send(b.builder.ReturnReserves); err != nil {
 		log.Printf("[broadcast] failed to send ReturnReserves: %v", err)
+	}
+}
+
+// OnOrphans sets what runs, on the receive loop, when a peer's orphan list changed; fn must not block.
+func (b *Broadcaster) OnOrphans(fn func()) {
+	b.onOrphans.Store(&fn)
+}
+
+// A lost message only delays freeing: peers also check orphan lists on every failure scan.
+func (b *Broadcaster) BroadcastOrphans() {
+	if !b.running.Load() {
+		return
+	}
+	if err := b.send(b.builder.Orphans); err != nil {
+		log.Printf("[broadcast] failed to send Orphans: %v", err)
 	}
 }
 

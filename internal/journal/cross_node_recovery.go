@@ -28,6 +28,11 @@ type RecoveryContext struct {
 	BitmapMgr *bitmap.Region
 	DirMgr    *dir.Manager
 	ExtentMgr *extent.Manager
+
+	// OrphanHolders returns the slots that may hold open a file replay leaves at zero links.
+	OrphanHolders func(num uint32) (uint64, error)
+	AddOrphan     func(num uint32, birth uint64) error
+	FreeSFBSlot   func(ctx context.Context, packed uint64)
 }
 
 // ReleaseReserved returns a crashed node's unused reserved blocks. They have no
@@ -187,6 +192,8 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 		return applyInodeUpdate(ctx, rctx, entry.Payload)
 	case TxnOpInodeDelete:
 		return applyInodeDelete(ctx, rctx, r, entry.Payload)
+	case TxnOpLinkDrop:
+		return applyLinkDrop(ctx, rctx, r, entry.Payload)
 	case TxnOpDirAddEntry:
 		return applyDirAddEntry(ctx, rctx, r, entry.Payload)
 	case TxnOpDirRemoveEntry:
@@ -322,6 +329,83 @@ func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 
 	log.Printf("[Recovery] InodeDelete: deleted inode %d", p.InodeNum)
 	return true, nil
+}
+
+var errLinkDropDone = errors.New("link drop already applied or overtaken")
+
+// applyLinkDrop redoes a lost link drop; at zero links the file is listed as an orphan, or freed if nobody holds it.
+func applyLinkDrop(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
+	p, err := DeserializeLinkDrop(payload)
+	if err != nil {
+		return false, err
+	}
+	num := uint32(p.InodeNum)
+	var holders uint64
+	if rctx.OrphanHolders != nil {
+		if holders, err = rctx.OrphanHolders(num); err != nil {
+			return false, fmt.Errorf("reading the live slots for inode %d: %w", num, err)
+		}
+	}
+	err = rctx.InodeTbl.Update(ctx, num, func(ino *inode.Inode) error {
+		if !r.unchanged(ino, p.MetaGeneration) || ino.LinkCount == 0 {
+			return errLinkDropDone
+		}
+		ino.LinkCount--
+		if ino.LinkCount == 0 {
+			ino.Holders = holders
+		}
+		return nil
+	})
+	switch {
+	case errors.Is(err, errLinkDropDone):
+		// The drop landed before the crash; the orphan may still be unlisted or unheld.
+		ino, err := rctx.InodeTbl.Read(num)
+		switch {
+		case err != nil || ino.Magic != inode.InodeMagic || ino.LinkCount != 0:
+			log.Printf("[Recovery] LinkDrop: inode %d changed since the drop was logged, skipping", num)
+			return false, nil
+		case ino.Holders != 0 && rctx.AddOrphan != nil:
+			return false, rctx.AddOrphan(num, ino.BirthGeneration)
+		}
+		// Without AddOrphan this node is alone, and the crash ended every open.
+		return false, freeOrphan(ctx, rctx, num, ino.MetaGeneration)
+	case err != nil:
+		return false, fmt.Errorf("failed to drop a link of inode %d: %w", num, err)
+	}
+	after, err := rctx.InodeTbl.Read(num)
+	if err != nil {
+		return true, err
+	}
+	r.wrote[num] = after.MetaGeneration
+	switch {
+	case after.LinkCount > 0:
+	case after.Holders != 0 && rctx.AddOrphan != nil:
+		return true, rctx.AddOrphan(num, after.BirthGeneration)
+	default:
+		return true, freeOrphan(ctx, rctx, num, after.MetaGeneration)
+	}
+	log.Printf("[Recovery] LinkDrop: inode %d has %d links left", num, after.LinkCount)
+	return true, nil
+}
+
+func freeOrphan(ctx context.Context, rctx *RecoveryContext, num uint32, gen uint64) error {
+	var freed *inode.Inode
+	ok, err := rctx.InodeTbl.FreeIf(ctx, num, func(ino *inode.Inode) bool {
+		freed = ino
+		return ino.MetaGeneration == gen && ino.LinkCount == 0
+	})
+	if err != nil || !ok {
+		return err
+	}
+	log.Printf("[Recovery] LinkDrop: freed inode %d", num)
+	sfbBacked, sfbSlot := freed.IsSFBBacked(), freed.InlineExtents[0].PhysicalBlock
+	if err := rctx.ExtentMgr.Delete(ctx, freed); err != nil {
+		return err
+	}
+	if sfbBacked && rctx.FreeSFBSlot != nil {
+		rctx.FreeSFBSlot(ctx, sfbSlot)
+	}
+	return nil
 }
 
 // applyDirAddEntry adds the entry for an inode this transaction's replay created.

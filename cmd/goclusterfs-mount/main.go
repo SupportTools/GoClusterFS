@@ -346,6 +346,17 @@ func main() {
 			BitmapMgr: bm,
 			DirMgr:    dirMgr,
 			ExtentMgr: extentMgr,
+			// Nothing is open on this node yet, so only peers can hold a file this replay orphans.
+			OrphanHolders: func(uint32) (uint64, error) {
+				live, err := nodeReg.LiveSlots()
+				return live &^ (1 << slotIdx), err
+			},
+			AddOrphan: func(num uint32, birth uint64) error {
+				return nodeReg.AddOrphan(node.Orphan{Inode: num, Birth: uint32(birth)})
+			},
+			FreeSFBSlot: func(ctx context.Context, packed uint64) {
+				goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
+			},
 		}
 		// Use per-transaction handler for self-recovery
 		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
@@ -468,8 +479,34 @@ func main() {
 		BitmapMgr: bm,
 		DirMgr:    dirMgr,
 		ExtentMgr: extentMgr,
+		OrphanHolders: func(num uint32) (uint64, error) {
+			live, err := nodeReg.LiveSlots()
+			if !gfs.HasOpen(num) {
+				live &^= 1 << slotIdx
+			}
+			return live, err
+		},
+		AddOrphan: func(num uint32, birth uint64) error {
+			return nodeReg.AddOrphan(node.Orphan{Inode: num, Birth: uint32(birth)})
+		},
+		FreeSFBSlot: func(ctx context.Context, packed uint64) {
+			goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
+		},
 	}
-	nodeReg.SetRecoveryHandler(journal.CreateRecoveryHandler(recoveryCtx))
+	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)
+	nodeReg.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
+		if err := replayPeer(info); err != nil {
+			return err
+		}
+		return gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
+	})
+	gfs.SetOrphanRegistry(nodeReg)
+	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
+	cacheMgr.OnOrphans(nodeReg.KickOrphans)
+	// Nothing is open here yet: let go of what this slot held before a crash.
+	if err := gfs.ForgetSlot(lock.ForReplay(context.Background()), slotIdx, nil); err != nil {
+		log.Printf("[WARN] letting go of orphans this slot held before: %v", err)
+	}
 
 	// Start failure detection to monitor for crashed nodes
 	nodeReg.StartFailureDetection()
@@ -620,6 +657,11 @@ func main() {
 	goclusterfs.ShutdownStep("API server stop", stopAPI)
 
 	exit := cli.ExitOK
+	goclusterfs.ShutdownStep("orphan release", func() {
+		if err := gfs.ForgetSlot(context.Background(), slotIdx, nil); err != nil {
+			log.Printf("[WARN] letting go of unlinked files at unmount: %v; the next node in slot %d does it", err, slotIdx)
+		}
+	})
 	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
 	if err := gfs.Close(); err != nil {
 		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)

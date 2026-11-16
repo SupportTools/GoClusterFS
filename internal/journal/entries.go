@@ -13,6 +13,7 @@ const (
 	TxnOpInodeCreate TxnOpType = 0x0100
 	TxnOpInodeUpdate TxnOpType = 0x0101
 	TxnOpInodeDelete TxnOpType = 0x0102
+	TxnOpLinkDrop    TxnOpType = 0x0103
 
 	// Directory Operations (0x02xx)
 	TxnOpDirAddEntry    TxnOpType = 0x0200
@@ -51,6 +52,8 @@ func (op TxnOpType) String() string {
 		return "InodeUpdate"
 	case TxnOpInodeDelete:
 		return "InodeDelete"
+	case TxnOpLinkDrop:
+		return "LinkDrop"
 	case TxnOpDirAddEntry:
 		return "DirAddEntry"
 	case TxnOpDirRemoveEntry:
@@ -211,6 +214,31 @@ func DeserializeInodeDelete(buf []byte) (*InodeDeletePayload, error) {
 	return &InodeDeletePayload{
 		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
 		MetaGeneration: trailingUint64(buf, 8),
+	}, nil
+}
+
+// LinkDropPayload records a file losing one link; MetaGeneration is the value before the drop.
+type LinkDropPayload struct {
+	InodeNum       uint64
+	MetaGeneration uint64
+}
+
+// Serialize converts the payload to bytes.
+func (p *LinkDropPayload) Serialize() []byte {
+	buf := make([]byte, 16)
+	binary.LittleEndian.PutUint64(buf[0:8], p.InodeNum)
+	binary.LittleEndian.PutUint64(buf[8:16], p.MetaGeneration)
+	return buf
+}
+
+// DeserializeLinkDrop parses a LinkDropPayload from bytes.
+func DeserializeLinkDrop(buf []byte) (*LinkDropPayload, error) {
+	if len(buf) < 16 {
+		return nil, ErrTxnTooSmall
+	}
+	return &LinkDropPayload{
+		InodeNum:       binary.LittleEndian.Uint64(buf[0:8]),
+		MetaGeneration: binary.LittleEndian.Uint64(buf[8:16]),
 	}, nil
 }
 
@@ -799,6 +827,10 @@ func (txn *Transaction) LogInodeUpdate(payload *InodeUpdatePayload) error {
 // LogInodeDelete adds an inode deletion entry to the transaction.
 func (txn *Transaction) LogInodeDelete(payload *InodeDeletePayload) error {
 	return txn.addEntry(TxnOpInodeDelete, payload.Serialize())
+}
+
+func (txn *Transaction) LogLinkDrop(payload *LinkDropPayload) error {
+	return txn.addEntry(TxnOpLinkDrop, payload.Serialize())
 }
 
 // LogDirAddEntry adds a directory entry addition to the transaction.

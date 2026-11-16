@@ -178,7 +178,7 @@ func expectOnlyLeaks(t *testing.T, fsys *FS) {
 }
 
 func isLeak(msg string) bool {
-	for _, leak := range []string{"leaked", "will never be freed", "unnamed: no directory names it", "belongs to no snapshot"} {
+	for _, leak := range []string{"leaked", "will never be freed", "unnamed: no directory names it", "belongs to no snapshot", "unlinked while open"} {
 		if strings.Contains(msg, leak) {
 			return true
 		}

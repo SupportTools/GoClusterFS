@@ -68,6 +68,7 @@ type InodeData struct {
 	ExtentTreeGen  uint64
 
 	BirthGeneration uint64
+	Holders         uint64
 
 	// Checksum
 	Checksum uint32
@@ -197,10 +198,14 @@ func (c *Checker) checkInodes() error {
 				fileCount++
 			}
 
-			// Validate link count
-			if inode.LinkCount == 0 && (inode.Flags&FlagDeleted) == 0 {
+			switch {
+			case inode.LinkCount == 0:
+				c.addProblem(PhaseInodes, Info, fmt.Sprintf("inode %d", inodeNum),
+					fmt.Sprintf("unlinked while open (holder bits %#x); with no node mounted, repair frees it as an unnamed inode", inode.Holders),
+					false)
+			case inode.Holders != 0:
 				c.addProblem(PhaseInodes, Warning, fmt.Sprintf("inode %d", inodeNum),
-					"link count is 0 but inode is not marked deleted",
+					fmt.Sprintf("has %d links but holder bits %#x, which only unlinked files carry", inode.LinkCount, inode.Holders),
 					false)
 			}
 
@@ -276,6 +281,7 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 	inode.ExtentDepth = binary.LittleEndian.Uint32(buf[184:188])
 	inode.ExtentTreeGen = binary.LittleEndian.Uint64(buf[188:196])
 	inode.BirthGeneration = binary.LittleEndian.Uint64(buf[196:204])
+	inode.Holders = binary.LittleEndian.Uint64(buf[204:212])
 
 	// Checksum (last 4 bytes)
 	inode.Checksum = binary.LittleEndian.Uint32(buf[252:256])

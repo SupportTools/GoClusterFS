@@ -1156,6 +1156,7 @@ func readAfterInodeReuse(t *testing.T, writer, reader *MountedFS, prefix string,
 	if err := writer.Remove(oldName); err != nil {
 		t.Fatalf("Writer: remove %s: %v", oldName, err)
 	}
+	expectFreed(t, writer.ImagePath, uint32(oldIno), peerReleaseWait, "after the writer removed "+oldName)
 	if err := writer.WriteFile(newName, nil); err != nil {
 		t.Fatalf("Writer: create %s: %v", newName, err)
 	}
@@ -2077,8 +2078,8 @@ func TestMultiNodeStatfsFreeBlocks(t *testing.T) {
 		t.Fatalf("Remove failed: %v", err)
 	}
 	for i := range cluster.NodeCount() {
-		if got := statfs(t, cluster.Node(i)).Bfree; got != start {
-			t.Errorf("node %d: Bfree after node 1 removed the file = %d, want %d", i, got, start)
+		if _, ok := waitFor(peerReleaseWait, func() bool { return statfs(t, cluster.Node(i)).Bfree == start }); !ok {
+			t.Errorf("node %d: Bfree %v after node 1 removed the file = %d, want %d", i, peerReleaseWait, statfs(t, cluster.Node(i)).Bfree, start)
 		}
 	}
 }

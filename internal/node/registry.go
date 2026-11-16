@@ -73,24 +73,34 @@ func (s NodeState) String() string {
 // Slot represents a node's on-disk registration entry.
 // Size: 4096 bytes (sector-aligned for O_DIRECT atomic writes)
 type Slot struct {
-	Magic         uint32     // 0x4E4F4445 "NODE"
-	State         NodeState  // Current state
-	UUID          [16]byte   // Node's unique identifier
-	HeartbeatSeq  uint64     // Monotonic heartbeat counter
-	HeartbeatTime int64      // Unix timestamp of last heartbeat
-	MountTime     int64      // When this node mounted
-	JournalOffset uint64     // This node's journal region offset
-	JournalSize   uint64     // This node's journal size
-	Hostname      [64]byte   // Node hostname
-	BootID        [16]byte   // Kernel boot ID of the node's host
-	PID           uint32     // Mount process ID
-	ProcStart     int64      // Mount process start time (Unix ns)
-	RecoveryOwner [16]byte   // Dead slots: node replaying the journal
-	RecoveryStart int64      // Dead slots: when that replay last renewed its lease (Unix s)
-	PIDNamespace  uint64     // Inode of the mount process's PID namespace
-	Reserved      [3904]byte // Padding to 4096 bytes
-	Checksum      uint32     // CRC32C of bytes 0-4091
+	Magic         uint32    // 0x4E4F4445 "NODE"
+	State         NodeState // Current state
+	UUID          [16]byte  // Node's unique identifier
+	HeartbeatSeq  uint64    // Monotonic heartbeat counter
+	HeartbeatTime int64     // Unix timestamp of last heartbeat
+	MountTime     int64     // When this node mounted
+	JournalOffset uint64    // This node's journal region offset
+	JournalSize   uint64    // This node's journal size
+	Hostname      [64]byte  // Node hostname
+	BootID        [16]byte  // Kernel boot ID of the node's host
+	PID           uint32    // Mount process ID
+	ProcStart     int64     // Mount process start time (Unix ns)
+	RecoveryOwner [16]byte  // Dead slots: node replaying the journal
+	RecoveryStart int64     // Dead slots: when that replay last renewed its lease (Unix s)
+	PIDNamespace  uint64    // Inode of the mount process's PID namespace
+	Orphans       []Orphan  // Files this node unlinked that some node may still have open
+	Checksum      uint32    // CRC32C of bytes 0-4091
 }
+
+// Orphan names an unlinked file by its inode and the low bits of its birth generation, so a reused slot never matches.
+type Orphan struct {
+	Inode uint32
+	Birth uint32
+}
+
+const MaxOrphans = (SlotSize - 4 - orphansOffset - 4) / 8
+
+const orphansOffset = 188
 
 // Registry manages node registration and heartbeats.
 type Registry struct {
@@ -113,6 +123,8 @@ type Registry struct {
 	onSlotLost func(slot int, owner [16]byte)
 
 	onOwnerDead   func(owner [16]byte, slot int) (done func(replayed bool))
+	onOrphans     func(slot int, orphans []Orphan)
+	orphanKick    chan struct{}
 	previousOwner *[16]byte
 	sightings     map[int]sighting
 
@@ -146,6 +158,7 @@ var (
 	ErrRecoveryInProgress = errors.New("recovery already in progress for this node")
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
+	ErrOrphansFull        = errors.New("this node's registry slot has no room for another orphan")
 )
 
 // FailedNodeInfo contains information about a failed node for recovery.
@@ -156,6 +169,7 @@ type FailedNodeInfo struct {
 	JournalSize   uint64
 	LastHeartbeat time.Time
 	Hostname      string
+	Orphans       []Orphan // files the dead node unlinked that may still be held open
 
 	// CheckLease fails once this node no longer holds the slot's recovery
 	// lease, and renews the lease while it does. Replay calls it before each
@@ -179,6 +193,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		localSlot:            -1,
 		preferred:            -1,
 		stopCh:               make(chan struct{}),
+		orphanKick:           make(chan struct{}, 1),
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
 		sightings:            make(map[int]sighting),
@@ -533,7 +548,7 @@ func (r *Registry) Unregister(ctx context.Context) error {
 		return err
 	}
 	if slot.UUID == r.localUUID {
-		if err := r.writeSlot(slotNum, &Slot{Magic: SlotMagic, State: NodeStateEmpty}); err != nil {
+		if err := r.writeSlot(slotNum, &Slot{Magic: SlotMagic, State: NodeStateEmpty, Orphans: slot.Orphans}); err != nil {
 			return err
 		}
 	}
@@ -707,6 +722,10 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
+	// Peers may still hold orphans an earlier owner of this slot listed.
+	if old, err := deserializeSlot(expected); err == nil {
+		newSlot.Orphans = old.Orphans
+	}
 
 	success, err := r.casSlot(slotIdx, expected, serializeSlot(newSlot))
 	if err != nil {
@@ -897,6 +916,13 @@ func serializeSlot(slot *Slot) []byte {
 	copy(buf[156:172], slot.RecoveryOwner[:])
 	binary.LittleEndian.PutUint64(buf[172:180], uint64(slot.RecoveryStart))
 	binary.LittleEndian.PutUint64(buf[180:188], slot.PIDNamespace)
+	n := min(len(slot.Orphans), MaxOrphans)
+	binary.LittleEndian.PutUint32(buf[orphansOffset:], uint32(n))
+	for i, o := range slot.Orphans[:n] {
+		at := orphansOffset + 4 + 8*i
+		binary.LittleEndian.PutUint32(buf[at:], o.Inode)
+		binary.LittleEndian.PutUint32(buf[at+4:], o.Birth)
+	}
 
 	// Compute checksum
 	checksum := storage.CRC32C(buf[:SlotSize-4])
@@ -941,6 +967,11 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 	copy(slot.Hostname[:], buf[64:128])
 	copy(slot.BootID[:], buf[128:144])
 	copy(slot.RecoveryOwner[:], buf[156:172])
+	n := min(int(binary.LittleEndian.Uint32(buf[orphansOffset:])), MaxOrphans)
+	for i := range n {
+		at := orphansOffset + 4 + 8*i
+		slot.Orphans = append(slot.Orphans, Orphan{Inode: binary.LittleEndian.Uint32(buf[at:]), Birth: binary.LittleEndian.Uint32(buf[at+4:])})
+	}
 
 	return slot, nil
 }
@@ -973,6 +1004,10 @@ func (r *Registry) failureDetectionLoop() {
 			return
 		case <-ticker.C:
 			r.detectAndRecoverFailedNodes()
+		case <-r.orphanKick:
+			if slots, err := r.readAllSlots(); err == nil {
+				r.passOrphans(slots)
+			}
 		}
 	}
 }
@@ -992,11 +1027,11 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 	if err != nil {
 		return
 	}
+	r.passOrphans(slots)
 	for i, slot := range slots {
 		if i == localSlot || slot == nil {
 			continue
 		}
-
 		r.mu.Lock()
 		r.remember(i, slot)
 		r.observe(i, slot)
@@ -1079,6 +1114,7 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		JournalSize:   slot.JournalSize,
 		LastHeartbeat: time.Unix(slot.HeartbeatTime, 0),
 		Hostname:      slot.Host(),
+		Orphans:       slot.Orphans,
 		CheckLease:    r.leaseCheck(slotIdx, slot.UUID, time.Now()),
 	}, nil
 }
