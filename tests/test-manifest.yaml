@@ -4669,9 +4669,16 @@ scenarios:
     environments:
       go: history/history_test.go::TestTearDuringALocalWriteIsAllowedAtWordBoundaries
 
+  - id: history-checker-word-tear
+    name: Coherence checker allows a tear inside one word during a local write
+    description: A torn read whose boundary word mixes bytes of the values on either side is allowed during a write on the reader's node; a word with bytes from neither side is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTearInsideAWordDuringALocalWriteIsAllowed
+
   - id: history-checker-stale-open
     name: Coherence checker allows ESTALE on open only under name churn
-    description: An open that fails with ESTALE is allowed only when its name lost its file at least twice during the call; otherwise it is a violation
+    description: An open that fails with ESTALE is allowed only when its name lost its file during the call and once more within the cache window before it or during it; otherwise it is a violation
     priority: go_only
     environments:
       go: history/history_test.go::TestStaleOpenOnlyWhenTheNameLostItsFileTwice
