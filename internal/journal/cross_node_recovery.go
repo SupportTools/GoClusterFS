@@ -489,6 +489,9 @@ func applyDirRename(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pa
 	if err != nil {
 		return false, err
 	}
+	if done, err := renameOvertaken(rctx, p); err != nil || done {
+		return false, err
+	}
 	placed, err := placeRenamed(ctx, rctx, r, p)
 	if err != nil || !placed {
 		if p.TargetInodeNum != 0 {
@@ -514,6 +517,26 @@ func applyDirRename(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pa
 	}
 	log.Printf("[Recovery] DirRename: %q in %d is %q in %d", p.OldName, p.OldParentInodeNum, p.NewName, p.NewParentInodeNum)
 	return true, nil
+}
+
+// renameOvertaken reports whether an inode the rename writes once under its locks is freed or more than one write past
+// the generation it logged. Another operation took the lock after the rename finished, so its names must stay.
+func renameOvertaken(rctx *RecoveryContext, p *DirRenamePayload) (bool, error) {
+	logged := map[uint64]uint64{p.OldParentInodeNum: p.OldParentGen, p.NewParentInodeNum: p.NewParentGen}
+	if p.EntryType == DirEntryDirectory && p.OldParentInodeNum != p.NewParentInodeNum {
+		logged[p.InodeNum] = p.MetaGeneration
+	}
+	for num, gen := range logged {
+		ino, err := rctx.InodeTbl.Read(uint32(num))
+		if err != nil {
+			return false, fmt.Errorf("failed to read inode %d: %w", num, err)
+		}
+		if ino.Magic != inode.InodeMagic || ino.MetaGeneration > gen+1 {
+			log.Printf("[Recovery] DirRename: inode %d changed after the rename of %q to %q finished, skipping", num, p.OldName, p.NewName)
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // placeRenamed makes the new name name the child, if it is free, names the child, or still names the logged target.

@@ -1765,6 +1765,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/rename_test.go::TestRenameReplayDropsTheTargetAfterTheNamesChanged
 
+  - id: fs-renamereplayleavesanovertakenrenamealone
+    name: Rename replay leaves an overtaken rename alone
+    description: A crash with a finished rename's intent open, after a later rename, rename back or unlink changed its names, leaves the later names as they are
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameReplayLeavesAnOvertakenRenameAlone
+
+  - id: fs-renamereplayleavesadirectorymovedbackalone
+    name: Rename replay leaves a directory moved back alone
+    description: A directory moved and moved back before the crash keeps its old name, "..", and both parents' link counts after replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameReplayLeavesADirectoryMovedBackAlone
+
   - id: rename-power-renameinonedirectory
     name: Power failure during a rename in one directory
     description: Power fails at each write; exactly one of the two names names the file, and fsck finds only leaks

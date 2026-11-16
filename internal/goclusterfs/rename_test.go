@@ -248,3 +248,86 @@ func TestRenameReplayDropsTheTargetAfterTheNamesChanged(t *testing.T) {
 	}
 	expectCleanFsck(t, remounted)
 }
+
+// crashAfterOvertaken runs overtake once the rename has changed its names and released its locks, then crashes with
+// the rename's intent still open, as a crash before its completion record reaches the device would.
+func crashAfterOvertaken(t *testing.T, fsys *FS, overtake func()) <-chan struct{} {
+	t.Helper()
+	crashed := make(chan struct{})
+	fired := false
+	afterCommit = func(got string) {
+		if got != "rename: names changed" || fired {
+			return
+		}
+		fired = true
+		overtake()
+		if _, err := fsys.journal.Checkpoint(); err != nil {
+			t.Errorf("checkpoint: %v", err)
+		}
+		close(crashed)
+		select {}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+	return crashed
+}
+
+// Replay must not redo a rename that finished and that later operations changed.
+func TestRenameReplayLeavesAnOvertakenRenameAlone(t *testing.T) {
+	for _, c := range []struct {
+		describe string
+		overtake func(ctx context.Context, fsys *FS) syscall.Errno
+		want     map[string]bool // which root names name the file after replay
+	}{
+		{"renamed again", func(ctx context.Context, fsys *FS) syscall.Errno { return fsys.Rename(ctx, "b", fsys, "c", 0) }, map[string]bool{"c": true}},
+		{"renamed back", func(ctx context.Context, fsys *FS) syscall.Errno { return fsys.Rename(ctx, "b", fsys, "a", 0) }, map[string]bool{"a": true}},
+		{"unlinked", func(ctx context.Context, fsys *FS) syscall.Errno { return fsys.Unlink(ctx, "b") }, map[string]bool{}},
+	} {
+		t.Run(c.describe, func(t *testing.T) {
+			fsys, path, offset, size := journaledFS(t)
+			ctx := context.Background()
+			a := createFile(t, fsys, "a")
+			crashed := crashAfterOvertaken(t, fsys, func() {
+				if errno := c.overtake(ctx, fsys); errno != 0 {
+					t.Errorf("the overtaking operation: %v", errno)
+				}
+			})
+			go func() { _ = fsys.Rename(ctx, "a", fsys, "b", 0) }()
+			<-crashed
+
+			remounted := remountAndReplay(t, path, offset, size)
+			for _, name := range []string{"a", "b", "c"} {
+				if got := named(t, remounted, inode.InodeRoot, name) == a.inodeNum; got != c.want[name] {
+					t.Errorf("after replay, %q names the file: %v, want %v", name, got, c.want[name])
+				}
+			}
+			expectCleanFsck(t, remounted)
+		})
+	}
+}
+
+func TestRenameReplayLeavesADirectoryMovedBackAlone(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	ctx := context.Background()
+	p1, p2 := newSubdir(t, fsys, "p1"), newSubdir(t, fsys, "p2")
+	d := newDirIn(t, fsys, p1.inodeNum, "d")
+	before1, before2 := links(t, fsys, p1.inodeNum), links(t, fsys, p2.inodeNum)
+	crashed := crashAfterOvertaken(t, fsys, func() {
+		if errno := p2.Rename(ctx, "e", p1, "d", 0); errno != 0 {
+			t.Errorf("move back: %v", errno)
+		}
+	})
+	go func() { _ = p1.Rename(ctx, "d", p2, "e", 0) }()
+	<-crashed
+
+	remounted := remountAndReplay(t, path, offset, size)
+	if named(t, remounted, p1.inodeNum, "d") != d.inodeNum || named(t, remounted, p2.inodeNum, "e") != 0 {
+		t.Errorf("after replay: d in p1 names %d, e in p2 names %d; want %d and 0", named(t, remounted, p1.inodeNum, "d"), named(t, remounted, p2.inodeNum, "e"), d.inodeNum)
+	}
+	if got := named(t, remounted, d.inodeNum, ".."); got != p1.inodeNum {
+		t.Errorf("\"..\" after replay names %d, want %d", got, p1.inodeNum)
+	}
+	if got1, got2 := links(t, remounted, p1.inodeNum), links(t, remounted, p2.inodeNum); got1 != before1 || got2 != before2 {
+		t.Errorf("link counts after replay %d and %d, want %d and %d", got1, got2, before1, before2)
+	}
+	expectCleanFsck(t, remounted)
+}
