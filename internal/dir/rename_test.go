@@ -279,3 +279,21 @@ func TestRenameGrowsAFullNewParent(t *testing.T) {
 	expectName(t, m, to, name, uint64(f.InodeNum))
 	expectName(t, m, from, "moving", 0)
 }
+
+func TestPointIfOnlyMovesANameThatStillNamesTheExpectedInode(t *testing.T) {
+	nodes, dirIno := newNodes(t, 1)
+	m := nodes[0]
+	a, b := newFileIn(t, m, dirIno, "a"), newNode(t, m, inode.S_IFREG|0o644)
+	ctx := context.Background()
+	if pointed, err := m.PointIf(ctx, reread(t, m, dirIno), "a", uint64(b.InodeNum), DT_REG, func(cur uint64) bool { return cur == 999 }); err != nil || pointed {
+		t.Errorf("PointIf with a refusing check: %v, %v", pointed, err)
+	}
+	expectName(t, m, dirIno, "a", uint64(a.InodeNum))
+	if pointed, err := m.PointIf(ctx, reread(t, m, dirIno), "a", uint64(b.InodeNum), DT_REG, func(cur uint64) bool { return cur == uint64(a.InodeNum) }); err != nil || !pointed {
+		t.Errorf("PointIf: %v, %v", pointed, err)
+	}
+	expectName(t, m, dirIno, "a", uint64(b.InodeNum))
+	if _, err := m.PointIf(ctx, reread(t, m, dirIno), "missing", uint64(b.InodeNum), DT_REG, func(uint64) bool { return true }); !errors.Is(err, ErrNotFound) {
+		t.Errorf("PointIf of a missing name: %v, want ErrNotFound", err)
+	}
+}

@@ -412,3 +412,35 @@ func (m *Manager) grow(ctx context.Context, num uint32, need uint16) error {
 	}
 	return fmt.Errorf("directory %d kept changing while it grew", num)
 }
+
+// PointIf makes name in dirIno name child, of type ftype, if ok accepts the inode it names now; ok runs under the directory lock.
+func (m *Manager) PointIf(ctx context.Context, dirIno *inode.Inode, name string, child uint64, ftype uint8, ok func(cur uint64) bool) (bool, error) {
+	if dirIno.Magic != inode.InodeMagic {
+		return false, ErrRemoved
+	}
+	defer m.LockDir(dirIno.InodeNum)()
+	if m.lockMgr != nil {
+		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
+			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
+		}
+		defer m.unlock(dirIno.InodeNum)
+	}
+	fresh, err := m.liveDirLocked(dirIno.InodeNum)
+	if err != nil {
+		return false, err
+	}
+	x, err := m.indexOf(fresh)
+	if err != nil {
+		return false, err
+	}
+	s, found, _ := x.find(fresh.MetaGeneration, name)
+	if !found {
+		return false, ErrNotFound
+	}
+	if !ok(s.child) {
+		return false, nil
+	}
+	return m.editChunk(fresh, x, s.chunk,
+		func(chunk []byte) bool { return pointName(chunk, name, child, ftype) },
+		func(names map[string]slot) { names[name] = slot{child: child, chunk: s.chunk, ftype: ftype} })
+}

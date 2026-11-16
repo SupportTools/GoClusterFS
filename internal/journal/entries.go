@@ -361,66 +361,66 @@ type DirRenamePayload struct {
 	NewParentInodeNum uint64
 	InodeNum          uint64
 	EntryType         DirEntryType
-	OldNameLen        uint8
-	NewNameLen        uint8
-	Reserved          [5]byte
+	TargetType        DirEntryType
+	Flags             uint32
+	OldParentGen      uint64 // each MetaGeneration as read under the rename's locks, before it changed anything
+	NewParentGen      uint64
+	MetaGeneration    uint64
+	TargetInodeNum    uint64 // 0 when the new name was free
+	TargetGen         uint64
 	OldName           string
 	NewName           string
 }
 
+const dirRenameHeader = 80
+
 // Serialize converts the payload to bytes.
 func (p *DirRenamePayload) Serialize() []byte {
-	oldNameLen := len(p.OldName)
-	newNameLen := len(p.NewName)
-	if oldNameLen > 255 {
-		oldNameLen = 255
-	}
-	if newNameLen > 255 {
-		newNameLen = 255
-	}
-
-	paddedOldNameLen := (oldNameLen + 3) &^ 3
-	paddedNewNameLen := (newNameLen + 3) &^ 3
-
-	buf := make([]byte, 32+paddedOldNameLen+paddedNewNameLen)
+	oldName, newName := p.OldName[:min(len(p.OldName), 255)], p.NewName[:min(len(p.NewName), 255)]
+	paddedOld := (len(oldName) + 3) &^ 3
+	buf := make([]byte, dirRenameHeader+paddedOld+(len(newName)+3)&^3)
 	binary.LittleEndian.PutUint64(buf[0:8], p.OldParentInodeNum)
 	binary.LittleEndian.PutUint64(buf[8:16], p.NewParentInodeNum)
 	binary.LittleEndian.PutUint64(buf[16:24], p.InodeNum)
 	buf[24] = byte(p.EntryType)
-	buf[25] = uint8(oldNameLen)
-	buf[26] = uint8(newNameLen)
-	// Reserved at 27-31
-
-	offset := 32
-	copy(buf[offset:], p.OldName[:oldNameLen])
-	offset += paddedOldNameLen
-	copy(buf[offset:], p.NewName[:newNameLen])
-
+	buf[25] = uint8(len(oldName))
+	buf[26] = uint8(len(newName))
+	buf[27] = byte(p.TargetType)
+	binary.LittleEndian.PutUint32(buf[28:32], p.Flags)
+	binary.LittleEndian.PutUint64(buf[32:40], p.OldParentGen)
+	binary.LittleEndian.PutUint64(buf[40:48], p.NewParentGen)
+	binary.LittleEndian.PutUint64(buf[48:56], p.MetaGeneration)
+	binary.LittleEndian.PutUint64(buf[56:64], p.TargetInodeNum)
+	binary.LittleEndian.PutUint64(buf[64:72], p.TargetGen)
+	copy(buf[dirRenameHeader:], oldName)
+	copy(buf[dirRenameHeader+paddedOld:], newName)
 	return buf
 }
 
 // DeserializeDirRename parses a DirRenamePayload from bytes.
 func DeserializeDirRename(buf []byte) (*DirRenamePayload, error) {
-	if len(buf) < 32 {
+	if len(buf) < dirRenameHeader {
 		return nil, ErrTxnTooSmall
 	}
-	oldNameLen := int(buf[25])
-	newNameLen := int(buf[26])
-	paddedOldNameLen := (oldNameLen + 3) &^ 3
-
-	if len(buf) < 32+paddedOldNameLen+newNameLen {
+	oldLen, newLen := int(buf[25]), int(buf[26])
+	paddedOld := (oldLen + 3) &^ 3
+	if len(buf) < dirRenameHeader+paddedOld+newLen {
 		return nil, ErrTxnTooSmall
 	}
-
 	return &DirRenamePayload{
 		OldParentInodeNum: binary.LittleEndian.Uint64(buf[0:8]),
 		NewParentInodeNum: binary.LittleEndian.Uint64(buf[8:16]),
 		InodeNum:          binary.LittleEndian.Uint64(buf[16:24]),
 		EntryType:         DirEntryType(buf[24]),
-		OldNameLen:        buf[25],
-		NewNameLen:        buf[26],
-		OldName:           string(buf[32 : 32+oldNameLen]),
-		NewName:           string(buf[32+paddedOldNameLen : 32+paddedOldNameLen+newNameLen]),
+		TargetType:        DirEntryType(buf[27]),
+		Flags:             binary.LittleEndian.Uint32(buf[28:32]),
+		OldParentGen:      binary.LittleEndian.Uint64(buf[32:40]),
+		NewParentGen:      binary.LittleEndian.Uint64(buf[40:48]),
+		MetaGeneration:    binary.LittleEndian.Uint64(buf[48:56]),
+		TargetInodeNum:    binary.LittleEndian.Uint64(buf[56:64]),
+		TargetGen:         binary.LittleEndian.Uint64(buf[64:72]),
+		OldName:           string(buf[dirRenameHeader : dirRenameHeader+oldLen]),
+		NewName:           string(buf[dirRenameHeader+paddedOld : dirRenameHeader+paddedOld+newLen]),
 	}, nil
 }
 
