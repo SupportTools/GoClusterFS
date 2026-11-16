@@ -573,6 +573,20 @@ func removeFromChunk(chunk []byte, name string) bool {
 // as it needs to allocate blocks (bitmap lock) before acquiring the inode lock.
 // Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
 func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
+	return m.appendBlock(ctx, dirIno,
+		func(next uint64) (*inode.Inode, bool, error) {
+			return m.addToExistingChunk(dirIno.InodeNum, entry, next)
+		},
+		func(data []byte) {
+			// The entry takes the first chunk (DirChunkSize) to keep RecLen in uint16 range
+			entry.RecLen = uint16(DirChunkSize)
+			serializeEntry(entry, data)
+		})
+}
+
+// appendBlock maps a new block, filled by fill, as directory dirIno's next one. Under the directory lock, settled
+// may report that another goroutine or node made the block unneeded.
+func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled func(nextBlock uint64) (*inode.Inode, bool, error), fill func(data []byte)) error {
 	// Calculate next block number based on current (possibly stale) size
 	nextBlock := extent.BlocksForSize(dirIno.Size)
 
@@ -622,11 +636,11 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 	}
 
 	// Another node may have added this name, or blocks with room for it, while the block was allocated.
-	freshIno, added, err := m.addToExistingChunk(dirIno.InodeNum, entry, nextBlock)
+	freshIno, done, err := settled(nextBlock)
 	if err != nil {
 		return err
 	}
-	if added {
+	if done {
 		dirIno.Size = freshIno.Size
 		return nil
 	}
@@ -647,12 +661,8 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 		return fmt.Errorf("failed to check extent: %w", extErr)
 	}
 
-	// The entry takes the first chunk (DirChunkSize) to keep RecLen in uint16 range
-	entry.RecLen = uint16(DirChunkSize)
-
-	// Write the entry data to the allocated physical block
 	data := make([]byte, BlockSize)
-	serializeEntry(entry, data)
+	fill(data)
 
 	if err := m.writeBlock(physBlock, data); err != nil {
 		return err
