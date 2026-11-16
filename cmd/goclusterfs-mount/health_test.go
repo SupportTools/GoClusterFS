@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
+	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
 func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
@@ -56,7 +57,11 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, err := api.NewServer(api.DefaultConfig().WithListenAddr("127.0.0.1:0"))
+			addr, err := testnet.LoopbackAddr()
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv, err := api.NewServer(api.DefaultConfig().WithListenAddr(addr))
 			if err != nil {
 				t.Fatal(err)
 			}
