@@ -214,7 +214,7 @@ func Check(ops []Op, r Rules) []Violation {
 		case o.Result == Failed:
 			out = append(out, Violation{What: o.Kind.String() + " failed", Op: o, Allowed: "success, ENOENT or EEXIST", History: []Op{o}})
 		case o.Result == Stale && !churned(o, logs[o.Name], r):
-			out = append(out, Violation{What: "open failed with ESTALE while its name kept its file", Op: o, Allowed: "ESTALE only when the name lost its file at least twice during the call", History: []Op{o}})
+			out = append(out, Violation{What: "open failed with ESTALE while its name kept its file", Op: o, Allowed: "ESTALE only when the name lost its file twice within the cache window and the call, once during the call", History: []Op{o}})
 		case o.Kind == Write && o.Result == Exists:
 			out = append(out, Violation{What: "open with O_CREAT and no O_EXCL failed with EEXIST", Op: o, Allowed: "the file opened", History: []Op{o}})
 		case o.Result != OK && o.Result != NotFound && o.Result != Exists:

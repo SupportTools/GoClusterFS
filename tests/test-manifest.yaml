@@ -4685,7 +4685,7 @@ scenarios:
 
   - id: history-checker-torn-read
     name: Coherence checker flags torn reads
-    description: A read that mixes values mid-sector, or with no write on its node overlapping, is a violation
+    description: A torn read is a violation when no write on the reader's node overlapped it, when a split falls off an 8-byte boundary outside one mixed word, or when a piece holds a value the read may not see
     priority: go_only
     environments:
       go: history/history_test.go::TestTornRead
