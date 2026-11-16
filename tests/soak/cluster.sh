@@ -8,6 +8,8 @@
 #   sigkill VM          SIGKILL VM's goclusterfs-mount and mount again
 #   stop VM SECONDS     SIGSTOP VM's goclusterfs-mount for SECONDS, resume it, then mount again
 #   remount VM          kill VM's goclusterfs-mount and mount again
+#   cut FAULT VM [SECS] only the first half of power, sigkill or stop: the node is left down
+#   restore FAULT VM    the second half: boot and mount the node again
 #   unmount-all         unmount every node
 #   mount-all           mount every node that is not mounted
 #   fsck [-repair]      run goclusterfs-fsck on VM 1 with every node unmounted; answers
@@ -42,6 +44,30 @@ remount() {
     kill_mount "$1" && setup_goclusterfs "$1" false
 }
 
+cut_node() {
+    case "$1" in
+        power) kill_vm "$2" ;;
+        sigkill) ssh_run "$2" "pkill -9 -f $MOUNT_PATTERN" ;;
+        stop)
+            local pid
+            pid=$(mount_pid "$2") || return 1
+            ssh_run "$2" "kill -STOP $pid" || return 1
+            sleep "$3"
+            ssh_run "$2" "kill -CONT $pid" || true
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+restore_node() {
+    if [[ $1 == power ]]; then
+        start_vm "$2" false && wait_vm_healthy "$2" && setup_goclusterfs "$2" false
+    else
+        # After a stop the other nodes declared this one failed and fenced it, so it has to mount again.
+        remount "$2"
+    fi
+}
+
 unmount_node() {
     local vm_id=$1 waited=0
     ssh_run "$vm_id" "fusermount3 -u ${GOCLUSTERFS_MOUNT}" || true
@@ -73,21 +99,14 @@ handle() {
             done
             reply "ok $(get_ssh_key) ${ports[*]}"
             ;;
-        power)
-            kill_vm "$1" >&2 && start_vm "$1" false >&2 && wait_vm_healthy "$1" >&2 &&
-                setup_goclusterfs "$1" false >&2 && reply ok
+        power | sigkill | stop)
+            cut_node "$cmd" "$@" >&2 && restore_node "$cmd" "$1" >&2 && reply ok
             ;;
-        sigkill)
-            remount "$1" >&2 && reply ok
+        cut)
+            cut_node "$@" >&2 && reply ok
             ;;
-        stop)
-            local pid
-            pid=$(mount_pid "$1") || return 1
-            ssh_run "$1" "kill -STOP $pid" >&2 || return 1
-            sleep "$2"
-            ssh_run "$1" "kill -CONT $pid" >&2
-            # The other nodes declared it failed and fenced it, so it has to mount again.
-            remount "$1" >&2 && reply ok
+        restore)
+            restore_node "$@" >&2 && reply ok
             ;;
         remount)
             remount "$1" >&2 && reply ok

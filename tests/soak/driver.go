@@ -49,9 +49,9 @@ type node struct {
 	port int
 	mu   sync.RWMutex // an operation holds it shared; a fault holds it exclusively
 	up   atomic.Bool
-	// faults counts the faults that hit this node; an operation that sees it change was cut short.
-	faults atomic.Uint64
-	agent  *agentConn
+	// hit is set while an -inflight fault takes the node down; an operation that fails then was cut short.
+	hit   atomic.Bool
+	agent *agentConn
 }
 
 // record is one line of the operation log.
@@ -363,13 +363,12 @@ func (d *driver) runLane(l *lane) {
 func (d *driver) runOpLocked(op *Op, n *node) {
 	op.Node = n.id
 	op.At = time.Now().UnixMilli()
-	faults := n.faults.Load()
 	ctx, cancel := context.WithTimeout(d.ctx, d.cfg.opTimeout)
 	resp, err := n.agent.call(ctx, op.request())
 	cancel()
 	// Registered before the node is released, so the fault that cut the operation short finds it.
 	var u *uncertain
-	if (err != nil || !matches(op.Want, resp.Errno)) && n.faults.Load() != faults && d.ctx.Err() == nil {
+	if (err != nil || !matches(op.Want, resp.Errno)) && n.hit.Load() && d.ctx.Err() == nil {
 		u = &uncertain{op: op, done: make(chan struct{})}
 		d.pendingMu.Lock()
 		d.pending[n.id] = append(d.pending[n.id], u)
@@ -454,11 +453,10 @@ func (d *driver) onNode(n *node, f func() error) error {
 	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	faults := n.faults.Load()
 	if !n.up.Load() {
 		return nil
 	}
-	if err := f(); err != nil && n.faults.Load() == faults {
+	if err := f(); err != nil && !n.hit.Load() {
 		return err
 	}
 	return nil
@@ -469,22 +467,28 @@ func (d *driver) injectFault(kind string, n *node) {
 	d.faultMu.Lock()
 	defer d.faultMu.Unlock()
 	start := time.Now()
-	n.up.Store(false)
 	command := fmt.Sprintf("%s %d", kind, n.id)
 	if kind == "stop" {
 		command = fmt.Sprintf("stop %d %d", n.id, int(d.cfg.stopFor.Seconds()))
 	}
 	log.Printf("fault: %s", command)
 	if d.cfg.inflight {
-		// Operations running on the node now are cut short; they finish with an error once it goes down.
-		n.faults.Add(1)
-		if _, _, err := d.ctl.run(command); err != nil {
+		// Operations keep starting on the node until the fault takes it down, so it cuts some of them short.
+		n.hit.Store(true)
+		if _, _, err := d.ctl.run("cut " + command); err != nil {
 			d.fail("fault %s: %v", command, err)
 			return
 		}
+		n.up.Store(false)
 		n.mu.Lock()
 		n.agent.close()
+		if _, _, err := d.ctl.run(fmt.Sprintf("restore %s %d", kind, n.id)); err != nil {
+			n.mu.Unlock()
+			d.fail("fault %s: restore: %v", command, err)
+			return
+		}
 	} else {
+		n.up.Store(false)
 		n.mu.Lock()
 		n.agent.close()
 		if _, _, err := d.ctl.run(command); err != nil {
@@ -509,6 +513,7 @@ func (d *driver) injectFault(kind string, n *node) {
 		d.fail("after fault %s: node %d: %v", command, n.id, err)
 		return
 	}
+	n.hit.Store(false)
 	n.up.Store(true)
 }
 
