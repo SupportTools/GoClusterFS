@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"slices"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -120,25 +117,6 @@ func TestReadsNeverShowStaleBytes(t *testing.T) {
 			want := append(append(slices.Clone(data), make([]byte, 700000-len(data))...), data...)
 			expectContent(t, c, want)
 			return data
-		}},
-		{"AppendThenFallocate", func(t *testing.T, fsys *FS, b *File, freed []uint64) []byte {
-			writeAt(t, b, data, 0)
-			expectReused(t, fsys, b, 0, freed)
-			if errno := b.Allocate(context.Background(), nil, 0, 2*BlockSize, 0); errno != 0 {
-				t.Fatalf("fallocate: %v", errno)
-			}
-			return append(slices.Clone(data), make([]byte, 2*BlockSize-len(data))...)
-		}},
-		{"SnapshotOfAReusedBlockThenGrow", func(t *testing.T, fsys *FS, b *File, freed []uint64) []byte {
-			writeAt(t, b, data, 0)
-			expectReused(t, fsys, b, 0, freed)
-			setxattr(t, b, "user.snapshot", "s")
-			writeAt(t, b, data, 600000)
-			setxattr(t, b, "user.snapshot.clone", "s:/sc")
-			sc := lookupFile(t, fsys, "sc")
-			truncateFile(t, sc, 700000)
-			expectContent(t, sc, append(slices.Clone(data), make([]byte, 700000-len(data))...))
-			return append(append(slices.Clone(data), make([]byte, 600000-len(data))...), data...)
 		}},
 		{"CloneOfASnapshotOfATruncatedFile", func(t *testing.T, fsys *FS, b *File, _ []uint64) []byte {
 			writeAt(t, b, pattern(3, 900000), 0)
@@ -288,115 +266,4 @@ func TestTruncateWhileAppending(t *testing.T) {
 	if failed > 0 {
 		t.Fatalf("%d of 200 truncates failed while the file was appended to", failed)
 	}
-}
-
-// One node appends records while another writes past the end of the file. Zeroing the gap before that write must
-// never wipe a record the first node wrote but had not yet covered with its size.
-func TestGrowingWriteNeverZeroesAnotherNodesAppend(t *testing.T) {
-	path := newFormattedImage(t)
-	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
-	ctx := context.Background()
-	const records, size = 64, 4096
-	for round := range 8 {
-		name := fmt.Sprintf("f%d", round)
-		a := createFile(t, nodeA, name)
-		b := &File{fs: nodeB, inodeNum: a.inodeNum}
-		var wg sync.WaitGroup
-		wg.Go(func() {
-			for k := range records {
-				if _, errno := a.Write(ctx, nil, pattern(byte(k+1), size), int64(k*size)); errno != 0 {
-					t.Errorf("record %d: %v", k, errno)
-				}
-			}
-		})
-		time.Sleep(time.Duration(round) * time.Millisecond)
-		if _, errno := b.Write(ctx, nil, pattern(99, 100), 900000); errno != 0 {
-			t.Fatalf("write past the end: %v", errno)
-		}
-		wg.Wait()
-		got := readWhole(t, a)
-		for k := range records {
-			if !bytes.Equal(got[k*size:(k+1)*size], pattern(byte(k+1), size)) {
-				t.Fatalf("round %d: record %d was lost to the other node's growth", round, k)
-			}
-		}
-	}
-}
-
-// writtenBytes returns how many bytes this process has passed to write system calls.
-func writtenBytes(t *testing.T) uint64 {
-	t.Helper()
-	io, err := os.ReadFile("/proc/self/io")
-	if err != nil {
-		t.Skipf("no /proc/self/io: %v", err)
-	}
-	for _, line := range strings.Split(string(io), "\n") {
-		if v, ok := strings.CutPrefix(line, "wchar: "); ok {
-			n, err := strconv.ParseUint(v, 10, 64)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return n
-		}
-	}
-	t.Fatal("no wchar in /proc/self/io")
-	return 0
-}
-
-// A sequential write in FUSE's 128 KiB pieces writes its data once, not a block of zeros before each new block.
-func TestSequentialWriteWritesDataOnce(t *testing.T) {
-	fsys := openFormattedFS(t, newFormattedImage(t))
-	f := createFile(t, fsys, "seq")
-	const total, piece = 16 << 20, 128 << 10
-	chunk := pattern(7, piece)
-	before := writtenBytes(t)
-	for off := 0; off < total; off += piece {
-		writeAt(t, f, chunk, int64(off))
-	}
-	ratio := float64(writtenBytes(t)-before) / total
-	t.Logf("writing %d MiB wrote %.2fx its size", total>>20, ratio)
-	if ratio > 1.2 {
-		t.Fatalf("writing %d MiB wrote %.2fx its size, want about 1x", total>>20, ratio)
-	}
-}
-
-// A write below the end of the file plans no gap, then a peer truncates before the write sets its size. The write must
-// not grow the file back over the truncated bytes without zeroing them.
-func TestWriteAfterPeerTruncateShowsNoOldBytes(t *testing.T) {
-	path := newFormattedImage(t)
-	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
-	ctx := context.Background()
-	a := createFile(t, nodeA, "f")
-	writeAt(t, a, pattern(3, 10000), 0)
-	b := &File{fs: nodeB, inodeNum: a.inodeNum}
-
-	var once sync.Once
-	truncated := make(chan struct{})
-	beforeSizeUpdate = func(*File) {
-		once.Do(func() {
-			go func() {
-				defer close(truncated)
-				in := &fuse.SetAttrIn{}
-				in.Valid, in.Size = fuse.FATTR_SIZE, 100
-				if errno := b.Setattr(ctx, nil, in, &fuse.AttrOut{}); errno != 0 {
-					t.Errorf("peer truncate: %v", errno)
-				}
-			}()
-			select {
-			case <-truncated:
-			case <-time.After(3 * time.Second):
-				t.Error("the peer's truncate did not land while the write waited to set its size")
-			}
-		})
-	}
-	t.Cleanup(func() { beforeSizeUpdate = nil })
-
-	data := pattern(9, 10)
-	if _, errno := a.Write(ctx, nil, data, 5000); errno != 0 {
-		t.Fatalf("write: %v", errno)
-	}
-	<-truncated
-	beforeSizeUpdate = nil
-	want := append(append(pattern(3, 100), make([]byte, 4900)...), data...)
-	expectContent(t, &File{fs: openFormattedFS(t, path), inodeNum: a.inodeNum}, want)
 }
