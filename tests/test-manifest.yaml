@@ -2360,6 +2360,22 @@ scenarios:
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestTrackedSendersBounded
 
+  - id: broadcast-silent-peers
+    name: Silent broadcast peers are reported
+    description: A node the registry shows mounted but not heard for 3 heartbeat intervals counts as silent until it is heard again or unmounts; this node is never listed
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/silence_test.go::TestSilentPeers
+
+  - id: broadcast-silent-peer-reported
+    name: A node reports peers it hears no broadcasts from
+    description: A node next to one that sends no broadcasts (Go) or that hears no multicast (Docker) reports its peers on /health and /metrics, and recovers when they are heard again
+    priority: high
+    environments:
+      go: broadcast_test.go::TestBroadcastReportsSilentPeer
+      docker: run-tests.sh::test_broadcast_silent_peer_reported
+      vm: TODO
+
   - id: broadcast-loss-drops-caches
     name: Broadcast loss drops caches
     description: A gap in a peer's sequence numbers clears the inode and extent caches once; a late message does not clear them again

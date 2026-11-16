@@ -108,6 +108,7 @@ func main() {
 		broadcastSecret  = flag.String("broadcast-secret", "", "Secret that signs broadcast messages, the same on every node; visible to local users in ps. Empty leaves them unauthenticated: any host that can reach the UDP ports can make this node drop its caches")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast; empty lets the kernel choose")
 		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
+		broadcastBeat    = flag.Duration("broadcast-heartbeat", 30*time.Second, "How often this node sends a broadcast heartbeat; a mounted node not heard for 3 of these is reported")
 
 		// TRIM configuration
 		trimEnabled   = flag.Bool("trim", true, "Discard freed blocks on the device (BLKDISCARD) in batches; does nothing on image files")
@@ -193,10 +194,13 @@ func main() {
 		UnicastPort:          *unicastPort,
 		MulticastTTL:         1, // Same subnet
 		MaxMulticastFailures: 3,
-		HeartbeatInterval:    30 * time.Second,
+		HeartbeatInterval:    *broadcastBeat,
 		Secret:               *broadcastSecret,
 		Interface:            *broadcastIface,
 		MaxPeers:             *broadcastPeers,
+	}
+	if *broadcastBeat <= 0 {
+		log.Fatalf("-broadcast-heartbeat must be positive, got %v", *broadcastBeat)
 	}
 	if *broadcastPeers < 1 {
 		log.Fatalf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
@@ -408,6 +412,7 @@ func main() {
 		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
 			broadcastFailed(err)
 		}
+		cacheMgr.WatchBroadcastPeers(expectedPeers(nodeReg))
 		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
 			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
 	} else {
@@ -538,6 +543,7 @@ func main() {
 				replaying:        nodeReg.Replaying,
 				broadcastOn:      cacheMgr.BroadcastEnabled(),
 				broadcastProblem: cacheMgr.BroadcastProblem,
+				silentPeers:      cacheMgr.SilentBroadcastPeers,
 			})
 			var snaps fileops.Snapshots
 			if gfs.SnapshotRegistry() != nil {

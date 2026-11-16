@@ -84,7 +84,7 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 				Misses:  20,
 				HitRate: 0.9,
 			},
-			Broadcast: &BroadcastTables{Peers: 3, Senders: 4, MaxPeers: 256},
+			Broadcast: &BroadcastTables{Peers: 3, Senders: 4, SilentPeers: 1, MaxPeers: 256},
 		},
 		journal: &JournalStatsResponse{
 			State:             "dirty",
@@ -166,6 +166,7 @@ func TestMetricsEndpoint_WithStatsProvider(t *testing.T) {
 		"goclusterfs_broadcast_peers 3",
 		"goclusterfs_broadcast_senders 4",
 		"goclusterfs_broadcast_max_peers 256",
+		"goclusterfs_broadcast_silent_peers 1",
 		"goclusterfs_cache_inode_hits_total 800",
 		"goclusterfs_cache_inode_misses_total 200",
 		"goclusterfs_cache_inode_hit_rate 0.8",
