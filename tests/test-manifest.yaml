@@ -1779,6 +1779,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/rename_test.go::TestRenameReplayLeavesADirectoryMovedBackAlone
 
+  - id: fs-renameoverasymlinkfreesitatonce
+    name: Rename over a symlink frees it at once
+    description: With a peer mounted, a rename over a symlink frees it at once instead of listing it as an orphan, since no node holds a symlink open
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameOverASymlinkFreesItAtOnce
+
   - id: rename-power-renameinonedirectory
     name: Power failure during a rename in one directory
     description: Power fails at each write; exactly one of the two names names the file, and fsck finds only leaks

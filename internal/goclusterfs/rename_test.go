@@ -331,3 +331,35 @@ func TestRenameReplayLeavesADirectoryMovedBackAlone(t *testing.T) {
 	}
 	expectCleanFsck(t, remounted)
 }
+
+// No node can hold a symlink open, so a rename over one frees it at once instead of listing it as an orphan.
+func TestRenameOverASymlinkFreesItAtOnce(t *testing.T) {
+	path := newFormattedImage(t)
+	cluster := newFakeCluster(0, 1)
+	fsys := cluster.join(t, openFormattedFS(t, path), 1)
+	ctx := context.Background()
+	a := createFile(t, fsys, "a")
+	link := newRegularFile(t, fsys)
+	if _, err := fsys.updateInode(ctx, link.inodeNum, func(ino *inode.Inode) error {
+		ino.Mode, ino.LinkCount = inode.S_IFLNK|0o777, 1
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.dirMgr.Add(ctx, readInode(t, fsys, inode.InodeRoot), "l", uint64(link.inodeNum), dir.DT_LNK); err != nil {
+		t.Fatal(err)
+	}
+
+	if errno := fsys.Rename(ctx, "a", fsys, "l", 0); errno != 0 {
+		t.Fatalf("rename over the symlink: %v", errno)
+	}
+	if got := named(t, fsys, inode.InodeRoot, "l"); got != a.inodeNum {
+		t.Errorf("l names inode %d, want %d", got, a.inodeNum)
+	}
+	if ino := readInode(t, fsys, link.inodeNum); ino.Magic != 0 {
+		t.Errorf("the replaced symlink: magic %#x, holders %#b; want it freed at once", ino.Magic, ino.Holders)
+	}
+	if got := cluster.list(1); len(got) != 0 {
+		t.Errorf("orphan list %v after a rename over a symlink, want it empty", got)
+	}
+}

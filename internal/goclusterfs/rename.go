@@ -77,10 +77,11 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 		return nameErrno(err)
 	}
 
-	// A file losing its last link is listed as an orphan before anything changes, as unlink does.
+	// A file losing its last link is listed as an orphan before anything changes, as unlink does. No node holds a
+	// symlink open, so a replaced symlink is freed at once.
 	var live uint64
 	var targetIno *inode.Inode
-	if op.Target != 0 && !op.TargetIsDir && !op.NoReplace {
+	if op.Target != 0 && !op.TargetIsDir && !op.NoReplace && ttype != dir.DT_LNK {
 		if targetIno, err = f.inodeTbl.Read(uint32(op.Target)); err != nil {
 			return syscall.EIO
 		}
