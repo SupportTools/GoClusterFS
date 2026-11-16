@@ -4662,6 +4662,13 @@ scenarios:
     environments:
       go: history/history_test.go::TestNameChangesMayLagTheWindow
 
+  - id: history-checker-local-tear
+    name: Coherence checker allows page-cache tears during a local write
+    description: A torn read split at 8-byte boundaries while a write on the reader's node overlapped it is allowed; a split at any other offset is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTearDuringALocalWriteIsAllowedAtWordBoundaries
+
   - id: history-checker-stale-open
     name: Coherence checker allows ESTALE on open only under name churn
     description: An open that fails with ESTALE is allowed only when its name lost its file at least twice during the call; otherwise it is a violation

@@ -94,6 +94,15 @@ func TestTornRead(t *testing.T) {
 	expect(t, b, "torn read")
 }
 
+func TestTearDuringALocalWriteIsAllowedAtWordBoundaries(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Write, Name: "a", Value: 2, Node: 1}, 20, 40)
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: []Piece{{0, 1}, {968, 2}, {1032, 1}}}, 25, 30)
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: []Piece{{0, 1}, {965, 2}}}, 25, 30)
+	expect(t, b, "torn read")
+}
+
 func TestSectorTearDuringALocalWriteIsAllowed(t *testing.T) {
 	b := &builder{}
 	b.write("a", 1, 0, 10)

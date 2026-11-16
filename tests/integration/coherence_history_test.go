@@ -29,7 +29,7 @@ var historyNames = []string{"n0", "n1", "n2", "n3", "n4"}
 // documented cross-node guarantees. It runs only with GCFS_HISTORY=1; -short
 // runs 2 nodes for 20s. For a long run set GCFS_HISTORY_MINUTES,
 // GCFS_HISTORY_NODES (2 to 4) and GCFS_HISTORY_OUT, a directory for each round's
-// history.
+// history. Set GCFS_IMAGE_DIR to keep the image off tmpfs, which tears writes inside a sector.
 func TestCoherenceHistory(t *testing.T) {
 	if os.Getenv("GCFS_HISTORY") != "1" {
 		t.Skip("set GCFS_HISTORY=1 to run the coherence history checker")
