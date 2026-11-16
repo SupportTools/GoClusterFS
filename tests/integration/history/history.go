@@ -60,9 +60,8 @@ type Op struct {
 	End      time.Duration
 	Result   Result
 	Err      string
-	Value    uint64   // Write: the value written. Read: the first value seen.
-	Other    uint64   // Read: a second value seen, when Content is Torn
-	OtherAt  int64    // Read: the byte offset where Other starts
+	Value    uint64   // Write: the value written. Read: the value seen, when Content is Whole.
+	Pieces   []Piece  // Read: each run of one value, when Content is Torn
 	Content  Content  // Read
 	Size     int64    // Stat
 	Names    []string // Readdir
@@ -84,7 +83,10 @@ func (o Op) String() string {
 	case o.Kind == Read && o.Content == Whole:
 		s += fmt.Sprintf(" = %#x", o.Value)
 	case o.Kind == Read && o.Content == Torn:
-		s += fmt.Sprintf(" = torn: %d bytes, %#x then %#x from byte %d", o.Size, o.Value, o.Other, o.OtherAt)
+		s += fmt.Sprintf(" = torn: %d bytes", o.Size)
+		for _, p := range o.Pieces {
+			s += fmt.Sprintf(", %#x from %d", p.Value, p.At)
+		}
 	case o.Kind == Read:
 		s += " = empty"
 	case o.Kind == Stat:
@@ -93,6 +95,12 @@ func (o Op) String() string {
 		s += " = [" + strings.Join(o.Names, " ") + "]"
 	}
 	return s
+}
+
+// Piece is a run of one value in a torn read, starting at byte At.
+type Piece struct {
+	At    int64
+	Value uint64
 }
 
 // Rules are the guarantees a history is checked against.
@@ -207,6 +215,7 @@ func Check(ops []Op, r Rules) []Violation {
 		case o.Kind == Write && o.Result == Exists:
 			out = append(out, Violation{What: "open with O_CREAT and no O_EXCL failed with EEXIST", Op: o, Allowed: "the file opened", History: []Op{o}})
 		case o.Result != OK && o.Result != NotFound && o.Result != Exists:
+		case o.Kind == Read && o.Content == Torn && sectorTear(o, logs[o.Name], r):
 		case o.Kind == Read || o.Kind == Stat:
 			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], r); bad {
 				out = append(out, v)
@@ -334,6 +343,26 @@ func (l *nameLog) during(from, to time.Duration, fn func(mutation)) {
 			fn(l.byEnd[i])
 		}
 	}
+}
+
+// sectorTear reports whether a torn read only mixes values split at 4 KB
+// boundaries while a write on the reader's node overlapped it, as Linux local
+// filesystems allow, and every piece is a value the read may see.
+func sectorTear(o Op, l *nameLog, r Rules) bool {
+	if o.Size != r.WriteSize || len(o.Pieces) < 2 || l == nil {
+		return false
+	}
+	allowed, _ := possible(o, l, o.Start-r.Window)
+	overlapping := false
+	for _, p := range o.Pieces {
+		if p.At%4096 != 0 || p.Value == 0 || !slices.Contains(allowed, state{present: true, value: p.Value}) {
+			return false
+		}
+		l.during(o.Start, o.End, func(m mutation) {
+			overlapping = overlapping || m.op.Kind == Write && m.op.Node == o.Node && m.op.Value == p.Value
+		})
+	}
+	return overlapping
 }
 
 // stableName reports whether name kept one file for a whole window before o

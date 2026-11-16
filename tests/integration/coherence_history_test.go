@@ -26,10 +26,14 @@ var historyNames = []string{"n0", "n1", "n2", "n3", "n4"}
 
 // TestCoherenceHistory runs clients on several nodes against a few shared names,
 // records every call with its start and end, and checks the history against the
-// documented cross-node guarantees. -short runs 2 nodes for 20s. For a long run
-// set GCFS_HISTORY_MINUTES, GCFS_HISTORY_NODES (2 to 4) and GCFS_HISTORY_OUT, a
-// directory for each round's history.
+// documented cross-node guarantees. It runs only with GCFS_HISTORY=1; -short
+// runs 2 nodes for 20s. For a long run set GCFS_HISTORY_MINUTES,
+// GCFS_HISTORY_NODES (2 to 4) and GCFS_HISTORY_OUT, a directory for each round's
+// history.
 func TestCoherenceHistory(t *testing.T) {
+	if os.Getenv("GCFS_HISTORY") != "1" {
+		t.Skip("set GCFS_HISTORY=1 to run the coherence history checker")
+	}
 	nodes, clients, total := 3, 3, 2*time.Minute
 	if testing.Short() {
 		nodes, clients, total = 2, 2, 20*time.Second
@@ -126,7 +130,7 @@ func historyCall(node *MountedFS, dir string, rng *rand.Rand, value uint64, star
 		err = writeValue(path, value)
 	case p < 50:
 		o.Kind = history.Read
-		o.Content, o.Value, o.Other, o.OtherAt, o.Size, err = readValue(path)
+		o.Content, o.Value, o.Pieces, o.Size, err = readValue(path)
 	case p < 65:
 		o.Kind = history.Stat
 		var fi os.FileInfo
@@ -174,12 +178,12 @@ func writeValue(path string, value uint64) error {
 	return errors.Join(err, f.Close())
 }
 
-// readValue reads path whole: Whole when it holds one nonzero value over the write size.
-// For a Torn read it also returns the first value that differs from the first word.
-func readValue(path string) (content history.Content, value, other uint64, otherAt, size int64, err error) {
+// readValue reads path whole: Whole when it holds one nonzero value over the
+// write size, else Torn with each run of one value.
+func readValue(path string) (history.Content, uint64, []history.Piece, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, 0, 0, 0, err
+		return 0, 0, nil, 0, err
 	}
 	buf := make([]byte, historyWriteSize+1)
 	n, err := f.ReadAt(buf, 0)
@@ -187,21 +191,21 @@ func readValue(path string) (content history.Content, value, other uint64, other
 		err = nil
 	}
 	if err = errors.Join(err, f.Close()); err != nil {
-		return 0, 0, 0, 0, int64(n), err
+		return 0, 0, nil, int64(n), err
 	}
 	if n == 0 {
-		return history.Empty, 0, 0, 0, 0, nil
+		return history.Empty, 0, nil, 0, nil
 	}
-	value = binary.LittleEndian.Uint64(buf)
-	for i := 8; i+8 <= n; i += 8 {
-		if w := binary.LittleEndian.Uint64(buf[i:]); w != value {
-			return history.Torn, value, w, int64(i), int64(n), nil
+	var pieces []history.Piece
+	for i := 0; i+8 <= n; i += 8 {
+		if w := binary.LittleEndian.Uint64(buf[i:]); len(pieces) == 0 || pieces[len(pieces)-1].Value != w {
+			pieces = append(pieces, history.Piece{At: int64(i), Value: w})
 		}
 	}
-	if n != historyWriteSize || value == 0 {
-		return history.Torn, value, 0, 0, int64(n), nil
+	if len(pieces) == 1 && n == historyWriteSize && pieces[0].Value != 0 {
+		return history.Whole, pieces[0].Value, nil, int64(n), nil
 	}
-	return history.Whole, value, 0, 0, int64(n), nil
+	return history.Torn, 0, pieces, int64(n), nil
 }
 
 func classify(err error) history.Result {

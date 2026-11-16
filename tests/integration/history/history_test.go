@@ -90,8 +90,21 @@ func TestNameChangesMayLagTheWindow(t *testing.T) {
 func TestTornRead(t *testing.T) {
 	b := &builder{}
 	b.write("a", 1, 0, 10)
-	b.add(Op{Kind: Read, Name: "a", Content: Torn}, 20, 30)
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Pieces: []Piece{{0, 1}, {968, 2}}}, 20, 30)
 	expect(t, b, "torn read")
+}
+
+func TestSectorTearDuringALocalWriteIsAllowed(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Write, Name: "a", Value: 2, Node: 1}, 20, 40)
+	tear := Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: []Piece{{0, 1}, {4096, 2}}}
+	b.add(tear, 25, 30)
+	b.add(Op{Kind: Write, Name: "b", Value: 3, Node: 0}, 20, 40)
+	b.add(Op{Kind: Read, Name: "b", Content: Torn, Size: 12288, Node: 1, Pieces: []Piece{{0, 0}, {4096, 3}}}, 25, 30)
+	tear.Node = 0
+	b.add(tear, 25, 30)
+	expect(t, b, "torn read", "torn read")
 }
 
 func TestUnknownValue(t *testing.T) {
