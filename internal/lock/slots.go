@@ -265,7 +265,7 @@ func (m *Manager) tornTooLong(ref slotRef, torn []byte) bool {
 		m.tornSince[ref] = tornSighting{since: time.Now(), sum: sum}
 		return false
 	}
-	return age(seen.since) > tornExpiry
+	return age(seen.since) > m.timing.tornExpiry
 }
 
 // ownAdoptedLocked reports whether AdoptOwner kept recordID in this node's own
@@ -335,7 +335,7 @@ func (m *Manager) dropClaimWaiter(recordID uint64) {
 func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written time.Time, won bool, by blocker, err error) {
 	m.mu.Lock()
 	c := m.claims[recordID]
-	rewrite := c.written.IsZero() || c.mode != mode || age(c.written) > renewAfter
+	rewrite := c.written.IsZero() || c.mode != mode || age(c.written) > m.timing.renewAfter
 	ignore := -1
 	if a, ok := m.adopted[recordID]; ok {
 		ignore = a.slot
@@ -350,7 +350,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode) (written ti
 		}
 		if _, lower, by := m.rowConflicts(recordID, row, mode, ignore); lower {
 			m.deferred.Add(1)
-			if !marked.IsZero() && age(marked) > renewAfter {
+			if !marked.IsZero() && age(marked) > m.timing.renewAfter {
 				at, err := m.markWaiting(recordID, key)
 				m.mu.Lock()
 				c.marked = at
@@ -446,7 +446,7 @@ func (m *Manager) releaseRecord(recordID uint64) error {
 		return nil
 	}
 	if !m.unreleased[recordID] {
-		log.Printf("[WARN] lock: clearing this node's claim on record %d failed: %v; retrying every %v until it is cleared", recordID, err, releaseRetry)
+		log.Printf("[WARN] lock: clearing this node's claim on record %d failed: %v; retrying every %v until it is cleared", recordID, err, m.timing.releaseRetry)
 	}
 	m.unreleased[recordID] = true
 	return err
