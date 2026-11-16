@@ -388,4 +388,3 @@ func TestUnlinkSymlinkWithPeerFreesAtOnce(t *testing.T) {
 		t.Errorf("%d free blocks after the unlink, want %d", got, free)
 	}
 }
-
