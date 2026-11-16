@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestMountUnmount verifies basic mount and unmount functionality.
@@ -724,46 +727,64 @@ func TestAppendFile(t *testing.T) {
 	t.Log("Append file test passed")
 }
 
-// TestRename tests renaming files.
-// Note: Rename is not yet implemented in GoClusterFS - this test verifies the expected error.
+// TestRename renames a file, renames it over another file, moves a directory between parents, and checks
+// RENAME_NOREPLACE, all through the mount.
 func TestRename(t *testing.T) {
-	mfs := NewMountedFS(t, 20)
+	mfs := NewMountedFS(t, 64)
 	if err := mfs.FormatAndMount(false); err != nil {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
-
-	// Create a file
 	content := []byte("Rename test content")
 	if err := mfs.WriteFile("oldname.txt", content); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
-
-	// Rename it - currently not implemented, so expect failure
-	oldPath := mfs.Path("oldname.txt")
-	newPath := mfs.Path("newname.txt")
-	err := os.Rename(oldPath, newPath)
-	if err != nil {
-		// Rename not implemented - this is expected for now
-		t.Logf("Rename not implemented (expected): %v", err)
-		t.Skip("Rename operation not yet implemented in GoClusterFS")
+	if err := os.Rename(mfs.Path("oldname.txt"), mfs.Path("newname.txt")); err != nil {
+		t.Fatalf("rename: %v", err)
 	}
-
-	// Old name should not exist
 	if mfs.Exists("oldname.txt") {
-		t.Error("Old name should not exist after rename")
+		t.Error("the old name still exists after the rename")
+	}
+	expectContent(t, mfs, "newname.txt", content)
+
+	if err := mfs.WriteFile("victim.txt", []byte("replaced")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(mfs.Path("newname.txt"), mfs.Path("victim.txt")); err != nil {
+		t.Fatalf("rename over a file: %v", err)
+	}
+	expectContent(t, mfs, "victim.txt", content)
+
+	for _, d := range []string{"a", "b", "a/sub"} {
+		if err := os.Mkdir(mfs.Path(d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mfs.WriteFile("a/sub/f", []byte("inside")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(mfs.Path("a/sub"), mfs.Path("b/moved")); err != nil {
+		t.Fatalf("move a directory between parents: %v", err)
+	}
+	expectContent(t, mfs, "b/moved/f", []byte("inside"))
+	if mfs.Exists("a/sub") {
+		t.Error("a/sub still exists after the move")
+	}
+	if dots, parent := inodeNumber(t, mfs, "b/moved/.."), inodeNumber(t, mfs, "b"); dots != parent {
+		t.Errorf("\"..\" of the moved directory is inode %d, want b's %d", dots, parent)
 	}
 
-	// New name should exist with same content
-	readBack, err := mfs.ReadFile("newname.txt")
-	if err != nil {
-		t.Fatalf("ReadFile new name failed: %v", err)
+	err := unix.Renameat2(unix.AT_FDCWD, mfs.Path("victim.txt"), unix.AT_FDCWD, mfs.Path("b/moved/f"), unix.RENAME_NOREPLACE)
+	if !errors.Is(err, unix.EEXIST) {
+		t.Errorf("RENAME_NOREPLACE over an existing name: %v, want EEXIST", err)
 	}
+	expectContent(t, mfs, "b/moved/f", []byte("inside"))
 
-	if !bytes.Equal(content, readBack) {
-		t.Error("Content changed after rename")
+	if err := mfs.Unmount(); err != nil {
+		t.Fatal(err)
 	}
-
-	t.Log("Rename test passed")
+	if code, out := runFsck(t, mfs.ImagePath); code != 0 {
+		t.Errorf("fsck after the renames: exit %d:\n%s", code, strings.Join(problemLines(out), "\n"))
+	}
 }
 
 // TestCopyFile tests copying files within the filesystem.
