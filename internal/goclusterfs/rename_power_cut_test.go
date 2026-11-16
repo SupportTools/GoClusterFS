@@ -37,6 +37,7 @@ func expectDirLinks(t *testing.T, fsys *FS, num uint32) {
 }
 
 func TestPowerCutDuringRenameInOneDirectory(t *testing.T) {
+	t.Parallel()
 	data := pattern(4, 4096)
 	var f *File
 	runPowerCuts(t, powerCutCase{
@@ -53,6 +54,7 @@ func TestPowerCutDuringRenameInOneDirectory(t *testing.T) {
 }
 
 func TestPowerCutDuringRenameBetweenDirectories(t *testing.T) {
+	t.Parallel()
 	var p1, p2 *Dir
 	var f *File
 	runPowerCuts(t, powerCutCase{
@@ -68,6 +70,7 @@ func TestPowerCutDuringRenameBetweenDirectories(t *testing.T) {
 }
 
 func TestPowerCutDuringRenameOverAFile(t *testing.T) {
+	t.Parallel()
 	var a, b *File
 	runPowerCuts(t, powerCutCase{
 		setup: func(t *testing.T, fsys *FS) {
@@ -86,6 +89,7 @@ func TestPowerCutDuringRenameOverAFile(t *testing.T) {
 }
 
 func TestPowerCutDuringDirectoryMove(t *testing.T) {
+	t.Parallel()
 	var p1, p2, d *Dir
 	runPowerCuts(t, powerCutCase{
 		setup: func(t *testing.T, fsys *FS) {
@@ -108,6 +112,7 @@ func TestPowerCutDuringDirectoryMove(t *testing.T) {
 }
 
 func TestPowerCutDuringRenameOverAnEmptyDirectory(t *testing.T) {
+	t.Parallel()
 	var p1, p2, d, e *Dir
 	runPowerCuts(t, powerCutCase{
 		setup: func(t *testing.T, fsys *FS) {
