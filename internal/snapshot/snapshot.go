@@ -777,9 +777,9 @@ func (r *Registry) find(match func(*Descriptor) bool) (uint64, *Descriptor, erro
 	return 0, nil, ErrSnapshotNotFound
 }
 
-// collect returns the valid descriptors keep accepts. It fails with EIO when a
-// sector cannot be read, rather than return part of the list.
-func (r *Registry) collect(keep func(*Descriptor) bool) ([]*Descriptor, error) {
+// readable returns the valid descriptors keep accepts in the sectors it can
+// read, and the error of the first sector it cannot read.
+func (r *Registry) readable(keep func(*Descriptor) bool) ([]*Descriptor, error) {
 	all, unreadable := r.descriptors()
 	var out []*Descriptor
 	for _, desc := range all {
@@ -787,10 +787,27 @@ func (r *Registry) collect(keep func(*Descriptor) bool) ([]*Descriptor, error) {
 			out = append(out, desc)
 		}
 	}
-	if err := unreadable(); err != nil {
+	return out, unreadable()
+}
+
+// collect is readable failing with EIO rather than return part of the list.
+func (r *Registry) collect(keep func(*Descriptor) bool) ([]*Descriptor, error) {
+	out, err := r.readable(keep)
+	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// unfinished returns the snapshots still creating or deleting in the sectors
+// it can read, and the error of the first sector it cannot read, so that
+// mount recovery goes on around a damaged sector.
+func (r *Registry) unfinished() ([]*Descriptor, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.readable(func(d *Descriptor) bool {
+		return d.Flags&FlagHidden == 0 && (d.State == StateCreating || d.State == StateDeleting)
+	})
 }
 
 // writeDescriptor writes a descriptor to a slot.

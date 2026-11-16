@@ -4114,6 +4114,13 @@ scenarios:
     environments:
       go: internal/snapshot/sector_error_test.go::TestUnreadableSectorFailsLookupsWithEIO
 
+  - id: snapshot-recover-around-unreadable-sector
+    name: Mount recovery rolls back snapshots around an unreadable registry sector
+    description: With one registry sector unreadable, RecoverIncompleteJobs still rolls back the creating snapshots in the other sectors instead of recovering none
+    priority: go_only
+    environments:
+      go: internal/snapshot/worker_test.go::TestRecoverAroundUnreadableSector
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
