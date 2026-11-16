@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -172,6 +173,9 @@ func openOnNode0UnlinkOnNode1(t *testing.T) (*MultiNodeCluster, *os.File, uint32
 	}
 	return cluster, f, num
 }
+
+// A peer lets go of a file another node removed on the Orphans broadcast, or at its next failure scan without one.
+const peerReleaseWait = 3 * node.FailureCheckInterval
 
 // The kernel sends FUSE RELEASE after close returns, so the file is freed a little later.
 func expectFreed(t *testing.T, image string, num uint32, timeout time.Duration, when string) {

@@ -2326,9 +2326,9 @@ test_inode_reuse_stale_read() {
     old_ino=$(exec_on_node "$writer" stat -c %i "$dir/$old")
     exec_on_node "$reader" sh -c "cat $dir/$old > /dev/null"
 
-    # New files take the first free inode from this node's start, so create files until one gets the old number.
+    # New files take the first free inode from this node's start, and the old one is free once peers let go of it.
     local new
-    new=$(exec_on_node "$writer" sh -c "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; done")
+    new=$(exec_on_node "$writer" sh -c "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; sleep 0.1; done")
     if [[ -z "$new" ]]; then
         log "ERROR: No new file reused inode $old_ino"
         exec_on_node "$writer" sh -c "rm -f $dir/reuse_new_*.bin"
@@ -2639,8 +2639,13 @@ test_statfs_multinode() {
     fi
 
     exec_on_node "$remover" rm -f "$file"
-    on_writer=$(statfs_free_blocks "$writer")
-    on_remover=$(statfs_free_blocks "$remover")
+    # The writer frees the file once it lets go of it: on the Orphans broadcast, or at its next failure scan.
+    for _ in $(seq 1 30); do
+        on_writer=$(statfs_free_blocks "$writer")
+        on_remover=$(statfs_free_blocks "$remover")
+        [[ "$on_writer" == "$start" && "$on_remover" == "$start" ]] && break
+        sleep 0.5
+    done
     if [[ "$on_writer" != "$start" || "$on_remover" != "$start" ]]; then
         log "ERROR: After $remover removed the file: $writer reports $on_writer free, $remover reports $on_remover, want $start"
         return 1

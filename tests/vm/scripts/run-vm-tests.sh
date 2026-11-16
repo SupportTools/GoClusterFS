@@ -1745,9 +1745,9 @@ test_inode_reuse_stale_read() {
     old_ino=$(ssh_run "$writer" "stat -c %i $dir/$old")
     ssh_run "$reader" "cat $dir/$old > /dev/null"
 
-    # New files take the first free inode from this node's start, so create files until one gets the old number.
+    # New files take the first free inode from this node's start, and the old one is free once peers let go of it.
     local new
-    new=$(ssh_run "$writer" "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; done")
+    new=$(ssh_run "$writer" "rm $dir/$old; for i in \$(seq 1 200); do f=reuse_new_\$i.bin; touch $dir/\$f; if [ \$(stat -c %i $dir/\$f) = $old_ino ]; then echo \$f; break; fi; sleep 0.1; done")
     if [[ -z "$new" ]]; then
         log_error "No new file reused inode $old_ino"
         ssh_run "$writer" "rm -f $dir/reuse_new_*.bin"
@@ -1976,8 +1976,13 @@ test_statfs_multinode() {
     fi
 
     ssh_run 2 "rm -f $file"
-    on_writer=$(statfs_free_blocks_on_vm 1)
-    on_remover=$(statfs_free_blocks_on_vm 2)
+    # VM 1 frees the file once it lets go of it: on the Orphans broadcast, or at its next failure scan.
+    for _ in $(seq 1 30); do
+        on_writer=$(statfs_free_blocks_on_vm 1)
+        on_remover=$(statfs_free_blocks_on_vm 2)
+        [[ "$on_writer" == "$start" && "$on_remover" == "$start" ]] && break
+        sleep 0.5
+    done
     if [[ "$on_writer" != "$start" || "$on_remover" != "$start" ]]; then
         log_error "After VM 2 removed the file: VM 1 reports $on_writer free, VM 2 reports $on_remover, want $start"
         return 1
