@@ -100,6 +100,7 @@ func (c *Checker) checkSnapshots() error {
 	seenIDs := make(map[uint64]bool)
 	seenNames := make(map[string]uint64) // name -> snapshot ID
 	dataInodes := make(map[uint32]bool)
+	var fixes []snapshotSectorFix
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
 		sectorOffset := snapshotOffset + sectorIdx*SnapshotSectorSize
@@ -110,12 +111,23 @@ func (c *Checker) checkSnapshots() error {
 			continue
 		}
 
+		// A sector that fails its checksum blocks every snapshot create, so
+		// repair rewrites it with the descriptors that pass their own checksum.
+		var fix *snapshotSectorFix
+		lost := func(msg string) (string, bool) {
+			if fix == nil {
+				return msg, false
+			}
+			return msg + "; repair clears the slot, so the snapshot in it is lost, and the next repair frees any data it kept", true
+		}
 		if !sectorChecksumValid(sectorBuf) {
 			checksumErrors++
 			c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("sector %d", sectorIdx),
-				"checksum mismatch: the runtime cannot read the snapshots in this sector",
-				false)
+				"checksum mismatch: the runtime cannot read the snapshots in this sector and refuses every snapshot create",
+				true)
 			c.snapsIncomplete = append(c.snapsIncomplete, fmt.Sprintf("snapshot registry sector %d fails its checksum", sectorIdx))
+			fixes = append(fixes, snapshotSectorFix{offset: sectorOffset, sector: rebuiltSnapshotSector(sectorBuf), problems: []int{c.lastProblem()}})
+			fix = &fixes[len(fixes)-1]
 		}
 
 		// Process each descriptor
@@ -131,9 +143,11 @@ func (c *Checker) checkSnapshots() error {
 
 			// Validate magic
 			if desc.Magic != SnapshotMagic {
-				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("sector %d slot %d", sectorIdx, descIdx),
-					fmt.Sprintf("invalid magic: 0x%08X (expected 0x%08X)", desc.Magic, SnapshotMagic),
-					false)
+				msg, repairable := lost(fmt.Sprintf("invalid magic: 0x%08X (expected 0x%08X)", desc.Magic, SnapshotMagic))
+				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("sector %d slot %d", sectorIdx, descIdx), msg, repairable)
+				if repairable {
+					fix.problems = append(fix.problems, c.lastProblem())
+				}
 				invalidDescriptors++
 				c.snapsIncomplete = append(c.snapsIncomplete, fmt.Sprintf("snapshot registry sector %d slot %d is damaged", sectorIdx, descIdx))
 				continue
@@ -198,11 +212,19 @@ func (c *Checker) checkSnapshots() error {
 
 			// Validate descriptor checksum
 			if computed := storage.CRC32C(descBuf[:124]); desc.Checksum != computed {
-				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("snapshot %d", desc.SnapshotID),
-					fmt.Sprintf("descriptor checksum mismatch: stored=0x%08X, computed=0x%08X",
-						desc.Checksum, computed),
-					false)
+				msg, repairable := lost(fmt.Sprintf("descriptor checksum mismatch: stored=0x%08X, computed=0x%08X; it reads as %q in sector %d slot %d",
+					desc.Checksum, computed, desc.Name, sectorIdx, descIdx))
+				c.addProblem(PhaseSnapshots, Error, fmt.Sprintf("snapshot %d", desc.SnapshotID), msg, repairable)
+				if repairable {
+					fix.problems = append(fix.problems, c.lastProblem())
+				}
 			}
+		}
+	}
+
+	if c.opts.Mode == Repair && len(fixes) > 0 {
+		if err := c.writeSnapshotSectors(fixes); err != nil {
+			return err
 		}
 	}
 
@@ -222,6 +244,42 @@ func (c *Checker) checkSnapshots() error {
 	c.logf("  Active snapshots: %d\n", activeSnapshots)
 
 	return nil
+}
+
+type snapshotSectorFix struct {
+	offset   uint64
+	sector   []byte
+	problems []int
+}
+
+// rebuiltSnapshotSector returns a copy of a registry sector that keeps the
+// descriptors passing their own checksum, clears every other slot, and has a
+// valid sector checksum.
+func rebuiltSnapshotSector(buf []byte) []byte {
+	out := storage.NewAlignedBuffer(SnapshotSectorSize).Bytes()
+	for i := 0; i < SnapshotDescriptorsPerSector; i++ {
+		desc := buf[i*SnapshotDescriptorSize : (i+1)*SnapshotDescriptorSize]
+		if binary.LittleEndian.Uint32(desc) == SnapshotMagic && binary.LittleEndian.Uint32(desc[124:]) == storage.CRC32C(desc[:124]) {
+			copy(out[i*SnapshotDescriptorSize:], desc)
+		}
+	}
+	setSectorChecksum(out)
+	return out
+}
+
+func (c *Checker) writeSnapshotSectors(fixes []snapshotSectorFix) error {
+	if err := c.beforeWrites(); err != nil {
+		return err
+	}
+	for _, f := range fixes {
+		if err := c.write(f.sector, f.offset, f.problems...); err != nil {
+			return fmt.Errorf("snapshot registry at 0x%X: %w", f.offset, err)
+		}
+	}
+	if c.opts.DryRun {
+		return nil
+	}
+	return c.dev.Sync()
 }
 
 // snapshotOrphaned says why desc belongs to no existing file, or returns "".
