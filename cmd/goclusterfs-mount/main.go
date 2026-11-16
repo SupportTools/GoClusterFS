@@ -348,6 +348,9 @@ func main() {
 			AddOrphan: func(num uint32, birth uint64) error {
 				return nodeReg.AddOrphan(node.Orphan{Inode: num, Birth: uint32(birth)})
 			},
+			FreeSFBSlot: func(ctx context.Context, packed uint64) {
+				goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
+			},
 		}
 		// Use per-transaction handler for self-recovery
 		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
@@ -478,6 +481,9 @@ func main() {
 		},
 		AddOrphan: func(num uint32, birth uint64) error {
 			return nodeReg.AddOrphan(node.Orphan{Inode: num, Birth: uint32(birth)})
+		},
+		FreeSFBSlot: func(ctx context.Context, packed uint64) {
+			goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
 		},
 	}
 	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)

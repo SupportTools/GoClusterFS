@@ -34,6 +34,17 @@ func (r *Registry) passOrphans(slots []*Slot) {
 	}
 }
 
+// PeersFailing reports whether another slot's node stopped heartbeating or awaits the end of its replay.
+func (r *Registry) PeersFailing() bool {
+	local := r.LocalSlot()
+	for i := range MaxNodes {
+		if _, occ := r.Occupant(i, false); i != local && occ != OccupiedLive && occ != Unoccupied {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Registry) AddOrphan(o Orphan) error {
 	return r.editOrphans(func(list []Orphan) ([]Orphan, error) {
 		switch {

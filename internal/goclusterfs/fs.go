@@ -2942,23 +2942,31 @@ func (f *FS) readSFB(ino *inode.Inode, off, n uint64) ([]byte, error) {
 	return bytes.Clone(buf.Bytes()[from-aligned : from-aligned+int64(n)]), nil
 }
 
-// freeSFBSlot clears a slot's bit in its container header. A failure leaks the
-// slot, which is safe because nothing allocates SFB slots any more.
 func (f *FS) freeSFBSlot(ctx context.Context, packed uint64) {
+	FreeSFBSlot(ctx, f.dev, f.lockMgr, f.dataOffset, packed)
+}
+
+// FreeSFBSlot clears a slot's bit in its container header. A failure leaks the
+// slot, which is safe because nothing allocates SFB slots any more.
+func FreeSFBSlot(ctx context.Context, dev *storage.Device, lockMgr *lock.Manager, dataOffset, packed uint64) {
 	container, slot := sfb.UnpackPhysicalBlock(packed)
-	if f.lockMgr != nil {
-		if err := f.lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, container, lock.LockModeExclusive); err != nil {
+	if lockMgr != nil {
+		if err := lockMgr.Acquire(ctx, lock.LockTypeSFBContainer, container, lock.LockModeExclusive); err != nil {
 			log.Printf("[WARN] Free SFB slot %d:%d: container lock failed: %v", container, slot, err)
 			return
 		}
-		defer f.release(lock.LockTypeSFBContainer, container, "SFB container")
+		defer func() {
+			if err := lockMgr.Release(lock.LockTypeSFBContainer, container); err != nil {
+				log.Printf("[WARN] Free SFB slot %d:%d: releasing the container lock failed: %v", container, slot, err)
+			}
+		}()
 	}
 
 	buf := storage.GetBuffer(storage.SectorSize)
 	defer storage.PutBuffer(buf)
 	sector := buf.Bytes()[:storage.SectorSize]
-	off := int64(f.dataOffset + container*BlockSize)
-	if _, err := f.dev.ReadAt(sector, off); err != nil {
+	off := int64(dataOffset + container*BlockSize)
+	if _, err := dev.ReadAt(sector, off); err != nil {
 		log.Printf("[WARN] Free SFB slot %d:%d: reading container header failed: %v", container, slot, err)
 		return
 	}
@@ -2975,7 +2983,7 @@ func (f *FS) freeSFBSlot(ctx context.Context, packed uint64) {
 	h.Bitmap[slot/8] &^= bit
 	h.FreeSlots++
 	copy(sector, h.Serialize())
-	if _, err := f.dev.WriteAt(sector, off); err != nil {
+	if _, err := dev.WriteAt(sector, off); err != nil {
 		log.Printf("[WARN] Free SFB slot %d:%d: writing container header failed: %v", container, slot, err)
 	}
 }

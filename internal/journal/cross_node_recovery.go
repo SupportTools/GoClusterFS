@@ -32,6 +32,7 @@ type RecoveryContext struct {
 	// OrphanHolders returns the slots that may hold open a file replay leaves at zero links.
 	OrphanHolders func(num uint32) (uint64, error)
 	AddOrphan     func(num uint32, birth uint64) error
+	FreeSFBSlot   func(ctx context.Context, packed uint64)
 }
 
 // ReleaseReserved returns a crashed node's unused reserved blocks. They have no
@@ -397,7 +398,14 @@ func freeOrphan(ctx context.Context, rctx *RecoveryContext, num uint32, gen uint
 		return err
 	}
 	log.Printf("[Recovery] LinkDrop: freed inode %d", num)
-	return rctx.ExtentMgr.Delete(ctx, freed)
+	sfbBacked, sfbSlot := freed.IsSFBBacked(), freed.InlineExtents[0].PhysicalBlock
+	if err := rctx.ExtentMgr.Delete(ctx, freed); err != nil {
+		return err
+	}
+	if sfbBacked && rctx.FreeSFBSlot != nil {
+		rctx.FreeSFBSlot(ctx, sfbSlot)
+	}
+	return nil
 }
 
 // applyDirAddEntry adds the entry for an inode this transaction's replay created.

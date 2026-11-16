@@ -21,6 +21,7 @@ type orphanRegistry interface {
 	AddOrphan(node.Orphan) error
 	DropOrphans(func(node.Orphan) bool) error
 	AllOrphans() ([]node.Orphan, error)
+	PeersFailing() bool
 }
 
 type openFiles struct {
@@ -30,7 +31,7 @@ type openFiles struct {
 	waitMu  sync.Mutex
 }
 
-var orphanDrainWait = 2 * node.FailureCheckInterval
+var orphanDrainWait = node.HeartbeatTimeout + 2*node.FailureCheckInterval
 
 var errNotHeld = errors.New("orphan is not held by this node")
 
@@ -88,11 +89,10 @@ func orphanOf(ino *inode.Inode) node.Orphan {
 	return node.Orphan{Inode: ino.InodeNum, Birth: uint32(ino.BirthGeneration)}
 }
 
-// reserveOrphan lists ino before its last link goes. A full list waits while peers free its
-// orphans, and fails the unlink with EBUSY, before it changes anything, once they stop.
+// reserveOrphan lists ino before its last link goes; a full list waits for peers, and gives EBUSY once live peers stop freeing.
 func (f *FS) reserveOrphan(ino *inode.Inode) (uint64, error) {
 	live, err := f.liveHolders()
-	if err != nil || f.orphanReg == nil || live == f.slotBit() {
+	if err != nil || f.orphanReg == nil || live == f.slotBit() && !f.opened(ino.InodeNum) {
 		return live, err
 	}
 	if err = f.orphanReg.AddOrphan(orphanOf(ino)); !errors.Is(err, node.ErrOrphansFull) {
@@ -108,11 +108,13 @@ func (f *FS) reserveOrphan(ino *inode.Inode) (uint64, error) {
 		switch {
 		case f.pruneOwnOrphans() > 0:
 			progress = time.Now()
+			continue
+		case f.orphanReg.PeersFailing():
+			progress = time.Now()
 		case time.Since(progress) > orphanDrainWait:
 			return 0, fmt.Errorf("%w: %v", errOrphansFull, err)
-		default:
-			time.Sleep(20 * time.Millisecond)
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -149,7 +151,14 @@ func (f *FS) dropLink(ctx context.Context, num uint32, live uint64) error {
 	case ino.LinkCount != 0:
 	case ino.Holders == 0:
 		return f.freeOrphan(ctx, num, ino.MetaGeneration)
-	case ino.Holders != f.slotBit():
+	case live == f.slotBit():
+		// An open may have come after reserveOrphan looked; unlisted, a crash would leak the file.
+		if f.orphanReg != nil {
+			if err := f.orphanReg.AddOrphan(orphanOf(ino)); err != nil && !errors.Is(err, node.ErrNotRegistered) {
+				log.Printf("[WARN] orphan inode %d: listing it failed; if this node crashes before closing it, fsck -repair frees it: %v", num, err)
+			}
+		}
+	default:
 		f.notifyOrphans()
 	}
 	return nil

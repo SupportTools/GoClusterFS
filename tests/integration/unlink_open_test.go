@@ -143,6 +143,46 @@ func TestPeerRemovesManyFilesQuickly(t *testing.T) {
 	}
 }
 
+// A stopped peer holds every file another node removes until it is replayed, so a bulk remove waits instead of failing.
+func TestBulkRemoveWaitsOutAStoppedPeer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for failure detection, about 30s")
+	}
+	cluster := NewMultiNodeCluster(t, 2, 400)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start node 0: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("start node 1: %v", err)
+	}
+	const files = 2000
+	for i := range files {
+		if err := os.WriteFile(cluster.Node(0).Path(fmt.Sprintf("f%d", i)), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stopped := cluster.Node(1).MountCmd.Process
+	if err := stopped.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop node 1: %v", err)
+	}
+	start := time.Now()
+	for i := range files {
+		if err := os.Remove(cluster.Node(0).Path(fmt.Sprintf("f%d", i))); err != nil {
+			t.Fatalf("node 0 removes file %d after %v: %v", i, time.Since(start), err)
+		}
+	}
+	t.Logf("node 0 removed %d files in %v with node 1 stopped", files, time.Since(start))
+
+	if err := cluster.Node(1).Kill(); err != nil {
+		t.Fatalf("kill node 1: %v", err)
+	}
+	_ = cluster.Node(1).Unmount()
+	cluster.StopAllNodes()
+	if code, out := runFsck(t, cluster.ImagePath); code != 0 {
+		t.Errorf("fsck: exit %d:\n%s", code, strings.Join(problemLines(out), "\n"))
+	}
+}
+
 func openOnNode0UnlinkOnNode1(t *testing.T) (*MultiNodeCluster, *os.File, uint32) {
 	t.Helper()
 	cluster := NewMultiNodeCluster(t, 2, 400)

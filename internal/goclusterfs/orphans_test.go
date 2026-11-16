@@ -17,10 +17,11 @@ import (
 
 // fakeCluster stands in for the node registry: which slots are live, and each slot's orphan list.
 type fakeCluster struct {
-	mu    sync.Mutex
-	live  uint64
-	lists map[int][]node.Orphan
-	max   int
+	mu      sync.Mutex
+	live    uint64
+	lists   map[int][]node.Orphan
+	max     int
+	failing bool
 }
 
 type fakeSlot struct {
@@ -74,6 +75,12 @@ func (s *fakeSlot) DropOrphans(done func(node.Orphan) bool) error {
 	defer s.c.mu.Unlock()
 	s.c.lists[s.slot] = slices.DeleteFunc(s.c.lists[s.slot], done)
 	return nil
+}
+
+func (s *fakeSlot) PeersFailing() bool {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	return s.c.failing
 }
 
 func (s *fakeSlot) AllOrphans() ([]node.Orphan, error) {
@@ -240,5 +247,52 @@ func TestFullOrphanListMakesRoomForFreedOrphans(t *testing.T) {
 	}
 	if got := cluster.list(0); len(got) != 1 || got[0].Inode != f.inodeNum {
 		t.Errorf("orphan list %v, want only inode %d", got, f.inodeNum)
+	}
+}
+
+// A node alone that unlinks a file it has open lists it, so the next mount of its slot frees it after a crash.
+func TestNodeAloneListsAnOrphanItHoldsOpen(t *testing.T) {
+	path := newFormattedImage(t)
+	cluster := newFakeCluster(0)
+	fsys := cluster.join(t, withBridge(openFormattedFS(t, path)), 0)
+	ctx := context.Background()
+	f := createOpen(t, fsys, "f")
+	writeAt(t, f, pattern(1, 4096), 0)
+	if errno := fsys.Unlink(ctx, "f"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	if ino := readInode(t, fsys, f.inodeNum); ino.Holders != 1 || !slices.Contains(cluster.list(0), orphanOf(ino)) {
+		t.Fatalf("holders %#b, list %v; want inode %d held by this node and listed", ino.Holders, cluster.list(0), f.inodeNum)
+	}
+
+	remounted := cluster.join(t, openFormattedFS(t, path), 0)
+	if err := remounted.ForgetSlot(ctx, 0, nil); err != nil {
+		t.Fatalf("forget the crashed incarnation: %v", err)
+	}
+	if ino := readInode(t, remounted, f.inodeNum); ino.Magic != 0 {
+		t.Fatalf("after the next mount: magic %#x, holders %#b; want the slot free", ino.Magic, ino.Holders)
+	}
+	expectNoProblems(t, remounted, "after the next mount let go")
+}
+
+// A full list keeps waiting while a peer is failing, since its replay will free what it held.
+func TestFailingPeerKeepsAFullListWaiting(t *testing.T) {
+	cluster := newFakeCluster(0, 1)
+	cluster.max = 0
+	cluster.failing = true
+	defer func(wait time.Duration) { orphanDrainWait = wait }(orphanDrainWait)
+	orphanDrainWait = 50 * time.Millisecond
+	fsys := cluster.join(t, withBridge(openFormattedFS(t, newFormattedImage(t))), 0)
+	createFile(t, fsys, "f")
+
+	const failingFor = 300 * time.Millisecond
+	time.AfterFunc(failingFor, func() {
+		cluster.mu.Lock()
+		defer cluster.mu.Unlock()
+		cluster.failing = false
+	})
+	start := time.Now()
+	if errno := fsys.Unlink(context.Background(), "f"); errno != syscall.EBUSY || time.Since(start) < failingFor {
+		t.Fatalf("unlink: %v after %v; want EBUSY only after the peer stopped failing (%v)", errno, time.Since(start), failingFor)
 	}
 }
