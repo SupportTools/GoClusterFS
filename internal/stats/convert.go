@@ -36,7 +36,7 @@ func cacheResponse(c cache.Stats, l lock.Stats) *api.CacheStatsResponse {
 	resp.ExtentCache.Capacity = c.ExtentCacheCapacity
 	resp.NegativeCache.Capacity = c.NegativeCacheCapacity
 	if c.BroadcastEnabled {
-		resp.Broadcast = &api.BroadcastTables{Peers: c.PeerCount, Senders: c.BroadcastSenders, MaxPeers: c.BroadcastMaxPeers}
+		resp.Broadcast = &api.BroadcastTables{Peers: c.PeerCount, Senders: c.BroadcastSenders, SilentPeers: c.BroadcastSilentPeers, MaxPeers: c.BroadcastMaxPeers}
 	}
 	return resp
 }

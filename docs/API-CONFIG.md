@@ -77,6 +77,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-broadcast-secret` | string | (empty) | Secret that signs broadcast messages, the same on every node; visible to local users in `ps`. Empty leaves them unauthenticated |
 | `-broadcast-iface` | string | (empty) | Network interface for multicast; empty lets the kernel choose |
 | `-broadcast-max-peers` | int | `256` | Most nodes the unicast peer table and the lost-message tracking hold. When either is full, the node heard from longest ago is dropped |
+| `-broadcast-heartbeat` | duration | `30s` | How often a node sends a broadcast heartbeat. A node the registry shows mounted but not heard on broadcast for 3 of these is reported in the log, on `/health` and on `/metrics` |
 
 ### TRIM Flags
 
@@ -105,7 +106,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
 | `-dashboard` | bool | `true` | Serve the [web dashboard](#web-dashboard) under `/ui/` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` checks the device, journal, journal recovery and broadcast; see [HTTP API Health and Shutdown](#http-api-health-and-shutdown). With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` checks the device, journal, journal recovery, broadcast and broadcast peers; see [HTTP API Health and Shutdown](#http-api-health-and-shutdown). With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
 
 Without a token, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
 
@@ -137,7 +138,7 @@ Snapshots belong to single files. A snapshot stays with the file it was taken of
 
 The snapshot and clone endpoints call `setxattr` on the file through the mount, so they take exactly the path `setfattr` takes. Delete marks the snapshot `deleting` and returns; the snapshot worker frees its blocks and removes it from the list shortly after, as with `setfattr -n user.snapshot.delete`. Clones go in the root directory only. Admin endpoints act on this node only.
 
-Errors answer with `{error, code, details}`: 400 for a bad path, name, destination or body; 413 for a body over 64 KB; 404 when the file or snapshot does not exist; 409 when the name exists, the file is busy, or the feature is off (`-snapshots=false`, `-journal=false`, `-trim=false`) or the file has old-style sharing that needs `goclusterfs-fsck -repair`; 507 when the device is full; 503 when the filesystem is no longer mounted; 501 when the kernel lacks `openat2` (before Linux 5.6).
+Errors answer with `{error, code, details}`: 400 for a bad path, name, destination or body; 413 for a body over 64 KB; 404 when the file or snapshot does not exist; 409 when the name exists, the file is busy, or the feature is off (`-snapshots=false`, `-journal=false`, `-trim=false`) or the file has old-style sharing that needs `goclusterfs-fsck -repair`; 507 when the device is full; 503 when the filesystem is no longer mounted; 501 when the kernel lacks `openat2` (before Linux 5.6). When a snapshot registry sector cannot be read, snapshot listings, lookups and creates answer 500 rather than a partial list or 404, and `details` names the sector and what to run: `goclusterfs-fsck -repair` for a sector that fails its checksum.
 
 Mount logs each write at INFO with the client address, the action, its arguments and the result. On shutdown, mount stops taking requests, waits for writes in flight to finish, and only then unmounts.
 
@@ -159,7 +160,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 |----------|---------|
 | `/api/v1/status` | Version, uptime, mount and device paths, and `capacity`: total, used and free blocks and bytes of the data region, for the whole volume |
 | `/api/v1/stats` | `cache` and `journal`, as below |
-| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks) and `max_peers` `dir_index` has `dirs` and `entries` (names) held, `limit`, `hits` (lookups an index answered), `misses`, `rebuilds` (full reads of a directory) and `hit_rate`. |
+| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks), `silent_peers` (mounted nodes not heard on broadcast for 3 heartbeat intervals) and `max_peers` `dir_index` has `dirs` and `entries` (names) held, `limit`, `hits` (lookups an index answered), `misses`, `rebuilds` (full reads of a directory) and `hit_rate`. |
 | `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
 | `/api/v1/stats/trim` | `trim_enabled`, false with `-trim=false` or after the device refused a discard as unsupported (image files always do). With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges, plus flushes skipped because the freed blocks could not be reserved), `last_trim_at` and `batch_size` |
 | `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate`, which are always 0, and `types`: per lock type (`bitmap`, `refcount`, `inode`, ...), the `acquires` served, the `blocked` acquires whose first try found the lock taken, and their `wait_seconds` |
@@ -167,13 +168,13 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
 | `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |
 
-`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*` (including `lock_acquires_total`, `lock_blocked_total` and `lock_wait_seconds_total`, labeled by lock `type`), `reserve_blocks`, `reserve_refills_total`, `reserve_returns_total`, `reserve_peer_waits_total` and `reserve_peer_wait_seconds_total` (with block reserves on), `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
+`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders`, `broadcast_silent_peers` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*` (including `lock_acquires_total`, `lock_blocked_total` and `lock_wait_seconds_total`, labeled by lock `type`), `reserve_blocks`, `reserve_refills_total`, `reserve_returns_total`, `reserve_peer_waits_total` and `reserve_peer_wait_seconds_total` (with block reserves on), `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
 
 ## HTTP API Health and Shutdown
 
-`GET /health` runs four checks and reports the worst of them:
+`GET /health` runs five checks and reports the worst of them:
 
 | Check | `ok` | `degraded` | `unhealthy` |
 |-------|------|------------|-------------|
@@ -181,6 +182,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `journal` | Clean or dirty, or off with `-journal=false` | This node's journal is being replayed | This node's journal is corrupt |
 | `recovery` | No replay is running | This node replays the journal of a crashed node | |
 | `broadcast` | Working, or off with `-broadcast=false` | The last invalidation send failed, or multicast is unavailable and no unicast peers are known | |
+| `broadcast-peers` | This node hears every node the registry shows mounted, or broadcast is off | A mounted node has not been heard on broadcast for 3 `-broadcast-heartbeat` intervals: multicast may not reach this node, or that node runs with `-broadcast=false` or another `-mcast-group` or `-mcast-port`. This node sees that node's changes in directories only after `-cache-ttl` | |
 
 `ok` and `degraded` answer 200; `unhealthy` answers 503. Degraded means the mount works with a problem: during a replay, files the crashed node had locked wait until it ends, and with broadcast down, peers see this node's changes only after `-cache-ttl`. Unhealthy means file operations fail. A mount that is not running refuses the connection. A check that is not `ok` has a `message` that says what to do. `gfsctl health` exits 0, 1 or 4 for the three states.
 

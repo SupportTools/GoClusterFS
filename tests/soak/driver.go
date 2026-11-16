@@ -39,6 +39,7 @@ type config struct {
 	sshBasePort  int
 	diskMB       int
 	budget       int64
+	stallAfter   time.Duration
 }
 
 type node struct {
@@ -77,9 +78,9 @@ type driver struct {
 	stopping atomic.Bool
 	failure  string
 
-	ops, unexpected, faults, fscks, barriers, slow atomic.Int64
-	slowestMs                                      atomic.Int64
-	opsByKind                                      sync.Map
+	ops, unexpected, faults, fscks, barriers, slow, stalls atomic.Int64
+	slowestMs                                              atomic.Int64
+	opsByKind                                              sync.Map
 }
 
 func (d *driver) logRecord(r record) {
@@ -145,6 +146,7 @@ func (d *driver) connect(n *node) error {
 	if err != nil {
 		return err
 	}
+	a.stallAfter, a.stalled = d.cfg.stallAfter, func(req request) { d.captureStall(n, req) }
 	n.agent = a
 	n.up.Store(true)
 	return nil
@@ -554,8 +556,8 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d faults=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d files=%d snapshots=%d blocks=%d [%s]",
-		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(),
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d files=%d snapshots=%d blocks=%d [%s]",
+		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
 		files, snaps, blocks, strings.Join(kinds, " "))
 }
 

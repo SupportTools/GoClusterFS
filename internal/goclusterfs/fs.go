@@ -291,6 +291,9 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 	}
 	log.Printf("[snapshot] Registry scan: %d active, %d creating, %d deleting",
 		stats.ActiveCount, stats.CreatingCount, stats.DeletingCount)
+	if stats.Unreadable != nil {
+		log.Printf("[snapshot] WARNING: %v. Snapshot creates, lookups and listings fail with EIO until it reads again; run goclusterfs-fsck", stats.Unreadable)
+	}
 
 	// Create and start background worker
 	cfg := snapshot.DefaultWorkerConfig()

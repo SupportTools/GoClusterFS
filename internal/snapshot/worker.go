@@ -323,9 +323,9 @@ func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	snapshots, err := w.registry.List(ctx)
+	snapshots, err := w.registry.unfinished()
 	if err != nil {
-		return fmt.Errorf("failed to list snapshots: %w", err)
+		log.Printf("[snapshot/worker] Recovering only the snapshots in readable registry sectors: %v", err)
 	}
 
 	var recovered int
@@ -337,8 +337,6 @@ func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
 				continue
 			}
 		case StateDeleting:
-		default:
-			continue
 		}
 		if _, err := w.QueueDeleteJob(ctx, snap.SnapshotID); err != nil {
 			log.Printf("[snapshot/worker] Failed to queue cleanup of snapshot %d: %v", snap.SnapshotID, err)

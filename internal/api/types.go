@@ -118,9 +118,10 @@ type DirIndexInfo struct {
 
 // BroadcastTables reports how full the broadcast peer tables are.
 type BroadcastTables struct {
-	Peers    int `json:"peers"`
-	Senders  int `json:"senders"`
-	MaxPeers int `json:"max_peers"`
+	Peers       int `json:"peers"`
+	Senders     int `json:"senders"`
+	SilentPeers int `json:"silent_peers"`
+	MaxPeers    int `json:"max_peers"`
 }
 
 // JournalStatsResponse is returned by GET /api/v1/stats/journal.

@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
+	"github.com/supporttools/GoClusterFS/internal/cli"
 )
 
 func TestMain(m *testing.M) {
@@ -173,6 +174,10 @@ func TestJSONMatchesServerTypes(t *testing.T) {
 		{[]string{"stats", "lock"}, "/api/v1/stats/lock", lock},
 		{[]string{"stats", "sfb"}, "/api/v1/stats/sfb", sfb},
 		{[]string{"stats", "cluster"}, "/api/v1/stats/cluster", cluster},
+		{[]string{"snapshots"}, "/api/v1/snapshots", &api.SnapshotListResponse{Total: 2, Snapshots: []api.SnapshotInfo{
+			{ID: 65, Name: "nightly", Inode: 12, State: "active", SizeBytes: 3 << 20, Blocks: 3, CreatedAt: "2026-11-16T00:00:00Z"},
+			{ID: 129, Name: "old", Inode: 40, State: "active", SizeBytes: 1 << 20, Blocks: 1, Orphan: true},
+		}}},
 		{[]string{"stats", "all"}, "/api/v1/stats/all", &api.AllStatsResponse{CollectedAt: "now", Cache: cacheStats, Journal: journal, Trim: trim, Lock: lock, SFB: sfb, Cluster: cluster}},
 	}
 	for _, tc := range cases {
@@ -214,6 +219,43 @@ func TestErrorsArePrintedOnce(t *testing.T) {
 	_, stderr, err = f.run(t, "stats", "bogus")
 	if err == nil || !strings.Contains(stderr, "unknown component: bogus") {
 		t.Errorf("unknown component: err=%v stderr:\n%s", err, stderr)
+	}
+}
+
+// The snapshot listing marks orphans, and an unreadable registry sector is an
+// API error that gfsctl prints with the API's details and exits 8 for.
+func TestSnapshots(t *testing.T) {
+	f := startFakeAPI(t, map[string]any{"/api/v1/snapshots": api.SnapshotListResponse{Total: 2, Snapshots: []api.SnapshotInfo{
+		{ID: 65, Name: "nightly", Inode: 12, State: "active", SizeBytes: 3 << 20},
+		{ID: 129, Name: "old", Inode: 40, State: "active", Orphan: true},
+	}}})
+	out, _, err := f.run(t, "snapshots", "--token", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.lastToken() != "Bearer secret" {
+		t.Errorf("sent Authorization %q, want the token", f.lastToken())
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && (fields[0] == "old") != (fields[len(fields)-1] == "yes") {
+			t.Errorf("orphan column wrong in %q:\n%s", line, out)
+		}
+	}
+
+	const details = "snapshot registry sector 3 fails its checksum; unmount the filesystem on every node and run goclusterfs-fsck -repair"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "Internal Server Error", Code: http.StatusInternalServerError, Details: details})
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, err := run(t, "--host", u.Hostname(), "--port", u.Port(), "snapshots")
+	if ExitCode(err) != cli.ExitFailure || !strings.Contains(stderr, details) {
+		t.Errorf("exit %d, stderr:\n%s\nwant exit %d and the API's details", ExitCode(err), stderr, cli.ExitFailure)
 	}
 }
 

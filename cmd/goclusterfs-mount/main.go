@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -108,6 +109,7 @@ func main() {
 		broadcastSecret  = flag.String("broadcast-secret", "", "Secret that signs broadcast messages, the same on every node; visible to local users in ps. Empty leaves them unauthenticated: any host that can reach the UDP ports can make this node drop its caches")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast; empty lets the kernel choose")
 		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
+		broadcastBeat    = flag.Duration("broadcast-heartbeat", 30*time.Second, "How often this node sends a broadcast heartbeat; a mounted node not heard for 3 of these is reported")
 
 		// TRIM configuration
 		trimEnabled   = flag.Bool("trim", true, "Discard freed blocks on the device (BLKDISCARD) in batches; does nothing on image files")
@@ -139,6 +141,7 @@ func main() {
 		os.Exit(code)
 	}
 	logging.SetDebug(*debug)
+	dumpGoroutinesOnSIGUSR1()
 
 	if *showVer {
 		fmt.Println("goclusterfs-mount", version.String())
@@ -193,10 +196,13 @@ func main() {
 		UnicastPort:          *unicastPort,
 		MulticastTTL:         1, // Same subnet
 		MaxMulticastFailures: 3,
-		HeartbeatInterval:    30 * time.Second,
+		HeartbeatInterval:    *broadcastBeat,
 		Secret:               *broadcastSecret,
 		Interface:            *broadcastIface,
 		MaxPeers:             *broadcastPeers,
+	}
+	if *broadcastBeat <= 0 {
+		log.Fatalf("-broadcast-heartbeat must be positive, got %v", *broadcastBeat)
 	}
 	if *broadcastPeers < 1 {
 		log.Fatalf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
@@ -419,6 +425,7 @@ func main() {
 		if err := cacheMgr.StartBroadcast(ctx, nodeUUID, uint32(slotIdx)); err != nil {
 			broadcastFailed(err)
 		}
+		cacheMgr.WatchBroadcastPeers(expectedPeers(nodeReg))
 		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
 			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
 	} else {
@@ -575,6 +582,7 @@ func main() {
 				replaying:        nodeReg.Replaying,
 				broadcastOn:      cacheMgr.BroadcastEnabled(),
 				broadcastProblem: cacheMgr.BroadcastProblem,
+				silentPeers:      cacheMgr.SilentBroadcastPeers,
 			})
 			var snaps fileops.Snapshots
 			if gfs.SnapshotRegistry() != nil {
@@ -779,4 +787,17 @@ func adoptLocks(locks *lock.Manager, owner [16]byte, slot int) func(replayed boo
 			log.Printf("Warning: Failed to release the locks taken over from dead node %x: %v", owner[:8], err)
 		}
 	}
+}
+
+// dumpGoroutinesOnSIGUSR1 writes every goroutine's stack to the log on SIGUSR1 and keeps the mount running.
+func dumpGoroutinesOnSIGUSR1() {
+	dumps := make(chan os.Signal, 1)
+	signal.Notify(dumps, syscall.SIGUSR1)
+	go func() {
+		for range dumps {
+			log.Println("goroutine dump begins")
+			_ = pprof.Lookup("goroutine").WriteTo(log.Writer(), 2)
+			log.Println("goroutine dump ends")
+		}
+	}()
 }

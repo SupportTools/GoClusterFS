@@ -39,6 +39,12 @@ type Broadcaster struct {
 	sendersMu sync.Mutex
 	senders   map[[16]byte]*senderSeq
 
+	started     time.Time
+	expected    atomic.Pointer[func() ([]ExpectedPeer, error)]
+	silentMu    sync.Mutex
+	silent      map[[16]byte]ExpectedPeer
+	firstListed map[[16]byte]time.Time
+
 	lossLogMu    sync.Mutex
 	lossLoggedAt time.Time
 
@@ -114,6 +120,7 @@ func (b *Broadcaster) Start(ctx context.Context) error {
 	}
 
 	b.ctx, b.cancel = context.WithCancel(ctx)
+	b.started = time.Now()
 
 	// Start transport with our message handler
 	if err := b.transport.Start(b.ctx, b.handleMessage); err != nil {
@@ -122,9 +129,10 @@ func (b *Broadcaster) Start(ctx context.Context) error {
 	}
 
 	// Start background tasks
-	b.wg.Add(2)
+	b.wg.Add(3)
 	go b.heartbeatLoop()
 	go b.cleanupLoop()
+	go b.watchLoop()
 
 	// Announce ourselves
 	b.announcePresence()
@@ -513,8 +521,12 @@ func (b *Broadcaster) Stats() BroadcasterStats {
 	b.sendersMu.Lock()
 	senders := len(b.senders)
 	b.sendersMu.Unlock()
+	b.silentMu.Lock()
+	silent := b.silent
+	b.silentMu.Unlock()
 	return BroadcasterStats{
 		TrackedSenders:        senders,
+		SilentPeers:           len(silent),
 		MaxPeers:              b.transport.config.maxPeers(),
 		InvalidationsReceived: atomic.LoadUint64(&b.invalidationsReceived),
 		InvalidationsSent:     atomic.LoadUint64(&b.invalidationsSent),
@@ -533,6 +545,7 @@ type BroadcasterStats struct {
 	MessagesIgnored       uint64
 	MessagesLost          uint64
 	TrackedSenders        int
+	SilentPeers           int
 	MaxPeers              int
 	Transport             TransportStats
 }
