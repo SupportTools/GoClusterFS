@@ -17,6 +17,7 @@ COPY . .
 
 # Build the mount binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o goclusterfs-mount ./cmd/goclusterfs-mount
+RUN CGO_ENABLED=0 GOOS=linux go build -o gcfs-staleness ./tests/docker/staleness
 
 # =============================================================================
 # Stage 2: Runtime - Minimal image with FUSE and network tools
@@ -42,6 +43,7 @@ RUN mkdir -p /mnt/goclusterfs /data /scripts
 
 # Copy binary from builder
 COPY --from=builder /build/goclusterfs-mount /usr/local/bin/
+COPY --from=builder /build/gcfs-staleness /usr/local/bin/
 
 # Copy container scripts
 COPY tests/docker/scripts/ /scripts/

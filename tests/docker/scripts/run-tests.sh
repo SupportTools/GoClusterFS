@@ -273,7 +273,7 @@ in_test_group() {
     [[ -z "$TEST_GROUP" ]] && return 0
     local group=1
     case "$1" in
-        "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|"Inode Reuse Stale Read"|"Rolling Restart")
+        "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|Staleness*|"Inode Reuse Stale Read"|"Rolling Restart")
             group=2 ;;
         # Takes about 14 minutes in CI, so it runs alone.
         "More Than 4096 Files")
@@ -2466,6 +2466,93 @@ test_dir_index_follows_other_node() {
     return 0
 }
 
+heal_network_faults() {
+    local node
+    for node in "${NODE_ARRAY[@]}"; do
+        exec_on_node "$node" sh -c 'tc qdisc del dev eth0 root 2>/dev/null; iptables -F INPUT; iptables -F OUTPUT' || true
+    done
+}
+
+# measure_staleness has node 1 rewrite a file 20 times, growing and truncating
+# it, while node 2 reads it through a file it holds open, node 3 stats it, and
+# node 4 opens it afresh for each look (or floods invalidations with "flood").
+# Fails if any of them sees a version later than its bound allows, with the
+# default -attr-timeout 1s and -cache-ttl 5s.
+measure_staleness() {
+    local name=$1 flood=${2:-}
+    local writer="${NODE_ARRAY[0]}" held="${NODE_ARRAY[1]}" stat="${NODE_ARRAY[2]}" fresh="${NODE_ARRAY[3]}"
+    local file
+    file="/mnt/goclusterfs/staleness_${name}_$(date +%s%N)"
+    local out="$RESULTS_DIR/staleness_$name"
+    local pids=() logs="$out.open,$out.stat"
+
+    exec_on_node "$held" gcfs-staleness read -file "$file" -duration 20s -modes open > "$out.open" 2>&1 &
+    pids+=($!)
+    exec_on_node "$stat" gcfs-staleness read -file "$file" -duration 20s -modes stat > "$out.stat" 2>&1 &
+    pids+=($!)
+    if [[ "$flood" == flood ]]; then
+        exec_on_node "$fresh" gcfs-staleness flood -dir "/mnt/goclusterfs/flood_$name" -duration 12s > "$out.flood" 2>&1 &
+    else
+        exec_on_node "$fresh" gcfs-staleness read -file "$file" -duration 20s -modes reopen > "$out.reopen" 2>&1 &
+        logs="$logs,$out.reopen"
+    fi
+    pids+=($!)
+    sleep 0.5
+    exec_on_node "$writer" gcfs-staleness write -file "$file" -versions 20 > "$out.w" 2>&1
+    wait "${pids[@]}"
+    heal_network_faults
+
+    local result=0
+    gcfs-staleness analyze -writer "$out.w" -reader "$logs" -bound-open 3s -bound-stat 1500ms -bound-reopen 500ms > "$out.result" 2>&1 || result=1
+    while read -r line; do log "  $line"; done < "$out.result"
+    exec_on_node "$writer" rm -rf "$file" "/mnt/goclusterfs/flood_$name"
+    return $result
+}
+
+apply_fault() {
+    local node=$1
+    shift
+    if ! exec_on_node "$node" "$@"; then
+        log "ERROR: could not apply network fault on $node: $*"
+        heal_network_faults
+        return 1
+    fi
+}
+
+test_staleness_packet_loss() {
+    apply_fault "${NODE_ARRAY[0]}" tc qdisc add dev eth0 root netem loss 30% || return 1
+    measure_staleness packet_loss
+}
+
+test_staleness_duplication_and_reordering() {
+    apply_fault "${NODE_ARRAY[0]}" tc qdisc add dev eth0 root netem delay 50ms reorder 50% 50% duplicate 30% || return 1
+    measure_staleness reordering
+}
+
+test_staleness_delay() {
+    apply_fault "${NODE_ARRAY[0]}" tc qdisc add dev eth0 root netem delay 1000ms 1000ms || return 1
+    measure_staleness delay
+}
+
+test_staleness_one_way_partition() {
+    local writer_ip
+    writer_ip=$(exec_on_node "${NODE_ARRAY[0]}" hostname -i | awk '{print $1}')
+    apply_fault "${NODE_ARRAY[1]}" iptables -I INPUT -s "$writer_ip" -j DROP || return 1
+    measure_staleness one_way_partition
+}
+
+# The reader hears no multicast at all, as behind a switch that drops it.
+test_staleness_multicast_dropped() {
+    apply_fault "${NODE_ARRAY[1]}" iptables -I INPUT -d 239.192.74.75 -j DROP || return 1
+    measure_staleness multicast_dropped
+}
+
+test_staleness_flood_under_loss() {
+    apply_fault "${NODE_ARRAY[0]}" tc qdisc add dev eth0 root netem loss 10% || return 1
+    apply_fault "${NODE_ARRAY[1]}" iptables -I INPUT -p udp -m statistic --mode random --probability 0.1 -j DROP || return 1
+    measure_staleness flood_under_loss flood
+}
+
 # Print the free 1MB blocks that statfs reports on node $1
 statfs_free_blocks() {
     exec_on_node "$1" stat -f -c %f /mnt/goclusterfs
@@ -3330,6 +3417,12 @@ run_test "Broadcast Invalidation" test_broadcast_invalidation
 run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
+run_test "Staleness Under Packet Loss" test_staleness_packet_loss
+run_test "Staleness Under Duplication and Reordering" test_staleness_duplication_and_reordering
+run_test "Staleness Under Delay" test_staleness_delay
+run_test "Staleness Under One-Way Partition" test_staleness_one_way_partition
+run_test "Staleness With Multicast Dropped" test_staleness_multicast_dropped
+run_test "Staleness During Flood Under Loss" test_staleness_flood_under_loss
 run_test "Inode Reuse Stale Read" test_inode_reuse_stale_read
 run_test "More Than 4096 Files" test_more_than_4096_files
 run_test "Extent Cache Coherency" test_extent_cache_coherency

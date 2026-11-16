@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("B")
+byte('H')
+[]byte("0")

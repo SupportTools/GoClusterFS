@@ -1,0 +1,6 @@
+go test fuzz v1
+uint32(0)
+uint32(12288)
+uint32(32768)
+uint32(4134)
+[]byte("TXNR00000000000000")

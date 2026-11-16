@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(false)
+byte('\x11')
+string(".?\xf8\xf5\xa5\xa5\xa5\xa5\xa5\xe3\xe3\xe3\xe3\xe3\xe3\xe3\xe3\xe3\xe3")
+bool(true)
+string("0")
+string("")
+[]byte("0")

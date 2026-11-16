@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("\"71\xe11)")
+byte('\x04')
+[]byte("0")

@@ -102,6 +102,7 @@ func New(cfg Config, bm Bitmap, j Journal, release func(context.Context, []uint6
 	if cfg.Idle <= 0 {
 		cfg.Idle = DefaultIdle
 	}
+	cfg.Size = min(cfg.Size, journal.MaxRecordBlocks)
 	m := &Manager{cfg: cfg, bm: bm, j: j, release: release, liveNodes: liveNodes,
 		owner: make(map[uint64]*record), out: make(map[uint64]bool)}
 	m.refreshCounts()

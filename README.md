@@ -28,13 +28,13 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Linux only.** GoClusterFS needs FUSE and O_DIRECT.
 - **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **`ls -l` of a large directory is slow.** Each lookup reads two inodes from disk, about 0.3 ms on our test host, and `ls -l` repeats its lookups once it runs longer than `-attr-timeout`. In one test, `ls -l` took 0.14 s on 1,000 files and 14 s on 10,000.
-- **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime. A file that stays open can use the old size and block mappings for up to `-cache-ttl` (default 5s). Opening the file again reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
+- **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime. A file that stays open can use the old size and block mappings for about twice `-attr-timeout`. Opening the file again reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
 - **On-disk format version 3.** Mount refuses images formatted by earlier builds, including version 3 images formatted before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) gave each lock type its own lock records. Copy the data off with the build that formatted the image, reformat, and copy it back.
 - **The inode count is set at format time.** `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB, so one per data block), between 4096 and 16,777,216. It cannot change later.
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
 - **fsck repairs little.** `-repair` rebuilds refcounts, frees leaked blocks and inodes no directory names, and fixes the superblock checksum. It only reports other problems. See [Filesystem Check](#filesystem-check).
-- **Cluster safety limits.** Node clocks, node stalls, and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
+- **Cluster safety limits.** Node stalls and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
 
 ## Quick Start
 
@@ -195,7 +195,7 @@ For clustered deployments:
 1. **Shared Storage**: All nodes must access the same block device (SAN, iSCSI, NVMe-oF)
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
-4. **Limits**: At most 64 nodes mount a device at once, and node clocks must agree within a few seconds (run NTP)
+4. **Limits**: At most 64 nodes mount a device at once; run NTP so file times agree
 5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
 6. **Stalled nodes**: Other nodes declare a node dead after about 20 seconds of silence, for example a paused VM, and replay its journal. The stalled node checks its registry slot before each write, so when it resumes it refuses new writes and exits. A write it started before the stall can still land. Only storage fencing closes that gap, such as SCSI-3 persistent reservations, which GoClusterFS does not use. See [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits)
 

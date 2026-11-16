@@ -48,6 +48,8 @@ type Device struct {
 	closeMu  sync.RWMutex            // Protects close; held shared during I/O
 	// writeGate, when set, runs before every write and can refuse it.
 	writeGate atomic.Pointer[func(offset int64) error]
+	// readFault, when a test sets it, runs before every read and can fail it.
+	readFault atomic.Pointer[func(offset int64) error]
 	file      *os.File
 	path      string
 	size      int64
@@ -192,6 +194,11 @@ func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if fault := d.readFault.Load(); fault != nil {
+		if err := (*fault)(offset); err != nil {
+			return 0, err
+		}
+	}
 
 	// Acquire shared close lock to prevent device close during I/O
 	d.closeMu.RLock()
@@ -249,6 +256,11 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 // with gate's error instead of writing.
 func (d *Device) SetWriteGate(gate func(offset int64) error) {
 	d.writeGate.Store(&gate)
+}
+
+// SetReadFault makes fault run before every read; a read it returns an error for fails with that error.
+func (d *Device) SetReadFault(fault func(offset int64) error) {
+	d.readFault.Store(&fault)
 }
 
 // CheckWrite runs the write gate for a write at offset. Callers that change the

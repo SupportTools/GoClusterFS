@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('`')
+bool(true)
+[]byte("\t\t\t\t\t\t\t\t")

@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\xef")
+string("\x00\xf0\xf0\xf0")
+string("/0")

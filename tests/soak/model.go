@@ -1,0 +1,428 @@
+//go:build linux
+
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"math/rand/v2"
+	"path"
+	"slices"
+	"strings"
+	"sync"
+	"syscall"
+)
+
+const (
+	blockSize = 1 << 20
+	maxFile   = 8 << 20
+	// anyErrno is the expected result of an operation that must fail, with any errno.
+	anyErrno = -2
+)
+
+// sharedDirs hold files of every lane and are never removed.
+var sharedDirs = []string{"/soak/d0", "/soak/d1", "/soak/d2", "/soak/d3"}
+
+// Op is one operation as the driver runs and logs it.
+type Op struct {
+	Seq   uint64 `json:"seq"`
+	Lane  int    `json:"lane"`
+	Node  int    `json:"node"`
+	Kind  string `json:"op"`
+	Path  string `json:"path,omitempty"`
+	Path2 string `json:"path2,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Off   int64  `json:"off,omitempty"`
+	Len   int64  `json:"len,omitempty"`
+	Seed  uint64 `json:"seed,omitempty"`
+	Want  int    `json:"want"`
+	Got   int    `json:"got"`
+	Err   string `json:"err,omitempty"`
+	At    int64  `json:"at"`
+	Ms    int64  `json:"ms"`
+}
+
+func (op *Op) request() request {
+	r := request{Op: op.Kind, Path: op.Path, Path2: op.Path2, Off: op.Off, Len: op.Len, Seed: op.Seed}
+	switch op.Kind {
+	case "snapshot":
+		r.Op, r.Attr, r.Value = "setxattr", "user.snapshot", op.Name
+	case "clone":
+		r.Op, r.Attr, r.Value = "setxattr", "user.clone", op.Path2
+	case "snapclone":
+		r.Op, r.Attr, r.Value = "setxattr", "user.snapshot.clone", op.Name+":"+op.Path2
+	case "snapdelete":
+		r.Op, r.Attr, r.Value = "setxattr", "user.snapshot.delete", op.Name
+	}
+	return r
+}
+
+// File is a file in the model. Its pointer is its identity: a later file at the same path is another File.
+type File struct {
+	Data  []byte
+	Snaps map[string]bool
+}
+
+// Snap is a snapshot. Owner is nil once its file is gone, which makes it an orphan.
+type Snap struct {
+	Data  []byte
+	Owner *File
+}
+
+// Model is the state every node must show once an acknowledged operation is visible.
+type Model struct {
+	mu    sync.Mutex
+	Files map[string]*File
+	Dirs  map[string]bool
+	Snaps map[string]*Snap
+}
+
+func newModel() *Model {
+	m := &Model{Files: map[string]*File{}, Dirs: map[string]bool{"/": true, "/soak": true}, Snaps: map[string]*Snap{}}
+	for _, d := range sharedDirs {
+		m.Dirs[d] = true
+	}
+	return m
+}
+
+func (m *Model) exists(p string) bool { return m.Files[p] != nil || m.Dirs[p] }
+
+func (m *Model) hasChildren(dir string) bool {
+	for p := range m.Files {
+		if path.Dir(p) == dir {
+			return true
+		}
+	}
+	for p := range m.Dirs {
+		if p != dir && path.Dir(p) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// expect returns the errno the operation must return on the model's current state.
+func (m *Model) expect(op *Op) int {
+	f := m.Files[op.Path]
+	switch op.Kind {
+	case "create", "mkdir":
+		switch {
+		case m.exists(op.Path):
+			return int(syscall.EEXIST)
+		case !m.Dirs[path.Dir(op.Path)]:
+			return int(syscall.ENOENT)
+		}
+	case "write", "truncate", "unlink":
+		switch {
+		case m.Dirs[op.Path]:
+			return int(syscall.EISDIR)
+		case f == nil:
+			return int(syscall.ENOENT)
+		}
+	case "rmdir":
+		switch {
+		case f != nil:
+			return int(syscall.ENOTDIR)
+		case !m.Dirs[op.Path]:
+			return int(syscall.ENOENT)
+		case m.hasChildren(op.Path):
+			return int(syscall.ENOTEMPTY)
+		}
+	case "rename":
+		return anyErrno
+	case "snapshot":
+		switch {
+		case f == nil:
+			return int(syscall.ENOENT)
+		case m.Snaps[op.Name] != nil:
+			return int(syscall.EEXIST)
+		}
+	case "clone", "snapclone":
+		switch {
+		case f == nil:
+			return int(syscall.ENOENT)
+		case op.Kind == "snapclone" && (m.Snaps[op.Name] == nil || m.Snaps[op.Name].Owner != f):
+			return int(syscall.ENOENT)
+		case m.exists(op.Path2):
+			return int(syscall.EEXIST)
+		}
+	case "snapdelete":
+		if f == nil || m.Snaps[op.Name] == nil || m.Snaps[op.Name].Owner != f {
+			return int(syscall.ENOENT)
+		}
+	}
+	return 0
+}
+
+// apply changes the model as a successful operation changed the filesystem.
+func (m *Model) apply(op *Op) {
+	f := m.Files[op.Path]
+	switch op.Kind {
+	case "create":
+		m.Files[op.Path] = &File{Snaps: map[string]bool{}}
+	case "write":
+		data := genData(op.Seed, op.Len)
+		if end := op.Off + op.Len; end > int64(len(f.Data)) {
+			f.Data = append(f.Data, make([]byte, end-int64(len(f.Data)))...)
+		}
+		copy(f.Data[op.Off:], data)
+	case "truncate":
+		if op.Len < int64(len(f.Data)) {
+			f.Data = f.Data[:op.Len]
+		} else {
+			f.Data = append(f.Data, make([]byte, op.Len-int64(len(f.Data)))...)
+		}
+	case "unlink":
+		for name := range f.Snaps {
+			m.Snaps[name].Owner = nil
+		}
+		delete(m.Files, op.Path)
+	case "mkdir":
+		m.Dirs[op.Path] = true
+	case "rmdir":
+		delete(m.Dirs, op.Path)
+	case "snapshot":
+		m.Snaps[op.Name] = &Snap{Data: bytes.Clone(f.Data), Owner: f}
+		f.Snaps[op.Name] = true
+	case "clone":
+		m.Files[op.Path2] = &File{Data: bytes.Clone(f.Data), Snaps: map[string]bool{}}
+	case "snapclone":
+		m.Files[op.Path2] = &File{Data: bytes.Clone(m.Snaps[op.Name].Data), Snaps: map[string]bool{}}
+	case "snapdelete":
+		delete(m.Snaps, op.Name)
+		delete(f.Snaps, op.Name)
+	}
+}
+
+// blocks estimates the data blocks the model holds, counting each snapshot as a full copy.
+func (m *Model) blocks() int64 {
+	var n int64
+	for _, f := range m.Files {
+		n += (int64(len(f.Data)) + blockSize - 1) / blockSize
+	}
+	for _, s := range m.Snaps {
+		n += (int64(len(s.Data)) + blockSize - 1) / blockSize
+	}
+	return n
+}
+
+// lane generates operations on its own files, directories and snapshots, whose names start with its prefix.
+type lane struct {
+	id     int
+	rng    *rand.Rand
+	next   int
+	budget int64
+}
+
+func (l *lane) prefix() string { return fmt.Sprintf("l%d-", l.id) }
+
+func (l *lane) name(kind string) string {
+	l.next++
+	return fmt.Sprintf("%s%s%d", l.prefix(), kind, l.next)
+}
+
+func (l *lane) owns(p string) bool { return strings.HasPrefix(path.Base(p), l.prefix()) }
+
+func pick[T any](r *rand.Rand, xs []T) T { return xs[r.IntN(len(xs))] }
+
+// generate picks the lane's next operation from the model's current state. The caller holds m.mu.
+func (l *lane) generate(m *Model) *Op {
+	var files, dirs, snaps []string
+	orphans := 0
+	for p := range m.Files {
+		if l.owns(p) {
+			files = append(files, p)
+		}
+	}
+	for p := range m.Dirs {
+		if l.owns(p) {
+			dirs = append(dirs, p)
+		}
+	}
+	for name, s := range m.Snaps {
+		switch {
+		case !l.owns(name):
+		case s.Owner != nil:
+			snaps = append(snaps, name)
+		default:
+			orphans++
+		}
+	}
+	slices.Sort(files)
+	slices.Sort(dirs)
+	slices.Sort(snaps)
+	parents := append(slices.Clone(sharedDirs), dirs...)
+	full := m.blocks() > l.budget
+	r := l.rng
+
+	weights := []struct {
+		kind string
+		w    int
+	}{
+		{"create", 15}, {"write", 30}, {"truncate", 8}, {"unlink", 8}, {"mkdir", 4}, {"rmdir", 4},
+		{"rename", 2}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3},
+	}
+	total := 0
+	for _, w := range weights {
+		total += w.w
+	}
+	n := r.IntN(total)
+	kind := ""
+	for _, w := range weights {
+		if n -= w.w; n < 0 {
+			kind = w.kind
+			break
+		}
+	}
+	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone"}, kind) {
+		kind = pick(r, []string{"unlink", "truncate", "snapdelete"})
+	}
+	if len(files) == 0 || len(files) < 6 && kind != "create" && kind != "mkdir" {
+		kind = "create"
+	}
+	if len(files) > 40 && kind == "create" {
+		kind = "unlink"
+	}
+
+	op := &Op{Lane: l.id, Kind: kind}
+	switch kind {
+	case "create":
+		op.Path = path.Join(pick(r, parents), l.name("f"))
+	case "write":
+		op.Path = pick(r, files)
+		size := int64(len(m.Files[op.Path].Data))
+		op.Len = pickLen(r)
+		switch v := r.IntN(10); {
+		case v < 5 && size > 0:
+			op.Off = r.Int64N(size)
+		case v < 8:
+			op.Off = size
+		default:
+			op.Off = size + r.Int64N(2*blockSize)
+		}
+		if op.Off+op.Len > maxFile {
+			op.Off, op.Len = 0, min(op.Len, 64<<10)
+		}
+		op.Seed = r.Uint64()
+	case "truncate":
+		op.Path = pick(r, files)
+		size := int64(len(m.Files[op.Path].Data))
+		if r.IntN(2) == 0 || full {
+			op.Len = r.Int64N(size + 1)
+		} else {
+			op.Len = min(size+r.Int64N(blockSize), maxFile)
+		}
+	case "unlink":
+		op.Path = pick(r, files)
+		if f := m.Files[op.Path]; len(f.Snaps) > 0 && (orphans >= 20 || r.IntN(10) > 0) {
+			op.Kind, op.Name = "snapdelete", pickKey(r, f.Snaps)
+		}
+	case "mkdir":
+		if len(dirs) >= 6 {
+			op.Kind, op.Path = "rmdir", pick(r, dirs)
+		} else {
+			op.Path = path.Join(pick(r, sharedDirs), l.name("d"))
+		}
+	case "rmdir":
+		if len(dirs) == 0 {
+			op.Kind, op.Path = "mkdir", path.Join(pick(r, sharedDirs), l.name("d"))
+			break
+		}
+		op.Path = pick(r, dirs)
+		if m.hasChildren(op.Path) && r.IntN(2) == 0 {
+			for _, p := range files {
+				if path.Dir(p) == op.Path {
+					op.Kind, op.Path = "unlink", p
+					break
+				}
+			}
+		}
+	case "rename":
+		op.Path = pick(r, files)
+		op.Path2 = path.Join(path.Dir(op.Path), l.name("r"))
+	case "snapshot":
+		op.Path, op.Name = pick(r, files), l.name("s")
+	case "clone":
+		op.Path, op.Path2 = pick(r, files), "/"+l.name("c")
+	case "snapclone", "snapdelete":
+		if len(snaps) == 0 {
+			op.Kind, op.Path, op.Name = "snapshot", pick(r, files), l.name("s")
+			break
+		}
+		op.Name = pick(r, snaps)
+		op.Path = m.pathOf(m.Snaps[op.Name].Owner)
+		if kind == "snapclone" {
+			op.Path2 = "/" + l.name("c")
+		}
+	case "invalid":
+		switch r.IntN(3) {
+		case 0:
+			op.Kind, op.Path = "create", pick(r, files)
+		case 1:
+			op.Kind, op.Path, op.Off, op.Len, op.Seed = "write", path.Join(pick(r, parents), l.name("missing")), 0, 4096, r.Uint64()
+		default:
+			op.Kind, op.Path, op.Name, op.Path2 = "snapclone", pick(r, files), l.name("nosnap"), "/"+l.name("c")
+		}
+	}
+	return op
+}
+
+func pickLen(r *rand.Rand) int64 {
+	switch v := r.IntN(20); {
+	case v < 14:
+		return 1 + r.Int64N(16<<10)
+	case v < 19:
+		return 64<<10 + r.Int64N(blockSize)
+	default:
+		return blockSize + r.Int64N(2*blockSize)
+	}
+}
+
+func pickKey(r *rand.Rand, m map[string]bool) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return pick(r, keys)
+}
+
+func (m *Model) pathOf(f *File) string {
+	for p, g := range m.Files {
+		if g == f {
+			return p
+		}
+	}
+	return ""
+}
+
+// snapsOf returns the names of the snapshots a node must list for the file at p.
+func (m *Model) snapsOf(p string) []string {
+	f := m.Files[p]
+	if f == nil {
+		return nil
+	}
+	names := make([]string, 0, len(f.Snaps))
+	for name := range f.Snaps {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// listing returns what a node must list in dir, as the agent describes entries.
+func (m *Model) listing(dir string) []string {
+	var out []string
+	for p, f := range m.Files {
+		if path.Dir(p) == dir {
+			out = append(out, fmt.Sprintf("f:%s:%d", path.Base(p), len(f.Data)))
+		}
+	}
+	for p := range m.Dirs {
+		if p != dir && path.Dir(p) == dir {
+			out = append(out, "d:"+path.Base(p))
+		}
+	}
+	slices.Sort(out)
+	return out
+}

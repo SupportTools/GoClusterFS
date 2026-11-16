@@ -1691,6 +1691,10 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	}
 
 	logging.Debugf("File.Getattr: inode=%d Size=%d AllocatedBlocks=%d", f.inodeNum, ino.Size, ino.AllocatedBlocks)
+	// Reads use the cached inode; they must not stop at an older size than stat shows.
+	if ino.Magic == inode.InodeMagic {
+		f.fs.cacheInode(ino)
+	}
 
 	// Zero means go-fuse applies the mount's -attr-timeout.
 	out.AttrValid = 0
@@ -2776,7 +2780,7 @@ func (f *FS) freeSFBSlot(ctx context.Context, packed uint64) {
 		return
 	}
 	h, err := sfb.DeserializeHeader(sector)
-	if err != nil || !bytes.Equal(h.Serialize(), sector[:sfb.HeaderSize]) || slot >= h.SlotCount {
+	if err != nil || !bytes.Equal(h.Serialize(), sector[:sfb.HeaderSize]) || slot >= min(h.SlotCount, uint16(8*len(h.Bitmap))) {
 		log.Printf("[WARN] Free SFB slot %d:%d: no valid container header, leaking the slot", container, slot)
 		return
 	}

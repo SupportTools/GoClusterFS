@@ -274,6 +274,9 @@ func main() {
 	nodeReg := node.NewRegistry(dev, nodeRegistryOffset)
 	nodeReg.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
 	hostname, _ := os.Hostname()
+	if *skipRecovery >= 0 {
+		nodeReg.PreferSlot(*skipRecovery)
+	}
 	slotIdx, err := nodeReg.Register(ctx, hostname)
 	if errors.Is(err, node.ErrNoFreeSlots) {
 		failf("Cannot join the cluster: all %d node slots are taken. List them with goclusterfs-fsck -list-slots %s, and free the slot of a node that will not come back with -release-slot", node.MaxNodes, *devicePath)
@@ -283,7 +286,7 @@ func main() {
 	}
 	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
 		failf("Node registry slot %d is no longer this node's (owner %x); stopping so two nodes never share a journal. "+
-			"Check that the device is reachable and that node clocks agree within a few seconds, then mount again", slot, owner[:8])
+			"Check that the device is reachable and that this node did not stall, then mount again", slot, owner[:8])
 	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)

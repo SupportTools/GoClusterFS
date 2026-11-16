@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('\x0e')
+bool(true)
+[]byte("XTNT\x01\x00\x01\x000000\x00")

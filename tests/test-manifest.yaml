@@ -484,6 +484,74 @@ scenarios:
       docker: run-tests.sh::test_network_partition
       vm: run-vm-tests.sh::test_network_partition
 
+  - id: open-file-growth-without-broadcast
+    name: Open file reads growth without broadcast
+    description: A node with broadcast off and a long cache TTL holds a file open while another node grows it; once stat shows the new size, a read at the new end returns the data
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOpenFileSeesGrowthWithoutBroadcast
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  # Staleness under network faults. Each test has node 1 rewrite a file while
+  # node 2 reads it through an open handle, node 3 stats it and node 4 opens it
+  # afresh, and checks how late each sees every version. Integration tests run
+  # every node in one network namespace, so tc and iptables cannot fault one
+  # node's traffic there.
+  - id: staleness-packet-loss
+    name: Staleness under packet loss
+    description: 30% loss on the writer's traffic; open, stat and fresh-open reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_packet_loss
+      vm: TODO
+
+  - id: staleness-duplication-reordering
+    name: Staleness under duplication and reordering
+    description: 30% duplicated and 50% reordered writer traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_duplication_and_reordering
+      vm: TODO
+
+  - id: staleness-delay
+    name: Staleness under delay
+    description: Writer traffic delayed 0 to 2 seconds; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_delay
+      vm: TODO
+
+  - id: staleness-one-way-partition
+    name: Staleness under a one-way partition
+    description: The reader hears nothing from the writer, which still hears the reader; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_one_way_partition
+      vm: TODO
+
+  - id: staleness-multicast-dropped
+    name: Staleness with multicast dropped
+    description: The reader drops all multicast while unicast works; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  - id: staleness-flood-under-loss
+    name: Staleness during an invalidation flood under loss
+    description: A third node floods invalidations while the writer and reader lose 10% of their traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_flood_under_loss
+      vm: TODO
+
   - id: rolling-restart
     name: Rolling restart
     description: Nodes can be restarted one at a time
@@ -654,6 +722,119 @@ scenarios:
       go: lock_reclaim_test.go::TestStalledNodesWritesStopAtWriteGate
       docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
       vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
+
+  - id: hostile-storage-latency-spikes
+    name: Storage latency spikes on one node
+    description: One node's path to the shared disk takes 100ms, 500ms, 1s and 2s per I/O for 15s each while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      go: internal/node/clock_skew_test.go::TestSlowRegistryReadsDoNotStarveHeartbeat
+      vm: run-vm-tests.sh::test_storage_latency_spikes
+
+  - id: clock-ahead-mount-keeps-live-slot
+    name: A node with a fast clock does not take a live node's slot
+    description: A node that never mounted the volume mounts with its clock 2 minutes ahead; it takes a free slot, and the mounted node keeps running
+    priority: high
+    environments:
+      go: internal/node/clock_skew_test.go::TestRegisterLeavesLiveSlotOfNodeWithSlowClock
+      docker: TODO  # containers share the host clock; covered in Go and VM
+      vm: run-vm-tests.sh::test_clock_ahead_mount
+
+  - id: clock-ahead-crash-replayed
+    name: A crashed node with a fast clock is replayed on time
+    description: A node whose clock is 3 minutes ahead crashes; its peer replays it within the usual failover time, judging silence on its own clock
+    priority: high
+    environments:
+      go: internal/node/clock_skew_test.go::TestCrashedNodeWithFastClockIsReplayed
+      docker: TODO  # containers share the host clock; covered in Go and VM
+      vm: run-vm-tests.sh::test_clock_ahead_crash_recovered
+
+  - id: register-takes-empty-slot-first
+    name: Register takes an empty slot before another host's silent one
+    description: A mount takes an empty slot without waiting, and leaves another host's slot whose heartbeat looks old to failure detection unless -skip-recovery names it or no slot is empty
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne
+
+  - id: register-takes-named-slot-under-recovery-once-lapsed
+    name: A named slot under recovery is taken once its lease lapses
+    description: -skip-recovery naming a slot that another node marked dead takes it only after its recovery lease stays unrenewed for the lease term
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesNamedSlotUnderRecoveryOnlyOnceItsLeaseLapses
+
+  - id: register-takes-back-earlier-boot-slot
+    name: A rebooted host takes back its slot
+    description: A mount takes back the slot its hostname held in an earlier kernel boot, once the slot's heartbeat proves silent, before any empty slot, so it replays that journal before serving
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesBackSlotOfItsEarlierBoot
+      vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
+
+  - id: register-leaves-watched-slot-that-changes
+    name: Register leaves a watched slot that changed
+    description: A slot Register watched stay silent is not taken if a peer marks it dead or its node beats again before the claim
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterLeavesWatchedSlotThatChanges
+
+  - id: renewed-lease-held-whatever-clock
+    name: A renewed recovery lease is held whatever the replayer's clock
+    description: A lease unchanged past recoveryLease counts as lapsed; once the replayer renews it, peers count it as held although its start time is 2 minutes in the past
+    priority: go_only
+    environments:
+      go: internal/node/clock_skew_test.go::TestRenewedRecoveryLeaseIsHeldWhateverTheReplayersClock
+
+  - id: hostile-storage-short-stalls
+    name: Short storage stalls on one node
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_stalls
+
+  - id: hostile-storage-long-stall
+    name: Long storage stall fences the node
+    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_stall
+
+  - id: hostile-storage-short-eio
+    name: Short EIO burst on one node
+    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_eio
+
+  - id: hostile-storage-long-eio
+    name: Long EIO burst fences the node
+    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_eio
+
+  - id: hostile-storage-flaky-eio
+    name: Flaky EIO on one node
+    description: One node's path fails every I/O for 1s in every 4s, for 40s; the node keeps running, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_flaky_eio
+
+  - id: partitioned-nodes-fall-back-to-cache-ttl
+    name: Partitioned nodes fall back to the cache TTL
+    description: Two nodes with different broadcast secrets receive none of each other's messages; each sees the other's creates, overwrites, growth, new directories, deletes and concurrent writes within the cache TTL plus the attribute timeout, and fsck is clean
+    priority: high
+    environments:
+      go: partition_test.go::TestPartitionedNodesFallBackToCacheTTL
+      docker: TODO  # would need per-container broadcast secrets in the compose file; covered on host mounts
+      vm: SKIPPED  # VMs share one user-mode network address and never exchange broadcasts
+
+  - id: one-failed-write-keeps-acknowledged-results
+    name: One failed write keeps acknowledged results
+    description: One device write fails with EIO in a workload that creates, writes, overwrites, truncates and unlinks; by default the last inode write of each step with a crash after it, and the first and last write to each region with the node running on (GOCLUSTERFS_EIO_SWEEP=metadata or full for more). Every acknowledged result holds, and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestOneFailedWriteKeepsAcknowledgedResults
 
   - id: lock-adopt-owner
     name: Replaying node takes over a dead node's exclusive locks
@@ -3085,6 +3266,62 @@ scenarios:
     environments:
       go: internal/journal/journal_fuzz_test.go::FuzzJournalScan
 
+  - id: fuzz-journal-replay
+    name: Fuzz journal replay
+    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s; every error fsck then finds names an inode or block the records touched or one those map
+    priority: go_only
+    environments:
+      go: internal/fsck/replay_fuzz_test.go::FuzzReplay
+
+  - id: fuzz-lock-row
+    name: Fuzz lock claim rows
+    description: Rows of valid, torn and checksum-passing garbage claims; a live write claim or torn slot always conflicts, an empty row never does, a released registry slot never blocks, and AdoptOwner and ClearForeignClaims write only their own slot
+    priority: go_only
+    environments:
+      go: internal/lock/slots_fuzz_test.go::FuzzLockRow
+
+  - id: fuzz-registry-slot
+    name: Fuzz node registry slots
+    description: A slot decodes only with a valid checksum or when all zero, round-trips, agrees with its lease expiry, and registry reads report no node in the empty slots around it
+    priority: go_only
+    environments:
+      go: internal/node/registry_fuzz_test.go::FuzzRegistrySlot
+
+  - id: fuzz-refcount-sector
+    name: Fuzz refcount sectors
+    description: Refcount operations over a fuzzed sector match a model, and a sector that fails its checksum refuses them all and stays unchanged on disk
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_fuzz_test.go::FuzzRefcountSector
+
+  - id: fuzz-dir-chunk
+    name: Fuzz directory chunks
+    description: Entries walkChunk returns fit their records and the chunk; chunkRoom agrees with what addToChunk can place; add and remove keep every other live entry
+    priority: go_only
+    environments:
+      go: internal/dir/dir_fuzz_test.go::FuzzDirChunk
+
+  - id: fuzz-sfb-container
+    name: Fuzz SFB containers from older builds
+    description: Freeing a slot clears exactly its bit in a valid container header or leaves the sector unchanged, and reading a slot never panics, whatever header and slot the disk holds
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/sfb_fuzz_test.go::FuzzSFBContainer
+
+  - id: fuzz-api-writes
+    name: Fuzz API write requests
+    description: A request reaches the file or admin service only with the token, from the same origin, by POST or DELETE, with a body of at most 64 KB, and with exactly the fields of one strict JSON object; API responses are JSON
+    priority: go_only
+    environments:
+      go: internal/api/writes_fuzz_test.go::FuzzWriteRequests
+
+  - id: fuzz-fileops-paths
+    name: Fuzz API file paths
+    description: Paths, snapshot names and clone destinations pass only the forms the checks promise, a snapshot clone value splits back into its name and destination, and an accepted path opens exactly the file it names under the mount root
+    priority: go_only
+    environments:
+      go: internal/fileops/fileops_fuzz_test.go::FuzzFileOpsPaths
+
   - id: reserve-unused-later-uses
     name: Unused reserved blocks exclude later uses
     description: Blocks a pending reserve record holds count as unused unless a later record maps or uses them, completed or not; a use logged before the record does not count
@@ -3691,7 +3928,7 @@ scenarios:
     description: Register reports the node whose failed slot it took, from any host, so mount keeps that node's lock claims through the replay
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestRegisterReportsPreviousOwnerOfAnyTakenSlot
+      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlotWhenNamedOrNoneIsEmpty
 
   - id: storage-write-gate-refuses-writes
     name: Device write gate refuses writes
@@ -3839,6 +4076,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
+
+  - id: lock-failed-release-retried
+    name: A failed release write is retried
+    description: A node's write clearing its claim fails once; the node clears it again, and another node gets the record within a few seconds instead of after the first node unmounts
+    priority: go_only
+    environments:
+      go: internal/lock/release_retry_test.go::TestFailedReleaseWriteIsRetried
+
+  - id: snapshot-unreadable-sector-not-rewritten
+    name: An unreadable snapshot registry sector is not rewritten
+    description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
 
   - id: lock-busy-node-yields
     name: Busy node yields a cached record

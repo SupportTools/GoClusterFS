@@ -1,0 +1,4 @@
+go test fuzz v1
+byte(')')
+bool(false)
+[]byte("\x8f\x92\x8f1")

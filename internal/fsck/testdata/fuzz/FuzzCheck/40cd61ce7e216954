@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('\u0098')
+bool(false)
+[]byte("𒒒𒒢𒒒")

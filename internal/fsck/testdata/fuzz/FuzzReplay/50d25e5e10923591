@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("c01c01c01c00")
+byte('\x10')
+[]byte("0")

@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\x00')
+byte('\x01')
+bool(true)
+byte('\x01')
+[]byte("20002000200020002\xbe002\xbe002\xbe002\xbe0")

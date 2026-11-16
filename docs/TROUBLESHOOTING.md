@@ -475,7 +475,7 @@ fusermount3 -u /mnt/cluster
 
 1. **Always unmount cleanly** before shutting down
 2. **Keep journaling on** (`-journal`, on by default)
-3. **Keep node clocks in sync and avoid stalls** (see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits))
+3. **Avoid stalls, and run NTP on every node** (see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits))
 4. **Run periodic fsck** during maintenance windows
 5. **Maintain backups** - no filesystem is immune to hardware failure
 
