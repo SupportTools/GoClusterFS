@@ -123,7 +123,8 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 
 	blocks, err := mgr.DataBlocks(plain)
 	must(err)
-	must(refs.Share(ctx, blocks))
+	_, err = refs.Share(ctx, blocks)
+	must(err)
 	clone := newFile("clone")
 	must(mgr.CopyExtentsForClone(ctx, plain, clone))
 	clone.Size = plain.Size

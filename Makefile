@@ -1,7 +1,7 @@
 # GoClusterFS Makefile
 # Build and test automation for the distributed filesystem
 
-.PHONY: build build-mount build-fsck build-gfsctl dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
+.PHONY: build build-mount build-fsck build-gfsctl soak completions dashboard test test-unit test-integration test-all test-parity test-multinode-docker docker-build-test docker-clean-test test-multinode-vm vm-clean clean fmt vet check-fuse check-qemu lint vuln help
 
 # Go parameters
 GOCMD=go
@@ -22,7 +22,7 @@ DASHBOARD_DIST=internal/webui/build/dist
 GOLANGCI_LINT_VERSION=v2.15.0
 GOVULNCHECK_VERSION=v1.9.0
 COVER_PROFILE=coverage.out
-UNIT_PKGS ?= ./internal/...
+UNIT_PKGS ?= ./internal/... ./tests/soak
 UNIT_TIMEOUT ?= 20m
 
 # Default target
@@ -33,18 +33,26 @@ build: build-mount build-fsck build-gfsctl
 
 build-mount:
 	@echo "Building $(MOUNT_BINARY)..."
-	$(GOBUILD) -o $(MOUNT_BINARY) ./cmd/mount
+	$(GOBUILD) -o $(MOUNT_BINARY) ./cmd/goclusterfs-mount
 	@echo "Built $(MOUNT_BINARY) successfully"
 
 build-fsck:
 	@echo "Building $(FSCK_BINARY)..."
-	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/fsck
+	$(GOBUILD) -o $(FSCK_BINARY) ./cmd/goclusterfs-fsck
 	@echo "Built $(FSCK_BINARY) successfully"
+
+# Static, so the same binary runs on the host as the driver and in the Alpine VMs as the agent
+soak: build-mount build-fsck
+	CGO_ENABLED=0 $(GOBUILD) -o goclusterfs-soak ./tests/soak
 
 build-gfsctl:
 	@echo "Building $(GFSCTL_BINARY)..."
 	$(GOBUILD) -o $(GFSCTL_BINARY) ./cmd/gfsctl
 	@echo "Built $(GFSCTL_BINARY) successfully"
+
+# Shell completions for the three commands into completions/bash and completions/zsh
+completions:
+	scripts/completions.sh completions
 
 # Builds the web dashboard into $(DASHBOARD_DIST), which goclusterfs-mount embeds; run before build
 dashboard:
@@ -185,7 +193,7 @@ vuln:
 clean:
 	@echo "Cleaning build artifacts..."
 	rm -f $(MOUNT_BINARY) $(FSCK_BINARY) $(GFSCTL_BINARY) $(COVER_PROFILE)
-	rm -rf $(DASHBOARD_DIST)
+	rm -rf $(DASHBOARD_DIST) completions
 	rm -f *.img
 	@echo "Clean complete"
 
@@ -213,6 +221,7 @@ help:
 	@echo "    build-mount    - Build goclusterfs-mount binary"
 	@echo "    build-fsck     - Build goclusterfs-fsck binary"
 	@echo "    build-gfsctl   - Build gfsctl binary"
+	@echo "    completions    - Write bash and zsh completions into completions/ (mount and fsck on Linux only)"
 	@echo "    dashboard      - Build the web dashboard (npm ci) for build to embed; run make dashboard build"
 	@echo ""
 	@echo "  Test:"

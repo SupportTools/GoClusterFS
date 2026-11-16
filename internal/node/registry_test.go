@@ -321,29 +321,6 @@ func TestRegistryGetActiveNodes(t *testing.T) {
 	}
 }
 
-func TestIsHeartbeatStale(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-
-	reg := NewRegistry(dev, 0)
-
-	// Fresh heartbeat - not stale
-	freshSlot := &Slot{
-		HeartbeatTime: time.Now().Unix(),
-	}
-	if reg.isHeartbeatStale(freshSlot) {
-		t.Error("fresh heartbeat should not be stale")
-	}
-
-	// Old heartbeat - stale
-	staleSlot := &Slot{
-		HeartbeatTime: time.Now().Add(-HeartbeatTimeout - time.Second).Unix(),
-	}
-	if !reg.isHeartbeatStale(staleSlot) {
-		t.Error("old heartbeat should be stale")
-	}
-}
-
 func BenchmarkSlotSerialize(b *testing.B) {
 	slot := &Slot{
 		Magic:         SlotMagic,
@@ -447,6 +424,7 @@ func TestGetFailedNodesWithStaleHeartbeat(t *testing.T) {
 
 	// Create a second registry to detect the failure
 	reg2 := NewRegistry(dev, 0)
+	silence(reg2, slot, staleSlot, HeartbeatTimeout+time.Second)
 
 	failed, err := reg2.GetFailedNodes()
 	if err != nil {
@@ -519,6 +497,8 @@ func TestRecoverFailedNode(t *testing.T) {
 		recoveredInfo = info
 		return nil
 	})
+
+	silence(reg2, failingSlot, staleSlot, deadAfter+time.Second)
 
 	// Trigger recovery on the failing node's slot
 	err = reg2.RecoverFailedNode(failingSlot)
@@ -631,10 +611,7 @@ func TestFailureDetectionLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeSlot failed: %v", err)
 	}
-	reg2.mu.Lock()
-	reg2.sightings[failingSlot] = sighting{uuid: staleSlot.UUID, seq: staleSlot.HeartbeatSeq, beat: staleSlot.HeartbeatTime,
-		since: time.Now().Add(-HeartbeatTimeout - deathMargin)}
-	reg2.mu.Unlock()
+	silence(reg2, failingSlot, staleSlot, deadAfter+time.Second)
 
 	// Set up recovery handler
 	recovered := make(chan *FailedNodeInfo, 1)
@@ -720,8 +697,8 @@ func TestRegisterSkipsSlotUnderRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if slot != 1 {
-		t.Errorf("Register took slot %d, want slot 1, whose recovery lease lapsed", slot)
+	if slot != 2 {
+		t.Errorf("Register took slot %d, want empty slot 2: a slot under recovery is failure detection's to judge, by watching its lease", slot)
 	}
 }
 
@@ -891,10 +868,7 @@ func TestRecoveryLeaseBlocksOthersUntilItLapses(t *testing.T) {
 		t.Fatalf("acquire during another node's lease: err = %v, want ErrSlotTaken", err)
 	}
 
-	failed.RecoveryStart = time.Now().Add(-2 * recoveryLease).Unix()
-	if err := reg.writeSlot(4, failed); err != nil {
-		t.Fatal(err)
-	}
+	silence(reg, 4, failed, recoveryLease+time.Second)
 	if _, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout); err != nil {
 		t.Fatalf("acquire after the lease lapsed: %v", err)
 	}
@@ -1015,6 +989,7 @@ func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
 	if err := reg.writeSlot(4, failed); err != nil {
 		t.Fatal(err)
 	}
+	silence(reg, 4, failed, HeartbeatTimeout+time.Second)
 	info, err := reg.acquireForRecovery(4, failed, HeartbeatTimeout)
 	if err != nil {
 		t.Fatal(err)
@@ -1023,17 +998,19 @@ func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
 		t.Fatalf("CheckLease right after acquire: %v", err)
 	}
 
+	// A replayer whose clock is behind still renews its lease to a value peers see change.
 	held, _ := reg.readSlot(4)
-	held.RecoveryStart = time.Now().Add(-recoveryLease / 2).Unix()
+	held.RecoveryStart = time.Now().Add(time.Hour).Unix()
 	if err := reg.writeSlot(4, held); err != nil {
 		t.Fatal(err)
 	}
-	if err := info.CheckLease(); err != nil {
+	if err := reg.leaseCheck(4, failed.UUID, time.Now().Add(-recoveryLease/2))(); err != nil {
 		t.Fatalf("CheckLease halfway through the lease: %v", err)
 	}
-	if renewed, _ := reg.readSlot(4); time.Since(time.Unix(renewed.RecoveryStart, 0)) > 5*time.Second {
-		t.Errorf("lease not renewed: started %v", time.Unix(renewed.RecoveryStart, 0))
+	if renewed, _ := reg.readSlot(4); renewed.RecoveryStart <= held.RecoveryStart {
+		t.Errorf("lease not renewed: start %d, was %d", renewed.RecoveryStart, held.RecoveryStart)
 	}
+	held, _ = reg.readSlot(4)
 
 	held.RecoveryOwner = [16]byte{6}
 	if err := reg.writeSlot(4, held); err != nil {
@@ -1178,26 +1155,33 @@ func TestHeartbeatStopsWhenSlotIsMarkedDead(t *testing.T) {
 	}
 }
 
+// silence makes reg treat slot as read unchanged for d, as if it had watched the slot that long.
+func silence(reg *Registry, idx int, slot *Slot, d time.Duration) {
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	seen := sightingOf(slot)
+	seen.since = time.Now().Add(-d)
+	reg.sightings[idx] = seen
+}
+
 func TestOwnClockDecidesDeathNotWallClock(t *testing.T) {
-	reg := &Registry{sightings: make(map[int]sighting)}
-	slot := &Slot{UUID: [16]byte{4}, State: NodeStateActive, HeartbeatSeq: 1,
-		HeartbeatTime: time.Now().Add(-time.Hour).Unix()}
+	for _, beat := range []time.Duration{-time.Hour, 3 * time.Minute} {
+		reg := &Registry{sightings: make(map[int]sighting)}
+		slot := &Slot{UUID: [16]byte{4}, State: NodeStateActive, HeartbeatSeq: 1, HeartbeatTime: time.Now().Add(beat).Unix()}
 
-	reg.observe(1, slot)
-	if reg.provenDead(1, slot) {
-		t.Error("a heartbeat first seen just now counted as dead because its wall-clock time is old")
-	}
-
-	reg.sightings[1] = sighting{uuid: slot.UUID, seq: 1, beat: slot.HeartbeatTime,
-		since: time.Now().Add(-(HeartbeatTimeout + deathMargin + time.Second))}
-	if !reg.provenDead(1, slot) {
-		t.Error("a heartbeat unchanged past timeout plus margin by this node's clock did not count as dead")
-	}
-
-	slot.HeartbeatSeq++
-	reg.observe(1, slot)
-	if reg.provenDead(1, slot) || !reg.recentlyAlive(1) {
-		t.Error("a heartbeat that advanced still counted as dead")
+		reg.observe(1, slot)
+		if reg.stale(1, slot, deadAfter) {
+			t.Errorf("heartbeat %v from now: first seen just now, it counted as dead", beat)
+		}
+		silence(reg, 1, slot, deadAfter+time.Second)
+		if !reg.stale(1, slot, deadAfter) {
+			t.Errorf("heartbeat %v from now: unchanged past deadAfter by this node's clock, it did not count as dead", beat)
+		}
+		slot.HeartbeatSeq++
+		reg.observe(1, slot)
+		if reg.stale(1, slot, deadAfter) {
+			t.Errorf("heartbeat %v from now: a heartbeat that advanced still counted as dead", beat)
+		}
 	}
 }
 
@@ -1253,9 +1237,13 @@ func TestOccupantReportsHowSlotStands(t *testing.T) {
 		{Magic: SlotMagic, State: NodeStateEmpty},
 	}
 	want := []Occupancy{OccupiedLive, OccupiedFailing, OccupiedReplaying, OccupiedLapsed, Unoccupied}
+	unchanged := map[int]time.Duration{1: HeartbeatTimeout + time.Second, 3: recoveryLease + time.Second}
 	for i, slot := range slots {
 		if err := reg.writeSlot(i, slot); err != nil {
 			t.Fatal(err)
+		}
+		if d, ok := unchanged[i]; ok {
+			silence(reg, i, slot, d)
 		}
 		if uuid, got := reg.Occupant(i, true); got != want[i] || uuid != slot.UUID {
 			t.Errorf("slot %d: Occupant = %x, %d; want %x, %d", i, uuid[:1], got, slot.UUID[:1], want[i])
@@ -1281,28 +1269,163 @@ func TestOccupantAnswersFromLastReadUnlessFresh(t *testing.T) {
 	}
 }
 
-func TestRegisterReportsPreviousOwnerOfAnyTakenSlot(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-	reg := NewRegistry(dev, 0)
-	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix()}
+// fillWithReplays marks every slot from first on as dead and under another node's recovery, so none is empty.
+func fillWithReplays(t *testing.T, reg *Registry, first int) {
+	t.Helper()
+	for i := first; i < MaxNodes; i++ {
+		dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{byte(100 + i)}, RecoveryOwner: [16]byte{7}, RecoveryStart: time.Now().Unix()}
+		if err := reg.writeSlot(i, dead); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func shortenSilentSlotWatch(t *testing.T) {
+	t.Helper()
+	old := silentSlotWatch
+	t.Cleanup(func() { silentSlotWatch = old })
+	silentSlotWatch = 2 * time.Second
+}
+
+// writeGoneSlot writes slot 0 as another host's node whose heartbeat stopped long ago by this clock.
+func writeGoneSlot(t *testing.T, reg *Registry) *Slot {
+	t.Helper()
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 3, HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix()}
 	copy(gone.Hostname[:], "elsewhere")
 	if err := reg.writeSlot(0, gone); err != nil {
 		t.Fatal(err)
 	}
-	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 0 {
-		t.Fatalf("Register = %d, %v; want the failed slot 0", slot, err)
-	}
-	if owner, ok := reg.PreviousOwner(); !ok || owner != gone.UUID {
-		t.Errorf("PreviousOwner = %x, %v; want the failed node %x of another host", owner, ok, gone.UUID)
-	}
+	return gone
+}
 
-	fresh := NewRegistry(dev, 0)
-	if _, err := fresh.Register(context.Background(), "node2"); err != nil {
-		t.Fatal(err)
+func TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	writeGoneSlot(t, reg)
+	if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 1 {
+		t.Fatalf("Register = %d, %v; want the empty slot 1", slot, err)
 	}
-	if owner, ok := fresh.PreviousOwner(); ok {
+	if owner, ok := reg.PreviousOwner(); ok {
 		t.Errorf("PreviousOwner = %x after taking an empty slot, want none", owner)
+	}
+}
+
+// A host that rebooted after a crash takes back the slot it held under the same
+// hostname once the slot proves silent, so its mount replays that journal. A
+// live host that shares the name beats during the watch and keeps its slot.
+func TestRegisterTakesBackSlotOfItsEarlierBoot(t *testing.T) {
+	for _, beating := range []bool{false, true} {
+		t.Run(map[bool]string{false: "silent", true: "another host with the name"}[beating], func(t *testing.T) {
+			shortenSilentSlotWatch(t)
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			reg := NewRegistry(dev, 0)
+			earlier := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 3,
+				HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix(), BootID: [16]byte{0xEE}}
+			copy(earlier.Hostname[:], "node")
+			if err := reg.writeSlot(0, earlier); err != nil {
+				t.Fatal(err)
+			}
+			if beating {
+				defer keepWriting(t, reg, 0, earlier, 3*HeartbeatTimeout)()
+			}
+			slot, err := reg.Register(context.Background(), "node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner, ok := reg.PreviousOwner()
+			switch {
+			case beating && slot == 0:
+				t.Error("Register took the slot of a live host that shares this hostname")
+			case !beating && (slot != 0 || !ok || owner != earlier.UUID):
+				t.Errorf("Register = %d, previous owner %x %v; want slot 0 of this hostname's earlier boot, node %x", slot, owner, ok, earlier.UUID)
+			}
+		})
+	}
+}
+
+func TestRegisterTakesAnotherHostsSilentSlotWhenNamedOrNoneIsEmpty(t *testing.T) {
+	for _, named := range []bool{true, false} {
+		t.Run(map[bool]string{true: "named", false: "none empty"}[named], func(t *testing.T) {
+			shortenSilentSlotWatch(t)
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			reg := NewRegistry(dev, 0)
+			gone := writeGoneSlot(t, reg)
+			if named {
+				reg.PreferSlot(0)
+			} else {
+				fillWithReplays(t, reg, 1)
+			}
+			if slot, err := reg.Register(context.Background(), "node"); err != nil || slot != 0 {
+				t.Fatalf("Register = %d, %v; want slot 0, whose heartbeat never changed", slot, err)
+			}
+			if owner, ok := reg.PreviousOwner(); !ok || owner != gone.UUID {
+				t.Errorf("PreviousOwner = %x, %v; want the failed node %x of another host", owner, ok, gone.UUID)
+			}
+		})
+	}
+}
+
+// A named slot under another node's recovery is taken once its lease lapses
+// unrenewed, and left alone while the lease is renewed.
+func TestRegisterTakesNamedSlotUnderRecoveryOnlyOnceItsLeaseLapses(t *testing.T) {
+	for _, renewed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "lapsed", true: "renewed"}[renewed], func(t *testing.T) {
+			t.Cleanup(SetRecoveryLease(2 * time.Second))
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			reg := NewRegistry(dev, 0)
+			dead := &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{5}, RecoveryOwner: [16]byte{6}, RecoveryStart: time.Now().Unix()}
+			if err := reg.writeSlot(0, dead); err != nil {
+				t.Fatal(err)
+			}
+			if renewed {
+				defer keepWriting(t, reg, 0, dead, 0)()
+			}
+			reg.PreferSlot(0)
+			slot, err := reg.Register(context.Background(), "node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if took := slot == 0; took == renewed {
+				t.Errorf("Register took slot %d; want slot 0 only when its lease was not renewed", slot)
+			}
+		})
+	}
+}
+
+// A slot that changes after Register watched it, because a peer marked it dead
+// to replay it or its node beat again, is not taken.
+func TestRegisterLeavesWatchedSlotThatChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*Slot)
+	}{
+		{"marked dead by a peer", func(s *Slot) {
+			s.State, s.RecoveryOwner, s.RecoveryStart = NodeStateDead, [16]byte{8}, time.Now().Unix()
+		}},
+		{"its node beat again", func(s *Slot) { s.HeartbeatSeq++ }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shortenSilentSlotWatch(t)
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			reg := NewRegistry(dev, 0)
+			gone := writeGoneSlot(t, reg)
+			reg.PreferSlot(0)
+			t.Cleanup(func() { afterSilentWatch = nil })
+			afterSilentWatch = func() {
+				tc.change(gone)
+				if err := reg.writeSlot(0, gone); err != nil {
+					t.Error(err)
+				}
+			}
+			if slot, err := reg.Register(context.Background(), "node"); err != nil || slot == 0 {
+				t.Fatalf("Register = %d, %v; want an empty slot, not slot 0, which changed after the watch", slot, err)
+			}
+		})
 	}
 }
 

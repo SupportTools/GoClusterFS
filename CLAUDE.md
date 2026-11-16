@@ -33,8 +33,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 
 | Path | What it does |
 |------|--------------|
-| `cmd/mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
-| `cmd/fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
+| `cmd/goclusterfs-mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
+| `cmd/goclusterfs-fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
 | `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics) |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
@@ -53,8 +53,8 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/sfb` | Small-file containers (4/8/16/64 KB slots in a 1 MB block). Disabled: nothing allocates slots, `goclusterfs` only reads and migrates files older builds stored there |
 | `internal/trim` | Batched `BLKDISCARD` for freed blocks |
 | `internal/fsck` | The fsck phases |
-| `internal/metrics` | Atomic counters, not used by `cmd/mount` yet |
-| `internal/api` | HTTP API served by `cmd/mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
+| `internal/metrics` | Atomic counters, not used by `goclusterfs-mount` yet |
+| `internal/api` | HTTP API served by `goclusterfs-mount`: `/health`, `/metrics`, `/api/v1/status`, `/api/v1/stats/...`; loopback only unless `-api-token` is set |
 | `internal/stats` | Background sampler that feeds `/api/v1/stats/...`, `/metrics` and the capacity in `/api/v1/status` |
 | `internal/cli` | Exit codes, flag parsing and error hints shared by the three commands |
 | `internal/logging` | The `-debug` switch: `logging.Debugf` prints only with `-debug` |
@@ -90,12 +90,12 @@ Snapshots and clones work through extended attributes on a file (`internal/goclu
 - `setfattr -n user.clone -v /<new-name> <file>` clones the file
 - `setfattr -n user.snapshot.clone -v <snapshot>:/<new-name> <file>` clones from a snapshot
 
-Clone paths are absolute from the filesystem root, and clones can only go in the root directory.
+Clone paths are absolute from the filesystem root, and clones can only go in the root directory. A snapshot records its file's inode number and birth generation, so a later file in the same inode slot does not see it; once its file is deleted it is an orphan, listed and deleted only through the API without a path.
 
 ## Current Limitations
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
-- At most 64 nodes mount a volume at once, one per registry slot. Heartbeats compare wall clocks, so node clocks must agree within a few seconds.
+- At most 64 nodes mount a volume at once, one per registry slot. A node judges another by whether its heartbeat changes, timed on its own clock, so failover does not need clocks to agree.
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. Every `statfs` (`df`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.

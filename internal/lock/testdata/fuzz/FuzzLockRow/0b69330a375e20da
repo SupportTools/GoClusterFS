@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('\v')
+byte('\x00')
+bool(true)
+byte('J')
+[]byte("8000800080008")

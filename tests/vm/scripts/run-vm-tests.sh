@@ -586,6 +586,72 @@ test_journal_recovery_multinode() {
     return 0
 }
 
+# VM A takes a block reserve, writes one block from it and is killed. VM B
+# replays VM A's journal, which gives the unused reserved blocks back: VM B's
+# free space ends one block below where it started.
+test_reserve_returned_after_crash() {
+    log_info "Testing that a killed node's unused block reserve is returned..."
+
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_info "SKIP: Need at least 2 VMs"
+        return 0
+    fi
+    ensure_cluster_healthy "$NODE_COUNT"
+
+    local vm_a=1 vm_b=2
+    local file=/mnt/goclusterfs/reserve-crash.bin
+    local free_kb
+    free_kb() { ssh_run "$vm_b" "df -k /mnt/goclusterfs | awk 'NR==2 {print \$4}'"; }
+
+    local before
+    sleep "$RESERVE_IDLE_RETURN_SECS"
+    before=$(free_kb)
+    ssh_run "$vm_a" "dd if=/dev/urandom of=$file bs=1M count=1 conv=fsync 2>/dev/null" || return 1
+    local sum
+    sum=$(ssh_run "$vm_a" "md5sum $file | cut -d' ' -f1")
+    local reserved
+    reserved=$(free_kb)
+    log_info "free on VM B: ${before}KB before, ${reserved}KB while VM A holds its reserve"
+    if (( reserved > before - 2048 )); then
+        log_error "VM A's write took less than its block and a reserve (${before}KB -> ${reserved}KB)"
+        return 1
+    fi
+
+    log_info "Hard-killing VM A while it holds its reserve..."
+    kill_vm "$vm_a"
+    local want=$((before - 1024)) now=0 waited=0
+    while (( waited < 90 )); do
+        now=$(free_kb)
+        [[ "$now" -eq "$want" ]] && break
+        sleep 3
+        waited=$((waited + 3))
+    done
+    if [[ "$now" -ne "$want" ]]; then
+        log_error "VM B shows ${now}KB free after VM A's replay, want ${want}KB: the reserve was not returned"
+        return 1
+    fi
+    log_info "VM A's unused reserve came back after ${waited}s"
+
+    # Allocation is first-fit, so VM B's filler would take the file's block if replay had freed it.
+    local filler=/mnt/goclusterfs/reserve-crash-filler.bin
+    ssh_run "$vm_b" "dd if=/dev/zero of=$filler bs=1M count=128 conv=fsync 2>/dev/null" || return 1
+    if [[ "$(ssh_run "$vm_b" "md5sum $file | cut -d' ' -f1")" != "$sum" ]]; then
+        log_error "VM A's file changed on VM B after the replay and a 128MB write"
+        return 1
+    fi
+
+    start_vm "$vm_a" false
+    wait_vm_healthy "$vm_a"
+    setup_goclusterfs "$vm_a" false
+    if [[ "$(ssh_run "$vm_a" "md5sum $file | cut -d' ' -f1")" != "$sum" ]]; then
+        log_error "VM A reads different data from its file after restarting"
+        return 1
+    fi
+    ssh_run "$vm_b" "rm -f $file $filler"
+    log_info "Reserve returned after crash test passed"
+    return 0
+}
+
 # VM A's mount restarts while VM B keeps creating files.
 # Matches Go test: TestMultiNodeRestartKeepsPeerJournal in journal_slots_test.go
 test_restart_keeps_peer_journal() {
@@ -1852,6 +1918,9 @@ statfs_free_blocks_on_vm() {
     ssh_run "$1" "stat -f -c %f /mnt/goclusterfs"
 }
 
+# statfs counts other nodes' unused block reserves as used; they go back within 1.5 x the 10s idle time.
+RESERVE_IDLE_RETURN_SECS=16
+
 # Writes 5 blocks, remounts on a restarted VM, and checks that statfs reports
 # the same free blocks as before the restart, not the whole volume.
 test_statfs_after_remount() {
@@ -1860,6 +1929,7 @@ test_statfs_after_remount() {
 
     local file=/mnt/goclusterfs/statfs_remount.bin
     local before written remounted
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     before=$(statfs_free_blocks_on_vm 1)
     ssh_run 1 "dd if=/dev/urandom of=$file bs=1M count=5 2>/dev/null"
     written=$(statfs_free_blocks_on_vm 1)
@@ -1894,8 +1964,10 @@ test_statfs_multinode() {
 
     local file=/mnt/goclusterfs/statfs_multinode.bin
     local start on_writer on_remover
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     start=$(statfs_free_blocks_on_vm 2)
     ssh_run 1 "dd if=/dev/urandom of=$file bs=1M count=5 2>/dev/null"
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     on_writer=$(statfs_free_blocks_on_vm 1)
     on_remover=$(statfs_free_blocks_on_vm 2)
     if [[ "$on_writer" != "$on_remover" ]] || (( start - on_remover < 5 )); then
@@ -3135,6 +3207,227 @@ test_stalled_node_writes_stop_at_write_gate() {
     return $result
 }
 
+# =============================================================================
+# Hostile storage and clocks
+# =============================================================================
+# VM 1 mounts through a device-mapper device over the shared disk, so its path
+# alone can be slowed, stalled or failed. Both nodes create small files and
+# record each one their create acknowledged; every acknowledged file must read
+# back, and fsck may find nothing but leaks.
+HOSTILE_DM=gcfs-path
+
+hostile_dm_load() {
+    ssh_run 1 "sz=\$(blockdev --getsz /dev/vda) && dmsetup suspend $HOSTILE_DM && dmsetup load $HOSTILE_DM --table \"0 \$sz $1\" && dmsetup resume $HOSTILE_DM"
+}
+
+hostile_setup() {
+    ensure_cluster_healthy 2 || return 1
+    unmount_goclusterfs 1 || { log_error "VM 1: unmount failed"; return 1; }
+    if ! ssh_run 1 "apk add --no-cache device-mapper > /dev/null && modprobe dm-delay && modprobe dm-flakey && { dmsetup remove $HOSTILE_DM 2>/dev/null; dmsetup create $HOSTILE_DM --table \"0 \$(blockdev --getsz /dev/vda) linear /dev/vda 0\"; }"; then
+        log_error "VM 1: device-mapper setup failed"
+        return 1
+    fi
+    setup_goclusterfs 1 false "" "/dev/mapper/$HOSTILE_DM"
+}
+
+hostile_writers_start() {
+    local vm
+    for vm in 1 2; do
+        ssh_run "$vm" "rm -f /tmp/hostile.stop /tmp/hostile.acked; nohup sh -c 'i=0; while [ ! -e /tmp/hostile.stop ]; do i=\$((i+1)); n=h$vm-\$i; if echo \$n > ${GOCLUSTERFS_MOUNT}/\$n 2>/dev/null; then echo \$n >> /tmp/hostile.acked; fi; sleep 0.1; done' < /dev/null > /dev/null 2>&1 &"
+    done
+}
+
+hostile_writers_stop() {
+    ssh_run 1 "touch /tmp/hostile.stop" || true
+    ssh_run 2 "touch /tmp/hostile.stop" || true
+    sleep 8
+}
+
+# Every file either node acknowledged must read back on VM $1 with its name as its content.
+hostile_check_acked() {
+    local reader=$1 vm acked bad result=0
+    for vm in 1 2; do
+        acked=$(ssh_run "$vm" "cat /tmp/hostile.acked 2>/dev/null" | wc -l)
+        bad=$(ssh_run "$vm" "cat /tmp/hostile.acked 2>/dev/null" | ssh_run "$reader" "n=0; while read f; do [ \"\$(cat ${GOCLUSTERFS_MOUNT}/\$f 2>/dev/null)\" = \"\$f\" ] || { n=\$((n+1)); [ \$n -le 5 ] && echo \"  \$f missing or wrong\" >&2; }; done; echo \$n")
+        log_info "VM $vm acknowledged $acked files; $bad of them are missing or wrong on VM $reader"
+        if [[ "$acked" -eq 0 || "$bad" != 0 ]]; then
+            result=1
+        fi
+    done
+    return $result
+}
+
+hostile_replayed_since() {
+    sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
+}
+
+# Unmounts both nodes, removes the device-mapper device, checks the disk with fsck -repair then fsck, and remounts both.
+hostile_fsck_and_restore() {
+    local result=0 out rc
+    if [[ -n "$(mount_pids 1)" ]]; then
+        unmount_goclusterfs 1 || crash_goclusterfs 1 || true
+    fi
+    ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove $HOSTILE_DM" || true
+    if [[ -n "$(mount_pids 2)" ]]; then
+        unmount_goclusterfs 2 || { log_error "VM 2: unmount failed"; result=1; }
+    fi
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -repair /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    log_info "fsck -repair exit $rc, $(echo "$out" | grep -c 'leaked') leaked-block lines"
+    echo "$out" | grep '^\[' | grep -v leaked | head -10
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck /dev/vda 2>&1; echo rc=\$?")
+    rc=${out##*rc=}
+    if [[ "$rc" != 0 ]]; then
+        echo "$out" | grep '^\[' | head -20
+        log_error "fsck after repair: exit $rc"
+        result=1
+    fi
+    setup_goclusterfs 1 false || result=1
+    setup_goclusterfs 2 false || result=1
+    return $result
+}
+
+# Runs one scenario: $1 names it, $2 is a function that disturbs VM 1's path,
+# and $3 is "survives" when VM 1 must keep running unreplayed or "fenced" when
+# it must stop and VM 2 must replay it.
+hostile_scenario() {
+    local name=$1 disturb=$2 expect=$3 result=0
+    hostile_setup || return 1
+    local marker="hostile: $name $(date +%s)"
+    mark_vm_logs "$marker"
+    hostile_writers_start
+    sleep 5
+    "$disturb"
+    sleep 5
+    hostile_writers_stop
+    if [[ "$expect" == fenced ]]; then
+        local waited=0
+        while ! hostile_replayed_since "$marker" && [[ $waited -lt 90 ]]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if ! hostile_replayed_since "$marker"; then
+            log_error "VM 2 did not replay VM 1 within 90s"
+            result=1
+        fi
+        if [[ -n "$(mount_pids 1)" ]]; then
+            log_error "VM 1 is still mounted after it lost its path for longer than the heartbeat timeout"
+            result=1
+        fi
+    else
+        if hostile_replayed_since "$marker"; then
+            log_error "VM 2 declared VM 1 dead although VM 1 was only slowed"
+            result=1
+        fi
+        if [[ -z "$(mount_pids 1)" ]]; then
+            log_error "VM 1 stopped although its path recovered"
+            sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|WARN' | head -10
+            result=1
+        fi
+    fi
+    hostile_check_acked 2 || result=1
+    hostile_fsck_and_restore || result=1
+    return $result
+}
+
+hostile_delay_spikes() {
+    local ms
+    for ms in 100 500 1000 2000; do
+        log_info "VM 1 path: ${ms}ms per I/O for 15s"
+        hostile_dm_load "delay /dev/vda 0 $ms" || return 1
+        sleep 15
+    done
+    hostile_dm_load "linear /dev/vda 0"
+}
+
+hostile_stall() {
+    log_info "VM 1 path: stalled for ${HOSTILE_STALL}s"
+    ssh_run 1 "dmsetup suspend $HOSTILE_DM"
+    sleep "$HOSTILE_STALL"
+    ssh_run 1 "dmsetup resume $HOSTILE_DM"
+}
+
+hostile_eio() {
+    log_info "VM 1 path: every I/O fails with EIO for ${HOSTILE_EIO}s"
+    hostile_dm_load "error" || return 1
+    sleep "$HOSTILE_EIO"
+    hostile_dm_load "linear /dev/vda 0"
+}
+
+hostile_flaky() {
+    log_info "VM 1 path: 1s of EIO every 4s, for 40s"
+    hostile_dm_load "flakey /dev/vda 0 3 1" || return 1
+    sleep 40
+    hostile_dm_load "linear /dev/vda 0"
+}
+
+test_storage_latency_spikes() { hostile_scenario "latency spikes" hostile_delay_spikes survives; }
+test_storage_short_stalls() {
+    HOSTILE_STALL=5 hostile_scenario "5s stall" hostile_stall survives || return 1
+    HOSTILE_STALL=12 hostile_scenario "12s stall" hostile_stall survives
+}
+test_storage_long_stall() { HOSTILE_STALL=30 hostile_scenario "30s stall" hostile_stall fenced; }
+test_storage_short_eio() { HOSTILE_EIO=2 hostile_scenario "2s of EIO" hostile_eio survives; }
+test_storage_long_eio() { HOSTILE_EIO=10 hostile_scenario "10s of EIO" hostile_eio fenced; }
+test_storage_flaky_eio() { hostile_scenario "flaky EIO" hostile_flaky survives; }
+
+# A node that never mounted the volume, with its clock 2 minutes ahead, must
+# take a free slot, not the slot of a node that is mounted and alive.
+test_clock_ahead_mount() {
+    ensure_cluster_healthy 2 || return 1
+    unmount_goclusterfs 2 || { log_error "VM 2: unmount failed"; return 1; }
+    local marker="hostile: clock ahead $(date +%s)" result=0
+    mark_vm_logs "$marker"
+    ssh_run 2 "hostname newnode; date -u -s '$(date -u -d @$(( $(date +%s) + 120 )) '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    setup_goclusterfs 2 false || result=1
+    sleep 5
+    local slot1 slot2
+    slot1=$(grep -o 'Registered as node [0-9]*' "$(get_vm_mount_log 1)" | tail -1)
+    slot2=$(sed -n "/$marker/,\$p" "$(get_vm_mount_log 2)" | grep -o 'Registered as node [0-9]*' | tail -1)
+    log_info "VM 1: $slot1; VM 2 with its clock 2 minutes ahead: $slot2"
+    if [[ -z "$(mount_pids 1)" ]]; then
+        log_error "VM 1 stopped after VM 2 mounted with a fast clock"
+        sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|slot' | head -5
+        result=1
+    fi
+    if [[ "$slot1" == "$slot2" ]]; then
+        log_error "VM 2 took VM 1's registry slot"
+        result=1
+    fi
+    ssh_run 2 "hostname localhost; date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    if [[ -z "$(mount_pids 1)" ]]; then
+        ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
+        setup_goclusterfs 1 false || result=1
+    fi
+    unmount_goclusterfs 2 || crash_goclusterfs 2 || true
+    setup_goclusterfs 2 false || result=1
+    return $result
+}
+
+# A node whose clock jumped 3 minutes ahead and then crashed must still be
+# replayed within the usual failover time.
+test_clock_ahead_crash_recovered() {
+    ensure_cluster_healthy 2 || return 1
+    local marker="hostile: clock ahead crash $(date +%s)" result=0 waited=0
+    mark_vm_logs "$marker"
+    ssh_run 1 "date -u -s '$(date -u -d @$(( $(date +%s) + 180 )) '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    sleep 3
+    crash_goclusterfs 1 || result=1
+    while ! hostile_replayed_since "$marker" && [[ $waited -lt 60 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! hostile_replayed_since "$marker"; then
+        log_error "VM 2 did not replay crashed VM 1 within 60s; VM 1's clock was 3 minutes ahead"
+        result=1
+    else
+        log_info "VM 2 replayed VM 1 ${waited}s after the crash"
+    fi
+    ssh_run 1 "date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null; fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
+    setup_goclusterfs 1 false || result=1
+    return $result
+}
+
 # A power failure while files are written may leave blocks that no file maps.
 # With every node unmounted, fsck -repair frees any it finds, the check after
 # it is clean, and no file changes.
@@ -3316,8 +3609,9 @@ restart_and_expect_only_leaks() {
         fi
     done
 
+    # Snapshots of files earlier tests deleted are orphans, which is not damage.
     out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
-    problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]')
+    problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
     if echo "$problems" | grep -v -e '^$' -e 'leaked' -e 'will never be freed' -e 'unnamed: no directory names it' -e 'belongs to no snapshot' | grep -q .; then
         log_error "fsck after the power failure found more than leaks:"
         echo "$problems" | head -20 >&2
@@ -3326,10 +3620,10 @@ restart_and_expect_only_leaks() {
     if [[ -n "$problems" ]]; then
         log_info "fsck found $(echo "$problems" | wc -l) leaks; repairing"
         ssh_run 1 "$fsck -repair /dev/vda > /dev/null 2>&1"
-        out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
-        if echo "$out" | grep -qE '^ *\[(WARN|ERROR)\]'; then
+        out=$(ssh_run 1 "$fsck /dev/vda 2>&1" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
+        if [[ -n "$out" ]]; then
             log_error "fsck after repair still finds problems:"
-            echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | head -20 >&2
+            echo "$out" | head -20 >&2
             return 1
         fi
     fi
@@ -3661,6 +3955,7 @@ test_snapshot_delete_after_overwrite() {
 
     ssh_run 1 "rm -f $file"
     ssh_run 1 "head -c 2097152 /dev/urandom > $file" || return 1
+    sleep "$RESERVE_IDLE_RETURN_SECS"
     free_before=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
     ssh_run 1 "setfattr -n user.snapshot -v snap_delete_temp $file" || {
         log_error "snapshot failed"
@@ -3911,6 +4206,7 @@ main() {
     run_test "Concurrent File Creation" test_concurrent_file_creation
     run_test "VM Kill Recovery" test_vm_kill_recovery
     run_test "Journal Recovery Multi-Node" test_journal_recovery_multinode
+    run_test "Reserve Returned After Crash" test_reserve_returned_after_crash
     run_test "Restart Keeps Peer Journal" test_restart_keeps_peer_journal
     run_test "Journal Recovery Multiple Files" test_journal_recovery_multiple_files
     run_test "Journal Recovery Large File" test_journal_recovery_large_file
@@ -3962,6 +4258,14 @@ main() {
     run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure
     run_test "TRIM Reuse Power Failure" test_trim_reuse_power_failure
     run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
+    run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
+    run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
+    run_test "Hostile: Long Storage Stall" test_storage_long_stall
+    run_test "Hostile: Short EIO Burst" test_storage_short_eio
+    run_test "Hostile: Long EIO Burst" test_storage_long_eio
+    run_test "Hostile: Flaky EIO" test_storage_flaky_eio
+    run_test "Hostile: Clock Ahead Mount" test_clock_ahead_mount
+    run_test "Hostile: Clock Ahead Crash Recovered" test_clock_ahead_crash_recovered
 
     # Summary
     log_info "=========================================="

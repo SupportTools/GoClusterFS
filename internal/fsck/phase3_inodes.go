@@ -67,6 +67,8 @@ type InodeData struct {
 	ExtentDepth    uint32
 	ExtentTreeGen  uint64
 
+	BirthGeneration uint64
+
 	// Checksum
 	Checksum uint32
 }
@@ -160,6 +162,7 @@ func (c *Checker) checkInodes() error {
 
 			usedInodes++
 			c.inodeUsed[inodeNum] = true
+			c.inodeBirth[inodeNum] = inode.BirthGeneration
 
 			// Validate inode number matches position
 			if inode.InodeNum != inodeNum {
@@ -272,6 +275,7 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 	inode.ExtentCount = binary.LittleEndian.Uint64(buf[176:184])
 	inode.ExtentDepth = binary.LittleEndian.Uint32(buf[184:188])
 	inode.ExtentTreeGen = binary.LittleEndian.Uint64(buf[188:196])
+	inode.BirthGeneration = binary.LittleEndian.Uint64(buf[196:204])
 
 	// Checksum (last 4 bytes)
 	inode.Checksum = binary.LittleEndian.Uint32(buf[252:256])

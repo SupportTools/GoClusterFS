@@ -1,0 +1,6 @@
+go test fuzz v1
+byte('9')
+byte('H')
+bool(true)
+byte('\x03')
+[]byte("8200200082")

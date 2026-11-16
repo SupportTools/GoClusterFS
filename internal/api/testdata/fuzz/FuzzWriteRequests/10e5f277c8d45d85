@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('\x01')
+string("api/v1/admin/flush-journal")
+bool(true)
+string("0")
+string("A++++++++++++++ ")
+[]byte("")

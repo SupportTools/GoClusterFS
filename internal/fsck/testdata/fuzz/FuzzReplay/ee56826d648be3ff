@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("091109A108110100")
+byte('A')
+[]byte("0")

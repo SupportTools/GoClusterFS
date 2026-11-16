@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("921\x03")
+byte('p')
+[]byte("0")

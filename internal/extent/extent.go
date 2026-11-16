@@ -103,6 +103,9 @@ type Manager struct {
 // snapshot or clone goes back to the bitmap only after its last owner frees it.
 func (m *Manager) SetRefcounts(refs *refcount.Region) {
 	m.refs = refs
+	if refs != nil {
+		refs.SetAllocationGuard(m.bitmap)
+	}
 }
 
 // NewManager creates a new extent manager. dataOffset is the device offset of

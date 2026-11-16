@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -656,7 +657,7 @@ func BenchmarkFree(b *testing.B) {
 }
 
 func BenchmarkFreeCountFullBitmap(b *testing.B) {
-	const sectors = 256 // the 1MB bitmap region cmd/mount reserves
+	const sectors = 256 // the 1MB bitmap region goclusterfs-mount reserves
 	dev, cleanup := createTestDevice(b, sectors*SectorSize)
 	defer cleanup()
 
@@ -680,5 +681,94 @@ func BenchmarkIsFree(b *testing.B) {
 		if _, err := region.IsFree(uint64(i % 10000)); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// FreeIf frees the blocks the caller picks, keeps the rest, and skips blocks
+// already free; HoldAllocated reports only allocated blocks.
+func TestFreeIfAndHoldAllocated(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	var uuid [16]byte
+	region := NewRegion(dev, 0, 1000, nil, uuid)
+	ctx := context.Background()
+	blocks, err := region.Alloc(ctx, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.Free(ctx, blocks[3]); err != nil {
+		t.Fatal(err)
+	}
+
+	allocated, release, err := region.HoldAllocated(ctx, blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if want := blocks[:3]; !slices.Equal(allocated, want) {
+		t.Errorf("HoldAllocated = %v, want %v", allocated, want)
+	}
+
+	pick := map[uint64]bool{blocks[0]: true, blocks[2]: true, blocks[3]: true}
+	kept, err := region.FreeIf(ctx, blocks, func([]uint64) func(uint64) bool {
+		return func(b uint64) bool { return pick[b] }
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint64{blocks[1]}; !slices.Equal(kept, want) {
+		t.Errorf("FreeIf kept %v, want %v", kept, want)
+	}
+	for i, b := range blocks {
+		free, err := region.IsFree(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := i != 1; free != want {
+			t.Errorf("block %d free = %v, want %v", b, free, want)
+		}
+	}
+}
+
+// A reserve whose second sector write fails ends its record and then restores
+// the first sector, so no picked block stays allocated. If the record cannot be
+// ended, it writes the failed sector again and keeps the blocks.
+func TestReserveRestoresSectorsWhenAWriteFails(t *testing.T) {
+	for _, endErr := range []error{nil, errors.New("journal failed")} {
+		dev, cleanup := createTestDevice(t, 10<<20)
+		var uuid [16]byte
+		region := NewRegion(dev, 0, BitsPerSector+100, nil, uuid)
+		ctx := context.Background()
+		if _, err := region.Alloc(ctx, BitsPerSector-8); err != nil {
+			t.Fatal(err)
+		}
+		free := region.FreeCount()
+		failed := false
+		dev.SetWriteGate(func(offset int64) error {
+			if offset == SectorSize && !failed {
+				failed = true
+				return errors.New("injected write error")
+			}
+			return nil
+		})
+		ended := false
+		blocks, err := region.Reserve(ctx, 16, func([]uint64) bool { return true }, func() error {
+			ended = true
+			return endErr
+		})
+		if !ended {
+			t.Fatalf("end error %v: Reserve did not end the record after the failed sector write", endErr)
+		}
+		want, wantBlocks := free, 0
+		if endErr != nil {
+			want, wantBlocks = free-16, 16
+		}
+		if (err == nil) != (endErr != nil) || len(blocks) != wantBlocks {
+			t.Errorf("end error %v: Reserve returned %d blocks, error %v", endErr, len(blocks), err)
+		}
+		if got := region.FreeCount(); got != want {
+			t.Errorf("end error %v: %d free blocks after the failed reserve, want %d", endErr, got, want)
+		}
+		cleanup()
 	}
 }

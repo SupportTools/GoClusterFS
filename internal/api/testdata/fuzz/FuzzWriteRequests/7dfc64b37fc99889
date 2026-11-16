@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('\x02')
+string("api/v1/snapshots/\xe1\xe1\xda\xda\xda\xda\xda\xda\xcb\xcb\xcb\xcb\xcb\xcb\xcb\xcb0")
+bool(true)
+string("%\x95")
+string("")
+[]byte("0")

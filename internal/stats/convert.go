@@ -54,13 +54,17 @@ func dirIndexInfo(d dir.IndexStats) *api.DirIndexInfo {
 }
 
 func lockResponse(l lock.Stats) *api.LockStatsResponse {
-	return &api.LockStatsResponse{
+	r := &api.LockStatsResponse{
 		HintCacheHits:    l.HintHits,
 		HintCacheMisses:  l.HintMisses,
 		HintCacheHitRate: hitRate(l.HintHits, l.HintMisses),
 		ActiveLocks:      l.Held,
 		PendingLocks:     l.Waiting,
 	}
+	for _, t := range l.Types {
+		r.Types = append(r.Types, api.LockTypeStats{Type: t.Name, Acquires: t.Acquires, Blocked: t.Blocked, WaitSeconds: t.Wait.Seconds()})
+	}
+	return r
 }
 
 func journalResponse(j journal.JournalStats) *api.JournalStatsResponse {

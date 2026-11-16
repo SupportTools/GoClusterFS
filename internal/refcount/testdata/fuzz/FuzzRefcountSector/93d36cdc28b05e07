@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('£')
+bool(false)
+[]byte("0")
+[]byte("11y1000y11y1y10001y1")

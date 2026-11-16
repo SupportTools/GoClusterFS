@@ -20,21 +20,28 @@ import (
 
 // Ops implements api.FileService for the filesystem mounted at a directory.
 type Ops struct {
-	root     string
-	registry *snapshot.Registry
+	root  string
+	snaps Snapshots
 	// checkRoot refuses a root that is not the mounted filesystem.
 	checkRoot func(fd int) error
 }
 
+// Snapshots is the filesystem's snapshot registry, which knows the file each snapshot was taken of.
+type Snapshots interface {
+	AllSnapshots(ctx context.Context) ([]snapshot.Entry, error)
+	FileSnapshots(ctx context.Context, inodeNum uint32) ([]*snapshot.Descriptor, error)
+	DeleteOrphanSnapshot(ctx context.Context, name string) error
+}
+
 // New returns Ops for the mount at root, which must already be mounted.
-// registry is nil when snapshots are off.
-func New(root string, registry *snapshot.Registry) *Ops {
+// snaps is nil when snapshots are off.
+func New(root string, snaps Snapshots) *Ops {
 	var st unix.Stat_t
 	dev := uint64(0)
 	if unix.Stat(root, &st) == nil {
 		dev = uint64(st.Dev)
 	}
-	return &Ops{root: root, registry: registry, checkRoot: func(fd int) error { return isOurMount(fd, dev) }}
+	return &Ops{root: root, snaps: snaps, checkRoot: func(fd int) error { return isOurMount(fd, dev) }}
 }
 
 // isOurMount refuses a root that is no longer this FUSE mount, for example a
@@ -64,26 +71,33 @@ func sameDevice(fd int, dev uint64) error {
 
 var _ api.FileService = (*Ops)(nil)
 
-// ListSnapshots returns every snapshot, or only those of the file at p.
+// ListSnapshots returns every snapshot, marking those whose file is gone, or only those of the file at p.
 func (o *Ops) ListSnapshots(ctx context.Context, p string) ([]api.SnapshotInfo, error) {
-	if o.registry == nil {
+	if o.snaps == nil {
 		return nil, fmt.Errorf("snapshots are %w (-snapshots=false)", api.ErrDisabled)
 	}
-	var descs []*snapshot.Descriptor
-	var err error
+	var entries []snapshot.Entry
 	if p == "" {
-		descs, err = o.registry.List(ctx)
+		var err error
+		if entries, err = o.snaps.AllSnapshots(ctx); err != nil {
+			return nil, err
+		}
 	} else {
-		var st unix.Stat_t
-		if st, err = o.stat(p); err == nil {
-			descs, err = o.registry.ListForInode(ctx, uint32(st.Ino))
+		st, err := o.stat(p)
+		if err != nil {
+			return nil, err
+		}
+		descs, err := o.snaps.FileSnapshots(ctx, uint32(st.Ino))
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range descs {
+			entries = append(entries, snapshot.Entry{Descriptor: d})
 		}
 	}
-	if err != nil {
-		return nil, err
-	}
-	out := make([]api.SnapshotInfo, 0, len(descs))
-	for _, d := range descs {
+	out := make([]api.SnapshotInfo, 0, len(entries))
+	for _, e := range entries {
+		d := e.Descriptor
 		info := api.SnapshotInfo{
 			ID:        d.SnapshotID,
 			Name:      d.GetName(),
@@ -91,6 +105,7 @@ func (o *Ops) ListSnapshots(ctx context.Context, p string) ([]api.SnapshotInfo, 
 			State:     d.State.String(),
 			SizeBytes: d.TotalSize,
 			Blocks:    d.TotalBlocks,
+			Orphan:    e.Orphan,
 		}
 		if d.CreateTime > 0 {
 			info.CreatedAt = time.Unix(d.CreateTime, 0).UTC().Format(time.RFC3339)
@@ -108,10 +123,17 @@ func (o *Ops) CreateSnapshot(_ context.Context, p, name string) error {
 	return o.setxattr(p, "user.snapshot", name)
 }
 
-// DeleteSnapshot does what setfattr -n user.snapshot.delete -v name does.
-func (o *Ops) DeleteSnapshot(_ context.Context, p, name string) error {
+// DeleteSnapshot does what setfattr -n user.snapshot.delete -v name does. Without p it deletes a snapshot whose file
+// is gone.
+func (o *Ops) DeleteSnapshot(ctx context.Context, p, name string) error {
 	if name == "" || strings.ContainsRune(name, '\x00') {
 		return fmt.Errorf("%w: snapshot name %q", api.ErrInvalidPath, name)
+	}
+	if p == "" {
+		if o.snaps == nil {
+			return fmt.Errorf("snapshots are %w (-snapshots=false)", api.ErrDisabled)
+		}
+		return o.snaps.DeleteOrphanSnapshot(ctx, name)
 	}
 	return o.setxattr(p, "user.snapshot.delete", name)
 }

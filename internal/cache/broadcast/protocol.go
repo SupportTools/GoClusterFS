@@ -58,6 +58,9 @@ const (
 
 	// TypePeerAnnounce announces a node's presence and IP address.
 	TypePeerAnnounce MessageType = 5
+
+	// TypeReturnReserves asks peers to give their reserved blocks back to the bitmap.
+	TypeReturnReserves MessageType = 6
 )
 
 // String returns a human-readable message type name.
@@ -73,6 +76,8 @@ func (t MessageType) String() string {
 		return "Heartbeat"
 	case TypePeerAnnounce:
 		return "PeerAnnounce"
+	case TypeReturnReserves:
+		return "ReturnReserves"
 	default:
 		return fmt.Sprintf("Unknown(%d)", t)
 	}
@@ -405,6 +410,18 @@ func (b *MessageBuilder) InvalidateAll() *Message {
 	return &Message{
 		Version:    ProtocolVersion,
 		Type:       TypeInvalidateAll,
+		Flags:      FlagUrgent,
+		SenderUUID: b.senderUUID,
+		Sequence:   b.seqGen.Next(),
+		Timestamp:  time.Now().UnixNano(),
+	}
+}
+
+// ReturnReserves creates a request for peers to give back their reserved blocks.
+func (b *MessageBuilder) ReturnReserves() *Message {
+	return &Message{
+		Version:    ProtocolVersion,
+		Type:       TypeReturnReserves,
 		Flags:      FlagUrgent,
 		SenderUUID: b.senderUUID,
 		Sequence:   b.seqGen.Next(),

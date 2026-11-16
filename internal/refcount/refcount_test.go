@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -587,13 +590,13 @@ func TestShareAndRelease(t *testing.T) {
 		return e.RefCount
 	}
 
-	if err := region.Share(ctx, blocks); err != nil {
+	if _, err := region.Share(ctx, blocks); err != nil {
 		t.Fatal(err)
 	}
 	if got := count(3); got != 2 {
 		t.Fatalf("first share of a new block: count %d, want 2", got)
 	}
-	if err := region.Share(ctx, blocks[:1]); err != nil {
+	if _, err := region.Share(ctx, blocks[:1]); err != nil {
 		t.Fatal(err)
 	}
 	if got := count(3); got != 3 {
@@ -979,7 +982,7 @@ func TestBlocksPastRegionLeaveTheNextRegionAlone(t *testing.T) {
 	if _, err := region.Increment(ctx, first); !errors.Is(err, ErrBlockPastRegion) {
 		t.Errorf("Increment(%d) = %v, want ErrBlockPastRegion", first, err)
 	}
-	if err := region.Share(ctx, []uint64{first - 1, last}); !errors.Is(err, ErrBlockPastRegion) {
+	if _, err := region.Share(ctx, []uint64{first - 1, last}); !errors.Is(err, ErrBlockPastRegion) {
 		t.Errorf("Share(%d, %d) = %v, want ErrBlockPastRegion", first-1, last, err)
 	}
 	if err := region.Set(ctx, last, 2, 0); !errors.Is(err, ErrBlockPastRegion) {
@@ -1104,5 +1107,87 @@ func BenchmarkScan(b *testing.B) {
 		if _, err := region.Scan(ctx); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Node A frees a block with no count under the bitmap lock while node B shares
+// it. B's Share waits for the bitmap lock and then skips the freed block, so no
+// free block keeps a count.
+func TestShareWaitsForUncountedFree(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 32<<20)
+	defer cleanup()
+	const blocks = 1000
+	node := func(slot int) (*lock.Manager, *bitmap.Region, *Region) {
+		var uuid [16]byte
+		copy(uuid[:], "test-node-uuid0")
+		uuid[15] = byte('0' + slot)
+		mgr := lock.NewManager(dev, 16<<20, 10<<20, uuid, slot)
+		bm := bitmap.NewRegion(dev, 1<<20, blocks, mgr, uuid)
+		refs := NewRegion(dev, 0, SizeForBlocks(blocks), blocks, mgr)
+		refs.SetAllocationGuard(bm)
+		return mgr, bm, refs
+	}
+	_, bmA, refsA := node(0)
+	mgrB, _, refsB := node(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	got, err := bmA.Alloc(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := got[0]
+	type result struct {
+		counted []uint64
+		err     error
+	}
+	shared := make(chan result, 1)
+	kept, err := bmA.FreeIf(ctx, []uint64{b}, func(bs []uint64) func(uint64) bool {
+		uncounted := refsA.Uncounted(bs)
+		go func() {
+			counted, err := refsB.Share(ctx, []uint64{b})
+			shared <- result{counted, err}
+		}()
+		for mgrB.Stats().Waiting == 0 {
+			select {
+			case r := <-shared:
+				shared <- r
+				return uncounted
+			case <-time.After(time.Millisecond):
+			}
+		}
+		return uncounted
+	})
+	if err != nil || len(kept) != 0 {
+		t.Fatalf("FreeIf kept %v, err %v; want the uncounted block freed", kept, err)
+	}
+	r := <-shared
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if len(r.counted) != 0 {
+		t.Errorf("Share counted %v, a block freed while it waited", r.counted)
+	}
+	if e, err := refsA.GetUnlocked(b); err != nil || e != (Entry{}) {
+		t.Errorf("freed block %d: entry %+v (err=%v), want no count", b, e, err)
+	}
+}
+
+// Share takes the refcount lock and then the bitmap lock, so taking them the
+// other way round must be refused, or a free and a share could deadlock.
+func TestReleaseRefusedUnderBitmapLock(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 32<<20)
+	defer cleanup()
+	var uuid [16]byte
+	copy(uuid[:], "test-node-uuid00")
+	mgr := lock.NewManager(dev, 16<<20, 10<<20, uuid, 0)
+	refs := NewRegion(dev, 0, SizeForBlocks(1000), 1000, mgr)
+	ctx := context.Background()
+	if err := mgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mgr.Release(lock.LockTypeBlockBitmap, 0) }()
+	if _, err := refs.Release(ctx, []uint64{1}); !errors.Is(err, lock.ErrDeadlockRisk) {
+		t.Fatalf("Release under the bitmap lock: %v, want ErrDeadlockRisk", err)
 	}
 }

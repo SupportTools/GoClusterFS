@@ -87,9 +87,13 @@ func TestCacheResponseReportsHitRatesAsFractions(t *testing.T) {
 }
 
 func TestLockAndJournalResponses(t *testing.T) {
-	l := lockResponse(lock.Stats{Held: 3, Waiting: 2, HintHits: 1, HintMisses: 3})
+	l := lockResponse(lock.Stats{Held: 3, Waiting: 2, HintHits: 1, HintMisses: 3,
+		Types: []lock.TypeStats{{Name: "bitmap", Acquires: 5, Blocked: 2, Wait: 1500 * time.Millisecond}}})
 	if l.ActiveLocks != 3 || l.PendingLocks != 2 || l.HintCacheHitRate != 0.25 {
 		t.Errorf("lockResponse = %+v", *l)
+	}
+	if len(l.Types) != 1 || l.Types[0] != (api.LockTypeStats{Type: "bitmap", Acquires: 5, Blocked: 2, WaitSeconds: 1.5}) {
+		t.Errorf("lockResponse types = %+v", l.Types)
 	}
 
 	j := journalResponse(journal.JournalStats{State: journal.JournalStateDirty, CommitCount: 4, BytesWritten: 8192, AvailableSpace: 100})

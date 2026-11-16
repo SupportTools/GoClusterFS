@@ -179,8 +179,10 @@ export class ApiClient {
   }
 
   // Deletion finishes in the background: the snapshot lists as "deleting" until the worker frees it.
-  deleteSnapshot(name: string, path: string): Promise<WriteResponse> {
-    return this.send('DELETE', `/api/v1/snapshots/${encodeURIComponent(name)}?path=${encodeURIComponent(path)}`)
+  // Without a path it deletes only an orphan, and answers 409 if the snapshot's file still exists.
+  deleteSnapshot(name: string, path?: string): Promise<WriteResponse> {
+    const query = path ? `?path=${encodeURIComponent(path)}` : ''
+    return this.send('DELETE', `/api/v1/snapshots/${encodeURIComponent(name)}${query}`)
   }
 
   cloneSnapshot(name: string, request: CloneRequest): Promise<WriteResponse> {
@@ -209,7 +211,7 @@ export const api = {
   getClusterStats: (options?: RequestOptions) => apiClient.getClusterStats(options),
   listSnapshots: (path?: string, options?: RequestOptions) => apiClient.listSnapshots(path, options),
   createSnapshot: (request: SnapshotRequest) => apiClient.createSnapshot(request),
-  deleteSnapshot: (name: string, path: string) => apiClient.deleteSnapshot(name, path),
+  deleteSnapshot: (name: string, path?: string) => apiClient.deleteSnapshot(name, path),
   cloneSnapshot: (name: string, request: CloneRequest) => apiClient.cloneSnapshot(name, request),
   cloneFile: (request: CloneRequest) => apiClient.cloneFile(request),
   admin: (operation: AdminOperation) => apiClient.admin(operation),

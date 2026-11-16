@@ -33,7 +33,7 @@ func leakBlock(t *testing.T, fsys *FS) {
 }
 
 // deleteWithTimedOutFree removes name as Unlink does, but its block free gives
-// up on a refcount lock another node holds, as it does after the 30s lock-wait
+// up on the bitmap and refcount locks another node holds, as it does after the 30s lock-wait
 // limit. Unlink detaches from its caller's context, so it would wait the full 30s.
 func deleteWithTimedOutFree(t *testing.T, fsys *FS, name string) {
 	t.Helper()
@@ -63,16 +63,20 @@ func deleteWithTimedOutFree(t *testing.T, fsys *FS, name string) {
 	copy(otherUUID[:], "othernode1234567")
 	otherUUID[15] = byte(slot)
 	other := lock.NewManager(fsys.dev, sb.LockBitmapOffset, sb.LockBitmapSize, otherUUID, slot)
-	if err := other.Acquire(ctx, lock.LockTypeRefCount, 0, lock.LockModeExclusive); err != nil {
-		t.Fatal(err)
+	for _, typ := range []lock.LockType{lock.LockTypeRefCount, lock.LockTypeBlockBitmap} {
+		if err := other.Acquire(ctx, typ, 0, lock.LockModeExclusive); err != nil {
+			t.Fatal(err)
+		}
 	}
 	expired, cancel := context.WithCancel(ctx)
 	cancel()
 	if err := fsys.extentMgr.Delete(expired, ino); err != nil {
 		t.Fatalf("delete %s: %v", name, err)
 	}
-	if err := other.Release(lock.LockTypeRefCount, 0); err != nil {
-		t.Fatal(err)
+	for _, typ := range []lock.LockType{lock.LockTypeBlockBitmap, lock.LockTypeRefCount} {
+		if err := other.Release(typ, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := fsys.inodeTbl.Free(ctx, ino.InodeNum); err != nil {
 		t.Fatal(err)

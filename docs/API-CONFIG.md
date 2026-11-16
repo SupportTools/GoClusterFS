@@ -25,26 +25,28 @@ These are the `goclusterfs-mount` flags:
 
 | Flag | Type | Description |
 |------|------|-------------|
-| `-device` | string | Path to block device or image file |
-| `-mount` | string | Mount point directory |
+| `-device` | string | Block device, or image file on a filesystem that supports O_DIRECT |
+| `-mount` | string | Directory to mount the filesystem on |
 
 ### General Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-format` | bool | `false` | Format the device (destroys all data) |
+| `-format` | bool | `false` | Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first |
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
 | `-debug` | bool | `false` | Print `[DEBUG]` log lines |
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
+| `-completion` | string | (empty) | Print a `bash` or `zsh` completion script and exit |
+| `-preflight` | bool | `false` | Check FUSE, the device (O_DIRECT, filesystem), the mount point, the broadcast ports and the API address; print `PASS`, `WARN` or `FAIL` with a fix for each, change nothing, and exit 8 if a check fails |
 
 ### Cache Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-cache-strict` | bool | `false` | Enable strict cache mode (always validate against disk) |
-| `-cache-ttl` | duration | `5s` | Cache entry TTL before revalidation required |
-| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries |
+| `-cache-strict` | bool | `false` | Check every cached inode against the device before using it; slower, but other nodes' changes show at once |
+| `-cache-ttl` | duration | `5s` | How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost |
+| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries; `stat` and `ls` can show another node's change this late, while opening a file always sees it |
 | `-cache-inodes` | int | `10000` | Most inodes the inode cache holds, about 480 bytes each (5 MB). `0` turns it off |
 | `-cache-extents` | int | `50000` | Most block mappings the extent cache holds, about 120 bytes each (6 MB). `0` turns it off |
 | `-cache-negative` | int | `1000` | Most not-found inode lookups the negative cache holds, about 40 bytes each. `0` turns it off |
@@ -52,7 +54,7 @@ These are the `goclusterfs-mount` flags:
 
 Each cache splits its limit evenly over 16 shards, so it holds a multiple of 16 entries: `-cache-negative 1000` holds 992, and a limit from 1 to 15 holds 16. A full cache drops the entry used longest ago.
 
-The kernel caches file attributes and directory entries for `-attr-timeout`. For that long after another node changes a file, `stat` and path lookups on this node can return the old size. Opening a file reads its inode from disk and makes the kernel fetch its size again, so a read after `open` sees the other node's completed writes. Reads through a file that is already open use the inode cache and can use the old size and block mappings for up to `-cache-ttl`, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
+The kernel caches file attributes and directory entries for `-attr-timeout`. For that long after another node changes a file, `stat` and path lookups on this node can return the old size. Opening a file reads its inode from disk and makes the kernel fetch its size again, so a read after `open` sees the other node's completed writes. Reads through a file that is already open use the inode cache. Each time the kernel rechecks the file's attributes, every `-attr-timeout` while the file is read, the mount refreshes that cache from disk, so an open file sees another node's completed writes within about twice `-attr-timeout` (2s at the default), even when broadcast messages are lost. Until then it can use the old size and block mappings, including a block that another node has since freed and reused for other data. With broadcast enabled, writes and directory changes invalidate peers' caches sooner; truncate, fallocate and unlink do not.
 
 `-attr-timeout=0` makes `stat` and path lookups always current, but each `stat` and path step is then a lookup that reads the directory's and the file's inodes from disk: about 0.7 ms per `stat` on the test host, against well under 0.1 ms from the kernel cache.
 
@@ -60,28 +62,29 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-journal` | bool | `true` | Enable write-ahead journal for crash consistency |
+| `-journal` | bool | `true` | Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only |
 | `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data) |
+| `-block-reserve` | int | `64` | Data blocks each node takes from the bitmap at once and hands out to writes without the cluster-wide bitmap lock; `0` turns reserves off. Needs `-journal`. See [Block Reserves](OPERATIONS.md#block-reserves) |
 
 ### Network Broadcast Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-broadcast` | bool | `true` | Enable network cache invalidation |
-| `-mcast-group` | string | `239.192.74.75` | Multicast group IP address |
-| `-mcast-port` | int | `31337` | UDP port for multicast |
+| `-broadcast` | bool | `true` | Send and receive cache invalidations over UDP so other nodes see changes sooner; correctness does not depend on it |
+| `-mcast-group` | string | `239.192.74.75` | Multicast group for broadcast messages; the same on every node |
+| `-mcast-port` | int | `31337` | UDP port for multicast messages; the same on every node |
 | `-unicast-port` | int | `31338` | UDP port for unicast; must differ from `-mcast-port` |
-| `-broadcast-secret` | string | (empty) | HMAC secret for message authentication |
-| `-broadcast-iface` | string | (auto) | Network interface for multicast |
+| `-broadcast-secret` | string | (empty) | Secret that signs broadcast messages, the same on every node; visible to local users in `ps`. Empty leaves them unauthenticated |
+| `-broadcast-iface` | string | (empty) | Network interface for multicast; empty lets the kernel choose |
 | `-broadcast-max-peers` | int | `256` | Most nodes the unicast peer table and the lost-message tracking hold. When either is full, the node heard from longest ago is dropped |
 
 ### TRIM Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-trim` | bool | `true` | Enable batched TRIM/BLKDISCARD |
-| `-trim-batch` | int | `256` | Number of blocks per TRIM batch |
-| `-trim-age` | duration | `5s` | Maximum age before forcing TRIM flush |
+| `-trim` | bool | `true` | Discard freed blocks on the device (`BLKDISCARD`) in batches; does nothing on image files |
+| `-trim-batch` | int | `256` | Freed blocks to collect before a discard |
+| `-trim-age` | duration | `5s` | Longest a freed block waits for its discard |
 
 ### Feature Flags
 
@@ -118,13 +121,14 @@ Each mount on a host needs its own `-api-addr`. When the port is taken, mount lo
 
 These endpoints change the filesystem or this node's state, and listing snapshots reads filesystem metadata. They only work with a token, also on loopback: the Host check stops web pages, not other local processes. Without a token they answer 403, and mount logs `API: snapshot, clone and admin endpoints are off`. The API refuses cross-origin writes: a CORS preflight for any method but `GET` or `HEAD` fails, and a write whose `Origin` header names another site gets 403. Same-origin pages and non-browser clients can call them.
 
-Snapshots belong to single files. A request names the file by its path in the mount, such as `/dir/file`. The path must be absolute and clean, and may not go through a symlink or out of the mount. Snapshot names are unique in the filesystem. The API creates and clones only names without `:`, `/` or NUL, because `user.snapshot.clone` splits at the first `:`. It deletes any name; escape `/` as `%2F` in the URL.
+Snapshots belong to single files. A snapshot stays with the file it was taken of: once that file is deleted, the snapshot is an orphan, which only the full listing shows and only a delete without `path` removes. A later file that reuses the inode number does not see it. Snapshots written by versions before this record cannot prove their file, so they are orphans too. A request names the file by its path in the mount, such as `/dir/file`. The path must be absolute and clean, and may not go through a symlink or out of the mount. Snapshot names are unique in the filesystem. The API creates and clones only names without `:`, `/` or NUL, because `user.snapshot.clone` splits at the first `:`. It deletes any name; escape `/` as `%2F` in the URL.
 
 | Method and path | Body | Does the same as | Success |
 |-----------------|------|------------------|---------|
-| `GET /api/v1/snapshots[?path=/f]` | | Reads the snapshot registry: every snapshot, or the file's, as `getfattr -n user.snapshots` lists them | 200, `{snapshots: [{id, name, inode, state, size_bytes, blocks, created_at}], total}` |
+| `GET /api/v1/snapshots[?path=/f]` | | Reads the snapshot registry: every snapshot, with `orphan: true` on those whose file is gone, or the file's, as `getfattr -n user.snapshots` lists them | 200, `{snapshots: [{id, name, inode, state, size_bytes, blocks, created_at, orphan}], total}` |
 | `POST /api/v1/snapshots` | `{"path": "/f", "name": "s1"}` | `setfattr -n user.snapshot -v s1 f` | 201 |
 | `DELETE /api/v1/snapshots/s1?path=/f` | | `setfattr -n user.snapshot.delete -v s1 f` | 200 |
+| `DELETE /api/v1/snapshots/s1` | | Deletes an orphan: a snapshot whose file is gone | 200; 409 if its file exists |
 | `POST /api/v1/snapshots/s1/clone` | `{"path": "/f", "dest": "/copy"}` | `setfattr -n user.snapshot.clone -v s1:/copy f` | 201 |
 | `POST /api/v1/clones` | `{"path": "/f", "dest": "/copy"}` | `setfattr -n user.clone -v /copy f` | 201 |
 | `POST /api/v1/admin/flush-journal` | | Checkpoints the journal now | 200 |
@@ -139,7 +143,7 @@ Mount logs each write at INFO with the client address, the action, its arguments
 
 ### Web Dashboard
 
-Mount serves a web dashboard at `http://<api-addr>/ui/`, unless `-dashboard=false`. It shows status, capacity, the cache, journal, TRIM and lock counters, and the nodes in the registry. It lists snapshots, and for a file you name it creates, clones and deletes them and clones the file. Its Settings page runs the admin endpoints.
+Mount serves a web dashboard at `http://<api-addr>/ui/`, unless `-dashboard=false`. It shows status, capacity, the cache, journal, TRIM and lock counters, and the nodes in the registry. It lists snapshots, and for a file you name it creates, clones and deletes them and clones the file. Orphaned snapshots, whose file is gone, get a list of their own where you can delete them. Its Settings page runs the admin endpoints.
 
 The dashboard's files are static and hold no data, so they need no token and skip the rate limit. The page calls `/api/v1/...` on the same origin with the same rules as any client: reads need the token when one is set, and snapshots always need it. Enter the token on the dashboard's Settings page. The browser keeps it in `sessionStorage`, so closing the tab forgets it. Responses carry a `Content-Security-Policy` that lets the page load and call only its own origin and stops other sites from framing it.
 
@@ -158,12 +162,12 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks) and `max_peers` `dir_index` has `dirs` and `entries` (names) held, `limit`, `hits` (lookups an index answered), `misses`, `rebuilds` (full reads of a directory) and `hit_rate`. |
 | `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
 | `/api/v1/stats/trim` | `trim_enabled`, false with `-trim=false` or after the device refused a discard as unsupported (image files always do). With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges, plus flushes skipped because the freed blocks could not be reserved), `last_trim_at` and `batch_size` |
-| `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate`, which are always 0 |
+| `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate`, which are always 0, and `types`: per lock type (`bitmap`, `refcount`, `inode`, ...), the `acquires` served, the `blocked` acquires whose first try found the lock taken, and their `wait_seconds` |
 | `/api/v1/stats/cluster` | This node's `node_id` (UUID in hex), `node_address` (hostname), `state`, `last_heartbeat_at` and `joined_at`; `cluster_size` (registered nodes); `healthy_nodes` (active with a heartbeat under 10 seconds old); and `peers`, each with `node_id`, `address` (hostname), `state` and `last_seen`. A state is `active`, `leaving`, `dead`, or `stale` when the heartbeat is over 10 seconds old and no node has declared it dead yet. `role` is always `peer`: there is no leader |
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
 | `/api/v1/stats/all` | `collected_at` and every section above except `sfb` |
 
-`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*`, `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
+`/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*` (including `lock_acquires_total`, `lock_blocked_total` and `lock_wait_seconds_total`, labeled by lock `type`), `reserve_blocks`, `reserve_refills_total`, `reserve_returns_total`, `reserve_peer_waits_total` and `reserve_peer_wait_seconds_total` (with block reserves on), `cluster_size`, `cluster_healthy_nodes` and `cluster_is_leader` (always 0). `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
 ---
 

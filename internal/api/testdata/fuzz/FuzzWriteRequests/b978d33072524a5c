@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('\x02')
+string("api/v1/sZ,\"shX")
+bool(true)
+string("")
+string("9")
+[]byte("")

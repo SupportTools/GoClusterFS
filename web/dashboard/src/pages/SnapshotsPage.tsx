@@ -158,11 +158,66 @@ function FileForm({ path, onChange }: { path: string; onChange: (path: string) =
   )
 }
 
+function OrphanSnapshots({ orphans, onDelete }: { orphans: SnapshotInfo[]; onDelete: (snapshot: SnapshotInfo) => void }) {
+  return (
+    <div className="card space-y-3">
+      <div>
+        <h2 className="card-header mb-1">Orphaned snapshots ({orphans.length})</h2>
+        <p className="text-sm text-gfs-text-muted">
+          The file each of these was taken of is gone, or it was taken by an older version that did not record its file.
+          No file lists them and they can't be cloned, but they keep their blocks until you delete them.
+        </p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full">
+          <thead className="bg-gfs-bg-tertiary">
+            <tr>
+              <PlainHeader label="Name" />
+              <PlainHeader label="State" />
+              <PlainHeader label="Size" />
+              <PlainHeader label="Blocks" />
+              <PlainHeader label="Created" />
+              <PlainHeader label="Old inode" />
+              <PlainHeader label="Actions" />
+            </tr>
+          </thead>
+          <tbody>
+            {orphans.map((snapshot) => (
+              <tr key={snapshot.id} className="border-b border-gfs-border last:border-0">
+                <td className="px-4 py-3 text-sm font-medium text-gfs-text-primary">{snapshot.name}</td>
+                <td className="px-4 py-3">
+                  <StateBadge state={snapshot.state} />
+                </td>
+                <td className="px-4 py-3 text-sm text-gfs-text-secondary">{formatBytes(snapshot.size_bytes)}</td>
+                <td className="px-4 py-3 text-sm text-gfs-text-secondary">{formatNumber(snapshot.blocks)}</td>
+                <td className="px-4 py-3 text-sm text-gfs-text-muted">
+                  {snapshot.created_at ? formatRelativeTime(new Date(snapshot.created_at)) : '-'}
+                </td>
+                <td className="px-4 py-3 text-sm font-mono text-gfs-text-muted">{snapshot.inode}</td>
+                <td className="px-4 py-3 text-sm">
+                  <button
+                    disabled={snapshot.state !== 'active'}
+                    onClick={() => onDelete(snapshot)}
+                    className="text-gfs-status-error hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
+                  >
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
 type Dialog =
   | { kind: 'create' }
   | { kind: 'clone-file' }
   | { kind: 'clone-snapshot'; snapshot: SnapshotInfo }
   | { kind: 'delete'; snapshot: SnapshotInfo }
+  | { kind: 'delete-orphan'; snapshot: SnapshotInfo }
 
 export function SnapshotsPage() {
   const refreshInterval = useRefreshInterval()
@@ -185,7 +240,7 @@ export function SnapshotsPage() {
   }
 
   const rows = useMemo(() => {
-    const list = snapshots.data?.snapshots ?? []
+    const list = (snapshots.data?.snapshots ?? []).filter((s) => !s.orphan)
     const query = search.toLowerCase()
     const filtered = query ? list.filter((s) => s.name.toLowerCase().includes(query)) : [...list]
     filtered.sort((a, b) => {
@@ -211,6 +266,8 @@ export function SnapshotsPage() {
 
   const closeDialog = () => setDialog(null)
   const list = snapshots.data?.snapshots ?? []
+  const owned = list.filter((s) => !s.orphan)
+  const orphans = list.filter((s) => s.orphan)
   const totalSize = list.reduce((sum, s) => sum + s.size_bytes, 0)
 
   return (
@@ -291,82 +348,90 @@ export function SnapshotsPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
-            <input
-              type="text"
-              placeholder="Filter by name..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="px-3 py-1.5 bg-gfs-bg-tertiary border border-gfs-border rounded text-sm text-gfs-text-primary placeholder-gfs-text-muted focus:outline-none focus:ring-2 focus:ring-gfs-accent-primary w-64"
-            />
-            <button onClick={snapshots.refetch} className="text-sm text-gfs-accent-primary hover:underline">
-              Refresh
-            </button>
-            <span className="text-sm text-gfs-text-muted ml-auto">
-              Showing {rows.length} of {list.length}
-            </span>
-          </div>
+          {owned.length > 0 && (
+            <>
+              <div className="flex items-center gap-4">
+                <input
+                  type="text"
+                  placeholder="Filter by name..."
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="px-3 py-1.5 bg-gfs-bg-tertiary border border-gfs-border rounded text-sm text-gfs-text-primary placeholder-gfs-text-muted focus:outline-none focus:ring-2 focus:ring-gfs-accent-primary w-64"
+                />
+                <button onClick={snapshots.refetch} className="text-sm text-gfs-accent-primary hover:underline">
+                  Refresh
+                </button>
+                <span className="text-sm text-gfs-text-muted ml-auto">
+                  Showing {rows.length} of {owned.length}
+                </span>
+              </div>
 
-          <div className="card overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead className="bg-gfs-bg-tertiary">
-                  <tr>
-                    <SortableHeader label="Name" field="name" sort={sortField} direction={sortDirection} onSort={handleSort} />
-                    <SortableHeader label="State" field="state" sort={sortField} direction={sortDirection} onSort={handleSort} />
-                    <SortableHeader label="Size" field="size_bytes" sort={sortField} direction={sortDirection} onSort={handleSort} />
-                    <PlainHeader label="Blocks" />
-                    <SortableHeader label="Created" field="created_at" sort={sortField} direction={sortDirection} onSort={handleSort} />
-                    {path ? <PlainHeader label="Actions" /> : <PlainHeader label="Inode" />}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((snapshot) => (
-                    <tr key={snapshot.id} className="border-b border-gfs-border hover:bg-gfs-bg-tertiary/50 transition-colors">
-                      <td className="px-4 py-3 text-sm font-medium text-gfs-text-primary">{snapshot.name}</td>
-                      <td className="px-4 py-3">
-                        <StateBadge state={snapshot.state} />
-                      </td>
-                      <td className="px-4 py-3 text-sm text-gfs-text-secondary">{formatBytes(snapshot.size_bytes)}</td>
-                      <td className="px-4 py-3 text-sm text-gfs-text-secondary">{formatNumber(snapshot.blocks)}</td>
-                      <td className="px-4 py-3 text-sm text-gfs-text-muted">
-                        {snapshot.created_at ? formatRelativeTime(new Date(snapshot.created_at)) : '-'}
-                      </td>
-                      {path ? (
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-3 text-sm">
-                            <button
-                              disabled={snapshot.state !== 'active'}
-                              onClick={() => setDialog({ kind: 'clone-snapshot', snapshot })}
-                              className="text-gfs-accent-primary hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
-                            >
-                              Clone
-                            </button>
-                            <button
-                              disabled={snapshot.state !== 'active'}
-                              onClick={() => setDialog({ kind: 'delete', snapshot })}
-                              className="text-gfs-status-error hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
-                            >
-                              Delete
-                            </button>
-                          </div>
-                        </td>
-                      ) : (
-                        <td className="px-4 py-3 text-sm font-mono text-gfs-text-muted">{snapshot.inode}</td>
+              <div className="card overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead className="bg-gfs-bg-tertiary">
+                      <tr>
+                        <SortableHeader label="Name" field="name" sort={sortField} direction={sortDirection} onSort={handleSort} />
+                        <SortableHeader label="State" field="state" sort={sortField} direction={sortDirection} onSort={handleSort} />
+                        <SortableHeader label="Size" field="size_bytes" sort={sortField} direction={sortDirection} onSort={handleSort} />
+                        <PlainHeader label="Blocks" />
+                        <SortableHeader label="Created" field="created_at" sort={sortField} direction={sortDirection} onSort={handleSort} />
+                        {path ? <PlainHeader label="Actions" /> : <PlainHeader label="Inode" />}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((snapshot) => (
+                        <tr key={snapshot.id} className="border-b border-gfs-border hover:bg-gfs-bg-tertiary/50 transition-colors">
+                          <td className="px-4 py-3 text-sm font-medium text-gfs-text-primary">{snapshot.name}</td>
+                          <td className="px-4 py-3">
+                            <StateBadge state={snapshot.state} />
+                          </td>
+                          <td className="px-4 py-3 text-sm text-gfs-text-secondary">{formatBytes(snapshot.size_bytes)}</td>
+                          <td className="px-4 py-3 text-sm text-gfs-text-secondary">{formatNumber(snapshot.blocks)}</td>
+                          <td className="px-4 py-3 text-sm text-gfs-text-muted">
+                            {snapshot.created_at ? formatRelativeTime(new Date(snapshot.created_at)) : '-'}
+                          </td>
+                          {path ? (
+                            <td className="px-4 py-3">
+                              <div className="flex items-center gap-3 text-sm">
+                                <button
+                                  disabled={snapshot.state !== 'active'}
+                                  onClick={() => setDialog({ kind: 'clone-snapshot', snapshot })}
+                                  className="text-gfs-accent-primary hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
+                                >
+                                  Clone
+                                </button>
+                                <button
+                                  disabled={snapshot.state !== 'active'}
+                                  onClick={() => setDialog({ kind: 'delete', snapshot })}
+                                  className="text-gfs-status-error hover:underline disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </td>
+                          ) : (
+                            <td className="px-4 py-3 text-sm font-mono text-gfs-text-muted">{snapshot.inode}</td>
+                          )}
+                        </tr>
+                      ))}
+                      {rows.length === 0 && (
+                        <tr>
+                          <td colSpan={6} className="px-4 py-8 text-center text-gfs-text-muted">
+                            No snapshots match the filter
+                          </td>
+                        </tr>
                       )}
-                    </tr>
-                  ))}
-                  {rows.length === 0 && (
-                    <tr>
-                      <td colSpan={6} className="px-4 py-8 text-center text-gfs-text-muted">
-                        No snapshots match the filter
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </>
+          )}
+
+          {orphans.length > 0 && (
+            <OrphanSnapshots orphans={orphans} onDelete={(snapshot) => setDialog({ kind: 'delete-orphan', snapshot })} />
+          )}
         </>
       )}
 
@@ -437,6 +502,31 @@ export function SnapshotsPage() {
             await api.cloneSnapshot(dialog.snapshot.name, { path, dest })
             setNotice(`Cloned snapshot ${dialog.snapshot.name} to ${dest}.`)
           }}
+        />
+      )}
+
+      {dialog?.kind === 'delete-orphan' && (
+        <ConfirmDeleteModal
+          key={dialog.snapshot.id}
+          isOpen
+          onClose={closeDialog}
+          onConfirm={async () => {
+            try {
+              await api.deleteSnapshot(dialog.snapshot.name)
+            } catch (err) {
+              if (err instanceof ApiError && err.status === 409) {
+                throw new Error('Its file still exists, so it is not an orphan. Delete it from that file\'s snapshots.')
+              }
+              throw err
+            }
+            snapshots.refetch()
+          }}
+          title="Delete orphaned snapshot"
+          itemName={dialog.snapshot.name}
+          itemType="snapshot"
+          warning="The snapshot and the blocks only it holds are freed. Its file is gone, so nothing else can reach them. This cannot be undone."
+          successMessage="Delete started. The snapshot shows as deleting until its blocks are freed."
+          requireTypeToConfirm
         />
       )}
 

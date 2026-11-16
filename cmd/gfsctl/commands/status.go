@@ -28,7 +28,7 @@ Examples:
 }
 
 func init() {
-	statusCmd.Flags().BoolVarP(&statusWatch, "watch", "w", false, "Enable watch mode for live updates")
+	statusCmd.Flags().BoolVarP(&statusWatch, "watch", "w", false, "Refresh the output every --interval until interrupted (default false)")
 	statusCmd.Flags().DurationVarP(&statusInterval, "interval", "i", 2*time.Second, "Refresh interval for watch mode")
 	rootCmd.AddCommand(statusCmd)
 }

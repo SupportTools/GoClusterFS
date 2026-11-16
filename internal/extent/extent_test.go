@@ -1566,7 +1566,7 @@ func TestFreeKeepsSharedBlocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := refs.Share(env.ctx, blocks); err != nil {
+	if _, err := refs.Share(env.ctx, blocks); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1663,7 +1663,7 @@ func TestConcurrentInlineCopyOnWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.write(src)
-	if err := refs.Share(env.ctx, []uint64{old}); err != nil {
+	if _, err := refs.Share(env.ctx, []uint64{old}); err != nil {
 		t.Fatal(err)
 	}
 	snap := env.newInode()

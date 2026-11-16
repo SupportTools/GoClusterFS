@@ -310,6 +310,21 @@ func TestTokenInQueryIsIgnored(t *testing.T) {
 	}
 }
 
+// The dashboard deletes orphans, whose file is gone, by leaving out ?path=.
+func TestDeleteWithoutPathReachesTheService(t *testing.T) {
+	srv, files, _ := startWriteServer(t, "secret")
+	if status, body := call(t, srv, "DELETE", "/api/v1/snapshots/s1", "secret", ""); status != http.StatusOK {
+		t.Fatalf("delete without a path: %d %s", status, body)
+	}
+	if got := files.lastCall(); got != "delete  s1" {
+		t.Fatalf("service got %q, want an empty path", got)
+	}
+	files.err = fmt.Errorf("snapshot %q belongs to inode 12: %w", "s1", syscall.EBUSY)
+	if status, body := call(t, srv, "DELETE", "/api/v1/snapshots/s1", "secret", ""); status != http.StatusConflict {
+		t.Fatalf("delete of a snapshot whose file exists: %d %s, want 409", status, body)
+	}
+}
+
 func TestDeleteTakesEscapedNames(t *testing.T) {
 	srv, files, _ := startWriteServer(t, "secret")
 	if status, body := call(t, srv, "DELETE", "/api/v1/snapshots/nightly%2F2026%3A1?path=/f", "secret", ""); status != http.StatusOK {

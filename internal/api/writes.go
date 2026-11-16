@@ -52,6 +52,8 @@ type SnapshotInfo struct {
 	SizeBytes uint64 `json:"size_bytes"`
 	Blocks    uint64 `json:"blocks"`
 	CreatedAt string `json:"created_at,omitempty"`
+	// Orphan marks a snapshot whose file is gone, or that cannot prove which file it was taken of.
+	Orphan bool `json:"orphan,omitempty"`
 }
 
 // SnapshotListResponse is returned by GET /api/v1/snapshots.

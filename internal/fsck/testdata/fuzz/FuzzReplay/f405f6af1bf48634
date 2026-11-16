@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("A0")
+byte('\x18')
+[]byte("")

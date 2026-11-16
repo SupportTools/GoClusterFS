@@ -500,6 +500,74 @@ scenarios:
       docker: run-tests.sh::test_network_partition
       vm: run-vm-tests.sh::test_network_partition
 
+  - id: open-file-growth-without-broadcast
+    name: Open file reads growth without broadcast
+    description: A node with broadcast off and a long cache TTL holds a file open while another node grows it; once stat shows the new size, a read at the new end returns the data
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeOpenFileSeesGrowthWithoutBroadcast
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  # Staleness under network faults. Each test has node 1 rewrite a file while
+  # node 2 reads it through an open handle, node 3 stats it and node 4 opens it
+  # afresh, and checks how late each sees every version. Integration tests run
+  # every node in one network namespace, so tc and iptables cannot fault one
+  # node's traffic there.
+  - id: staleness-packet-loss
+    name: Staleness under packet loss
+    description: 30% loss on the writer's traffic; open, stat and fresh-open reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_packet_loss
+      vm: TODO
+
+  - id: staleness-duplication-reordering
+    name: Staleness under duplication and reordering
+    description: 30% duplicated and 50% reordered writer traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_duplication_and_reordering
+      vm: TODO
+
+  - id: staleness-delay
+    name: Staleness under delay
+    description: Writer traffic delayed 0 to 2 seconds; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_delay
+      vm: TODO
+
+  - id: staleness-one-way-partition
+    name: Staleness under a one-way partition
+    description: The reader hears nothing from the writer, which still hears the reader; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_one_way_partition
+      vm: TODO
+
+  - id: staleness-multicast-dropped
+    name: Staleness with multicast dropped
+    description: The reader drops all multicast while unicast works; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_multicast_dropped
+      vm: TODO
+
+  - id: staleness-flood-under-loss
+    name: Staleness during an invalidation flood under loss
+    description: A third node floods invalidations while the writer and reader lose 10% of their traffic; reads stay within their staleness bounds
+    priority: docker_only
+    environments:
+      go: SKIPPED
+      docker: run-tests.sh::test_staleness_flood_under_loss
+      vm: TODO
+
   - id: rolling-restart
     name: Rolling restart
     description: Nodes can be restarted one at a time
@@ -670,6 +738,119 @@ scenarios:
       go: lock_reclaim_test.go::TestStalledNodesWritesStopAtWriteGate
       docker: TODO  # needs SIGSTOP and SIGCONT on one container's mount process with a writer through it; covered in Go and VM
       vm: run-vm-tests.sh::test_stalled_node_writes_stop_at_write_gate
+
+  - id: hostile-storage-latency-spikes
+    name: Storage latency spikes on one node
+    description: One node's path to the shared disk takes 100ms, 500ms, 1s and 2s per I/O for 15s each while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      go: internal/node/clock_skew_test.go::TestSlowRegistryReadsDoNotStarveHeartbeat
+      vm: run-vm-tests.sh::test_storage_latency_spikes
+
+  - id: clock-ahead-mount-keeps-live-slot
+    name: A node with a fast clock does not take a live node's slot
+    description: A node that never mounted the volume mounts with its clock 2 minutes ahead; it takes a free slot, and the mounted node keeps running
+    priority: high
+    environments:
+      go: internal/node/clock_skew_test.go::TestRegisterLeavesLiveSlotOfNodeWithSlowClock
+      docker: TODO  # containers share the host clock; covered in Go and VM
+      vm: run-vm-tests.sh::test_clock_ahead_mount
+
+  - id: clock-ahead-crash-replayed
+    name: A crashed node with a fast clock is replayed on time
+    description: A node whose clock is 3 minutes ahead crashes; its peer replays it within the usual failover time, judging silence on its own clock
+    priority: high
+    environments:
+      go: internal/node/clock_skew_test.go::TestCrashedNodeWithFastClockIsReplayed
+      docker: TODO  # containers share the host clock; covered in Go and VM
+      vm: run-vm-tests.sh::test_clock_ahead_crash_recovered
+
+  - id: register-takes-empty-slot-first
+    name: Register takes an empty slot before another host's silent one
+    description: A mount takes an empty slot without waiting, and leaves another host's slot whose heartbeat looks old to failure detection unless -skip-recovery names it or no slot is empty
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesEmptySlotBeforeAnotherHostsSilentOne
+
+  - id: register-takes-named-slot-under-recovery-once-lapsed
+    name: A named slot under recovery is taken once its lease lapses
+    description: -skip-recovery naming a slot that another node marked dead takes it only after its recovery lease stays unrenewed for the lease term
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesNamedSlotUnderRecoveryOnlyOnceItsLeaseLapses
+
+  - id: register-takes-back-earlier-boot-slot
+    name: A rebooted host takes back its slot
+    description: A mount takes back the slot its hostname held in an earlier kernel boot, once the slot's heartbeat proves silent, before any empty slot, so it replays that journal before serving
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterTakesBackSlotOfItsEarlierBoot
+      vm: run-vm-tests.sh::test_fsck_repair_after_power_failure
+
+  - id: register-leaves-watched-slot-that-changes
+    name: Register leaves a watched slot that changed
+    description: A slot Register watched stay silent is not taken if a peer marks it dead or its node beats again before the claim
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRegisterLeavesWatchedSlotThatChanges
+
+  - id: renewed-lease-held-whatever-clock
+    name: A renewed recovery lease is held whatever the replayer's clock
+    description: A lease unchanged past recoveryLease counts as lapsed; once the replayer renews it, peers count it as held although its start time is 2 minutes in the past
+    priority: go_only
+    environments:
+      go: internal/node/clock_skew_test.go::TestRenewedRecoveryLeaseIsHeldWhateverTheReplayersClock
+
+  - id: hostile-storage-short-stalls
+    name: Short storage stalls on one node
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_stalls
+
+  - id: hostile-storage-long-stall
+    name: Long storage stall fences the node
+    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_stall
+
+  - id: hostile-storage-short-eio
+    name: Short EIO burst on one node
+    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_short_eio
+
+  - id: hostile-storage-long-eio
+    name: Long EIO burst fences the node
+    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_long_eio
+
+  - id: hostile-storage-flaky-eio
+    name: Flaky EIO on one node
+    description: One node's path fails every I/O for 1s in every 4s, for 40s; the node keeps running, every acknowledged file reads back, and fsck finds nothing but leaks
+    priority: vm_only  # needs a device-mapper device under one node's mount
+    environments:
+      vm: run-vm-tests.sh::test_storage_flaky_eio
+
+  - id: partitioned-nodes-fall-back-to-cache-ttl
+    name: Partitioned nodes fall back to the cache TTL
+    description: Two nodes with different broadcast secrets receive none of each other's messages; each sees the other's creates, overwrites, growth, new directories, deletes and concurrent writes within the cache TTL plus the attribute timeout, and fsck is clean
+    priority: high
+    environments:
+      go: partition_test.go::TestPartitionedNodesFallBackToCacheTTL
+      docker: TODO  # would need per-container broadcast secrets in the compose file; covered on host mounts
+      vm: SKIPPED  # VMs share one user-mode network address and never exchange broadcasts
+
+  - id: one-failed-write-keeps-acknowledged-results
+    name: One failed write keeps acknowledged results
+    description: One device write fails with EIO in a workload that creates, writes, overwrites, truncates and unlinks; by default the last inode write of each step with a crash after it, and the first and last write to each region with the node running on (GOCLUSTERFS_EIO_SWEEP=metadata or full for more). Every acknowledged result holds, and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestOneFailedWriteKeepsAcknowledgedResults
 
   - id: lock-adopt-owner
     name: Replaying node takes over a dead node's exclusive locks
@@ -984,6 +1165,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/cross_node_recovery_test.go::TestApplyExtentAddSkipsChangedInode
+
+  - id: replay-keeps-inode-written-during-it
+    name: Replay keeps an inode written while it runs
+    description: Another goroutine on the replaying node writes the inode between the replay's read and its write; the replay skips the record instead of overwriting that write
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayKeepsInodeWrittenDuringIt
 
   - id: dir-entry-replay-skips-removed-parent
     name: Directory entry replay skips a removed parent
@@ -1515,6 +1703,34 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/record_order_test.go::TestRecoverReplaysVersion1Journal
+
+  - id: snapshot-stays-with-its-file
+    name: A snapshot stays with the file it was taken of
+    description: A file is snapshotted and deleted, and a new file takes its inode slot; the new file lists, clones and deletes none of the old file's snapshots, which fsck reports as orphans
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotStaysWithItsFile
+
+  - id: orphan-snapshot-listed-and-deletable
+    name: Orphan snapshots are listed and deleted without their file
+    description: The full listing marks a deleted file's snapshot as an orphan and the new file's as not; only the orphan can be deleted without a file
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestOrphanSnapshotListedAndDeletable
+
+  - id: snapshot-without-birth-is-orphan
+    name: A snapshot without its file's birth generation is an orphan
+    description: A descriptor as older versions wrote it cannot prove which file it belongs to; the file does not list it, the full listing marks it an orphan, and fsck reports it
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotWithoutBirthIsOrphan
+
+  - id: snapshot-descriptor-target-birth
+    name: A snapshot descriptor keeps its file's birth generation
+    description: A descriptor read back from disk belongs to its file and to no other inode number or birth generation
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestDescriptorKeepsTargetBirth
 
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
@@ -2249,6 +2465,48 @@ scenarios:
     environments:
       go: internal/lock/type_records_test.go::TestLockTypesHaveTheirOwnRecords
 
+  - id: lock-stats-blocked-acquires
+    name: Lock stats count blocked acquires per type
+    description: An acquire that waits for another node's hold counts as blocked for its lock type with at least the time it waited; one that finds the lock free counts only as an acquire. /metrics exports these as goclusterfs_lock_acquires_total, blocked_total and wait_seconds_total by type
+    priority: go_only
+    environments:
+      go: internal/lock/lock_test.go::TestStatsCountBlockedAcquires
+
+  - id: share-waits-for-uncounted-free
+    name: Share waits for a free of an uncounted block
+    description: Node A frees a block with no count under the bitmap lock while node B shares it; B's Share waits for the bitmap lock, skips the freed block, and no free block keeps a count
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestShareWaitsForUncountedFree
+
+  - id: bitmap-free-if
+    name: Bitmap frees chosen blocks in one hold
+    description: FreeIf frees the blocks the caller picks, keeps the rest and skips blocks already free; HoldAllocated reports only allocated blocks
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestFreeIfAndHoldAllocated
+
+  - id: unshared-delete-no-refcount-lock
+    name: Deleting unshared files skips the refcount lock
+    description: Deleting files no snapshot or clone shared frees their blocks with one bitmap lock hold per file and no refcount lock
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestDeletingUnsharedFilesTakesNoRefcountLock
+
+  - id: release-refused-under-bitmap-lock
+    name: Refcount lock refused under the bitmap lock
+    description: Share takes the refcount lock and then the bitmap lock, so the lock-order checker refuses the refcount lock to a goroutine holding the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_test.go::TestReleaseRefusedUnderBitmapLock
+
+  - id: counted-frees-and-shares-across-nodes
+    name: Clone deletes and clones on two nodes
+    description: Node B clones a file while node A deletes the previous clone, 20 rounds; neither waits on the other, every block of the deleted clones is freed, and the source's counts come back to 1
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestCountedFreesAndSharesAcrossNodes
+
   - id: locks-no-wait-other-types
     name: Locks never wait on records of another type
     description: With one node holding a lock in every inode record, another node takes locks of every other type without waiting
@@ -2982,6 +3240,358 @@ scenarios:
     environments:
       go: internal/journal/journal_fuzz_test.go::FuzzJournalScan
 
+  - id: fuzz-journal-replay
+    name: Fuzz journal replay
+    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s; every error fsck then finds names an inode or block the records touched or one those map
+    priority: go_only
+    environments:
+      go: internal/fsck/replay_fuzz_test.go::FuzzReplay
+
+  - id: fuzz-lock-row
+    name: Fuzz lock claim rows
+    description: Rows of valid, torn and checksum-passing garbage claims; a live write claim or torn slot always conflicts, an empty row never does, a released registry slot never blocks, and AdoptOwner and ClearForeignClaims write only their own slot
+    priority: go_only
+    environments:
+      go: internal/lock/slots_fuzz_test.go::FuzzLockRow
+
+  - id: fuzz-registry-slot
+    name: Fuzz node registry slots
+    description: A slot decodes only with a valid checksum or when all zero, round-trips, agrees with its lease expiry, and registry reads report no node in the empty slots around it
+    priority: go_only
+    environments:
+      go: internal/node/registry_fuzz_test.go::FuzzRegistrySlot
+
+  - id: fuzz-refcount-sector
+    name: Fuzz refcount sectors
+    description: Refcount operations over a fuzzed sector match a model, and a sector that fails its checksum refuses them all and stays unchanged on disk
+    priority: go_only
+    environments:
+      go: internal/refcount/refcount_fuzz_test.go::FuzzRefcountSector
+
+  - id: fuzz-dir-chunk
+    name: Fuzz directory chunks
+    description: Entries walkChunk returns fit their records and the chunk; chunkRoom agrees with what addToChunk can place; add and remove keep every other live entry
+    priority: go_only
+    environments:
+      go: internal/dir/dir_fuzz_test.go::FuzzDirChunk
+
+  - id: fuzz-sfb-container
+    name: Fuzz SFB containers from older builds
+    description: Freeing a slot clears exactly its bit in a valid container header or leaves the sector unchanged, and reading a slot never panics, whatever header and slot the disk holds
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/sfb_fuzz_test.go::FuzzSFBContainer
+
+  - id: fuzz-api-writes
+    name: Fuzz API write requests
+    description: A request reaches the file or admin service only with the token, from the same origin, by POST or DELETE, with a body of at most 64 KB, and with exactly the fields of one strict JSON object; API responses are JSON
+    priority: go_only
+    environments:
+      go: internal/api/writes_fuzz_test.go::FuzzWriteRequests
+
+  - id: fuzz-fileops-paths
+    name: Fuzz API file paths
+    description: Paths, snapshot names and clone destinations pass only the forms the checks promise, a snapshot clone value splits back into its name and destination, and an accepted path opens exactly the file it names under the mount root
+    priority: go_only
+    environments:
+      go: internal/fileops/fileops_fuzz_test.go::FuzzFileOpsPaths
+
+  - id: reserve-unused-later-uses
+    name: Unused reserved blocks exclude later uses
+    description: Blocks a pending reserve record holds count as unused unless a later record maps or uses them, completed or not; a use logged before the record does not count
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestReservedUnusedSubtractsLaterUses
+
+  - id: reserve-unused-completed
+    name: Completed reserve records free nothing
+    description: A completed reserve record frees nothing, and after a reserve is renewed only the renewed record's blocks count
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestReservedUnusedIgnoresCompletedReserves
+
+  - id: reserve-used-then-freed
+    name: Replay keeps a reserved block that was used and freed
+    description: A reserved block a write used and a truncate freed, which another node may hold since, is not freed by replay
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestReservedUnusedKeepsUsedThenFreedBlock
+
+  - id: reserve-released-once
+    name: Replay frees unused reserved blocks once
+    description: Recovery passes the unused reserved blocks to release once, after the transactions, then resets the journal
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestRecoverReleasingFreesUnusedReservedOnce
+
+  - id: reserve-complete-stops-replay
+    name: Completing reserves in a crashed journal
+    description: Completing a crashed node's reserve intents in its journal stops replay from freeing their blocks
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteReservesStopsReplayFreeingThem
+
+  - id: block-runs-round-trip
+    name: Block runs round trip
+    description: Reserve and use records store blocks as runs and decode back to the same blocks
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestBlockRunsRoundTrip
+
+  - id: fsck-crashed-reserve
+    name: fsck reports a crashed node's reserve
+    description: fsck reports the blocks a crashed node reserved and never used as reserved, not as leaks, and exits clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_crash_test.go::TestFsckReportsCrashedNodesReserve
+
+  - id: replay-frees-crashed-reserve
+    name: Replay frees a crashed node's unused reserve
+    description: Replaying a crashed node's journal frees the reserved blocks it never used and keeps the one a file maps; fsck is then clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_crash_test.go::TestReplayFreesCrashedNodesUnusedReserve
+
+  - id: fsck-repair-crashed-reserve
+    name: fsck repair frees a crashed reserve once
+    description: fsck -repair -force frees a crashed node's unused reserve and marks it done in the node's journal, so a later replay leaves the blocks alone after another node allocated them
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_crash_test.go::TestFsckRepairFreesCrashedNodesReserveOnce
+
+  - id: reserve-size
+    name: Reserve size and low-space cutoff
+    description: A reserve holds at most the configured size and a sixteenth of the free blocks per node, and none below two reserves per node or 1% of the blocks
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReserveSize
+
+  - id: reserve-return-order
+    name: Reserve return ends its record first
+    description: Giving the reserve back ends its journal record before freeing blocks, so a crash in between leaks rather than double-frees
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestReturnEndsRecordBeforeFreeing
+
+  - id: reserve-return-handed-out
+    name: Block handed back after a return is freed
+    description: Returning the reserve while a write holds one of its blocks ends the record; the block the write later hands back is freed without a record
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestBlockHandedBackAfterReturnIsFreed
+
+  - id: reserve-failed-log
+    name: Failed commit leaves its reserved blocks allocated
+    description: A block whose use commit failed may be mapped on disk, so it goes neither back to the reserve nor to the bitmap
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFailedLogLeavesBlockAllocated
+
+  - id: reserve-failed-end
+    name: Failed record end keeps its blocks
+    description: When ending a reserve record fails, its blocks stay reserved, and a later return ends it and frees them
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFailedEndKeepsBlocks
+
+  - id: reserve-refresh
+    name: Old reserve record is renewed
+    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record and ends; if the old record cannot end, nothing is freed until it does
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefreshRenewsAnOldRecord
+
+  - id: reserve-refresh-handed-out
+    name: Old record of handed-out blocks ends
+    description: A record whose blocks are all handed out ends once it is far behind the tail, so a write stuck on a lock cannot hold the journal head back
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefreshEndsRecordOfHandedOutBlocks
+
+  - id: reserve-used-record-ends
+    name: Fully used reserve record ends
+    description: A record whose blocks were all used ends at the next tidy
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestUsedRecordEnds
+
+  - id: reserve-refill-record-failure
+    name: Refill whose record fails
+    description: A refill whose record hit a full journal marks nothing; any other commit error leaves the blocks allocated, and the transaction is aborted either way
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRefillRecordFailure
+
+  - id: reserve-writers-never-wait-for-bitmap
+    name: Writers never wait for the bitmap lock through the reserve
+    description: TakeReady, Untake, Logged and Stats return while a refill or a return waits for the bitmap lock
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestWritersDoNotWaitForBitmapLock
+
+  - id: reserve-inode-lock-holders-skip-refill
+    name: Inode-lock holders and statfs do not wait for a refill
+    description: While another node holds the bitmap lock and a refill waits for it, statfs and a write holding an inode lock still use the reserve
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestInodeLockHoldersDoNotWaitForRefill
+
+  - id: reserve-peer-requests-coalesce
+    name: Peer return requests coalesce
+    description: A flood of peer requests gives the reserve back at most once per tick while a writer keeps refilling it
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestPeerRequestsCoalesce
+
+  - id: reserve-statfs-own-reserve
+    name: Statfs counts the node's own reserve as free
+    description: A one-block write lowers statfs by one block although it took a whole reserve from the bitmap
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestStatfsCountsOwnReserveAsFree
+
+  - id: bitmap-reserve-restores-on-write-failure
+    name: Failed reserve sector write ends the record, then restores
+    description: A reserve whose second sector write fails ends its record and restores the first sector; if the record cannot end, it writes the failed sector again and keeps the blocks
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestReserveRestoresSectorsWhenAWriteFails
+
+  - id: journal-durable-end-full-ring
+    name: Durable end of the oldest intent in a full ring
+    description: A reserve record that pins a ring too full for a completion record still ends, because the head moves past it; replay then frees none of its blocks and commits work again
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteIntentDurableEndsOldestIntentInFullRing
+
+  - id: journal-failed-head-move
+    name: Failed head move keeps replay whole
+    description: When moving the head past a full ring's oldest intent fails after the head moved in memory, the intent stays ended, the next checkpoint stays consistent and replay runs every pending intent; a retry writes the moved head
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestFailedHeadMoveKeepsReplayWhole
+
+  - id: reserve-journal-full-log
+    name: Journal-full use commit puts blocks back
+    description: A use commit that hit a full journal wrote nothing, so its blocks go back to the reserve
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestJournalFullLogPutsBlockBack
+
+  - id: reserve-free-count-saturates
+    name: Cached free count never wraps
+    description: Subtracting a refill from a free count that already left it out stops at zero
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestFreeCountNeverWraps
+
+  - id: reserve-reopened-record-ends
+    name: Record reopened after a failed refresh ends
+    description: A refresh that fails after a write used a record's last blocks reopens the record, which then ends as fully used
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestRecordReopenedAfterFailedRefreshEnds
+
+  - id: reserve-ends-skip-frees
+    name: Record ends and peer waits never wait for frees
+    description: While a return's free waits for the bitmap lock, tidy, refresh and WaitForPeers (even with endMu held) all finish
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestWaitForPeersAndEndsDoNotWaitForFrees
+
+  - id: journal-durable-intent-completion
+    name: Durable intent completion survives a failed write
+    description: CompleteIntentDurable keeps the intent pending when the completion cannot be written, so a retry writes it and replay skips the intent
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestCompleteIntentDurableRetriesAfterFailure
+
+  - id: reserve-writes
+    name: Writes take blocks from the reserve
+    description: Ten one-block writes take the bitmap lock once, and unmount gives the rest of the reserve back; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestWritesTakeBlocksFromReserve
+
+  - id: reserve-idle-return
+    name: Idle reserve goes back
+    description: A reserve nobody takes from goes back to the bitmap after the idle time
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestIdleReserveGoesBack
+
+  - id: reserve-replay-used-freed-retaken
+    name: Replay keeps a reserved block used, freed and retaken
+    description: Node A writes a reserved block, truncates it and node B allocates it; replaying A's journal frees A's unused reserve and leaves B's block alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsReservedBlockUsedFreedAndRetaken
+
+  - id: reserve-full-waits-for-peers
+    name: Full bitmap waits for peers' reserves
+    description: Node B finds the bitmap full while node A holds a reserve; B asks for it back and its write gets a block instead of ENOSPC
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestFullBitmapWaitsForPeersReserve
+
+  - id: reserve-full-enospc
+    name: Full bitmap without reserves is ENOSPC
+    description: With no blocks in any reserve, a write on a full device fails with ENOSPC after the wait for other nodes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestFullBitmapWithoutReservesIsENOSPC
+
+  - id: reserve-concurrent-writers
+    name: Concurrent writers share a reserve
+    description: Four writers share one reserve while it refills and goes back when idle; every file keeps its data and fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestConcurrentWritersShareReserve
+
+  - id: power-cut-reserve-refill
+    name: Power cut during a reserve refill
+    description: Power fails at every write of a write that takes the first reserve and maps a block; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReserveRefill
+
+  - id: power-cut-write-from-reserve
+    name: Power cut during a write from the reserve
+    description: Power fails at every write of a write that maps a block the reserve holds; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringWriteFromReserve
+
+  - id: power-cut-two-block-reserve
+    name: Power cut during a two-block reserved write
+    description: Power fails at every write of a write that maps two reserved blocks; replay leaves no leaked blocks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringTwoBlockWriteFromReserve
+
+  - id: power-cut-reserve-return
+    name: Power cut during a reserve return
+    description: Power fails at every write of giving the reserve back; files keep their data and fsck finds nothing but leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReserveReturn
+
+  - id: power-cut-reserved-write-copies
+    name: Power cut during a reserved write that copies
+    description: Power fails at every write of a write that maps a reserved block and copies a shared one; the file and its snapshot keep their data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/reserve_power_cut_test.go::TestPowerCutDuringReservedWriteThatCopies
+
+  - id: reserve-returned-after-crash
+    name: Killed node's reserve is returned and its written blocks kept
+    description: A node writes from its block reserve and is killed; the survivor replays its journal, the unused reserved blocks come back, and the written file keeps its data and blocks through later allocations
+    priority: high
+    environments:
+      go: internal/goclusterfs/reserve_test.go::TestReplayKeepsMappedBlocksOfCrashedNodesReserve
+      docker: TODO - Docker kills containers but the harness has no df comparison across nodes; the Go replay test and the VM test cover it
+      vm: run-vm-tests.sh::test_reserve_returned_after_crash
+
   # ===========================================================================
   # DISTRIBUTED LOCK SAFETY (internal/lock)
   # Two or three lock managers share one device to act as separate nodes.
@@ -3264,14 +3874,14 @@ scenarios:
     description: A mount whose own journal replay gives up waiting for another node's lock retries with backoff and replays the transaction once the lock frees
     priority: go_only
     environments:
-      go: cmd/mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
+      go: cmd/goclusterfs-mount/recovery_test.go::TestOwnReplayRetriesWhileAnotherNodeHoldsALock
 
   - id: mount-own-replay-stops-at-bad-record
     name: Mount stops at a journal record that does not decode
     description: Any own-journal replay failure other than a lock wait returns at once without a retry, and mount fails with the -skip-recovery hint
     priority: go_only
     environments:
-      go: cmd/mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
+      go: cmd/goclusterfs-mount/recovery_test.go::TestOwnReplayStopsAtARecordThatDoesNotDecode
 
   - id: registry-occupant-states
     name: Registry reports how each slot's node stands
@@ -3292,7 +3902,7 @@ scenarios:
     description: Register reports the node whose failed slot it took, from any host, so mount keeps that node's lock claims through the replay
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestRegisterReportsPreviousOwnerOfAnyTakenSlot
+      go: internal/node/registry_test.go::TestRegisterTakesAnotherHostsSilentSlotWhenNamedOrNoneIsEmpty
 
   - id: storage-write-gate-refuses-writes
     name: Device write gate refuses writes
@@ -3441,12 +4051,40 @@ scenarios:
     environments:
       go: internal/lock/safety_test.go::TestReleaseCachedFreesHoldsAtOnce
 
+  - id: lock-failed-release-retried
+    name: A failed release write is retried
+    description: A node's write clearing its claim fails once; the node clears it again, and another node gets the record within a few seconds instead of after the first node unmounts
+    priority: go_only
+    environments:
+      go: internal/lock/release_retry_test.go::TestFailedReleaseWriteIsRetried
+
+  - id: snapshot-unreadable-sector-not-rewritten
+    name: An unreadable snapshot registry sector is not rewritten
+    description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
     priority: go_only
     environments:
       go: internal/lock/safety_test.go::TestBusyNodeYieldsCachedRecord
+
+  - id: lock-higher-slot-not-starved
+    name: Higher slot gets a lock a lower slot keeps claiming again
+    description: A lower slot releases a lock and claims it again as soon as its cached hold expires; a higher slot waiting for it still gets it within 2 seconds each time
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestHigherSlotGetsLockFromLowerSlotThatKeepsReclaimingIt
+
+  - id: lock-yield-only-to-live-waiters
+    name: Holder yields only to a live node's waiting mark
+    description: A holder ends its turn early for a waiting mark whose node is alive in the registry, or is fresh without a registry; it ignores marks of failing, replayed or replaced nodes and stale marks
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestHolderYieldsOnlyToLiveWaiters
 
   - id: lock-concurrent-dir-reads-create
     name: Concurrent directory reads do not delay create or unlink
@@ -3747,7 +4385,7 @@ scenarios:
     description: A peer journal replay or broadcast trouble reports degraded with 200; a failing device or corrupt journal reports unhealthy with 503; -journal=false and -broadcast=false stay ok
     priority: go_only
     environments:
-      go: cmd/mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+      go: cmd/goclusterfs-mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
 
   - id: storage-last-error
     name: Device remembers its last I/O failure
@@ -3888,3 +4526,17 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/shutdown_test.go::TestEndedShutdownWatchDoesNotDump
+
+  - id: mount-preflight
+    name: Mount preflight checks
+    description: goclusterfs-mount -preflight reports PASS, WARN or FAIL with a fix for FUSE, fusermount, the mount point, the device, the broadcast ports and the API address, changes nothing, and exits 8 when a check fails
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightNamesAFixForEachFailure
+
+  - id: cli-shell-completions
+    name: Shell completions for the CLIs
+    description: goclusterfs-mount and goclusterfs-fsck print bash and zsh completion scripts built from their own flags; bash completes flag names, file and directory values, and fsck's device argument
+    priority: go_only
+    environments:
+      go: internal/cli/completion_test.go::TestBashCompletion

@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("\"71111\"71111\"2")
+byte('û')
+[]byte("0")

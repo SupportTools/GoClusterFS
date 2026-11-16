@@ -1171,3 +1171,34 @@ func TestRegistryCreateRefusesTakenName(t *testing.T) {
 		t.Fatalf("reusing a removed name: %v", err)
 	}
 }
+
+// A descriptor keeps its file's birth generation on disk, and matches only that file.
+func TestDescriptorKeepsTargetBirth(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	target := Target{Inode: 7, Birth: 1<<40 + 5}
+	if _, err := NewRegistry(dev, 0, 4*SectorSize, nil).CreateFor(ctx, "s", target, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(dev, 0, 4*SectorSize, nil)
+	got, err := reg.GetByName(ctx, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.BelongsTo(target) {
+		t.Errorf("snapshot of %+v read back with birth %d, want it to belong to its file", target, got.TargetBirth)
+	}
+	for _, other := range []Target{{7, target.Birth + 1}, {8, target.Birth}, {7, 0}} {
+		if got.BelongsTo(other) {
+			t.Errorf("snapshot of %+v belongs to %+v", target, other)
+		}
+		if list, err := reg.ListForTarget(ctx, other); err != nil || len(list) != 0 {
+			t.Errorf("ListForTarget(%+v) = %d snapshots, %v; want none", other, len(list), err)
+		}
+	}
+	if list, err := reg.ListForTarget(ctx, target); err != nil || len(list) != 1 {
+		t.Errorf("ListForTarget(%+v) = %d snapshots, %v; want 1", target, len(list), err)
+	}
+}

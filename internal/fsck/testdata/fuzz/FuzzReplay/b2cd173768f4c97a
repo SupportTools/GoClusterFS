@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("cA1c")
+byte('ð')
+[]byte("0")

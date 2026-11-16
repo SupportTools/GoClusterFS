@@ -1,0 +1,5 @@
+go test fuzz v1
+byte('\u0093')
+bool(true)
+[]byte("0")
+[]byte("!1\x00\x00\x00!1")

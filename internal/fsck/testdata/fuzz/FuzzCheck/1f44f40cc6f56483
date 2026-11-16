@@ -1,0 +1,4 @@
+go test fuzz v1
+byte('\x17')
+bool(true)
+[]byte("000000005\x00 ")

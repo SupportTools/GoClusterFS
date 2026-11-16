@@ -199,6 +199,8 @@ export interface SnapshotInfo {
   size_bytes: number
   blocks: number
   created_at?: string
+  /** Its file is gone, or it predates the record of which file it belongs to; only the full list shows it */
+  orphan?: boolean
 }
 
 // GET /api/v1/snapshots[?path=]

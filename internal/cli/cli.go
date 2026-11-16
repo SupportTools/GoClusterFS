@@ -5,7 +5,10 @@ package cli
 import (
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"os"
+	"strings"
 	"syscall"
 )
 
@@ -44,4 +47,24 @@ func OpenHint(err error) string {
 		return "another program has it open exclusively"
 	}
 	return "check that the device exists and is readable and writable"
+}
+
+// PrintFlags prints fs's flags like flag.PrintDefaults, but names every
+// default, including false, 0 and the empty string.
+func PrintFlags(w io.Writer, fs *flag.FlagSet) {
+	fs.VisitAll(func(f *flag.Flag) {
+		typ, usage := flag.UnquoteUsage(f)
+		head := "  -" + f.Name
+		if typ != "" {
+			head += " " + typ
+		}
+		def := f.DefValue
+		switch {
+		case typ == "string" && def == "":
+			def = "empty"
+		case typ == "string":
+			def = fmt.Sprintf("%q", def)
+		}
+		_, _ = fmt.Fprintf(w, "%s\n    \t%s (default %s)\n", head, strings.ReplaceAll(usage, "\n", "\n    \t"), def)
+	})
 }

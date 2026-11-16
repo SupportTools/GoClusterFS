@@ -100,7 +100,7 @@ func findBinary() (string, error) {
 		return path, nil
 	}
 
-	return "", fmt.Errorf("goclusterfs-mount binary not found; run 'go build -o goclusterfs-mount ./cmd/mount' first")
+	return "", fmt.Errorf("goclusterfs-mount binary not found; run 'go build -o goclusterfs-mount ./cmd/goclusterfs-mount' first")
 }
 
 // NewMountedFS creates and mounts a new test filesystem.
@@ -263,7 +263,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}
@@ -296,7 +296,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}
@@ -307,6 +307,23 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 
 // WaitForMount waits until the filesystem is mounted and accessible.
 // It checks /proc/mounts to verify the FUSE mount is active.
+// processExited reports whether p has exited, without waiting for it: an exited child stays a zombie until reaped.
+func processExited(p *os.Process) bool {
+	if p == nil {
+		return false
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", p.Pid))
+	if err != nil {
+		return true
+	}
+	_, after, ok := strings.Cut(string(stat), ") ")
+	return ok && strings.HasPrefix(after, "Z")
+}
+
+// mountWait is how long a mount may take: one whose -skip-recovery names
+// another host's slot watches it for about 12 seconds before taking it.
+const mountWait = 30 * time.Second
+
 func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
@@ -321,9 +338,8 @@ func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 			}
 		}
 
-		// Check if mount command exited unexpectedly
-		if m.MountCmd != nil && m.MountCmd.ProcessState != nil {
-			return fmt.Errorf("mount process exited unexpectedly: %v", m.MountCmd.ProcessState)
+		if m.MountCmd != nil && (m.MountCmd.ProcessState != nil || processExited(m.MountCmd.Process)) {
+			return fmt.Errorf("mount process exited unexpectedly")
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -332,23 +348,38 @@ func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 	return fmt.Errorf("timeout waiting for mount after %v", timeout)
 }
 
-// Unmount unmounts the filesystem using fusermount.
+// unmountBusyTimeout is how long Unmount retries fusermount while the mount is
+// busy: a FUSE release still in flight after close, or a desktop indexer
+// crawling the mount, keeps it busy for a moment.
+const unmountBusyTimeout = 10 * time.Second
+
+// Unmount unmounts the filesystem and waits for the mount process to run its
+// clean shutdown. If the mount stays busy, it kills the process and detaches
+// the dead mount, so a later Mount at the same path can work, and returns an
+// error.
 func (m *MountedFS) Unmount() error {
-	// Use fusermount to unmount FIRST.
-	// This triggers the go-fuse server to exit cleanly, allowing
-	// the mount command to run its shutdown code (journal checkpoint, etc.)
-	// Do NOT cancel the context first - that would SIGKILL the process
-	// and skip the clean shutdown path where journal checkpointing happens.
-	cmd := exec.Command("fusermount", "-u", m.MountPoint)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		// May fail if already unmounted
-		m.t.Logf("fusermount output: %s", output)
+	var unmountErr error
+	start := time.Now()
+	for busy := 0; ; busy++ {
+		output, err := exec.Command("fusermount", "-u", m.MountPoint).CombinedOutput()
+		if err == nil || !m.IsMounted() {
+			unmountErr = nil
+			if busy > 0 {
+				m.t.Logf("fusermount -u succeeded after the mount was busy for %v", time.Since(start).Round(time.Millisecond))
+			}
+			break
+		}
+		unmountErr = fmt.Errorf("fusermount -u %s: %v: %s", m.MountPoint, err, strings.TrimSpace(string(output)))
+		if !strings.Contains(string(output), "busy") || time.Since(start) > unmountBusyTimeout {
+			m.t.Log(unmountErr)
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Wait for mount process to exit cleanly
+	// Do not cancel the context first: that kills the process before its
+	// clean shutdown checkpoints the journal.
 	if m.MountCmd != nil && m.MountCmd.Process != nil {
-		// Give it time to run clean shutdown (journal checkpoint, etc.)
 		done := make(chan error, 1)
 		go func() {
 			done <- m.MountCmd.Wait()
@@ -360,7 +391,6 @@ func (m *MountedFS) Unmount() error {
 				m.t.Logf("mount process exited: %v", err)
 			}
 		case <-time.After(10 * time.Second):
-			// Force kill only as last resort after generous timeout
 			m.t.Log("Warning: mount process did not exit in time, force killing")
 			if m.cancel != nil {
 				m.cancel()
@@ -369,6 +399,14 @@ func (m *MountedFS) Unmount() error {
 		}
 	}
 
+	if m.IsMounted() {
+		if output, err := exec.Command("fusermount", "-uz", m.MountPoint).CombinedOutput(); err != nil {
+			m.t.Logf("fusermount -uz %s: %v: %s", m.MountPoint, err, output)
+		}
+	}
+	if unmountErr != nil {
+		return unmountErr
+	}
 	m.t.Log("Unmounted successfully")
 	return nil
 }
@@ -582,7 +620,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}
@@ -616,7 +654,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	}
 
 	// Wait for mount to become accessible
-	if err := m.WaitForMount(10 * time.Second); err != nil {
+	if err := m.WaitForMount(mountWait); err != nil {
 		_ = m.Unmount()
 		return err
 	}

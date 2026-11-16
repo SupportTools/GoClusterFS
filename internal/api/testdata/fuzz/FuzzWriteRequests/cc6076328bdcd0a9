@@ -1,0 +1,8 @@
+go test fuzz v1
+bool(true)
+byte('V')
+string("api/v1/snapshots/\xcc\xe1")
+bool(true)
+string("0")
+string("")
+[]byte("0")

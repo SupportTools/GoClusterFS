@@ -1,0 +1,4 @@
+go test fuzz v1
+string("\U0001b6c20\U0001b6c20\U0001b6c20𛂯\U000db0af\U0001b6c20\U0001b6c20\U000db0af\U0001b6c20\U0001b6c20\U0001b6c20")
+string("0")
+string("0")

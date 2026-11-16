@@ -13,7 +13,7 @@ env:
   GO_VERSION: "1.26"
   GOLANGCI_LINT_VERSION: v2.15.0
   # Exact release, at least 48 hours old when pinned (company package-age policy).
-  NODE_VERSION: "22.23.4"
+  NODE_VERSION: "22.23.5"
 
 jobs:
   build:

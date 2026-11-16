@@ -30,6 +30,16 @@ type RecoveryContext struct {
 	ExtentMgr *extent.Manager
 }
 
+// ReleaseReserved returns a crashed node's unused reserved blocks. They have no
+// count, and freeing skips any already free.
+func (rctx *RecoveryContext) ReleaseReserved(ctx context.Context) func([]uint64) error {
+	return func(blocks []uint64) error {
+		log.Printf("[Recovery] Freeing %d reserved blocks the node never used", len(blocks))
+		rctx.ExtentMgr.ReleaseBlocks(ctx, blocks)
+		return nil
+	}
+}
+
 // RecoveryResult contains statistics about the recovery operation.
 type RecoveryResult struct {
 	TxnReplayed     int
@@ -105,7 +115,7 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 		return nil
 	}
 
-	stats, err := RecoverChecked(region, handler, info.CheckLease)
+	stats, err := RecoverReleasing(region, handler, info.CheckLease, rctx.ReleaseReserved(ctx))
 	if err != nil {
 		return result, fmt.Errorf("journal recovery failed: %w", err)
 	}
@@ -189,6 +199,9 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 		return applyExtentAdd(ctx, rctx, r, entry.Payload)
 	case TxnOpExtentFree:
 		return applyExtentFree(ctx, rctx, r, entry.Payload)
+	case TxnOpBlockReserve, TxnOpBlockUse:
+		// Read before replay to free unused reserved blocks; nothing to apply.
+		return false, nil
 	default:
 		// Unhandled operation types are logged but not an error
 		log.Printf("[Recovery] Skipping unhandled operation type: %s", entry.Entry.OpType)
@@ -517,9 +530,11 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pa
 	})
 }
 
+// beforeReplayWrite, when a test sets it, runs between a replay's read of an inode and its write.
+var beforeReplayWrite func(inodeNum uint32)
+
 // updateExtents reads an inode, applies change, and writes it back when change
-// reports an update, starting over if another node changed the inode's extent
-// tree in between.
+// reports an update. If any write landed since the read, it starts over.
 func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, inodeNum uint32, change func(*inode.Inode) (bool, error)) (bool, error) {
 	const attempts = 5
 	for attempt := 1; ; attempt++ {
@@ -527,12 +542,16 @@ func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, ino
 		if err != nil {
 			return false, fmt.Errorf("inode %d not found", inodeNum)
 		}
+		readGen := ino.MetaGeneration
 		changed, err := change(ino)
 		if err != nil || !changed {
 			rctx.ExtentMgr.DiscardPending(ctx, ino)
 			return false, err
 		}
-		err = rctx.InodeTbl.Write(ctx, ino)
+		if beforeReplayWrite != nil {
+			beforeReplayWrite(inodeNum)
+		}
+		err = rctx.InodeTbl.WriteIfUnchanged(ctx, ino, readGen)
 		if err == nil {
 			r.wrote[inodeNum] = ino.MetaGeneration
 			return true, nil

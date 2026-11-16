@@ -90,10 +90,10 @@ func Execute() error {
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgHost, "host", "localhost", "API server host")
 	rootCmd.PersistentFlags().IntVar(&cfgPort, "port", 8080, "API server port")
-	rootCmd.PersistentFlags().StringVar(&cfgToken, "token", "", "Bearer token for authentication (visible in ps; prefer GFSCTL_TOKEN or the config file)")
+	rootCmd.PersistentFlags().StringVar(&cfgToken, "token", "", "Bearer token for authentication (default none; visible in ps, so prefer GFSCTL_TOKEN or the config file)")
 	rootCmd.PersistentFlags().DurationVar(&cfgTimeout, "timeout", 30*time.Second, "Request timeout")
 	rootCmd.PersistentFlags().StringVarP(&cfgOutput, "output", "o", "text", "Output format (text, json)")
-	rootCmd.PersistentFlags().BoolVar(&cfgDebug, "debug", false, "Print [DEBUG] lines for each API request")
+	rootCmd.PersistentFlags().BoolVar(&cfgDebug, "debug", false, "Print [DEBUG] lines for each API request (default false)")
 }
 
 // resolveSettings fills every setting whose flag was not given from the

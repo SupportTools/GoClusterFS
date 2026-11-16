@@ -181,7 +181,7 @@ func TestScanStopsAtUnreachableTail(t *testing.T) {
 		_ = scanJournal(region, func(txn *RecoveredTxn) error {
 			replayed = append(replayed, txn.Header.Seq)
 			return nil
-		}, &RecoveryStats{}, nil, nil)
+		}, &RecoveryStats{}, nil, nil, false)
 		done <- replayed
 	}()
 	select {

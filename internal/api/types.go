@@ -168,11 +168,20 @@ type TrimStatsResponse struct {
 
 // LockStatsResponse is returned by GET /api/v1/stats/lock.
 type LockStatsResponse struct {
-	HintCacheHits    uint64  `json:"hint_cache_hits"`
-	HintCacheMisses  uint64  `json:"hint_cache_misses"`
-	HintCacheHitRate float64 `json:"hint_cache_hit_rate"`
-	ActiveLocks      int     `json:"active_locks,omitempty"`
-	PendingLocks     int     `json:"pending_locks,omitempty"`
+	HintCacheHits    uint64          `json:"hint_cache_hits"`
+	HintCacheMisses  uint64          `json:"hint_cache_misses"`
+	HintCacheHitRate float64         `json:"hint_cache_hit_rate"`
+	ActiveLocks      int             `json:"active_locks,omitempty"`
+	PendingLocks     int             `json:"pending_locks,omitempty"`
+	Types            []LockTypeStats `json:"types,omitempty"`
+}
+
+// LockTypeStats counts one lock type's acquires on this node since it mounted.
+type LockTypeStats struct {
+	Type        string  `json:"type"`
+	Acquires    uint64  `json:"acquires"`
+	Blocked     uint64  `json:"blocked"`
+	WaitSeconds float64 `json:"wait_seconds"`
 }
 
 // SFBStatsResponse is returned by GET /api/v1/stats/sfb.
@@ -221,6 +230,16 @@ type AllStatsResponse struct {
 	Lock        *LockStatsResponse    `json:"lock,omitempty"`
 	SFB         *SFBStatsResponse     `json:"sfb,omitempty"`
 	Cluster     *ClusterInfoResponse  `json:"cluster,omitempty"`
+	Reserve     *ReserveStatsResponse `json:"reserve,omitempty"`
+}
+
+// ReserveStatsResponse counts this node's block reserve since it mounted.
+type ReserveStatsResponse struct {
+	Blocks          int     `json:"blocks"`
+	Refills         uint64  `json:"refills"`
+	Returns         uint64  `json:"returns"`
+	PeerWaits       uint64  `json:"peer_waits"`
+	PeerWaitSeconds float64 `json:"peer_wait_seconds"`
 }
 
 // StatsOverviewResponse is returned by GET /api/v1/stats.

@@ -85,7 +85,7 @@ func TestReleaseSlot(t *testing.T) {
 	if got, err := replacement.Register(ctx, "replacement"); err != nil || got != slot {
 		t.Fatalf("a new node registered in slot %d (%v), want released slot %d", got, err, slot)
 	}
-	if result, err := journal.ScanAndRecover(dev, uint64(journalAt), sb.JournalSlotSize(), nil); result != nil || err != nil {
+	if result, err := journal.ScanAndRecover(dev, uint64(journalAt), sb.JournalSlotSize(), nil, nil); result != nil || err != nil {
 		t.Errorf("mount recovery of the released journal = %+v, %v; want nothing to recover", result, err)
 	}
 }
@@ -157,7 +157,7 @@ func TestReleaseSlotLease(t *testing.T) {
 	var late *node.Registry
 	t.Cleanup(fsck.SetReleaseHooks(func() {
 		late = node.NewRegistry(dev, sb.NodeRegistryOffset)
-		if got, err := late.Register(ctx, "late"); err != nil || got != slot {
+		if got, err := late.Register(ctx, "gone"); err != nil || got != slot {
 			t.Errorf("late node took slot %d (%v), want the stale slot %d", got, err, slot)
 		}
 	}, nil))
@@ -202,6 +202,7 @@ func TestReleaseSlotCrash(t *testing.T) {
 		resetFirst bool
 	}{{"before reset", false}, {"after reset", true}} {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Cleanup(node.SetRecoveryLease(time.Second))
 			var sb *superblock.Superblock
 			dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
 			ctx := context.Background()
@@ -236,9 +237,7 @@ func TestReleaseSlotCrash(t *testing.T) {
 				t.Fatalf("a peer replayed slot %d during the lease", slot)
 			}
 
-			editSlot(t, dev, sb, slot, func(s []byte) {
-				binary.LittleEndian.PutUint64(s[172:180], uint64(time.Now().Add(-61*time.Second).Unix()))
-			})
+			time.Sleep(2 * time.Second)
 			replays := detectFailures(peer, dev)
 			if len(replays) != 1 || replays[0].slot != slot {
 				t.Fatalf("after the lease lapsed the peer replayed %+v, want slot %d once", replays, slot)

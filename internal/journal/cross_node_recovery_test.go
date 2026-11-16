@@ -464,6 +464,55 @@ func TestApplyExtentAdd(t *testing.T) {
 	}
 }
 
+// The replay reads the inode outside any lock, so a same-node write can land before its write.
+func TestReplayKeepsInodeWrittenDuringIt(t *testing.T) {
+	rctx, cleanup := testRecoveryContext(t)
+	defer cleanup()
+	ctx := context.Background()
+	r := newTxnReplay([16]byte{})
+	if _, err := applyInodeCreate(ctx, rctx, r, (&InodeCreatePayload{InodeNum: 50, Mode: 0644}).Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyBlockAlloc(ctx, rctx, (&BlockAllocPayload{InodeNum: 50, StartBlock: 1, Count: 1, Purpose: BlockPurposeData}).Serialize()); err != nil {
+		t.Fatal(err)
+	}
+	created, err := rctx.InodeTbl.Read(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { beforeReplayWrite = nil })
+	updated := false
+	beforeReplayWrite = func(num uint32) {
+		if updated {
+			return
+		}
+		updated = true
+		if err := rctx.InodeTbl.Update(ctx, num, func(ino *inode.Inode) error {
+			ino.UID = 4242
+			return nil
+		}); err != nil {
+			t.Errorf("update during replay: %v", err)
+		}
+	}
+	payload := &ExtentAddPayload{InodeNum: 50, FileBlock: 0, DiskBlock: 1, Length: 1, MetaGeneration: created.MetaGeneration, Size: 4096}
+	applied, err := applyExtentAdd(ctx, rctx, newTxnReplay([16]byte{}), payload.Serialize())
+	if err != nil {
+		t.Fatalf("applyExtentAdd: %v", err)
+	}
+
+	ino, err := rctx.InodeTbl.Read(50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.UID != 4242 {
+		t.Errorf("UID = %d after the replay, want 4242: the replay overwrote a write made after its read", ino.UID)
+	}
+	if applied {
+		t.Error("the replay applied a record whose inode was written since it was logged")
+	}
+}
+
 // TestCreateRecoveryHandler tests the RecoveryHandler creation.
 // TestApplyExtentAddIntoTree replays an ExtentAdd whose inode write was lost in
 // a crash, for a file whose extents already live in an extent tree.
