@@ -579,7 +579,7 @@ setup_goclusterfs() {
 # Wait for GoClusterFS mount to be ready
 wait_for_goclusterfs_mount() {
     local vm_id="$1"
-    local timeout="${2:-30}"
+    local timeout="${2:-${GOCLUSTERFS_MOUNT_TIMEOUT:-30}}"
     local elapsed=0
 
     log_info "Waiting for GoClusterFS mount on VM $vm_id..."

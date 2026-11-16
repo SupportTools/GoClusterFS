@@ -21,6 +21,8 @@ set -uo pipefail
 
 SOAK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODE_COUNT=${NODE_COUNT:-3}
+# A remount after a stop fault has taken 22s just to register on a loaded host.
+export GOCLUSTERFS_MOUNT_TIMEOUT=${GOCLUSTERFS_MOUNT_TIMEOUT:-90}
 source "${SOAK_DIR}/../vm/vm-test-harness.sh" >&2
 
 reply() { echo "$*"; }
