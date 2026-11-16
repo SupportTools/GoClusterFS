@@ -446,17 +446,22 @@ func (d *driver) checkOp(m *node, op *Op, paths []string) error {
 	return nil
 }
 
-// onNode runs f while holding node n shared, unless a fault has taken n down.
+// onNode runs f while holding node n shared, unless a fault has taken n down. With -inflight a fault can start while f
+// runs; its errors are then dropped, and the fault checks n once it is back.
 func (d *driver) onNode(n *node, f func() error) error {
 	if !n.up.Load() {
 		return nil
 	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
+	faults := n.faults.Load()
 	if !n.up.Load() {
 		return nil
 	}
-	return f()
+	if err := f(); err != nil && n.faults.Load() == faults {
+		return err
+	}
+	return nil
 }
 
 // injectFault takes one node down, brings it back and checks it shows the model. Operations go on elsewhere.
