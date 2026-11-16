@@ -2360,6 +2360,13 @@ scenarios:
     environments:
       go: internal/cache/broadcast/broadcaster_test.go::TestTrackedSendersBounded
 
+  - id: testnet-reachable-ports
+    name: Test ports reach the test's own sockets
+    description: Ports from internal/testnet accept the test's own connections and datagrams, and its HTTP server answers the test's requests
+    priority: go_only
+    environments:
+      go: internal/testnet/testnet_test.go::TestPortsReachThisProcess
+
   - id: broadcast-silent-peers
     name: Silent broadcast peers are reported
     description: A node the registry shows mounted but not heard for 3 heartbeat intervals counts as silent until it is heard again or unmounts; this node is never listed

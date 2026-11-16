@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
 func startBroadcaster(t *testing.T, cfg Config, id [16]byte, h InvalidationHandler) *Broadcaster {
@@ -26,7 +28,7 @@ func startBroadcaster(t *testing.T, cfg Config, id [16]byte, h InvalidationHandl
 // test reads.
 func unicastTo(t *testing.T) (*Broadcaster, *net.UDPConn) {
 	t.Helper()
-	raw, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	raw, err := testnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
