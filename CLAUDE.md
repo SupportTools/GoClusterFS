@@ -96,7 +96,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 
 - Linux only. Needs FUSE and a backing store that supports O_DIRECT.
 - At most 64 nodes mount a volume at once, one per registry slot. A node judges another by whether its heartbeat changes, timed on its own clock, so failover does not need clocks to agree.
-- `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, and the superblock checksum. It reports every other problem without fixing it.
+- `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. Every `statfs` (`df`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - No rename, symlinks, or hard links.
