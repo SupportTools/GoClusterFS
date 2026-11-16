@@ -343,3 +343,31 @@ func TestOwnPassKeepsAReservedOrphan(t *testing.T) {
 		t.Errorf("ForgetSlot of this node's slot kept %v, a still-linked entry no unlink is working on", got)
 	}
 }
+
+// A peer may unlink a new file as soon as its name appears; the creating node must still hold the file for its caller.
+func TestCreateHoldsAFileAPeerUnlinksAtOnce(t *testing.T) {
+	path := newFormattedImage(t)
+	cluster := newFakeCluster(0, 1)
+	nodeA := cluster.join(t, withBridge(openFormattedFS(t, path)), 0)
+	nodeB := cluster.join(t, openFormattedFS(t, path), 1)
+	ctx := context.Background()
+	var once sync.Once
+	afterCommit = func(op string) {
+		if op == "create: named" {
+			once.Do(func() {
+				if errno := nodeB.Unlink(ctx, "f"); errno != 0 {
+					t.Errorf("node B unlink: %v", errno)
+				}
+				nodeA.LearnOrphans(1, cluster.list(1))
+			})
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+
+	f := createOpen(t, nodeA, "f")
+	writeAt(t, f, pattern(1, 4096), 0)
+	checkAt(t, f, pattern(1, 4096), 0)
+	if ino := readInode(t, nodeA, f.inodeNum); ino.Magic != inode.InodeMagic || ino.LinkCount != 0 || ino.Holders != 1 {
+		t.Fatalf("magic %#x, links %d, holders %#b; want an orphan node A holds", ino.Magic, ino.LinkCount, ino.Holders)
+	}
+}
