@@ -278,8 +278,12 @@ func (d *Device) SetWriteObserver(observe func(offset int64, n int)) {
 	d.writeObserver.Store(&observe)
 }
 
-// SetSyncObserver makes every Sync that succeeds call synced afterwards.
+// SetSyncObserver makes every Sync that succeeds call synced afterwards; nil removes it.
 func (d *Device) SetSyncObserver(synced func()) {
+	if synced == nil {
+		d.syncObserver.Store(nil)
+		return
+	}
 	d.syncObserver.Store(&synced)
 }
 

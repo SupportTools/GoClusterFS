@@ -40,7 +40,10 @@ func loseUnflushedWrites(t *testing.T, dev *storage.Device) *cacheLoss {
 		c.undo = nil
 		c.mu.Unlock()
 	})
-	t.Cleanup(func() { dev.SetWriteObserver(nil) })
+	t.Cleanup(func() {
+		dev.SetWriteObserver(nil)
+		dev.SetSyncObserver(nil)
+	})
 	return c
 }
 
