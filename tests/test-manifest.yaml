@@ -4566,3 +4566,17 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cli/completion_test.go::TestBashCompletion
+
+  - id: stale-file-node-estale
+    name: A file node whose inode is gone opens as stale
+    description: After another caller unlinks a file, or a directory takes its slot, open and getattr of the old node return ESTALE, not EISDIR or empty attributes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/open_errors_test.go::TestStaleFileNodeOpensAsStale
+
+  - id: create-without-excl-opens-existing
+    name: Create without O_EXCL opens a name made since the lookup
+    description: A CREATE that finds its name taken opens that file without O_EXCL, truncates it with O_TRUNC, and fails with EEXIST only under O_EXCL
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/open_errors_test.go::TestCreateWithoutExclOpensTheFileItFinds
