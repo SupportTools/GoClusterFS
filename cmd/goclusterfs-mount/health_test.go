@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
 )
@@ -37,6 +38,11 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			s.broadcastProblem = func() string { return "multicast is unavailable and no unicast peers are known" }
 			return s
 		}(), want: api.HealthStatusDegraded, code: http.StatusOK, problem: "broadcast"},
+		{name: "a mounted peer is silent", src: func() healthSources {
+			s := fineSources()
+			s.silentPeers = func() ([]string, time.Duration) { return []string{"node3 (1a2b3c4d)"}, 90 * time.Second }
+			return s
+		}(), want: api.HealthStatusDegraded, code: http.StatusOK, problem: "broadcast-peers"},
 		{name: "device failing", src: func() healthSources {
 			s := fineSources()
 			s.deviceError = func() error { return syscall.EIO }
@@ -63,8 +69,8 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if resp.Status != tt.want {
 				t.Errorf("status = %s, want %s: %+v", resp.Status, tt.want, resp.Checks)
 			}
-			if len(resp.Checks) != 4 {
-				t.Errorf("checks = %v, want device, journal, recovery and broadcast", resp.Checks)
+			if len(resp.Checks) != 5 {
+				t.Errorf("checks = %v, want device, journal, recovery, broadcast and broadcast-peers", resp.Checks)
 			}
 			for name, check := range resp.Checks {
 				if (name == tt.problem) != (check.Status != api.HealthStatusOK) {
@@ -101,6 +107,9 @@ func TestHealthMessagesNameTheSlotsAndTheError(t *testing.T) {
 	if got := journalHealth(&api.JournalStatsResponse{State: "recovering"}); got.Status != api.HealthStatusDegraded {
 		t.Errorf("recovering journal = %+v, want degraded", got)
 	}
+	if msg := silentPeersHealth([]string{"a (01)", "b (02)"}, 90*time.Second).Message; !strings.Contains(msg, "a (01), b (02)") || !strings.Contains(msg, "1m30s") {
+		t.Errorf("silent peers message = %q", msg)
+	}
 }
 
 func fineSources() healthSources {
@@ -110,5 +119,6 @@ func fineSources() healthSources {
 		replaying:        func() []int { return nil },
 		broadcastOn:      true,
 		broadcastProblem: func() string { return "" },
+		silentPeers:      func() ([]string, time.Duration) { return nil, 90 * time.Second },
 	}
 }

@@ -2571,6 +2571,62 @@ test_staleness_flood_under_loss() {
     measure_staleness flood_under_loss flood
 }
 
+# api_get prints the response to GET $2 from the API inside node $1.
+api_get() {
+    exec_on_node "$1" bash -c "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET $2 HTTP/1.0\r\nHost: localhost\r\n\r\n' >&3 && cat <&3" 2>/dev/null
+}
+
+broadcast_peers_health() {
+    api_get "$1" /health | tr -d ' \n' | grep -o '"broadcast-peers":{"status":"[a-z]*"' | sed 's/.*"status":"//; s/"$//'
+}
+
+silent_peers_metric() {
+    api_get "$1" /metrics | awk '/^goclusterfs_broadcast_silent_peers /{print $2}'
+}
+
+# A node that hears no multicast must say so: on /health, on /metrics and in its log.
+test_broadcast_silent_peer_reported() {
+    local reader="${NODE_ARRAY[1]}" other="${NODE_ARRAY[0]}"
+    local want=$((NODE_COUNT - 1)) status metric i failed=0
+    local since
+    since=$(date +%s)
+
+    apply_fault "$reader" iptables -I INPUT -d 239.192.74.75 -j DROP || return 1
+    for i in $(seq 1 30); do
+        status=$(broadcast_peers_health "$reader")
+        metric=$(silent_peers_metric "$reader")
+        [[ "$status" == degraded && "$metric" == "$want" ]] && break
+        sleep 1
+    done
+    log "After dropping multicast for ${i}s, $reader: broadcast-peers $status, silent peers $metric"
+    if [[ "$status" != degraded || "$metric" != "$want" ]]; then
+        log "ERROR: $reader did not report its $want peers as silent"
+        failed=1
+    fi
+    if ! docker logs --since "$since" "$reader" 2>&1 | grep -q "no broadcast heard from node"; then
+        log "ERROR: $reader logged no warning about the silent peers"
+        failed=1
+    fi
+    if [[ "$(broadcast_peers_health "$other")" != ok ]]; then
+        log "ERROR: $other, which still hears multicast, reports silent peers"
+        failed=1
+    fi
+
+    heal_network_faults
+    for i in $(seq 1 20); do
+        status=$(broadcast_peers_health "$reader")
+        metric=$(silent_peers_metric "$reader")
+        [[ "$status" == ok && "$metric" == 0 ]] && break
+        sleep 1
+    done
+    log "${i}s after healing, $reader: broadcast-peers $status, silent peers $metric"
+    if [[ "$status" != ok || "$metric" != 0 ]]; then
+        log "ERROR: $reader still reports silent peers after multicast came back"
+        failed=1
+    fi
+    return $failed
+}
+
 # Print the free 1MB blocks that statfs reports on node $1
 statfs_free_blocks() {
     exec_on_node "$1" stat -f -c %f /mnt/goclusterfs
@@ -3436,6 +3492,7 @@ run_test "Broadcast Invalidation" test_broadcast_invalidation
 run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidation
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
+run_test "Broadcast Silent Peer Reported" test_broadcast_silent_peer_reported
 run_test "Staleness Under Packet Loss" test_staleness_packet_loss
 run_test "Staleness Under Duplication and Reordering" test_staleness_duplication_and_reordering
 run_test "Staleness Under Delay" test_staleness_delay

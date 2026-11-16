@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
 )
@@ -14,6 +15,7 @@ type healthSources struct {
 	replaying        func() []int
 	broadcastOn      bool
 	broadcastProblem func() string
+	silentPeers      func() ([]string, time.Duration)
 }
 
 func registerHealthChecks(srv *api.Server, src healthSources) {
@@ -24,6 +26,7 @@ func registerHealthChecks(srv *api.Server, src healthSources) {
 	check("journal", func() api.ComponentHealth { return journalHealth(src.journal()) })
 	check("recovery", func() api.ComponentHealth { return recoveryHealth(src.replaying()) })
 	check("broadcast", func() api.ComponentHealth { return broadcastHealth(src.broadcastOn, src.broadcastProblem()) })
+	check("broadcast-peers", func() api.ComponentHealth { return silentPeersHealth(src.silentPeers()) })
 }
 
 func healthy(message string) api.ComponentHealth {
@@ -76,4 +79,11 @@ func broadcastHealth(on bool, problem string) api.ComponentHealth {
 		return degraded("%s; peers see this node's changes only after -cache-ttl until it recovers. Check the network between the nodes and the -mcast-port and -unicast-port firewall rules", problem)
 	}
 	return healthy("")
+}
+
+func silentPeersHealth(names []string, quiet time.Duration) api.ComponentHealth {
+	if len(names) == 0 {
+		return healthy("")
+	}
+	return degraded("no broadcast heard from %s for over %v, though the registry shows them mounted; this node sees their changes only after -cache-ttl. Check that multicast reaches this node, and that they run with -broadcast and the same -mcast-group and -mcast-port", strings.Join(names, ", "), quiet)
 }

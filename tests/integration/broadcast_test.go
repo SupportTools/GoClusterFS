@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/api"
 )
 
 // Well above the 5s inode cache TTL; tests log propagation time instead of asserting a bound.
@@ -331,4 +333,59 @@ func TestMountFailsOnTakenBroadcastPortBeforeFormat(t *testing.T) {
 	if !bytes.Equal(head, make([]byte, len(head))) {
 		t.Error("mount wrote the superblock before failing on the broadcast port")
 	}
+}
+
+// TestBroadcastReportsSilentPeer mounts a node that sends no broadcasts next
+// to one that does. The broadcasting node must report it on /health and
+// /metrics: it would otherwise see that node's changes only after -cache-ttl
+// without anything saying so.
+func TestBroadcastReportsSilentPeer(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	addr := freeLoopbackAddr(t)
+	cluster.Node(0).ExtraArgs = []string{"-api-addr", addr, "-broadcast-heartbeat", "500ms"}
+	cluster.Node(1).ExtraArgs = []string{"-broadcast=false"}
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("FormatAndStartFirst failed: %v", err)
+	}
+	base := "http://" + addr
+	waitForAPI(t, base)
+
+	var health api.HealthResponse
+	getAPI(t, base+"/health", &health)
+	if c := health.Checks["broadcast-peers"]; c.Status != api.HealthStatusOK {
+		t.Fatalf("broadcast-peers before the second node mounted: %+v", c)
+	}
+
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("StartNode(1) failed: %v", err)
+	}
+	elapsed, ok := waitFor(10*time.Second, func() bool {
+		getAPI(t, base+"/health", &health)
+		return health.Checks["broadcast-peers"].Status == api.HealthStatusDegraded
+	})
+	if !ok {
+		t.Fatalf("node 0 never reported node 1 as silent: %+v", health.Checks["broadcast-peers"])
+	}
+	t.Logf("reported %v after node 1 mounted: %s", elapsed.Round(100*time.Millisecond), health.Checks["broadcast-peers"].Message)
+
+	if _, ok := waitFor(5*time.Second, func() bool {
+		v, ok := metricValue(getMetrics(t, base), "goclusterfs_broadcast_silent_peers")
+		return ok && v == 1
+	}); !ok {
+		t.Errorf("goclusterfs_broadcast_silent_peers never reached 1")
+	}
+}
+
+func getMetrics(t *testing.T, base string) string {
+	t.Helper()
+	resp, err := apiClient.Get(base + "/metrics")
+	if err != nil {
+		return ""
+	}
+	defer mustClose(t, resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
