@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"net"
 	"net/http"
 	"runtime"
 	"strings"
@@ -11,6 +10,9 @@ import (
 	"testing"
 	"time"
 )
+
+// The stop tests check that Serve returned, not that the old address refuses
+// connections: another process may take the freed port.
 
 var serverFrames = []string{
 	"net/http.(*conn).serve",
@@ -94,9 +96,10 @@ func TestStopLetsRequestsInFlightFinish(t *testing.T) {
 		t.Fatalf("Stop returned %v while a request was in flight", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-		_ = conn.Close()
-		t.Error("the server accepted a new connection while stopping")
+	select {
+	case <-s.served:
+	case <-time.After(time.Second):
+		t.Error("the server still accepted new connections while stopping")
 	}
 
 	close(release)
@@ -147,8 +150,10 @@ func TestStopIdleServer(t *testing.T) {
 	if err := s.Stop(); err != nil {
 		t.Errorf("second Stop = %v, want the first result", err)
 	}
-	if code := getStatus("http://" + s.Addr() + "/health"); code != 0 {
-		t.Errorf("GET /health after Stop = %d, want a refused connection", code)
+	select {
+	case <-s.served:
+	default:
+		t.Error("Stop returned while the server still accepted connections")
 	}
 	expectNoLeftoverGoroutines(t, before)
 }
