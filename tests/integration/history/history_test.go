@@ -176,3 +176,21 @@ func TestRenameShowsExactlyOneName(t *testing.T) {
 	b.list(2005, 2015, "b")
 	expect(t, b, "listing shows both names of a rename")
 }
+
+func TestStaleOpenOnlyWhenTheNameLostItsFileTwice(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 100, 200)
+	expect(t, b, "ESTALE while its name kept its file")
+
+	b = &builder{}
+	b.write("a", 1, 0, 10)
+	b.unlink("a", 110, 120)
+	b.write("a", 2, 130, 140)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 100, 200)
+	expect(t, b, "ESTALE while its name kept its file")
+
+	b.unlink("a", 150, 160)
+	b.write("a", 3, 170, 180)
+	expect(t, b)
+}

@@ -34,10 +34,11 @@ const (
 	Exists             // EEXIST
 	Unsupported        // the call is not implemented; it changed nothing
 	Failed             // any other error: the call may or may not have taken effect
+	Stale              // open failed with ESTALE; it changed nothing
 )
 
 func (r Result) String() string {
-	return [...]string{"ok", "ENOENT", "EEXIST", "unsupported", "failed"}[r]
+	return [...]string{"ok", "ENOENT", "EEXIST", "unsupported", "failed", "ESTALE"}[r]
 }
 
 // Content is what a successful Read saw.
@@ -212,6 +213,8 @@ func Check(ops []Op, r Rules) []Violation {
 		switch {
 		case o.Result == Failed:
 			out = append(out, Violation{What: o.Kind.String() + " failed", Op: o, Allowed: "success, ENOENT or EEXIST", History: []Op{o}})
+		case o.Result == Stale && !churned(o, logs[o.Name]):
+			out = append(out, Violation{What: "open failed with ESTALE while its name kept its file", Op: o, Allowed: "ESTALE only when the name lost its file at least twice during the call", History: []Op{o}})
 		case o.Kind == Write && o.Result == Exists:
 			out = append(out, Violation{What: "open with O_CREAT and no O_EXCL failed with EEXIST", Op: o, Allowed: "the file opened", History: []Op{o}})
 		case o.Result != OK && o.Result != NotFound && o.Result != Exists:
@@ -343,6 +346,20 @@ func (l *nameLog) during(from, to time.Duration, fn func(mutation)) {
 			fn(l.byEnd[i])
 		}
 	}
+}
+
+// churned reports whether o's name lost its file at least twice during o; only then can ESTALE outlast the kernel's one retry.
+func churned(o Op, l *nameLog) bool {
+	if l == nil {
+		return false
+	}
+	removed := 0
+	l.during(o.Start, o.End, func(m mutation) {
+		if !m.after.present {
+			removed++
+		}
+	})
+	return removed >= 2
 }
 
 // sectorTear reports whether a torn read only mixes values split at 4 KB

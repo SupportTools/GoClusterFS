@@ -219,6 +219,10 @@ func classify(err error) history.Result {
 	case errors.Is(err, syscall.ENOSYS), errors.Is(err, syscall.ENOTSUP), errors.Is(err, syscall.EXDEV):
 		return history.Unsupported
 	}
+	var path *fs.PathError
+	if errors.Is(err, syscall.ESTALE) && errors.As(err, &path) && path.Op == "open" {
+		return history.Stale
+	}
 	return history.Failed
 }
 
@@ -229,7 +233,7 @@ func summarize(ops []history.Op) string {
 	}
 	var parts []string
 	for _, k := range []history.Kind{history.Write, history.Read, history.Stat, history.Readdir, history.Create, history.Unlink, history.Rename} {
-		for _, r := range []history.Result{history.OK, history.NotFound, history.Exists, history.Unsupported, history.Failed} {
+		for _, r := range []history.Result{history.OK, history.NotFound, history.Exists, history.Unsupported, history.Stale, history.Failed} {
 			if n := counts[k.String()+" "+r.String()]; n > 0 {
 				parts = append(parts, fmt.Sprintf("%s %s %d", k, r, n))
 			}
