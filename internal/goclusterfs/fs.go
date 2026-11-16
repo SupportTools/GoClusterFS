@@ -1716,9 +1716,9 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	return nil, 0, 0
 }
 
-// liveFile reports whether ino is a regular file some name still holds. A node can
-// outlive its inode: another node unlinks it, or frees the slot for a new inode.
-// ESTALE makes the kernel look the name up again.
+// liveFile reports whether ino is a regular file some name still holds, so a new
+// open may use it. A node can outlive its file: another caller unlinks it, or the
+// slot goes to a new inode. ESTALE makes the kernel look the name up again.
 func liveFile(ino *inode.Inode) bool {
 	return ino.Magic == inode.InodeMagic && ino.IsFile() && ino.LinkCount > 0
 }
@@ -1733,7 +1733,7 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 		logging.Debugf("File.Getattr: read failed: %v", err)
 		return syscall.EIO
 	}
-	if !liveFile(ino) {
+	if ino.Magic != inode.InodeMagic || !ino.IsFile() {
 		return syscall.ESTALE
 	}
 
