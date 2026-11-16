@@ -4107,6 +4107,13 @@ scenarios:
     environments:
       go: internal/snapshot/sector_error_test.go::TestUnreadableSectorIsNotRewritten
 
+  - id: fsck-repair-snapshot-sector
+    name: fsck repair rewrites a snapshot registry sector that fails its checksum
+    description: Repair keeps the descriptors that pass their own checksum, clears the damaged one and reports it, snapshot creates work again, and the next repair frees the lost snapshot's data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
+
   - id: lock-busy-node-yields
     name: Busy node yields a cached record
     description: A node that held a record past CacheGrace releases it when idle and waits YieldGap, so a waiting node gets it
