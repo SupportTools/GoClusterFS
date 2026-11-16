@@ -210,7 +210,7 @@ scenarios:
 
   - id: rename-file
     name: Rename file
-    description: Rename a file within directory
+    description: Rename a file, rename it over another file, move a directory between parents with its ".." following, and refuse RENAME_NOREPLACE over an existing name; fsck is clean afterwards (Docker and VM rename one file)
     priority: high
     environments:
       go: integration_test.go::TestRename
@@ -1645,6 +1645,160 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringSnapshotDelete
+
+  - id: dir-renameinonedirectory
+    name: Directory rename within one directory
+    description: A rename in one directory commits once and moves the name
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameInOneDirectory
+
+  - id: dir-renamereplacesatarget
+    name: Directory rename over a target and NOREPLACE
+    description: A rename replaces a target file; NOREPLACE over an existing name changes nothing
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameReplacesATarget
+
+  - id: dir-renamemovesadirectorybetweenparents
+    name: Directory rename moves a directory
+    description: A directory moved between parents gets its ".." rewritten and both link counts adjusted
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameMovesADirectoryBetweenParents
+
+  - id: dir-renamerefusesamoveintoitself
+    name: Directory rename refuses a move into itself
+    description: Moving a directory into its own subtree fails before anything changes
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameRefusesAMoveIntoItself
+
+  - id: dir-renamecheckstargettypes
+    name: Directory rename checks target types
+    description: A directory over a file, a file over a directory, and a directory over a non-empty one are refused; a directory over an empty one replaces it
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameChecksTargetTypes
+
+  - id: dir-renameafterastalelookupchangesnothing
+    name: Directory rename rechecks its lookups
+    description: A rename whose names changed since the lookup, or whose commit fails, changes nothing
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameAfterAStaleLookupChangesNothing
+
+  - id: dir-renameisseenbyanothernode
+    name: Directory rename is seen by another node
+    description: Another node's index sees the rename on its next lookup
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameIsSeenByAnotherNode
+
+  - id: dir-renamegrowsafullnewparent
+    name: Directory rename grows a full new parent
+    description: A rename into a directory with no room gives it a new block first
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestRenameGrowsAFullNewParent
+
+  - id: dir-pointifonlymovesanamethatstillnamestheex
+    name: Directory PointIf checks the current inode
+    description: PointIf points a name at another inode only while it names the expected one
+    priority: go_only
+    environments:
+      go: internal/dir/rename_test.go::TestPointIfOnlyMovesANameThatStillNamesTheExpectedInode
+
+  - id: fs-renamekeepsthefileanditsdata
+    name: Rename keeps the file and its data
+    description: A renamed file keeps its inode and data; fsck is clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameKeepsTheFileAndItsData
+
+  - id: fs-renameoverafilefreesit
+    name: Rename over a file frees it
+    description: The replaced file's inode and blocks are freed
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameOverAFileFreesIt
+
+  - id: fs-renameoverafileapeerhasopen
+    name: Rename over a file a peer has open
+    description: The replaced file stays an orphan the peer holds until its last close
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameOverAFileAPeerHasOpen
+
+  - id: fs-renamemovesadirectory
+    name: Rename moves a directory between parents
+    description: The moved directory's ".." and both parents' link counts follow
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameMovesADirectory
+
+  - id: fs-renameerrors
+    name: Rename errors
+    description: EXCHANGE, NOREPLACE, a missing name, type mismatches, a non-empty target and a move into itself give the right errno
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameErrors
+
+  - id: fs-renamereplayfinishesarenameoverafile
+    name: Rename replay finishes a rename over a file
+    description: A crash right after the commit ends with the new name and the target freed
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameReplayFinishesARenameOverAFile
+
+  - id: fs-renamereplaymovesadirectory
+    name: Rename replay moves a directory
+    description: A crash right after the commit of a directory move ends with the new name, ".." and link counts right
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameReplayMovesADirectory
+
+  - id: fs-renamereplaydropsthetargetafterthenamesc
+    name: Rename replay drops the target once
+    description: A crash after the names changed frees the target exactly once
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_test.go::TestRenameReplayDropsTheTargetAfterTheNamesChanged
+
+  - id: rename-power-renameinonedirectory
+    name: Power failure during a rename in one directory
+    description: Power fails at each write; exactly one of the two names names the file, and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameInOneDirectory
+
+  - id: rename-power-renamebetweendirectories
+    name: Power failure during a rename between directories
+    description: Power fails at each write; exactly one of the two names names the file
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameBetweenDirectories
+
+  - id: rename-power-renameoverafile
+    name: Power failure during a rename over a file
+    description: Power fails at each write; the file has one name, and the target keeps its name only if the rename did not happen
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameOverAFile
+
+  - id: rename-power-directorymove
+    name: Power failure during a directory move
+    description: Power fails at each write; the directory has one name, its ".." names that parent, and link counts are right
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringDirectoryMove
+
+  - id: rename-power-renameoveranemptydirectory
+    name: Power failure during a rename over an empty directory
+    description: Power fails at each write; one name, and link counts are right
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameOverAnEmptyDirectory
 
   - id: clone-power-failure-go
     name: Power failure at each write of a clone

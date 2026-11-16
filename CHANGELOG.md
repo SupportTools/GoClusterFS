@@ -59,6 +59,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `-cache-inodes`, `-cache-extents`, `-cache-negative` and `-broadcast-max-peers` set the cache and broadcast table sizes, and `/metrics` reports each limit next to its size.
 - A node that hears no broadcasts from a node the registry shows mounted, for 3 `-broadcast-heartbeat` intervals (90 seconds by default), logs a warning naming it, reports `broadcast-peers` as degraded on `/health`, and counts it in `goclusterfs_broadcast_silent_peers`. A network that silently drops multicast was invisible before.
+- Rename of files and directories, in one directory or between two, with `RENAME_NOREPLACE`. A rename over a file or an empty directory replaces it; a file another node has open stays readable there until its last close. `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
 
 ### Changed
 
