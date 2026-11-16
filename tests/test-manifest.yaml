@@ -1984,6 +1984,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/stale_bytes_test.go::TestSequentialWriteWritesDataOnce
 
+  - id: zero-range-stays-in-range
+    name: Zeroing part of a block leaves the blocks around it alone
+    description: The buffer pool rounds sizes up, so zeroing a block's tail must not also zero the start of the next block, which another file or directory owns
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestZeroRangeZeroesOnlyItsRange
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run

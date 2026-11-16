@@ -400,3 +400,41 @@ func TestWriteAfterPeerTruncateShowsNoOldBytes(t *testing.T) {
 	want := append(append(pattern(3, 100), make([]byte, 4900)...), data...)
 	expectContent(t, &File{fs: openFormattedFS(t, path), inodeNum: a.inodeNum}, want)
 }
+
+// The buffer pool rounds sizes up, so zeroing a block's tail once also zeroed the start of the next block, which another
+// file or directory owns.
+func TestZeroRangeZeroesOnlyItsRange(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	const first = 10
+	fill := bytes.Repeat([]byte{0xAB}, BlockSize)
+	for _, r := range []struct{ from, to uint64 }{
+		{0, 4096},
+		{0, 176128},
+		{163840, BlockSize},
+		{176128, BlockSize},
+		{1024000, BlockSize},
+		{BlockSize - 4096, BlockSize},
+	} {
+		for b := uint64(first); b < first+3; b++ {
+			if _, err := fsys.dev.WriteAt(fill, int64(fsys.dataOffset+b*BlockSize)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := fsys.zeroRange(first+1, r.from, r.to); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 3*BlockSize)
+		if _, err := fsys.dev.ReadAt(got, int64(fsys.dataOffset+first*BlockSize)); err != nil {
+			t.Fatal(err)
+		}
+		want := bytes.Repeat([]byte{0xAB}, 3*BlockSize)
+		clear(want[BlockSize+r.from : BlockSize+r.to])
+		if !bytes.Equal(got, want) {
+			at := 0
+			for got[at] == want[at] {
+				at++
+			}
+			t.Errorf("zeroing [%d, %d) of the middle block: first wrong byte at %d of the three blocks", r.from, r.to, at)
+		}
+	}
+}

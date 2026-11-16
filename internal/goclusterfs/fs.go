@@ -2044,7 +2044,7 @@ func (f *FS) zeroRange(physBlock, from, to uint64) error {
 	buf := storage.GetBuffer(int(to - from))
 	defer storage.PutBuffer(buf)
 	clear(buf.Bytes())
-	_, err := f.dev.WriteAt(buf.Bytes(), int64(f.dataOffset+physBlock*BlockSize+from))
+	_, err := f.dev.WriteAt(buf.Bytes()[:to-from], int64(f.dataOffset+physBlock*BlockSize+from))
 	return err
 }
 
