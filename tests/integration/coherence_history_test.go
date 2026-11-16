@@ -46,7 +46,7 @@ func TestCoherenceHistory(t *testing.T) {
 	}
 	out := os.Getenv("GCFS_HISTORY_OUT")
 
-	cluster := NewMultiNodeCluster(t, nodes, 256)
+	cluster := NewMultiNodeCluster(t, nodes, 1024)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("format and start node 0: %v", err)
 	}
