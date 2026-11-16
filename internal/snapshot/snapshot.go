@@ -179,7 +179,7 @@ type Descriptor struct {
 	State         State                    // Current state
 	Flags         Flags                    // Snapshot flags
 	DataInode     uint32                   // Hidden inode holding the captured extents
-	TargetBirth   uint64                   // Birth generation of the snapshotted file, 48 bits
+	TargetBirth   uint64                   // Birth generation of the snapshotted file, 48 bits; without FlagHasTargetBirth, the bytes an older version left there
 	TotalBlocks   uint64                   // Number of blocks at snapshot time
 	TotalSize     uint64                   // File size at snapshot time
 	CreateTime    int64                    // Creation timestamp
@@ -902,12 +902,10 @@ func decodeDescriptor(sectorData []byte, descIdx uint64) (*Descriptor, error) {
 		CreateTime:    int64(binary.LittleEndian.Uint64(data[52:60])),
 		DeleteTime:    int64(binary.LittleEndian.Uint64(data[60:68])),
 		RefCountJobID: binary.LittleEndian.Uint64(data[68:76]),
+		TargetBirth:   uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36])),
 		Checksum:      stored,
 	}
 	copy(desc.Name[:], data[76:124])
-	if desc.Flags&FlagHasTargetBirth != 0 {
-		desc.TargetBirth = uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36]))
-	}
 
 	return desc, nil
 }

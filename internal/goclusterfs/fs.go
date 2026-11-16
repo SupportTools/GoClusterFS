@@ -751,7 +751,7 @@ func (f *FS) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Create creates a new file in the root directory.
 func (f *FS) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	return f.createFile(detach(ctx), &f.Inode, inode.InodeRoot, name, mode, out)
+	return f.createFile(detach(ctx), &f.Inode, inode.InodeRoot, name, flags, mode, out)
 }
 
 // allocErrno maps a failure to allocate data or extent-tree blocks. Only an
@@ -965,13 +965,50 @@ func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode) {
 }
 
 // createFile creates a file called name in directory parentNum, whose go-fuse node is parent.
-func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
+func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	var node *fs.Inode
 	errno := retryRace("Create", name, func() (errno syscall.Errno) {
 		node, errno = f.createFileOnce(ctx, parent, parentNum, name, mode, out)
+		if errno == syscall.EEXIST && flags&syscall.O_EXCL == 0 {
+			node, errno = f.openExisting(ctx, parent, name, flags, out)
+		}
 		return errno
 	})
 	return node, nil, 0, errno
+}
+
+// openExisting opens name in parent for a create without O_EXCL that found the
+// name taken: the kernel saw no such name, but another node or thread made it since.
+func (f *FS) openExisting(ctx context.Context, parent *fs.Inode, name string, flags uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	node, errno := parent.Operations().(fs.NodeLookuper).Lookup(ctx, name, out)
+	switch {
+	case errno == syscall.ENOENT:
+		return nil, syscall.EAGAIN
+	case errno != 0:
+		return nil, errno
+	}
+	file, ok := node.Operations().(*File)
+	if !ok {
+		return nil, syscall.EISDIR
+	}
+	ino, err := f.inodeTbl.Read(file.inodeNum)
+	switch {
+	case err != nil:
+		return nil, syscall.EIO
+	case !liveFile(ino):
+		return nil, syscall.EAGAIN
+	}
+	f.cacheInode(ino)
+	if flags&syscall.O_TRUNC != 0 && ino.Size > 0 {
+		in := &fuse.SetAttrIn{}
+		in.Valid, in.Size = fuse.FATTR_SIZE, 0
+		var attr fuse.AttrOut
+		if errno := file.Setattr(ctx, nil, in, &attr); errno != 0 {
+			return nil, errno
+		}
+		out.Attr = attr.Attr
+	}
+	return node, 0
 }
 
 // createFileOnce returns EAGAIN when another node claims the free inode slot it picked first.
@@ -1381,7 +1418,7 @@ func (d *Dir) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Create creates a new file.
 func (d *Dir) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
-	return d.fs.createFile(detach(ctx), &d.Inode, d.inodeNum, name, mode, out)
+	return d.fs.createFile(detach(ctx), &d.Inode, d.inodeNum, name, flags, mode, out)
 }
 
 // Mkdir creates a new directory.
@@ -1660,9 +1697,9 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 		logging.Debugf("File.Open: read failed: %v", err)
 		return nil, 0, syscall.EIO
 	}
-	if !ino.IsFile() {
-		logging.Debugf("File.Open: not a file")
-		return nil, 0, syscall.EISDIR
+	if !liveFile(ino) {
+		logging.Debugf("File.Open: inode %d is no longer this file", f.inodeNum)
+		return nil, 0, syscall.ESTALE
 	}
 	logging.Debugf("File.Open: success, Size=%d", ino.Size)
 	// Close-to-open consistency: reads through this handle start from the on-disk inode.
@@ -1678,6 +1715,13 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	return nil, 0, 0
 }
 
+// liveFile reports whether ino is a regular file some name still holds, so a new
+// open may use it. A node can outlive its file: another caller unlinks it, or the
+// slot goes to a new inode. ESTALE makes the kernel look the name up again.
+func liveFile(ino *inode.Inode) bool {
+	return ino.Magic == inode.InodeMagic && ino.IsFile() && ino.LinkCount > 0
+}
+
 // Getattr returns file attributes.
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	logging.Debugf("File.Getattr: inode=%d", f.inodeNum)
@@ -1687,6 +1731,9 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	if err != nil {
 		logging.Debugf("File.Getattr: read failed: %v", err)
 		return syscall.EIO
+	}
+	if ino.Magic != inode.InodeMagic || !ino.IsFile() {
+		return syscall.ESTALE
 	}
 
 	logging.Debugf("File.Getattr: inode=%d Size=%d AllocatedBlocks=%d", f.inodeNum, ino.Size, ino.AllocatedBlocks)

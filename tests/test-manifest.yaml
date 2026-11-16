@@ -4580,3 +4580,97 @@ scenarios:
     priority: go_only
     environments:
       go: internal/cli/completion_test.go::TestBashCompletion
+
+  - id: history-checker-accepts-concurrent
+    name: Coherence checker accepts concurrent histories
+    description: Overlapping writes, reads within the coherence window, unlinks and creates that the documented guarantees allow give no violations
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestConcurrentHistoryPasses
+
+  - id: history-checker-stale-read
+    name: Coherence checker flags a stale read after open
+    description: A read right after open that misses a write completed before it is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestStaleReadRightAfterOpen
+
+  - id: history-checker-name-window
+    name: Coherence checker allows name changes to lag the window
+    description: A name created or removed within -attr-timeout may still look old; after the window it may not
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestNameChangesMayLagTheWindow
+
+  - id: history-checker-torn-read
+    name: Coherence checker flags torn reads
+    description: A read that mixes values mid-sector, or with no write on its node overlapping, is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestTornRead
+
+  - id: history-checker-sector-tear
+    name: Coherence checker allows 4 KB tears during a local write
+    description: A read split at 4 KB boundaries between values a write on the same node was storing is allowed
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestSectorTearDuringALocalWriteIsAllowed
+
+  - id: history-checker-resurrection
+    name: Coherence checker flags resurrected names
+    description: A stat, listing or create that finds a name unlinked more than a window ago is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestResurrectedName
+
+  - id: history-checker-listing
+    name: Coherence checker flags listings missing created names
+    description: A listing or unlink that misses a name created more than a window ago is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestListingMissesCreatedName
+
+  - id: history-checker-failed-calls
+    name: Coherence checker treats failed calls as maybe applied
+    description: A failed write may or may not have taken effect, and is itself reported
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestFailedCallsMayOrMayNotTakeEffect
+
+  - id: history-checker-rename
+    name: Coherence checker checks rename atomicity in listings
+    description: A listing during or after a rename onto a free name shows exactly one of the two names
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenameShowsExactlyOneName
+
+  - id: history-checker-eexist
+    name: Coherence checker flags EEXIST from a non-exclusive open
+    description: open with O_CREAT and no O_EXCL must open the file, never fail with EEXIST
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestNonExclusiveOpenNeverFailsWithEEXIST
+
+  # Records every call of 2-4 mounts on one clock in one process; docker exec and ssh would add their own latency to each timing. Runs only with GCFS_HISTORY=1.
+  - id: coherence-history
+    name: Concurrent multi-node history meets the documented guarantees
+    description: Clients on 2-4 nodes create, write, read, stat, list, unlink and rename a few shared names; the recorded history has no violations
+    priority: medium
+    environments:
+      go: coherence_history_test.go::TestCoherenceHistory
+      docker: TODO
+      vm: TODO
+
+  - id: stale-file-node-estale
+    name: A file node whose inode is gone opens as stale
+    description: After another caller unlinks a file, or a directory takes its slot, open and getattr of the old node return ESTALE, not EISDIR or empty attributes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/open_errors_test.go::TestStaleFileNodeOpensAsStale
+
+  - id: create-without-excl-opens-existing
+    name: Create without O_EXCL opens a name made since the lookup
+    description: A CREATE that finds its name taken opens that file without O_EXCL, truncates it with O_TRUNC, and fails with EEXIST only under O_EXCL
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/open_errors_test.go::TestCreateWithoutExclOpensTheFileItFinds
