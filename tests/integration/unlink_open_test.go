@@ -49,6 +49,15 @@ func TestFileUnlinkedWhileOpenKeepsItsData(t *testing.T) {
 	} else if !bytes.Equal(got, fill('d')) {
 		t.Errorf("the open descriptor reads %q..., want its own write 'd'", got[:4])
 	}
+	again, err := os.OpenFile(fmt.Sprintf("/proc/self/fd/%d", f.Fd()), os.O_RDONLY, 0)
+	if err != nil {
+		t.Errorf("reopen through /proc/self/fd: %v", err)
+	} else {
+		if _, err := again.ReadAt(got, 0); err != nil || !bytes.Equal(got, fill('d')) {
+			t.Errorf("reopened descriptor reads %q... (%v), want 'd'", got[:4], err)
+		}
+		_ = again.Close()
+	}
 	if err := f.Close(); err != nil {
 		t.Errorf("close: %v", err)
 	}

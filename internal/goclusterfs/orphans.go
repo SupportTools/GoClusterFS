@@ -79,6 +79,11 @@ func (f *FS) liveHolders() (uint64, error) {
 	return live | f.slotBit(), err
 }
 
+// holdsOrphan lets an open of /proc/self/fd/N reach a file this node already has open after its unlink.
+func (f *FS) holdsOrphan(ino *inode.Inode) bool {
+	return ino.Magic == inode.InodeMagic && ino.IsFile() && ino.LinkCount == 0 && ino.Holders&f.slotBit() != 0
+}
+
 func orphanOf(ino *inode.Inode) node.Orphan {
 	return node.Orphan{Inode: ino.InodeNum, Birth: uint32(ino.BirthGeneration)}
 }

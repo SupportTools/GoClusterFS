@@ -1723,9 +1723,9 @@ func (f *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, s
 	logging.Debugf("File.Open: inode=%d flags=%d", f.inodeNum, flags)
 	// Counted before the check, so a peer's last unlink sees this open and keeps the file.
 	unlock := f.fs.lockInode(f.inodeNum)
-	f.fs.addOpen(f.inodeNum, 1)
+	reopen := f.fs.addOpen(f.inodeNum, 1) > 1
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
-	if err != nil || !liveFile(ino) {
+	if err != nil || !liveFile(ino) && !(reopen && f.fs.holdsOrphan(ino)) {
 		f.fs.addOpen(f.inodeNum, -1)
 		unlock()
 		if err != nil {
