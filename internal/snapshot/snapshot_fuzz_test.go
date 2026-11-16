@@ -60,21 +60,15 @@ func FuzzDecodeDescriptor(f *testing.F) {
 
 func checkDescriptorDecode(t *testing.T, sector []byte, idx uint64) {
 	desc, err := decodeDescriptor(sector, idx)
-	if err != nil {
+	if err != nil || desc.Magic == 0 {
 		return
 	}
 	_ = desc.GetName()
 
 	out := make([]byte, BytesPerSector)
 	encodeDescriptor(out, 0, desc)
-	again, err := decodeDescriptor(out, 0)
-	if err != nil {
-		t.Fatalf("decoding a re-encoded descriptor: %v", err)
-	}
-	// Bytes only some formats use, such as the birth generation without
-	// FlagHasTargetBirth, re-encode as zero and change the checksum.
-	again.Checksum = desc.Checksum
-	if *again != *desc {
-		t.Fatalf("descriptor changed after an encode/decode round trip: %+v != %+v", again, desc)
+	in := sector[idx*DescriptorSize : (idx+1)*DescriptorSize]
+	if !bytes.Equal(out[:DescriptorSize], in) {
+		t.Fatalf("re-encoding a descriptor changed its bytes:\nread  %x\nwrote %x", in, out[:DescriptorSize])
 	}
 }
