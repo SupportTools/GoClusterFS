@@ -4137,6 +4137,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
 
+  - id: fsck-checks-every-dir-entry
+    name: fsck checks every directory entry's type and inode range
+    description: fsck reports an entry whose type does not match its inode whatever the inode number, and an entry whose inode number is past the inode table, including one that would wrap to a used inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_dir_test.go::TestFsckChecksEveryDirectoryEntry
+
   - id: snapshot-unreadable-sector-eio
     name: An unreadable snapshot registry sector makes lookups and listings fail with EIO
     description: With a registry sector that fails its checksum, a lookup that finds nothing and every listing fail with EIO instead of not found or a partial list; a snapshot in a readable sector is still found and the mount scan still succeeds
