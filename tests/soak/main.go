@@ -43,6 +43,7 @@ func main() {
 		fs.DurationVar(&cfg.fsckEvery, "fsck-every", time.Hour, "interval between quiesced fsck runs; 0 for none")
 		fs.DurationVar(&cfg.barrierEvery, "barrier-every", 5*time.Minute, "interval between full directory checks; 0 for none")
 		fs.DurationVar(&cfg.window, "window", 30*time.Second, "how long a node may take to show an acknowledged change, including waiting out a failed node")
+		fs.BoolVar(&cfg.inflight, "inflight", false, "let faults cut operations short; the model takes what the node shows after recovery")
 		fs.DurationVar(&cfg.coherence, "coherence", 6*time.Second, "the documented coherence window; slower checks are logged")
 		fs.DurationVar(&cfg.stopFor, "stop-for", 25*time.Second, "how long a stop fault keeps the mount stopped; past the 10s heartbeat timeout")
 		fs.DurationVar(&cfg.opTimeout, "op-timeout", 5*time.Minute, "an operation taking longer is a hang")
@@ -98,9 +99,26 @@ func replay(cfg config, oplog string, upto uint64) error {
 	if err := d.bringUp(); err != nil {
 		return fmt.Errorf("bring up the cluster: %w", err)
 	}
+	outcomes := map[uint64]string{}
 	for _, r := range records {
-		if d.ctx.Err() != nil || upto > 0 && r.Type == "op" && r.Seq > upto {
+		if r.Type == "resolved" {
+			outcomes[r.Seq] = r.Detail
+		}
+	}
+	for _, r := range records {
+		if d.ctx.Err() != nil || upto > 0 && (r.Type == "op" || r.Type == "uncertain") && r.Seq > upto {
 			break
+		}
+		if r.Type == "uncertain" {
+			// A fault cut this operation short; replay runs it only if it took effect, since its timing cannot recur.
+			switch outcomes[r.Seq] {
+			case "after":
+				r.Type = "op"
+			case "torn":
+				return fmt.Errorf("op %d: a write the fault left torn cannot be replayed", r.Seq)
+			default:
+				continue
+			}
 		}
 		switch r.Type {
 		case "op":
