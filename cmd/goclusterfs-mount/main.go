@@ -509,10 +509,14 @@ func main() {
 	}
 	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)
 	nodeReg.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
-		if err := replayPeer(info); err != nil {
-			return err
+		err := replayPeer(info)
+		if err == nil {
+			err = gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
 		}
-		return gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
+		if errors.Is(err, lock.ErrLockTimeout) {
+			return fmt.Errorf("%w: %w", node.ErrReplayContended, err)
+		}
+		return err
 	})
 	gfs.SetOrphanRegistry(nodeReg)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
@@ -596,6 +600,7 @@ func main() {
 				deviceError:      dev.LastError,
 				journal:          sampler.JournalStats,
 				replaying:        nodeReg.Replaying,
+				failingReplays:   nodeReg.FailingReplays,
 				broadcastOn:      cacheMgr.BroadcastEnabled(),
 				broadcastProblem: cacheMgr.BroadcastProblem,
 				silentPeers:      cacheMgr.SilentBroadcastPeers,

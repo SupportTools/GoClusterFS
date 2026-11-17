@@ -17,6 +17,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,6 +147,7 @@ type Registry struct {
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 	replays              atomic.Uint64
 	replayFailures       atomic.Uint64
+	failures             map[int]*replayFailure // the last run of identical replay failures per slot
 }
 
 // emptySlot is a slot no node ever wrote; it has no checksum.
@@ -161,6 +163,8 @@ var (
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
 	ErrOrphansFull        = errors.New("this node's registry slot has no room for another orphan")
+	// ErrReplayContended marks a replay that failed waiting on other nodes, such as for a lock; it never counts toward a backoff.
+	ErrReplayContended = errors.New("the replay waited too long on other nodes")
 )
 
 // FailedNodeInfo contains information about a failed node for recovery.
@@ -198,6 +202,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		orphanKick:           make(chan struct{}, 1),
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
+		failures:             make(map[int]*replayFailure),
 		sightings:            make(map[int]sighting),
 		seen:                 make(map[int]*Slot),
 		bootID:               readBootID(),
@@ -1057,9 +1062,12 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		r.mu.Lock()
 		r.remember(i, slot)
 		r.observe(i, slot)
+		if f := r.failures[i]; f != nil && (slot.UUID != f.uuid || slot.State != NodeStateDead) {
+			delete(r.failures, i)
+		}
 
 		// Peers wait for a failed node's locks until its replay ends, so only a node proven dead, not one paused, is replayed.
-		if !r.stale(i, slot, deadAfter) {
+		if !r.stale(i, slot, deadAfter) || r.backingOff(i, slot) {
 			r.mu.Unlock()
 			continue
 		}
@@ -1084,11 +1092,13 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		err = r.replay(handler, i, info)
 		done(err == nil)
 		if err != nil {
-			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v. To discard its journal instead, mount a node with -skip-recovery=%d",
-				i, info.UUID[:8], err, recoveryLease, i)
 			r.mu.Lock()
 			delete(r.recoveryInProgress, i)
+			msg := r.replayFailed(i, info.UUID, err)
 			r.mu.Unlock()
+			if msg != "" {
+				log.Print(msg)
+			}
 			continue
 		}
 
@@ -1098,8 +1108,66 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		}
 		r.mu.Lock()
 		delete(r.recoveryInProgress, i)
+		delete(r.failures, i)
 		r.mu.Unlock()
 	}
+}
+
+const (
+	// replayRepeats identical failures in a row make this node back off from a slot's replay.
+	replayRepeats = 3
+	// ReplayBackoff is how long a backed-off slot must stay unchanged before this node replays it again.
+	// Every attempt, by any node, renews the slot's lease, so once all nodes back off the cluster tries about this often.
+	ReplayBackoff = 10 * time.Minute
+	// failureLogEvery is how often a backed-off slot's failures are logged.
+	failureLogEvery = time.Hour
+)
+
+// replayFailure is a run of replay failures of one dead node's slot, all with the same error.
+type replayFailure struct {
+	uuid   [16]byte
+	err    string
+	count  int
+	logged time.Time
+}
+
+// backingOff reports whether this node leaves slot i alone for now. Called with r.mu held after observe.
+func (r *Registry) backingOff(i int, slot *Slot) bool {
+	f := r.failures[i]
+	return f != nil && f.count >= replayRepeats && r.silentFor(i, slot) < ReplayBackoff
+}
+
+// replayFailed counts a failed replay of slot i and returns what to log, or "" once the slot is backed off
+// and was logged within failureLogEvery. Called with r.mu held.
+func (r *Registry) replayFailed(i int, uuid [16]byte, err error) string {
+	failed := fmt.Sprintf("[Recovery] Replaying slot %d (node %x) failed: %v", i, uuid[:8], err)
+	if errors.Is(err, ErrReplayContended) || errors.Is(err, ErrLeaseLost) {
+		return fmt.Sprintf("%s; any node retries after %v", failed, recoveryLease)
+	}
+	f := r.failures[i]
+	if f == nil || f.uuid != uuid || f.err != err.Error() {
+		f = &replayFailure{uuid: uuid, err: err.Error()}
+		r.failures[i] = f
+	}
+	f.count++
+	switch {
+	case f.count < replayRepeats:
+		return fmt.Sprintf("%s; any node retries after %v. To see what its journal holds, run goclusterfs-fsck -inspect-slot %d; "+
+			"to discard it, mount a node with -skip-recovery=%d", failed, recoveryLease, i, i)
+	case f.count == replayRepeats || time.Since(f.logged) >= failureLogEvery:
+		f.logged = time.Now()
+		return fmt.Sprintf("%s, %d times in a row; this node now retries it after %v without a change and logs this at most hourly. "+
+			"Files it had locked stay locked until a replay succeeds. Run goclusterfs-fsck -inspect-slot %d, then see Damaged Journal Slot in OPERATIONS.md",
+			failed, f.count, ReplayBackoff, i)
+	}
+	return ""
+}
+
+// FailingReplay is a dead node's slot whose replay failed on this node with the same error several times in a row.
+type FailingReplay struct {
+	Slot     int
+	Failures int
+	Err      string
 }
 
 // acquireForRecovery marks a failed node's slot Dead with this node as the
@@ -1290,11 +1358,12 @@ type Stats struct {
 	Replays        uint64 // other nodes' journals this node replayed
 	ReplayFailures uint64 // replays that failed and were left for a retry
 	Replaying      []int  // slots whose journal this node is replaying now
+	Failing        []FailingReplay
 }
 
 // Stats returns this node's liveness and replay counts.
 func (r *Registry) Stats() Stats {
-	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying()}
+	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays()}
 	if r.lastBeat.Load() != nil {
 		st.HeartbeatAge = r.sinceLastBeat()
 	}
@@ -1308,6 +1377,20 @@ func (r *Registry) Replaying() []int {
 		slots = append(slots, bits.TrailingZeros64(mask))
 	}
 	return slots
+}
+
+// FailingReplays returns the slots this node backs off from, after their replay failed the same way replayRepeats times in a row.
+func (r *Registry) FailingReplays() []FailingReplay {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var failing []FailingReplay
+	for i, f := range r.failures {
+		if f.count >= replayRepeats {
+			failing = append(failing, FailingReplay{Slot: i, Failures: f.count, Err: f.err})
+		}
+	}
+	slices.SortFunc(failing, func(a, b FailingReplay) int { return a.Slot - b.Slot })
+	return failing
 }
 
 // RecoverFailedNode manually triggers recovery for a specific node.
