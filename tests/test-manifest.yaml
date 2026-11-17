@@ -1835,6 +1835,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringRmdir
 
+  - id: mkdir-eio-parent-links
+    name: A write that fails mkdir keeps the parent's link count
+    description: Each write of one mkdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedMkdirWriteKeepsParentLinks
+
+  - id: rmdir-eio-parent-links
+    name: A write that fails rmdir keeps the parent's link count
+    description: Each write of one rmdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRmdirWriteKeepsParentLinks
+
   - id: fsck-directory-tree
     name: fsck checks the directory tree
     description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them
