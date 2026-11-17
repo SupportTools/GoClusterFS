@@ -145,8 +145,9 @@ func TestMultiNodeHardLinks(t *testing.T) {
 	}
 }
 
-// One node links a file while the other removes its only name. Either the link wins and the new name reads the
-// file with one link, or the unlink wins and the link fails; the volume stays consistent.
+// One node links a file while the other removes its only name, with the link starting 0 to 19 ms later. Either the
+// link wins and the new name reads the file with one link, or the unlink wins and the link fails; the volume stays
+// consistent.
 func TestMultiNodeLinkRacesLastUnlink(t *testing.T) {
 	cluster := NewMultiNodeCluster(t, 2, 50)
 	if err := cluster.FormatAndStartFirst(false); err != nil {
@@ -168,7 +169,11 @@ func TestMultiNodeLinkRacesLastUnlink(t *testing.T) {
 		var linkErr, rmErr error
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); linkErr = os.Link(linker.Path(name), linker.Path(link)) }()
+		go func() {
+			defer wg.Done()
+			time.Sleep(time.Duration(i) * time.Millisecond)
+			linkErr = os.Link(linker.Path(name), linker.Path(link))
+		}()
 		go func() { defer wg.Done(); rmErr = os.Remove(remover.Path(name)) }()
 		wg.Wait()
 		if rmErr != nil {
