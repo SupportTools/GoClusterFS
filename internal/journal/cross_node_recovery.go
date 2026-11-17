@@ -467,6 +467,14 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 	if err != nil {
 		return false, err
 	}
+	added, err := addLoggedEntry(ctx, rctx, r, p)
+	if err != nil || p.EntryType != DirEntryDirectory {
+		return added, err
+	}
+	return added, recountLinks(ctx, rctx, p.ParentInodeNum)
+}
+
+func addLoggedEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p *DirAddEntryPayload) (bool, error) {
 	if !r.created[p.ChildInodeNum] {
 		log.Printf("[Recovery] DirAddEntry: replay did not create inode %d, skipping %q", p.ChildInodeNum, p.Name)
 		return false, nil
@@ -489,18 +497,28 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 	case err != nil:
 		return false, fmt.Errorf("failed to add entry %q: %w", p.Name, err)
 	}
-	if p.EntryType == DirEntryDirectory {
-		if err := rctx.InodeTbl.Update(ctx, uint32(p.ParentInodeNum), func(parent *inode.Inode) error {
-			parent.LinkCount++
-			return nil
-		}); err != nil {
-			return true, fmt.Errorf("failed to count the link from %q in parent %d: %w", p.Name, p.ParentInodeNum, err)
-		}
-	}
-
 	log.Printf("[Recovery] DirAddEntry: added entry %q -> inode %d in parent %d",
 		p.Name, p.ChildInodeNum, p.ParentInodeNum)
 	return true, nil
+}
+
+// recountLinks sets directory num's link count from its subdirectories, after replay of a mkdir or rmdir that may
+// have been cut between the parent's inode write and its chunk write.
+func recountLinks(ctx context.Context, rctx *RecoveryContext, num uint64) error {
+	parent, ok, err := liveDir(rctx, num)
+	if !ok {
+		return err
+	}
+	fixed, err := rctx.DirMgr.RecountLinks(ctx, parent)
+	switch {
+	case errors.Is(err, dir.ErrRemoved):
+		return nil
+	case err != nil:
+		return fmt.Errorf("failed to recount the links of directory %d: %w", num, err)
+	case fixed:
+		log.Printf("[Recovery] directory %d: link count set from its subdirectories", num)
+	}
+	return nil
 }
 
 func fileTypeOf(t DirEntryType) uint8 {
@@ -656,7 +674,14 @@ func applyDirRemoveEntry(ctx context.Context, rctx *RecoveryContext, payload []b
 	if err != nil {
 		return false, err
 	}
+	removed, err := removeLoggedEntry(ctx, rctx, p)
+	if err != nil || p.EntryType != DirEntryDirectory {
+		return removed, err
+	}
+	return removed, recountLinks(ctx, rctx, p.ParentInodeNum)
+}
 
+func removeLoggedEntry(ctx context.Context, rctx *RecoveryContext, p *DirRemoveEntryPayload) (bool, error) {
 	parentIno, ok, err := liveDir(rctx, p.ParentInodeNum)
 	if !ok {
 		return false, err

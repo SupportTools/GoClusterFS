@@ -127,8 +127,8 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 |------|---------|-------------|
 | `-broadcast` | `true` | Send cache invalidations over UDP so other nodes see changes sooner |
 | `-mcast-group` | `239.192.74.75` | Multicast group address |
-| `-mcast-port` | `31337` | UDP port for multicast |
-| `-unicast-port` | `31338` | UDP port for unicast; must differ from `-mcast-port` |
+| `-mcast-port` | `24730` | UDP port for multicast |
+| `-unicast-port` | `24731` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | (empty) | Secret that signs broadcast messages; the same on every node |
 | `-broadcast-iface` | (empty) | Network interface for multicast; empty lets the kernel choose |
 

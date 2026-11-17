@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
@@ -393,5 +394,29 @@ func TestPowerCutDuringClone(t *testing.T) {
 				checkFile(t, c, data)
 			}
 		},
+	})
+}
+
+// Power fails during mkdir. The root counts a link for the new directory exactly when it names it.
+func TestPowerCutDuringMkdir(t *testing.T) {
+	t.Parallel()
+	runPowerCuts(t, powerCutCase{
+		setup: func(t *testing.T, fsys *FS) {},
+		op: func(fsys *FS, _ *power) {
+			_, _ = withBridge(fsys).Mkdir(context.Background(), "d", 0o755, &fuse.EntryOut{})
+		},
+		check: func(t *testing.T, fsys *FS) { expectDirLinks(t, fsys, inode.InodeRoot) },
+	})
+}
+
+// Power fails during rmdir. The root drops the directory's link exactly when it drops its name.
+func TestPowerCutDuringRmdir(t *testing.T) {
+	t.Parallel()
+	runPowerCuts(t, powerCutCase{
+		setup: func(t *testing.T, fsys *FS) { newSubdir(t, fsys, "d") },
+		op: func(fsys *FS, _ *power) {
+			_ = withBridge(fsys).Rmdir(context.Background(), "d")
+		},
+		check: func(t *testing.T, fsys *FS) { expectDirLinks(t, fsys, inode.InodeRoot) },
 	})
 }

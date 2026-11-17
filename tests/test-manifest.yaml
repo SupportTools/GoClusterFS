@@ -1821,6 +1821,27 @@ scenarios:
     environments:
       go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameOverAnEmptyDirectory
 
+  - id: mkdir-power-failure
+    name: Power failure during mkdir
+    description: Power fails at each write; the root counts a link for the new directory exactly when it names it, and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringMkdir
+
+  - id: rmdir-power-failure
+    name: Power failure during rmdir
+    description: Power fails at each write; the root drops the directory's link exactly when it drops its name, and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringRmdir
+
+  - id: fsck-directory-tree
+    name: fsck checks the directory tree
+    description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_tree_test.go::TestFsckReportsDirectoryTreeProblems
+
   - id: clone-power-failure-go
     name: Power failure at each write of a clone
     description: Power fails at each device write of a clone; the source keeps its data and the clone is either gone or a full copy, and fsck finds only leaks
@@ -4829,6 +4850,13 @@ scenarios:
     priority: go_only
     environments:
       go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightNamesAFixForEachFailure
+
+  - id: mount-preflight-nodeports
+    name: Preflight warns about NodePort-range ports on Kubernetes nodes
+    description: On a host that looks like a Kubernetes node, -preflight warns about a broadcast or API port in 30000-32767 and names the flag to change; the default ports pass
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightWarnsAboutNodePorts
 
   - id: cli-shell-completions
     name: Shell completions for the CLIs

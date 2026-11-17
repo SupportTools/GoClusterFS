@@ -54,7 +54,7 @@ type DirEntryData struct {
 //   - Referenced inodes exist and are in use
 //   - File type in entry matches inode mode
 //   - Root directory exists and is accessible
-//   - Check for directory cycles (not implemented yet)
+//   - The directory tree: one name per directory, "..", link counts, and no loops
 //
 // It also finds the inodes other than root that no directory names, which
 // phase 8 reports. "." and ".." are not names.
@@ -71,6 +71,7 @@ func (c *Checker) checkDirectories() error {
 	dirCount := 0
 	entryCount := 0
 	invalidEntries := 0
+	tree := dirTree{dotdot: map[uint32]uint32{}, parents: map[uint32][]uint32{}, subdirs: map[uint32]int{}, links: map[uint32]uint32{}}
 	totalInodes := sb.InodeTableSize / InodeSize
 
 	// Find all directory inodes and validate their entries
@@ -103,6 +104,7 @@ func (c *Checker) checkDirectories() error {
 			}
 
 			dirCount++
+			tree.links[inodeNum] = inode.LinkCount
 
 			// Skip empty directories
 			if inode.Size == 0 {
@@ -145,9 +147,17 @@ func (c *Checker) checkDirectories() error {
 					continue
 				}
 
-				if entry.Name != "." && entry.Name != ".." {
+				switch entry.Name {
+				case "..":
+					tree.dotdot[inodeNum] = target
+				case ".":
+				default:
 					c.dirEntryRefs[target]++
 					c.dirNames[inodeNum]++
+					if c.entryType[target] == DT_DIR {
+						tree.parents[target] = append(tree.parents[target], inodeNum)
+						tree.subdirs[inodeNum]++
+					}
 				}
 
 				// Phase 3 reports an inode whose mode has no valid type.
@@ -165,6 +175,11 @@ func (c *Checker) checkDirectories() error {
 		if inodeNum != InodeRoot && c.dirEntryRefs[inodeNum] == 0 {
 			c.unnamed = append(c.unnamed, inodeNum)
 		}
+	}
+	if len(c.namesIncomplete) == 0 {
+		c.checkDirectoryTree(tree)
+	} else {
+		c.logf("  Directory tree not checked: %s\n", c.namesIncomplete[0])
 	}
 
 	c.logf("  Directories validated: %d\n", dirCount)
@@ -280,4 +295,61 @@ func parseDirChunk(chunk []byte, base int) ([]*DirEntryData, []string) {
 		pos += recLen
 	}
 	return entries, errors
+}
+
+// dirTree is what phase 6 read of every directory: its "..", the directories that name it, its subdirectories and
+// its link count.
+type dirTree struct {
+	dotdot  map[uint32]uint32
+	parents map[uint32][]uint32
+	subdirs map[uint32]int
+	links   map[uint32]uint32
+}
+
+// checkDirectoryTree reports a directory that has other than one name, whose ".." does not name the directory that
+// names it, whose link count is not 2 plus its subdirectories, or from which ".." never reaches the root.
+func (c *Checker) checkDirectoryTree(t dirTree) {
+	dirs := slices.Sorted(maps.Keys(t.links))
+	for _, d := range dirs {
+		loc := fmt.Sprintf("inode %d", d)
+		if want := 2 + uint32(t.subdirs[d]); t.links[d] != want {
+			c.addProblem(PhaseDirectories, Warning, loc, fmt.Sprintf("directory has %d links, want %d: 2 plus one per subdirectory", t.links[d], want), false)
+		}
+		dots, hasDots := t.dotdot[d]
+		switch ps := t.parents[d]; {
+		case d == InodeRoot:
+			if dots != InodeRoot {
+				c.addProblem(PhaseDirectories, Error, loc, fmt.Sprintf("\"..\" of the root names inode %d, not the root", dots), false)
+			}
+		case len(ps) > 1:
+			c.addProblem(PhaseDirectories, Error, loc, fmt.Sprintf("directory has %d names, in directories %v; a directory has exactly one", len(ps), ps), false)
+		case len(ps) == 1 && !hasDots:
+			c.addProblem(PhaseDirectories, Error, loc, "directory has no \"..\"", false)
+		case len(ps) == 1 && dots != ps[0]:
+			c.addProblem(PhaseDirectories, Error, loc, fmt.Sprintf("\"..\" names inode %d, but directory %d names it", dots, ps[0]), false)
+		}
+	}
+
+	reaches, cut := map[uint32]bool{InodeRoot: true}, map[uint32]bool{}
+	for _, d := range dirs {
+		var path []uint32
+		at := map[uint32]int{}
+		cur := d
+		for !reaches[cur] && !cut[cur] {
+			if i, looped := at[cur]; looped {
+				c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", cur), fmt.Sprintf("\"..\" never reaches the root: it loops through directories %v", path[i:]), false)
+				break
+			}
+			at[cur] = len(path)
+			path = append(path, cur)
+			next, ok := t.dotdot[cur]
+			if _, isDir := t.links[next]; !ok || !isDir {
+				break
+			}
+			cur = next
+		}
+		for _, p := range path {
+			reaches[p], cut[p] = reaches[cur], !reaches[cur]
+		}
+	}
 }

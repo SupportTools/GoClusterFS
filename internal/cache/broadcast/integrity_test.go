@@ -82,7 +82,7 @@ func FuzzUnmarshal(f *testing.F) {
 		builder.InvalidateExtent(4, 5),
 		builder.InvalidateAll(),
 		builder.Heartbeat(),
-		builder.PeerAnnounce(1, 31337, [16]byte{}),
+		builder.PeerAnnounce(1, 24730, [16]byte{}),
 	} {
 		for _, s := range [][]byte{nil, secret} {
 			data, err := msg.Marshal(s)

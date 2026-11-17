@@ -224,7 +224,7 @@ func (m *Manager) applyRename(op *RenameOp, p *renamePlan) error {
 			func(chunk []byte) bool { return pointName(chunk, "..", uint64(newDir.InodeNum), DT_DIR) },
 			func(names map[string]slot) {
 				names[".."] = slot{child: uint64(newDir.InodeNum), chunk: dots.chunk, ftype: DT_DIR}
-			}); err != nil {
+			}, nil); err != nil {
 			return err
 		}
 	}
@@ -405,7 +405,7 @@ func (m *Manager) grow(ctx context.Context, num uint32, need uint16) error {
 				_, ok := x.chunkWithRoom(need)
 				return cur, ok, nil
 			},
-			func([]byte) {})
+			func([]byte) {}, nil)
 		if !errors.Is(err, errRetryAdd) {
 			return err
 		}
@@ -442,5 +442,5 @@ func (m *Manager) PointIf(ctx context.Context, dirIno *inode.Inode, name string,
 	}
 	return m.editChunk(fresh, x, s.chunk,
 		func(chunk []byte) bool { return pointName(chunk, name, child, ftype) },
-		func(names map[string]slot) { names[name] = slot{child: child, chunk: s.chunk, ftype: ftype} })
+		func(names map[string]slot) { names[name] = slot{child: child, chunk: s.chunk, ftype: ftype} }, nil)
 }
