@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Older binaries read a newer node's waiting mark in a lock record as a held lock.
   - Older binaries free a file unlinked while open at once, even when a newer node still has it open.
   - Older binaries cannot replay a journal this version wrote, because they do not know its link-drop records. After a crash, let this version replay the journal before you downgrade.
+  - Older binaries skip rename records when they replay a journal this version wrote, but still apply the replaced file's link drop, which can free a file whose name remains. Upgrade every node before anyone renames.
 - Run `goclusterfs-fsck -repair` before the first mount after upgrading an image that has snapshots or clones. Unmount the device on every node first.
 - Older versions marked a file's blocks shared, on snapshot or clone, without counting the owners. Until `goclusterfs-fsck -repair` counts them, this version never frees such blocks, so deleting those files leaks their space, and it refuses to snapshot or clone them (`ENOTSUP`). In-place writes to an old clone still change its source.
 - Snapshots now record the birth generation of the file they were taken of, so a later file that reuses the inode number cannot list, clone or delete them. Snapshots older versions made do not record it, and some captured no data, so after the upgrade they are orphans: `getfattr -n user.snapshots` no longer lists them, `GET /api/v1/snapshots` lists them with `orphan: true`, and `DELETE /api/v1/snapshots/<name>` without `path` deletes them. Older binaries keep the birth generation in inode bytes 196–203 only while they do not rewrite the inode, so upgrade all nodes together.
@@ -61,6 +62,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `-cache-inodes`, `-cache-extents`, `-cache-negative` and `-broadcast-max-peers` set the cache and broadcast table sizes, and `/metrics` reports each limit next to its size.
 - A node that hears no broadcasts from a node the registry shows mounted, for 3 `-broadcast-heartbeat` intervals (90 seconds by default), logs a warning naming it, reports `broadcast-peers` as degraded on `/health`, and counts it in `goclusterfs_broadcast_silent_peers`. A network that silently drops multicast was invisible before.
+- Rename of files and directories, in one directory or between two, with `RENAME_NOREPLACE`. A rename over a file or an empty directory replaces it; a file another node has open stays readable there until its last close. `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
 
 ### Changed
 
@@ -83,6 +85,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `goclusterfs-fsck` checked a directory entry's type only when the entry's inode number was below the count of inodes in use, and then only that the type was a valid value. It now reports every entry whose type differs from its inode's, which lookup, unlink and rmdir trust: an unlink could remove a directory that its entry calls a file. It also reports an entry whose inode number is past the inode table; before, a number past 2^32 wrapped and could pass as an inode in use.
+- `goclusterfs-fsck` never checked a snapshot's parent: the check was an empty block. It now warns about a snapshot whose parent snapshot does not exist, is the snapshot itself, or was taken of another file. Deleting a snapshot hands its children to its parent.
 - A file node that outlived its file, such as an O_PATH descriptor or a name another node had just removed, could open, read, write and truncate the next file to take its inode slot. It now fails with ESTALE.
 - Snapshot lookups and listings skipped a snapshot registry sector they could not read: `getfattr -n user.snapshots` and `GET /api/v1/snapshots` returned part of the list, and a delete, clone or lookup of a snapshot in that sector reported it missing. A snapshot delete job took such a snapshot for already deleted. They now fail with `EIO`, and the API answers 500 with the sector and what to run. A snapshot in a readable sector is still found, and mount still succeeds and logs a warning naming the sector.
 - A file unlinked while open, on this node or another, was freed at once: its descriptors read and wrote whatever file took the inode next. The file now keeps its inode and blocks until every node has closed it. A node that dies holding it lets go when a peer replays its journal. While other nodes are mounted, each node tracks up to 487 unlinked files that other nodes have not yet let go of. An unlink beyond that waits, and fails with EBUSY only when live nodes keep holding them for 20 s.

@@ -890,6 +890,11 @@ func (m *Manager) checkLockOrder(key lockKey, recordID, gid uint64) error {
 	return nil
 }
 
+// Record returns the record a lock maps to; take several locks of one type in increasing record order.
+func (m *Manager) Record(lockType LockType, resourceID uint64) uint64 {
+	return m.hashToRecord(lockType, resourceID)
+}
+
 // hashToRecord maps a lock to a record position.
 func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 	// Simple hash combining type and resource ID

@@ -6,18 +6,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
 func freeUDPPorts(t *testing.T, n int) []int {
 	t.Helper()
-	ports := make([]int, n)
-	for i := range ports {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = conn.Close() }()
-		ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
+	ports, err := testnet.UDPPorts(n)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return ports
 }

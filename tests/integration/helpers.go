@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/superblock"
+	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
 // MountedFS manages a temporary mounted GoClusterFS instance for testing.
@@ -39,26 +39,19 @@ type MountedFS struct {
 // freeUDPPorts returns n distinct UDP ports that were free on all interfaces.
 func freeUDPPorts(t *testing.T, n int) []int {
 	t.Helper()
-	ports := make([]int, n)
-	for i := range ports {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{})
-		if err != nil {
-			t.Fatalf("Failed to find a free UDP port: %v", err)
-		}
-		defer func() { _ = conn.Close() }()
-		ports[i] = conn.LocalAddr().(*net.UDPAddr).Port
+	ports, err := testnet.UDPPorts(n)
+	if err != nil {
+		t.Fatalf("Failed to find free UDP ports: %v", err)
 	}
 	return ports
 }
 
 func freeLoopbackAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	addr, err := testnet.LoopbackAddr()
 	if err != nil {
 		t.Fatalf("Failed to find a free port: %v", err)
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
 	return addr
 }
 

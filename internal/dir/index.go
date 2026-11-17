@@ -264,6 +264,15 @@ func (m *Manager) physicalBlock(dirIno *inode.Inode, block uint64) (uint64, erro
 
 // editChunk writes the directory inode before the chunk, so no node can read the change under the old generation.
 func (m *Manager) editChunk(dirIno *inode.Inode, x *index, at uint32, edit func(chunk []byte) bool, update func(names map[string]slot)) (changed bool, err error) {
+	return m.changeChunk(dirIno, x, at, edit, update, func() error { return m.inodeTbl.WriteWithLockHeld(dirIno) })
+}
+
+// rewriteChunk edits a chunk of a directory whose inode the caller already wrote under the same locks.
+func (m *Manager) rewriteChunk(dirIno *inode.Inode, x *index, at uint32, edit func(chunk []byte) bool, update func(names map[string]slot)) (changed bool, err error) {
+	return m.changeChunk(dirIno, x, at, edit, update, func() error { return nil })
+}
+
+func (m *Manager) changeChunk(dirIno *inode.Inode, x *index, at uint32, edit func(chunk []byte) bool, update func(names map[string]slot), writeInode func() error) (changed bool, err error) {
 	physBlock, err := m.physicalBlock(dirIno, uint64(at/chunksPerBlock))
 	if err != nil {
 		return false, err
@@ -277,7 +286,7 @@ func (m *Manager) editChunk(dirIno *inode.Inode, x *index, at uint32, edit func(
 		m.indexes.drop(x.num)
 		return false, nil
 	}
-	if err := m.inodeTbl.WriteWithLockHeld(dirIno); err != nil {
+	if err := writeInode(); err != nil {
 		m.indexes.drop(x.num)
 		return false, fmt.Errorf("failed to write directory inode: %w", err)
 	}

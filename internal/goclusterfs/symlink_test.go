@@ -334,7 +334,7 @@ func TestFsckReportsSymlinkEntryTypes(t *testing.T) {
 		}
 	}
 	got := fsckProblems(t, fsys)
-	for _, want := range []string{`entry "l2" has file type 1, but inode`, `entry "f2" is typed as a symlink`} {
+	for _, want := range []string{`entry "l2" has file type 1, but inode`, `entry "f2" has file type 7, but inode`} {
 		if !strings.Contains(got, want) {
 			t.Errorf("fsck did not report %q:%s", want, got)
 		}
