@@ -224,19 +224,19 @@ func Check(ops []Op, r Rules) []Violation {
 		case o.Kind == Write && o.Result == Exists:
 			out = append(out, Violation{What: "open with O_CREAT and no O_EXCL failed with EEXIST", Op: o, Allowed: "the file opened", History: []Op{o}})
 		case o.Result != OK && o.Result != NotFound && o.Result != Exists:
-		case o.Kind == Read && o.Content == Torn && localWriteTear(o, logs, otherNames(o, o.Name, renames, r), r):
+		case o.Kind == Read && o.Content == Torn && localWriteTear(o, logs, renames, r):
 		case o.Kind == Read || o.Kind == Stat:
-			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], r); bad {
+			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], movedFile(o, o.Name, logs, renames, r), r); bad {
 				out = append(out, v)
 			}
 		case o.Kind == Unlink || o.Kind == Create:
-			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], r); bad {
+			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], nil, r); bad {
 				out = append(out, v)
 			}
 		case o.Kind == Readdir:
 			for name, l := range logs {
 				listed := slices.Contains(o.Names, name)
-				if v, bad := checkName(o, name, func(s state) bool { return s.present == listed }, l, r); bad {
+				if v, bad := checkName(o, name, func(s state) bool { return s.present == listed }, l, nil, r); bad {
 					v.What = map[bool]string{true: "listing shows a name that should be gone", false: "listing misses a name that should exist"}[listed] + " (" + name + ")"
 					out = append(out, v)
 				}
@@ -268,13 +268,18 @@ func observed(o Op, r Rules) func(state) bool {
 	return func(state) bool { return false }
 }
 
-// checkName finds the states o may see of name and reports a violation when seen accepts none of them.
-func checkName(o Op, name string, seen func(state) bool, l *nameLog, r Rules) (Violation, bool) {
+// checkName finds the states o may see of name, plus extra, and reports a violation when seen accepts none of them.
+func checkName(o Op, name string, seen func(state) bool, l *nameLog, extra []state, r Rules) (Violation, bool) {
 	window := r.Window
 	if o.Kind == Read && stableName(o, l, r) {
 		window = 0
 	}
 	allowed, deciding := possible(o, l, o.Start-window)
+	for _, s := range extra {
+		if !slices.Contains(allowed, s) {
+			allowed = append(allowed, s)
+		}
+	}
 	for _, s := range allowed {
 		if seen(s) {
 			return Violation{}, false
@@ -298,15 +303,15 @@ func checkName(o Op, name string, seen func(state) bool, l *nameLog, r Rules) (V
 }
 
 // possible returns the states o may see when changes that ended before settled
-// must show, with the mutations that decide them. o's own effect is excluded.
-func possible(o Op, l *nameLog, settled time.Duration) ([]state, []Op) {
+// must show, with the mutations that decide them. o's own effect, and skip's, are excluded.
+func possible(o Op, l *nameLog, settled time.Duration, skip ...int) ([]state, []Op) {
 	if l == nil {
 		return []state{{}}, nil
 	}
 	var states []state
 	var deciding []Op
 	take := func(m mutation) {
-		if m.op.ID == o.ID {
+		if m.op.ID == o.ID || slices.Contains(skip, m.op.ID) {
 			return
 		}
 		if !slices.Contains(states, m.after) {
@@ -327,22 +332,16 @@ func possible(o Op, l *nameLog, settled time.Duration) ([]state, []Op) {
 			states = append(states, state{})
 		}
 	}
-	writing, movedAway := false, false
+	writing := false
 	l.during(settled, o.End, func(m mutation) {
 		take(m)
 		writing = writing || m.op.Kind == Write && m.op.ID != o.ID
-		movedAway = movedAway || m.op.Kind == Rename && !m.after.present
 	})
 	for _, m := range l.maybes {
 		if m.op.Start < o.End && m.op.End >= latest {
 			take(m)
 			writing = writing || m.op.Kind == Write
-			movedAway = movedAway || m.op.Kind == Rename && !m.after.present
 		}
-	}
-	moved := state{present: true, any: true}
-	if movedAway && !slices.Contains(states, moved) {
-		states = append(states, moved)
 	}
 	created := state{present: true, empty: true}
 	if writing && slices.Contains(states, state{}) && !slices.Contains(states, created) {
@@ -380,13 +379,15 @@ func churned(o Op, l *nameLog, r Rules) bool {
 
 // localWriteTear reports whether a torn read overlapped a write on its own node, through its name or the other name
 // of a nearby rename, and, apart from words the page cache split, saw only values it may see.
-func localWriteTear(o Op, logs map[string]*nameLog, others []string, r Rules) bool {
+func localWriteTear(o Op, logs map[string]*nameLog, renames map[string][]Op, r Rules) bool {
 	l := logs[o.Name]
 	if o.Size != r.WriteSize || len(o.Pieces) < 2 || l == nil {
 		return false
 	}
 	allowed, _ := possible(o, l, o.Start-r.Window)
 	anyValue := slices.ContainsFunc(allowed, func(s state) bool { return s.any })
+	allowed = append(allowed, movedFile(o, o.Name, logs, renames, r)...)
+	others := otherNames(o, o.Name, renames, r)
 	overlapping := false
 	for _, p := range wholeWords(o.Pieces) {
 		if p.At%8 != 0 || p.Value == 0 || !anyValue && !slices.Contains(allowed, state{present: true, value: p.Value}) {
@@ -432,6 +433,33 @@ func otherNames(o Op, name string, renames map[string][]Op, r Rules) []string {
 		}
 		if near(o, rn, r) && !slices.Contains(out, other) {
 			out = append(out, other)
+		}
+	}
+	return out
+}
+
+// movedFile returns the states a cached entry for name may show of a file a nearby rename moved away from it: the
+// file's states as of the rename, and the values writes through its new name gave it since.
+func movedFile(o Op, name string, logs map[string]*nameLog, renames map[string][]Op, r Rules) []state {
+	var out []state
+	add := func(s state) {
+		if s.present && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	for _, rn := range renames[name] {
+		if rn.Name != name || !near(o, rn, r) {
+			continue
+		}
+		before, _ := possible(rn, logs[name], rn.Start-r.Window)
+		for _, s := range before {
+			add(s)
+		}
+		since, _ := possible(o, logs[rn.To], rn.Start-r.Window, rn.ID)
+		for _, s := range since {
+			if !s.any {
+				add(s)
+			}
 		}
 	}
 	return out

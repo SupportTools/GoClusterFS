@@ -243,6 +243,15 @@ func TestRenamedAwayNameMayOpenTheMovedFileForAWindow(t *testing.T) {
 	expect(t, b, "read found a name that should be gone")
 }
 
+func TestRenamedAwayNameSeesOnlyTheMovedFile(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Rename, Name: "a", To: "b"}, 2000, 2010)
+	b.write("c", 9, 2100, 2110)
+	b.read("a", 9, 2200, 2210)
+	expect(t, b, "stale or unknown value")
+}
+
 func TestWriteNearARenameMayLandInEitherName(t *testing.T) {
 	b := &builder{}
 	b.write("a", 1, 0, 10)

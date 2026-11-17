@@ -4992,6 +4992,13 @@ scenarios:
     environments:
       go: history/history_test.go::TestRenamedAwayNameMayOpenTheMovedFileForAWindow
 
+  - id: history-checker-rename-old-name-only-moved-file
+    name: Coherence checker limits a renamed-away name to the moved file
+    description: Within the cache window after a rename, a read of the old name that sees a value no write gave the moved file is still a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenamedAwayNameSeesOnlyTheMovedFile
+
   - id: history-checker-rename-write
     name: Coherence checker lets a write near a rename land in either name
     description: A write to a rename's old name within the cache window may land in the moved file; one after the window may not
