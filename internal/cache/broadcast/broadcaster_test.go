@@ -379,10 +379,10 @@ func TestTransportPeerManagement(t *testing.T) {
 		t.Errorf("Expected 0 peers initially, got %d", transport.PeerCount())
 	}
 
-	a := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 31338}
+	a := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 24731}
 	transport.AddPeer(a)
-	transport.AddPeer(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 31338})
-	transport.AddPeer(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 31338})
+	transport.AddPeer(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 2), Port: 24731})
+	transport.AddPeer(&net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 24731})
 	transport.AddPeer(nil)
 
 	if transport.PeerCount() != 2 {
@@ -400,7 +400,7 @@ func TestPeerTableBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := func(i int) *net.UDPAddr { return &net.UDPAddr{IP: net.IPv4(10, 0, byte(i>>8), byte(i)), Port: 31338} }
+	addr := func(i int) *net.UDPAddr { return &net.UDPAddr{IP: net.IPv4(10, 0, byte(i>>8), byte(i)), Port: 24731} }
 
 	for i := 0; i < 10*cfg.MaxPeers; i++ {
 		transport.AddPeer(addr(i))
@@ -444,11 +444,11 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.MulticastGroup != "239.192.74.75" {
 		t.Errorf("Expected multicast group 239.192.74.75, got %s", cfg.MulticastGroup)
 	}
-	if cfg.MulticastPort != 31337 {
-		t.Errorf("Expected port 31337, got %d", cfg.MulticastPort)
+	if cfg.MulticastPort != 24730 {
+		t.Errorf("Expected port 24730, got %d", cfg.MulticastPort)
 	}
-	if cfg.UnicastPort != 31338 {
-		t.Errorf("Expected unicast port 31338, got %d", cfg.UnicastPort)
+	if cfg.UnicastPort != 24731 {
+		t.Errorf("Expected unicast port 24731, got %d", cfg.UnicastPort)
 	}
 	if cfg.MulticastTTL != 1 {
 		t.Errorf("Expected TTL 1, got %d", cfg.MulticastTTL)

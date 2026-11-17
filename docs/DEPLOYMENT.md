@@ -63,7 +63,7 @@ newgrp fuse
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
 | Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
-| Ports | UDP 31337 (multicast) and UDP 31338 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API |
+| Ports | UDP 24730 (multicast) and UDP 24731 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API. On a Kubernetes node, keep all three below 30000: kube-proxy sends local traffic to ports in its NodePort range (30000-32767 by default) to its services. `-preflight` warns about it |
 | Several mounts per host | Each mount on a host needs its own `-unicast-port` and `-api-addr`. Mounts of different volumes also need their own `-mcast-group` or `-mcast-port` |
 | Several clusters per LAN | Give each cluster its own `-mcast-group`, or set `-broadcast-secret`; otherwise clusters receive each other's invalidations and peer announcements |
 | Latency | < 10ms between nodes recommended |
@@ -289,7 +289,7 @@ Use identical mount options and the same GoClusterFS version on all nodes:
 ```bash
 ./goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster \
     -mcast-group 239.192.74.75 \
-    -mcast-port 31337 \
+    -mcast-port 24730 \
     -broadcast-secret "your-shared-secret"
 ```
 
@@ -297,11 +297,11 @@ Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock 
 
 ### Step 4: Verify Cluster Communication
 
-Each mount logs `Broadcast: enabled on 239.192.74.75:31337, unicast port 31338` at startup. If broadcast cannot start, for example because a port is taken, the mount fails; pass `-broadcast=false` to run without it. It logs `Broadcast stats` when it unmounts.
+Each mount logs `Broadcast: enabled on 239.192.74.75:24730, unicast port 24731` at startup. If broadcast cannot start, for example because a port is taken, the mount fails; pass `-broadcast=false` to run without it. It logs `Broadcast stats` when it unmounts.
 
 ```bash
 # Verify broadcast is working
-tcpdump -i eth0 udp port 31337 or udp port 31338
+tcpdump -i eth0 udp port 24730 or udp port 24731
 
 # Verify every node registered
 gfsctl stats cluster
@@ -314,7 +314,7 @@ gfsctl stats cluster
 ```bash
 ./goclusterfs-mount ... \
     -mcast-group 239.192.74.75 \
-    -mcast-port 31337 \
+    -mcast-port 24730 \
     -broadcast-iface eth0
 ```
 
@@ -344,7 +344,7 @@ ExecStart=/usr/local/bin/goclusterfs-mount \
     -device /dev/mapper/shared_lun \
     -mount /mnt/cluster \
     -mcast-group 239.192.74.75 \
-    -mcast-port 31337 \
+    -mcast-port 24730 \
     -broadcast-secret "${GOCLUSTERFS_SECRET}"
 ExecStop=/usr/bin/fusermount3 -u /mnt/cluster
 Restart=on-failure
@@ -446,11 +446,11 @@ Mount refuses a non-loopback `-api-addr` without a token, and a token file that 
 
 ```bash
 # Allow multicast traffic between cluster nodes
-iptables -A INPUT -p udp -m multiport --dports 31337,31338 -j ACCEPT
-iptables -A OUTPUT -p udp -m multiport --dports 31337,31338 -j ACCEPT
+iptables -A INPUT -p udp -m multiport --dports 24730,24731 -j ACCEPT
+iptables -A OUTPUT -p udp -m multiport --dports 24730,24731 -j ACCEPT
 
 # Or with firewalld
-firewall-cmd --permanent --add-port=31337-31338/udp
+firewall-cmd --permanent --add-port=24730-24731/udp
 firewall-cmd --reload
 ```
 

@@ -184,6 +184,11 @@ func (m *Manager) Lookup(ctx context.Context, dirIno *inode.Inode, name string) 
 
 // Add adds a new entry to a directory.
 func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8) error {
+	return m.AddAndUpdate(ctx, dirIno, name, childInode, fileType, nil)
+}
+
+// AddAndUpdate adds an entry and applies parent to the directory inode in the write that goes with it.
+func (m *Manager) AddAndUpdate(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8, parent func(*inode.Inode)) error {
 	if dirIno.Magic != inode.InodeMagic {
 		return ErrRemoved
 	}
@@ -214,7 +219,7 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 	// to allocate the same logical block position. If a conflict is detected,
 	// errRetryAdd is returned and we retry the operation.
 	for attempt := 0; attempt < MaxAddRetries; attempt++ {
-		err := m.addInternal(ctx, dirIno, entry)
+		err := m.addInternal(ctx, dirIno, entry, parent)
 		if err == errRetryAdd {
 			logging.Debugf("dir.Add: retry attempt %d for entry %q in inode %d",
 				attempt+1, name, dirIno.InodeNum)
@@ -241,13 +246,13 @@ func (m *Manager) unlock(dirInode uint32) {
 
 // addInternal performs the actual add operation.
 // Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
-func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
+func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *DirEntry, parent func(*inode.Inode)) error {
 	if m.lockMgr != nil {
 		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
 			return fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
 	}
-	freshIno, added, err := m.addToExistingChunk(dirIno.InodeNum, entry, 0)
+	freshIno, added, err := m.addToExistingChunk(dirIno.InodeNum, entry, 0, parent)
 	// addToNewBlock allocates a block, which must happen without the directory lock.
 	if m.lockMgr != nil {
 		m.unlock(dirIno.InodeNum)
@@ -262,7 +267,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 	// CRITICAL: Pass freshIno (not dirIno) so addToNewBlock has the latest size
 	// for calculating which block to allocate. addToNewBlock will re-read anyway,
 	// but starting with a fresher estimate reduces wasted allocations.
-	err = m.addToNewBlock(ctx, freshIno, entry)
+	err = m.addToNewBlock(ctx, freshIno, entry, parent)
 	if err == nil {
 		dirIno.Size = freshIno.Size
 	}
@@ -270,7 +275,7 @@ func (m *Manager) addInternal(ctx context.Context, dirIno *inode.Inode, entry *D
 }
 
 // addToExistingChunk adds entry to the first chunk with room if the directory has more than blocks blocks. Caller holds the directory lock.
-func (m *Manager) addToExistingChunk(num uint32, entry *DirEntry, blocks uint64) (freshIno *inode.Inode, added bool, err error) {
+func (m *Manager) addToExistingChunk(num uint32, entry *DirEntry, blocks uint64, parent func(*inode.Inode)) (freshIno *inode.Inode, added bool, err error) {
 	freshIno, err = m.liveDirLocked(num)
 	if err != nil {
 		return nil, false, err
@@ -293,7 +298,7 @@ func (m *Manager) addToExistingChunk(num uint32, entry *DirEntry, blocks uint64)
 		func(chunk []byte) bool { return addToChunk(chunk, entry) },
 		func(names map[string]slot) {
 			names[entry.Name] = slot{child: entry.InodeNum, chunk: at, ftype: entry.FileType}
-		})
+		}, parent)
 	if errors.Is(err, extent.ErrTreeConflict) || (err == nil && !added) {
 		return nil, false, errRetryAdd
 	}
@@ -309,6 +314,11 @@ func (m *Manager) Remove(ctx context.Context, dirIno *inode.Inode, name string) 
 // RemoveIf removes name if ok accepts the inode it names; ok runs under the directory lock.
 // The directory inode is written before RemoveIf returns, so before the caller frees the child.
 func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool) (bool, error) {
+	return m.RemoveIfAndUpdate(ctx, dirIno, name, ok, nil)
+}
+
+// RemoveIfAndUpdate is RemoveIf that applies parent to the directory inode in the write that goes with the removal.
+func (m *Manager) RemoveIfAndUpdate(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool, parent func(*inode.Inode)) (bool, error) {
 	if dirIno.Magic != inode.InodeMagic {
 		return false, ErrRemoved
 	}
@@ -350,7 +360,7 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 		}
 		removed, err := m.editChunk(fresh, x, s.chunk,
 			func(chunk []byte) bool { return removeFromChunk(chunk, name) },
-			func(names map[string]slot) { delete(names, name) })
+			func(names map[string]slot) { delete(names, name) }, parent)
 		if removed || err != nil || attempt > 0 {
 			if err == nil && !removed {
 				err = fmt.Errorf("%w: %q is in the index of directory %d but not in its chunk", ErrCorrupted, name, dirIno.InodeNum)
@@ -572,21 +582,21 @@ func removeFromChunk(chunk []byte, name string) bool {
 // IMPORTANT: This function expects to be called WITHOUT holding the inode lock,
 // as it needs to allocate blocks (bitmap lock) before acquiring the inode lock.
 // Returns errRetryAdd if a concurrent modification is detected and the caller should retry.
-func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry *DirEntry) error {
+func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry *DirEntry, parent func(*inode.Inode)) error {
 	return m.appendBlock(ctx, dirIno,
 		func(next uint64) (*inode.Inode, bool, error) {
-			return m.addToExistingChunk(dirIno.InodeNum, entry, next)
+			return m.addToExistingChunk(dirIno.InodeNum, entry, next, parent)
 		},
 		func(data []byte) {
 			// The entry takes the first chunk (DirChunkSize) to keep RecLen in uint16 range
 			entry.RecLen = uint16(DirChunkSize)
 			serializeEntry(entry, data)
-		})
+		}, parent)
 }
 
 // appendBlock maps a new block, filled by fill, as directory dirIno's next one. Under the directory lock, settled
 // may report that another goroutine or node made the block unneeded.
-func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled func(nextBlock uint64) (*inode.Inode, bool, error), fill func(data []byte)) error {
+func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled func(nextBlock uint64) (*inode.Inode, bool, error), fill func(data []byte), parent func(*inode.Inode)) error {
 	// Calculate next block number based on current (possibly stale) size
 	nextBlock := extent.BlocksForSize(dirIno.Size)
 
@@ -691,6 +701,9 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 	freshIno.Size = uint64(nextBlock+1) * BlockSize
 	freshIno.AllocatedBlocks++
 	freshIno.MetaGeneration++
+	if parent != nil {
+		parent(freshIno)
+	}
 
 	// Write the updated inode to disk.
 	// Use WriteWithLockHeld since we already hold the inode lock.
@@ -813,4 +826,42 @@ func FileTypeFromMode(mode uint16) uint8 {
 	default:
 		return DT_UNKNOWN
 	}
+}
+
+// RecountLinks sets directory dirIno's link count to 2 plus its subdirectories, if it differs. A crash between a
+// directory's inode write and its chunk write leaves the count off by one.
+func (m *Manager) RecountLinks(ctx context.Context, dirIno *inode.Inode) (bool, error) {
+	defer m.LockDir(dirIno.InodeNum)()
+	if m.lockMgr != nil {
+		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
+			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
+		}
+		defer m.unlock(dirIno.InodeNum)
+	}
+	fresh, err := m.liveDirLocked(dirIno.InodeNum)
+	if err != nil {
+		return false, err
+	}
+	x, err := m.indexOf(fresh)
+	if err != nil {
+		return false, err
+	}
+	want := uint32(2)
+	x.mu.RLock()
+	for name, s := range x.names {
+		if s.ftype == DT_DIR && name != "." && name != ".." {
+			want++
+		}
+	}
+	x.mu.RUnlock()
+	if fresh.LinkCount == want {
+		return false, nil
+	}
+	from := fresh.MetaGeneration
+	fresh.LinkCount = want
+	if err := m.inodeTbl.WriteWithLockHeld(fresh); err != nil {
+		return false, fmt.Errorf("failed to write directory inode %d: %w", fresh.InodeNum, err)
+	}
+	m.KeepIndex(fresh.InodeNum, from, fresh.MetaGeneration)
+	return true, nil
 }

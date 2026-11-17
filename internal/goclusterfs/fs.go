@@ -957,16 +957,11 @@ func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid uint32
 	return txn, nil
 }
 
-// touchParent sets the mtime of directory num, adds links to its link count, and tells other nodes.
-func (f *FS) touchParent(ctx context.Context, num uint32, links uint32, now int64) {
-	// dirMgr.Add may have changed the directory's extents, so update it from disk.
-	dirIno, err := f.updateDirLocked(ctx, num, func(ino *inode.Inode) error {
-		ino.LinkCount += links
-		ino.Mtime = now
-		return nil
-	})
+// announceDir caches directory num as it is on disk and tells other nodes it changed.
+func (f *FS) announceDir(num uint32) {
+	dirIno, err := f.inodeTbl.Read(num)
 	if err != nil {
-		log.Printf("[WARN] directory inode %d: mtime and link count not updated: %v", num, err)
+		log.Printf("[WARN] directory inode %d: not refreshed: %v", num, err)
 		return
 	}
 	if f.cacheMgr != nil {
@@ -1098,7 +1093,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		afterCommit("create: inode claimed")
 	}
 
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG); err != nil {
+	if err := f.dirMgr.AddAndUpdate(ctx, dirIno, name, uint64(inodeNum), dir.DT_REG, func(p *inode.Inode) { p.Mtime = now }); err != nil {
 		logging.Debugf("Create %q: dirMgr.Add failed: %v", name, err)
 		f.addOpen(childIno.InodeNum, -1)
 		f.freeNewInode(ctx, childIno.InodeNum)
@@ -1108,7 +1103,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		afterCommit("create: named")
 	}
 	f.cacheInode(childIno)
-	f.touchParent(ctx, parentNum, 0, now)
+	f.announceDir(parentNum)
 
 	ch := parent.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
@@ -1186,13 +1181,16 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		afterCommit("mkdir: inode claimed")
 	}
 
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR); err != nil {
+	if err := f.dirMgr.AddAndUpdate(ctx, dirIno, name, uint64(inodeNum), dir.DT_DIR, func(p *inode.Inode) {
+		p.LinkCount++
+		p.Mtime = now
+	}); err != nil {
 		logging.Debugf("Mkdir %q: dirMgr.Add failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
 		return nil, nameErrno(err)
 	}
 	f.cacheInode(childIno)
-	f.touchParent(ctx, parentNum, 1, now)
+	f.announceDir(parentNum)
 
 	ch := parent.NewPersistentInode(ctx, &Dir{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
 		Mode: fuse.S_IFDIR,
@@ -1643,7 +1641,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 
 	// Another node may have removed the name, or changed the child, since the lookup.
 	var changed, readFailed bool
-	removed, err := d.fs.dirMgr.RemoveIf(ctx, dirIno, name, func(child uint64) bool {
+	removed, err := d.fs.dirMgr.RemoveIfAndUpdate(ctx, dirIno, name, func(child uint64) bool {
 		if child != childInodeNum {
 			return false
 		}
@@ -1651,6 +1649,11 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 		readFailed = err != nil
 		changed = err == nil && !sameForRemoval(childIno, cur)
 		return err == nil && !changed
+	}, func(p *inode.Inode) {
+		if isDir {
+			p.LinkCount--
+		}
+		p.Mtime = time.Now().UnixNano()
 	})
 	switch {
 	case err != nil:
@@ -1699,20 +1702,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 		reserved = false
 	}
 
-	// Update directory mtime, and its link count for directory removal
-	now := time.Now().UnixNano()
-	if updated, err := d.fs.updateDirLocked(ctx, d.inodeNum, func(ino *inode.Inode) error {
-		if isDir {
-			ino.LinkCount--
-		}
-		ino.Mtime = now
-		return nil
-	}); err != nil {
-		log.Printf("[WARN] removeEntry %q: directory inode %d not updated: %v", name, d.inodeNum, err)
-	} else {
-		// Cache the updated parent directory inode
-		d.fs.cacheInode(updated)
-	}
+	d.fs.announceDir(d.inodeNum)
 
 	// === WAL: Mark intent complete ===
 	if d.fs.journal != nil && intentSeq > 0 {

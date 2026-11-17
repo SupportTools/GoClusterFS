@@ -53,7 +53,7 @@ func receive(t *testing.T, got chan *Message, want MessageType) {
 
 // TestDefaultLayoutStarts checks the default socket layout. With the unicast
 // port equal to the multicast port, Start always failed, so broadcast never ran.
-// Free ports stand in for 31337 and 31338 so the test does not depend on them.
+// Free ports stand in for 24730 and 24731 so the test does not depend on them.
 func TestDefaultLayoutStarts(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.UnicastPort == cfg.MulticastPort {

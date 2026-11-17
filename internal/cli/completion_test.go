@@ -13,7 +13,7 @@ func completionFlags() *flag.FlagSet {
 	fs := flag.NewFlagSet("demo", flag.ContinueOnError)
 	fs.String("device", "", "Block device to mount; required")
 	fs.String("mount", "", "Directory to mount on")
-	fs.Int("port", 31337, "UDP port [see docs]; the same on every node")
+	fs.Int("port", 24730, "UDP port [see docs]; the same on every node")
 	fs.Bool("format", false, "Erase the device. Other nodes' data is lost")
 	return fs
 }
