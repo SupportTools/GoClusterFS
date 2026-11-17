@@ -40,7 +40,6 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 	step(t, m, &Op{Kind: "create", Path: f}, 0)
 	step(t, m, &Op{Kind: "snapclone", Path: f, Name: "l0-s1", Path2: "/l0-c1"}, int(syscall.ENOENT))
 	step(t, m, &Op{Kind: "snapdelete", Path: f, Name: "l0-s1"}, int(syscall.ENOENT))
-	step(t, m, &Op{Kind: "rename", Path: f, Path2: "/soak/d0/l0-r1"}, anyErrno)
 
 	link := "/soak/d0/l0-d1/l0-ln1"
 	step(t, m, &Op{Kind: "symlink", Path: link, Path2: "../l0-f1"}, 0)
@@ -54,6 +53,46 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 	}
 	step(t, m, &Op{Kind: "unlink", Path: link}, 0)
 	step(t, m, &Op{Kind: "rmdir", Path: "/soak/d0/l0-d1"}, 0)
+}
+
+func TestModelRenamesAsTheFilesystemDoes(t *testing.T) {
+	m := newModel()
+	a, b, d, e := "/soak/d0/l0-f1", "/soak/d1/l0-f2", "/soak/d0/l0-d1", "/soak/d1/l0-d2"
+	link := "/soak/d0/l0-ln1"
+	step(t, m, &Op{Kind: "create", Path: a}, 0)
+	step(t, m, &Op{Kind: "write", Path: a, Len: 5, Seed: 1}, 0)
+	step(t, m, &Op{Kind: "snapshot", Path: a, Name: "l0-s1"}, 0)
+	step(t, m, &Op{Kind: "create", Path: b}, 0)
+	step(t, m, &Op{Kind: "snapshot", Path: b, Name: "l0-s2"}, 0)
+	step(t, m, &Op{Kind: "mkdir", Path: d}, 0)
+	step(t, m, &Op{Kind: "mkdir", Path: e}, 0)
+	step(t, m, &Op{Kind: "symlink", Path: link, Path2: "l0-x"}, 0)
+
+	step(t, m, &Op{Kind: "rename", Path: "/soak/d0/l0-missing", Path2: "/soak/d0/l0-r1"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "rename", Path: a, Path2: "/soak/d0/l0-gone/l0-r1"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "rename", Path: a, Path2: a}, 0)
+	step(t, m, &Op{Kind: "rename", Path: a, Path2: d}, int(syscall.EISDIR))
+	step(t, m, &Op{Kind: "rename", Path: d, Path2: b}, int(syscall.ENOTDIR))
+	step(t, m, &Op{Kind: "rename", Path: d, Path2: d + "/l0-d3"}, int(syscall.EINVAL))
+
+	step(t, m, &Op{Kind: "rename", Path: a, Path2: b}, 0)
+	if m.Files[a] != nil || string(m.Files[b].Data) != string(genData(1, 5)) || m.Snaps["l0-s2"].Owner != nil || m.Snaps["l0-s1"].Owner != m.Files[b] {
+		t.Fatal("a rename over a file moves the file, its data and its snapshots, and orphans the replaced file's snapshots")
+	}
+	step(t, m, &Op{Kind: "rename", Path: e, Path2: d}, 0)
+	if !m.Dirs[d] || m.Dirs[e] {
+		t.Fatal("an empty directory renamed over another replaces it")
+	}
+	step(t, m, &Op{Kind: "mkdir", Path: e}, 0)
+	step(t, m, &Op{Kind: "create", Path: e + "/l0-f3"}, 0)
+	step(t, m, &Op{Kind: "rename", Path: d, Path2: e}, int(syscall.ENOTEMPTY))
+	step(t, m, &Op{Kind: "rename", Path: b, Path2: d + "/l0-f2"}, 0)
+	step(t, m, &Op{Kind: "rename", Path: link, Path2: d + "/l0-ln1"}, 0)
+	step(t, m, &Op{Kind: "rename", Path: d, Path2: "/soak/d2/l0-d4"}, 0)
+	want := []string{"f:l0-f2:5", "l:l0-ln1:l0-x"}
+	if got := m.listing("/soak/d2/l0-d4"); strings.Join(got, ",") != strings.Join(want, ",") || m.Dirs[d] || m.pathOf(m.Snaps["l0-s1"].Owner) != "/soak/d2/l0-d4/l0-f2" {
+		t.Fatalf("moving a directory moves what is in it, snapshots included: lists %v, want %v", got, want)
+	}
 }
 
 // A lane only names and touches its own files, directories and snapshots, the same way for the same seed.
