@@ -439,7 +439,8 @@ func otherNames(o Op, name string, renames map[string][]Op, r Rules) []string {
 }
 
 // movedFile returns the states a cached entry for name may show of a file a nearby rename moved away from it: the
-// file's states as of the rename, and the values writes through its new name gave it since.
+// file's states as of the rename, and the values writes through its new name gave it since. A file the rename
+// replaced at the new name is never among them.
 func movedFile(o Op, name string, logs map[string]*nameLog, renames map[string][]Op, r Rules) []state {
 	var out []state
 	add := func(s state) {
@@ -455,10 +456,11 @@ func movedFile(o Op, name string, logs map[string]*nameLog, renames map[string][
 		for _, s := range before {
 			add(s)
 		}
-		since, _ := possible(o, logs[rn.To], rn.Start-r.Window, rn.ID)
-		for _, s := range since {
-			if !s.any {
-				add(s)
+		if l := logs[rn.To]; l != nil {
+			for _, m := range append(slices.Clone(l.byEnd), l.maybes...) {
+				if m.op.Kind == Write && m.op.ID != rn.ID && m.op.End >= rn.Start && m.op.Start < o.End {
+					add(m.after)
+				}
 			}
 		}
 	}
