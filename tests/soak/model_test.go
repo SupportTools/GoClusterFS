@@ -54,6 +54,40 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 	}
 	step(t, m, &Op{Kind: "unlink", Path: link}, 0)
 	step(t, m, &Op{Kind: "rmdir", Path: "/soak/d0/l0-d1"}, 0)
+
+	hard := "/soak/d0/l0-hl1"
+	step(t, m, &Op{Kind: "snapshot", Path: f, Name: "l0-s2"}, 0)
+	step(t, m, &Op{Kind: "link", Path: f, Path2: hard}, 0)
+	step(t, m, &Op{Kind: "link", Path: f, Path2: hard}, int(syscall.EEXIST))
+	step(t, m, &Op{Kind: "link", Path: "/soak/d0/l0-missing", Path2: "/soak/d0/l0-hl2"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "write", Path: hard, Off: 0, Len: 10, Seed: 7}, 0)
+	if !bytes.Equal(m.Files[f].Data, m.Files[hard].Data) || m.Files[f] != m.Files[hard] {
+		t.Fatal("a write through one hard link must show through the other")
+	}
+	step(t, m, &Op{Kind: "unlink", Path: f}, 0)
+	step(t, m, &Op{Kind: "snapclone", Path: hard, Name: "l0-s2", Path2: "/l0-c2"}, 0)
+}
+
+// A rename between two names of one file changes nothing, and replacing one name of a linked file keeps its snapshots.
+func TestModelRenamesHardLinks(t *testing.T) {
+	m := newModel()
+	a, b, c := "/soak/d0/l0-f1", "/soak/d0/l0-hl1", "/soak/d1/l0-f2"
+	step(t, m, &Op{Kind: "create", Path: a}, 0)
+	step(t, m, &Op{Kind: "snapshot", Path: a, Name: "l0-s1"}, 0)
+	step(t, m, &Op{Kind: "link", Path: a, Path2: b}, 0)
+	step(t, m, &Op{Kind: "rename", Path: a, Path2: b}, 0)
+	if m.Files[a] == nil || m.Files[a] != m.Files[b] || m.Snaps["l0-s1"].Owner != m.Files[a] {
+		t.Fatal("a rename between two names of one file must change nothing")
+	}
+	step(t, m, &Op{Kind: "create", Path: c}, 0)
+	step(t, m, &Op{Kind: "rename", Path: c, Path2: b}, 0)
+	if m.Snaps["l0-s1"].Owner != m.Files[a] {
+		t.Fatal("a rename over one name of a linked file must keep the file's snapshots")
+	}
+	step(t, m, &Op{Kind: "unlink", Path: a}, 0)
+	if m.Snaps["l0-s1"].Owner != nil {
+		t.Fatal("removing the file's last name must orphan its snapshots")
+	}
 }
 
 func TestModelRenamesAsTheFilesystemDoes(t *testing.T) {

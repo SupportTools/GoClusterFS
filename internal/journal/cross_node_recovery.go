@@ -169,10 +169,12 @@ type txnReplay struct {
 	created map[uint64]bool
 	wrote   map[uint32]uint64
 	keep    map[uint64]bool // targets a replayed rename left named, so its records must not drop or free them
+	linked  map[uint64]bool // files this transaction gave a link, which its DirAddEntry names
 }
 
 func newTxnReplay(owner [16]byte) *txnReplay {
-	return &txnReplay{owner: owner, created: make(map[uint64]bool), wrote: make(map[uint32]uint64), keep: make(map[uint64]bool)}
+	return &txnReplay{owner: owner, created: make(map[uint64]bool), wrote: make(map[uint32]uint64), keep: make(map[uint64]bool),
+		linked: make(map[uint64]bool)}
 }
 
 // kept reports whether a rename earlier in this transaction left inode num named, and logs why op skips it.
@@ -205,6 +207,8 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 		return applyInodeDelete(ctx, rctx, r, entry.Payload)
 	case TxnOpLinkDrop:
 		return applyLinkDrop(ctx, rctx, r, entry.Payload)
+	case TxnOpLinkAdd:
+		return applyLinkAdd(ctx, rctx, r, entry.Payload)
 	case TxnOpSymlinkTarget:
 		return applySymlinkTarget(ctx, rctx, r, entry.Payload)
 	case TxnOpDirAddEntry:
@@ -298,6 +302,41 @@ func initCreated(ctx context.Context, rctx *RecoveryContext, ino *inode.Inode, p
 	}
 	ino.LinkCount = 2
 	return rctx.DirMgr.InitDirectory(ctx, ino, p.ParentInodeNum)
+}
+
+var errLinkAddSkipped = errors.New("the file changed since the link was logged")
+
+// applyLinkAdd gives a file the link a hard link logged, only if nothing changed the file since; only then may the
+// transaction's DirAddEntry name it. A changed file may already have the link and its name, which another node may
+// have renamed since, so replay leaves it alone. A link that a crash cut off between its count and its name stays an
+// extra link, which fsck repairs.
+func applyLinkAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
+	p, err := DeserializeLinkDrop(payload)
+	if err != nil {
+		return false, err
+	}
+	num := uint32(p.InodeNum)
+	err = rctx.InodeTbl.Update(ctx, num, func(ino *inode.Inode) error {
+		if !r.unchanged(ino, p.MetaGeneration) || !ino.IsFile() || ino.LinkCount == 0 {
+			return errLinkAddSkipped
+		}
+		ino.LinkCount++
+		return nil
+	})
+	switch {
+	case errors.Is(err, errLinkAddSkipped):
+		log.Printf("[Recovery] LinkAdd: inode %d changed since the link was logged, skipping", num)
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("failed to add a link to inode %d: %w", num, err)
+	}
+	after, err := rctx.InodeTbl.Read(num)
+	if err != nil {
+		return true, err
+	}
+	r.wrote[num] = after.MetaGeneration
+	r.linked[p.InodeNum] = true
+	return true, nil
 }
 
 // applySymlinkTarget gives a symlink its target, only when replay created it in this transaction and nothing wrote it since.
@@ -477,8 +516,8 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 }
 
 func addLoggedEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p *DirAddEntryPayload) (bool, error) {
-	if !r.created[p.ChildInodeNum] {
-		log.Printf("[Recovery] DirAddEntry: replay did not create inode %d, skipping %q", p.ChildInodeNum, p.Name)
+	if !r.created[p.ChildInodeNum] && !r.linked[p.ChildInodeNum] {
+		log.Printf("[Recovery] DirAddEntry: replay did not create or link inode %d, skipping %q", p.ChildInodeNum, p.Name)
 		return false, nil
 	}
 

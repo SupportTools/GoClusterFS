@@ -17,6 +17,8 @@ const (
 	TxnOpInodeUpdate TxnOpType = 0x0101
 	TxnOpInodeDelete TxnOpType = 0x0102
 	TxnOpLinkDrop    TxnOpType = 0x0103
+	// TxnOpLinkAdd gives a file one more link; the DirAddEntry after it in the transaction names it.
+	TxnOpLinkAdd TxnOpType = 0x0104
 	// TxnOpSymlinkTarget gives an inode created in the same transaction its symlink target.
 	TxnOpSymlinkTarget TxnOpType = 0x0105
 
@@ -59,6 +61,8 @@ func (op TxnOpType) String() string {
 		return "InodeDelete"
 	case TxnOpLinkDrop:
 		return "LinkDrop"
+	case TxnOpLinkAdd:
+		return "LinkAdd"
 	case TxnOpSymlinkTarget:
 		return "SymlinkTarget"
 	case TxnOpDirAddEntry:
@@ -238,7 +242,10 @@ func (p *LinkDropPayload) Serialize() []byte {
 	return buf
 }
 
-// DeserializeLinkDrop parses a LinkDropPayload from bytes.
+// LinkAddPayload records a file gaining one link; MetaGeneration is the value before the increment.
+type LinkAddPayload = LinkDropPayload
+
+// DeserializeLinkDrop parses a LinkDropPayload, or a LinkAddPayload, from bytes.
 func DeserializeLinkDrop(buf []byte) (*LinkDropPayload, error) {
 	if len(buf) < 16 {
 		return nil, ErrTxnTooSmall
@@ -872,6 +879,10 @@ func (txn *Transaction) LogInodeDelete(payload *InodeDeletePayload) error {
 
 func (txn *Transaction) LogLinkDrop(payload *LinkDropPayload) error {
 	return txn.addEntry(TxnOpLinkDrop, payload.Serialize())
+}
+
+func (txn *Transaction) LogLinkAdd(payload *LinkAddPayload) error {
+	return txn.addEntry(TxnOpLinkAdd, payload.Serialize())
 }
 
 // LogDirAddEntry adds a directory entry addition to the transaction.

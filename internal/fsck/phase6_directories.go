@@ -130,10 +130,17 @@ func (c *Checker) checkDirectories() error {
 			}
 
 			// Validate each entry
+			seen := map[string]bool{}
 			for _, entry := range entries {
 				if entry.InodeNum == 0 {
 					continue // Deleted entry
 				}
+				if seen[entry.Name] {
+					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
+						fmt.Sprintf("holds the name %q more than once; a lookup finds only one of them", entry.Name), false)
+					continue
+				}
+				seen[entry.Name] = true
 				if entry.Name == "." {
 					tree.dot[inodeNum] = entry.InodeNum
 				}

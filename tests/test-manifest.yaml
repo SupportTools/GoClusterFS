@@ -120,6 +120,64 @@ scenarios:
       docker: run-tests.sh::test_dir_fsync
       vm: run-vm-tests.sh::test_dir_fsync
 
+  - id: hard-links
+    name: Hard links
+    description: A file linked on one node reads and writes through every name on the others; removing one name keeps the file and drops its link count by one
+    priority: high
+    environments:
+      go: hardlink_test.go::TestHardLinks
+      docker: run-tests.sh::test_hard_links
+      vm: run-vm-tests.sh::test_hard_links
+
+  - id: hard-links-multinode
+    name: Hard links across nodes, and a link racing the last unlink
+    description: A link made on one node is seen and removed on the other; a link racing the last unlink either wins with one link left or fails with ENOENT, and fsck is clean
+    priority: go_only
+    environments:
+      go: hardlink_test.go::TestMultiNodeLinkRacesLastUnlink
+
+  - id: hard-link-counts
+    name: Link counts follow links and unlinks
+    description: Each link adds one and each unlink takes one away; the file is freed with its last name; directories, symlinks, taken names, orphans and 65000 links are refused
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkCountsNames
+
+  - id: hard-link-replay
+    name: Replay finishes a link a crash interrupted, only on an unchanged file
+    description: A link crashes after its record, its count or its name, sometimes after a write changed the file. Replay adds the link and name only when nothing changed the file; a count that landed without its name stays an extra link that fsck repairs
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkReplaysAfterCrash
+
+  - id: hard-link-replay-peer-rename
+    name: Replay does not restore a link's name another node renamed
+    description: A link finishes without a durable completion record and another node renames its new name; replay leaves the file with its two names and two links
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkReplayAfterPeerRename
+
+  - id: hard-link-reused-slot
+    name: A link refuses a source whose slot another file took
+    description: A peer frees the source and a new file takes its inode slot before the link reads it; the link fails with ENOENT and the new file keeps one link
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkRefusesReusedSlot
+
+  - id: power-cut-during-link
+    name: Power cut during a link, and during an unlink of a linked file
+    description: Power fails at every write of a link, or of removing one name of a linked file; the data stays under every name left, and fsck finds at most an extra link, which -repair fixes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestPowerCutDuringLink
+
+  - id: fsck-file-link-counts
+    name: fsck checks and repairs regular files' link counts
+    description: A regular file with fewer links than names is an error, with more a warning; -repair sets the count to the names found
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestFsckRepairsTooFewLinks
+
   - id: directory-fsync-power-cut
     name: Entries survive a power cut once their directory is fsynced
     description: Without a journal, a power cut loses every write since the last flush; the entries made and removed before a directory fsync survive it, and a create after the last fsync does not
@@ -2325,15 +2383,6 @@ scenarios:
   - id: symbolic-links
     name: Symbolic links
     description: Create and follow symbolic links
-    priority: medium
-    environments:
-      go: TODO
-      docker: TODO
-      vm: TODO
-
-  - id: hard-links
-    name: Hard links
-    description: Create and verify hard links
     priority: medium
     environments:
       go: TODO
