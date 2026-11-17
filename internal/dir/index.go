@@ -265,12 +265,16 @@ func (m *Manager) physicalBlock(dirIno *inode.Inode, block uint64) (uint64, erro
 // editChunk writes the directory inode, with parent applied to it, before the chunk, so no node can read the change
 // under the old generation.
 func (m *Manager) editChunk(dirIno *inode.Inode, x *index, at uint32, edit func(chunk []byte) bool, update func(names map[string]slot), parent func(*inode.Inode)) (changed bool, err error) {
-	return m.changeChunk(dirIno, x, at, edit, update, func() error {
+	changed, err = m.changeChunk(dirIno, x, at, edit, update, func() error {
 		if parent != nil {
 			parent(dirIno)
 		}
 		return m.inodeTbl.WriteWithLockHeld(dirIno)
 	})
+	if err != nil && parent != nil {
+		m.restoreLinks(dirIno.InodeNum)
+	}
+	return changed, err
 }
 
 // rewriteChunk edits a chunk of a directory whose inode the caller already wrote under the same locks.

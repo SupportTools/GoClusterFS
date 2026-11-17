@@ -382,6 +382,7 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// This is CRITICAL for crash consistency - the tail offset must be
 	// persisted so recovery can find the transaction data.
 	if err := j.region.FlushSuperblock(); err != nil {
+		j.abandonLocked(seq)
 		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to flush superblock: %w", err)
 	}
@@ -436,6 +437,16 @@ func (j *Journal) dropIntent(seq uint64) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	delete(j.pendingIntents, seq)
+	j.abandonLocked(seq)
+}
+
+// abandonLocked ends a record whose Commit failed after it reached the ring: the next commit's tail would otherwise
+// cover it, and replay would run an operation its caller never ran, on an inode slot this node may have reused since.
+// Must hold j.mu.
+func (j *Journal) abandonLocked(seq uint64) {
+	if err := j.appendCompletionLocked(seq); err != nil {
+		log.Printf("[WARN] journal: record %d failed to commit and could not be ended, so replay may run it: %v", seq, err)
+	}
 }
 
 // Abort abandons a transaction without committing.

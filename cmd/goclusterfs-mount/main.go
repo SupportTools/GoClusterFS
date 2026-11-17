@@ -458,6 +458,9 @@ func main() {
 	// Create filesystem with journal, TRIM, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nil, refcountReg, lockMgr, nodeUUID, dataOffset)
 	gfs.SetSymlinks(sb.RequiredFlags&superblock.RequiredSymlinks != 0)
+	gfs.SetFailStop(func(err error) {
+		failf("[ERROR] Stopping this node and keeping its locks: %v. A peer replays this node's journal and finishes the rename, or the next mount here does", err)
+	})
 	var res *reserve.Manager
 	if j != nil && *blockReserve > 0 {
 		res = reserve.New(reserve.Config{Size: *blockReserve}, bm, j, extentMgr.ReleaseBlocks, func() int {

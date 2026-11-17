@@ -114,7 +114,12 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 		}
 		return err
 	}
+	op.Stuck = f.failStop
 	r, err := f.dirMgr.Rename(ctx, op)
+	if err != nil && intentSeq != 0 {
+		log.Printf("[WARN] rename %q to %q failed after its commit; leaving intent %d for replay: %v", oldName, newName, intentSeq, err)
+		return syscall.EIO
+	}
 	if intentSeq != 0 {
 		defer f.closeIntent(intentSeq)
 	}
