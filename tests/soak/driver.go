@@ -34,6 +34,7 @@ type config struct {
 	fsckEvery    time.Duration
 	barrierEvery time.Duration
 	window       time.Duration
+	inflight     bool
 	coherence    time.Duration
 	stopFor      time.Duration
 	opTimeout    time.Duration
@@ -44,10 +45,12 @@ type config struct {
 }
 
 type node struct {
-	id    int
-	port  int
-	mu    sync.RWMutex // an operation holds it shared; a fault holds it exclusively
-	up    atomic.Bool
+	id   int
+	port int
+	mu   sync.RWMutex // an operation holds it shared; a fault holds it exclusively
+	up   atomic.Bool
+	// hit is set while an -inflight fault takes the node down; an operation that fails then was cut short.
+	hit   atomic.Bool
 	agent *agentConn
 }
 
@@ -68,6 +71,8 @@ type driver struct {
 	model   *Model
 	pause   sync.RWMutex // lanes hold it shared per operation; barriers and fsck hold it exclusively
 	faultMu sync.Mutex
+	// victims hands a fault, with -inflight, the node a lane is about to run an operation on.
+	victims chan *node
 	seq     atomic.Uint64
 	logMu   sync.Mutex
 	logw    io.Writer
@@ -75,13 +80,16 @@ type driver struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	failMu  sync.Mutex
+	// pending holds operations a fault cut short on each node, until the fault reads what they left.
+	pendingMu sync.Mutex
+	pending   map[int][]*uncertain
 	// stopping is set when the run's time is up, so the operations it cuts short are not failures.
 	stopping atomic.Bool
 	failure  string
 
-	ops, unexpected, faults, fscks, barriers, slow, stalls atomic.Int64
-	slowestMs                                              atomic.Int64
-	opsByKind                                              sync.Map
+	ops, unexpected, faults, fscks, barriers, slow, stalls, resolved atomic.Int64
+	slowestMs                                                        atomic.Int64
+	opsByKind                                                        sync.Map
 }
 
 func (d *driver) logRecord(r record) {
@@ -358,9 +366,30 @@ func (d *driver) runOpLocked(op *Op, n *node) {
 	op.Node = n.id
 	op.At = time.Now().UnixMilli()
 	ctx, cancel := context.WithTimeout(d.ctx, d.cfg.opTimeout)
+	if d.cfg.inflight {
+		select {
+		case d.victims <- n:
+		default:
+		}
+	}
 	resp, err := n.agent.call(ctx, op.request())
 	cancel()
+	// Registered before the node is released, so the fault that cut the operation short finds it.
+	var u *uncertain
+	if (err != nil || !matches(op.Want, resp.Errno)) && n.hit.Load() && d.ctx.Err() == nil {
+		u = &uncertain{op: op, done: make(chan struct{})}
+		d.pendingMu.Lock()
+		d.pending[n.id] = append(d.pending[n.id], u)
+		d.pendingMu.Unlock()
+	}
 	n.mu.RUnlock()
+	if u != nil {
+		op.Ms = time.Now().UnixMilli() - op.At
+		op.Got, op.Err = resp.Errno, fmt.Sprint(err, resp.Err)
+		d.logRecord(record{Type: "uncertain", Op: *op})
+		<-u.done
+		return
+	}
 	d.finishOp(op, resp, err)
 }
 
@@ -424,7 +453,8 @@ func (d *driver) checkOp(m *node, op *Op, paths []string) error {
 	return nil
 }
 
-// onNode runs f while holding node n shared, unless a fault has taken n down.
+// onNode runs f while holding node n shared, unless a fault has taken n down. With -inflight a fault can start while f
+// runs; its errors are then dropped, and the fault checks n once it is back.
 func (d *driver) onNode(n *node, f func() error) error {
 	if !n.up.Load() {
 		return nil
@@ -434,7 +464,21 @@ func (d *driver) onNode(n *node, f func() error) error {
 	if !n.up.Load() {
 		return nil
 	}
-	return f()
+	if err := f(); err != nil && !n.hit.Load() {
+		return err
+	}
+	return nil
+}
+
+// victimMidOp returns the node of the next operation a lane starts within a minute, so the fault lands while it runs.
+func (d *driver) victimMidOp(fallback *node) *node {
+	select {
+	case n := <-d.victims:
+		return n
+	case <-time.After(time.Minute):
+	case <-d.ctx.Done():
+	}
+	return fallback
 }
 
 // injectFault takes one node down, brings it back and checks it shows the model. Operations go on elsewhere.
@@ -442,19 +486,37 @@ func (d *driver) injectFault(kind string, n *node) {
 	d.faultMu.Lock()
 	defer d.faultMu.Unlock()
 	start := time.Now()
-	n.up.Store(false)
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.agent.close()
 	command := fmt.Sprintf("%s %d", kind, n.id)
 	if kind == "stop" {
 		command = fmt.Sprintf("stop %d %d", n.id, int(d.cfg.stopFor.Seconds()))
 	}
 	log.Printf("fault: %s", command)
-	if _, _, err := d.ctl.run(command); err != nil {
-		d.fail("fault %s: %v", command, err)
-		return
+	if d.cfg.inflight {
+		// Operations keep starting on the node until the fault takes it down, so it cuts some of them short.
+		n.hit.Store(true)
+		if _, _, err := d.ctl.run("cut " + command); err != nil {
+			d.fail("fault %s: %v", command, err)
+			return
+		}
+		n.up.Store(false)
+		n.mu.Lock()
+		n.agent.close()
+		if _, _, err := d.ctl.run(fmt.Sprintf("restore %s %d", kind, n.id)); err != nil {
+			n.mu.Unlock()
+			d.fail("fault %s: restore: %v", command, err)
+			return
+		}
+	} else {
+		n.up.Store(false)
+		n.mu.Lock()
+		n.agent.close()
+		if _, _, err := d.ctl.run(command); err != nil {
+			n.mu.Unlock()
+			d.fail("fault %s: %v", command, err)
+			return
+		}
 	}
+	defer n.mu.Unlock()
 	if err := d.connect(n); err != nil {
 		d.fail("fault %s: reconnect: %v", command, err)
 		return
@@ -462,10 +524,15 @@ func (d *driver) injectFault(kind string, n *node) {
 	n.up.Store(false)
 	d.faults.Add(1)
 	d.logRecord(record{Type: "fault", Fault: kind, Victim: n.id, Op: Op{At: start.UnixMilli(), Ms: time.Since(start).Milliseconds()}})
+	if err := d.resolvePending(n); err != nil {
+		d.fail("after fault %s: %v", command, err)
+		return
+	}
 	if err := d.verifyAll(n, true); err != nil {
 		d.fail("after fault %s: node %d: %v", command, n.id, err)
 		return
 	}
+	n.hit.Store(false)
 	n.up.Store(true)
 }
 
@@ -567,8 +634,8 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d faults=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d files=%d snapshots=%d blocks=%d [%s]",
-		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d files=%d snapshots=%d blocks=%d [%s]",
+		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
 		files, snaps, blocks, strings.Join(kinds, " "))
 }
 
@@ -590,7 +657,7 @@ func newDriver(cfg config) (*driver, func(), error) {
 		return nil, nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel}
+	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, victims: make(chan *node)}
 	cleanup := func() {
 		cancel()
 		for _, n := range d.nodes {
@@ -642,7 +709,11 @@ func run(cfg config) error {
 	}
 	wg.Go(func() {
 		every(ctx, cfg.faultEvery, func() {
-			d.injectFault(pick(faultRng, []string{"power", "sigkill", "stop"}), pick(faultRng, d.nodes))
+			kind, n := pick(faultRng, []string{"power", "sigkill", "stop"}), pick(faultRng, d.nodes)
+			if cfg.inflight {
+				n = d.victimMidOp(n)
+			}
+			d.injectFault(kind, n)
 		})
 	})
 	wg.Go(func() { every(ctx, cfg.fsckEvery, d.quiescedFsck) })

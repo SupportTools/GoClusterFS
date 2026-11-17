@@ -14,6 +14,10 @@
   - goclusterfs-mount is stopped past the 10s heartbeat timeout and resumed.
 
   The node comes back, mounts again and must show the model. The other nodes keep working through the fault.
+- **In-flight faults:** by default a fault waits for the operations running on its node. With `-inflight` it does not, so a fault can land in the middle of an operation.
+  - An operation the fault cuts short may or may not have happened. Once the node is back, the soak reads what it shows and accepts the state from before the operation or after it.
+  - A write may also be torn: each 4 KB sector shows the old data or the new.
+  - Anything else is a failure. `ops.jsonl` logs each such operation as `uncertain`, then the outcome the soak saw as `resolved`.
 - **Stalls:** when a call waits longer than `-stall-capture` (20s), the soak saves from every node:
   - each mount thread's kernel stack;
   - the lock and reserve wait totals from `/metrics`;
