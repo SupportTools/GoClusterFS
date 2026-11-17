@@ -84,6 +84,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A power failure during mkdir or rmdir could leave the parent directory's link count off by one: the entry and the count were written under separate locks, and replay did not fix the count. Both now change in one write of the parent's inode, and replay sets the parent's count from its subdirectories.
 - `goclusterfs-fsck` checked a directory entry's type only when the entry's inode number was below the count of inodes in use, and then only that the type was a valid value. It now reports every entry whose type differs from its inode's, which lookup, unlink and rmdir trust: an unlink could remove a directory that its entry calls a file. It also reports an entry whose inode number is past the inode table; before, a number past 2^32 wrapped and could pass as an inode in use.
 - `goclusterfs-fsck` never checked a snapshot's parent: the check was an empty block. It now warns about a snapshot whose parent snapshot does not exist, is the snapshot itself, or was taken of another file. Deleting a snapshot hands its children to its parent.
 - A file node that outlived its file, such as an O_PATH descriptor or a name another node had just removed, could open, read, write and truncate the next file to take its inode slot. It now fails with ESTALE.

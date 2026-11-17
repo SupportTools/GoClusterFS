@@ -1821,6 +1821,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameOverAnEmptyDirectory
 
+  - id: mkdir-power-failure
+    name: Power failure during mkdir
+    description: Power fails at each write; the root counts a link for the new directory exactly when it names it, and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringMkdir
+
+  - id: rmdir-power-failure
+    name: Power failure during rmdir
+    description: Power fails at each write; the root drops the directory's link exactly when it drops its name, and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringRmdir
+
   - id: fsck-directory-tree
     name: fsck checks the directory tree
     description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them

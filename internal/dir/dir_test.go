@@ -825,7 +825,7 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 		name := fmt.Sprintf("entry-%d", i)
 		entry := &DirEntry{InodeNum: uint64(50 + i), NameLen: uint8(len(name)), FileType: DT_REG, Name: name}
 		entry.RecLen = entrySize(entry)
-		if err := dirMgr.addToNewBlock(ctx, fresh, entry); err != nil {
+		if err := dirMgr.addToNewBlock(ctx, fresh, entry, nil); err != nil {
 			t.Fatalf("addToNewBlock %d: %v", i, err)
 		}
 	}
