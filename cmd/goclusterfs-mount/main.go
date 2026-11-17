@@ -547,6 +547,7 @@ func main() {
 			Name:          "goclusterfs",
 			Debug:         *fuseDebug,
 			MaxReadAhead:  128 * 1024, // 128KB readahead
+			MaxWrite:      goclusterfs.MaxWrite,
 			DisableXAttrs: false,
 			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
 		},

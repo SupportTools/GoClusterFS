@@ -77,6 +77,9 @@ var beforeShareMark func()
 // file's inode, before it writes the inode back.
 var duringShareMark func()
 
+// MaxWrite is the largest write request the kernel sends the daemon; a snapshot captures each request whole.
+const MaxWrite = 128 << 10
+
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected. Back-to-back snapshots on another
 // node can force a retry each time; with conflictBackoff, 10 tries span up to 5s.

@@ -149,12 +149,11 @@ func TestAPIRequestOnReplacedFileIsStale(t *testing.T) {
 	}
 }
 
-// Without the kernel's i_rwsem, the inode lock alone must keep each write whole: a snapshot or clone taken while this
-// node writes holds exactly one version. A write of up to 128 KiB is one FUSE request.
+// Without the kernel's i_rwsem, the inode lock alone keeps each write request whole against a snapshot or clone.
 func TestAPISnapshotWhileTheNodeWrites(t *testing.T) {
 	ctx := context.Background()
 	fsys := openFormattedFS(t, newFormattedImage(t))
-	const size = 128 << 10
+	const size = MaxWrite
 	file := createFile(t, fsys, "w")
 	writeAt(t, file, pattern(0, size), 0)
 
