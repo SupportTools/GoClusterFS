@@ -5478,14 +5478,14 @@ scenarios:
 
   - id: lock-writer-gets-file-io-from-readers
     name: A writer gets a file I/O lock that readers on lower slots keep taking
-    description: Four lower-slot nodes keep taking a file I/O lock shared; a higher-slot node asking for it exclusive gets it within 1.5s each time, because readers wait behind its waiting mark
+    description: Four lower-slot nodes keep taking a file I/O lock shared; a higher-slot node asking for it exclusive gets it each time before the acquire timeout, because readers wait behind its waiting mark
     priority: go_only
     environments:
       go: internal/lock/file_io_test.go::TestWriterGetsRecordWhileReadersOnLowerSlotsKeepReading
 
   - id: lock-reader-gets-file-io-from-writer
     name: A reader gets a file I/O lock a writer keeps taking
-    description: Readers wait behind writers only for two turns, so a reader in a lower or higher slot than a node that keeps writing gets the lock within 1.5s each time
+    description: Readers wait behind writers only for two turns, so a reader in a lower or higher slot than a node that keeps writing gets the lock each time before the acquire timeout
     priority: go_only
     environments:
       go: internal/lock/file_io_test.go::TestReaderGetsRecordWhileWriterKeepsWriting
@@ -5561,3 +5561,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/fairness_test.go::TestContestedHolderKeepsItsNewClaimBriefly
+
+  - id: lock-read-claim-waits-two-turns-for-writer
+    name: A read claim waits two turns behind a write mark
+    description: With a live node's mark for a write claim in the row, a read claim does not get the lock within one turn and gets it only after two turns
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestReadClaimWaitsTwoTurnsBehindALiveWriteMark

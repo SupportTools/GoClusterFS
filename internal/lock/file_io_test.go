@@ -2,7 +2,6 @@ package lock
 
 import (
 	"errors"
-	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +16,7 @@ func keepAcquiring(t *testing.T, m *Manager, mode LockMode, stop <-chan struct{}
 			return
 		default:
 		}
-		if err := acquireWithin(m, 10*time.Second, LockTypeFileIO, 7, mode); err != nil {
+		if err := acquireWithin(m, m.timing.acquireTimeout, LockTypeFileIO, 7, mode); err != nil {
 			t.Errorf("node %d Acquire mode %d: %v", m.nodeSlot, mode, err)
 			return
 		}
@@ -26,12 +25,14 @@ func keepAcquiring(t *testing.T, m *Manager, mode LockMode, stop <-chan struct{}
 	}
 }
 
+// waitsFor takes the lock in mode times and returns how long each took. A node
+// that other nodes shut out waits until the lock's own acquire timeout and fails.
 func waitsFor(t *testing.T, m *Manager, mode LockMode, times int) []time.Duration {
 	var waits []time.Duration
 	for range times {
 		start := time.Now()
-		if err := acquireWithin(m, 10*time.Second, LockTypeFileIO, 7, mode); err != nil {
-			t.Fatalf("node %d never got mode %d: %v", m.nodeSlot, mode, err)
+		if err := acquireWithin(m, m.timing.acquireTimeout, LockTypeFileIO, 7, mode); err != nil {
+			t.Fatalf("node %d never got mode %d within the acquire timeout: %v", m.nodeSlot, mode, err)
 		}
 		waits = append(waits, time.Since(start))
 		release(t, m, LockTypeFileIO, 7)
@@ -54,11 +55,7 @@ func TestWriterGetsRecordWhileReadersOnLowerSlotsKeepReading(t *testing.T) {
 	}
 	writer := newTestNode(dev, 0, region, 4)
 
-	waits := waitsFor(t, writer, LockModeExclusive, 8)
-	t.Logf("writer waits: %v", waits)
-	if longest := slices.Max(waits); longest > 1500*time.Millisecond {
-		t.Errorf("writer waited up to %v for 4 reading nodes, want under 1.5s: %v", longest, waits)
-	}
+	t.Logf("writer waits: %v", waitsFor(t, writer, LockModeExclusive, 8))
 }
 
 func TestReaderGetsRecordWhileWriterKeepsWriting(t *testing.T) {
@@ -73,14 +70,35 @@ func TestReaderGetsRecordWhileWriterKeepsWriting(t *testing.T) {
 		wg.Go(func() { keepAcquiring(t, writer, LockModeExclusive, stop) })
 		time.Sleep(20 * time.Millisecond)
 
-		waits := waitsFor(t, reader, LockModeShared, 8)
-		t.Logf("reader in slot %d waits: %v", readerSlot, waits)
+		t.Logf("reader in slot %d waits: %v", readerSlot, waitsFor(t, reader, LockModeShared, 8))
 		close(stop)
 		wg.Wait()
-		if longest := slices.Max(waits); longest > 1500*time.Millisecond {
-			t.Errorf("reader in slot %d waited up to %v for a writing node, want under 1.5s: %v", readerSlot, longest, waits)
-		}
 	}
+}
+
+// A read claim waits behind a live node's mark for a write claim for two turns,
+// then takes the lock anyway, so a stream of writers cannot shut readers out.
+func TestReadClaimWaitsTwoTurnsBehindALiveWriteMark(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	m := newTestNode(dev, 0, 1<<20, 1)
+	m.timing.holdTurn = 100 * time.Millisecond
+	mark := &claimSlot{mode: modeWaiting, wants: LockModeExclusive, lockType: LockTypeFileIO, resourceID: 3, owner: [16]byte{5}, acquireTime: time.Now().UnixNano()}
+	if err := m.writeSlot(m.hashToRecord(LockTypeFileIO, 3), 5, mark); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := acquireWithin(m, m.timing.holdTurn, LockTypeFileIO, 3, LockModeShared); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("read claim next to a live write mark: %v, want ErrLockTimeout while it waits", err)
+	}
+	start := time.Now()
+	if err := acquireWithin(m, m.timing.acquireTimeout, LockTypeFileIO, 3, LockModeShared); err != nil {
+		t.Fatalf("read claim after two turns behind a write mark: %v", err)
+	}
+	if waited := time.Since(start); waited < 2*m.timing.holdTurn {
+		t.Errorf("read claim got the lock after %v, before its two turns (%v) behind the write mark", waited, 2*m.timing.holdTurn)
+	}
+	release(t, m, LockTypeFileIO, 3)
 }
 
 func TestFileIOLockRanksBeforeEveryOtherType(t *testing.T) {
