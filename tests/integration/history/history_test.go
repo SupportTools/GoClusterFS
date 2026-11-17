@@ -243,6 +243,16 @@ func TestRenamedAwayNameMayOpenTheMovedFileForAWindow(t *testing.T) {
 	expect(t, b, "read found a name that should be gone")
 }
 
+func TestReadOverlappingARenameMaySeeAWriteThroughTheNewName(t *testing.T) {
+	b := &builder{}
+	b.write("n0", 1, 0, 10)
+	b.add(Op{Kind: Rename, Name: "n0", To: "n3", Node: 2}, 16243, 16245)
+	b.add(Op{Kind: Write, Name: "n3", Value: 0x1eb, Node: 2}, 16248, 16250)
+	b.add(Op{Kind: Write, Name: "n0", Value: 0x1ec, Node: 2}, 16255, 16260)
+	b.read("n0", 0x1eb, 16185, 16291)
+	expect(t, b)
+}
+
 func TestRenamedAwayNameSeesOnlyTheMovedFile(t *testing.T) {
 	b := &builder{}
 	b.write("a", 1, 0, 10)

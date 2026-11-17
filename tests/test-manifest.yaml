@@ -4992,6 +4992,13 @@ scenarios:
     environments:
       go: history/history_test.go::TestRenamedAwayNameMayOpenTheMovedFileForAWindow
 
+  - id: history-checker-read-across-rename
+    name: Coherence checker follows a file across a rename during a read
+    description: A read of a name that overlaps a rename of it may return a value written through the new name after the rename, even when a new file took the old name since
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestReadOverlappingARenameMaySeeAWriteThroughTheNewName
+
   - id: history-checker-rename-old-name-only-moved-file
     name: Coherence checker limits a renamed-away name to the moved file
     description: Within the cache window after a rename, a read of the old name that sees a value no write gave the moved file is still a violation
