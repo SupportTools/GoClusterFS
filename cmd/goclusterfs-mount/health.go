@@ -14,6 +14,7 @@ type healthSources struct {
 	deviceError      func() error
 	journal          func() *api.JournalStatsResponse
 	replaying        func() []int
+	failingReplays   func() []node.FailingReplay
 	broadcastOn      bool
 	broadcastProblem func() string
 	silentPeers      func() ([]string, time.Duration)
@@ -26,7 +27,7 @@ func registerHealthChecks(srv *api.Server, src healthSources) {
 	}
 	check("device", func() api.ComponentHealth { return deviceHealth(src.deviceError()) })
 	check("journal", func() api.ComponentHealth { return journalHealth(src.journal()) })
-	check("recovery", func() api.ComponentHealth { return recoveryHealth(src.replaying()) })
+	check("recovery", func() api.ComponentHealth { return recoveryHealth(src.replaying(), src.failingReplays()) })
 	check("broadcast", func() api.ComponentHealth { return broadcastHealth(src.broadcastOn, src.broadcastProblem()) })
 	check("broadcast-peers", func() api.ComponentHealth { return silentPeersHealth(src.silentPeers()) })
 	check("heartbeat", func() api.ComponentHealth { return heartbeatHealth(src.heartbeatAge()) })
@@ -63,7 +64,13 @@ func journalHealth(j *api.JournalStatsResponse) api.ComponentHealth {
 	return healthy("")
 }
 
-func recoveryHealth(slots []int) api.ComponentHealth {
+func recoveryHealth(slots []int, failing []node.FailingReplay) api.ComponentHealth {
+	if len(failing) > 0 {
+		f := failing[0]
+		return degraded("the journal replay of the crashed node in slot %d failed %d times in a row: %s. Files it had locked stay locked; "+
+			"this node retries after %v without a change. Run goclusterfs-fsck -inspect-slot %d, then see Damaged Journal Slot in OPERATIONS.md",
+			f.Slot, f.Failures, f.Err, node.ReplayBackoff, f.Slot)
+	}
 	if len(slots) == 0 {
 		return healthy("")
 	}

@@ -180,7 +180,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 |-------|------|------------|-------------|
 | `device` | The last device read, write or sync worked | | The last device read, write or sync failed |
 | `journal` | Clean or dirty, or off with `-journal=false` | This node's journal is being replayed | This node's journal is corrupt |
-| `recovery` | No replay is running | This node replays the journal of a crashed node | |
+| `recovery` | No replay is running | This node replays the journal of a crashed node, or that replay failed 3 times in a row with the same error | |
 | `broadcast` | Working, or off with `-broadcast=false` | The last invalidation send failed, or multicast is unavailable and no unicast peers are known | |
 | `broadcast-peers` | This node hears every node the registry shows mounted, or broadcast is off | A mounted node has not been heard on broadcast for 3 `-broadcast-heartbeat` intervals: multicast may not reach this node, or that node runs with `-broadcast=false` or another `-mcast-group` or `-mcast-port`. This node sees that node's changes in directories only after `-cache-ttl` | |
 | `heartbeat` | This node's last heartbeat reached its registry slot within 2 seconds | The last heartbeat is older than that. Heartbeats are writes to the shared device, so a slow device delays them; at 5 seconds the node stops | |
