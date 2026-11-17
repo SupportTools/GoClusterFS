@@ -1522,7 +1522,7 @@ scenarios:
 
   - id: fsck-release-dead-slot
     name: fsck releases a dead node's slot
-    description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot refuses to act without -salvage or -discard-journal, prints what it discards without writing, -discard-journal -report FILE frees the slot and writes the discarded journal to FILE, and a mount then uses it
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
     environments:
@@ -2180,6 +2180,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: fsck-release-slot-salvage
+    name: fsck slot release salvages a journal's good transactions
+    description: With salvage, release replays the slot's committed transactions in order until one fails to apply, reports that one as failed and every later one as discarded, then resets the journal and frees the slot; a journal a mount could replay is refused without salvage or force; salvage stops before its next transaction once another registry slot changes, leaving the journal and the slot for a later run
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotSalvage
+
+  - id: release-slot-renews-lease
+    name: Slot release keeps its lease through a long reset
+    description: A reset that renews the recovery lease through ReleaseSlot's renew function may run past the lease budget and still frees the slot, keeping its orphans; renew fails once another node takes the lease
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotRenewsItsLease
 
   - id: fsck-release-slot-refusals
     name: fsck slot release refusals

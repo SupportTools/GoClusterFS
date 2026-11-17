@@ -43,15 +43,20 @@ func (c *Checker) InspectSlot(i int) (*SlotInspection, error) {
 	if i < 0 || i >= len(slots) {
 		return nil, fmt.Errorf("%w: slot %d; slots are 0 to %d", ErrNoSuchSlot, i, len(slots)-1)
 	}
-	in := &SlotInspection{Status: slots[i]}
-	in.JournalOffset, in.JournalSize = c.journalArea(i)
-	region, err := c.slotJournal(i)
+	return c.inspect(slots[i]), nil
+}
+
+// inspect reads the journal of slot s and what replaying it would change.
+func (c *Checker) inspect(s SlotStatus) *SlotInspection {
+	in := &SlotInspection{Status: s}
+	in.JournalOffset, in.JournalSize = c.journalArea(s.Index)
+	region, err := c.slotJournal(s.Index)
 	switch {
 	case errors.Is(err, journal.ErrJournalUninitialized):
-		return in, nil
+		return in
 	case err != nil:
 		in.HeaderErr = rootCause(err)
-		return in, nil
+		return in
 	}
 	header := region.Superblock()
 	in.Header = &header
@@ -63,7 +68,7 @@ func (c *Checker) InspectSlot(i int) (*SlotInspection, error) {
 	for _, txn := range txns {
 		in.Pending = append(in.Pending, pendingTxn(txn))
 	}
-	return in, nil
+	return in
 }
 
 func pendingTxn(txn *journal.RecoveredTxn) PendingTxn {
