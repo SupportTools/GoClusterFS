@@ -52,6 +52,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - CI gates: unit tests with the race detector and coverage, golangci-lint (`make lint`), govulncheck (`make vuln`), and a `go mod tidy` check.
 - Release workflow: pushing a `v*` tag publishes a GitHub Release with `linux/amd64` and `linux/arm64` archives, checksums, and the matching `CHANGELOG.md` section. `scripts/dist.sh` builds the same archives locally.
 - `goclusterfs-fsck -version` prints the release version, commit, and commit date.
+- `goclusterfs-fsck -inspect-slot N` describes registry slot N and lists every transaction a replay of its journal would apply, with the inodes and blocks each one touches. It writes nothing, so it runs on a mounted device.
 - HTTP API in `goclusterfs-mount` (`-api`, on by default): `/health`, `/metrics`, `/api/v1/status` and `/api/v1/stats/...`. It listens on `127.0.0.1:8080` (`-api-addr`). Mount refuses a non-loopback `-api-addr` or `-api-cors '*'` without `-api-token`, and checks the API flags before it opens the device. `/metrics` uses the Prometheus client library and adds Go runtime and process metrics. `-api-rate-limit` limits requests per client IP (off by default).
 - `-api-token-file` (mode 0600 or stricter) and `GOCLUSTERFS_API_TOKEN` for the API token. Mount warns when it comes from `-api-token`, which `ps` shows to every local user.
 - HTTP API write endpoints, only with a token: create, list, clone and delete snapshots, clone files, and flush the journal, flush TRIM or clear caches on this node. Snapshot and clone requests run the same code as `setfattr` inside the mount daemon.
@@ -73,6 +74,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A node whose replay of a crashed peer's journal fails 3 times in a row with the same error now retries every 10 minutes instead of every minute, logs the failure at most once an hour, and reports `/health` `recovery` as degraded with the slot and a `goclusterfs-fsck -inspect-slot` hint until a replay succeeds or the slot changes hands. Lock timeouts do not count.
 - Freeing blocks that no snapshot or clone shares takes only the block bitmap lock, once per operation, not the refcount lock and one bitmap lock per block. Snapshots and clones take the bitmap lock while they count a file's blocks.
 - Each node keeps the directories it reads in an in-memory index, so a lookup no longer reads and decodes the whole directory. A lookup checks the directory inode's generation on disk before it uses the index, so other nodes' changes show on the next lookup without broadcast. Removing an entry now writes the directory inode before the child is freed. `-dir-index-entries` caps the names held (default 1,048,576, about 100 MB), and `/metrics` counts hits, misses and rebuilds. In one test with two nodes, `ls -l` of 4,000 files went from 65 s to 1 s, a `stat` from 3.8 ms to 0.25 ms, and a create from 14 ms to 6 ms.
 - `-format` now writes a superblock with the volume layout and zeroes all metadata regions, even on a device that already holds a filesystem. Mount reads every region offset from the superblock.

@@ -1148,6 +1148,112 @@ func TestStatsCountReplaysAndHeartbeatAge(t *testing.T) {
 	}
 }
 
+func TestPeerReplayBacksOffAfterIdenticalFailures(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	const dead = 4
+	deadNode := func(uuid byte) {
+		t.Helper()
+		if err := reg.writeSlot(dead, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{uuid}, RecoveryOwner: [16]byte{9}, RecoveryStart: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadNode(5)
+	var replayErr error
+	tries := 0
+	reg.SetRecoveryHandler(func(*FailedNodeInfo) error { tries++; return replayErr })
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	// scan runs failure detection after this node has seen the dead slot unchanged for quiet.
+	scan := func(quiet time.Duration) (tried bool, logged string) {
+		t.Helper()
+		slot, err := reg.readSlot(dead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		silence(reg, dead, slot, quiet)
+		before := tries
+		logs.Reset()
+		reg.detectAndRecoverFailedNodes()
+		return tries > before, logs.String()
+	}
+	lapsed := recoveryLease + time.Second
+	failing := func() string { return fmt.Sprint(reg.FailingReplays()) }
+
+	for k, err := range []error{fmt.Errorf("%w: inode 9", ErrReplayContended), ErrLeaseLost, fmt.Errorf("%w: inode 9", ErrReplayContended), ErrLeaseLost} {
+		replayErr = err
+		if tried, _ := scan(lapsed); !tried {
+			t.Fatalf("after %d lock timeouts and lost leases, no retry once the lease lapsed", k)
+		}
+	}
+	if got := failing(); got != "[]" {
+		t.Fatalf("lock timeouts and lost leases made the slot failing: %s", got)
+	}
+
+	replayErr = errors.New("bad record")
+	var logged string
+	for k := 1; k <= replayRepeats; k++ {
+		var tried bool
+		if tried, logged = scan(lapsed); !tried || !strings.Contains(logged, "bad record") {
+			t.Fatalf("failure %d: tried %v, logged %q", k, tried, logged)
+		}
+	}
+	if !strings.Contains(logged, "3 times in a row") || !strings.Contains(logged, "-inspect-slot 4") {
+		t.Errorf("third identical failure logged %q", logged)
+	}
+	if got := failing(); got != "[{4 3 bad record}]" {
+		t.Errorf("FailingReplays after 3 identical failures = %s", got)
+	}
+	if tried, _ := scan(ReplayBackoff - time.Minute); tried {
+		t.Fatal("retried within the backoff")
+	}
+	if tried, logged := scan(ReplayBackoff + time.Second); !tried || logged != "" {
+		t.Fatalf("after the backoff: tried %v, logged %q; want a retry that logs nothing within the hour", tried, logged)
+	}
+	reg.mu.Lock()
+	reg.failures[dead].logged = time.Now().Add(-failureLogEvery)
+	reg.mu.Unlock()
+	if _, logged := scan(ReplayBackoff + time.Second); !strings.Contains(logged, "5 times in a row") {
+		t.Errorf("an hour after the last log, the failure logged %q", logged)
+	}
+
+	replayErr = errors.New("short read")
+	if tried, logged := scan(ReplayBackoff + time.Second); !tried || !strings.Contains(logged, "any node retries after") {
+		t.Fatalf("a different error: tried %v, logged %q", tried, logged)
+	}
+	if got := failing(); got != "[]" {
+		t.Errorf("a different error kept the slot failing: %s", got)
+	}
+	if tried, _ := scan(lapsed); !tried {
+		t.Fatal("a different error kept the backoff")
+	}
+	replayErr = nil
+	if tried, _ := scan(lapsed); !tried || len(reg.failures) != 0 {
+		t.Fatalf("successful replay: tried %v, failures %v", tried, reg.failures)
+	}
+
+	deadNode(6)
+	replayErr = errors.New("bad record")
+	for range replayRepeats {
+		scan(lapsed)
+	}
+	if got := failing(); got != "[{4 3 bad record}]" {
+		t.Fatalf("FailingReplays for the next dead node = %s", got)
+	}
+	if err := reg.writeSlot(dead, &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if tried, _ := scan(0); tried || failing() != "[]" {
+		t.Errorf("a new node in the slot: tried %v, FailingReplays = %s", tried, failing())
+	}
+}
+
 func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()

@@ -354,7 +354,7 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 - **Storage or replay errors** (an I/O error, or `journal recovery failed: ...`): the journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery=N`, with the slot number N from the error, which discards slot N's journal.
 
-`-skip-recovery` is for emergencies only: it throws away changes the node had committed, which may have been only partly applied. Never put it in a unit file or script. `goclusterfs-fsck -list-slots` shows each slot's journal state first.
+`-skip-recovery` is for emergencies only: it throws away changes the node had committed, which may have been only partly applied. Never put it in a unit file or script. `goclusterfs-fsck -list-slots` shows each slot's journal state first, and `goclusterfs-fsck -inspect-slot N` lists every transaction a replay of slot N would apply, with the inodes and blocks each one touches. Both only read, so they run while nodes have the filesystem mounted.
 
 `-skip-recovery=N` discards a journal only when the mount takes slot N, and it makes the mount try slot N first. It takes the slot at once if it is empty or holds this host's exited mount; after watching it for about 12 seconds if it holds another host's node whose heartbeat never changes; and after a minute if a running node is replaying it and that replay keeps failing, since the replay's lease then lapses. If it cannot take slot N, it logs `ignoring -skip-recovery=N` and replays the journal of the slot it took, so it never discards a journal you did not name. To discard slot N's journal:
 
@@ -363,10 +363,11 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 
 `-skip-recovery=N` does not stop the node from replaying crashed peers' journals. `-journal=false` also skips the replay of its own slot, and leaves that journal in place for the next mount, so don't use it on a device that may have a dirty journal.
 
-A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed`, naming `-skip-recovery=N`, and retry every minute. A mount takes such a slot only when `-skip-recovery=N` names it or no slot is empty. Discard its journal as above, or free the slot with fsck. Unmount the filesystem on every node first, then:
+A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed`, naming `-skip-recovery=N`, and retry every minute. After 3 failures in a row with the same error, a node retries only once the slot has stayed unchanged for 10 minutes, logs the failure at most once an hour, and its `/health` `recovery` check reports degraded with the slot number. Each attempt by any node changes the slot, so the cluster as a whole then tries about every 10 minutes. Lock timeouts do not count toward the 3. A mount takes such a slot only when `-skip-recovery=N` names it or no slot is empty. Discard its journal as above, or free the slot with fsck. Unmount the filesystem on every node first, then:
 
 ```bash
 ./goclusterfs-fsck -list-slots /dev/device                       # find the slot and its journal state
+./goclusterfs-fsck -inspect-slot N /dev/device                   # list what its journal would replay
 ./goclusterfs-fsck -release-slot N /dev/device                   # check the slot; prints what releasing discards
 ./goclusterfs-fsck -release-slot N -discard-journal /dev/device  # reset its journal and free the slot
 ```
