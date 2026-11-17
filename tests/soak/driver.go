@@ -71,6 +71,8 @@ type driver struct {
 	model   *Model
 	pause   sync.RWMutex // lanes hold it shared per operation; barriers and fsck hold it exclusively
 	faultMu sync.Mutex
+	// victims hands a fault, with -inflight, the node a lane is about to run an operation on.
+	victims chan *node
 	seq     atomic.Uint64
 	logMu   sync.Mutex
 	logw    io.Writer
@@ -364,6 +366,12 @@ func (d *driver) runOpLocked(op *Op, n *node) {
 	op.Node = n.id
 	op.At = time.Now().UnixMilli()
 	ctx, cancel := context.WithTimeout(d.ctx, d.cfg.opTimeout)
+	if d.cfg.inflight {
+		select {
+		case d.victims <- n:
+		default:
+		}
+	}
 	resp, err := n.agent.call(ctx, op.request())
 	cancel()
 	// Registered before the node is released, so the fault that cut the operation short finds it.
@@ -460,6 +468,17 @@ func (d *driver) onNode(n *node, f func() error) error {
 		return err
 	}
 	return nil
+}
+
+// victimMidOp returns the node of the next operation a lane starts within a minute, so the fault lands while it runs.
+func (d *driver) victimMidOp(fallback *node) *node {
+	select {
+	case n := <-d.victims:
+		return n
+	case <-time.After(time.Minute):
+	case <-d.ctx.Done():
+	}
+	return fallback
 }
 
 // injectFault takes one node down, brings it back and checks it shows the model. Operations go on elsewhere.
@@ -638,7 +657,7 @@ func newDriver(cfg config) (*driver, func(), error) {
 		return nil, nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}}
+	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, victims: make(chan *node)}
 	cleanup := func() {
 		cancel()
 		for _, n := range d.nodes {
@@ -690,7 +709,11 @@ func run(cfg config) error {
 	}
 	wg.Go(func() {
 		every(ctx, cfg.faultEvery, func() {
-			d.injectFault(pick(faultRng, []string{"power", "sigkill", "stop"}), pick(faultRng, d.nodes))
+			kind, n := pick(faultRng, []string{"power", "sigkill", "stop"}), pick(faultRng, d.nodes)
+			if cfg.inflight {
+				n = d.victimMidOp(n)
+			}
+			d.injectFault(kind, n)
 		})
 	})
 	wg.Go(func() { every(ctx, cfg.fsckEvery, d.quiescedFsck) })
