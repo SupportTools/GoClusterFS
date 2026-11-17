@@ -70,17 +70,6 @@ func (f *FS) linkOnce(ctx context.Context, parent *fs.Inode, parentNum, num uint
 
 // addLink gives inode num one more link and the name in directory parentNum, and returns the inode as written.
 func (f *FS) addLink(ctx context.Context, parentNum, num uint32, name string) (*inode.Inode, syscall.Errno) {
-	ino, err := f.inodeTbl.Read(num)
-	switch {
-	case err != nil:
-		return nil, syscall.EIO
-	case ino.Magic != inode.InodeMagic || ino.LinkCount == 0:
-		return nil, syscall.ENOENT
-	case !ino.IsFile():
-		return nil, syscall.EPERM
-	case ino.LinkCount >= maxLinks:
-		return nil, syscall.EMLINK
-	}
 	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
 		return nil, syscall.EIO
@@ -91,44 +80,14 @@ func (f *FS) addLink(ctx context.Context, parentNum, num uint32, name string) (*
 		return nil, nameErrno(err)
 	}
 
-	if f.journal != nil {
-		seq, err := f.logLink(num, ino.MetaGeneration, parentNum, name)
-		if err != nil {
-			return nil, syscall.EIO
-		}
-		defer f.closeIntent(seq)
-		if afterCommit != nil {
-			afterCommit("link")
-		}
-	}
-
 	// The count goes up before the name appears: a crash in between leaves an extra link, never a name for a freed file.
 	now := time.Now().UnixNano()
-	logged := ino.MetaGeneration
-	unlock := f.lockInode(num)
-	ino, err = f.updateUnderInodeLock(ctx, num, func(cur *inode.Inode) error {
-		switch {
-		case cur.Magic != inode.InodeMagic || cur.LinkCount == 0:
-			return errLinkGone
-		case cur.MetaGeneration != logged:
-			return errLinkChanged
-		case cur.LinkCount >= maxLinks:
-			return errTooManyLinks
-		}
-		cur.LinkCount++
-		cur.Ctime = now
-		return nil
-	})
-	unlock()
-	switch {
-	case errors.Is(err, errLinkGone):
-		return nil, syscall.ENOENT
-	case errors.Is(err, errLinkChanged):
-		return nil, syscall.EAGAIN
-	case errors.Is(err, errTooManyLinks):
-		return nil, syscall.EMLINK
-	case err != nil:
-		return nil, syscall.EIO
+	ino, seq, errno := f.countLink(ctx, num, parentNum, name, now)
+	if seq != 0 {
+		defer f.closeIntent(seq)
+	}
+	if errno != 0 {
+		return nil, errno
 	}
 	if afterCommit != nil {
 		afterCommit("link: counted")
@@ -144,6 +103,58 @@ func (f *FS) addLink(ctx context.Context, parentNum, num uint32, name string) (*
 		f.cacheMgr.BroadcastInvalidateInode(num, ino.DataGeneration, ino.MetaGeneration)
 	}
 	return ino, 0
+}
+
+// countLink logs the link and adds it to inode num's count, and returns the journal seq to close. It holds the inode's
+// lock from reading the generation to the increment, so replay can take generation+1 by this node as the increment.
+func (f *FS) countLink(ctx context.Context, num, parentNum uint32, name string, now int64) (*inode.Inode, uint64, syscall.Errno) {
+	defer f.lockInode(num)()
+	ino, err := f.inodeTbl.Read(num)
+	switch {
+	case err != nil:
+		return nil, 0, syscall.EIO
+	case ino.Magic != inode.InodeMagic || ino.LinkCount == 0:
+		return nil, 0, syscall.ENOENT
+	case !ino.IsFile():
+		return nil, 0, syscall.EPERM
+	case ino.LinkCount >= maxLinks:
+		return nil, 0, syscall.EMLINK
+	}
+	logged := ino.MetaGeneration
+	var seq uint64
+	if f.journal != nil {
+		if seq, err = f.logLink(num, logged, parentNum, name); err != nil {
+			return nil, 0, syscall.EIO
+		}
+		if afterCommit != nil {
+			afterCommit("link")
+		}
+	}
+
+	ino, err = f.updateUnderInodeLock(ctx, num, func(cur *inode.Inode) error {
+		switch {
+		case cur.Magic != inode.InodeMagic || cur.LinkCount == 0:
+			return errLinkGone
+		case cur.MetaGeneration != logged:
+			return errLinkChanged
+		case cur.LinkCount >= maxLinks:
+			return errTooManyLinks
+		}
+		cur.LinkCount++
+		cur.Ctime = now
+		return nil
+	})
+	switch {
+	case errors.Is(err, errLinkGone):
+		return nil, seq, syscall.ENOENT
+	case errors.Is(err, errLinkChanged):
+		return nil, seq, syscall.EAGAIN
+	case errors.Is(err, errTooManyLinks):
+		return nil, seq, syscall.EMLINK
+	case err != nil:
+		return nil, seq, syscall.EIO
+	}
+	return ino, seq, 0
 }
 
 // logLink commits the intent to give inode num, at MetaGeneration gen, one more link and the name in parentNum.

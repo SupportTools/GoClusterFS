@@ -5,6 +5,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
@@ -119,6 +120,32 @@ func TestLinkReplaysAfterCrash(t *testing.T) {
 			expectCleanFsck(t, after)
 		})
 	}
+}
+
+// A write on the linking node waits until the link is counted. Otherwise a crash before the increment leaves the
+// write's generation bump, which replay takes for the increment, and the new name would go uncounted.
+func TestLinkReplayAfterSameNodeWrite(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	a := createFile(t, fsys, "a")
+	writeAt(t, a, pattern(6, 100), 0)
+	crashed := crashAfterCommit(t, fsys, "link")
+	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b") }()
+	<-crashed
+	wrote := make(chan struct{})
+	go func() {
+		_, _ = a.Write(context.Background(), nil, pattern(7, 100), BlockSize)
+		close(wrote)
+	}()
+	select {
+	case <-wrote:
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	after := remountAndReplay(t, path, offset, size)
+	if got := linkCount(t, after, a.inodeNum); got != 2 {
+		t.Errorf("link count after replay: %d, want 2", got)
+	}
+	expectCleanFsck(t, after)
 }
 
 // A link crashes after its increment, and another write changes the file before replay. Replay can't tell the

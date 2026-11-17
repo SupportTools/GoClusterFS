@@ -150,6 +150,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/hardlink_test.go::TestLinkReplaysAfterCrash
 
+  - id: hard-link-replay-same-node-write
+    name: Replay counts a link whose node wrote the file during it
+    description: A link crashes after its commit while the same node writes the file; the write waits for the count, so replay gives the file both names and two links
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkReplayAfterSameNodeWrite
+
   - id: power-cut-during-link
     name: Power cut during a link, and during an unlink of a linked file
     description: Power fails at every write of a link, or of removing one name of a linked file; the data stays under every name left, and fsck finds at most an extra link, which -repair fixes
