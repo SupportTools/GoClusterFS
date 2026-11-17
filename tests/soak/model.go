@@ -18,6 +18,8 @@ const (
 	maxFile   = 8 << 20
 	// anyErrno is the expected result of an operation that must fail, with any errno.
 	anyErrno = -2
+	// maxInlineTarget is the longest symlink target an inode holds; longer ones take a block.
+	maxInlineTarget = 92
 )
 
 // sharedDirs hold files of every lane and are never removed.
@@ -75,17 +77,18 @@ type Model struct {
 	Files map[string]*File
 	Dirs  map[string]bool
 	Snaps map[string]*Snap
+	Links map[string]string // symlink path -> target
 }
 
 func newModel() *Model {
-	m := &Model{Files: map[string]*File{}, Dirs: map[string]bool{"/": true, "/soak": true}, Snaps: map[string]*Snap{}}
+	m := &Model{Files: map[string]*File{}, Dirs: map[string]bool{"/": true, "/soak": true}, Snaps: map[string]*Snap{}, Links: map[string]string{}}
 	for _, d := range sharedDirs {
 		m.Dirs[d] = true
 	}
 	return m
 }
 
-func (m *Model) exists(p string) bool { return m.Files[p] != nil || m.Dirs[p] }
+func (m *Model) exists(p string) bool { return m.Files[p] != nil || m.Dirs[p] || m.Links[p] != "" }
 
 func (m *Model) hasChildren(dir string) bool {
 	for p := range m.Files {
@@ -98,6 +101,11 @@ func (m *Model) hasChildren(dir string) bool {
 			return true
 		}
 	}
+	for p := range m.Links {
+		if path.Dir(p) == dir {
+			return true
+		}
+	}
 	return false
 }
 
@@ -105,7 +113,7 @@ func (m *Model) hasChildren(dir string) bool {
 func (m *Model) expect(op *Op) int {
 	f := m.Files[op.Path]
 	switch op.Kind {
-	case "create", "mkdir":
+	case "create", "mkdir", "symlink":
 		switch {
 		case m.exists(op.Path):
 			return int(syscall.EEXIST)
@@ -116,6 +124,8 @@ func (m *Model) expect(op *Op) int {
 		switch {
 		case m.Dirs[op.Path]:
 			return int(syscall.EISDIR)
+		case op.Kind == "unlink" && m.Links[op.Path] != "":
+			return 0
 		case f == nil:
 			return int(syscall.ENOENT)
 		}
@@ -172,7 +182,13 @@ func (m *Model) apply(op *Op) {
 		} else {
 			f.Data = append(f.Data, make([]byte, op.Len-int64(len(f.Data)))...)
 		}
+	case "symlink":
+		m.Links[op.Path] = op.Path2
 	case "unlink":
+		if m.Links[op.Path] != "" {
+			delete(m.Links, op.Path)
+			return
+		}
 		for name := range f.Snaps {
 			m.Snaps[name].Owner = nil
 		}
@@ -203,6 +219,11 @@ func (m *Model) blocks() int64 {
 	for _, s := range m.Snaps {
 		n += (int64(len(s.Data)) + blockSize - 1) / blockSize
 	}
+	for _, target := range m.Links {
+		if len(target) > maxInlineTarget {
+			n++
+		}
+	}
 	return n
 }
 
@@ -227,11 +248,16 @@ func pick[T any](r *rand.Rand, xs []T) T { return xs[r.IntN(len(xs))] }
 
 // generate picks the lane's next operation from the model's current state. The caller holds m.mu.
 func (l *lane) generate(m *Model) *Op {
-	var files, dirs, snaps []string
+	var files, dirs, snaps, links []string
 	orphans := 0
 	for p := range m.Files {
 		if l.owns(p) {
 			files = append(files, p)
+		}
+	}
+	for p := range m.Links {
+		if l.owns(p) {
+			links = append(links, p)
 		}
 	}
 	for p := range m.Dirs {
@@ -249,6 +275,7 @@ func (l *lane) generate(m *Model) *Op {
 		}
 	}
 	slices.Sort(files)
+	slices.Sort(links)
 	slices.Sort(dirs)
 	slices.Sort(snaps)
 	parents := append(slices.Clone(sharedDirs), dirs...)
@@ -260,7 +287,7 @@ func (l *lane) generate(m *Model) *Op {
 		w    int
 	}{
 		{"create", 15}, {"write", 30}, {"truncate", 8}, {"unlink", 8}, {"mkdir", 4}, {"rmdir", 4},
-		{"rename", 2}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3},
+		{"rename", 2}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3}, {"symlink", 5},
 	}
 	total := 0
 	for _, w := range weights {
@@ -274,7 +301,7 @@ func (l *lane) generate(m *Model) *Op {
 			break
 		}
 	}
-	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone"}, kind) {
+	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone", "symlink"}, kind) {
 		kind = pick(r, []string{"unlink", "truncate", "snapdelete"})
 	}
 	if len(files) == 0 || len(files) < 6 && kind != "create" && kind != "mkdir" {
@@ -312,7 +339,17 @@ func (l *lane) generate(m *Model) *Op {
 		} else {
 			op.Len = min(size+r.Int64N(blockSize), maxFile)
 		}
+	case "symlink":
+		if len(links) >= 20 {
+			op.Kind, op.Path = "unlink", pick(r, links)
+			break
+		}
+		op.Path, op.Path2 = path.Join(pick(r, parents), l.name("ln")), l.target(r, files)
 	case "unlink":
+		if len(links) > 0 && r.IntN(4) == 0 {
+			op.Path = pick(r, links)
+			break
+		}
 		op.Path = pick(r, files)
 		if f := m.Files[op.Path]; len(f.Snaps) > 0 && (orphans >= 20 || r.IntN(10) > 0) {
 			op.Kind, op.Name = "snapdelete", pickKey(r, f.Snaps)
@@ -365,6 +402,18 @@ func (l *lane) generate(m *Model) *Op {
 		}
 	}
 	return op
+}
+
+// target picks a symlink target in the lane's names: a lane file, a missing name, or one too long for the inode.
+func (l *lane) target(r *rand.Rand, files []string) string {
+	switch r.IntN(3) {
+	case 0:
+		return "../" + path.Base(pick(r, files))
+	case 1:
+		return l.name("missing")
+	default:
+		return strings.Repeat(l.prefix()+"x/", 20+r.IntN(600)) + l.name("t")
+	}
 }
 
 func pickLen(r *rand.Rand) int64 {
@@ -421,6 +470,11 @@ func (m *Model) listing(dir string) []string {
 	for p := range m.Dirs {
 		if p != dir && path.Dir(p) == dir {
 			out = append(out, "d:"+path.Base(p))
+		}
+	}
+	for p, target := range m.Links {
+		if path.Dir(p) == dir {
+			out = append(out, "l:"+path.Base(p)+":"+target)
 		}
 	}
 	slices.Sort(out)

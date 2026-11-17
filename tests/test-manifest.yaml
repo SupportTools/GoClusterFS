@@ -5163,6 +5163,21 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/symlink_test.go::TestUnlinkSymlinkWithPeerFreesAtOnce
+  - id: symlink-cross-node
+    name: Symlinks across nodes
+    description: Symlinks with an inline and a block target made on one node read back with readlink and lstat on another, a file reads through one, and an unlink there removes the link on the first node
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeSymlinks
+      docker: run-tests.sh::test_symlink_cross_node
+      vm: run-vm-tests.sh::test_symlink_cross_node
+
+  - id: soak-model-symlinks
+    name: Soak model follows symlink rules
+    description: The soak model treats a symlink as a name that blocks create, mkdir and rmdir, lists it with its target, and removes it on unlink
+    priority: go_only
+    environments:
+      go: tests/soak/model_test.go::TestModelFollowsTheFilesystemRules
 
   - id: symlink-stale-node-after-reuse
     name: A stale symlink node does not reach the next symlink in its slot
