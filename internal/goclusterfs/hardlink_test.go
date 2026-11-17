@@ -108,7 +108,7 @@ func TestLinkReplaysAfterCrash(t *testing.T) {
 			a := createFile(t, fsys, "a")
 			writeAt(t, a, pattern(2, 300), 0)
 			crashed := crashAfterCommit(t, fsys, crashPoint)
-			go fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b")
+			go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b") }()
 			<-crashed
 
 			after := remountAndReplay(t, path, offset, size)
@@ -127,7 +127,7 @@ func TestLinkReplaySkipsChangedFile(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	a := createFile(t, fsys, "a")
 	crashed := crashAfterCommit(t, fsys, "link: counted")
-	go fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b")
+	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b") }()
 	<-crashed
 	afterCommit = nil
 	writeAt(t, a, pattern(3, 100), 0)
