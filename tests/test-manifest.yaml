@@ -1837,17 +1837,38 @@ scenarios:
 
   - id: mkdir-eio-parent-links
     name: A write that fails mkdir keeps the parent's link count
-    description: Each write of one mkdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    description: Each write of one mkdir fails with EIO in turn; the root's link count still matches its subdirectories, on the running node and after a crash and replay
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedMkdirWriteKeepsParentLinks
 
   - id: rmdir-eio-parent-links
     name: A write that fails rmdir keeps the parent's link count
-    description: Each write of one rmdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    description: Each write of one rmdir fails with EIO in turn; the root's link count still matches its subdirectories, on the running node and after a crash and replay
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedRmdirWriteKeepsParentLinks
+
+  - id: rename-eio-one-name
+    name: A write that fails a rename leaves one name
+    description: Each write of a rename over a file in another directory fails with EIO in turn; the file has exactly one name and fsck finds only leaks, on the running node and after a crash and replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRenameWriteLeavesOneName
+
+  - id: directory-move-eio-one-name
+    name: A write that fails a directory move leaves one name
+    description: Each write of a directory move between parents fails with EIO in turn; the directory has exactly one name, its ".." names that parent, both link counts are right and fsck finds only leaks, on the running node and after a crash and replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedDirectoryMoveWriteLeavesOneName
+
+  - id: failed-commit-not-replayed
+    name: A failed journal commit is not replayed onto a reused inode
+    description: Each write of one create fails with EIO in turn, a second create may reuse its inode slot, and the node crashes; after replay the two names never share an inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedCreateThenCrashKeepsNamesApart
 
   - id: fsck-directory-tree
     name: fsck checks the directory tree

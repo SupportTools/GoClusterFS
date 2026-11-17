@@ -3,6 +3,7 @@ package goclusterfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"syscall"
 
@@ -103,18 +104,25 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 	}()
 
 	var intentSeq uint64
+	var logged *journal.DirRenamePayload
+	var planned *dir.Renamed
 	op.Commit = func(r *dir.Renamed) error {
 		if f.journal == nil {
 			return nil
 		}
-		seq, err := f.logRename(op, r, flags)
-		intentSeq = seq
+		seq, p, err := f.logRename(op, r, flags)
+		intentSeq, logged, planned = seq, p, r
 		if err == nil && afterCommit != nil {
 			afterCommit("rename")
 		}
 		return err
 	}
 	r, err := f.dirMgr.Rename(ctx, op)
+	if err != nil && intentSeq != 0 {
+		if r, err = f.finishRename(ctx, logged, planned, err); errors.Is(err, errRenameUnfinished) {
+			return syscall.EIO
+		}
+	}
 	if intentSeq != 0 {
 		defer f.closeIntent(intentSeq)
 	}
@@ -148,8 +156,29 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 	return 0
 }
 
+// errRenameUnfinished marks a rename that failed after its commit and could not be finished: its intent stays
+// pending, so replay finishes it after a crash or remount.
+var errRenameUnfinished = errors.New("rename failed after its commit and is left for replay")
+
+// finishRename finishes a rename that failed after its commit, as replay would, so its names never stay half
+// changed. It returns the planned rename once the new name names the child.
+func (f *FS) finishRename(ctx context.Context, p *journal.DirRenamePayload, planned *dir.Renamed, failed error) (*dir.Renamed, error) {
+	// Only the rename record runs, which needs no orphan hooks.
+	rctx := &journal.RecoveryContext{Dev: f.dev, InodeTbl: f.inodeTbl, BitmapMgr: f.bitmapMgr, DirMgr: f.dirMgr, ExtentMgr: f.extentMgr}
+	placed, err := journal.FinishRename(ctx, rctx, f.nodeUUID, p)
+	switch {
+	case err != nil:
+		log.Printf("[WARN] rename %q to %q failed after its commit (%v), and finishing it failed: %v", p.OldName, p.NewName, failed, err)
+		return nil, fmt.Errorf("%w: %w", errRenameUnfinished, err)
+	case !placed:
+		return nil, fmt.Errorf("another operation took over the names of a rename that failed: %w", failed)
+	}
+	log.Printf("[WARN] rename %q to %q failed after its commit (%v); finished it", p.OldName, p.NewName, failed)
+	return planned, nil
+}
+
 // logRename commits the rename and what it does to the target, before any of it reaches the device.
-func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, error) {
+func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, *journal.DirRenamePayload, error) {
 	txn := f.journal.Begin()
 	payload := &journal.DirRenamePayload{
 		OldParentInodeNum: uint64(op.OldParent),
@@ -178,9 +207,10 @@ func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, 
 	}
 	if err != nil {
 		f.journal.Abort(txn)
-		return 0, err
+		return 0, nil, err
 	}
-	return f.journal.Commit(txn)
+	seq, err := f.journal.Commit(txn)
+	return seq, payload, err
 }
 
 // freeReplacedDir frees an empty directory a rename replaced, unless it changed since the rename checked it.

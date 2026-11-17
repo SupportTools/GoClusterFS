@@ -570,6 +570,12 @@ func applyDirRename(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pa
 	return true, nil
 }
 
+// FinishRename finishes a rename this node committed that failed partway, as replay would. It reports whether the
+// new name now names the child; false means another operation took over the names since, and they must stay.
+func FinishRename(ctx context.Context, rctx *RecoveryContext, owner [16]byte, p *DirRenamePayload) (bool, error) {
+	return applyDirRename(ctx, rctx, newTxnReplay(owner), p.Serialize())
+}
+
 // renameOvertaken reports whether an inode the rename writes once under its locks is freed or more than one write past
 // the generation it logged. Another operation took the lock after the rename finished, so its names must stay.
 func renameOvertaken(rctx *RecoveryContext, p *DirRenamePayload) (bool, error) {
