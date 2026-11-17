@@ -80,10 +80,12 @@ func TestMultiNodeRestartKeepsPeerJournal(t *testing.T) {
 
 	writer = startFileWriter(nodeB, "crash")
 	writer.waitFor(t, 10)
-	if err := cluster.KillNode(1); err != nil {
+	// Stop the writer before the unmount: the dead mount fails every write, but its unmounted path is a plain directory.
+	if err := nodeB.Kill(); err != nil {
 		t.Fatalf("kill node B: %v", err)
 	}
 	crashAcked, _ := writer.stop()
+	_ = nodeB.Unmount()
 
 	assertJournalOwner(t, cluster.ImagePath, offsetB, uuidB)
 
