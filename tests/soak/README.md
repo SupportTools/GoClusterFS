@@ -2,7 +2,7 @@
 
 `goclusterfs-soak` runs a random mix of operations on a 3-VM cluster for hours or days and checks every node against a model of the expected state.
 
-- **Operations:** create, write (overwrite, append, sparse), truncate, unlink, mkdir, rmdir, rename, symlink, snapshot, clone, clone from a snapshot, and snapshot delete. Renames move a lane's files, links and directories, replace its other entries, or fail as rename(2) does: a missing source or parent, a file onto a directory or the reverse, a directory onto one with entries, or a directory into itself.
+- **Operations:** create, write (overwrite, append, sparse), truncate, unlink, mkdir, rmdir, rename, symlink, snapshot, clone, clone from a snapshot, and snapshot delete. Renames move a lane's files, links and directories, replace its other entries, or fail as rename(2) does: a missing source or parent, a file onto a directory or the reverse, a directory onto one with entries, an entry onto a directory that holds it, or a directory into itself.
 - **Lanes:** several lanes run at once, each on its own files and snapshots, in directories they share.
 - **Checks:** after every operation, each node must show its result, through a fresh open, within `-window` (30s).
   - The window covers `-attr-timeout` and `-cache-ttl`, because broadcast cannot cross the VMs' separate networks.

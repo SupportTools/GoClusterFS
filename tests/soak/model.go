@@ -416,6 +416,8 @@ func (m *Model) expectRename(src, dst string) int {
 		return 0
 	case srcDir && strings.HasPrefix(dst, src+"/"):
 		return int(syscall.EINVAL)
+	case strings.HasPrefix(src, dst+"/"):
+		return int(syscall.ENOTEMPTY)
 	case !m.exists(dst):
 		return 0
 	case srcDir && !m.Dirs[dst]:
