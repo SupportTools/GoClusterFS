@@ -1,28 +1,59 @@
-//go:build linux
-
 package fileops
 
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/supporttools/GoClusterFS/internal/api"
+	"github.com/supporttools/GoClusterFS/internal/snapshot"
 )
+
+type fakeFS struct {
+	snapshots bool
+	calls     []string
+}
+
+func (f *fakeFS) SnapshotsEnabled() bool { return f.snapshots }
+func (f *fakeFS) AllSnapshots(context.Context) ([]snapshot.Entry, error) {
+	f.calls = append(f.calls, "all")
+	return nil, nil
+}
+func (f *fakeFS) SnapshotsAt(_ context.Context, p string) ([]*snapshot.Descriptor, error) {
+	f.calls = append(f.calls, "at "+p)
+	return nil, nil
+}
+func (f *fakeFS) DeleteOrphanSnapshot(_ context.Context, name string) error {
+	f.calls = append(f.calls, "orphan "+name)
+	return nil
+}
+func (f *fakeFS) SnapshotFile(_ context.Context, p, name string) error {
+	f.calls = append(f.calls, "snapshot "+p+" "+name)
+	return nil
+}
+func (f *fakeFS) DeleteFileSnapshot(_ context.Context, p, name string) error {
+	f.calls = append(f.calls, "delete "+p+" "+name)
+	return nil
+}
+func (f *fakeFS) CloneFileSnapshot(_ context.Context, p, name, dest string) error {
+	f.calls = append(f.calls, "clonesnap "+p+" "+name+" "+dest)
+	return nil
+}
+func (f *fakeFS) CloneFile(_ context.Context, p, dest string) error {
+	f.calls = append(f.calls, "clone "+p+" "+dest)
+	return nil
+}
 
 func TestPathChecks(t *testing.T) {
 	for _, p := range []string{"", "f", "/", "/a/../b", "/a/", "//a", "/a/./b", "/a\x00b"} {
-		if _, err := relative(p); !errors.Is(err, api.ErrInvalidPath) {
-			t.Errorf("relative(%q) = %v, want ErrInvalidPath", p, err)
+		if err := checkPath(p); !errors.Is(err, api.ErrInvalidPath) {
+			t.Errorf("checkPath(%q) = %v, want ErrInvalidPath", p, err)
 		}
 	}
 	for _, p := range []string{"/f", "/dir/f", "/a b/c"} {
-		if _, err := relative(p); err != nil {
-			t.Errorf("relative(%q) = %v", p, err)
+		if err := checkPath(p); err != nil {
+			t.Errorf("checkPath(%q) = %v", p, err)
 		}
 	}
 	for _, n := range []string{"", "a:b", "a/b", "a\x00"} {
@@ -40,79 +71,59 @@ func TestPathChecks(t *testing.T) {
 	}
 }
 
-func TestOpenStaysInsideTheRoot(t *testing.T) {
-	base := t.TempDir()
-	root := filepath.Join(base, "mnt")
-	outside := filepath.Join(base, "secret")
-	for _, dir := range []string{root, filepath.Join(root, "dir"), outside} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, f := range []string{filepath.Join(root, "f"), filepath.Join(root, "dir", "g"), filepath.Join(outside, "passwd")} {
-		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Symlink(filepath.Join(outside, "passwd"), filepath.Join(root, "link")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, filepath.Join(root, "linkdir")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("f", filepath.Join(root, "inside-link")); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Mkfifo(filepath.Join(root, "fifo"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	o := New(root, nil)
-	if _, err := o.open("/f"); !errors.Is(err, api.ErrNotMounted) {
-		t.Fatalf("open on a plain directory: %v, want ErrNotMounted", err)
-	}
-	o.checkRoot = nil
-
-	for _, p := range []string{"/f", "/dir/g"} {
-		f, err := o.open(p)
+func TestOpsCallTheFSOnlyWithCheckedArguments(t *testing.T) {
+	ctx := context.Background()
+	fsys := &fakeFS{snapshots: true}
+	o := New(fsys)
+	for _, err := range []error{
+		o.CreateSnapshot(ctx, "/d/f", "s"),
+		o.DeleteSnapshot(ctx, "/d/f", "a/b:c"),
+		o.DeleteSnapshot(ctx, "", "orphan"),
+		o.CloneSnapshot(ctx, "/d/f", "s", "/c"),
+		o.CloneFile(ctx, "/d/f", "/c"),
+	} {
 		if err != nil {
-			t.Errorf("open(%q): %v", p, err)
-			continue
-		}
-		_ = f.Close()
-	}
-	for _, p := range []string{"/link", "/linkdir/passwd", "/inside-link"} {
-		if f, err := o.open(p); !errors.Is(err, api.ErrInvalidPath) {
-			if f != nil {
-				_ = f.Close()
-			}
-			t.Errorf("open(%q) = %v, want ErrInvalidPath", p, err)
+			t.Fatal(err)
 		}
 	}
-	for _, p := range []string{"/dir", "/fifo"} {
-		if err := o.CreateSnapshot(context.Background(), p, "s"); !errors.Is(err, api.ErrInvalidPath) {
-			t.Errorf("snapshot of %s: %v, want ErrInvalidPath", p, err)
+	if _, err := o.ListSnapshots(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.ListSnapshots(ctx, "/d/f"); err != nil {
+		t.Fatal(err)
+	}
+	want := "snapshot /d/f s|delete /d/f a/b:c|orphan orphan|clonesnap /d/f s /c|clone /d/f /c|all|at /d/f"
+	if got := strings.Join(fsys.calls, "|"); got != want {
+		t.Fatalf("FS calls:\n%s\nwant\n%s", got, want)
+	}
+
+	fsys.calls = nil
+	for _, err := range []error{
+		o.CreateSnapshot(ctx, "/d/../f", "s"),
+		o.CreateSnapshot(ctx, "/f", "a:b"),
+		o.DeleteSnapshot(ctx, "f", "s"),
+		o.CloneSnapshot(ctx, "/f", "s", "/d/c"),
+		o.CloneFile(ctx, "/", "/c"),
+	} {
+		if !errors.Is(err, api.ErrInvalidPath) {
+			t.Errorf("bad request: %v, want ErrInvalidPath", err)
 		}
 	}
-	if _, err := o.ListSnapshots(context.Background(), ""); !errors.Is(err, api.ErrDisabled) {
-		t.Errorf("list without a registry: %v, want ErrDisabled", err)
+	if _, err := o.ListSnapshots(ctx, "/d/"); !errors.Is(err, api.ErrInvalidPath) {
+		t.Errorf("list with a bad path: %v, want ErrInvalidPath", err)
+	}
+	if len(fsys.calls) != 0 {
+		t.Errorf("refused requests reached the FS: %v", fsys.calls)
 	}
 }
 
-func TestSameDevice(t *testing.T) {
-	dir := t.TempDir()
-	fd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		t.Fatal(err)
+func TestSnapshotsOff(t *testing.T) {
+	ctx := context.Background()
+	o := New(&fakeFS{})
+	if _, err := o.ListSnapshots(ctx, ""); !errors.Is(err, api.ErrDisabled) {
+		t.Errorf("list: %v, want ErrDisabled", err)
 	}
-	defer func() { _ = unix.Close(fd) }()
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		t.Fatal(err)
-	}
-	if err := sameDevice(fd, uint64(st.Dev)); err != nil {
-		t.Errorf("same device: %v", err)
-	}
-	if err := sameDevice(fd, uint64(st.Dev)+1); !errors.Is(err, api.ErrNotMounted) {
-		t.Errorf("other device: %v, want ErrNotMounted", err)
+	if err := o.DeleteSnapshot(ctx, "", "s"); !errors.Is(err, api.ErrDisabled) {
+		t.Errorf("orphan delete: %v, want ErrDisabled", err)
 	}
 }

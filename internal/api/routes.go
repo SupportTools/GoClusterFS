@@ -24,6 +24,12 @@ func (s *Server) registerRoutes() {
 	if s.config.Dashboard != nil {
 		s.router.Handle("/ui/", http.StripPrefix("/ui", s.config.Dashboard))
 	}
+
+	// Answers what no route matches, such as /api/v1%2F, whose escaped slash
+	// the mux does not split on, in JSON like every other API error.
+	s.router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "endpoint not found", "")
+	})
 }
 
 // handleHealth handles GET /health requests.

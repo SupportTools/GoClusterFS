@@ -1,11 +1,17 @@
 package fsck
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"maps"
 	"slices"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/dir"
+	"github.com/supporttools/GoClusterFS/internal/extent"
+	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -71,7 +77,7 @@ func (c *Checker) checkDirectories() error {
 	dirCount := 0
 	entryCount := 0
 	invalidEntries := 0
-	tree := dirTree{dotdot: map[uint32]uint32{}, parents: map[uint32][]uint32{}, subdirs: map[uint32]int{}, links: map[uint32]uint32{}}
+	tree := dirTree{dot: map[uint32]uint64{}, dotdot: map[uint32]uint32{}, parents: map[uint32][]uint32{}, subdirs: map[uint32]int{}, links: map[uint32]uint32{}}
 	totalInodes := sb.InodeTableSize / InodeSize
 
 	// Find all directory inodes and validate their entries
@@ -135,6 +141,9 @@ func (c *Checker) checkDirectories() error {
 					continue
 				}
 				seen[entry.Name] = true
+				if entry.Name == "." {
+					tree.dot[inodeNum] = entry.InodeNum
+				}
 
 				if entry.InodeNum >= totalInodes {
 					c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", inodeNum),
@@ -184,7 +193,9 @@ func (c *Checker) checkDirectories() error {
 		}
 	}
 	if len(c.namesIncomplete) == 0 {
-		c.checkDirectoryTree(tree)
+		if err := c.checkDirectoryTree(tree); err != nil {
+			return err
+		}
 	} else {
 		c.logf("  Directory tree not checked: %s\n", c.namesIncomplete[0])
 	}
@@ -304,36 +315,53 @@ func parseDirChunk(chunk []byte, base int) ([]*DirEntryData, []string) {
 	return entries, errors
 }
 
-// dirTree is what phase 6 read of every directory: its "..", the directories that name it, its subdirectories and
-// its link count.
+// dirTree is what phase 6 read of every directory: its "." and "..", the directories that name it, its
+// subdirectories and its link count.
 type dirTree struct {
+	dot     map[uint32]uint64
 	dotdot  map[uint32]uint32
 	parents map[uint32][]uint32
 	subdirs map[uint32]int
 	links   map[uint32]uint32
 }
 
-// checkDirectoryTree reports a directory that has other than one name, whose ".." does not name the directory that
-// names it, whose link count is not 2 plus its subdirectories, or from which ".." never reaches the root.
-func (c *Checker) checkDirectoryTree(t dirTree) {
+// checkDirectoryTree reports a directory that has other than one name, whose "." does not name itself, whose ".."
+// does not name the directory that names it, whose link count is not 2 plus its subdirectories, or from which ".."
+// never reaches the root. Repair points a wrong "." at the directory itself and a wrong ".." at the parent found by
+// walking the names down from the root.
+func (c *Checker) checkDirectoryTree(t dirTree) error {
 	dirs := slices.Sorted(maps.Keys(t.links))
+	parent := t.parentsFromRoot()
+	var fixes []dotFix
+	wrong := func(d uint32, name string, cur uint64, want uint32, found bool, msg string) {
+		c.addProblem(PhaseDirectories, Error, fmt.Sprintf("inode %d", d), msg, found)
+		if found {
+			fixes = append(fixes, dotFix{dir: d, name: name, cur: cur, want: want, problem: c.lastProblem()})
+		}
+	}
 	for _, d := range dirs {
 		loc := fmt.Sprintf("inode %d", d)
 		if want := 2 + uint32(t.subdirs[d]); t.links[d] != want {
 			c.addProblem(PhaseDirectories, Warning, loc, fmt.Sprintf("directory has %d links, want %d: 2 plus one per subdirectory", t.links[d], want), false)
 		}
+		if dot, ok := t.dot[d]; !ok {
+			c.addProblem(PhaseDirectories, Error, loc, "directory has no \".\"", false)
+		} else if dot != uint64(d) {
+			wrong(d, ".", dot, d, true, fmt.Sprintf("\".\" names inode %d, not directory %d itself", dot, d))
+		}
 		dots, hasDots := t.dotdot[d]
+		p, reached := parent[d]
 		switch ps := t.parents[d]; {
 		case d == InodeRoot:
 			if dots != InodeRoot {
-				c.addProblem(PhaseDirectories, Error, loc, fmt.Sprintf("\"..\" of the root names inode %d, not the root", dots), false)
+				wrong(d, "..", uint64(dots), InodeRoot, hasDots, fmt.Sprintf("\"..\" of the root names inode %d, not the root", dots))
 			}
 		case len(ps) > 1:
 			c.addProblem(PhaseDirectories, Error, loc, fmt.Sprintf("directory has %d names, in directories %v; a directory has exactly one", len(ps), ps), false)
 		case len(ps) == 1 && !hasDots:
 			c.addProblem(PhaseDirectories, Error, loc, "directory has no \"..\"", false)
 		case len(ps) == 1 && dots != ps[0]:
-			c.addProblem(PhaseDirectories, Error, loc, fmt.Sprintf("\"..\" names inode %d, but directory %d names it", dots, ps[0]), false)
+			wrong(d, "..", uint64(dots), p, reached, fmt.Sprintf("\"..\" names inode %d, but directory %d names it", dots, ps[0]))
 		}
 	}
 
@@ -359,4 +387,71 @@ func (c *Checker) checkDirectoryTree(t dirTree) {
 			reaches[p], cut[p] = reaches[cur], !reaches[cur]
 		}
 	}
+	if c.opts.Mode != Repair || len(fixes) == 0 {
+		return nil
+	}
+	return c.repairDots(fixes)
+}
+
+// parentsFromRoot walks the names down from the root and returns, for each directory it reaches, the directory that
+// names it. It does not go through a directory with more than one name.
+func (t dirTree) parentsFromRoot() map[uint32]uint32 {
+	children := map[uint32][]uint32{}
+	for d, ps := range t.parents {
+		if len(ps) == 1 {
+			children[ps[0]] = append(children[ps[0]], d)
+		}
+	}
+	parent := map[uint32]uint32{}
+	for queue := []uint32{InodeRoot}; len(queue) > 0; queue = queue[1:] {
+		for _, d := range children[queue[0]] {
+			if _, seen := parent[d]; !seen && d != InodeRoot {
+				parent[d] = queue[0]
+				queue = append(queue, d)
+			}
+		}
+	}
+	return parent
+}
+
+type dotFix struct {
+	dir     uint32
+	name    string
+	cur     uint64
+	want    uint32
+	problem int
+}
+
+// repairDots points each wrong "." or ".." at want, if it still names the inode phase 6 read.
+func (c *Checker) repairDots(fixes []dotFix) error {
+	if err := c.beforeWrites(); err != nil {
+		return err
+	}
+	if c.opts.DryRun {
+		for _, f := range fixes {
+			c.markRepaired(f.problem)
+		}
+		return nil
+	}
+	sb := c.sbData
+	var uuid [16]byte
+	tbl := inode.NewTable(c.dev, sb.InodeTableOffset, sb.InodeTableSize, nil, uuid)
+	mgr := extent.NewManager(c.dev, bitmap.NewRegion(c.dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, uuid), nil, sb.DataRegionOffset)
+	mgr.SetRefcounts(refcount.NewRegion(c.dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, nil))
+	tbl.SetTreeFlusher(mgr)
+	dirs := dir.NewManager(c.dev, tbl, mgr, nil, sb.DataRegionOffset)
+	for _, f := range fixes {
+		ino, err := tbl.Read(f.dir)
+		if err != nil {
+			return fmt.Errorf("directory %d: %w", f.dir, err)
+		}
+		pointed, err := dirs.PointIf(context.Background(), ino, f.name, uint64(f.want), dir.DT_DIR, func(cur uint64) bool { return cur == f.cur })
+		if err != nil {
+			return fmt.Errorf("directory %d %q: %w", f.dir, f.name, err)
+		}
+		if pointed {
+			c.markRepaired(f.problem)
+		}
+	}
+	return c.dev.Sync()
 }
