@@ -20,6 +20,7 @@ func (s *Server) MetricsHandler() http.Handler {
 	// Register the filesystem collector
 	collector := newFSCollector(s)
 	registry.MustRegister(collector)
+	registry.MustRegister(s.apiRequests)
 
 	// Also register standard process and Go metrics if desired
 	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -119,6 +120,14 @@ type fsCollector struct {
 	clusterSizeDesc         *prometheus.Desc
 	clusterHealthyNodesDesc *prometheus.Desc
 	clusterIsLeaderDesc     *prometheus.Desc
+	clusterNodesDesc        *prometheus.Desc
+
+	lockFailuresDesc        *prometheus.Desc
+	nodeHeartbeatAgeDesc    *prometheus.Desc
+	peerReplaysDesc         *prometheus.Desc
+	peerReplaysRunningDesc  *prometheus.Desc
+	mountReplayedTxnsDesc   *prometheus.Desc
+	mountDiscardedJournDesc *prometheus.Desc
 
 	fsSizeBytesDesc *prometheus.Desc
 	fsFreeBytesDesc *prometheus.Desc
@@ -496,6 +505,41 @@ func newFSCollector(s *Server) *fsCollector {
 			"Whether this node is the cluster leader (1) or not (0)",
 			nil, nil,
 		),
+		clusterNodesDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "cluster", "nodes"),
+			"Registered nodes, this one included, by registry state: active, leaving, stale or dead",
+			[]string{"state"}, nil,
+		),
+		lockFailuresDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "lock", "failures_total"),
+			"Lock acquires that gave up with an error, such as a timeout or a failed node whose replay lease lapsed, by lock type",
+			[]string{"type"}, nil,
+		),
+		nodeHeartbeatAgeDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "node", "heartbeat_age_seconds"),
+			"How long ago this node's last heartbeat reached its registry slot; past 5 seconds the node stops",
+			nil, nil,
+		),
+		peerReplaysDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "journal", "peer_replays_total"),
+			"Journals of crashed nodes this node replayed, by result: ok, or failed and left for a retry",
+			[]string{"result"}, nil,
+		),
+		peerReplaysRunningDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "journal", "peer_replays_running"),
+			"Crashed nodes' journals this node is replaying now",
+			nil, nil,
+		),
+		mountReplayedTxnsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "journal", "mount_replayed_transactions"),
+			"Committed transactions this node replayed from its slot's journal when it mounted",
+			nil, nil,
+		),
+		mountDiscardedJournDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "journal", "mount_discarded"),
+			"1 if this node discarded its slot's journal at mount with -skip-recovery",
+			nil, nil,
+		),
 
 		fsSizeBytesDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "fs", "size_bytes"),
@@ -594,6 +638,13 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.clusterSizeDesc
 	ch <- c.clusterHealthyNodesDesc
 	ch <- c.clusterIsLeaderDesc
+	ch <- c.clusterNodesDesc
+	ch <- c.lockFailuresDesc
+	ch <- c.nodeHeartbeatAgeDesc
+	ch <- c.peerReplaysDesc
+	ch <- c.peerReplaysRunningDesc
+	ch <- c.mountReplayedTxnsDesc
+	ch <- c.mountDiscardedJournDesc
 
 	ch <- c.fsSizeBytesDesc
 	ch <- c.fsFreeBytesDesc
@@ -637,7 +688,11 @@ func (c *fsCollector) Collect(ch chan<- prometheus.Metric) {
 	if lock := provider.LockStats(); lock != nil {
 		c.collectLockStats(ch, lock)
 	}
-	if all := provider.AllStats(); all != nil && all.Reserve != nil {
+	all := provider.AllStats()
+	if all != nil && all.Node != nil {
+		c.collectNodeStats(ch, all.Node)
+	}
+	if all != nil && all.Reserve != nil {
 		r := all.Reserve
 		ch <- prometheus.MustNewConstMetric(c.reserveBlocksDesc, prometheus.GaugeValue, float64(r.Blocks))
 		ch <- prometheus.MustNewConstMetric(c.reserveRefillsDesc, prometheus.CounterValue, float64(r.Refills))
@@ -741,7 +796,21 @@ func (c *fsCollector) collectLockStats(ch chan<- prometheus.Metric, stats *LockS
 		ch <- prometheus.MustNewConstMetric(c.lockAcquiresDesc, prometheus.CounterValue, float64(t.Acquires), t.Type)
 		ch <- prometheus.MustNewConstMetric(c.lockBlockedDesc, prometheus.CounterValue, float64(t.Blocked), t.Type)
 		ch <- prometheus.MustNewConstMetric(c.lockWaitSecondsDesc, prometheus.CounterValue, t.WaitSeconds, t.Type)
+		ch <- prometheus.MustNewConstMetric(c.lockFailuresDesc, prometheus.CounterValue, float64(t.Failed), t.Type)
 	}
+}
+
+func (c *fsCollector) collectNodeStats(ch chan<- prometheus.Metric, n *NodeStatsResponse) {
+	ch <- prometheus.MustNewConstMetric(c.nodeHeartbeatAgeDesc, prometheus.GaugeValue, n.HeartbeatAgeSeconds)
+	ch <- prometheus.MustNewConstMetric(c.peerReplaysDesc, prometheus.CounterValue, float64(n.PeerReplays), "ok")
+	ch <- prometheus.MustNewConstMetric(c.peerReplaysDesc, prometheus.CounterValue, float64(n.PeerReplayFailures), "failed")
+	ch <- prometheus.MustNewConstMetric(c.peerReplaysRunningDesc, prometheus.GaugeValue, float64(len(n.ReplayingSlots)))
+	ch <- prometheus.MustNewConstMetric(c.mountReplayedTxnsDesc, prometheus.GaugeValue, float64(n.MountReplayedTransactions))
+	discarded := 0.0
+	if n.MountDiscardedJournal {
+		discarded = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.mountDiscardedJournDesc, prometheus.GaugeValue, discarded)
 }
 
 func (c *fsCollector) collectSFBStats(ch chan<- prometheus.Metric, stats *SFBStatsResponse) {
@@ -765,4 +834,15 @@ func (c *fsCollector) collectClusterStats(ch chan<- prometheus.Metric, stats *Cl
 		isLeader = 1.0
 	}
 	ch <- prometheus.MustNewConstMetric(c.clusterIsLeaderDesc, prometheus.GaugeValue, isLeader)
+
+	states := map[string]int{"active": 0, "leaving": 0, "stale": 0, "dead": 0}
+	if stats.State != "" && stats.State != "unknown" {
+		states[stats.State]++
+	}
+	for _, p := range stats.Peers {
+		states[p.State]++
+	}
+	for state, n := range states {
+		ch <- prometheus.MustNewConstMetric(c.clusterNodesDesc, prometheus.GaugeValue, float64(n), state)
+	}
 }

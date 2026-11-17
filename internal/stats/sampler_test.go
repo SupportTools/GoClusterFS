@@ -1,6 +1,7 @@
 package stats
 
 import (
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -45,6 +46,9 @@ type fakeNodes struct{ calls atomic.Int64 }
 
 func (f *fakeNodes) LocalUUID() [16]byte { return [16]byte{0xab} }
 func (f *fakeNodes) LocalSlot() int      { return 0 }
+func (f *fakeNodes) Stats() node.Stats {
+	return node.Stats{HeartbeatAge: 1500 * time.Millisecond, Replays: 2, ReplayFailures: 1, Replaying: []int{5}}
+}
 func (f *fakeNodes) Slots() ([]*node.Slot, error) {
 	f.calls.Add(1)
 	return []*node.Slot{activeSlot("local", time.Now())}, nil
@@ -254,5 +258,19 @@ func TestSamplerRefreshesInBackgroundUntilStopped(t *testing.T) {
 	}
 	if s.CacheStats().InodeCache.Hits != 42 {
 		t.Error("the last snapshot should stay readable after Stop")
+	}
+}
+
+func TestSamplerReportsNodeLiveness(t *testing.T) {
+	s := startSampler(Sources{Nodes: &fakeNodes{}, MountReplay: MountReplay{Transactions: 4, Discarded: true}}, time.Hour, time.Hour)
+	defer s.Stop()
+	n := s.AllStats().Node
+	if n == nil {
+		t.Fatal("AllStats has no node section")
+	}
+	want := api.NodeStatsResponse{HeartbeatAgeSeconds: 1.5, PeerReplays: 2, PeerReplayFailures: 1, ReplayingSlots: []int{5},
+		MountReplayedTransactions: 4, MountDiscardedJournal: true}
+	if fmt.Sprint(*n) != fmt.Sprint(want) {
+		t.Errorf("node section = %+v, want %+v", *n, want)
 	}
 }

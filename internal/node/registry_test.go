@@ -1116,6 +1116,37 @@ func TestSlotLossMessages(t *testing.T) {
 	}
 }
 
+func TestStatsCountReplaysAndHeartbeatAge(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if st := reg.Stats(); st.HeartbeatAge != 0 || st.Replays != 0 {
+		t.Fatalf("before registering: %+v, want zeros", st)
+	}
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	inReplay := make(chan []int, 1)
+	ok := func(*FailedNodeInfo) error { inReplay <- reg.Stats().Replaying; return nil }
+	failing := func(*FailedNodeInfo) error { return errors.New("bad record") }
+	if err := reg.replay(ok, 7, &FailedNodeInfo{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-inReplay; fmt.Sprint(got) != "[7]" {
+		t.Errorf("during the replay of slot 7, Replaying = %v", got)
+	}
+	if err := reg.replay(failing, 7, &FailedNodeInfo{}); err == nil {
+		t.Fatal("a failing replay returned nil")
+	}
+	st := reg.Stats()
+	if st.Replays != 1 || st.ReplayFailures != 1 || len(st.Replaying) != 0 {
+		t.Errorf("after one replay and one failure: %+v", st)
+	}
+	if st.HeartbeatAge <= 0 || st.HeartbeatAge > HeartbeatTimeout {
+		t.Errorf("heartbeat age right after registering = %v", st.HeartbeatAge)
+	}
+}
+
 func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
