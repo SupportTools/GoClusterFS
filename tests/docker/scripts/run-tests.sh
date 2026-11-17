@@ -930,6 +930,89 @@ test_rename_file() {
     return 0
 }
 
+# Waits up to 5 s for a shell check, run in the mount on a node, to pass: a node may show old names for -attr-timeout.
+settle_on_node() {
+    local node=$1 check=$2 i
+    for i in $(seq 1 25); do
+        exec_on_node "$node" sh -c "cd /mnt/goclusterfs && $check" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    log "ERROR: on $node, still false after 5 s: $check"
+    return 1
+}
+
+# Test: two nodes rename at once: onto one name, a rename racing an unlink of its source or a create of its target,
+# and crossing directory moves. Based on the Go TestMultiNodeRenamesOntoOneName, TestMultiNodeRenameRacesUnlinkOfItsSource,
+# TestMultiNodeRenameRacesCreateOfItsTarget and TestMultiNodeCrossMovesCannotFormALoop.
+test_multinode_rename() {
+    log "Testing renames from two nodes at once..."
+    if [[ ${#NODE_ARRAY[@]} -lt 2 ]]; then
+        log "SKIP: Need at least 2 nodes for the multi-node rename test"
+        return 0
+    fi
+    local n1="${NODE_ARRAY[0]}" n2="${NODE_ARRAY[1]}" m=/mnt/goclusterfs i p1 p2 r1 r2 got want
+    for i in 1 2 3 4 5; do
+        exec_on_node "$n1" sh -c "printf a$i > $m/rn_a$i" && exec_on_node "$n2" sh -c "printf b$i > $m/rn_b$i" || return 1
+        exec_on_node "$n1" mv "$m/rn_a$i" "$m/rn_t$i" & p1=$!
+        exec_on_node "$n2" mv "$m/rn_b$i" "$m/rn_t$i" & p2=$!
+        wait $p1; r1=$?; wait $p2; r2=$?
+        if [[ $r1 -ne 0 || $r2 -ne 0 ]]; then
+            log "ERROR: round $i: renames onto one name exited $r1 and $r2, want both 0"
+            return 1
+        fi
+        settle_on_node "$n1" "test ! -e rn_a$i && test ! -e rn_b$i" || return 1
+        got=$(exec_on_node "$n1" cat "$m/rn_t$i")
+        if [[ "$got" != "a$i" && "$got" != "b$i" ]]; then
+            log "ERROR: round $i: rn_t$i holds '$got', want a$i or b$i"
+            return 1
+        fi
+        settle_on_node "$n2" "test ! -e rn_a$i && test ! -e rn_b$i && test \"\$(cat rn_t$i)\" = $got" || return 1
+
+        exec_on_node "$n1" sh -c "printf s$i > $m/rn_s$i" || return 1
+        settle_on_node "$n2" "test \"\$(cat rn_s$i)\" = s$i" || return 1
+        exec_on_node "$n1" mv "$m/rn_s$i" "$m/rn_d$i" 2>/dev/null & p1=$!
+        exec_on_node "$n2" rm "$m/rn_s$i" 2>/dev/null & p2=$!
+        wait $p1; r1=$?; wait $p2; r2=$?
+        if [[ $r1 -eq 0 && $r2 -ne 0 ]]; then
+            want="test ! -e rn_s$i && test \"\$(cat rn_d$i)\" = s$i"
+        elif [[ $r2 -eq 0 && $r1 -ne 0 ]]; then
+            want="test ! -e rn_s$i && test ! -e rn_d$i"
+        else
+            log "ERROR: round $i: rename and unlink of one name exited $r1 and $r2, want exactly one 0"
+            return 1
+        fi
+        settle_on_node "$n1" "$want" && settle_on_node "$n2" "$want" || return 1
+
+        exec_on_node "$n1" sh -c "printf m$i > $m/rn_m$i" || return 1
+        exec_on_node "$n1" mv "$m/rn_m$i" "$m/rn_c$i" & p1=$!
+        exec_on_node "$n2" sh -c "set -C; printf c$i > $m/rn_c$i" 2>/dev/null & p2=$!
+        wait $p1; r1=$?; wait $p2
+        if [[ $r1 -ne 0 ]]; then
+            log "ERROR: round $i: a rename racing a create of its target exited $r1, want 0"
+            return 1
+        fi
+        want="test ! -e rn_m$i && test \"\$(cat rn_c$i)\" = m$i"
+        settle_on_node "$n1" "$want" && settle_on_node "$n2" "$want" || return 1
+
+        exec_on_node "$n1" mkdir "$m/rn_x$i" "$m/rn_y$i" || return 1
+        settle_on_node "$n2" "test -d rn_x$i && test -d rn_y$i" || return 1
+        exec_on_node "$n1" mv "$m/rn_x$i" "$m/rn_y$i/x" 2>/dev/null & p1=$!
+        exec_on_node "$n2" mv "$m/rn_y$i" "$m/rn_x$i/y" 2>/dev/null & p2=$!
+        wait $p1; r1=$?; wait $p2; r2=$?
+        if [[ $r1 -eq 0 && $r2 -ne 0 ]]; then
+            want="test -d rn_y$i/x && test ! -e rn_x$i"
+        elif [[ $r2 -eq 0 && $r1 -ne 0 ]]; then
+            want="test -d rn_x$i/y && test ! -e rn_y$i"
+        else
+            log "ERROR: round $i: crossing directory moves exited $r1 and $r2, want exactly one 0"
+            return 1
+        fi
+        settle_on_node "$n1" "$want" && settle_on_node "$n2" "$want" || return 1
+    done
+    log "Multi-node rename test passed"
+    return 0
+}
+
 # Test: Single-node stress test
 # Rapidly creates, reads, verifies, and deletes files to stress test the filesystem
 test_stress_single_node() {
@@ -3466,6 +3549,7 @@ run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 run_test "Snapshot During Writes" test_snapshot_during_writes
 run_test "Concurrent Directory Ops" test_concurrent_directory_ops
+run_test "Multi-Node Rename" test_multinode_rename
 
 if [ "$SKIP_CONCURRENT_TESTS" = "true" ]; then
     log "SKIPPING: Concurrent Writes (known race conditions - set SKIP_CONCURRENT_TESTS=false to enable)"

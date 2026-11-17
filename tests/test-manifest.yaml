@@ -1821,6 +1821,42 @@ scenarios:
     environments:
       go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameOverAnEmptyDirectory
 
+  - id: multinode-rename-onto-one-name
+    name: Two nodes rename onto one name at once
+    description: Each node renames its own file onto one new name. Without RENAME_NOREPLACE both succeed and the name ends with one of the files on both nodes; with it exactly one succeeds and the other gets EEXIST. fsck is clean afterwards (Docker and VM run the plain rename)
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeRenamesOntoOneName
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
+  - id: multinode-rename-races-unlink
+    name: A rename races an unlink of its source on another node
+    description: Exactly one of the rename and the unlink succeeds and the other gets ENOENT; both nodes then agree on the names
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeRenameRacesUnlinkOfItsSource
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
+  - id: multinode-rename-races-create
+    name: A rename races a create of its target on another node
+    description: A plain rename always ends as the target, replacing the new file if the create came first; with RENAME_NOREPLACE exactly one of the rename and the O_EXCL create succeeds (Docker and VM run the plain rename)
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeRenameRacesCreateOfItsTarget
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
+  - id: multinode-rename-cross-moves
+    name: Crossing directory moves on two nodes cannot form a loop
+    description: One node moves x into y while another moves y into x; exactly one succeeds and the other gets EINVAL or ENOENT, and fsck finds no loop
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeCrossMovesCannotFormALoop
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
   - id: mkdir-power-failure
     name: Power failure during mkdir
     description: Power fails at each write; the root counts a link for the new directory exactly when it names it, and fsck finds only leaks
