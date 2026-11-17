@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1218,6 +1219,31 @@ func writeLocalSlotAt(t *testing.T, reg *Registry, idx int, pid int, heartbeat t
 		t.Fatal(err)
 	}
 	return slot
+}
+
+func TestReleaseSlotKeepsOrphans(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	orphans := []Orphan{{Inode: 12, Birth: 3}, {Inode: 40, Birth: 9}}
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5}, HeartbeatTime: time.Now().Add(-time.Hour).Unix(), Orphans: orphans}
+	if err := reg.writeSlot(2, gone); err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := reg.readSlotRaw(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released, err := reg.ReleaseSlot(2, raw, func() error { return nil }); !released || err != nil {
+		t.Fatalf("ReleaseSlot = %v, %v", released, err)
+	}
+	slot, err := reg.readSlot(2)
+	if err != nil || slot.State != NodeStateEmpty || !slices.Equal(slot.Orphans, orphans) {
+		t.Fatalf("released slot: %+v, %v; want empty with orphans %v", slot, err, orphans)
+	}
+	if all, err := reg.AllOrphans(); err != nil || !slices.Equal(all, orphans) {
+		t.Errorf("AllOrphans after the release = %v, %v; want %v, so live nodes still free them", all, err, orphans)
+	}
 }
 
 func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
