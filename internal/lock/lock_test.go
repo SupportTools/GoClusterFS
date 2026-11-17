@@ -467,13 +467,31 @@ func TestStatsCountAcquiresThatGiveUp(t *testing.T) {
 			t.Fatalf("Acquire of a held lock: %v, want ErrLockTimeout", err)
 		}
 	}
+	holder := NewOwner()
+	if err := mgr1.AcquireAs(context.Background(), holder, LockTypeFileIO, 0, LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := mgr1.ReleaseAs(holder, LockTypeFileIO, 0); err != nil {
+			t.Error(err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := mgr2.AcquireAs(ctx, NewOwner(), LockTypeFileIO, 0, LockModeShared); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("AcquireAs of a held file I/O lock: %v, want ErrLockTimeout", err)
+	}
+
+	want := map[string]uint64{"bitmap": 2, "file_io": 1}
 	for _, ts := range mgr2.Stats().Types {
-		if ts.Name == "bitmap" {
-			if ts.Failed != 2 || ts.Acquires != 0 {
-				t.Errorf("node 2 bitmap stats = %+v, want 2 failed and no acquires", ts)
+		if failed, ok := want[ts.Name]; ok {
+			if ts.Failed != failed || ts.Acquires != 0 {
+				t.Errorf("node 2 %s stats = %+v, want %d failed and no acquires", ts.Name, ts, failed)
 			}
-			return
+			delete(want, ts.Name)
 		}
 	}
-	t.Error("node 2 reports no bitmap stats after two failed acquires")
+	for name := range want {
+		t.Errorf("node 2 reports no %s stats after failed acquires", name)
+	}
 }

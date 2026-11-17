@@ -361,7 +361,8 @@ func TestSequentialWriteWritesDataOnce(t *testing.T) {
 }
 
 // A write below the end of the file plans no gap, then a peer truncates before the write sets its size. The write must
-// not grow the file back over the truncated bytes without zeroing them.
+// not grow the file back over the truncated bytes without zeroing them. Setattr would wait for the write's file I/O
+// lock, so the truncate skips it, as a journal replay of a crashed node's truncate does on the node replaying it.
 func TestWriteAfterPeerTruncateShowsNoOldBytes(t *testing.T) {
 	path := newFormattedImage(t)
 	nodeA, nodeB := openFormattedFS(t, path), openFormattedFS(t, path)
@@ -378,7 +379,7 @@ func TestWriteAfterPeerTruncateShowsNoOldBytes(t *testing.T) {
 				defer close(truncated)
 				in := &fuse.SetAttrIn{}
 				in.Valid, in.Size = fuse.FATTR_SIZE, 100
-				if errno := b.Setattr(ctx, nil, in, &fuse.AttrOut{}); errno != 0 {
+				if errno := b.setattrIOLocked(ctx, nil, in, &fuse.AttrOut{}); errno != 0 {
 					t.Errorf("peer truncate: %v", errno)
 				}
 			}()

@@ -97,7 +97,7 @@ sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ./gfsctl version
 ```
 
-`make build` reports version `dev`. Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives, with the version set and the dashboard included, on the GitHub Releases page. Run the same version on every node: builds from before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) refuse volumes formatted by later builds with `unknown required flags 0x10`, and later builds refuse theirs.
+`make build` reports version `dev`. Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives, with the version set and the dashboard included, on the GitHub Releases page. Run the same version on every node: builds from before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) refuse volumes formatted by later builds with `unknown required flags 0x10`, builds from before file I/O locks with `0x40`, and later builds refuse their volumes. Mount also refuses to join while a live node runs a build that uses lock records differently, and names that node.
 
 ---
 

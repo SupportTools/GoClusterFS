@@ -138,7 +138,7 @@ func TestDeserializeBufferTooSmall(t *testing.T) {
 func TestCanMountCurrentVersion(t *testing.T) {
 	sb := &Superblock{
 		Version:       CurrentVersion,
-		RequiredFlags: RequiredJournal | RequiredTypedLockRecords,
+		RequiredFlags: RequiredJournal | RequiredLockLayout,
 	}
 
 	if err := sb.CanMount(); err != nil {
@@ -150,7 +150,7 @@ func TestCanMountOlderVersion(t *testing.T) {
 	// Test that we accept older versions within range
 	sb := &Superblock{
 		Version:       MinSupportedVersion,
-		RequiredFlags: RequiredTypedLockRecords,
+		RequiredFlags: RequiredLockLayout,
 	}
 
 	if err := sb.CanMount(); err != nil {
@@ -203,7 +203,7 @@ func TestCanMountWithOptionalFeatures(t *testing.T) {
 	sb := &Superblock{
 		Version:       CurrentVersion,
 		FeatureFlags:  0xFFFFFFFF, // All optional flags set
-		RequiredFlags: RequiredJournal | RequiredTypedLockRecords,
+		RequiredFlags: RequiredJournal | RequiredLockLayout,
 	}
 
 	if err := sb.CanMount(); err != nil {
@@ -215,6 +215,14 @@ func TestCanMountRefusesHashedLockRecords(t *testing.T) {
 	sb := &Superblock{Version: CurrentVersion, RequiredFlags: RequiredJournal}
 	if err := sb.CanMount(); !errors.Is(err, ErrUnsupportedLayout) || !strings.Contains(err.Error(), "reformat with -format") {
 		t.Errorf("CanMount of a volume without per-type lock records: err = %v, want ErrUnsupportedLayout saying to reformat", err)
+	}
+}
+
+func TestCanMountRefusesLockRecordsWithoutFileIOLocks(t *testing.T) {
+	sb := &Superblock{Version: CurrentVersion, RequiredFlags: RequiredJournal | RequiredTypedLockRecords}
+	err := sb.CanMount()
+	if !errors.Is(err, ErrUnsupportedLayout) || !strings.Contains(err.Error(), "file I/O locks") || !strings.Contains(err.Error(), "reformat with -format") {
+		t.Errorf("CanMount of a volume formatted before file I/O locks: err = %v, want ErrUnsupportedLayout naming file I/O locks and saying to reformat", err)
 	}
 }
 

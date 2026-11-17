@@ -83,6 +83,7 @@ TestMultiNodeInodeReuseStaleRead 1.3
 TestMultiNodeJournalRecovery 0.0
 TestMultiNodeMixedSizeWrites 2.1
 TestMultiNodeOverlappingBlockWrites 2.1
+TestMultiNodeReadsNeverSeePartOfAWrite 9.0
 TestMultiNodeRecoveryIdempotency 0.0
 TestMultiNodeRecoveryWithLargeFile 0.0
 TestMultiNodeRecoveryWithMultipleFiles 0.0

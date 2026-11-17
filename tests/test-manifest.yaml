@@ -2036,7 +2036,7 @@ scenarios:
 
   - id: lock-stats-count-give-ups
     name: Lock stats count acquires that give up
-    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire
+    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire; a file I/O AcquireAs that times out counts too
     priority: go_only
     environments:
       go: internal/lock/lock_test.go::TestStatsCountAcquiresThatGiveUp
@@ -3007,12 +3007,19 @@ scenarios:
     environments:
       go: internal/superblock/superblock_test.go::TestCanMountRefusesHashedLockRecords
 
-  - id: fsck-refuses-hashed-lock-records
-    name: fsck refuses volumes without per-type lock records
-    description: fsck phase 1 reports a missing RequiredTypedLockRecords flag as fatal, with advice to reformat
+  - id: mount-refuses-lock-records-without-file-io
+    name: Mount refuses volumes formatted before file I/O locks
+    description: A superblock without RequiredFileIOLocks fails CanMount with advice to reformat, since its lock records belong to other types
     priority: go_only
     environments:
-      go: internal/fsck/fsck_test.go::TestFsckRefusesHashedLockRecords
+      go: internal/superblock/superblock_test.go::TestCanMountRefusesLockRecordsWithoutFileIOLocks
+
+  - id: fsck-refuses-hashed-lock-records
+    name: fsck refuses volumes with an older lock record layout
+    description: fsck phase 1 reports a missing RequiredTypedLockRecords or RequiredFileIOLocks flag as fatal, with advice to reformat
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckRefusesOlderLockRecordLayouts
 
   - id: create-stuck-inode-lock-eio
     name: Create fails with EIO when the new inode's lock is never freed
@@ -5334,7 +5341,7 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/orphans_test.go::TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose
-  # ===========================================================================
+  # ====================================================================
   # SYMLINKS
   # Inline targets of up to 92 bytes live in the inode's extent area; longer
   # ones, up to 4095 bytes, in one data block.
@@ -5467,3 +5474,97 @@ scenarios:
     environments:
       go: internal/goclusterfs/symlink_test.go::TestStaleLinkNodeAfterSlotReuse
 
+=======
+
+  - id: lock-writer-gets-file-io-from-readers
+    name: A writer gets a file I/O lock that readers on lower slots keep taking
+    description: Four lower-slot nodes keep taking a file I/O lock shared; a higher-slot node asking for it exclusive gets it each time before the acquire timeout, because readers wait behind its waiting mark
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestWriterGetsRecordWhileReadersOnLowerSlotsKeepReading
+
+  - id: lock-reader-gets-file-io-from-writer
+    name: A reader gets a file I/O lock a writer keeps taking
+    description: Readers wait behind writers only for two turns, so a reader in a lower or higher slot than a node that keeps writing gets the lock each time before the acquire timeout
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestReaderGetsRecordWhileWriterKeepsWriting
+
+  - id: lock-file-io-ranks-first
+    name: The file I/O lock ranks before every other lock type
+    description: A goroutine holding a file I/O lock takes locks of every other type; one holding any other lock is refused a file I/O lock with ErrDeadlockRisk
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestFileIOLockRanksBeforeEveryOtherType
+
+  - id: lock-held-since
+    name: HeldSince moves only when another node could have written
+    description: HeldSince stays the same while a node keeps its cached hold and moves forward after another node held the record exclusive
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestHeldSinceMovesOnlyWhenAnotherNodeCouldHaveWritten
+
+  - id: register-refuses-other-lock-layout
+    name: Register refuses to join while a live node has another lock layout
+    description: A node whose build maps locks to records differently does not register while a node with another lock layout heartbeats; the error names that node and slot
+    priority: go_only
+    environments:
+      go: internal/node/lock_layout_test.go::TestRegisterRefusesWhileALiveNodeHasAnotherLockLayout
+
+  - id: register-joins-past-silent-other-lock-layout
+    name: Register joins past a silent node with another lock layout
+    description: A slot with another lock layout whose heartbeat stays unchanged for the watch does not stop Register
+    priority: go_only
+    environments:
+      go: internal/node/lock_layout_test.go::TestRegisterJoinsPastASilentNodeWithAnotherLockLayout
+
+  - id: read-never-sees-part-of-peer-write
+    name: A read never sees part of another node's write
+    description: Node B reads two blocks while node A's two-block write has written its first block; B's read waits and returns all old or all new data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/atomic_read_test.go::TestReadNeverSeesPartOfAnotherNodesWrite
+
+  - id: read-never-sees-part-of-peer-truncate
+    name: A read never sees part of another node's truncate
+    description: Node B reads while node A's truncate has zeroed the tail of the last block but not changed the size; B's read returns the old file or the truncated one
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/atomic_read_test.go::TestReadNeverSeesPartOfAnotherNodesTruncate
+
+  - id: read-sees-peer-write-past-cached-inode
+    name: A read sees another node's write that grew an inode this node cached
+    description: Node B reads a file, node A writes past its end, and B's next read returns A's data, because the first read after B claims the file I/O lock from disk reads the inode again
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/atomic_read_test.go::TestReadSeesAnotherNodesWriteThatGrewACachedInode
+
+  - id: reads-never-see-part-of-a-write
+    name: Whole-file reads never mix two writes from another node
+    description: One node keeps overwriting a 1 MB file with one 1 MB write of a single value at a time while every node reads it whole with O_DIRECT (and, in Go, also on mounts with -direct-io); no read returns parts of two writes
+    priority: critical
+    environments:
+      go: atomic_read_test.go::TestMultiNodeReadsNeverSeePartOfAWrite
+      docker: run-tests.sh::test_reads_never_see_part_of_a_write
+      vm: run-vm-tests.sh::test_reads_never_see_part_of_a_write
+
+  - id: lock-holder-keeps-unwanted-record
+    name: A holder keeps a record no other node waits for
+    description: A node that keeps taking a lock past its turn starts a new turn instead of yielding when the record shows no other node's claim or mark, so none of its acquires wait
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestHolderKeepsRecordNobodyWaitsFor
+
+  - id: lock-contested-claim-kept-briefly
+    name: A contested holder keeps a new claim briefly
+    description: A node that has seen another node waiting for a whole turn keeps each new claim for minTurn, so an acquire right after a release joins it instead of yielding
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestContestedHolderKeepsItsNewClaimBriefly
+
+  - id: lock-read-claim-waits-two-turns-for-writer
+    name: A read claim waits two turns behind a write mark
+    description: With a live node's mark for a write claim in the row, a read claim does not get the lock within one turn and gets it only after two turns
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestReadClaimWaitsTwoTurnsBehindALiveWriteMark

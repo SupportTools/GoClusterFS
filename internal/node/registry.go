@@ -90,6 +90,7 @@ type Slot struct {
 	RecoveryStart int64     // Dead slots: when that replay last renewed its lease (Unix s)
 	PIDNamespace  uint64    // Inode of the mount process's PID namespace
 	Orphans       []Orphan  // Files this node unlinked that some node may still have open
+	LockLayout    uint32    // How the node's build maps locks to lock records; 0 before builds recorded it
 	Checksum      uint32    // CRC32C of bytes 0-4091
 }
 
@@ -99,9 +100,12 @@ type Orphan struct {
 	Birth uint32
 }
 
-const MaxOrphans = (SlotSize - 4 - orphansOffset - 4) / 8
+const MaxOrphans = (lockLayoutOffset - orphansOffset - 4) / 8
 
-const orphansOffset = 188
+const (
+	orphansOffset    = 188
+	lockLayoutOffset = SlotSize - 8
+)
 
 // Registry manages node registration and heartbeats.
 type Registry struct {
@@ -121,6 +125,7 @@ type Registry struct {
 	hostname   string
 	bootID     [16]byte
 	pidNS      uint64
+	lockLayout uint32
 	onSlotLost func(SlotLoss)
 
 	onOwnerDead   func(owner [16]byte, slot int) (done func(replayed bool))
@@ -163,6 +168,7 @@ var (
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
 	ErrOrphansFull        = errors.New("this node's registry slot has no room for another orphan")
+	ErrLockLayout         = errors.New("a live node maps locks to lock records differently from this build")
 	// ErrReplayContended marks a replay that failed waiting on other nodes, such as for a lock; it never counts toward a backoff.
 	ErrReplayContended = errors.New("the replay waited too long on other nodes")
 )
@@ -327,6 +333,9 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	var name [64]byte
 	copy(name[:], hostname)
 	r.hostname = string(bytes.TrimRight(name[:], "\x00"))
+	if err := r.checkLockLayouts(); err != nil {
+		return -1, err
+	}
 
 	empty := func(slot *Slot) bool { return slot.State == NodeStateEmpty }
 	ownFailed := func(slot *Slot) bool {
@@ -371,6 +380,48 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 		err = ErrNoFreeSlots
 	}
 	return i, err
+}
+
+// SetLockLayout sets the lock record layout Register writes in this node's
+// slot. Register refuses to join while a live node's slot holds another one.
+func (r *Registry) SetLockLayout(id uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lockLayout = id
+}
+
+// checkLockLayouts returns ErrLockLayout naming a node whose slot holds another
+// lock layout, unless its heartbeat stays unchanged for silentSlotWatch: two
+// such nodes would not exclude each other. Called with r.mu held.
+func (r *Registry) checkLockLayouts() error {
+	slots, err := r.readAllSlots()
+	if err != nil {
+		return err
+	}
+	differs := func(s *Slot) bool {
+		return s != nil && (s.State == NodeStateActive || s.State == NodeStateLeaving) && s.LockLayout != r.lockLayout &&
+			(!r.sameHost(s) || !r.deadLocalOwner(s))
+	}
+	var other []int
+	for i, s := range slots {
+		if differs(s) {
+			other = append(other, i)
+		}
+	}
+	if len(other) == 0 {
+		return nil
+	}
+	silent := map[int]bool{}
+	for _, w := range r.awaitSilentSlots(other, silentSlotWatch) {
+		silent[w.slot] = true
+	}
+	for _, i := range other {
+		if _, s, err := r.readSlotRaw(i); err == nil && !silent[i] && differs(s) {
+			return fmt.Errorf("%w: node %s in slot %d (%x) has lock layout %08x, this build %08x",
+				ErrLockLayout, s.Host(), i, s.UUID[:8], s.LockLayout, r.lockLayout)
+		}
+	}
+	return nil
 }
 
 // PreferSlot makes Register try slot first: it takes it if it is empty, or if
@@ -746,6 +797,7 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		PID:           uint32(os.Getpid()),
 		ProcStart:     processStart,
 		PIDNamespace:  r.pidNS,
+		LockLayout:    r.lockLayout,
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
@@ -950,6 +1002,7 @@ func serializeSlot(slot *Slot) []byte {
 		binary.LittleEndian.PutUint32(buf[at:], o.Inode)
 		binary.LittleEndian.PutUint32(buf[at+4:], o.Birth)
 	}
+	binary.LittleEndian.PutUint32(buf[lockLayoutOffset:], slot.LockLayout)
 
 	// Compute checksum
 	checksum := storage.CRC32C(buf[:SlotSize-4])
@@ -988,6 +1041,7 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 		ProcStart:     int64(binary.LittleEndian.Uint64(buf[148:156])),
 		RecoveryStart: int64(binary.LittleEndian.Uint64(buf[172:180])),
 		PIDNamespace:  binary.LittleEndian.Uint64(buf[180:188]),
+		LockLayout:    binary.LittleEndian.Uint32(buf[lockLayoutOffset:]),
 		Checksum:      stored,
 	}
 	copy(slot.UUID[:], buf[8:24])

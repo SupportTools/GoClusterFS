@@ -45,11 +45,16 @@ const (
 	RequiredTypedLockRecords uint64 = 1 << 4
 	// RequiredSymlinks means symlink inodes may keep their target in the inode's extent area.
 	RequiredSymlinks uint64 = 1 << 5
+	// RequiredFileIOLocks means reads and writes take file I/O locks, which have lock records of their own; builds without it give those records to other types.
+	RequiredFileIOLocks uint64 = 1 << 6
+
+	// RequiredLockLayout is the lock record layout of this build.
+	RequiredLockLayout = RequiredTypedLockRecords | RequiredFileIOLocks
 )
 
 // FlagsWeSupport defines which required flags this version understands.
 // Update this as new features are implemented.
-var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredTypedLockRecords | RequiredSymlinks
+var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks
 
 // Errors
 var (
@@ -137,6 +142,11 @@ func CheckRequiredFlags(flags uint64) error {
 	}
 	if flags&RequiredTypedLockRecords == 0 {
 		return fmt.Errorf("%w: the volume was formatted before each lock type had its own lock records, so its nodes "+
+			"would not exclude this version's. Copy the data off with the version that formatted it, then reformat with -format",
+			ErrUnsupportedLayout)
+	}
+	if flags&RequiredFileIOLocks == 0 {
+		return fmt.Errorf("%w: the volume was formatted before reads and writes took file I/O locks, so its nodes "+
 			"would not exclude this version's. Copy the data off with the version that formatted it, then reformat with -format",
 			ErrUnsupportedLayout)
 	}
