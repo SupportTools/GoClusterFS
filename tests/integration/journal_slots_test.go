@@ -165,6 +165,69 @@ func TestNodeRestartReplaysOwnJournalAtMount(t *testing.T) {
 	verifyFiles(t, node, names)
 }
 
+// TestJournalOffStillHonorsTheSlotsJournal restarts a crashed node with -journal=false, which must still replay the
+// slot's journal; with -skip-recovery naming the slot, -journal=false must really reset a damaged journal.
+func TestJournalOffStillHonorsTheSlotsJournal(t *testing.T) {
+	cluster := NewMultiNodeCluster(t, 1, 50)
+	node := cluster.Node(0)
+	before := &syncBuffer{}
+	node.Log = before
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start: %v", err)
+	}
+	uuid := mustMatch(t, registeredRe, before, "registration")
+	slot := mustMatch(t, slotRe, before, "registration")
+	offset := mustMatch(t, journalInitRe, before, "journal init")
+	var names []string
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("before-crash-%d", i)
+		if err := node.WriteFile(name, []byte(name)); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	if err := cluster.KillNode(0); err != nil {
+		t.Fatalf("kill: %v", err)
+	}
+
+	off := &syncBuffer{}
+	node.Log = off
+	node.ExtraArgs = []string{"-journal=false"}
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("restart with -journal=false: %v", err)
+	}
+	if got := mustMatch(t, selfRecoveryRe, off, "journal replay at mount with -journal=false"); got != uuid {
+		t.Errorf("-journal=false replayed the journal of node %s, want the crashed node %s", got, uuid)
+	}
+	verifyFiles(t, node, names)
+	if err := cluster.StopNode(0); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	damageJournalHeader(t, cluster.ImagePath, offset)
+	node.ExtraArgs = []string{"-journal=false", "-skip-recovery=" + slot}
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount with -journal=false -skip-recovery=%s: %v", slot, err)
+	}
+	if err := cluster.StopNode(0); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if header := readImageSector(t, cluster.ImagePath, offset); !bytes.Equal(header, make([]byte, len(header))) {
+		t.Fatalf("-journal=false -skip-recovery=%s left slot %s's damaged journal header in place", slot, slot)
+	}
+
+	node.ExtraArgs = nil
+	journaled := &syncBuffer{}
+	node.Log = journaled
+	if err := cluster.StartNode(0, false); err != nil {
+		t.Fatalf("mount with the journal on after the reset: %v", err)
+	}
+	if got := mustMatch(t, journalInitRe, journaled, "journal init"); got != offset {
+		t.Errorf("the journal started at offset %s, want slot %s's offset %s", got, slot, offset)
+	}
+	verifyFiles(t, node, names)
+}
+
 // TestMountRefusesDamagedJournal damages the header of a node's journal slot.
 // Mount must fail and name the slot instead of starting a new journal over
 // it, and -skip-recovery must mount and start a new journal.

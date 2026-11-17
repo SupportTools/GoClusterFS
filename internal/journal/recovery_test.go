@@ -2,10 +2,12 @@ package journal
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"testing"
 
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -486,4 +488,30 @@ func damageJournalHeader(t *testing.T, dev *storage.Device, offset int64, damage
 		t.Fatalf("write journal header: %v", err)
 	}
 	return bytes.Clone(header)
+}
+
+func TestRecoveryRefusesUnusableJournalState(t *testing.T) {
+	for _, state := range []JournalState{JournalStateCorrupt, JournalState(9)} {
+		t.Run(state.String(), func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, DefaultJournalSlotSize)
+			defer cleanup()
+			if _, err := InitRegion(dev, 0, DefaultJournalSlotSize, [16]byte{1}, 1); err != nil {
+				t.Fatalf("InitRegion failed: %v", err)
+			}
+			marked := damageJournalHeader(t, dev, 0, func(h []byte) {
+				binary.LittleEndian.PutUint32(h[40:44], uint32(state))
+				binary.LittleEndian.PutUint32(h[JournalSuperblockSize-4:], storage.CRC32C(h[:JournalSuperblockSize-4]))
+			})
+			if _, err := ScanAndRecover(dev, 0, DefaultJournalSlotSize, func(*RecoveredTxn) error { return nil }, nil); !errors.Is(err, ErrJournalCorrupt) {
+				t.Errorf("ScanAndRecover = %v, want ErrJournalCorrupt", err)
+			}
+			info := &node.FailedNodeInfo{JournalOffset: 0, JournalSize: DefaultJournalSlotSize}
+			if _, err := ReplayJournal(context.Background(), &RecoveryContext{Dev: dev}, info); !errors.Is(err, ErrJournalCorrupt) {
+				t.Errorf("ReplayJournal = %v, want ErrJournalCorrupt", err)
+			}
+			if !bytes.Equal(readJournalHeader(t, dev, 0), marked) {
+				t.Error("recovery rewrote a journal it refused")
+			}
+		})
+	}
 }

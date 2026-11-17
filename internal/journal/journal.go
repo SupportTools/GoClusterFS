@@ -754,7 +754,9 @@ func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handle
 		return nil, fmt.Errorf("journal at offset %d: %w", regionOffset, err)
 	}
 
-	// Check if recovery is needed
+	if err := region.Superblock().checkState(); err != nil {
+		return nil, fmt.Errorf("journal at offset %d: %w", regionOffset, err)
+	}
 	if !region.NeedsRecovery() {
 		return nil, nil // Journal is clean, nothing to do
 	}
