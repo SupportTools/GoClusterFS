@@ -2249,6 +2249,13 @@ scenarios:
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlot
 
+  - id: skip-recovery-online-refusal
+    name: -skip-recovery refuses to drop committed transactions while nodes run
+    description: skipRecoveryLoss names the running node and the committed transactions when the named slot's journal holds some or cannot be read while another node heartbeats, and allows the discard once no other node runs or the journal holds nothing committed
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/recovery_test.go::TestSkipRecoveryRefusesLossWhileNodesRun
+
   - id: fsck-release-slot-online
     name: fsck slot release while other nodes run
     description: While another node heartbeats, release watches the slot unchanged on its own clock (longer for a slot under a recovery lease) and refuses if it changes, refuses a journal with committed transactions, one it cannot read or one in an unusable state, never replays, and frees a slot whose journal holds nothing committed; the released node's CheckOwnership then fails
