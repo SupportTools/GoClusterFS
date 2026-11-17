@@ -2258,7 +2258,7 @@ scenarios:
 
   - id: fsck-release-slot-online
     name: fsck slot release while other nodes run
-    description: While another node heartbeats, release watches the slot unchanged on its own clock (longer for a slot under a recovery lease) and refuses if it changes, refuses a journal with committed transactions, one it cannot read or one in an unusable state, never replays, and frees a slot whose journal holds nothing committed; the released node's CheckOwnership then fails
+    description: While another node heartbeats, release watches the slot unchanged on its own clock (longer for a slot under a recovery lease) and refuses if it changes, refuses a journal with committed transactions, one it cannot read or one in an unusable state, never replays, and frees a slot whose journal holds nothing committed; the released node's CheckOwnership then fails, and the release clears the slot's lock claims, so after another node registers in the slot a peer takes the released node's lock at once
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlotOnline
