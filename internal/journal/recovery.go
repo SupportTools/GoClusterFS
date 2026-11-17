@@ -494,12 +494,9 @@ func DryRunRecover(region *Region) ([]*RecoveredTxn, *RecoveryStats, error) {
 		return nil
 	}
 
-	// Don't mark as recovering for dry run
-	if err := scanJournal(region, handler, stats, nil, nil, false); err != nil {
-		return nil, stats, err
-	}
-
-	return txns, stats, nil
+	// On an error, txns holds the transactions read before it.
+	err := scanJournal(region, handler, stats, nil, nil, false)
+	return txns, stats, err
 }
 
 // ReservedUnused returns the blocks that reserve records whose intents have not
