@@ -62,6 +62,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `-cache-inodes`, `-cache-extents`, `-cache-negative` and `-broadcast-max-peers` set the cache and broadcast table sizes, and `/metrics` reports each limit next to its size.
 - A node that hears no broadcasts from a node the registry shows mounted, for 3 `-broadcast-heartbeat` intervals (90 seconds by default), logs a warning naming it, reports `broadcast-peers` as degraded on `/health`, and counts it in `goclusterfs_broadcast_silent_peers`. A network that silently drops multicast was invisible before.
 - Rename of files and directories, in one directory or between two, with `RENAME_NOREPLACE`. A rename over a file or an empty directory replaces it; a file another node has open stays readable there until its last close. `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
+- `goclusterfs-fsck` checks the directory tree: a directory with more than one name, a `..` that does not name the directory that names it, a directory link count other than 2 plus its subdirectories, and a `..` chain that never reaches the root. Repair reports these but does not change directories.
 - `-preflight` warns when a broadcast port or the API port is in the NodePort range 30000-32767 on a host that looks like a Kubernetes node.
 
 ### Changed
@@ -85,6 +86,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A power failure during mkdir or rmdir could leave the parent directory's link count off by one: the entry and the count were written under separate locks, and replay did not fix the count. Both now change in one write of the parent's inode, and replay sets the parent's count from its subdirectories.
 - `goclusterfs-fsck` checked a directory entry's type only when the entry's inode number was below the count of inodes in use, and then only that the type was a valid value. It now reports every entry whose type differs from its inode's, which lookup, unlink and rmdir trust: an unlink could remove a directory that its entry calls a file. It also reports an entry whose inode number is past the inode table; before, a number past 2^32 wrapped and could pass as an inode in use.
 - `goclusterfs-fsck` never checked a snapshot's parent: the check was an empty block. It now warns about a snapshot whose parent snapshot does not exist, is the snapshot itself, or was taken of another file. Deleting a snapshot hands its children to its parent.
 - A file node that outlived its file, such as an O_PATH descriptor or a name another node had just removed, could open, read, write and truncate the next file to take its inode slot. It now fails with ESTALE.

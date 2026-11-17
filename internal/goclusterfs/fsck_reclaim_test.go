@@ -582,6 +582,9 @@ func TestFsckRepairReclaimsInterruptedSubdirectoryUnlink(t *testing.T) {
 	if err := fsys.dirMgr.Add(ctx, root, "sub", uint64(sub.inodeNum), dir.DT_DIR); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := fsys.updateInode(ctx, inode.InodeRoot, func(r *inode.Inode) error { r.LinkCount++; return nil }); err != nil {
+		t.Fatal(err)
+	}
 	victim := newRegularFile(t, fsys)
 	if _, err := fsys.updateInode(ctx, victim.inodeNum, func(ino *inode.Inode) error {
 		ino.LinkCount = 1
