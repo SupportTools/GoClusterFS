@@ -97,6 +97,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- On slow storage, a node in a low registry slot that kept using a lock shut out nodes in higher slots: after each turn it waited a fixed 50 ms and claimed the lock again before their slower claims finished, and a lower slot wins a tie. Readers on other nodes got one read in a test window while one node wrote. A node now leaves the lock alone after its turn until the waiting nodes have taken it, for at most one turn.
 - `goclusterfs-fsck -release-slot` left the released node's lock claims in place. A node that later registered in that slot made them count as its own until its mount finished its own journal replay, so peers waited on those lock records meanwhile. The release now clears them.
 - A mount with `-journal=false` skipped replaying the journal its registry slot held from a crash, so a later mount with the journal on replayed those old transactions over newer writes; with `-skip-recovery` it logged that it discarded the journal but left it in place. It now replays the slot's journal whatever `-journal` says, and `-skip-recovery` resets it.
 - A journal header whose state was corrupt or a value this build does not know counted as clean, so a mount would start a new journal over it and peers would skip it. Replay now refuses it with `journal is corrupt`.

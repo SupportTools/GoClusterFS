@@ -142,7 +142,11 @@ func (m *Manager) readRow(recordID uint64) ([]byte, error) {
 	buf := storage.GetBuffer(RowSize)
 	defer storage.PutBuffer(buf)
 	m.rowReads.Add(1)
-	if _, err := m.dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, 0)); err != nil {
+	read := m.dev.ReadAtUnsharded
+	if m.rowRead != nil {
+		read = m.rowRead
+	}
+	if _, err := read(buf.Bytes(), m.slotOffset(recordID, 0)); err != nil {
 		return nil, err
 	}
 	return append([]byte(nil), buf.Bytes()...), nil
