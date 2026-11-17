@@ -1578,6 +1578,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: fsck-online-release
+    name: fsck releases a slot online only when nothing committed is lost
+    description: With node B mounted, -release-slot frees paused node A's slot after watching it unchanged, B then writes A's file, and A, resumed, stops at its write gate without its write landing; with committed transactions in a dead node's journal, -release-slot with -salvage or -discard-journal and a mount with -skip-recovery all refuse while B runs and name the steps to stop the cluster and run -repair
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against real mounts.
+    environments:
+      go: fsck_test.go::TestFsckOnlineRelease
+      docker: TODO
+      vm: TODO
+
   - id: fsck-release-dead-slot
     name: fsck releases a dead node's slot
     description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot refuses to act without -salvage or -discard-journal, prints what it discards without writing, -discard-journal -report FILE frees the slot and writes the discarded journal to FILE, and a mount then uses it
@@ -2238,6 +2248,27 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: fsck-release-slot-online
+    name: fsck slot release while other nodes run
+    description: While another node heartbeats, release watches the slot unchanged on its own clock (longer for a slot under a recovery lease) and refuses if it changes, refuses a journal with committed transactions, one it cannot read or one in an unusable state, never replays, and frees a slot whose journal holds nothing committed; the released node's CheckOwnership then fails
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotOnline
+
+  - id: journal-pending-committed
+    name: Count the committed transactions a journal reset would drop
+    description: PendingCommitted is 0 for a journal never initialized, a clean one, or one whose only transaction is uncommitted, counts committed transactions, and errors on a damaged header, an unusable state or a record it cannot read
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestPendingCommitted
+
+  - id: registry-running-slots
+    name: Registry reports which slots change during a watch
+    description: RunningSlots lists the slots whose bytes change while it watches, such as a heartbeating node's, and not a stopped node's or an empty slot
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRunningSlots
 
   - id: fsck-release-slot-salvage
     name: fsck slot release salvages a journal's good transactions
