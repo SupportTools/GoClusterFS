@@ -12,9 +12,11 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -533,4 +535,126 @@ func TestFailedCreateThenCrashKeepsNamesApart(t *testing.T) {
 	for n := 0; n < total; n++ {
 		t.Run(fmt.Sprintf("eio_at_%d", n), func(t *testing.T) { run(t, n) })
 	}
+}
+
+// A write that fails a rename with EIO while a peer waits to change the old parent: the rename finishes under its
+// locks before the peer gets them, so the file keeps exactly one name.
+func TestFailedRenameFinishesBeforeAPeerChangesTheOldParent(t *testing.T) {
+	t.Parallel()
+	run := func(t *testing.T, n int) int {
+		nodeA, path, _, _ := journaledFS(t)
+		withBridge(nodeA)
+		nodeB := openFormattedFS(t, path)
+		p1, p2 := newSubdir(t, nodeA, "p1"), newSubdir(t, nodeA, "p2")
+		a, b := fileIn(t, nodeA, p1.inodeNum, "a").inodeNum, fileIn(t, nodeA, p2.inodeNum, "b").inodeNum
+		peer := newRegularFile(t, nodeB)
+		if _, err := nodeB.updateInode(context.Background(), peer.inodeNum, func(ino *inode.Inode) error { ino.LinkCount = 1; return nil }); err != nil {
+			t.Fatal(err)
+		}
+		p1Ino := readInode(t, nodeB, p1.inodeNum)
+		added := make(chan error, 1)
+		var count atomic.Int64
+		nodeA.dev.SetWriteGate(func(int64) error {
+			if count.Add(1)-1 != int64(n) {
+				return nil
+			}
+			go func() {
+				added <- nodeB.dirMgr.Add(context.Background(), p1Ino, "peer", uint64(peer.inodeNum), dir.DT_REG)
+			}()
+			time.Sleep(50 * time.Millisecond)
+			return syscall.EIO
+		})
+		_ = p1.Rename(context.Background(), "a", p2, "b", 0)
+		writes := int(count.Load())
+		nodeA.dev.SetWriteGate(func(int64) error { return nil })
+		if n >= 0 {
+			if err := <-added; err != nil {
+				t.Fatalf("peer add: %v", err)
+			}
+		}
+		if !expectOneName(t, nodeA, p1.inodeNum, "a", p2.inodeNum, "b", a) {
+			if got := named(t, nodeA, p2.inodeNum, "b"); got != b {
+				t.Errorf("the rename did not happen, but b names inode %d, not %d", got, b)
+			}
+		}
+		if n >= 0 && named(t, nodeA, p1.inodeNum, "peer") != peer.inodeNum {
+			t.Error("the peer's file is missing from the old parent")
+		}
+		expectDirLinks(t, nodeA, p1.inodeNum)
+		expectDirLinks(t, nodeA, p2.inodeNum)
+		expectOnlyLeaks(t, nodeA)
+		return writes
+	}
+	total := run(t, -1)
+	for n := 0; n < total; n++ {
+		t.Run(fmt.Sprintf("eio_at_%d", n), func(t *testing.T) { run(t, n) })
+	}
+}
+
+// When every write fails from a rename's old-name removal on, the rename cannot finish. It stops the node with its
+// locks held, so a peer waiting for the old parent stays blocked until replay finishes the rename.
+func TestStuckRenameKeepsItsLocksUntilReplay(t *testing.T) {
+	t.Parallel()
+	nodeA, path, offset, size := journaledFS(t)
+	withBridge(nodeA)
+	nodeB := openFormattedFS(t, path)
+	p1, p2 := newSubdir(t, nodeA, "p1"), newSubdir(t, nodeA, "p2")
+	a := fileIn(t, nodeA, p1.inodeNum, "a").inodeNum
+	peer := newRegularFile(t, nodeB)
+	if _, err := nodeB.updateInode(context.Background(), peer.inodeNum, func(ino *inode.Inode) error { ino.LinkCount = 1; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	blocks, err := nodeA.extentMgr.DataBlocks(readInode(t, nodeA, p1.inodeNum))
+	if err != nil || len(blocks) != 1 {
+		t.Fatalf("old parent's blocks: %v, %v", blocks, err)
+	}
+	oldChunks := int64(nodeA.dataOffset + blocks[0]*BlockSize)
+
+	stuck := make(chan error, 1)
+	nodeA.SetFailStop(func(err error) {
+		stuck <- err
+		select {}
+	})
+	var dead atomic.Bool
+	nodeA.dev.SetWriteGate(func(off int64) error {
+		if off >= oldChunks && off < oldChunks+BlockSize {
+			dead.Store(true)
+		}
+		if dead.Load() {
+			return errPowerCut
+		}
+		return nil
+	})
+	go func() { _ = p1.Rename(context.Background(), "a", p2, "b", 0) }()
+	select {
+	case err := <-stuck:
+		t.Logf("stopped: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the rename neither finished nor stopped the node")
+	}
+
+	added := make(chan error, 1)
+	go func() {
+		added <- nodeB.dirMgr.Add(context.Background(), readInode(t, nodeB, p1.inodeNum), "peer", uint64(peer.inodeNum), dir.DT_REG)
+	}()
+	select {
+	case err := <-added:
+		t.Fatalf("the peer changed the old parent of a half-done rename (%v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	nodeA.snapshotWkr.Stop()
+	replayed := remountAndReplay(t, path, offset, size)
+	select {
+	case err := <-added:
+		if err != nil {
+			t.Fatalf("peer add after replay: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the peer still waits after replay")
+	}
+	expectOneName(t, replayed, p1.inodeNum, "a", p2.inodeNum, "b", a)
+	expectDirLinks(t, replayed, p1.inodeNum)
+	expectDirLinks(t, replayed, p2.inodeNum)
+	expectOnlyLeaks(t, replayed)
 }

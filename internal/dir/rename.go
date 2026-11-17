@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
 	"time"
 
@@ -32,6 +33,9 @@ type RenameOp struct {
 	TargetIsDir          bool
 	NoReplace            bool
 	Commit               func(*Renamed) error // runs under every lock before anything changes; an error changes nothing
+	// Stuck runs under every lock when writes failed after Commit and finishing them failed too. It should stop the
+	// node, so replay finishes the rename before anyone else can change its directories.
+	Stuck func(error)
 }
 
 // Renamed is what a rename changes, read under its locks before the change.
@@ -103,7 +107,119 @@ func (m *Manager) renameLocked(ctx context.Context, op *RenameOp) (*Renamed, err
 	if err := op.Commit(p.r); err != nil {
 		return nil, err
 	}
-	return p.r, m.applyRename(op, p)
+	planned := map[uint32]uint64{p.r.OldParent.InodeNum: p.r.OldParent.MetaGeneration, p.r.NewParent.InodeNum: p.r.NewParent.MetaGeneration}
+	failed := m.applyRename(op, p)
+	if failed == nil {
+		return p.r, nil
+	}
+	for attempt := 0; attempt < finishAttempts; attempt++ {
+		err := m.finishLocked(op, p, planned)
+		if err == nil {
+			log.Printf("[WARN] rename %q to %q: a write failed (%v); finished the rename", op.OldName, op.NewName, failed)
+			return p.r, nil
+		}
+		log.Printf("[WARN] rename %q to %q: a write failed (%v), and finishing it failed: %v", op.OldName, op.NewName, failed, err)
+		failed = err
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	if op.Stuck != nil {
+		op.Stuck(fmt.Errorf("rename %q to %q is half done: %w", op.OldName, op.NewName, failed))
+	}
+	return nil, failed
+}
+
+// finishAttempts is how often a rename whose writes failed partway tries to finish before its node stops.
+const finishAttempts = 3
+
+// finishLocked completes a rename whose writes failed partway, under the locks it still holds, so no one else sees
+// or changes the half-done names. It reads each directory again and redoes what did not land. Each parent's inode
+// write landed if its generation moved past planned, the generation the rename read under its locks.
+func (m *Manager) finishLocked(op *RenameOp, p *renamePlan, planned map[uint32]uint64) error {
+	r := p.r
+	links := map[uint32]int{}
+	if r.MovesDir {
+		links[r.OldParent.InodeNum]--
+		links[r.NewParent.InodeNum]++
+	}
+	if r.Target != nil && op.TargetIsDir {
+		links[r.NewParent.InodeNum]--
+	}
+	now := time.Now().UnixNano()
+	fresh := map[uint32]*inode.Inode{}
+	for num, gen := range planned {
+		d, err := m.liveDirLocked(num)
+		if err != nil {
+			return err
+		}
+		if d.MetaGeneration == gen {
+			d.LinkCount = uint32(int(d.LinkCount) + links[num])
+			d.Mtime, d.Ctime = now, now
+			if err := m.inodeTbl.WriteWithLockHeld(d); err != nil {
+				m.indexes.drop(num)
+				return fmt.Errorf("failed to write directory inode %d: %w", num, err)
+			}
+		}
+		fresh[num] = d
+	}
+	r.OldParent, r.NewParent = fresh[r.OldParent.InodeNum], fresh[r.NewParent.InodeNum]
+
+	if r.MovesDir {
+		child, err := m.liveDirLocked(uint32(op.Child))
+		if err != nil {
+			return err
+		}
+		x, err := m.indexOf(child)
+		if err != nil {
+			return err
+		}
+		dots, found, _ := x.find(child.MetaGeneration, "..")
+		if !found {
+			return fmt.Errorf("%w: directory %d has no \"..\"", ErrCorrupted, child.InodeNum)
+		}
+		if dots.child != uint64(op.NewParent) {
+			if _, err := m.editChunk(child, x, dots.chunk,
+				func(chunk []byte) bool { return pointName(chunk, "..", uint64(op.NewParent), DT_DIR) },
+				func(names map[string]slot) {
+					names[".."] = slot{child: uint64(op.NewParent), chunk: dots.chunk, ftype: DT_DIR}
+				}, nil); err != nil {
+				return err
+			}
+		}
+		r.Child = child
+	}
+
+	newX, err := m.indexOf(r.NewParent)
+	if err != nil {
+		return err
+	}
+	if s, found, _ := newX.find(r.NewParent.MetaGeneration, op.NewName); !found || s.child != op.Child {
+		named := slot{child: op.Child, chunk: p.at, ftype: r.ChildType}
+		place := func(chunk []byte) bool {
+			entry := &DirEntry{InodeNum: op.Child, NameLen: uint8(len(op.NewName)), FileType: r.ChildType, Name: op.NewName}
+			entry.RecLen = entrySize(entry)
+			return addToChunk(chunk, entry)
+		}
+		if found {
+			named.chunk = s.chunk
+			place = func(chunk []byte) bool { return pointName(chunk, op.NewName, op.Child, r.ChildType) }
+		}
+		if placed, err := m.rewriteChunk(r.NewParent, newX, named.chunk, place, func(names map[string]slot) { names[op.NewName] = named }); err != nil || !placed {
+			return cmp.Or(err, fmt.Errorf("%w: chunk %d of directory %d no longer takes %q", ErrCorrupted, named.chunk, r.NewParent.InodeNum, op.NewName))
+		}
+	}
+
+	oldX, err := m.indexOf(r.OldParent)
+	if err != nil {
+		return err
+	}
+	if s, found, _ := oldX.find(r.OldParent.MetaGeneration, op.OldName); found && s.child == op.Child {
+		if removed, err := m.rewriteChunk(r.OldParent, oldX, s.chunk,
+			func(chunk []byte) bool { return removeFromChunk(chunk, op.OldName) },
+			func(names map[string]slot) { delete(names, op.OldName) }); err != nil || !removed {
+			return cmp.Or(err, fmt.Errorf("%w: %q is in the index of directory %d but not in its chunk", ErrCorrupted, op.OldName, r.OldParent.InodeNum))
+		}
+	}
+	return nil
 }
 
 // renamePlan is what checkRename found under the locks: where each name is, and the chunk with room for NewName.

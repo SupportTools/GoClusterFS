@@ -143,6 +143,7 @@ type FS struct {
 	// Configuration
 	nodeUUID   [16]byte
 	dataOffset uint64 // Offset where data blocks start on disk
+	failStop   func(error)
 
 	// Runtime state
 	uid uint32
@@ -316,6 +317,11 @@ func (f *FS) SetReserve(r *reserve.Manager) {
 	if f.journal != nil {
 		f.reserve = r
 	}
+}
+
+// SetFailStop sets what stops this node when an operation cannot finish and must not let go of its locks.
+func (f *FS) SetFailStop(fn func(error)) {
+	f.failStop = fn
 }
 
 // Close closes the filesystem and releases resources.

@@ -1863,6 +1863,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedDirectoryMoveWriteLeavesOneName
 
+  - id: rename-eio-peer-waits
+    name: A rename that fails partway finishes before a peer changes its old parent
+    description: Each write of a rename between directories fails with EIO in turn while another node waits to add a file to the old parent; the rename finishes under its locks first, so the file has exactly one name, the peer's file is there and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRenameFinishesBeforeAPeerChangesTheOldParent
+
+  - id: rename-stuck-keeps-locks
+    name: A rename that cannot finish stops its node with its locks held
+    description: Every write fails from the old-name removal on; the rename stops the node without releasing its locks, a peer waiting for the old parent stays blocked, and replay then leaves exactly one name
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestStuckRenameKeepsItsLocksUntilReplay
+
   - id: failed-commit-not-replayed
     name: A failed journal commit is not replayed onto a reused inode
     description: Each write of one create fails with EIO in turn, a second create may reuse its inode slot, and the node crashes; after replay the two names never share an inode
