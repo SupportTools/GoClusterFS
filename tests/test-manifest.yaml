@@ -1508,7 +1508,7 @@ scenarios:
 
   - id: fsck-release-dead-slot
     name: fsck releases a dead node's slot
-    description: -release-slot exits 8 while the node is mounted; after the node dies with a damaged journal header, -list-slots shows the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
     environments:
