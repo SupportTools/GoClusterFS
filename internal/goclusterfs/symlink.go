@@ -171,14 +171,14 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		afterCommit("symlink: inode claimed")
 	}
 
-	if err := f.dirMgr.Add(ctx, dirIno, name, uint64(inodeNum), dir.DT_LNK); err != nil {
+	if err := f.dirMgr.AddAndUpdate(ctx, dirIno, name, uint64(inodeNum), dir.DT_LNK, func(p *inode.Inode) { p.Mtime = now }); err != nil {
 		logging.Debugf("Symlink %q: dirMgr.Add failed: %v", name, err)
 		f.freeNewInode(ctx, childIno.InodeNum)
 		return nil, nameErrno(err)
 	}
 	giveBack = nil
 	f.cacheInode(childIno)
-	f.touchParent(ctx, parentNum, 0, now)
+	f.announceDir(parentNum)
 	fillEntryOut(out, childIno)
 	return f.linkNode(ctx, parent, childIno, out), 0
 }
