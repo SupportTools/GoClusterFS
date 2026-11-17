@@ -48,28 +48,29 @@ func (f *FS) link(ctx context.Context, parent *fs.Inode, parentNum uint32, targe
 	}
 	var node *fs.Inode
 	errno := retryRace("Link", name, func() (errno syscall.Errno) {
-		node, errno = f.linkOnce(ctx, parent, parentNum, file.inodeNum, name, out)
+		node, errno = f.linkOnce(ctx, parent, parentNum, file, name, out)
 		return errno
 	})
 	return node, errno
 }
 
-func (f *FS) linkOnce(ctx context.Context, parent *fs.Inode, parentNum, num uint32, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	ino, errno := f.addLink(ctx, parentNum, num, name)
+func (f *FS) linkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32, file *File, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	ino, errno := f.addLink(ctx, parentNum, file, name)
 	if errno != 0 {
 		return nil, errno
 	}
 	ch := parent.NewPersistentInode(ctx, newFile(f, ino), fs.StableAttr{
 		Mode: fuse.S_IFREG,
-		Ino:  uint64(num),
+		Ino:  uint64(file.inodeNum),
 		Gen:  ino.BirthGeneration,
 	})
 	fillEntryOut(out, ino)
 	return ch, 0
 }
 
-// addLink gives inode num one more link and the name in directory parentNum, and returns the inode as written.
-func (f *FS) addLink(ctx context.Context, parentNum, num uint32, name string) (*inode.Inode, syscall.Errno) {
+// addLink gives file one more link and the name in directory parentNum, and returns its inode as written.
+func (f *FS) addLink(ctx context.Context, parentNum uint32, file *File, name string) (*inode.Inode, syscall.Errno) {
+	num := file.inodeNum
 	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
 		return nil, syscall.EIO
@@ -82,7 +83,7 @@ func (f *FS) addLink(ctx context.Context, parentNum, num uint32, name string) (*
 
 	// The count goes up before the name appears: a crash in between leaves an extra link, never a name for a freed file.
 	now := time.Now().UnixNano()
-	ino, seq, errno := f.countLink(ctx, num, parentNum, name, now)
+	ino, seq, errno := f.countLink(ctx, file, parentNum, name, now)
 	if seq != 0 {
 		defer f.closeIntent(seq)
 	}
@@ -105,18 +106,18 @@ func (f *FS) addLink(ctx context.Context, parentNum, num uint32, name string) (*
 	return ino, 0
 }
 
-// countLink logs the link and adds it to inode num's count, and returns the journal seq to close. It holds the inode's
+// countLink logs the link and adds it to file's count, and returns the journal seq to close. It holds the inode's
 // lock from reading the generation to the increment, so replay can take generation+1 by this node as the increment.
-func (f *FS) countLink(ctx context.Context, num, parentNum uint32, name string, now int64) (*inode.Inode, uint64, syscall.Errno) {
+// A slot that another file took since the kernel looked the source up is ENOENT, so the link never names that file.
+func (f *FS) countLink(ctx context.Context, file *File, parentNum uint32, name string, now int64) (*inode.Inode, uint64, syscall.Errno) {
+	num := file.inodeNum
 	defer f.lockInode(num)()
 	ino, err := f.inodeTbl.Read(num)
 	switch {
 	case err != nil:
 		return nil, 0, syscall.EIO
-	case ino.Magic != inode.InodeMagic || ino.LinkCount == 0:
+	case !file.current(ino) || ino.LinkCount == 0:
 		return nil, 0, syscall.ENOENT
-	case !ino.IsFile():
-		return nil, 0, syscall.EPERM
 	case ino.LinkCount >= maxLinks:
 		return nil, 0, syscall.EMLINK
 	}
@@ -133,7 +134,7 @@ func (f *FS) countLink(ctx context.Context, num, parentNum uint32, name string, 
 
 	ino, err = f.updateUnderInodeLock(ctx, num, func(cur *inode.Inode) error {
 		switch {
-		case cur.Magic != inode.InodeMagic || cur.LinkCount == 0:
+		case !file.current(cur) || cur.LinkCount == 0:
 			return errLinkGone
 		case cur.MetaGeneration != logged:
 			return errLinkChanged

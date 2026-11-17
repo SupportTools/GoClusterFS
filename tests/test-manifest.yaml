@@ -157,6 +157,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/hardlink_test.go::TestLinkReplayAfterSameNodeWrite
 
+  - id: hard-link-reused-slot
+    name: A link refuses a source whose slot another file took
+    description: A peer frees the source and a new file takes its inode slot before the link reads it; the link fails with ENOENT and the new file keeps one link
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkRefusesReusedSlot
+
+  - id: hard-link-peer-change-retry
+    name: A link starts over when a peer changes the file under it
+    description: A peer changes the file between the link's record and its increment; the link retries, and a crash after the count replays into both names and two links
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkRetriesAfterPeerChange
+
   - id: power-cut-during-link
     name: Power cut during a link, and during an unlink of a linked file
     description: Power fails at every write of a link, or of removing one name of a linked file; the data stays under every name left, and fsck finds at most an extra link, which -repair fixes

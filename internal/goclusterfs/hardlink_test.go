@@ -23,10 +23,10 @@ func linkCount(t *testing.T, fsys *FS, num uint32) uint32 {
 	return ino.LinkCount
 }
 
-func mustLink(t *testing.T, fsys *FS, parent, num uint32, name string) {
+func mustLink(t *testing.T, fsys *FS, parent uint32, file *File, name string) {
 	t.Helper()
-	if _, errno := fsys.addLink(context.Background(), parent, num, name); errno != 0 {
-		t.Fatalf("link %q to inode %d: %v", name, num, errno)
+	if _, errno := fsys.addLink(context.Background(), parent, file, name); errno != 0 {
+		t.Fatalf("link %q to inode %d: %v", name, file.inodeNum, errno)
 	}
 }
 
@@ -39,8 +39,8 @@ func TestLinkCountsNames(t *testing.T) {
 	a := createFile(t, fsys, "a")
 	writeAt(t, a, pattern(1, BlockSize+100), 0)
 
-	mustLink(t, fsys, inode.InodeRoot, a.inodeNum, "b")
-	mustLink(t, fsys, sub.inodeNum, a.inodeNum, "c")
+	mustLink(t, fsys, inode.InodeRoot, a, "b")
+	mustLink(t, fsys, sub.inodeNum, a, "c")
 	if got := linkCount(t, fsys, a.inodeNum); got != 3 {
 		t.Fatalf("link count after two links: %d, want 3", got)
 	}
@@ -79,7 +79,7 @@ func TestLinkRefuses(t *testing.T) {
 	if _, errno := fsys.link(ctx, &fsys.Inode, inode.InodeRoot, sub, "dirlink", &fuse.EntryOut{}); errno != syscall.EPERM {
 		t.Errorf("link to a directory: %v, want EPERM", errno)
 	}
-	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a.inodeNum, "taken"); errno != syscall.EEXIST {
+	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a, "taken"); errno != syscall.EEXIST {
 		t.Errorf("link over a taken name: %v, want EEXIST", errno)
 	}
 	setLinks := func(n uint32) {
@@ -89,11 +89,11 @@ func TestLinkRefuses(t *testing.T) {
 		}
 	}
 	setLinks(maxLinks)
-	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a.inodeNum, "many"); errno != syscall.EMLINK {
+	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a, "many"); errno != syscall.EMLINK {
 		t.Errorf("link at %d links: %v, want EMLINK", maxLinks, errno)
 	}
 	setLinks(0)
-	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a.inodeNum, "orphan"); errno != syscall.ENOENT {
+	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a, "orphan"); errno != syscall.ENOENT {
 		t.Errorf("link to a file with no link left: %v, want ENOENT", errno)
 	}
 	if got := linkCount(t, fsys, a.inodeNum); got != 0 {
@@ -109,7 +109,7 @@ func TestLinkReplaysAfterCrash(t *testing.T) {
 			a := createFile(t, fsys, "a")
 			writeAt(t, a, pattern(2, 300), 0)
 			crashed := crashAfterCommit(t, fsys, crashPoint)
-			go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b") }()
+			go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a, "b") }()
 			<-crashed
 
 			after := remountAndReplay(t, path, offset, size)
@@ -129,7 +129,7 @@ func TestLinkReplayAfterSameNodeWrite(t *testing.T) {
 	a := createFile(t, fsys, "a")
 	writeAt(t, a, pattern(6, 100), 0)
 	crashed := crashAfterCommit(t, fsys, "link")
-	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b") }()
+	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a, "b") }()
 	<-crashed
 	wrote := make(chan struct{})
 	go func() {
@@ -148,13 +148,73 @@ func TestLinkReplayAfterSameNodeWrite(t *testing.T) {
 	expectCleanFsck(t, after)
 }
 
+// A peer frees the source and a new file takes its slot before the link reads it: the link fails rather than give the
+// new file a name.
+func TestLinkRefusesReusedSlot(t *testing.T) {
+	ctx := context.Background()
+	fsys, path, _, _ := journaledFS(t)
+	peer := openFormattedFS(t, path)
+	a := createFile(t, fsys, "a")
+	if errno := peer.RootDir().Unlink(ctx, "a"); errno != 0 {
+		t.Fatalf("peer unlink a: %v", errno)
+	}
+	other := createFile(t, peer, "other")
+	if other.inodeNum != a.inodeNum {
+		t.Fatalf("the peer's new file took slot %d, want a's slot %d", other.inodeNum, a.inodeNum)
+	}
+	if _, errno := fsys.addLink(ctx, inode.InodeRoot, a, "b"); errno != syscall.ENOENT {
+		t.Errorf("link to a file whose slot another file took: %v, want ENOENT", errno)
+	}
+	if got := linkCount(t, peer, other.inodeNum); got != 1 {
+		t.Errorf("the new file has %d links, want 1", got)
+	}
+}
+
+// A peer changes the file between the link's record and its increment. The link starts over, so a crash after the
+// count replays into a finished link rather than an extra link without its name.
+func TestLinkRetriesAfterPeerChange(t *testing.T) {
+	ctx := context.Background()
+	fsys, path, offset, size := journaledFS(t)
+	peer := openFormattedFS(t, path)
+	a := createFile(t, fsys, "a")
+	changed := false
+	crashed := make(chan struct{})
+	afterCommit = func(op string) {
+		switch {
+		case op == "link" && !changed:
+			changed = true
+			if _, err := peer.updateInodeLocked(ctx, a.inodeNum, func(ino *inode.Inode) error { ino.Mtime++; return nil }); err != nil {
+				t.Errorf("peer change: %v", err)
+			}
+		case op == "link: counted":
+			if _, err := fsys.journal.Checkpoint(); err != nil {
+				t.Errorf("checkpoint: %v", err)
+			}
+			close(crashed)
+			select {}
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+	go func() { _, _ = fsys.link(ctx, &fsys.Inode, inode.InodeRoot, a, "b", &fuse.EntryOut{}) }()
+	<-crashed
+
+	after := remountAndReplay(t, path, offset, size)
+	if b := lookupFile(t, after, "b"); b.inodeNum != a.inodeNum {
+		t.Errorf("b names inode %d, want %d", b.inodeNum, a.inodeNum)
+	}
+	if got := linkCount(t, after, a.inodeNum); got != 2 {
+		t.Errorf("link count after replay: %d, want 2", got)
+	}
+	expectCleanFsck(t, after)
+}
+
 // A link crashes after its increment, and another write changes the file before replay. Replay can't tell the
 // increment was the link's, so it leaves an extra link and no new name, which fsck reports and repair takes back.
 func TestLinkReplaySkipsChangedFile(t *testing.T) {
 	fsys, path, offset, size := journaledFS(t)
 	a := createFile(t, fsys, "a")
 	crashed := crashAfterCommit(t, fsys, "link: counted")
-	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a.inodeNum, "b") }()
+	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a, "b") }()
 	<-crashed
 	afterCommit = nil
 	writeAt(t, a, pattern(3, 100), 0)
@@ -211,7 +271,7 @@ func TestPowerCutDuringLink(t *testing.T) {
 			writeAt(t, f, data, 0)
 		},
 		op: func(fsys *FS, _ *power) {
-			_, _ = fsys.addLink(context.Background(), inode.InodeRoot, f.inodeNum, "g")
+			_, _ = fsys.addLink(context.Background(), inode.InodeRoot, f, "g")
 		},
 		check: func(t *testing.T, fsys *FS) {
 			checkFile(t, lookupFile(t, fsys, "f"), data)
@@ -237,7 +297,7 @@ func TestPowerCutDuringUnlinkOfLinkedFile(t *testing.T) {
 		setup: func(t *testing.T, fsys *FS) {
 			f = createFile(t, fsys, "f")
 			writeAt(t, f, data, 0)
-			mustLink(t, fsys, inode.InodeRoot, f.inodeNum, "g")
+			mustLink(t, fsys, inode.InodeRoot, f, "g")
 		},
 		op: func(fsys *FS, _ *power) {
 			_ = fsys.RootDir().Unlink(context.Background(), "f")
