@@ -150,6 +150,17 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 			return "after", nil
 		}
 		return "before", nil
+	case "link":
+		there, err := d.exists(n, op.Path2, false)
+		switch {
+		case err != nil:
+			return "", err
+		case !there:
+			return "before", nil
+		case d.sameContent(n, op.Path2, before):
+			return "after", nil
+		}
+		return "", fmt.Errorf("link %s to %s: the new name does not read the source", op.Path, op.Path2)
 	case "clone", "snapclone":
 		source := before
 		if op.Kind == "snapclone" {
