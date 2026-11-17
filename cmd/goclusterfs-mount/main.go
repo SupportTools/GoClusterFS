@@ -91,7 +91,7 @@ func main() {
 		// Cache configuration
 		cacheStrict   = flag.Bool("cache-strict", false, "Check every cached inode against the device before using it; slower, but other nodes' changes show at once")
 		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost")
-		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries; stat and ls can show another node's change this late, while opening a file always sees it")
+		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries; stat and ls can show another node's change this late. Opening a file always sees it, except that a name another node renamed away can still open the moved file")
 		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
 		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
 		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")

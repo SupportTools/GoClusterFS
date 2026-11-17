@@ -46,7 +46,7 @@ These are the `goclusterfs-mount` flags:
 |------|------|---------|-------------|
 | `-cache-strict` | bool | `false` | Check every cached inode against the device before using it; slower, but other nodes' changes show at once |
 | `-cache-ttl` | duration | `5s` | How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost |
-| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries; `stat` and `ls` can show another node's change this late, while opening a file always sees it |
+| `-attr-timeout` | duration | `1s` | How long the kernel caches file attributes and directory entries; `stat` and `ls` can show another node's change this late. Opening a file always sees it, except that a name another node renamed away can still open the moved file |
 | `-cache-inodes` | int | `10000` | Most inodes the inode cache holds, about 480 bytes each (5 MB). `0` turns it off |
 | `-cache-extents` | int | `50000` | Most block mappings the extent cache holds, about 120 bytes each (6 MB). `0` turns it off |
 | `-cache-negative` | int | `1000` | Most not-found inode lookups the negative cache holds, about 40 bytes each. `0` turns it off |
