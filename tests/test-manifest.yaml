@@ -1986,7 +1986,7 @@ scenarios:
 
   - id: lock-stats-count-give-ups
     name: Lock stats count acquires that give up
-    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire
+    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire; a file I/O AcquireAs that times out counts too
     priority: go_only
     environments:
       go: internal/lock/lock_test.go::TestStatsCountAcquiresThatGiveUp
