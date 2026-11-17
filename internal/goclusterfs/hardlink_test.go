@@ -2,10 +2,11 @@ package goclusterfs
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
@@ -101,47 +102,101 @@ func TestLinkRefuses(t *testing.T) {
 	}
 }
 
-// A link crashes at each step and its journal is replayed: the file ends with both names and two links.
+// rootNames returns the names in the root directory that name inode num, sorted.
+func rootNames(t *testing.T, fsys *FS, num uint32) []string {
+	t.Helper()
+	entries, err := fsys.dirMgr.List(context.Background(), readRoot(t, fsys))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.InodeNum == uint64(num) {
+			names = append(names, e.Name)
+		}
+	}
+	slices.Sort(names)
+	return names
+}
+
+// A link crashes at each step, sometimes after a write changed the file, and its journal is replayed. Replay finishes
+// the link only if nothing changed the file since its record. A count that landed without its name stays an extra
+// link, which fsck reports and repair takes back.
 func TestLinkReplaysAfterCrash(t *testing.T) {
-	for _, crashPoint := range []string{"link", "link: counted"} {
-		t.Run(strings.ReplaceAll(crashPoint, ": ", "_"), func(t *testing.T) {
+	for _, tc := range []struct {
+		crashPoint string
+		changed    bool
+		names      []string
+		links      uint32
+	}{
+		{"link", false, []string{"a", "b"}, 2},
+		{"link", true, []string{"a"}, 1},
+		{"link: counted", false, []string{"a"}, 2},
+		{"link: counted", true, []string{"a"}, 2},
+		{"link: named", false, []string{"a", "b"}, 2},
+	} {
+		name := strings.ReplaceAll(tc.crashPoint, ": ", "_")
+		if tc.changed {
+			name += "_then_changed"
+		}
+		t.Run(name, func(t *testing.T) {
 			fsys, path, offset, size := journaledFS(t)
 			a := createFile(t, fsys, "a")
-			writeAt(t, a, pattern(2, 300), 0)
-			crashed := crashAfterCommit(t, fsys, crashPoint)
+			want := pattern(2, 300)
+			writeAt(t, a, want, 0)
+			crashed := crashAfterCommit(t, fsys, tc.crashPoint)
 			go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a, "b") }()
 			<-crashed
+			if tc.changed {
+				afterCommit = nil
+				writeAt(t, a, pattern(3, 100), BlockSize)
+				want = append(append(want, make([]byte, BlockSize-300)...), pattern(3, 100)...)
+			}
 
 			after := remountAndReplay(t, path, offset, size)
-			checkFile(t, lookupFile(t, after, "b"), pattern(2, 300))
-			if got := linkCount(t, after, a.inodeNum); got != 2 {
-				t.Errorf("link count after replay: %d, want 2", got)
+			if got := rootNames(t, after, a.inodeNum); !slices.Equal(got, tc.names) {
+				t.Fatalf("names after replay: %v, want %v", got, tc.names)
 			}
-			expectCleanFsck(t, after)
+			for _, n := range tc.names {
+				checkFile(t, lookupFile(t, after, n), want)
+			}
+			if got := linkCount(t, after, a.inodeNum); got != tc.links {
+				t.Errorf("link count after replay: %d, want %d", got, tc.links)
+			}
+			if int(tc.links) == len(tc.names) {
+				expectCleanFsck(t, after)
+				return
+			}
+			extra := fmt.Sprintf("has %d links but %d names", tc.links, len(tc.names))
+			if r := runFsck(t, after, fsck.DefaultOptions()); !strings.Contains(problemList(r), extra) {
+				t.Errorf("fsck should report the extra link:%s", problemList(r))
+			}
+			expectRepairedClean(t, after)
+			if got := linkCount(t, after, a.inodeNum); got != uint32(len(tc.names)) {
+				t.Errorf("link count after repair: %d, want %d", got, len(tc.names))
+			}
 		})
 	}
 }
 
-// A write on the linking node waits until the link is counted. Otherwise a crash before the increment leaves the
-// write's generation bump, which replay takes for the increment, and the new name would go uncounted.
-func TestLinkReplayAfterSameNodeWrite(t *testing.T) {
+// A link finishes, but its completion record never reaches the device, and another node renames the new name before
+// replay. Replay must not add the old name back: three names on two links would let unlinking free the file.
+func TestLinkReplayAfterPeerRename(t *testing.T) {
+	ctx := context.Background()
 	fsys, path, offset, size := journaledFS(t)
+	peer := openFormattedFS(t, path)
 	a := createFile(t, fsys, "a")
-	writeAt(t, a, pattern(6, 100), 0)
-	crashed := crashAfterCommit(t, fsys, "link")
-	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a, "b") }()
+	crashed := crashAfterCommit(t, fsys, "link: named")
+	go func() { _, _ = fsys.addLink(ctx, inode.InodeRoot, a, "b") }()
 	<-crashed
-	wrote := make(chan struct{})
-	go func() {
-		_, _ = a.Write(context.Background(), nil, pattern(7, 100), BlockSize)
-		close(wrote)
-	}()
-	select {
-	case <-wrote:
-	case <-time.After(500 * time.Millisecond):
+	if errno := peer.Rename(ctx, "b", peer, "c", 0); errno != 0 {
+		t.Fatalf("peer rename b to c: %v", errno)
 	}
 
 	after := remountAndReplay(t, path, offset, size)
+	if got := rootNames(t, after, a.inodeNum); !slices.Equal(got, []string{"a", "c"}) {
+		t.Errorf("names after replay: %v, want [a c]", got)
+	}
 	if got := linkCount(t, after, a.inodeNum); got != 2 {
 		t.Errorf("link count after replay: %d, want 2", got)
 	}
@@ -167,73 +222,6 @@ func TestLinkRefusesReusedSlot(t *testing.T) {
 	}
 	if got := linkCount(t, peer, other.inodeNum); got != 1 {
 		t.Errorf("the new file has %d links, want 1", got)
-	}
-}
-
-// A peer changes the file between the link's record and its increment. The link starts over, so a crash after the
-// count replays into a finished link rather than an extra link without its name.
-func TestLinkRetriesAfterPeerChange(t *testing.T) {
-	ctx := context.Background()
-	fsys, path, offset, size := journaledFS(t)
-	peer := openFormattedFS(t, path)
-	a := createFile(t, fsys, "a")
-	changed := false
-	crashed := make(chan struct{})
-	afterCommit = func(op string) {
-		switch {
-		case op == "link" && !changed:
-			changed = true
-			if _, err := peer.updateInodeLocked(ctx, a.inodeNum, func(ino *inode.Inode) error { ino.Mtime++; return nil }); err != nil {
-				t.Errorf("peer change: %v", err)
-			}
-		case op == "link: counted":
-			if _, err := fsys.journal.Checkpoint(); err != nil {
-				t.Errorf("checkpoint: %v", err)
-			}
-			close(crashed)
-			select {}
-		}
-	}
-	t.Cleanup(func() { afterCommit = nil })
-	go func() { _, _ = fsys.link(ctx, &fsys.Inode, inode.InodeRoot, a, "b", &fuse.EntryOut{}) }()
-	<-crashed
-
-	after := remountAndReplay(t, path, offset, size)
-	if b := lookupFile(t, after, "b"); b.inodeNum != a.inodeNum {
-		t.Errorf("b names inode %d, want %d", b.inodeNum, a.inodeNum)
-	}
-	if got := linkCount(t, after, a.inodeNum); got != 2 {
-		t.Errorf("link count after replay: %d, want 2", got)
-	}
-	expectCleanFsck(t, after)
-}
-
-// A link crashes after its increment, and another write changes the file before replay. Replay can't tell the
-// increment was the link's, so it leaves an extra link and no new name, which fsck reports and repair takes back.
-func TestLinkReplaySkipsChangedFile(t *testing.T) {
-	fsys, path, offset, size := journaledFS(t)
-	a := createFile(t, fsys, "a")
-	crashed := crashAfterCommit(t, fsys, "link: counted")
-	go func() { _, _ = fsys.addLink(context.Background(), inode.InodeRoot, a, "b") }()
-	<-crashed
-	afterCommit = nil
-	writeAt(t, a, pattern(3, 100), 0)
-
-	after := remountAndReplay(t, path, offset, size)
-	root, err := after.inodeTbl.Read(inode.InodeRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := after.dirMgr.Lookup(context.Background(), root, "b"); err != dir.ErrNotFound {
-		t.Errorf("lookup b after replay: %v, want it not added", err)
-	}
-	r := runFsck(t, after, fsck.DefaultOptions())
-	if !strings.Contains(problemList(r), "has 2 links but 1 names") {
-		t.Errorf("fsck should report the extra link:%s", problemList(r))
-	}
-	expectRepairedClean(t, after)
-	if got := linkCount(t, after, a.inodeNum); got != 1 {
-		t.Errorf("link count after repair: %d, want 1", got)
 	}
 }
 

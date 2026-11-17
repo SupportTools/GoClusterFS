@@ -144,18 +144,18 @@ scenarios:
       go: internal/goclusterfs/hardlink_test.go::TestLinkCountsNames
 
   - id: hard-link-replay
-    name: Replay finishes a link a crash interrupted
-    description: A link crashes after its commit or after its increment; replay leaves both names and two links. If another write changed the file first, replay leaves an extra link that fsck repairs
+    name: Replay finishes a link a crash interrupted, only on an unchanged file
+    description: A link crashes after its record, its count or its name, sometimes after a write changed the file. Replay adds the link and name only when nothing changed the file; a count that landed without its name stays an extra link that fsck repairs
     priority: go_only
     environments:
       go: internal/goclusterfs/hardlink_test.go::TestLinkReplaysAfterCrash
 
-  - id: hard-link-replay-same-node-write
-    name: Replay counts a link whose node wrote the file during it
-    description: A link crashes after its commit while the same node writes the file; the write waits for the count, so replay gives the file both names and two links
+  - id: hard-link-replay-peer-rename
+    name: Replay does not restore a link's name another node renamed
+    description: A link finishes without a durable completion record and another node renames its new name; replay leaves the file with its two names and two links
     priority: go_only
     environments:
-      go: internal/goclusterfs/hardlink_test.go::TestLinkReplayAfterSameNodeWrite
+      go: internal/goclusterfs/hardlink_test.go::TestLinkReplayAfterPeerRename
 
   - id: hard-link-reused-slot
     name: A link refuses a source whose slot another file took
@@ -163,13 +163,6 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/hardlink_test.go::TestLinkRefusesReusedSlot
-
-  - id: hard-link-peer-change-retry
-    name: A link starts over when a peer changes the file under it
-    description: A peer changes the file between the link's record and its increment; the link retries, and a crash after the count replays into both names and two links
-    priority: go_only
-    environments:
-      go: internal/goclusterfs/hardlink_test.go::TestLinkRetriesAfterPeerChange
 
   - id: power-cut-during-link
     name: Power cut during a link, and during an unlink of a linked file
@@ -2390,15 +2383,6 @@ scenarios:
   - id: symbolic-links
     name: Symbolic links
     description: Create and follow symbolic links
-    priority: medium
-    environments:
-      go: TODO
-      docker: TODO
-      vm: TODO
-
-  - id: hard-links
-    name: Hard links
-    description: Create and verify hard links
     priority: medium
     environments:
       go: TODO

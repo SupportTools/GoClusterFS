@@ -304,14 +304,12 @@ func initCreated(ctx context.Context, rctx *RecoveryContext, ino *inode.Inode, p
 	return rctx.DirMgr.InitDirectory(ctx, ino, p.ParentInodeNum)
 }
 
-var (
-	errLinkAddLanded  = errors.New("the link's increment landed before the crash")
-	errLinkAddSkipped = errors.New("the file changed since the link was logged")
-)
+var errLinkAddSkipped = errors.New("the file changed since the link was logged")
 
-// applyLinkAdd gives a file the link a hard link logged while nothing changed the file since, or takes over the
-// increment if it landed before the crash. Either way the transaction's DirAddEntry may then name the file. The count
-// goes up before the name, so a skipped record leaves at most an extra link, which fsck repairs.
+// applyLinkAdd gives a file the link a hard link logged, only if nothing changed the file since; only then may the
+// transaction's DirAddEntry name it. A changed file may already have the link and its name, which another node may
+// have renamed since, so replay leaves it alone. A link that a crash cut off between its count and its name stays an
+// extra link, which fsck repairs.
 func applyLinkAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeLinkDrop(payload)
 	if err != nil {
@@ -319,21 +317,13 @@ func applyLinkAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payl
 	}
 	num := uint32(p.InodeNum)
 	err = rctx.InodeTbl.Update(ctx, num, func(ino *inode.Inode) error {
-		switch {
-		case ino.Magic != inode.InodeMagic || !ino.IsFile() || ino.LinkCount == 0:
+		if !r.unchanged(ino, p.MetaGeneration) || !ino.IsFile() || ino.LinkCount == 0 {
 			return errLinkAddSkipped
-		case r.unchanged(ino, p.MetaGeneration):
-			ino.LinkCount++
-			return nil
-		case ino.MetaGeneration == p.MetaGeneration+1 && ino.LastModifierUUID == r.owner:
-			return errLinkAddLanded
 		}
-		return errLinkAddSkipped
+		ino.LinkCount++
+		return nil
 	})
 	switch {
-	case errors.Is(err, errLinkAddLanded):
-		r.linked[p.InodeNum] = true
-		return false, nil
 	case errors.Is(err, errLinkAddSkipped):
 		log.Printf("[Recovery] LinkAdd: inode %d changed since the link was logged, skipping", num)
 		return false, nil
