@@ -292,9 +292,9 @@ Lock slot reads and writes do not take the device's per-region I/O lock, so a no
 
 **A read request never returns part of a write request.** Every read and write request the kernel sends for a file takes the file's I/O lock for the whole request, on every node: shared for a read, exclusive for a write, a truncate or an `fallocate`. Snapshots and clones take it shared while they share the file's blocks. So a read request returns each overlapping write request whole or not at all, whichever node wrote it, and a snapshot never holds part of a write. Writes to one file run one at a time across the cluster and on each node, whatever ranges they cover, so several nodes writing one file do not run in parallel.
 
-The guarantee is per request, and a request carries at most 1 MB:
+A read request sees each write request whole: up to MaxWrite, 1 MiB. Larger operations are several requests:
 
-- A `write()` larger than 1 MB becomes several requests, and another node can read between them.
+- The kernel splits a `write()` larger than MaxWrite into several requests, and another node can read between them.
 - Reads through the page cache come in requests of up to 1 MB, and the kernel keeps the pages it read. One `read()` can return pages this node cached before another node's write together with pages it fetched after it. The cached pages are dropped when this node next opens the file or refreshes its attributes, after `-attr-timeout` (1 second by default).
 - A read through the page cache that overlaps a write on the same node can return a mix of old and new data split at any byte, even inside an 8-byte word, as on ext4 or tmpfs: the kernel copies a page out to the reader while the write copies into it, and neither reaches GoClusterFS.
 - A read with `O_DIRECT`, or any read on a mount with `-direct-io`, skips the page cache: each `read()` of up to 1 MB is one request and never mixes two writes. `-direct-io` sends every read and write of file data to the filesystem, so small and repeated reads are slower, and a shared `mmap` of a file fails with `ENODEV`.
