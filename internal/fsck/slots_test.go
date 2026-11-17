@@ -131,8 +131,37 @@ func TestReleaseSlotSalvage(t *testing.T) {
 	if _, err := newChecker(dev).PlanRelease(slot, false); err == nil || !strings.Contains(err.Error(), "add -salvage") {
 		t.Fatalf("PlanRelease of a replayable journal without salvage or force: %v", err)
 	}
+
+	starting := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	restore := fsck.SetReleaseHooks(nil, func() {
+		if _, err := starting.Register(context.Background(), "starting"); err != nil {
+			t.Error(err)
+		}
+	})
 	c := newChecker(dev)
 	plan, err := c.PlanRelease(slot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Release(plan, true); err == nil || !strings.Contains(err.Error(), "changed its node registry slot") {
+		t.Fatalf("Release with salvage while a node starts: %v", err)
+	}
+	restore()
+	if allocated(applies) {
+		t.Fatal("salvage replayed a transaction after a node started")
+	}
+	if slots, err := newChecker(dev).Slots(); err != nil || !slots[slot].InUse() || slots[slot].JournalFresh {
+		t.Fatalf("after the stopped salvage, slot %d: %+v, %v; want it taken with its journal kept", slot, slots[slot], err)
+	}
+	if err := starting.Unregister(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	editSlot(t, dev, sb, slot, func(s []byte) {
+		binary.LittleEndian.PutUint64(s[172:180], uint64(time.Now().Add(-time.Hour).Unix()))
+	})
+
+	c = newChecker(dev)
+	plan, err = c.PlanRelease(slot, true)
 	if err != nil {
 		t.Fatal(err)
 	}

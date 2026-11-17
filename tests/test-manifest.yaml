@@ -2183,7 +2183,7 @@ scenarios:
 
   - id: fsck-release-slot-salvage
     name: fsck slot release salvages a journal's good transactions
-    description: With salvage, release replays the slot's committed transactions in order until one fails to apply, reports that one as failed and every later one as discarded, then resets the journal and frees the slot; a journal a mount could replay is refused without salvage or force
+    description: With salvage, release replays the slot's committed transactions in order until one fails to apply, reports that one as failed and every later one as discarded, then resets the journal and frees the slot; a journal a mount could replay is refused without salvage or force; salvage stops before its next transaction once another registry slot changes, leaving the journal and the slot for a later run
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlotSalvage

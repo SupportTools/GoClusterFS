@@ -3,12 +3,14 @@ package fsck
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 )
 
@@ -20,8 +22,9 @@ type Salvage struct {
 }
 
 // salvage replays slot i's journal until a transaction fails to apply or a
-// record cannot be read. It returns an error only when renew fails, since
-// another node may then hold the slot.
+// record cannot be read. It returns an error, leaving the journal for the next
+// run, when renew fails or another registry slot changes: another node may then
+// hold the slot or write beside the replay, which takes no cluster locks.
 func (c *Checker) salvage(i int, renew func() error) (*Salvage, error) {
 	s := &Salvage{Replayed: make(map[uint64]bool)}
 	region, err := c.slotJournal(i)
@@ -45,16 +48,34 @@ func (c *Checker) salvage(i int, renew func() error) (*Salvage, error) {
 		s.Replayed[txn.Header.Seq] = true
 		return nil
 	}
-	var leaseErr error
+	var stopErr error
 	check := func() error {
-		leaseErr = renew()
-		return leaseErr
+		if stopErr = renew(); stopErr == nil {
+			stopErr = c.othersUnchanged(i)
+		}
+		return stopErr
 	}
 	_, s.Err = journal.RecoverReleasing(region, handler, check, rctx.ReleaseReserved(context.Background()))
-	if leaseErr != nil {
-		return nil, leaseErr
+	if stopErr != nil {
+		return nil, stopErr
 	}
 	return s, nil
+}
+
+// othersUnchanged fails once a registry slot other than i differs from what planning read, which means a node started.
+func (c *Checker) othersUnchanged(i int) error {
+	now, err := c.readRegistry()
+	if err != nil {
+		return fmt.Errorf("read the node registry: %w", err)
+	}
+	for _, changed := range changedSlots(c.registry, now) {
+		if changed != i {
+			slot, _ := node.ParseSlot(now[changed*node.SlotSize : (changed+1)*node.SlotSize])
+			return fmt.Errorf("salvage stopped: %s changed its node registry slot, so a node may be running; "+
+				"the journal was not reset. Unmount every node and run again once the slot's lease lapses", slotName(changed, slot))
+		}
+	}
+	return nil
 }
 
 // replayContext builds the managers a replay needs, without locks: fsck replays only while no node runs.
