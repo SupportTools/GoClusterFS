@@ -1093,7 +1093,7 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		}
 
 		if err := r.clearFailedSlot(i, info.UUID); err != nil {
-			log.Printf("[Recovery] Clearing slot %d (node %x) after replay failed: %v; any node replays it again after %v",
+			log.Printf("[Recovery] Replayed slot %d (node %x), but emptying the slot failed: %v; any node replays it again after %v",
 				i, info.UUID[:8], err, recoveryLease)
 		}
 		r.mu.Lock()
