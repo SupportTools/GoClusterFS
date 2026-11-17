@@ -1522,7 +1522,7 @@ scenarios:
 
   - id: fsck-release-dead-slot
     name: fsck releases a dead node's slot
-    description: -release-slot exits 8 while the node is mounted; after the node dies with a damaged journal header, -list-slots shows the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
     environments:
@@ -2152,6 +2152,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
+
+  - id: fsck-inspect-slot
+    name: fsck inspects a node registry slot without writing
+    description: -inspect-slot reports the slot's node, lease and orphans, the journal header, every committed transaction a replay would apply with the inodes and blocks it changes, and where a damaged journal stops the scan; it writes nothing, so it runs on a mounted device
+    priority: go_only
+    environments:
+      go: internal/fsck/inspect_test.go::TestInspectSlot
+
+  - id: journal-entry-touches
+    name: Journal entries name what they change
+    description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
+    priority: go_only
+    environments:
+      go: internal/journal/describe_test.go::TestEntryTouches
 
   - id: fsck-release-slot
     name: fsck slot release checks

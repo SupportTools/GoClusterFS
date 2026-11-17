@@ -15,6 +15,7 @@
 //	-force: Keep checking after a fatal error; with -repair, repair even if
 //	        a stopped node's journal still needs replay
 //	-list-slots: List node registry slots with their lease and journal
+//	-inspect-slot N: Describe slot N and what replaying its journal would change; writes nothing
 //	-release-slot N: Free the slot of a node that will not return; with
 //	        -discard-journal, reset its journal and free it
 //
@@ -59,6 +60,7 @@ func main() {
 		debug        = flag.Bool("debug", false, "Print [DEBUG] log lines")
 
 		listSlots      = flag.Bool("list-slots", false, "List node registry slots with their lease and journal, then exit")
+		inspectSlotN   = flag.Int("inspect-slot", -1, "Describe registry slot N, its journal and every transaction a replay would apply, then exit; writes nothing, so it runs on a mounted device")
 		releaseSlotN   = flag.Int("release-slot", -1, "Check that registry slot N can be released and print what releasing it discards; -1 checks none")
 		discardJournal = flag.Bool("discard-journal", false, "With -release-slot, reset the slot's journal and free the slot; writes that journal holds are lost")
 	)
@@ -116,7 +118,14 @@ func main() {
 		os.Exit(fsck.ExitUsage)
 	}
 	releasing := *releaseSlotN != -1
+	inspecting := *inspectSlotN != -1
 	switch {
+	case inspecting && *inspectSlotN < 0:
+		fmt.Fprintln(os.Stderr, "Error: -inspect-slot needs a slot number")
+		os.Exit(fsck.ExitUsage)
+	case inspecting && (*listSlots || releasing || *repair):
+		fmt.Fprintln(os.Stderr, "Error: -inspect-slot, -list-slots, -release-slot and -repair run separately")
+		os.Exit(fsck.ExitUsage)
 	case *discardJournal && !releasing:
 		fmt.Fprintln(os.Stderr, "Error: -discard-journal needs -release-slot")
 		os.Exit(fsck.ExitUsage)
@@ -154,11 +163,14 @@ func main() {
 		}
 	}()
 
-	if *listSlots || releasing {
+	if *listSlots || releasing || inspecting {
 		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose})
-		if *listSlots {
+		switch {
+		case *listSlots:
 			err = printSlots(os.Stdout, checker)
-		} else {
+		case inspecting:
+			err = inspectSlot(os.Stdout, checker, *inspectSlotN)
+		default:
 			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *discardJournal, *force)
 		}
 		switch {
