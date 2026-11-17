@@ -565,7 +565,7 @@ As with fsck(8), the codes add up: a repair that fixed some errors and left othe
 | 3 | Inodes | Inode checksums, file type, link count, block counts; reads extent trees; symlink length, layout and target (reported, never repaired) |
 | 4 | Extents | Extents stay inside the device and are allocated; two inodes share a block only if both mark it shared; extent tree structure |
 | 5 | Refcounts | The table covers every data block; sector checksums; each block's refcount covers the inodes that map it |
-| 6 | Directories | Entry lengths and names; entries point at inodes in use; symlink entries match symlink inodes |
+| 6 | Directories | Entry lengths and names; entries point at inodes in use; each entry's type matches its inode, symlinks included |
 | 7 | Snapshots | Registry sector and descriptor checksums, duplicate IDs and names, snapshot data inodes |
 | 8 | Cross-Validation | Allocated blocks that no inode maps, mapped blocks the bitmap calls free, inodes no directory names |
 
