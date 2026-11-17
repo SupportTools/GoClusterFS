@@ -1371,7 +1371,7 @@ func TestReleaseSlotKeepsOrphans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if released, err := reg.ReleaseSlot(2, raw, func() error { return nil }); !released || err != nil {
+	if released, err := reg.ReleaseSlot(2, raw, func(func() error) error { return nil }); !released || err != nil {
 		t.Fatalf("ReleaseSlot = %v, %v", released, err)
 	}
 	slot, err := reg.readSlot(2)
@@ -1398,7 +1398,7 @@ func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	released, err := reg.ReleaseSlot(0, raw, func() error {
+	released, err := reg.ReleaseSlot(0, raw, func(func() error) error {
 		time.Sleep(2 * claimSettle)
 		return nil
 	})
@@ -1407,6 +1407,71 @@ func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
 	}
 	if slot, err := reg.readSlot(0); err != nil || slot.State != NodeStateDead || slot.RecoveryOwner != reg.localUUID {
 		t.Errorf("slot after the abandoned release: %+v, %v; want dead under this registry's lease", slot, err)
+	}
+}
+
+func TestReleaseSlotRenewsItsLease(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	t.Cleanup(SetRecoveryLease(8 * claimSettle))
+	defer func(old time.Duration) { releaseLeaseBudget = old }(releaseLeaseBudget)
+	releaseLeaseBudget = 2 * claimSettle
+
+	reg := NewRegistry(dev, 0)
+	orphans := []Orphan{{Inode: 12, Birth: 3}}
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5}, HeartbeatTime: time.Now().Add(-time.Hour).Unix(), Orphans: orphans}
+	for _, idx := range []int{0, 1} {
+		if err := reg.writeSlot(idx, gone); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _, err := reg.readSlotRaw(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var starts []int64
+	released, err := reg.ReleaseSlot(0, raw, func(renew func() error) error {
+		for range 6 {
+			time.Sleep(claimSettle)
+			if err := renew(); err != nil {
+				return err
+			}
+			slot, err := reg.readSlot(0)
+			if err != nil {
+				return err
+			}
+			starts = append(starts, slot.RecoveryStart)
+		}
+		return nil
+	})
+	if !released || err != nil {
+		t.Fatalf("ReleaseSlot with a reset that renews for %v, past the %v budget = %v, %v", 6*claimSettle, releaseLeaseBudget, released, err)
+	}
+	if starts[0] == starts[len(starts)-1] {
+		t.Errorf("the lease start never moved during the reset: %v", starts)
+	}
+	if slot, err := reg.readSlot(0); err != nil || slot.State != NodeStateEmpty || !slices.Equal(slot.Orphans, orphans) {
+		t.Errorf("released slot: %+v, %v; want empty with orphans %v", slot, err, orphans)
+	}
+
+	raw, _, err = reg.readSlotRaw(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err = reg.ReleaseSlot(1, raw, func(renew func() error) error {
+		taken, err := reg.readSlot(1)
+		if err != nil {
+			return err
+		}
+		taken.RecoveryOwner = [16]byte{9}
+		if err := reg.writeSlot(1, taken); err != nil {
+			return err
+		}
+		return renew()
+	})
+	if released || !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("ReleaseSlot after another node took the lease = %v, %v; want ErrLeaseLost", released, err)
 	}
 }
 

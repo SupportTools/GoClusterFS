@@ -359,11 +359,17 @@ A slot belongs to its host's hostname and boot ID. If the damaged slot belongs t
 ```bash
 ./goclusterfs-fsck -list-slots /dev/device                       # find the slot and its journal state
 ./goclusterfs-fsck -inspect-slot N /dev/device                   # list what its journal would replay
-./goclusterfs-fsck -release-slot N /dev/device                   # check the slot; prints what releasing discards
-./goclusterfs-fsck -release-slot N -discard-journal /dev/device  # reset its journal and free the slot
+./goclusterfs-fsck -release-slot N /dev/device                   # check the slot; writes nothing
+./goclusterfs-fsck -release-slot N -salvage -report slot-N.txt /dev/device          # replay what applies, discard the rest
+./goclusterfs-fsck -release-slot N -discard-journal -report slot-N.txt /dev/device  # or discard the whole journal
 ```
 
-`-release-slot` refuses while any node has the filesystem mounted, and until a minute after the slot's lease ended: its last heartbeat plus 10 seconds, or for a slot another node was replaying, that node's last lease renewal plus 60 seconds. Without `-force` it also refuses a journal that a mount might still replay: one with committed transactions that fsck reads in full, or one fsck cannot read to the end. Mount a node to replay it instead, and add `-force` only if that replay fails. With `-discard-journal`, fsck holds the slot's recovery lease while it resets the journal, frees the slot, and exits 1. The next node to mount can then use the slot. Run fsck afterwards, because discarded transactions may have been only partly applied.
+`-release-slot` refuses while any node has the filesystem mounted, and until a minute after the slot's lease ended: its last heartbeat plus 10 seconds, or for a slot another node was replaying, that node's last lease renewal plus 60 seconds. Alone it writes nothing and lists the journal's transactions. Then pick one:
+
+- `-salvage` replays the journal's committed transactions in order, as a mount would, until one fails to apply or a record cannot be read. It discards that transaction and every later one. Use it when a replay fails on one bad transaction.
+- `-discard-journal` discards the whole journal unread. While a mount could still replay the journal, it refuses without `-force`: mount a node to replay it, or use `-salvage`.
+
+Either one holds the slot's recovery lease while it works, resets the journal, frees the slot, and exits 1. Each prints what happened to every transaction, and `-report FILE` writes the same to FILE; fsck writes the file once before it changes the device and refuses if it cannot. Salvage replays without cluster locks, which is safe only because no node runs; it does not free the dead node's unused block reserve when it stops early. Run fsck afterwards: a discarded or failed transaction may be partly applied, and `-repair` reclaims the blocks such a transaction leaked.
 
 ### Emergency: All Nodes Down
 

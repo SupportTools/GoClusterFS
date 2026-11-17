@@ -77,6 +77,9 @@ func (c *Checker) Slots() ([]SlotStatus, error) {
 type ReleasePlan struct {
 	Slot     SlotStatus
 	Discards string // what resetting the slot's journal throws away
+	// Replayable says why a mount could still replay the journal; empty when it could not.
+	Replayable string
+	Journal    *SlotInspection
 }
 
 // PlanRelease checks that slot i can be released: mount would accept the
@@ -110,31 +113,41 @@ func (c *Checker) PlanRelease(i int, force bool) (*ReleasePlan, error) {
 	discards, keep := journalContents(c.slotJournal(i))
 	if keep != "" && !force {
 		return nil, fmt.Errorf("release refused: slot %d's journal holds %s, and %s; "+
-			"mount a node to replay it, or add -force to discard it", i, discards, keep)
+			"mount a node to replay it, add -salvage to replay it here, or add -force to discard it", i, discards, keep)
 	}
-	return &ReleasePlan{Slot: s, Discards: discards}, nil
+	return &ReleasePlan{Slot: s, Discards: discards, Replayable: keep, Journal: c.inspect(s)}, nil
 }
 
 // Release takes the plan's slot under a recovery lease, resets its journal
-// and empties the slot, so a node can register there with a new journal. It
-// writes nothing if any registry slot changed since PlanRelease watched it.
-func (c *Checker) Release(plan *ReleasePlan) error {
+// and empties the slot, so a node can register there with a new journal. With
+// salvage set it first replays the journal until a transaction fails to apply
+// or a record cannot be read, and returns how far it got. It writes nothing if
+// any registry slot changed since PlanRelease watched it.
+func (c *Checker) Release(plan *ReleasePlan, salvage bool) (*Salvage, error) {
 	i := plan.Slot.Index
 	now, err := c.readRegistry()
 	if err != nil {
-		return fmt.Errorf("read the node registry: %w", err)
+		return nil, fmt.Errorf("read the node registry: %w", err)
 	}
 	if changed := changedSlots(c.registry, now); len(changed) > 0 {
-		return fmt.Errorf("release stopped: node registry slot %d changed since fsck checked it; nothing was written", changed[0])
+		return nil, fmt.Errorf("release stopped: node registry slot %d changed since fsck checked it; nothing was written", changed[0])
 	}
 	if beforeReleaseWrites != nil {
 		beforeReleaseWrites()
 	}
 
 	reset := false
-	resetJournal := func() error {
+	var salvaged *Salvage
+	resetJournal := func(renew func() error) error {
 		if whileReleaseHoldsLease != nil {
 			whileReleaseHoldsLease()
+		}
+		if salvage {
+			s, err := c.salvage(i, renew)
+			if err != nil {
+				return err
+			}
+			salvaged = s
 		}
 		offset, _ := c.journalArea(i)
 		if _, err := c.dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), int64(offset)); err != nil {
@@ -146,13 +159,13 @@ func (c *Checker) Release(plan *ReleasePlan) error {
 	released, err := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).ReleaseSlot(i, plan.Slot.raw, resetJournal)
 	switch {
 	case err != nil && reset:
-		return fmt.Errorf("release slot %d: %w; its journal is reset but the slot is not free, run again", i, err)
+		return salvaged, fmt.Errorf("release slot %d: %w; its journal is reset but the slot is not free, run again", i, err)
 	case err != nil:
-		return fmt.Errorf("release slot %d: %w", i, err)
+		return salvaged, fmt.Errorf("release slot %d: %w", i, err)
 	case !released:
-		return fmt.Errorf("release stopped: another node took slot %d since fsck checked it; its journal was not touched", i)
+		return nil, fmt.Errorf("release stopped: another node took slot %d since fsck checked it; its journal was not touched", i)
 	}
-	return c.dev.Sync()
+	return salvaged, c.dev.Sync()
 }
 
 // journalArea returns where slot i's journal starts and how long it is.

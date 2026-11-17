@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -26,11 +28,17 @@ Node registry slots:
   inodes and blocks each changes. It writes nothing, so it runs while the
   filesystem is mounted.
 
-  -release-slot N checks that slot N can be freed and prints what freeing it
-  would discard. It refuses while any node has the filesystem mounted, until
-  a minute after the slot's lease ended, and, without -force, while a mount
-  could still replay the journal. Add -discard-journal to reset the slot's
-  journal and free the slot; fsck then exits 1.
+  -release-slot N checks that slot N can be freed and lists the transactions
+  in its journal. It refuses while any node has the filesystem mounted, and
+  until a minute after the slot's lease ended. It writes nothing until you
+  pick one of:
+    -salvage          replay the journal until a transaction fails to apply
+                      or cannot be read, then discard the rest
+    -discard-journal  discard the whole journal unread; while a mount could
+                      still replay it, this also needs -force
+  Either resets the journal and frees the slot, and fsck then exits 1.
+  -report FILE also writes what happened to each transaction to FILE. Run
+  fsck afterwards: a discarded or failed transaction may be partly applied.
 `
 
 // printSlots lists the slots that are in use or whose journal was written
@@ -67,31 +75,122 @@ func printSlots(out io.Writer, checker *fsck.Checker) error {
 	return err
 }
 
-// releaseSlot checks slot i and prints what releasing it discards. With
-// discard set it also releases the slot.
-func releaseSlot(out io.Writer, checker *fsck.Checker, i int, discard, force bool) error {
-	plan, err := checker.PlanRelease(i, force)
+// releaseSlot checks slot i and prints what releasing it replays and
+// discards. With salvage or discard set it releases the slot, and with a
+// report path it also writes that text to the file.
+func releaseSlot(out io.Writer, checker *fsck.Checker, i int, salvage, discard, force bool, reportPath string) (err error) {
+	plan, err := checker.PlanRelease(i, force || !discard)
 	if err != nil {
 		return err
 	}
+	var record bytes.Buffer
+	if reportPath != "" {
+		fmt.Fprintf(&record, "goclusterfs-fsck -release-slot %d%s at %s UTC\n", i, releaseFlags(salvage, discard, force), time.Now().UTC().Format(time.DateTime))
+	}
+	p := &printer{w: io.MultiWriter(out, &record)}
 	s := plan.Slot
-	p := &printer{w: out}
 	p.printf("Slot %d: %s, %s, lease %s\n", s.Index, s.Name(), s.Slot.State, lease(s))
 	p.printf("Journal: %s\n", s.Journal)
-	p.printf("Releasing discards %s.\n", plan.Discards)
-	if !discard {
-		p.printf("Nothing was written. Run again with -discard-journal to reset the journal and free the slot.\n")
+	if reportPath != "" {
+		// Discard nothing the report could not record.
+		if err := os.WriteFile(reportPath, record.Bytes(), 0o644); err != nil {
+			return fmt.Errorf("write the report: %w; nothing was written to the device", err)
+		}
+		defer func() {
+			if err != nil {
+				fmt.Fprintf(&record, "Error: %v\n", err)
+			}
+			if werr := os.WriteFile(reportPath, record.Bytes(), 0o644); werr != nil && err == nil {
+				err = fmt.Errorf("the release finished, but writing the report failed: %w", werr)
+			}
+		}()
+	}
+
+	if !salvage && !discard {
+		p.printf("-discard-journal discards %s.\n", plan.Discards)
+		printTxns(p, plan.Journal, func(fsck.PendingTxn) string { return "" })
+		if plan.Replayable != "" {
+			p.printf("Replay: %s. Mount a node to replay it, or use -salvage; -discard-journal needs -force.\n", plan.Replayable)
+		}
+		p.printf("Nothing was written. Run again with -salvage to replay the transactions that apply and discard the rest, " +
+			"or with -discard-journal to discard the whole journal; either frees the slot.\n")
 		return p.err
 	}
-	// Discard nothing the user could not be shown.
 	if p.err != nil {
 		return p.err
 	}
-	if err := checker.Release(plan); err != nil {
+
+	salvaged, err := checker.Release(plan, salvage)
+	switch {
+	case salvage && salvaged != nil:
+		p.printf("Salvage replayed %d of %d committed transactions:\n", len(salvaged.Replayed), len(plan.Journal.Pending))
+		printTxns(p, plan.Journal, func(t fsck.PendingTxn) string {
+			switch {
+			case salvaged.Replayed[t.Seq]:
+				return "replayed"
+			case t.Seq == salvaged.FailedSeq:
+				return "failed"
+			}
+			return "discarded"
+		})
+		switch {
+		case salvaged.FailedSeq != 0:
+			p.printf("Txn %d failed: %v. It may be partly applied; the transactions after it were discarded.\n", salvaged.FailedSeq, salvaged.Err)
+		case salvaged.Err != nil:
+			p.printf("Salvage stopped: %v. What follows was discarded.\n", salvaged.Err)
+		}
+	case discard && err == nil:
+		p.printf("Discarded %s:\n", plan.Discards)
+		printTxns(p, plan.Journal, func(fsck.PendingTxn) string { return "discarded" })
+	}
+	if err != nil {
 		return err
 	}
-	p.printf("Released slot %d: its journal is reset and a node can register in it.\n", i)
+	p.printf("Released slot %d: its journal is reset and a node can register in it. Run goclusterfs-fsck now: "+
+		"discarded or failed transactions may be partly applied.\n", i)
 	return p.err
+}
+
+func releaseFlags(salvage, discard, force bool) string {
+	var flags string
+	if salvage {
+		flags += " -salvage"
+	}
+	if discard {
+		flags += " -discard-journal"
+	}
+	if force {
+		flags += " -force"
+	}
+	return flags
+}
+
+// printTxns lists the journal's pending transactions, each after what mark says the release does with it.
+func printTxns(p *printer, in *fsck.SlotInspection, mark func(fsck.PendingTxn) string) {
+	for _, t := range in.Pending {
+		prefix := mark(t)
+		if prefix != "" {
+			prefix = fmt.Sprintf("%-9s ", prefix)
+		}
+		p.printf("  %s%s\n", prefix, txnLine(t))
+		if t.DecodeErr != nil {
+			p.printf("    a replay cannot decode it: %v\n", t.DecodeErr)
+		}
+	}
+	if in.ScanErr != nil {
+		p.printf("  the scan stopped after txn %s: %v. Nothing after it can be read.\n", lastSeq(in.Pending), in.ScanErr)
+	}
+}
+
+func txnLine(t fsck.PendingTxn) string {
+	line := fmt.Sprintf("txn %d at %s: %s", t.Seq, t.Time.Format(time.DateTime), strings.Join(t.Ops, ", "))
+	if len(t.Inodes) > 0 {
+		line += "; inodes " + joinNumbers(t.Inodes)
+	}
+	if len(t.Blocks) > 0 {
+		line += "; blocks " + blockRuns(t.Blocks)
+	}
+	return line
 }
 
 // inspectSlot prints what fsck.InspectSlot finds about slot i.
@@ -134,22 +233,7 @@ func printPending(p *printer, in *fsck.SlotInspection) {
 	h := in.Header
 	p.printf("%s, written by node %x, generation %d.\n", strings.ToLower(h.State.String()), h.NodeUUID[:8], h.NodeGeneration)
 	p.printf("  %d committed transactions to replay, %d incomplete at the end (a replay drops those).\n", len(in.Pending), in.Stats.TxnIncomplete)
-	for _, t := range in.Pending {
-		p.printf("  txn %d at %s: %s", t.Seq, t.Time.Format(time.DateTime), strings.Join(t.Ops, ", "))
-		if len(t.Inodes) > 0 {
-			p.printf("; inodes %s", joinNumbers(t.Inodes))
-		}
-		if len(t.Blocks) > 0 {
-			p.printf("; blocks %s", blockRuns(t.Blocks))
-		}
-		p.printf("\n")
-		if t.DecodeErr != nil {
-			p.printf("    a replay cannot decode it: %v\n", t.DecodeErr)
-		}
-	}
-	if in.ScanErr != nil {
-		p.printf("  the scan stopped after txn %s: %v. A replay fails here too.\n", lastSeq(in.Pending), in.ScanErr)
-	}
+	printTxns(p, in, func(fsck.PendingTxn) string { return "" })
 }
 
 func unixTime(sec int64) string {

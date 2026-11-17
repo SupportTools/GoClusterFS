@@ -1266,15 +1266,14 @@ var releaseLeaseBudget = recoveryLease / 2
 // still holds expected, the raw bytes the caller checked. Like a peer that
 // replays a crashed node's journal, it first takes the slot's recovery lease,
 // so neither Register nor failure detection touches the slot while reset
-// clears its journal; then it empties the slot. It returns false without
-// running reset if the slot changed or another node won the lease.
-func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error) (bool, error) {
+// clears its journal; then it empties the slot. A long reset calls renew, as a
+// replay does before each transaction: it keeps the lease and fails once
+// another node holds it. ReleaseSlot returns false without running reset if
+// the slot changed or another node won the lease.
+func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func(renew func() error) error) (bool, error) {
 	if slotIdx < 0 || slotIdx >= MaxNodes {
 		return false, fmt.Errorf("slot index out of range: %d", slotIdx)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	slot, err := deserializeSlot(expected)
 	if err != nil {
 		return false, err
@@ -1285,27 +1284,57 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error)
 	leaseStart := time.Now()
 	slot.RecoveryStart = leaseStart.Unix()
 	leased := serializeSlot(slot)
-	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
-		return false, err
-	}
-	time.Sleep(claimSettle)
-	if current, _, err := r.readSlotRaw(slotIdx); err != nil || !bytes.Equal(current, leased) {
+	if ok, err := r.takeReleaseLease(slotIdx, expected, leased); err != nil || !ok {
 		return false, err
 	}
 
-	if err := reset(); err != nil {
+	held := leaseStart
+	check := r.leaseCheck(slotIdx, slot.UUID, leaseStart)
+	renew := func() error {
+		if err := check(); err != nil {
+			return err
+		}
+		held = time.Now()
+		return nil
+	}
+	if err := reset(renew); err != nil {
 		return false, err
 	}
-	if age := time.Since(leaseStart); age > releaseLeaseBudget {
-		return false, fmt.Errorf("the journal reset took %s, too long to trust the slot's recovery lease; "+
+	if age := time.Since(held); age > releaseLeaseBudget {
+		return false, fmt.Errorf("the journal reset ran %s without renewing the slot's recovery lease, too long to trust it; "+
 			"the slot stays dead until the lease lapses", age.Round(time.Millisecond))
 	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, current, err := r.readSlotRaw(slotIdx)
+	if err != nil {
+		return false, err
+	}
+	// Renewals move only RecoveryStart; any other change means another writer.
+	renewed := *current
+	renewed.RecoveryStart = slot.RecoveryStart
+	if !bytes.Equal(serializeSlot(&renewed), leased) {
+		return false, fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
+	}
 	// No node replayed this slot to take over its orphans, so the slot keeps them for live nodes and its next owner.
-	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty, Orphans: slot.Orphans}))
+	ok, err := r.casSlot(slotIdx, raw, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty, Orphans: current.Orphans}))
 	if err == nil && !ok {
 		err = fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
 	}
 	return ok, err
+}
+
+// takeReleaseLease writes leased over expected and reports whether the slot still holds it after claimSettle.
+func (r *Registry) takeReleaseLease(slotIdx int, expected, leased []byte) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
+		return false, err
+	}
+	time.Sleep(claimSettle)
+	current, _, err := r.readSlotRaw(slotIdx)
+	return err == nil && bytes.Equal(current, leased), err
 }
 
 // GetFailedNodes returns information about nodes that have failed (stale heartbeat).
