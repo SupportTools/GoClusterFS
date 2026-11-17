@@ -484,10 +484,11 @@ func movedTo(o Op, renames map[string][]Op, r Rules) []string {
 	return out
 }
 
-// near reports whether rename rn, on another node, overlaps o or ended within a window before it. The renaming node's
-// kernel moves its own cached entry, so only other nodes can still reach the moved file through the old name.
+// near reports whether rename rn overlaps o or ended within a window before it, so o may act on the file rn moved.
+// The renaming node's kernel moves its own cached entry, so there only an op that started before the rename ended,
+// and may have opened the file then, can.
 func near(o, rn Op, r Rules) bool {
-	return rn.ID != o.ID && rn.Node != o.Node && rn.Start < o.End && rn.End+r.Window >= o.Start
+	return rn.ID != o.ID && (rn.Node != o.Node || o.Start < rn.End) && rn.Start < o.End && rn.End+r.Window >= o.Start
 }
 
 // wholeWords drops each 8-byte piece whose bytes all come from the pieces either side: the page cache can split a copy inside a word.

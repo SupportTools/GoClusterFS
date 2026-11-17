@@ -5013,6 +5013,13 @@ scenarios:
     environments:
       go: history/history_test.go::TestRenamingNodeNeverSeesTheMovedFileThroughTheOldName
 
+  - id: history-checker-same-node-overlap
+    name: Coherence checker lets a read open across a rename on its own node see the moved file
+    description: A read that started before a rename on its own node ended may return a value written through the new name, since its open file follows the moved file
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestReadOpenAcrossARenameOnItsOwnNodeSeesTheMovedFile
+
   - id: history-checker-rename-not-replaced-file
     name: Coherence checker never lets a renamed-away name show the file the rename replaced
     description: After a rename over an existing file, a read of the old name inside the cache window that shows the replaced file's data is a violation; one that shows a write through the new name after the rename passes

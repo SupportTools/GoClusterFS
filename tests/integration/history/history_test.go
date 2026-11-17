@@ -271,6 +271,15 @@ func TestRenamingNodeNeverSeesTheMovedFileThroughTheOldName(t *testing.T) {
 	expect(t, b, "stale or unknown value")
 }
 
+func TestReadOpenAcrossARenameOnItsOwnNodeSeesTheMovedFile(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Rename, Name: "a", To: "b", Node: 1}, 2000, 2010)
+	b.add(Op{Kind: Write, Name: "b", Value: 2, Node: 1}, 2050, 2060)
+	b.read("a", 2, 1990, 2100)
+	expect(t, b)
+}
+
 func TestRenamedAwayNameNeverSeesTheReplacedFile(t *testing.T) {
 	b := &builder{}
 	b.write("n0", 1, 0, 10)
