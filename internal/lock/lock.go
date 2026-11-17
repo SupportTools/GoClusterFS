@@ -196,6 +196,7 @@ type TypeStats struct {
 	Acquires uint64        // acquires served
 	Blocked  uint64        // acquires whose first try found the lock taken, served or not
 	Wait     time.Duration // time the blocked acquires spent in Acquire
+	Failed   uint64        // acquires that gave up with an error, such as a timeout or a failed node's lapsed replay
 }
 
 var typeNames = [numLockTypes]string{
@@ -348,8 +349,9 @@ func (m *Manager) Stats() Stats {
 			Acquires: c.held.Load() + c.joined.Load() + c.cached.Load() + c.claimed.Load(),
 			Blocked:  c.blocked.Load(),
 			Wait:     time.Duration(c.waitNanos.Load()),
+			Failed:   c.failed.Load(),
 		}
-		if ts.Acquires > 0 || ts.Blocked > 0 {
+		if ts.Acquires > 0 || ts.Blocked > 0 || ts.Failed > 0 {
 			stats.Types = append(stats.Types, ts)
 		}
 	}
@@ -386,9 +388,10 @@ var typeFirstRow = func() (first [numLockTypes]uint64) {
 // acquireCounts says how one lock type's acquires on this node were served:
 // a key this node already held, a join of a held record, a cached record, a
 // claim won on disk. retries counts tries that found the lock taken, blocked
-// the acquires that had at least one, and waitNanos their time in Acquire.
+// the acquires that had at least one, waitNanos their time in Acquire, and
+// failed the acquires that returned an error.
 type acquireCounts struct {
-	held, joined, cached, claimed, retries, blocked, waitNanos atomic.Uint64
+	held, joined, cached, claimed, retries, blocked, waitNanos, failed atomic.Uint64
 }
 
 func (m *Manager) countAcquire(lockType LockType, pick func(*acquireCounts) *atomic.Uint64) {
@@ -473,10 +476,15 @@ func (m *Manager) LogStats() {
 // A goroutine must not hold a lock while it waits for another goroutine that
 // needs the same record. Once the hold's turn is over, that goroutine cannot
 // join it, and both wait until the timeout.
-func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
+func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) (err error) {
 	if int(lockType) >= numLockTypes {
 		return fmt.Errorf("lock: unknown lock type %d", lockType)
 	}
+	defer func() {
+		if err != nil {
+			m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.failed })
+		}
+	}()
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 	recordID := m.hashToRecord(lockType, resourceID)
 	gid := getGoroutineID()
