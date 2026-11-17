@@ -2012,6 +2012,27 @@ scenarios:
     environments:
       go: internal/goclusterfs/stale_bytes_test.go::TestTruncateWhileAppending
 
+  - id: growing-write-keeps-other-nodes-append
+    name: Zeroing before a growing write never wipes another node's append
+    description: One node appends records while another writes past the end of the file; every acknowledged record survives the zeroing of the gap before the second write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestGrowingWriteNeverZeroesAnotherNodesAppend
+
+  - id: sequential-write-writes-data-once
+    name: A sequential write writes its data once
+    description: Writing 16 MiB in FUSE's 128 KiB pieces passes about 1x its size to write calls, with no block of zeros before each new block
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestSequentialWriteWritesDataOnce
+
+  - id: zero-range-stays-in-range
+    name: Zeroing part of a block leaves the blocks around it alone
+    description: The buffer pool rounds sizes up, so zeroing a block's tail must not also zero the start of the next block, which another file or directory owns
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestZeroRangeZeroesOnlyItsRange
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
