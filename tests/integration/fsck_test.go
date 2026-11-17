@@ -279,7 +279,7 @@ func TestFsckReleasesDeadSlot(t *testing.T) {
 	damageJournalHeader(t, image, offset)
 
 	expectFsck(t, 0, "damaged: journal superblock checksum mismatch", "-list-slots", image)
-	expectFsck(t, 0, "header damaged: journal superblock checksum mismatch", "-inspect-slot", slot, image)
+	expectFsck(t, 0, "journal superblock checksum mismatch. A replay fails here", "-inspect-slot", slot, image)
 	expectFsck(t, 16, "-inspect-slot needs a slot number", "-inspect-slot", "-2", image)
 	expectFsck(t, 16, "no such node registry slot", "-inspect-slot", "64", image)
 	expectFsck(t, 16, "-discard-journal needs -release-slot", "-discard-journal", image)
