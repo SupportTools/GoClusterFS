@@ -278,7 +278,7 @@ func TestInvalidateExtentPayload(t *testing.T) {
 func TestPeerAnnouncePayload(t *testing.T) {
 	original := &PeerAnnouncePayload{
 		NodeSlot: 3,
-		Port:     31337,
+		Port:     24730,
 		IPAddr:   [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 192, 168, 1, 100},
 	}
 
@@ -391,7 +391,7 @@ func TestMessageBuilder(t *testing.T) {
 
 	t.Run("PeerAnnounce", func(t *testing.T) {
 		ipAddr := [16]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 10, 0, 0, 1}
-		msg := builder.PeerAnnounce(5, 31337, ipAddr)
+		msg := builder.PeerAnnounce(5, 24730, ipAddr)
 
 		if msg.Type != TypePeerAnnounce {
 			t.Errorf("Type = %v, want %v", msg.Type, TypePeerAnnounce)
@@ -404,8 +404,8 @@ func TestMessageBuilder(t *testing.T) {
 		if payload.NodeSlot != 5 {
 			t.Errorf("NodeSlot = %d, want 5", payload.NodeSlot)
 		}
-		if payload.Port != 31337 {
-			t.Errorf("Port = %d, want 31337", payload.Port)
+		if payload.Port != 24730 {
+			t.Errorf("Port = %d, want 24730", payload.Port)
 		}
 	})
 

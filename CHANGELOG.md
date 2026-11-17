@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- The default broadcast ports moved from UDP 31337 and 31338 to UDP 24730 (`-mcast-port`) and 24731 (`-unicast-port`), out of Kubernetes' NodePort range 30000-32767, where kube-proxy can send their traffic to a service. Open the new ports in your firewall, or pass `-mcast-port 31337 -unicast-port 31338` on every node to keep the old ones.
 - The on-disk format is now version 3. Mount refuses devices formatted by earlier builds. Version 1 kept one journal for all nodes. Version 2 had room for 4096 inodes, and on devices over 128 GB its refcounts overwrote the snapshot registry and then data blocks. Copy the data off with the old build, reformat with `-format`, and copy it back.
 - Devices must be at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
 - Mount also refuses version 3 devices formatted before lock records had one claim slot per node, or before each lock type had its own lock records. Older builds refuse devices this version formats. Copy the data off with the build that formatted them and reformat.
@@ -62,6 +63,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A node that hears no broadcasts from a node the registry shows mounted, for 3 `-broadcast-heartbeat` intervals (90 seconds by default), logs a warning naming it, reports `broadcast-peers` as degraded on `/health`, and counts it in `goclusterfs_broadcast_silent_peers`. A network that silently drops multicast was invisible before.
 - Rename of files and directories, in one directory or between two, with `RENAME_NOREPLACE`. A rename over a file or an empty directory replaces it; a file another node has open stays readable there until its last close. `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
 - `goclusterfs-fsck` checks the directory tree: a directory with more than one name, a `..` that does not name the directory that names it, a directory link count other than 2 plus its subdirectories, and a `..` chain that never reaches the root. Repair reports these but does not change directories.
+- `-preflight` warns when a broadcast port or the API port is in the NodePort range 30000-32767 on a host that looks like a Kubernetes node.
 
 ### Changed
 
