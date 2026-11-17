@@ -290,9 +290,9 @@ func main() {
 	if err != nil {
 		failf("Cannot join the cluster: %v; check the device, then mount again", err)
 	}
-	nodeReg.SetSlotLostHandler(func(slot int, owner [16]byte) {
-		failf("Node registry slot %d is no longer this node's (owner %x); stopping so two nodes never share a journal. "+
-			"Check that the device is reachable and that this node did not stall, then mount again", slot, owner[:8])
+	nodeReg.SetSlotLostHandler(func(loss node.SlotLoss) {
+		failf("%s; stopping so two nodes never share a journal. "+
+			"Check that the device is reachable and that this node did not stall, then mount again", loss)
 	})
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
