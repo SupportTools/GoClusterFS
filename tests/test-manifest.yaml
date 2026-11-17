@@ -5604,7 +5604,7 @@ scenarios:
 
   - id: reads-never-see-part-of-a-write
     name: Whole-file reads never mix two writes from another node
-    description: One node keeps overwriting a 1 MB file with one 1 MB write of a single value at a time while every node reads it whole with O_DIRECT (and, in Go, also on mounts with -direct-io); no read returns parts of two writes
+    description: One node keeps overwriting a 1 MB file with one 1 MB write of a single value at a time while every node reads it whole with O_DIRECT (and, in Go, also on mounts with -direct-io); no read returns parts of two writes. In Go the run lasts until every node made 10 reads, and fails naming a node that could not within 60s
     priority: critical
     environments:
       go: atomic_read_test.go::TestMultiNodeReadsNeverSeePartOfAWrite
@@ -5631,3 +5631,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/file_io_test.go::TestReadClaimWaitsTwoTurnsBehindALiveWriteMark
+
+  - id: lock-slow-waiters-get-turns
+    name: Nodes with slow claims get turns from a low slot that keeps a lock
+    description: A node in slot 0 keeps taking a file I/O lock while two nodes whose slot writes and row reads each take 40 ms ask for it; both slow nodes and slot 0 get it at least 3 times in 3s
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestSlowWaitersGetTurnsFromALowSlotThatKeepsTheLock
