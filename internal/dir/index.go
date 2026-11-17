@@ -219,6 +219,9 @@ func (m *Manager) indexOf(dirIno *inode.Inode) (*index, error) {
 func (m *Manager) scan(dirIno *inode.Inode) (*index, []DirEntry, error) {
 	m.indexes.rebuilds.Add(1)
 	blocks := extent.BlocksForSize(dirIno.Size)
+	if total := m.extentMgr.TotalBlocks(); total > 0 && blocks > total {
+		return nil, nil, fmt.Errorf("%w: directory %d is %d bytes, more than the data region holds", extent.ErrBlockOutOfRange, dirIno.InodeNum, dirIno.Size)
+	}
 	x := &index{
 		num:   dirIno.InodeNum,
 		gen:   dirIno.MetaGeneration,
@@ -256,6 +259,9 @@ func (m *Manager) scan(dirIno *inode.Inode) (*index, []DirEntry, error) {
 
 func (m *Manager) physicalBlock(dirIno *inode.Inode, block uint64) (uint64, error) {
 	ext, offset, err := m.extentMgr.Lookup(dirIno, block)
+	if err == nil {
+		err = m.extentMgr.CheckRange(ext.PhysicalBlock, offset+1)
+	}
 	if err != nil {
 		return 0, err
 	}

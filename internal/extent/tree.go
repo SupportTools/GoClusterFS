@@ -297,6 +297,9 @@ func (m *Manager) loadNode(inodeNum uint32, block, gen uint64, level uint16) (*T
 }
 
 func (m *Manager) readNode(inodeNum uint32, block, gen uint64) (*TreeNode, error) {
+	if err := m.CheckRange(block, 1); err != nil {
+		return nil, err
+	}
 	n, err := ReadTreeNode(m.dev, m.dataOffset, block, gen)
 	if err != nil {
 		return nil, err
@@ -335,6 +338,9 @@ func ReadTreeNode(dev *storage.Device, dataOffset, block, gen uint64) (*TreeNode
 }
 
 func (m *Manager) writeNode(block uint64, n *TreeNode) error {
+	if err := m.CheckRange(block, 1); err != nil {
+		return err
+	}
 	size := treeNodeSize(n.count())
 	ab := storage.GetBuffer(size)
 	defer storage.PutBuffer(ab)

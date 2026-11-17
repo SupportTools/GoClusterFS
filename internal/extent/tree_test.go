@@ -939,3 +939,22 @@ func TestFoldOfUncommittedTreeKeepsReleases(t *testing.T) {
 		t.Fatalf("free blocks = %d after commit, want %d (only block 0 still mapped)", got, free-1)
 	}
 }
+
+// Replay maps the blocks a journal record names. One past the data region can only come from damage, and mapping it
+// would send later reads and writes outside the region.
+func TestAddExtentForRecoveryRefusesBlocksPastTheDataRegion(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	for _, ext := range []Extent{
+		{0, treeTestBlocks, 1, FlagAllocated},
+		{0, treeTestBlocks - 1, 2, FlagAllocated},
+		{0, 1<<64 - 1, 2, FlagAllocated},
+	} {
+		if err := env.mgr.AddExtentForRecovery(env.ctx, ino, &ext); !errors.Is(err, ErrBlockOutOfRange) {
+			t.Errorf("map %d blocks at %d: %v, want ErrBlockOutOfRange", ext.Length, ext.PhysicalBlock, err)
+		}
+	}
+	if err := env.mgr.AddExtentForRecovery(env.ctx, ino, &Extent{0, treeTestBlocks - 1, 1, FlagAllocated}); err != nil {
+		t.Errorf("map the last block: %v", err)
+	}
+}
