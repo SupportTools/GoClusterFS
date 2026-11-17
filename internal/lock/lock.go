@@ -650,7 +650,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
-	m.renewIdleTurn(recordID)
+	yield := m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (!covers(rec.mode, mode) || age(rec.renewed) > m.timing.renewAfter) {
@@ -667,7 +667,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 			}
 			return false, false, blocker{}, nil
 		}
-		if m.turnOverLocked(recordID, rec) && !m.goroutineHoldsRecordLocked(recordID, gid) &&
+		if yield && !m.goroutineHoldsRecordLocked(recordID, gid) &&
 			(waited < m.timing.holdTurn || !m.goroutineHoldsAnyLocked(gid)) {
 			if rec.keys > 0 {
 				m.mu.Unlock()
@@ -746,12 +746,14 @@ func (m *Manager) contestedTooLongLocked(recordID uint64) bool {
 	return waited && age(seen) > m.timing.holdTurn
 }
 
-// renewIdleTurn starts a new turn on a record whose turn is over when its row
-// shows no other node waiting: no claim that conflicts with this node's hold
-// and no live mark. Giving the record up would only make this node wait
-// yieldGap. A node that starts waiting after the row read waits one more turn.
-// It runs under the record gate.
-func (m *Manager) renewIdleTurn(recordID uint64) {
+// renewIdleTurn reports whether this node must give recordID up: its turn is
+// over and its row shows another node waiting, a claim that conflicts with this
+// node's hold or a live mark, or the row cannot be read. With nobody waiting it
+// starts a new turn instead, since giving the record up would only make this
+// node wait yieldGap. A node that starts waiting after the row read waits one
+// more turn. Callers act on its answer only, so a turn that runs out after its
+// check does not end with nobody waiting. It runs under the record gate.
+func (m *Manager) renewIdleTurn(recordID uint64) (yield bool) {
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
 	over := ok && m.turnOverLocked(recordID, rec)
@@ -761,14 +763,14 @@ func (m *Manager) renewIdleTurn(recordID uint64) {
 	}
 	m.mu.Unlock()
 	if !over {
-		return
+		return false
 	}
 	row, err := m.readRow(recordID)
 	if err != nil {
-		return
+		return true
 	}
 	if conflict, _, _ := m.rowConflicts(recordID, row, rec.mode, ignore); conflict || m.othersWaiting(row) {
-		return
+		return true
 	}
 	m.mu.Lock()
 	if m.records[recordID] == rec {
@@ -776,6 +778,7 @@ func (m *Manager) renewIdleTurn(recordID uint64) {
 		delete(m.contested, recordID)
 	}
 	m.mu.Unlock()
+	return false
 }
 
 // endTurnLocked drops this node's hold on recordID, which the caller releases
@@ -927,7 +930,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
-	m.renewIdleTurn(recordID)
+	yield := m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
@@ -940,7 +943,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 		m.mu.Unlock()
 		return nil
 	}
-	if m.turnOverLocked(recordID, rec) {
+	if yield {
 		m.endTurnLocked(recordID)
 		m.mu.Unlock()
 		return m.releaseRecord(recordID)
@@ -958,7 +961,7 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
-	m.renewIdleTurn(recordID)
+	yield := m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
@@ -967,7 +970,7 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 		return
 	}
 	// A hold that ends while another node has waited long yields, however new.
-	if m.turnOverLocked(recordID, rec) || m.contestedTooLongLocked(recordID) {
+	if yield || m.contestedTooLongLocked(recordID) {
 		m.endTurnLocked(recordID)
 	} else {
 		delete(m.records, recordID)

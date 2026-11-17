@@ -5651,7 +5651,7 @@ scenarios:
 
   - id: lock-holder-keeps-unwanted-record
     name: A holder keeps a record no other node waits for
-    description: A node that keeps taking a lock past its turn starts a new turn instead of yielding when the record shows no other node's claim or mark, so none of its acquires wait
+    description: A node that keeps taking a lock past its turn starts a new turn instead of yielding when the record shows no other node's claim or mark, so none of its acquires wait, even with a 1ns turn that runs out between its row check and its release
     priority: go_only
     environments:
       go: internal/lock/fairness_test.go::TestHolderKeepsRecordNobodyWaitsFor
