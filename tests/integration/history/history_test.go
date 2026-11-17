@@ -231,3 +231,47 @@ func TestStaleOpenOnlyWhenTheNameLostItsFileTwice(t *testing.T) {
 	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 2000, 2100)
 	expect(t, b, "ESTALE while its name kept its file")
 }
+
+func TestRenamedAwayNameMayOpenTheMovedFileForAWindow(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Rename, Name: "a", To: "b"}, 2000, 2010)
+	b.write("b", 2, 2100, 2110)
+	b.read("a", 2, 2200, 2210)
+	b.add(Op{Kind: Stat, Name: "a", Size: 12288, Node: 1}, 2200, 2201)
+	b.read("a", 2, 3500, 3510)
+	expect(t, b, "read found a name that should be gone")
+}
+
+func TestWriteNearARenameMayLandInEitherName(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Rename, Name: "a", To: "b"}, 2000, 2010)
+	b.write("b", 2, 2100, 2110)
+	b.write("a", 3, 2900, 2950)
+	b.read("b", 3, 4000, 4010)
+	b.write("a", 4, 3500, 3510)
+	b.read("b", 4, 5000, 5010)
+	expect(t, b, "stale or unknown value right after open")
+}
+
+func TestPageCacheTearMayComeThroughTheOtherNameOfARename(t *testing.T) {
+	b := &builder{}
+	b.add(Op{Kind: Rename, Name: "a", To: "b"}, 0, 10)
+	b.add(Op{Kind: Write, Name: "b", Value: 1, Node: 1}, 100, 110)
+	b.add(Op{Kind: Write, Name: "b", Value: 2, Node: 1}, 200, 260)
+	torn := []Piece{{At: 0, Value: 1}, {At: 4096, Value: 2}}
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 1, Pieces: torn}, 250, 251)
+	b.add(Op{Kind: Read, Name: "a", Content: Torn, Size: 12288, Node: 2, Pieces: torn}, 250, 251)
+	expect(t, b, "torn read")
+}
+
+func TestRenameOntoANameCountsAsItLosingItsFile(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.write("b", 2, 0, 10)
+	b.add(Op{Kind: Rename, Name: "b", To: "a"}, 110, 120)
+	b.add(Op{Kind: Rename, Name: "c", To: "a"}, 150, 160)
+	b.add(Op{Kind: Read, Name: "a", Result: Stale, Node: 1}, 100, 200)
+	expect(t, b)
+}

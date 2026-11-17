@@ -107,7 +107,8 @@ type Piece struct {
 // Rules are the guarantees a history is checked against.
 type Rules struct {
 	// Window is how long stat, lookups and listings on one node may show a name
-	// as it was before another node's change: -attr-timeout plus some slack.
+	// as it was before another node's change: -attr-timeout plus some slack. For
+	// that long after a rename, opening its old name may open the moved file.
 	Window time.Duration
 	// WriteSize is the size of every Write. Stat sizes must be 0 or WriteSize.
 	WriteSize int64
@@ -180,6 +181,7 @@ func Check(ops []Op, r Rules) []Violation {
 		}
 		l.maxDur = max(l.maxDur, m.op.End-m.op.Start)
 	}
+	renames := renamesByName(ops)
 	for _, o := range ops {
 		maybe := o.Result == Failed
 		if o.Result != OK && !maybe {
@@ -189,7 +191,11 @@ func Check(ops []Op, r Rules) []Violation {
 		case Create:
 			add(o.Name, mutation{o, state{present: true, empty: true}, maybe})
 		case Write:
-			add(o.Name, mutation{o, state{present: true, value: o.Value}, maybe})
+			movedTo := movedTo(o, renames, r)
+			add(o.Name, mutation{o, state{present: true, value: o.Value}, maybe || len(movedTo) > 0})
+			for _, name := range movedTo {
+				add(name, mutation{o, state{present: true, value: o.Value}, true})
+			}
 		case Unlink:
 			add(o.Name, mutation{o, state{}, maybe})
 		case Rename:
@@ -218,7 +224,7 @@ func Check(ops []Op, r Rules) []Violation {
 		case o.Kind == Write && o.Result == Exists:
 			out = append(out, Violation{What: "open with O_CREAT and no O_EXCL failed with EEXIST", Op: o, Allowed: "the file opened", History: []Op{o}})
 		case o.Result != OK && o.Result != NotFound && o.Result != Exists:
-		case o.Kind == Read && o.Content == Torn && localWriteTear(o, logs[o.Name], r):
+		case o.Kind == Read && o.Content == Torn && localWriteTear(o, logs, otherNames(o, o.Name, renames, r), r):
 		case o.Kind == Read || o.Kind == Stat:
 			if v, bad := checkName(o, o.Name, observed(o, r), logs[o.Name], r); bad {
 				out = append(out, v)
@@ -321,16 +327,22 @@ func possible(o Op, l *nameLog, settled time.Duration) ([]state, []Op) {
 			states = append(states, state{})
 		}
 	}
-	writing := false
+	writing, movedAway := false, false
 	l.during(settled, o.End, func(m mutation) {
 		take(m)
 		writing = writing || m.op.Kind == Write && m.op.ID != o.ID
+		movedAway = movedAway || m.op.Kind == Rename && !m.after.present
 	})
 	for _, m := range l.maybes {
 		if m.op.Start < o.End && m.op.End >= latest {
 			take(m)
 			writing = writing || m.op.Kind == Write
+			movedAway = movedAway || m.op.Kind == Rename && !m.after.present
 		}
+	}
+	moved := state{present: true, any: true}
+	if movedAway && !slices.Contains(states, moved) {
+		states = append(states, moved)
 	}
 	created := state{present: true, empty: true}
 	if writing && slices.Contains(states, state{}) && !slices.Contains(states, created) {
@@ -356,7 +368,7 @@ func churned(o Op, l *nameLog, r Rules) bool {
 	before, during := 0, 0
 	l.during(o.Start-r.Window, o.End, func(m mutation) {
 		switch {
-		case m.after.present:
+		case m.after.present && m.op.Kind != Rename:
 		case m.op.End >= o.Start:
 			during++
 		default:
@@ -366,22 +378,79 @@ func churned(o Op, l *nameLog, r Rules) bool {
 	return during >= 1 && before+during >= 2
 }
 
-// localWriteTear reports whether a torn read overlapped a write on its own node and, apart from words the page cache split, saw only values it may see.
-func localWriteTear(o Op, l *nameLog, r Rules) bool {
+// localWriteTear reports whether a torn read overlapped a write on its own node, through its name or the other name
+// of a nearby rename, and, apart from words the page cache split, saw only values it may see.
+func localWriteTear(o Op, logs map[string]*nameLog, others []string, r Rules) bool {
+	l := logs[o.Name]
 	if o.Size != r.WriteSize || len(o.Pieces) < 2 || l == nil {
 		return false
 	}
 	allowed, _ := possible(o, l, o.Start-r.Window)
+	anyValue := slices.ContainsFunc(allowed, func(s state) bool { return s.any })
 	overlapping := false
 	for _, p := range wholeWords(o.Pieces) {
-		if p.At%8 != 0 || p.Value == 0 || !slices.Contains(allowed, state{present: true, value: p.Value}) {
+		if p.At%8 != 0 || p.Value == 0 || !anyValue && !slices.Contains(allowed, state{present: true, value: p.Value}) {
 			return false
 		}
-		l.during(o.Start, o.End, func(m mutation) {
+		same := func(m mutation) {
 			overlapping = overlapping || m.op.Kind == Write && m.op.Node == o.Node && m.op.Value == p.Value
-		})
+		}
+		for _, name := range append([]string{o.Name}, others...) {
+			if nl := logs[name]; nl != nil {
+				nl.during(o.Start, o.End, same)
+				for _, m := range nl.maybes {
+					if m.op.Start < o.End && m.op.End >= o.Start {
+						same(m)
+					}
+				}
+			}
+		}
 	}
 	return overlapping
+}
+
+// renamesByName lists each rename that may have taken effect under both of its names.
+func renamesByName(ops []Op) map[string][]Op {
+	by := map[string][]Op{}
+	for _, o := range ops {
+		if o.Kind == Rename && (o.Result == OK || o.Result == Failed) {
+			by[o.Name] = append(by[o.Name], o)
+			by[o.To] = append(by[o.To], o)
+		}
+	}
+	return by
+}
+
+// otherNames returns the other name of each rename of name that overlaps o or ended within a window before it: a
+// node's kernel may still resolve name to the file the rename moved away or replaced.
+func otherNames(o Op, name string, renames map[string][]Op, r Rules) []string {
+	var out []string
+	for _, rn := range renames[name] {
+		other := rn.To
+		if other == name {
+			other = rn.Name
+		}
+		if near(o, rn, r) && !slices.Contains(out, other) {
+			out = append(out, other)
+		}
+	}
+	return out
+}
+
+// movedTo returns where nearby renames moved the file o's name named: o, opened through a cached entry, may act on it.
+func movedTo(o Op, renames map[string][]Op, r Rules) []string {
+	var out []string
+	for _, rn := range renames[o.Name] {
+		if rn.Name == o.Name && near(o, rn, r) && !slices.Contains(out, rn.To) {
+			out = append(out, rn.To)
+		}
+	}
+	return out
+}
+
+// near reports whether rename rn overlaps o or ended within a window before it.
+func near(o, rn Op, r Rules) bool {
+	return rn.ID != o.ID && rn.Start < o.End && rn.End+r.Window >= o.Start
 }
 
 // wholeWords drops each 8-byte piece whose bytes all come from the pieces either side: the page cache can split a copy inside a word.
