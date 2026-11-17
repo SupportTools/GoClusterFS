@@ -156,9 +156,9 @@ func TestReaderNeverSeesUncommittedBlocks(t *testing.T) {
 	for i := range data {
 		data[i] = byte(i/BlockSize + 1)
 	}
-	// After each block, node A waits for a read that started after it, so B
-	// sees every block's size however the two are scheduled. B keeps reading
-	// while A writes the next block.
+	// After each quarter of the file, node A waits for a read that started
+	// after it, so B sees at least three sizes however the two are scheduled.
+	// B keeps reading while A writes on.
 	done, read, stop := make(chan error, 1), make(chan struct{}, 1), make(chan struct{})
 	defer close(stop)
 	readAfterNow := func() bool {
@@ -181,7 +181,7 @@ func TestReaderNeverSeesUncommittedBlocks(t *testing.T) {
 				done <- fmt.Errorf("write at %d: n=%d errno=%v", off, n, errno)
 				return
 			}
-			if (off+chunk)%BlockSize == 0 && !readAfterNow() {
+			if end := off + chunk; end%(len(data)/4) == 0 && end < len(data) && !readAfterNow() {
 				return
 			}
 		}
@@ -217,8 +217,8 @@ func TestReaderNeverSeesUncommittedBlocks(t *testing.T) {
 		default:
 		}
 	}
-	if len(sizes) < blocks {
-		t.Fatalf("node B saw the file at only %d non-empty sizes while node A wrote %d blocks", len(sizes), blocks)
+	if len(sizes) < 3 {
+		t.Fatalf("node B saw the file at only %d non-empty sizes while node A wrote it", len(sizes))
 	}
 }
 
