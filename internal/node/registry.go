@@ -1232,7 +1232,8 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error)
 		return false, fmt.Errorf("the journal reset took %s, too long to trust the slot's recovery lease; "+
 			"the slot stays dead until the lease lapses", age.Round(time.Millisecond))
 	}
-	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
+	// No node replayed this slot to take over its orphans, so the slot keeps them for live nodes and its next owner.
+	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty, Orphans: slot.Orphans}))
 	if err == nil && !ok {
 		err = fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
 	}

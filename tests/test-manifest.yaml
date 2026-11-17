@@ -2138,6 +2138,13 @@ scenarios:
     environments:
       go: internal/node/registry_test.go::TestReleaseSlotGivesUpOnSlowReset
 
+  - id: release-slot-keeps-orphans
+    name: Slot release keeps the slot's orphan list
+    description: A slot fsck releases keeps the list of files its node unlinked while they were open, so live nodes learn them and the next node in the slot frees them, instead of leaking them until repair
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotKeepsOrphans
+
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust
     description: A zero inode size, no or too many data blocks, a wrapping offset or overlapping regions abort fsck in phase 1 with exit code 8
