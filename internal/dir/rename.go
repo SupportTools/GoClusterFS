@@ -123,7 +123,12 @@ func (m *Manager) renameLocked(ctx context.Context, op *RenameOp) (*Renamed, err
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
 	if op.Stuck != nil {
-		op.Stuck(fmt.Errorf("rename %q to %q is half done: %w", op.OldName, op.NewName, failed))
+		replacing := ""
+		if op.Target != 0 {
+			replacing = fmt.Sprintf(", replacing inode %d", op.Target)
+		}
+		op.Stuck(fmt.Errorf("rename of %q (inode %d) in directory %d to %q in directory %d%s is half done: %w",
+			op.OldName, op.Child, op.OldParent, op.NewName, op.NewParent, replacing, failed))
 	}
 	return nil, failed
 }

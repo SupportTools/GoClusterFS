@@ -45,6 +45,7 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 | `Journal: disabled (no crash consistency guarantees)` | `-journal=false`. This node also skipped replaying its slot's journal. |
 | `[Recovery] Replaying slot N (node ...) failed` | Another node's journal cannot be replayed. See [Damaged Journal Slot](#damaged-journal-slot). |
 | `ERROR: heartbeats to node registry slot N have failed` | This node cannot write the device. It stops. |
+| `[ERROR] Stopping this node and keeping its locks: rename of ... is half done` | A rename hit a write error after its journal commit, and three tries to redo the missing writes failed too. The mount exits without releasing its locks, so another node replays its journal and finishes the rename. See [Handling Node Failure](#handling-node-failure). Check the device before mounting this node again. |
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Failed to start cache broadcast: ...` | The mount stops before it touches the device. See [Mount Fails: "Failed to start cache broadcast"](TROUBLESHOOTING.md#mount-fails-failed-to-start-cache-broadcast). |
 | `Warning: Failed to start API server` | The API port is taken. The mount runs without the API, `/metrics`, `gfsctl` and the dashboard. |
@@ -328,6 +329,8 @@ When a node fails unexpectedly:
 1. **Other nodes keep running.** Operations that need one of the failed node's locks wait until the lock is taken over.
 2. **Locks and journal.** Once the failed node is proven dead, one surviving node takes over its exclusive locks, replays its journal, then frees the locks. Until then, operations that need its locks wait, however long that takes. See [Node Requirements](#node-requirements).
 3. **No action is needed** on the surviving nodes.
+
+A node also stops on purpose when a rename hits a lasting I/O error after its journal commit. A rename changes two directory entries in separate writes, so the node first redoes the writes that failed while it still holds its locks. If they keep failing, it logs `[ERROR] Stopping this node and keeping its locks` with the names, the inode numbers and the error, and exits. Its locks stay claimed, so no other node can change those directories until failover replays its journal and finishes the rename. The file or directory then has its new name only. Other operations that fail after their commit leave at most an inode or blocks that no name reaches; `goclusterfs-fsck -repair` reclaims those.
 
 **When the failed node comes back**, mount it again with the same options. If it gets its old registry slot back (same hostname and boot ID), it replays its own journal before serving. Don't run fsck while other nodes have the device mounted: `-repair` refuses, and a check-only run reads metadata that is changing.
 

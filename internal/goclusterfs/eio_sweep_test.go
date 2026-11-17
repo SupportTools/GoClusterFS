@@ -554,10 +554,12 @@ func TestFailedRenameFinishesBeforeAPeerChangesTheOldParent(t *testing.T) {
 		p1Ino := readInode(t, nodeB, p1.inodeNum)
 		added := make(chan error, 1)
 		var count atomic.Int64
+		var fired atomic.Bool
 		nodeA.dev.SetWriteGate(func(int64) error {
 			if count.Add(1)-1 != int64(n) {
 				return nil
 			}
+			fired.Store(true)
 			go func() {
 				added <- nodeB.dirMgr.Add(context.Background(), p1Ino, "peer", uint64(peer.inodeNum), dir.DT_REG)
 			}()
@@ -567,7 +569,7 @@ func TestFailedRenameFinishesBeforeAPeerChangesTheOldParent(t *testing.T) {
 		_ = p1.Rename(context.Background(), "a", p2, "b", 0)
 		writes := int(count.Load())
 		nodeA.dev.SetWriteGate(func(int64) error { return nil })
-		if n >= 0 {
+		if fired.Load() {
 			if err := <-added; err != nil {
 				t.Fatalf("peer add: %v", err)
 			}
@@ -577,7 +579,7 @@ func TestFailedRenameFinishesBeforeAPeerChangesTheOldParent(t *testing.T) {
 				t.Errorf("the rename did not happen, but b names inode %d, not %d", got, b)
 			}
 		}
-		if n >= 0 && named(t, nodeA, p1.inodeNum, "peer") != peer.inodeNum {
+		if fired.Load() && named(t, nodeA, p1.inodeNum, "peer") != peer.inodeNum {
 			t.Error("the peer's file is missing from the old parent")
 		}
 		expectDirLinks(t, nodeA, p1.inodeNum)
@@ -591,15 +593,16 @@ func TestFailedRenameFinishesBeforeAPeerChangesTheOldParent(t *testing.T) {
 	}
 }
 
-// When every write fails from a rename's old-name removal on, the rename cannot finish. It stops the node with its
-// locks held, so a peer waiting for the old parent stays blocked until replay finishes the rename.
+// When the first try and every retry of a directory move fail from its old-name removal on, the move cannot finish.
+// It stops the node with its locks held, so a peer waiting for the old parent stays blocked until replay finishes the
+// move with one name, the right "..", both link counts right and fsck clean.
 func TestStuckRenameKeepsItsLocksUntilReplay(t *testing.T) {
 	t.Parallel()
 	nodeA, path, offset, size := journaledFS(t)
 	withBridge(nodeA)
 	nodeB := openFormattedFS(t, path)
 	p1, p2 := newSubdir(t, nodeA, "p1"), newSubdir(t, nodeA, "p2")
-	a := fileIn(t, nodeA, p1.inodeNum, "a").inodeNum
+	d := newDirIn(t, nodeA, p1.inodeNum, "d")
 	peer := newRegularFile(t, nodeB)
 	if _, err := nodeB.updateInode(context.Background(), peer.inodeNum, func(ino *inode.Inode) error { ino.LinkCount = 1; return nil }); err != nil {
 		t.Fatal(err)
@@ -625,7 +628,7 @@ func TestStuckRenameKeepsItsLocksUntilReplay(t *testing.T) {
 		}
 		return nil
 	})
-	go func() { _ = p1.Rename(context.Background(), "a", p2, "b", 0) }()
+	go func() { _ = p1.Rename(context.Background(), "d", p2, "e", 0) }()
 	select {
 	case err := <-stuck:
 		t.Logf("stopped: %v", err)
@@ -653,8 +656,13 @@ func TestStuckRenameKeepsItsLocksUntilReplay(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the peer still waits after replay")
 	}
-	expectOneName(t, replayed, p1.inodeNum, "a", p2.inodeNum, "b", a)
+	if !expectOneName(t, replayed, p1.inodeNum, "d", p2.inodeNum, "e", d.inodeNum) {
+		t.Error("replay did not finish the move")
+	}
+	if got := named(t, replayed, d.inodeNum, ".."); got != p2.inodeNum {
+		t.Errorf("\"..\" of the moved directory names %d, want %d", got, p2.inodeNum)
+	}
 	expectDirLinks(t, replayed, p1.inodeNum)
 	expectDirLinks(t, replayed, p2.inodeNum)
-	expectOnlyLeaks(t, replayed)
+	expectCleanFsck(t, replayed)
 }
