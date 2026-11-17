@@ -2605,6 +2605,13 @@ scenarios:
     environments:
       go: internal/testnet/testnet_test.go::TestPortsReachThisProcess
 
+  - id: integration-watchdog-connection
+    name: The hang watchdog aborts only its own mount's FUSE connection
+    description: The integration harness finds a mount's FUSE connection by its exact mount point in mountinfo, takes the top of stacked mounts, and finds none when a non-FUSE mount covers it
+    priority: go_only
+    environments:
+      go: tests/integration/watchdog_test.go::TestWatchdogFindsTheMountsOwnFUSEConnection
+
   - id: broadcast-silent-peers
     name: Silent broadcast peers are reported
     description: A node the registry shows mounted but not heard for 3 heartbeat intervals counts as silent until it is heard again or unmounts; this node is never listed
