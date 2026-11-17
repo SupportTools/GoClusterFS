@@ -177,7 +177,7 @@ A snapshot stays with the file it was taken of. When you delete the file, its sn
 
 Snapshots and clones share blocks with the file and copy a block on its first write. A block is freed when no file, snapshot, or clone uses it. Before you mount an image with snapshots or clones using a newer build, read the upgrade notes in [CHANGELOG.md](../CHANGELOG.md).
 
-**What a snapshot captures while the file is written.** A snapshot or clone captures each write request whole: up to MaxWrite, currently 128 KiB, rising to 1 MiB. The kernel splits a larger `write()` into several requests, and a snapshot may capture some of them, as it always could from another node. For a consistent snapshot of a file that writes larger records, pause its writers first.
+**What a snapshot captures while the file is written.** A snapshot or clone captures each write request whole: up to MaxWrite, 1 MiB. The kernel splits a larger `write()` into several requests, and a snapshot may capture some of them, as it always could from another node. For a consistent snapshot of a file that writes larger records, pause its writers first.
 
 ---
 
