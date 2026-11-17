@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"path"
 	"slices"
@@ -139,7 +140,7 @@ func (m *Model) expect(op *Op) int {
 			return int(syscall.ENOTEMPTY)
 		}
 	case "rename":
-		return anyErrno
+		return m.expectRename(op.Path, op.Path2)
 	case "snapshot":
 		switch {
 		case f == nil:
@@ -197,6 +198,8 @@ func (m *Model) apply(op *Op) {
 		m.Dirs[op.Path] = true
 	case "rmdir":
 		delete(m.Dirs, op.Path)
+	case "rename":
+		m.applyRename(op.Path, op.Path2)
 	case "snapshot":
 		m.Snaps[op.Name] = &Snap{Data: bytes.Clone(f.Data), Owner: f}
 		f.Snaps[op.Name] = true
@@ -287,7 +290,7 @@ func (l *lane) generate(m *Model) *Op {
 		w    int
 	}{
 		{"create", 15}, {"write", 30}, {"truncate", 8}, {"unlink", 8}, {"mkdir", 4}, {"rmdir", 4},
-		{"rename", 2}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3}, {"symlink", 5},
+		{"rename", 6}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3}, {"symlink", 5},
 	}
 	total := 0
 	for _, w := range weights {
@@ -375,8 +378,7 @@ func (l *lane) generate(m *Model) *Op {
 			}
 		}
 	case "rename":
-		op.Path = pick(r, files)
-		op.Path2 = path.Join(path.Dir(op.Path), l.name("r"))
+		op.Path, op.Path2 = l.renamePaths(r, files, links, dirs, parents)
 	case "snapshot":
 		op.Path, op.Name = pick(r, files), l.name("s")
 	case "clone":
@@ -402,6 +404,113 @@ func (l *lane) generate(m *Model) *Op {
 		}
 	}
 	return op
+}
+
+// expectRename returns what rename(2) returns, in the order the kernel and goclusterfs check.
+func (m *Model) expectRename(src, dst string) int {
+	srcDir := m.Dirs[src]
+	switch {
+	case !m.exists(src) || !m.Dirs[path.Dir(dst)]:
+		return int(syscall.ENOENT)
+	case src == dst:
+		return 0
+	case srcDir && strings.HasPrefix(dst, src+"/"):
+		return int(syscall.EINVAL)
+	case strings.HasPrefix(src, dst+"/"):
+		return int(syscall.ENOTEMPTY)
+	case !m.exists(dst):
+		return 0
+	case srcDir && !m.Dirs[dst]:
+		return int(syscall.ENOTDIR)
+	case !srcDir && m.Dirs[dst]:
+		return int(syscall.EISDIR)
+	case srcDir && m.hasChildren(dst):
+		return int(syscall.ENOTEMPTY)
+	}
+	return 0
+}
+
+// applyRename moves src, and everything under it, to dst. A file it replaces loses its snapshots, as unlink does.
+func (m *Model) applyRename(src, dst string) {
+	if src == dst {
+		return
+	}
+	if f := m.Files[dst]; f != nil {
+		for name := range f.Snaps {
+			m.Snaps[name].Owner = nil
+		}
+	}
+	delete(m.Files, dst)
+	delete(m.Links, dst)
+	delete(m.Dirs, dst)
+	moved := func(p string) (string, bool) {
+		if p == src || strings.HasPrefix(p, src+"/") {
+			return dst + strings.TrimPrefix(p, src), true
+		}
+		return "", false
+	}
+	for _, p := range slices.Collect(maps.Keys(m.Files)) {
+		if q, ok := moved(p); ok {
+			m.Files[q] = m.Files[p]
+			delete(m.Files, p)
+		}
+	}
+	for _, p := range slices.Collect(maps.Keys(m.Links)) {
+		if q, ok := moved(p); ok {
+			m.Links[q] = m.Links[p]
+			delete(m.Links, p)
+		}
+	}
+	for _, p := range slices.Collect(maps.Keys(m.Dirs)) {
+		if q, ok := moved(p); ok {
+			delete(m.Dirs, p)
+			m.Dirs[q] = true
+		}
+	}
+}
+
+// renamePaths picks a rename of one of the lane's files, links or directories. Most move to a new name; the rest
+// replace another of the lane's entries, or fail: a missing source or parent, a type mismatch, a directory with
+// entries, or a directory moved into itself. Directories stay directly under the shared directories, which only
+// lanes' own directories sit in, so no lane moves another lane's entries.
+func (l *lane) renamePaths(r *rand.Rand, files, links, dirs, parents []string) (string, string) {
+	switch v := r.IntN(10); {
+	case v < 2 && len(dirs) > 0:
+		src := pick(r, dirs)
+		switch r.IntN(5) {
+		case 0:
+			return src, path.Join(src, l.name("d"))
+		case 1:
+			return src, pick(r, dirs)
+		case 2:
+			return src, pick(r, files)
+		}
+		return src, path.Join(pick(r, sharedDirs), l.name("d"))
+	case v == 2 && len(links) > 0:
+		return pick(r, links), l.renameTarget(r, files, links, dirs, parents)
+	case v == 3:
+		return path.Join(pick(r, parents), l.name("missing")), path.Join(pick(r, parents), l.name("r"))
+	}
+	return pick(r, files), l.renameTarget(r, files, links, dirs, parents)
+}
+
+// renameTarget picks where a file or link goes: usually a new name, sometimes over the lane's own entries.
+func (l *lane) renameTarget(r *rand.Rand, files, links, dirs, parents []string) string {
+	switch r.IntN(8) {
+	case 0:
+		return pick(r, files)
+	case 1:
+		if len(dirs) > 0 {
+			return pick(r, dirs)
+		}
+	case 2:
+		if len(links) > 0 {
+			return pick(r, links)
+		}
+	case 3:
+		return path.Join(pick(r, sharedDirs), l.name("missing"), l.name("r"))
+	}
+	return path.Join(pick(r, parents), l.name("r"))
 }
 
 // target picks a symlink target in the lane's names: a lane file, a missing name, or one too long for the inode.

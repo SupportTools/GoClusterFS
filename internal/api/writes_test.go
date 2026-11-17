@@ -163,8 +163,8 @@ func TestWriteErrorsMapToStatus(t *testing.T) {
 		{syscall.EIO, http.StatusInternalServerError},
 		{fmt.Errorf("%w: bad", ErrInvalidPath), http.StatusBadRequest},
 		{fmt.Errorf("snapshots are %w", ErrDisabled), http.StatusConflict},
-		{fmt.Errorf("%w", ErrNotMounted), http.StatusServiceUnavailable},
-		{syscall.ENOSYS, http.StatusNotImplemented},
+		{fmt.Errorf("/f: %w", syscall.ESTALE), http.StatusConflict},
+		{fmt.Errorf("/f goes through a symlink: %w", syscall.ELOOP), http.StatusBadRequest},
 	} {
 		files.err = tc.err
 		if status, _ := call(t, srv, "POST", "/api/v1/snapshots", "secret", `{"path":"/f","name":"s"}`); status != tc.want {

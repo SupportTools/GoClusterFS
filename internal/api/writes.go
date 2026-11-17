@@ -38,9 +38,6 @@ var (
 
 	// ErrDisabled is returned when the feature is turned off by a mount flag.
 	ErrDisabled = errors.New("disabled")
-
-	// ErrNotMounted is returned when the filesystem is no longer mounted.
-	ErrNotMounted = errors.New("not mounted")
 )
 
 // SnapshotInfo describes one snapshot in the registry.
@@ -377,13 +374,11 @@ func writeOpError(w http.ResponseWriter, err error) {
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrDisabled):
 		status = http.StatusConflict
-	case errors.Is(err, ErrNotMounted):
-		status = http.StatusServiceUnavailable
 	case errors.As(err, &errno):
 		switch errno {
 		case syscall.ENOENT:
 			status = http.StatusNotFound
-		case syscall.EEXIST, syscall.ENOTSUP, syscall.EBUSY, syscall.EAGAIN:
+		case syscall.EEXIST, syscall.ENOTSUP, syscall.EBUSY, syscall.EAGAIN, syscall.ESTALE:
 			status = http.StatusConflict
 		case syscall.EINVAL, syscall.ENAMETOOLONG, syscall.EISDIR, syscall.ENOTDIR, syscall.ELOOP, syscall.EXDEV:
 			status = http.StatusBadRequest
@@ -391,8 +386,6 @@ func writeOpError(w http.ResponseWriter, err error) {
 			status = http.StatusInsufficientStorage
 		case syscall.EACCES, syscall.EPERM:
 			status = http.StatusForbidden
-		case syscall.ENOSYS:
-			status = http.StatusNotImplemented
 		}
 	}
 	writeError(w, status, http.StatusText(status), err.Error())

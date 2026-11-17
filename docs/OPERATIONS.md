@@ -177,6 +177,8 @@ A snapshot stays with the file it was taken of. When you delete the file, its sn
 
 Snapshots and clones share blocks with the file and copy a block on its first write. A block is freed when no file, snapshot, or clone uses it. Before you mount an image with snapshots or clones using a newer build, read the upgrade notes in [CHANGELOG.md](../CHANGELOG.md).
 
+**What a snapshot captures while the file is written.** A snapshot or clone captures each write request whole: up to MaxWrite, currently 128 KiB, rising to 1 MiB. The kernel splits a larger `write()` into several requests, and a snapshot may capture some of them, as it always could from another node. For a consistent snapshot of a file that writes larger records, pause its writers first.
+
 ---
 
 ## Cluster Management
@@ -403,7 +405,7 @@ rsync -av /mnt/cluster/ /backup/goclusterfs_files/
 
 #### Method 3: Snapshot of One File
 
-Snapshots work on single files, not the whole filesystem. To copy a consistent version of one busy file, snapshot it, clone the snapshot, and copy the clone:
+Snapshots work on single files, not the whole filesystem. To copy a version of one busy file, snapshot it, clone the snapshot, and copy the clone. A snapshot holds each write request whole but can split a larger `write()`; see [Managing Snapshots](#managing-snapshots):
 
 ```bash
 setfattr -n user.snapshot -v backup1 /mnt/cluster/data.db
@@ -447,7 +449,7 @@ goclusterfs-fsck -repair /dev/device
 goclusterfs-mount -device /dev/device -mount /mnt/cluster
 ```
 
-`-repair` fixes refcounts and the superblock checksum, frees leaked blocks and inodes no directory names, and rewrites a snapshot registry sector that fails its checksum, keeping the snapshots whose descriptors pass their own checksum. It never edits directories, and there is no `lost+found`. Restore anything else from backup. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide).
+`-repair` fixes refcounts and the superblock checksum, frees leaked blocks and inodes no directory names, and rewrites a snapshot registry sector that fails its checksum, keeping the snapshots whose descriptors pass their own checksum. It edits directories only to point a wrong `.` or `..` back at the right directory, and there is no `lost+found`. Restore anything else from backup. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide).
 
 ---
 

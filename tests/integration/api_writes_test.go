@@ -275,7 +275,10 @@ func TestAPIWritesDuringFileIO(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := f.WriteAt(chunked(i, v, size), 0); err != nil {
+				unwatch := m.watchStall(t, fmt.Sprintf("write f%d", i))
+				_, err := f.WriteAt(chunked(i, v, size), 0)
+				unwatch()
+				if err != nil {
 					t.Errorf("write f%d: %v", i, err)
 					return
 				}
@@ -290,7 +293,10 @@ func TestAPIWritesDuringFileIO(t *testing.T) {
 					return
 				default:
 				}
-				if data, err := m.ReadFile(fmt.Sprintf("f%d", i)); err != nil || len(data) != size {
+				unwatch := m.watchStall(t, fmt.Sprintf("read f%d", i))
+				data, err := m.ReadFile(fmt.Sprintf("f%d", i))
+				unwatch()
+				if err != nil || len(data) != size {
 					t.Errorf("read f%d: %d bytes, %v", i, len(data), err)
 					return
 				}
@@ -302,7 +308,9 @@ func TestAPIWritesDuringFileIO(t *testing.T) {
 	retry := func(method, path string, body any) bool {
 		for attempt := 0; attempt < 10; attempt++ {
 			start := time.Now()
+			unwatch := m.watchStall(t, method+" "+path)
 			status, out, err := m.call(method, path, body)
+			unwatch()
 			if err != nil {
 				t.Errorf("%s %s after %v: %v (deadlock?)", method, path, time.Since(start), err)
 				return false

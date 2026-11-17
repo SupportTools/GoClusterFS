@@ -1970,6 +1970,34 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotWithoutBirthIsOrphan
 
+  - id: api-lookup-file
+    name: API path lookup inside the filesystem
+    description: The API finds a file by walking directories in the filesystem, without the kernel, and refuses a symlink anywhere on the path, a directory, a non-directory in the middle, a missing name and an unclean path
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/api_test.go::TestLookupFile
+
+  - id: api-methods-match-setxattr
+    name: API snapshot and clone methods match setfattr
+    description: SnapshotFile, SnapshotsAt, CloneFileSnapshot, CloneFile and DeleteFileSnapshot give the same data and errors as the user.snapshot and user.clone attributes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/api_test.go::TestAPIMethodsDoWhatSetxattrDoes
+
+  - id: api-request-on-replaced-file
+    name: API request on a replaced file
+    description: A file deleted and replaced in the same inode slot between the API's lookup and its inode lock answers ESTALE and gets no snapshot
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/api_test.go::TestAPIRequestOnReplacedFileIsStale
+
+  - id: api-snapshot-while-node-writes
+    name: API snapshot while the same node writes
+    description: Snapshots and clones the API takes while the same node keeps rewriting a file in 128 KiB writes each hold exactly one written version
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/api_test.go::TestAPISnapshotWhileTheNodeWrites
+
   - id: snapshot-descriptor-target-birth
     name: A snapshot descriptor keeps its file's birth generation
     description: A descriptor read back from disk belongs to its file and to no other inode number or birth generation
@@ -2611,6 +2639,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/testnet/testnet_test.go::TestPortsReachThisProcess
+
+  - id: integration-watchdog-connection
+    name: The hang watchdog aborts only its own mount's FUSE connection
+    description: The integration harness finds a mount's FUSE connection by its exact mount point in mountinfo, takes the top of stacked mounts, and finds none when a non-FUSE mount covers it
+    priority: go_only
+    environments:
+      go: tests/integration/watchdog_test.go::TestWatchdogFindsTheMountsOwnFUSEConnection
 
   - id: broadcast-silent-peers
     name: Silent broadcast peers are reported
@@ -3601,7 +3636,7 @@ scenarios:
 
   - id: fuzz-fileops-paths
     name: Fuzz API file paths
-    description: Paths, snapshot names and clone destinations pass only the forms the checks promise, a snapshot clone value splits back into its name and destination, and an accepted path opens exactly the file it names under the mount root
+    description: Paths, snapshot names and clone destinations pass only the forms the checks promise, and a snapshot clone value splits back into its name and destination
     priority: go_only
     environments:
       go: internal/fileops/fileops_fuzz_test.go::FuzzFileOpsPaths
@@ -4395,6 +4430,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_dir_test.go::TestFsckChecksEveryDirectoryEntry
+
+  - id: fsck-repair-dot-entries
+    name: fsck repairs a wrong "." or ".." after a rename
+    description: After a rename moves a directory, a ".." left at the old parent and a "." naming another directory are reported with both inode numbers; a dry run changes nothing and repair points them at the right directories
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_tree_test.go::TestFsckRepairsDotEntriesAfterRename
 
   - id: fsck-snapshot-parents
     name: fsck checks snapshot parents

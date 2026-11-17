@@ -72,6 +72,8 @@ jobs:
 
       - name: Integration tests without -short
         shell: bash
+        env:
+          GOCLUSTERFS_HANG_DIR: ${{ github.workspace }}/hangs
         run: |
           tests=$(tests/scripts/integration-groups.sh regex ${{ strategy.job-total }} ${{ matrix.group }})
           go test -v -timeout 30m -run "$tests" ./tests/integration/... 2>&1 | tee integration-${{ matrix.group }}.log
@@ -81,7 +83,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nightly-integration-${{ matrix.group }}
-          path: integration-${{ matrix.group }}.log
+          path: |
+            integration-${{ matrix.group }}.log
+            hangs/
           retention-days: 14
 
   docker:

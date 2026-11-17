@@ -236,6 +236,8 @@ jobs:
 
       - name: Integration Tests
         shell: bash
+        env:
+          GOCLUSTERFS_HANG_DIR: ${{ github.workspace }}/hangs
         run: |
           tests=$(tests/scripts/integration-groups.sh regex ${{ strategy.job-total }} ${{ matrix.group }})
           # -short skips the stress tests, which need longer than CI allows
@@ -247,5 +249,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: integration-log-${{ matrix.group }}
-          path: integration-${{ matrix.group }}.log
+          path: |
+            integration-${{ matrix.group }}.log
+            hangs/
           retention-days: 7
