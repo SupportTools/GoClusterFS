@@ -1951,6 +1951,58 @@ test_statfs_after_remount() {
     return 0
 }
 
+# Symlinks made on VM 1 read back, and unlink, on VM 2.
+test_symlink_cross_node() {
+    log_info "Testing symlinks across VMs..."
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping symlink cross-node test (requires 2+ VMs)"
+        return 0
+    fi
+    ensure_cluster_healthy 2
+
+    local d=/mnt/goclusterfs long failed=0
+    long="$(printf 'd/%.0s' $(seq 1 1000))end"
+    ssh_run 1 "rm -f $d/sl_short $d/sl_long $d/sl_real $d/sl_tofile"
+    ssh_run 1 "ln -s target/short $d/sl_short && ln -s '$long' $d/sl_long" || return 1
+    ssh_run 1 "echo through > $d/sl_real && ln -s sl_real $d/sl_tofile" || return 1
+
+    if [[ "$(ssh_run 2 "readlink $d/sl_short")" != target/short ]]; then
+        log_error "VM 2 reads the wrong short target"
+        failed=1
+    fi
+    if [[ "$(ssh_run 2 "readlink $d/sl_long")" != "$long" ]]; then
+        log_error "VM 2 reads the wrong long target"
+        failed=1
+    fi
+    if [[ "$(ssh_run 2 "stat -c %F $d/sl_long")" != "symbolic link" ]]; then
+        log_error "VM 2 does not see sl_long as a symlink"
+        failed=1
+    fi
+    if [[ "$(ssh_run 2 "cat $d/sl_tofile")" != through ]]; then
+        log_error "VM 2 cannot read a file through a symlink"
+        failed=1
+    fi
+
+    ssh_run 2 "rm $d/sl_short" || return 1
+    local tries=0
+    while ssh_run 1 "test -L $d/sl_short"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 50 ]; then
+            log_error "VM 1 still sees the symlink VM 2 removed"
+            failed=1
+            break
+        fi
+        sleep 0.2
+    done
+    ssh_run 1 "rm -f $d/sl_long $d/sl_real $d/sl_tofile"
+
+    if [[ $failed -ne 0 ]]; then
+        return 1
+    fi
+    log_info "Symlink cross-node test passed"
+    return 0
+}
+
 # Writes 5 blocks on VM 1 and removes the file on VM 2, checking after each
 # step that both VMs report the same free blocks.
 test_statfs_multinode() {
@@ -4230,6 +4282,7 @@ main() {
     run_test "Directory Lookup Coherency" test_dir_index_follows_other_node
     run_test "Statfs After Remount" test_statfs_after_remount
     run_test "Statfs Multi-Node" test_statfs_multinode
+    run_test "Symlink Cross Node" test_symlink_cross_node
     run_test "Rolling Restart" test_rolling_restart
     run_test "Stress Random Failures" test_stress_random_failures
 

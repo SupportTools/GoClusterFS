@@ -1835,6 +1835,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/power_cut_test.go::TestPowerCutDuringRmdir
 
+  - id: mkdir-eio-parent-links
+    name: A write that fails mkdir keeps the parent's link count
+    description: Each write of one mkdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedMkdirWriteKeepsParentLinks
+
+  - id: rmdir-eio-parent-links
+    name: A write that fails rmdir keeps the parent's link count
+    description: Each write of one rmdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRmdirWriteKeepsParentLinks
+
   - id: fsck-directory-tree
     name: fsck checks the directory tree
     description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them
@@ -5184,6 +5198,21 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/symlink_test.go::TestUnlinkSymlinkWithPeerFreesAtOnce
+  - id: symlink-cross-node
+    name: Symlinks across nodes
+    description: Symlinks with an inline and a block target made on one node read back with readlink and lstat on another, a file reads through one, and an unlink there removes the link on the first node
+    priority: high
+    environments:
+      go: multinode_test.go::TestMultiNodeSymlinks
+      docker: run-tests.sh::test_symlink_cross_node
+      vm: run-vm-tests.sh::test_symlink_cross_node
+
+  - id: soak-model-symlinks
+    name: Soak model follows symlink rules
+    description: The soak model treats a symlink as a name that blocks create, mkdir and rmdir, lists it with its target, and removes it on unlink
+    priority: go_only
+    environments:
+      go: tests/soak/model_test.go::TestModelFollowsTheFilesystemRules
 
   - id: symlink-stale-node-after-reuse
     name: A stale symlink node does not reach the next symlink in its slot

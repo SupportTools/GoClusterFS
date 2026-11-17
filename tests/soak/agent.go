@@ -111,6 +111,8 @@ func serve(root string, req request) response {
 		err = unix.Rmdir(p)
 	case "rename":
 		err = unix.Rename(p, filepath.Join(root, req.Path2))
+	case "symlink":
+		err = unix.Symlink(req.Path2, p)
 	case "setxattr":
 		err = unix.Setxattr(p, req.Attr, []byte(req.Value), 0)
 	case "getxattr":
@@ -145,10 +147,17 @@ func serve(root string, req request) response {
 	return resp
 }
 
-// entryName describes a directory entry as "d:name" or "f:name:size".
+// entryName describes a directory entry as "d:name", "l:name:target" or "f:name:size".
 func entryName(dir string, e os.DirEntry) string {
 	if e.IsDir() {
 		return "d:" + e.Name()
+	}
+	if e.Type()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return "l:" + e.Name() + ":?"
+		}
+		return "l:" + e.Name() + ":" + target
 	}
 	var st unix.Stat_t
 	if err := unix.Lstat(filepath.Join(dir, e.Name()), &st); err != nil {

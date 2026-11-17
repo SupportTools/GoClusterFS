@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"math/rand/v2"
 	"path"
 	"slices"
@@ -18,6 +19,8 @@ const (
 	maxFile   = 8 << 20
 	// anyErrno is the expected result of an operation that must fail, with any errno.
 	anyErrno = -2
+	// maxInlineTarget is the longest symlink target an inode holds; longer ones take a block.
+	maxInlineTarget = 92
 )
 
 // sharedDirs hold files of every lane and are never removed.
@@ -75,17 +78,18 @@ type Model struct {
 	Files map[string]*File
 	Dirs  map[string]bool
 	Snaps map[string]*Snap
+	Links map[string]string // symlink path -> target
 }
 
 func newModel() *Model {
-	m := &Model{Files: map[string]*File{}, Dirs: map[string]bool{"/": true, "/soak": true}, Snaps: map[string]*Snap{}}
+	m := &Model{Files: map[string]*File{}, Dirs: map[string]bool{"/": true, "/soak": true}, Snaps: map[string]*Snap{}, Links: map[string]string{}}
 	for _, d := range sharedDirs {
 		m.Dirs[d] = true
 	}
 	return m
 }
 
-func (m *Model) exists(p string) bool { return m.Files[p] != nil || m.Dirs[p] }
+func (m *Model) exists(p string) bool { return m.Files[p] != nil || m.Dirs[p] || m.Links[p] != "" }
 
 func (m *Model) hasChildren(dir string) bool {
 	for p := range m.Files {
@@ -98,6 +102,11 @@ func (m *Model) hasChildren(dir string) bool {
 			return true
 		}
 	}
+	for p := range m.Links {
+		if path.Dir(p) == dir {
+			return true
+		}
+	}
 	return false
 }
 
@@ -105,7 +114,7 @@ func (m *Model) hasChildren(dir string) bool {
 func (m *Model) expect(op *Op) int {
 	f := m.Files[op.Path]
 	switch op.Kind {
-	case "create", "mkdir":
+	case "create", "mkdir", "symlink":
 		switch {
 		case m.exists(op.Path):
 			return int(syscall.EEXIST)
@@ -116,6 +125,8 @@ func (m *Model) expect(op *Op) int {
 		switch {
 		case m.Dirs[op.Path]:
 			return int(syscall.EISDIR)
+		case op.Kind == "unlink" && m.Links[op.Path] != "":
+			return 0
 		case f == nil:
 			return int(syscall.ENOENT)
 		}
@@ -129,7 +140,7 @@ func (m *Model) expect(op *Op) int {
 			return int(syscall.ENOTEMPTY)
 		}
 	case "rename":
-		return anyErrno
+		return m.expectRename(op.Path, op.Path2)
 	case "snapshot":
 		switch {
 		case f == nil:
@@ -172,7 +183,13 @@ func (m *Model) apply(op *Op) {
 		} else {
 			f.Data = append(f.Data, make([]byte, op.Len-int64(len(f.Data)))...)
 		}
+	case "symlink":
+		m.Links[op.Path] = op.Path2
 	case "unlink":
+		if m.Links[op.Path] != "" {
+			delete(m.Links, op.Path)
+			return
+		}
 		for name := range f.Snaps {
 			m.Snaps[name].Owner = nil
 		}
@@ -181,6 +198,8 @@ func (m *Model) apply(op *Op) {
 		m.Dirs[op.Path] = true
 	case "rmdir":
 		delete(m.Dirs, op.Path)
+	case "rename":
+		m.applyRename(op.Path, op.Path2)
 	case "snapshot":
 		m.Snaps[op.Name] = &Snap{Data: bytes.Clone(f.Data), Owner: f}
 		f.Snaps[op.Name] = true
@@ -202,6 +221,11 @@ func (m *Model) blocks() int64 {
 	}
 	for _, s := range m.Snaps {
 		n += (int64(len(s.Data)) + blockSize - 1) / blockSize
+	}
+	for _, target := range m.Links {
+		if len(target) > maxInlineTarget {
+			n++
+		}
 	}
 	return n
 }
@@ -227,11 +251,16 @@ func pick[T any](r *rand.Rand, xs []T) T { return xs[r.IntN(len(xs))] }
 
 // generate picks the lane's next operation from the model's current state. The caller holds m.mu.
 func (l *lane) generate(m *Model) *Op {
-	var files, dirs, snaps []string
+	var files, dirs, snaps, links []string
 	orphans := 0
 	for p := range m.Files {
 		if l.owns(p) {
 			files = append(files, p)
+		}
+	}
+	for p := range m.Links {
+		if l.owns(p) {
+			links = append(links, p)
 		}
 	}
 	for p := range m.Dirs {
@@ -249,6 +278,7 @@ func (l *lane) generate(m *Model) *Op {
 		}
 	}
 	slices.Sort(files)
+	slices.Sort(links)
 	slices.Sort(dirs)
 	slices.Sort(snaps)
 	parents := append(slices.Clone(sharedDirs), dirs...)
@@ -260,7 +290,7 @@ func (l *lane) generate(m *Model) *Op {
 		w    int
 	}{
 		{"create", 15}, {"write", 30}, {"truncate", 8}, {"unlink", 8}, {"mkdir", 4}, {"rmdir", 4},
-		{"rename", 2}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3},
+		{"rename", 6}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3}, {"symlink", 5},
 	}
 	total := 0
 	for _, w := range weights {
@@ -274,7 +304,7 @@ func (l *lane) generate(m *Model) *Op {
 			break
 		}
 	}
-	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone"}, kind) {
+	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone", "symlink"}, kind) {
 		kind = pick(r, []string{"unlink", "truncate", "snapdelete"})
 	}
 	if len(files) == 0 || len(files) < 6 && kind != "create" && kind != "mkdir" {
@@ -312,7 +342,17 @@ func (l *lane) generate(m *Model) *Op {
 		} else {
 			op.Len = min(size+r.Int64N(blockSize), maxFile)
 		}
+	case "symlink":
+		if len(links) >= 20 {
+			op.Kind, op.Path = "unlink", pick(r, links)
+			break
+		}
+		op.Path, op.Path2 = path.Join(pick(r, parents), l.name("ln")), l.target(r, files)
 	case "unlink":
+		if len(links) > 0 && r.IntN(4) == 0 {
+			op.Path = pick(r, links)
+			break
+		}
 		op.Path = pick(r, files)
 		if f := m.Files[op.Path]; len(f.Snaps) > 0 && (orphans >= 20 || r.IntN(10) > 0) {
 			op.Kind, op.Name = "snapdelete", pickKey(r, f.Snaps)
@@ -338,8 +378,7 @@ func (l *lane) generate(m *Model) *Op {
 			}
 		}
 	case "rename":
-		op.Path = pick(r, files)
-		op.Path2 = path.Join(path.Dir(op.Path), l.name("r"))
+		op.Path, op.Path2 = l.renamePaths(r, files, links, dirs, parents)
 	case "snapshot":
 		op.Path, op.Name = pick(r, files), l.name("s")
 	case "clone":
@@ -365,6 +404,125 @@ func (l *lane) generate(m *Model) *Op {
 		}
 	}
 	return op
+}
+
+// expectRename returns what rename(2) returns, in the order the kernel and goclusterfs check.
+func (m *Model) expectRename(src, dst string) int {
+	srcDir := m.Dirs[src]
+	switch {
+	case !m.exists(src) || !m.Dirs[path.Dir(dst)]:
+		return int(syscall.ENOENT)
+	case src == dst:
+		return 0
+	case srcDir && strings.HasPrefix(dst, src+"/"):
+		return int(syscall.EINVAL)
+	case strings.HasPrefix(src, dst+"/"):
+		return int(syscall.ENOTEMPTY)
+	case !m.exists(dst):
+		return 0
+	case srcDir && !m.Dirs[dst]:
+		return int(syscall.ENOTDIR)
+	case !srcDir && m.Dirs[dst]:
+		return int(syscall.EISDIR)
+	case srcDir && m.hasChildren(dst):
+		return int(syscall.ENOTEMPTY)
+	}
+	return 0
+}
+
+// applyRename moves src, and everything under it, to dst. A file it replaces loses its snapshots, as unlink does.
+func (m *Model) applyRename(src, dst string) {
+	if src == dst {
+		return
+	}
+	if f := m.Files[dst]; f != nil {
+		for name := range f.Snaps {
+			m.Snaps[name].Owner = nil
+		}
+	}
+	delete(m.Files, dst)
+	delete(m.Links, dst)
+	delete(m.Dirs, dst)
+	moved := func(p string) (string, bool) {
+		if p == src || strings.HasPrefix(p, src+"/") {
+			return dst + strings.TrimPrefix(p, src), true
+		}
+		return "", false
+	}
+	for _, p := range slices.Collect(maps.Keys(m.Files)) {
+		if q, ok := moved(p); ok {
+			m.Files[q] = m.Files[p]
+			delete(m.Files, p)
+		}
+	}
+	for _, p := range slices.Collect(maps.Keys(m.Links)) {
+		if q, ok := moved(p); ok {
+			m.Links[q] = m.Links[p]
+			delete(m.Links, p)
+		}
+	}
+	for _, p := range slices.Collect(maps.Keys(m.Dirs)) {
+		if q, ok := moved(p); ok {
+			delete(m.Dirs, p)
+			m.Dirs[q] = true
+		}
+	}
+}
+
+// renamePaths picks a rename of one of the lane's files, links or directories. Most move to a new name; the rest
+// replace another of the lane's entries, or fail: a missing source or parent, a type mismatch, a directory with
+// entries, or a directory moved into itself. Directories stay directly under the shared directories, which only
+// lanes' own directories sit in, so no lane moves another lane's entries.
+func (l *lane) renamePaths(r *rand.Rand, files, links, dirs, parents []string) (string, string) {
+	switch v := r.IntN(10); {
+	case v < 2 && len(dirs) > 0:
+		src := pick(r, dirs)
+		switch r.IntN(5) {
+		case 0:
+			return src, path.Join(src, l.name("d"))
+		case 1:
+			return src, pick(r, dirs)
+		case 2:
+			return src, pick(r, files)
+		}
+		return src, path.Join(pick(r, sharedDirs), l.name("d"))
+	case v == 2 && len(links) > 0:
+		return pick(r, links), l.renameTarget(r, files, links, dirs, parents)
+	case v == 3:
+		return path.Join(pick(r, parents), l.name("missing")), path.Join(pick(r, parents), l.name("r"))
+	}
+	return pick(r, files), l.renameTarget(r, files, links, dirs, parents)
+}
+
+// renameTarget picks where a file or link goes: usually a new name, sometimes over the lane's own entries.
+func (l *lane) renameTarget(r *rand.Rand, files, links, dirs, parents []string) string {
+	switch r.IntN(8) {
+	case 0:
+		return pick(r, files)
+	case 1:
+		if len(dirs) > 0 {
+			return pick(r, dirs)
+		}
+	case 2:
+		if len(links) > 0 {
+			return pick(r, links)
+		}
+	case 3:
+		return path.Join(pick(r, sharedDirs), l.name("missing"), l.name("r"))
+	}
+	return path.Join(pick(r, parents), l.name("r"))
+}
+
+// target picks a symlink target in the lane's names: a lane file, a missing name, or one too long for the inode.
+func (l *lane) target(r *rand.Rand, files []string) string {
+	switch r.IntN(3) {
+	case 0:
+		return "../" + path.Base(pick(r, files))
+	case 1:
+		return l.name("missing")
+	default:
+		return strings.Repeat(l.prefix()+"x/", 20+r.IntN(600)) + l.name("t")
+	}
 }
 
 func pickLen(r *rand.Rand) int64 {
@@ -421,6 +579,11 @@ func (m *Model) listing(dir string) []string {
 	for p := range m.Dirs {
 		if p != dir && path.Dir(p) == dir {
 			out = append(out, "d:"+path.Base(p))
+		}
+	}
+	for p, target := range m.Links {
+		if path.Dir(p) == dir {
+			out = append(out, "l:"+path.Base(p)+":"+target)
 		}
 	}
 	slices.Sort(out)
