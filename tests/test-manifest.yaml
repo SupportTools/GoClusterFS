@@ -675,9 +675,23 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesDamagedJournal
 
+  - id: journal-off-honors-slot-journal
+    name: -journal=false still honors the slot's journal
+    description: A node restarted with -journal=false after a crash replays its slot's journal before serving, and -journal=false with -skip-recovery naming the slot really resets a damaged journal, so a later mount with the journal on succeeds
+    priority: go_only
+    environments:
+      go: journal_slots_test.go::TestJournalOffStillHonorsTheSlotsJournal
+
+  - id: journal-unusable-state-refused
+    name: A journal in an unusable state is refused, not overwritten
+    description: A journal whose header passes its checksum but whose state is corrupt or unknown makes the mount's replay and a peer's replay fail with ErrJournalCorrupt instead of treating it as clean
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestRecoveryRefusesUnusableJournalState
+
   - id: skip-recovery-discards-only-named-slot
     name: -skip-recovery discards only the named slot
-    description: A mount that takes another host's crashed slot ignores -skip-recovery naming a different slot and replays that slot, also on a retry after its own failed mount stamped the slot; -skip-recovery naming the slot discards its journal
+    description: With -skip-recovery naming a different slot, a mount leaves another host's crashed slot and its damaged journal alone and takes an empty slot; -skip-recovery naming the crashed slot takes it and starts a new journal over the damaged one
     priority: go_only
     environments:
       go: journal_slots_test.go::TestSkipRecoveryDiscardsOnlyNamedSlot

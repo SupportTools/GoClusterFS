@@ -100,7 +100,9 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 		log.Printf("[Recovery] Journal was written by earlier slot owner %x", owner[:4])
 	}
 
-	// Check if recovery is needed
+	if err := region.Superblock().checkState(); err != nil {
+		return nil, err
+	}
 	if !region.NeedsRecovery() {
 		log.Printf("[Recovery] Journal is clean, no recovery needed")
 		result.Duration = time.Since(start)

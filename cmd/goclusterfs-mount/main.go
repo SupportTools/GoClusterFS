@@ -339,7 +339,9 @@ func main() {
 	if *skipRecovery >= 0 && !skip {
 		log.Printf("Journal: ignoring -skip-recovery=%d: this mount took slot %d, so it replays that slot's journal", *skipRecovery, slotIdx)
 	}
-	if *journalEnabled && !skip {
+	// -journal=false only stops this mount journaling its own writes: the slot's journal is still replayed, or reset
+	// below, so no later mount replays it over newer data.
+	if !skip {
 		// Set up recovery context with our managers
 		recoveryCtx := &journal.RecoveryContext{
 			Dev:       dev,
@@ -373,9 +375,14 @@ func main() {
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
 				result.Stats.TxnCommitted, result.Stats.BytesScanned, result.NodeUUID[:8])
 		}
-	} else if skip {
+	} else {
 		mountReplay.Discarded = true
 		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
+		if !*journalEnabled {
+			if err := resetJournalHeader(dev, journalOffset); err != nil {
+				failf("Discarding the journal of slot %d failed: %v; check the device, then mount again", slotIdx, err)
+			}
+		}
 	}
 	releasePrevious(true)
 	if err := lockMgr.ClearForeignClaims(); err != nil {
@@ -752,6 +759,14 @@ var ownerStates = map[node.Occupancy]lock.OwnerState{
 // ownReplayRetry is the first wait before a mount retries its own journal
 // replay; tests shorten it.
 var ownReplayRetry = time.Second
+
+// resetJournalHeader zeroes the journal header, as goclusterfs-fsck -release-slot does, so no mount replays it.
+func resetJournalHeader(dev *storage.Device, offset uint64) error {
+	if _, err := dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), int64(offset)); err != nil {
+		return err
+	}
+	return dev.Sync()
+}
 
 // recoverOwnJournal replays the journal this node's slot holds from its
 // previous owner. A replay that gave up waiting for another node's lock is

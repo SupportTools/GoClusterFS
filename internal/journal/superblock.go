@@ -295,3 +295,12 @@ func (sb *JournalSuperblock) AvailableSpace() uint32 {
 func (sb *JournalSuperblock) NeedsRecovery() bool {
 	return sb.State == JournalStateDirty || sb.State == JournalStateRecovering
 }
+
+// checkState refuses a state no replay or new journal may treat as clean: corrupt, or a value this build does not know.
+func (sb JournalSuperblock) checkState() error {
+	switch sb.State {
+	case JournalStateClean, JournalStateDirty, JournalStateRecovering:
+		return nil
+	}
+	return fmt.Errorf("%w: its state is %s", ErrJournalCorrupt, sb.State)
+}
