@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"math/rand/v2"
 	"strings"
 	"syscall"
@@ -54,6 +55,18 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 	}
 	step(t, m, &Op{Kind: "unlink", Path: link}, 0)
 	step(t, m, &Op{Kind: "rmdir", Path: "/soak/d0/l0-d1"}, 0)
+
+	hard := "/soak/d0/l0-hl1"
+	step(t, m, &Op{Kind: "snapshot", Path: f, Name: "l0-s2"}, 0)
+	step(t, m, &Op{Kind: "link", Path: f, Path2: hard}, 0)
+	step(t, m, &Op{Kind: "link", Path: f, Path2: hard}, int(syscall.EEXIST))
+	step(t, m, &Op{Kind: "link", Path: "/soak/d0/l0-missing", Path2: "/soak/d0/l0-hl2"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "write", Path: hard, Off: 0, Len: 10, Seed: 7}, 0)
+	if !bytes.Equal(m.Files[f].Data, m.Files[hard].Data) || m.Files[f] != m.Files[hard] {
+		t.Fatal("a write through one hard link must show through the other")
+	}
+	step(t, m, &Op{Kind: "unlink", Path: f}, 0)
+	step(t, m, &Op{Kind: "snapclone", Path: hard, Name: "l0-s2", Path2: "/l0-c2"}, 0)
 }
 
 // A lane only names and touches its own files, directories and snapshots, the same way for the same seed.

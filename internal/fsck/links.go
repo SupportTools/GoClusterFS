@@ -32,7 +32,7 @@ func (c *Checker) checkFileLinks() error {
 		if int(ino.LinkCount) == names {
 			continue
 		}
-		severity, why := Warning, "it is never freed"
+		severity, why := Warning, "it will never be freed"
 		if int(ino.LinkCount) < names {
 			severity, why = Error, "unlinking can free it while a name remains"
 		}

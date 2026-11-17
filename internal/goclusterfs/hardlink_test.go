@@ -172,3 +172,51 @@ func TestFsckRepairsTooFewLinks(t *testing.T) {
 		t.Errorf("link count after repair: %d, want 2", got)
 	}
 }
+
+// Power fails during a link: the file keeps its data under its first name, the new name is either gone or reads the
+// same file, and fsck finds at most an extra link.
+func TestPowerCutDuringLink(t *testing.T) {
+	data := pattern(4, BlockSize+10)
+	var f *File
+	runPowerCuts(t, powerCutCase{
+		setup: func(t *testing.T, fsys *FS) {
+			f = createFile(t, fsys, "f")
+			writeAt(t, f, data, 0)
+		},
+		op: func(fsys *FS, _ *power) {
+			_, _ = fsys.addLink(context.Background(), inode.InodeRoot, f.inodeNum, "g")
+		},
+		check: func(t *testing.T, fsys *FS) {
+			checkFile(t, lookupFile(t, fsys, "f"), data)
+			root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if num, _, err := fsys.dirMgr.Lookup(context.Background(), root, "g"); err == nil {
+				if uint32(num) != f.inodeNum {
+					t.Fatalf("g names inode %d, want %d", num, f.inodeNum)
+				}
+				checkFile(t, lookupFile(t, fsys, "g"), data)
+			}
+		},
+	})
+}
+
+// Power fails while one name of a linked file is removed: the other name keeps the file and its data.
+func TestPowerCutDuringUnlinkOfLinkedFile(t *testing.T) {
+	data := pattern(5, 2*BlockSize)
+	var f *File
+	runPowerCuts(t, powerCutCase{
+		setup: func(t *testing.T, fsys *FS) {
+			f = createFile(t, fsys, "f")
+			writeAt(t, f, data, 0)
+			mustLink(t, fsys, inode.InodeRoot, f.inodeNum, "g")
+		},
+		op: func(fsys *FS, _ *power) {
+			_ = fsys.RootDir().Unlink(context.Background(), "f")
+		},
+		check: func(t *testing.T, fsys *FS) {
+			checkFile(t, lookupFile(t, fsys, "g"), data)
+		},
+	})
+}

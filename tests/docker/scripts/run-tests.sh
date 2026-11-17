@@ -741,6 +741,30 @@ test_delete_directory() {
     return 0
 }
 
+# A file linked on one node reads through both names on another; removing one name keeps the file.
+test_hard_links() {
+    log "Testing hard links..."
+
+    local node="${NODE_ARRAY[0]}"
+    local other="${NODE_ARRAY[1]:-${NODE_ARRAY[0]}}"
+    local mnt=/mnt/goclusterfs
+    if ! exec_on_node "$node" sh -c "echo hardlinked > $mnt/hl_a && ln $mnt/hl_a $mnt/hl_b && [ \$(stat -c %h $mnt/hl_a) = 2 ]"; then
+        log "ERROR: ln failed, or the link count is not 2"
+        return 1
+    fi
+    if [[ "$(exec_on_node "$other" cat $mnt/hl_b)" != "hardlinked" ]]; then
+        log "ERROR: $other cannot read the file through its second name"
+        return 1
+    fi
+    if ! exec_on_node "$other" sh -c "rm $mnt/hl_a && [ \$(stat -c %h $mnt/hl_b) = 1 ] && [ \$(cat $mnt/hl_b) = hardlinked ]"; then
+        log "ERROR: removing one name did not leave the other with one link"
+        return 1
+    fi
+    exec_on_node "$node" rm -f "$mnt/hl_a" "$mnt/hl_b"
+    log "Hard links test passed"
+    return 0
+}
+
 # Git, SQLite and Postgres fsync a directory after creating or removing an entry in it; each fsync must succeed.
 test_dir_fsync() {
     log "Testing directory fsync..."
@@ -3507,6 +3531,7 @@ run_test "Many Files" test_many_files
 run_test "Nested Directories" test_nested_directories
 run_test "Delete Directory" test_delete_directory
 run_test "Directory Fsync" test_dir_fsync
+run_test "Hard Links" test_hard_links
 run_test "Truncate File" test_truncate_file
 run_test "Append File" test_append_file
 run_test "Rename File" test_rename_file

@@ -88,6 +88,16 @@ func newModel() *Model {
 	return m
 }
 
+// named reports whether a path still names file f, which a hard link shares between names.
+func (m *Model) named(f *File) bool {
+	for _, g := range m.Files {
+		if g == f {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Model) exists(p string) bool { return m.Files[p] != nil || m.Dirs[p] || m.Links[p] != "" }
 
 func (m *Model) hasChildren(dir string) bool {
@@ -147,6 +157,15 @@ func (m *Model) expect(op *Op) int {
 		case m.Snaps[op.Name] != nil:
 			return int(syscall.EEXIST)
 		}
+	case "link":
+		switch {
+		case f == nil:
+			return int(syscall.ENOENT)
+		case m.exists(op.Path2):
+			return int(syscall.EEXIST)
+		case !m.Dirs[path.Dir(op.Path2)]:
+			return int(syscall.ENOENT)
+		}
 	case "clone", "snapclone":
 		switch {
 		case f == nil:
@@ -184,15 +203,19 @@ func (m *Model) apply(op *Op) {
 		}
 	case "symlink":
 		m.Links[op.Path] = op.Path2
+	case "link":
+		m.Files[op.Path2] = f
 	case "unlink":
 		if m.Links[op.Path] != "" {
 			delete(m.Links, op.Path)
 			return
 		}
-		for name := range f.Snaps {
-			m.Snaps[name].Owner = nil
-		}
 		delete(m.Files, op.Path)
+		if !m.named(f) {
+			for name := range f.Snaps {
+				m.Snaps[name].Owner = nil
+			}
+		}
 	case "mkdir":
 		m.Dirs[op.Path] = true
 	case "rmdir":
@@ -213,8 +236,12 @@ func (m *Model) apply(op *Op) {
 // blocks estimates the data blocks the model holds, counting each snapshot as a full copy.
 func (m *Model) blocks() int64 {
 	var n int64
+	counted := map[*File]bool{}
 	for _, f := range m.Files {
-		n += (int64(len(f.Data)) + blockSize - 1) / blockSize
+		if !counted[f] {
+			counted[f] = true
+			n += (int64(len(f.Data)) + blockSize - 1) / blockSize
+		}
 	}
 	for _, s := range m.Snaps {
 		n += (int64(len(s.Data)) + blockSize - 1) / blockSize
@@ -288,6 +315,7 @@ func (l *lane) generate(m *Model) *Op {
 	}{
 		{"create", 15}, {"write", 30}, {"truncate", 8}, {"unlink", 8}, {"mkdir", 4}, {"rmdir", 4},
 		{"rename", 2}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3}, {"symlink", 5},
+		{"link", 4},
 	}
 	total := 0
 	for _, w := range weights {
@@ -315,6 +343,8 @@ func (l *lane) generate(m *Model) *Op {
 	switch kind {
 	case "create":
 		op.Path = path.Join(pick(r, parents), l.name("f"))
+	case "link":
+		op.Path, op.Path2 = pick(r, files), path.Join(pick(r, parents), l.name("hl"))
 	case "write":
 		op.Path = pick(r, files)
 		size := int64(len(m.Files[op.Path].Data))

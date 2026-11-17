@@ -2391,6 +2391,30 @@ test_dir_fsync() {
     return 0
 }
 
+# Test: Hard links
+# A file linked on one VM reads through both names on the other; removing one name keeps the file.
+test_hard_links() {
+    log_info "Testing hard links..."
+    ensure_cluster_healthy 2
+
+    local mnt=/mnt/goclusterfs
+    if ! ssh_run 1 "echo hardlinked > $mnt/hl_a && ln $mnt/hl_a $mnt/hl_b && [ \$(stat -c %h $mnt/hl_a) = 2 ]"; then
+        log_error "ln on VM 1 failed, or the link count is not 2"
+        return 1
+    fi
+    if [[ "$(ssh_run 2 "cat $mnt/hl_b")" != "hardlinked" ]]; then
+        log_error "VM 2 cannot read the file through its second name"
+        return 1
+    fi
+    if ! ssh_run 2 "rm $mnt/hl_a && [ \$(stat -c %h $mnt/hl_b) = 1 ] && [ \$(cat $mnt/hl_b) = hardlinked ]"; then
+        log_error "removing one name on VM 2 did not leave the other with one link"
+        return 1
+    fi
+    ssh_run 1 "rm -f $mnt/hl_a $mnt/hl_b"
+    log_info "Hard links test passed"
+    return 0
+}
+
 # Test: Truncate file
 # Creates a file and truncates it to a smaller size, verifying the operation
 test_truncate_file() {
@@ -4294,6 +4318,7 @@ main() {
     run_test "Nested Directories" test_nested_directories
     run_test "Delete Directory" test_delete_directory
     run_test "Directory Fsync" test_dir_fsync
+    run_test "Hard Links" test_hard_links
     run_test "Truncate File" test_truncate_file
     run_test "Append File" test_append_file
     run_test "Rename File" test_rename_file

@@ -113,6 +113,8 @@ func serve(root string, req request) response {
 		err = unix.Rename(p, filepath.Join(root, req.Path2))
 	case "symlink":
 		err = unix.Symlink(req.Path2, p)
+	case "link":
+		err = unix.Link(p, filepath.Join(root, req.Path2))
 	case "setxattr":
 		err = unix.Setxattr(p, req.Attr, []byte(req.Value), 0)
 	case "getxattr":

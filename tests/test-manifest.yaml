@@ -120,6 +120,50 @@ scenarios:
       docker: run-tests.sh::test_dir_fsync
       vm: run-vm-tests.sh::test_dir_fsync
 
+  - id: hard-links
+    name: Hard links
+    description: A file linked on one node reads and writes through every name on the others; removing one name keeps the file and drops its link count by one
+    priority: high
+    environments:
+      go: hardlink_test.go::TestHardLinks
+      docker: run-tests.sh::test_hard_links
+      vm: run-vm-tests.sh::test_hard_links
+
+  - id: hard-links-multinode
+    name: Hard links across nodes, and a link racing the last unlink
+    description: A link made on one node is seen and removed on the other; a link racing the last unlink either wins with one link left or fails with ENOENT, and fsck is clean
+    priority: go_only
+    environments:
+      go: hardlink_test.go::TestMultiNodeLinkRacesLastUnlink
+
+  - id: hard-link-counts
+    name: Link counts follow links and unlinks
+    description: Each link adds one and each unlink takes one away; the file is freed with its last name; directories, symlinks, taken names, orphans and 65000 links are refused
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkCountsNames
+
+  - id: hard-link-replay
+    name: Replay finishes a link a crash interrupted
+    description: A link crashes after its commit or after its increment; replay leaves both names and two links. If another write changed the file first, replay leaves an extra link that fsck repairs
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestLinkReplaysAfterCrash
+
+  - id: power-cut-during-link
+    name: Power cut during a link, and during an unlink of a linked file
+    description: Power fails at every write of a link, or of removing one name of a linked file; the data stays under every name left, and fsck finds at most an extra link, which -repair fixes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestPowerCutDuringLink
+
+  - id: fsck-file-link-counts
+    name: fsck checks and repairs regular files' link counts
+    description: A regular file with fewer links than names is an error, with more a warning; -repair sets the count to the names found
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/hardlink_test.go::TestFsckRepairsTooFewLinks
+
   - id: directory-fsync-power-cut
     name: Entries survive a power cut once their directory is fsynced
     description: Without a journal, a power cut loses every write since the last flush; the entries made and removed before a directory fsync survive it, and a create after the last fsync does not
