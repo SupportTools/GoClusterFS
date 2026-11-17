@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
 	"syscall"
@@ -76,20 +77,30 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 	if s := d.model.Snaps[op.Name]; s != nil {
 		snapData = s.Data
 	}
+	_, isLink := d.model.Links[op.Path]
+	isDir := d.model.Dirs[op.Path]
 	d.model.mu.Unlock()
 
 	switch op.Kind {
-	case "create", "mkdir", "unlink", "rmdir":
-		exists, err := d.exists(n, op.Path, op.Kind == "mkdir" || op.Kind == "rmdir")
+	case "create", "mkdir", "unlink", "rmdir", "symlink":
+		exists, err := d.present(n, op.Path, op.Kind == "mkdir" || op.Kind == "rmdir", isLink || op.Kind == "symlink")
 		if err != nil {
 			return "", err
 		}
-		if exists == (op.Kind == "create" || op.Kind == "mkdir") {
+		if exists == (op.Kind == "create" || op.Kind == "mkdir" || op.Kind == "symlink") {
 			return "after", nil
 		}
 		return "before", nil
 	case "rename":
-		return "before", nil
+		// A rename is atomic: the source is still there only if it did not happen.
+		exists, err := d.present(n, op.Path, isDir, isLink)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			return "before", nil
+		}
+		return "after", nil
 	case "write", "truncate":
 		after := bytes.Clone(before)
 		applyData(op, &after)
@@ -142,6 +153,21 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 		return "", fmt.Errorf("%s: errno %d size %d, neither absent nor a full copy", op.Path2, resp.Errno, resp.Size)
 	}
 	return "", fmt.Errorf("cannot resolve a cut-short %s", op.Kind)
+}
+
+// present reports whether node n shows p. A link is looked up in its directory's listing, since reading follows it.
+func (d *driver) present(n *node, p string, dir, link bool) (bool, error) {
+	if !link {
+		return d.exists(n, p, dir)
+	}
+	resp, err := d.call(n, request{Op: "list", Path: path.Dir(p)})
+	if err != nil {
+		return false, err
+	}
+	if resp.Errno != 0 {
+		return false, fmt.Errorf("%s: list errno %d", path.Dir(p), resp.Errno)
+	}
+	return slices.ContainsFunc(resp.Names, func(e string) bool { return strings.HasPrefix(e, "l:"+path.Base(p)+":") }), nil
 }
 
 func (d *driver) exists(n *node, p string, dir bool) (bool, error) {
