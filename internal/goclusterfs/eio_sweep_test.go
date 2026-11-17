@@ -338,3 +338,45 @@ func TestOneFailedWriteKeepsAcknowledgedResults(t *testing.T) {
 		})
 	}
 }
+
+// A write that fails mkdir with EIO, with no crash after it, leaves the root's link count matching its entries.
+func TestFailedMkdirWriteKeepsParentLinks(t *testing.T) {
+	t.Parallel()
+	failEachWrite(t, func(*testing.T, *FS) {}, func(fsys *FS) {
+		_, _ = fsys.Mkdir(context.Background(), "d", 0o755, &fuse.EntryOut{})
+	})
+}
+
+// A write that fails rmdir with EIO, with no crash after it, leaves the root's link count matching its entries.
+func TestFailedRmdirWriteKeepsParentLinks(t *testing.T) {
+	t.Parallel()
+	failEachWrite(t, func(t *testing.T, fsys *FS) { newSubdir(t, fsys, "d") }, func(fsys *FS) {
+		_ = fsys.Rmdir(context.Background(), "d")
+	})
+}
+
+// failEachWrite runs op once for each of its writes, failing that write with EIO, and checks the root's link count.
+func failEachWrite(t *testing.T, setup func(*testing.T, *FS), op func(*FS)) {
+	total := failWrite(t, -1, setup, op)
+	for n := 0; n < total; n++ {
+		t.Run(fmt.Sprintf("eio_at_%d", n), func(t *testing.T) { failWrite(t, n, setup, op) })
+	}
+}
+
+func failWrite(t *testing.T, n int, setup func(*testing.T, *FS), op func(*FS)) int {
+	t.Helper()
+	fsys, _, _, _ := journaledFS(t)
+	withBridge(fsys)
+	setup(t, fsys)
+	var count atomic.Int64
+	fsys.dev.SetWriteGate(func(int64) error {
+		if count.Add(1)-1 == int64(n) {
+			return syscall.EIO
+		}
+		return nil
+	})
+	op(fsys)
+	fsys.dev.SetWriteGate(func(int64) error { return nil })
+	expectDirLinks(t, fsys, inode.InodeRoot)
+	return int(count.Load())
+}

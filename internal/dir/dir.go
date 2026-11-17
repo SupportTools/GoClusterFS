@@ -214,6 +214,7 @@ func (m *Manager) AddAndUpdate(ctx context.Context, dirIno *inode.Inode, name st
 	entry.RecLen = entrySize(entry)
 
 	defer m.LockDir(dirIno.InodeNum)()
+	parent, applied := tracked(parent)
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to add entries simultaneously, they may race
 	// to allocate the same logical block position. If a conflict is detected,
@@ -224,6 +225,9 @@ func (m *Manager) AddAndUpdate(ctx context.Context, dirIno *inode.Inode, name st
 			logging.Debugf("dir.Add: retry attempt %d for entry %q in inode %d",
 				attempt+1, name, dirIno.InodeNum)
 			continue
+		}
+		if err != nil && *applied {
+			m.restoreLinks(dirIno.InodeNum, func() (bool, error) { return m.recountUnderInodeLock(ctx, dirIno.InodeNum) })
 		}
 		return err
 	}
@@ -342,6 +346,7 @@ func (m *Manager) RemoveIfAndUpdate(ctx context.Context, dirIno *inode.Inode, na
 		defer m.unlock(dirIno.InodeNum)
 	}
 
+	parent, applied := tracked(parent)
 	for attempt := 0; ; attempt++ {
 		fresh, err := m.liveDirLocked(dirIno.InodeNum)
 		if err != nil {
@@ -364,6 +369,9 @@ func (m *Manager) RemoveIfAndUpdate(ctx context.Context, dirIno *inode.Inode, na
 		if removed || err != nil || attempt > 0 {
 			if err == nil && !removed {
 				err = fmt.Errorf("%w: %q is in the index of directory %d but not in its chunk", ErrCorrupted, name, dirIno.InodeNum)
+			}
+			if err != nil && *applied {
+				m.restoreLinks(dirIno.InodeNum, func() (bool, error) { return m.recountLocked(dirIno.InodeNum) })
 			}
 			return removed, err
 		}
@@ -832,13 +840,47 @@ func FileTypeFromMode(mode uint16) uint8 {
 // directory's inode write and its chunk write leaves the count off by one.
 func (m *Manager) RecountLinks(ctx context.Context, dirIno *inode.Inode) (bool, error) {
 	defer m.LockDir(dirIno.InodeNum)()
+	return m.recountUnderInodeLock(ctx, dirIno.InodeNum)
+}
+
+// tracked wraps parent to report whether an inode write carried it.
+func tracked(parent func(*inode.Inode)) (func(*inode.Inode), *bool) {
+	applied := new(bool)
+	if parent == nil {
+		return nil, applied
+	}
+	return func(ino *inode.Inode) {
+		*applied = true
+		parent(ino)
+	}, applied
+}
+
+// restoreLinks recounts directory num after a failed write that carried a parent update: the inode write may have
+// landed without its chunk, and the failed operation leaves nothing for replay.
+func (m *Manager) restoreLinks(num uint32, recount func() (bool, error)) {
+	fixed, err := recount()
+	switch {
+	case err != nil:
+		log.Printf("[WARN] directory %d: link count may be off after a failed write: %v", num, err)
+	case fixed:
+		log.Printf("[WARN] directory %d: link count set from its subdirectories after a failed write", num)
+	}
+}
+
+// recountUnderInodeLock is recountLocked for a caller that holds only the directory's stripe.
+func (m *Manager) recountUnderInodeLock(ctx context.Context, num uint32) (bool, error) {
 	if m.lockMgr != nil {
-		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
+		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return false, fmt.Errorf("failed to acquire directory lock: %w", err)
 		}
-		defer m.unlock(dirIno.InodeNum)
+		defer m.unlock(num)
 	}
-	fresh, err := m.liveDirLocked(dirIno.InodeNum)
+	return m.recountLocked(num)
+}
+
+// recountLocked is RecountLinks for a caller that holds the directory's stripe and inode lock.
+func (m *Manager) recountLocked(num uint32) (bool, error) {
+	fresh, err := m.liveDirLocked(num)
 	if err != nil {
 		return false, err
 	}
