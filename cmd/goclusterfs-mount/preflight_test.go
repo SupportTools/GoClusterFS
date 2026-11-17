@@ -56,6 +56,7 @@ func usableConfig(t *testing.T) preflightConfig {
 		fuseDevice: fuse,
 		lookPath:   func(string) (string, error) { return "/usr/bin/fusermount3", nil },
 		uid:        0,
+		kubeNode:   func() string { return "" },
 	}
 }
 
@@ -159,7 +160,7 @@ func TestPreflightTakenPorts(t *testing.T) {
 	defer func() { _ = tcp.Close() }()
 
 	cfg := usableConfig(t)
-	cfg.network = broadcast.Config{Enabled: true, MulticastGroup: "239.192.74.75", MulticastPort: 31399,
+	cfg.network = broadcast.Config{Enabled: true, MulticastGroup: "239.192.74.75", MulticastPort: 24739,
 		UnicastPort: udp.LocalAddr().(*net.UDPAddr).Port, Secret: "s"}
 	cfg.apiAddr = tcp.Addr().String()
 	code, out := runChecks(t, cfg)
@@ -185,5 +186,35 @@ func TestPreflightWarnsWithoutBroadcastSecret(t *testing.T) {
 	}
 	if code != cli.ExitOK {
 		t.Errorf("a warning failed the preflight: exit %d\n%s", code, out)
+	}
+}
+
+func TestPreflightWarnsAboutNodePorts(t *testing.T) {
+	inRange := broadcast.Config{Enabled: true, MulticastPort: 31337, UnicastPort: 24731}
+	tests := []struct {
+		name     string
+		network  broadcast.Config
+		apiAddr  string
+		kubeNode string
+		want     []string
+	}{
+		{"not a Kubernetes node", inRange, "127.0.0.1:30080", "", nil},
+		{"defaults on a Kubernetes node", broadcast.DefaultConfig(), "127.0.0.1:8080", "/var/lib/kubelet exists", nil},
+		{"broadcast port in range", inRange, "127.0.0.1:8080", "/var/lib/kubelet exists", []string{"UDP -mcast-port 31337"}},
+		{"API port in range", broadcast.DefaultConfig(), "127.0.0.1:30080", "/etc/kubernetes exists", []string{"TCP -api-addr port 30080"}},
+		{"broadcast off", broadcast.Config{MulticastPort: 31337, UnicastPort: 31338}, "", "/etc/kubernetes exists", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := checkNodePorts(tt.network, tt.apiAddr, tt.kubeNode)
+			if (c.status == statusWarn) != (tt.want != nil) {
+				t.Fatalf("status %s, want a warning: %v (%s)", c.status, tt.want != nil, c.detail)
+			}
+			for _, w := range tt.want {
+				if !strings.Contains(c.detail, w) || !strings.Contains(c.detail, tt.kubeNode) || c.fix == "" {
+					t.Errorf("detail %q, fix %q: want it to name %q and say why", c.detail, c.fix, w)
+				}
+			}
+		})
 	}
 }

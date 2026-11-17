@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/supporttools/GoClusterFS/internal/cache/broadcast"
@@ -34,6 +36,7 @@ type preflightConfig struct {
 	fuseDevice         string
 	lookPath           func(string) (string, error)
 	uid                int
+	kubeNode           func() string // why this host looks like a Kubernetes node, or ""
 }
 
 // runPreflight checks what a mount needs from this host and the device,
@@ -47,6 +50,7 @@ func runPreflight(w io.Writer, cfg preflightConfig) int {
 	}
 	checks = append(checks, checkBroadcast(cfg.network)...)
 	checks = append(checks, checkAPIAddr(cfg.apiAddr))
+	checks = append(checks, checkNodePorts(cfg.network, cfg.apiAddr, cfg.kubeNode()))
 
 	failed, warned := 0, 0
 	for _, c := range checks {
@@ -231,8 +235,56 @@ func checkAPIAddr(addr string) check {
 	return c
 }
 
+// Kubernetes' default NodePort range. kube-proxy sends local traffic to these
+// ports, 127.0.0.1 included, to its services.
+const nodePortLow, nodePortHigh = 30000, 32767
+
+func checkNodePorts(network broadcast.Config, apiAddr, kubeNode string) check {
+	c := check{name: "NodePort range"}
+	if kubeNode == "" {
+		c.status, c.detail = statusPass, "this host does not look like a Kubernetes node"
+		return c
+	}
+	var clashes []string
+	add := func(port int, what string) {
+		if port >= nodePortLow && port <= nodePortHigh {
+			clashes = append(clashes, fmt.Sprintf("%s %d", what, port))
+		}
+	}
+	if network.Enabled {
+		add(network.MulticastPort, "UDP -mcast-port")
+		add(network.UnicastPort, "UDP -unicast-port")
+	}
+	if _, port, err := net.SplitHostPort(apiAddr); err == nil {
+		if p, err := strconv.Atoi(port); err == nil {
+			add(p, "TCP -api-addr port")
+		}
+	}
+	if len(clashes) == 0 {
+		c.status, c.detail = statusPass, fmt.Sprintf("no port in %d-%d (%s)", nodePortLow, nodePortHigh, kubeNode)
+		return c
+	}
+	c.status = statusWarn
+	c.detail = fmt.Sprintf("%s in Kubernetes' NodePort range %d-%d, and %s: kube-proxy sends traffic for a NodePort service's port to that service", strings.Join(clashes, ", "), nodePortLow, nodePortHigh, kubeNode)
+	c.fix = fmt.Sprintf("choose ports below %d with -mcast-port, -unicast-port and -api-addr", nodePortLow)
+	return c
+}
+
+// kubeNodeSign says why this host looks like a Kubernetes node, or returns "".
+func kubeNodeSign() string {
+	for _, dir := range []string{"/var/lib/kubelet", "/etc/kubernetes", "/var/lib/rancher/rke2", "/var/lib/rancher/k3s"} {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir + " exists"
+		}
+	}
+	if b, err := os.ReadFile("/proc/sys/net/ipv4/conf/all/route_localnet"); err == nil && strings.TrimSpace(string(b)) == "1" {
+		return "route_localnet is 1, as kube-proxy sets it"
+	}
+	return ""
+}
+
 func defaultPreflightConfig() preflightConfig {
-	return preflightConfig{fuseDevice: "/dev/fuse", lookPath: lookPathWithBin, uid: os.Getuid()}
+	return preflightConfig{fuseDevice: "/dev/fuse", lookPath: lookPathWithBin, uid: os.Getuid(), kubeNode: kubeNodeSign}
 }
 
 // lookPathWithBin searches PATH, then /bin, as go-fuse does for fusermount.

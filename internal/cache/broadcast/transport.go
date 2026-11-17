@@ -55,12 +55,12 @@ type Config struct {
 	MulticastGroup string
 
 	// MulticastPort is the UDP port for multicast communication.
-	// Default: 31337
+	// Default: 24730
 	MulticastPort int
 
 	// UnicastPort is the UDP port for unicast messages. It must differ from
 	// MulticastPort, which the multicast socket holds.
-	// Default: 31338
+	// Default: 24731
 	UnicastPort int
 
 	// MulticastTTL controls how far multicast packets travel.
@@ -124,8 +124,8 @@ func DefaultConfig() Config {
 	return Config{
 		Enabled:              true,
 		MulticastGroup:       "239.192.74.75",
-		MulticastPort:        31337,
-		UnicastPort:          31338,
+		MulticastPort:        24730,
+		UnicastPort:          24731,
 		MulticastTTL:         1,
 		MaxMulticastFailures: 3,
 		HeartbeatInterval:    30 * time.Second,
