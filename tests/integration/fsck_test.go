@@ -19,6 +19,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -411,7 +412,9 @@ func deadNodeWithCommittedTxn(t *testing.T, imagePath string) (slot string, jour
 	if err != nil {
 		t.Fatal(err)
 	}
-	i, err := node.NewRegistry(dev, sb.NodeRegistryOffset).Register(context.Background(), "gone")
+	reg := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	reg.SetLockLayout(lock.LayoutID())
+	i, err := reg.Register(context.Background(), "gone")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -41,7 +41,7 @@ TestFileNotFound 0.3
 TestFileStatBlocks 0.4
 TestFilesystemStats 0.3
 TestFsckCleanAfterWorkload 13.0
-TestFsckOnlineRelease 75
+TestFsckOnlineRelease 50
 TestFsckReleasesDeadSlot 14.2
 TestFsckRepairsOlderSharing 15.7
 TestGfsctlReadsLiveMount 0.3
