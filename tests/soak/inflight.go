@@ -79,6 +79,8 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 	}
 	_, isLink := d.model.Links[op.Path]
 	isDir := d.model.Dirs[op.Path]
+	_, dstLink := d.model.Links[op.Path2]
+	dstDir, dstExisted := d.model.Dirs[op.Path2], d.model.exists(op.Path2)
 	d.model.mu.Unlock()
 
 	switch op.Kind {
@@ -92,15 +94,28 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 		}
 		return "before", nil
 	case "rename":
-		// A rename is atomic: the source is still there only if it did not happen.
-		exists, err := d.present(n, op.Path, isDir, isLink)
+		srcThere, err := d.present(n, op.Path, isDir, isLink)
 		if err != nil {
 			return "", err
 		}
-		if exists {
-			return "before", nil
+		// Before the rename the target is as it was; after it, the target is the source.
+		dstThere, err := d.present(n, op.Path2, dstDir, dstLink)
+		if srcThere {
+			if err != nil {
+				return "", err
+			}
+			if dstThere == dstExisted {
+				return "before", nil
+			}
+		} else {
+			if dstThere, err = d.present(n, op.Path2, isDir, isLink); err != nil {
+				return "", err
+			}
+			if dstThere && (f == nil || d.sameContent(n, op.Path2, before)) {
+				return "after", nil
+			}
 		}
-		return "after", nil
+		return "", fmt.Errorf("rename %s to %s: source shown %v, target shown %v, which is neither before nor after", op.Path, op.Path2, srcThere, dstThere)
 	case "write", "truncate":
 		after := bytes.Clone(before)
 		applyData(op, &after)
@@ -153,6 +168,12 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 		return "", fmt.Errorf("%s: errno %d size %d, neither absent nor a full copy", op.Path2, resp.Errno, resp.Size)
 	}
 	return "", fmt.Errorf("cannot resolve a cut-short %s", op.Kind)
+}
+
+// sameContent reports whether node n reads want at p.
+func (d *driver) sameContent(n *node, p string, want []byte) bool {
+	resp, err := d.call(n, request{Op: "read", Path: p})
+	return err == nil && resp.Errno == 0 && resp.Size == int64(len(want)) && resp.Sum == sum(want)
 }
 
 // present reports whether node n shows p. A link is looked up in its directory's listing, since reading follows it.
