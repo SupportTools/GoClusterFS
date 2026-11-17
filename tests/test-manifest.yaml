@@ -4992,6 +4992,13 @@ scenarios:
     environments:
       go: internal/extent/tree_test.go::TestAddExtentForRecoveryRefusesBlocksPastTheDataRegion
 
+  - id: tree-root-out-of-range
+    name: A tree root past the data region fails lookups
+    description: An inode whose extent tree root is past the data region fails Lookup with ErrBlockOutOfRange instead of reading another region as a tree node
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestTreeRootPastTheDataRegionFailsLookups
+
   - id: damaged-directory-blocks
     name: A damaged directory fails lookups instead of crashing
     description: A directory whose extent points past the data region or the device, or whose size exceeds the data region, fails Lookup with ErrBlockOutOfRange

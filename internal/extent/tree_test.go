@@ -958,3 +958,20 @@ func TestAddExtentForRecoveryRefusesBlocksPastTheDataRegion(t *testing.T) {
 		t.Errorf("map the last block: %v", err)
 	}
 }
+
+// An inode whose tree root was damaged to a block past the data region fails its lookups, instead of reading another
+// region's bytes as a tree node.
+func TestTreeRootPastTheDataRegionFailsLookups(t *testing.T) {
+	env := newTreeEnv(t, 4)
+	ino := env.newInode()
+	env.insertScattered(ino, 10)
+	env.write(ino)
+	if !ino.HasExtentTree() {
+		t.Fatal("ten scattered extents should overflow into a tree")
+	}
+	ino.ExtentTreeRoot = treeTestBlocks
+	env.remount(4)
+	if _, _, err := env.mgr.Lookup(ino, 0); !errors.Is(err, ErrBlockOutOfRange) {
+		t.Errorf("lookup through a tree root past the data region: %v, want ErrBlockOutOfRange", err)
+	}
+}
