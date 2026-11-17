@@ -301,7 +301,7 @@ func (l *lane) generate(m *Model) *Op {
 			break
 		}
 	}
-	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone"}, kind) {
+	if full && slices.Contains([]string{"create", "write", "snapshot", "clone", "snapclone", "symlink"}, kind) {
 		kind = pick(r, []string{"unlink", "truncate", "snapdelete"})
 	}
 	if len(files) == 0 || len(files) < 6 && kind != "create" && kind != "mkdir" {

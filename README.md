@@ -11,7 +11,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Distributed Locking**: CAS-based on-disk locks for safe concurrent access
 - **Network Cache Invalidation**: UDP multicast for near-instant cross-node cache updates
 - **Copy-on-Write Snapshots**: File snapshots and clones that share blocks until a write (experimental)
-- **Symlinks**: Targets of up to 92 bytes live in the inode, longer ones up to 4095 bytes in one block; no rename or hard links yet
+- **Symlinks**: Targets of up to 92 bytes live in the inode, longer ones up to 4095 bytes in one block; no hard links yet
 - **Thin Provisioning**: Allocate-on-write with TRIM/BLKDISCARD support
 - **8-Phase fsck**: Comprehensive filesystem consistency checker with repair mode
 
