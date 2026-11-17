@@ -130,3 +130,31 @@ func TestHolderKeepsRecordNobodyWaitsFor(t *testing.T) {
 		}
 	}
 }
+
+// A node whose new claim finds a waiter it has seen for a whole turn keeps the
+// claim for minTurn, so a request that follows another at once, like a write
+// after a truncate, does not wait for the other node.
+func TestContestedHolderKeepsItsNewClaimBriefly(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	m := newTestNode(dev, 0, 1<<20, 1)
+	m.timing.holdTurn = 30 * time.Millisecond
+	m.timing.minTurn = 200 * time.Millisecond
+	mark := &claimSlot{mode: modeWaiting, wants: LockModeExclusive, lockType: LockTypeFileIO, resourceID: 3, owner: [16]byte{5}, acquireTime: time.Now().UnixNano()}
+	if err := m.writeSlot(m.hashToRecord(LockTypeFileIO, 3), 5, mark); err != nil {
+		t.Fatal(err)
+	}
+
+	requireAcquired(t, m, LockTypeFileIO, 3, LockModeExclusive)
+	release(t, m, LockTypeFileIO, 3)
+	time.Sleep(3 * m.timing.holdTurn)
+	requireAcquired(t, m, LockTypeFileIO, 3, LockModeExclusive)
+	release(t, m, LockTypeFileIO, 3)
+	requireAcquired(t, m, LockTypeFileIO, 3, LockModeExclusive)
+	release(t, m, LockTypeFileIO, 3)
+	for _, ts := range m.Stats().Types {
+		if ts.Name == "file_io" && ts.Blocked > 0 {
+			t.Errorf("an acquire right after a release waited %v, though the claim was new", ts.Wait)
+		}
+	}
+}

@@ -261,6 +261,10 @@ func covers(held, want LockMode) bool {
 // they test, before using it, so no test changes what another test's timers read.
 type timings struct {
 	cacheGrace, holdTurn, yieldGap time.Duration
+	// minTurn is how long a node keeps a new claim before another node's
+	// long wait can end its turn, so the requests of one operation, such as a
+	// truncate and a write, go through together.
+	minTurn time.Duration
 	// renewAfter is the age of a slot after which this node writes it again
 	// before relying on it, so other nodes never see a slot in use as stale.
 	renewAfter time.Duration
@@ -283,6 +287,7 @@ func defaultTimings() timings {
 		cacheGrace:     CacheGrace,
 		holdTurn:       HoldTurn,
 		yieldGap:       YieldGap,
+		minTurn:        YieldGap,
 		renewAfter:     StaleThreshold / 3,
 		acquireTimeout: DefaultTimeout,
 		tornExpiry:     StaleThreshold,
@@ -719,11 +724,17 @@ func (m *Manager) giveUp(err error, lockType LockType, resourceID uint64, mode L
 }
 
 // turnOverLocked reports whether this node has had its turn on recordID: its
-// turn on the record lasted holdTurn, or it kept claiming the record again for
-// holdTurn since it saw another node waiting.
+// turn on the record lasted holdTurn, or it has kept claiming the record again
+// for holdTurn since it saw another node waiting and has held this claim for minTurn.
 func (m *Manager) turnOverLocked(recordID uint64, rec *heldRecord) bool {
+	return age(rec.turn) > m.timing.holdTurn || m.contestedTooLongLocked(recordID) && age(rec.turn) > m.timing.minTurn
+}
+
+// contestedTooLongLocked reports whether this node has kept claiming recordID
+// again for holdTurn since it saw another node waiting.
+func (m *Manager) contestedTooLongLocked(recordID uint64) bool {
 	seen, waited := m.contested[recordID]
-	return age(rec.turn) > m.timing.holdTurn || waited && age(seen) > m.timing.holdTurn
+	return waited && age(seen) > m.timing.holdTurn
 }
 
 // renewIdleTurn starts a new turn on a record whose turn is over when its row
@@ -914,7 +925,8 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 		m.mu.Unlock()
 		return
 	}
-	if m.turnOverLocked(recordID, rec) {
+	// A hold that ends while another node has waited long yields, however new.
+	if m.turnOverLocked(recordID, rec) || m.contestedTooLongLocked(recordID) {
 		m.endTurnLocked(recordID)
 	} else {
 		delete(m.records, recordID)

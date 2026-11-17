@@ -5287,3 +5287,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/fairness_test.go::TestHolderKeepsRecordNobodyWaitsFor
+
+  - id: lock-contested-claim-kept-briefly
+    name: A contested holder keeps a new claim briefly
+    description: A node that has seen another node waiting for a whole turn keeps each new claim for minTurn, so an acquire right after a release joins it instead of yielding
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestContestedHolderKeepsItsNewClaimBriefly
