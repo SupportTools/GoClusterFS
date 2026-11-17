@@ -29,9 +29,11 @@ Node registry slots:
   filesystem is mounted.
 
   -release-slot N checks that slot N can be freed and lists the transactions
-  in its journal. It refuses while any node has the filesystem mounted, and
-  until a minute after the slot's lease ended. It writes nothing until you
-  pick one of:
+  in its journal. With no node mounted, it refuses until a minute after the
+  slot's lease ended. While nodes have the filesystem mounted, it watches the
+  slot unchanged for 40 seconds (70 for a slot a peer was replaying) instead,
+  and refuses a journal that holds a committed transaction or that it cannot
+  read: stop the cluster for those. It writes nothing until you pick one of:
     -salvage          replay the journal until a transaction fails to apply
                       or cannot be read, then discard the rest
     -discard-journal  discard the whole journal unread; while a mount could
@@ -91,6 +93,10 @@ func releaseSlot(out io.Writer, checker *fsck.Checker, i int, salvage, discard, 
 	s := plan.Slot
 	p.printf("Slot %d: %s, %s, lease %s\n", s.Index, s.Name(), s.Slot.State, lease(s))
 	p.printf("Journal: %s\n", s.Journal)
+	if plan.Online != "" {
+		p.printf("Online: %s has the filesystem mounted. The journal holds no committed transaction, so releasing the slot "+
+			"loses nothing; fsck replays nothing, and the node's unused block reserve stays allocated until goclusterfs-fsck -repair.\n", plan.Online)
+	}
 	if reportPath != "" {
 		// Discard nothing the report could not record.
 		if err := os.WriteFile(reportPath, record.Bytes(), 0o644); err != nil {
@@ -139,6 +145,8 @@ func releaseSlot(out io.Writer, checker *fsck.Checker, i int, salvage, discard, 
 		case salvaged.Err != nil:
 			p.printf("Salvage stopped: %v. What follows was discarded.\n", salvaged.Err)
 		}
+	case salvage && plan.Online != "" && err == nil:
+		p.printf("Nothing to replay: the journal holds no committed transaction.\n")
 	case discard && err == nil:
 		p.printf("Discarded %s:\n", plan.Discards)
 		printTxns(p, plan.Journal, func(fsck.PendingTxn) string { return "discarded" })
