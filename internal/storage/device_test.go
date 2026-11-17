@@ -447,3 +447,44 @@ func TestFailedReadIsRecorded(t *testing.T) {
 		t.Errorf("ReadAt on a closed file = %v, LastError = %v, want both set", err, dev.LastError())
 	}
 }
+
+// Offsets come from on-disk block numbers, so damage can put them anywhere: every read and write outside the device
+// fails with ErrOutOfRange instead of reaching the shard locks.
+func TestDeviceRefusesIOOutsideIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	fromFuzz := uint64(0x8303130327600000)
+	one, two := NewAlignedBuffer(SectorSize).Bytes(), NewAlignedBuffer(2*SectorSize).Bytes()
+	cases := []struct {
+		name   string
+		buf    []byte
+		offset int64
+	}{
+		{"negative", one, -SectorSize},
+		{"block number that overflowed", one, int64(fromFuzz)},
+		{"at the end", one, 2 * SectorSize},
+		{"across the end", two, SectorSize},
+		{"near the largest offset", one, (1<<63 - 1) &^ (SectorSize - 1)},
+	}
+	ops := map[string]func([]byte, int64) (int, error){
+		"ReadAt": dev.ReadAt, "ReadAtUnsharded": dev.ReadAtUnsharded, "WriteAt": dev.WriteAt, "WriteAtUnsharded": dev.WriteAtUnsharded,
+	}
+	for _, c := range cases {
+		for name, op := range ops {
+			if _, err := op(c.buf, c.offset); !errors.Is(err, ErrOutOfRange) {
+				t.Errorf("%s %s (%d bytes at %d) = %v, want ErrOutOfRange", name, c.name, len(c.buf), c.offset, err)
+			}
+		}
+	}
+	if _, err := dev.ReadAt(one, SectorSize); err != nil {
+		t.Errorf("read of the last sector: %v", err)
+	}
+}

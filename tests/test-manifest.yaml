@@ -3822,7 +3822,7 @@ scenarios:
 
   - id: fuzz-journal-replay
     name: Fuzz journal replay
-    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s; every error fsck then finds names an inode or block the records touched or one those map
+    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s without a panic, even when a record sends replay to a block outside the device; every error fsck then finds names an inode or block the records touched or one those map
     priority: go_only
     environments:
       go: internal/fsck/replay_fuzz_test.go::FuzzReplay
@@ -5015,6 +5015,34 @@ scenarios:
     priority: go_only
     environments:
       go: cmd/goclusterfs-mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+
+  - id: storage-io-out-of-range
+    name: Device refuses I/O outside it
+    description: Reads and writes at a negative offset, past the end, across the end or at an overflowed block offset fail with ErrOutOfRange instead of panicking in the shard locks
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestDeviceRefusesIOOutsideIt
+
+  - id: recovery-extent-out-of-range
+    name: Replay refuses to map blocks past the data region
+    description: AddExtentForRecovery fails with ErrBlockOutOfRange for an extent that starts or ends past the data region, including one whose end overflows
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestAddExtentForRecoveryRefusesBlocksPastTheDataRegion
+
+  - id: tree-root-out-of-range
+    name: A tree root past the data region fails lookups
+    description: An inode whose extent tree root is past the data region fails Lookup with ErrBlockOutOfRange instead of reading another region as a tree node
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestTreeRootPastTheDataRegionFailsLookups
+
+  - id: damaged-directory-blocks
+    name: A damaged directory fails lookups instead of crashing
+    description: A directory whose extent points past the data region or the device, or whose size exceeds the data region, fails Lookup with ErrBlockOutOfRange
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestDamagedDirectoryFailsLookups
 
   - id: storage-last-error
     name: Device remembers its last I/O failure

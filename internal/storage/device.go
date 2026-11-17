@@ -39,6 +39,9 @@ const (
 	IOShardSize = 1 << 20 // 1MB
 )
 
+// ErrOutOfRange is the error for a read or write that reaches outside the device.
+var ErrOutOfRange = errors.New("I/O outside the device")
+
 // Device represents a block device opened with O_DIRECT.
 // I/O operations are protected by sharded locks to allow parallel access
 // to different regions of the device. Operations within the same 1MB region
@@ -197,6 +200,9 @@ func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if err := d.checkRange(offset, len(buf)); err != nil {
+		return 0, err
+	}
 	if fault := d.readFault.Load(); fault != nil {
 		if err := (*fault)(offset); err != nil {
 			return 0, err
@@ -236,6 +242,9 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	}
 	if len(buf) == 0 {
 		return 0, nil
+	}
+	if err := d.checkRange(offset, len(buf)); err != nil {
+		return 0, err
 	}
 	if err := d.CheckWrite(offset); err != nil {
 		return 0, err
@@ -334,6 +343,15 @@ func (d *Device) record(err error) {
 // Fd returns the file descriptor for use with syscalls.
 func (d *Device) Fd() uintptr {
 	return d.file.Fd()
+}
+
+// checkRange refuses n bytes at offset unless they fit inside the device; offsets come from on-disk numbers, which
+// damage can make negative or past the end.
+func (d *Device) checkRange(offset int64, n int) error {
+	if offset < 0 || int64(n) > d.size || offset > d.size-int64(n) {
+		return fmt.Errorf("%w: %d bytes at offset %d, device has %d", ErrOutOfRange, n, offset, d.size)
+	}
+	return nil
 }
 
 // validateAlignment checks that buffer and offset meet O_DIRECT requirements.
