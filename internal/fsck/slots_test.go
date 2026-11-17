@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/node"
@@ -70,7 +71,7 @@ func TestReleaseSlot(t *testing.T) {
 	if !strings.HasPrefix(plan.Slot.Journal, "damaged: ") || !strings.HasPrefix(plan.Discards, "the whole journal, unread") {
 		t.Errorf("plan reports journal %q, discards %q", plan.Slot.Journal, plan.Discards)
 	}
-	if err := c.Release(plan); err != nil {
+	if _, err := c.Release(plan, false); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -87,6 +88,112 @@ func TestReleaseSlot(t *testing.T) {
 	}
 	if result, err := journal.ScanAndRecover(dev, uint64(journalAt), sb.JournalSlotSize(), nil, nil); result != nil || err != nil {
 		t.Errorf("mount recovery of the released journal = %+v, %v; want nothing to recover", result, err)
+	}
+}
+
+func TestReleaseSlotSalvage(t *testing.T) {
+	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
+	slot := goneNode(t, dev, sb)
+	journalAt := sb.JournalRegionOffset + uint64(slot)*sb.JournalSlotSize()
+	j, err := journal.Init(dev, journalAt, sb.JournalSlotSize(), [16]byte{1}, 1, journal.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	applies, fails, after := sb.TotalBlocks-4, sb.TotalBlocks+5, sb.TotalBlocks-1
+	for _, p := range []journal.BlockAllocPayload{
+		{InodeNum: 9, StartBlock: applies, Count: 2},
+		{InodeNum: 9, StartBlock: fails, Count: 1},
+		{InodeNum: 9, StartBlock: after, Count: 1},
+	} {
+		txn := j.Begin()
+		if err := txn.LogBlockAlloc(&p); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Commit(txn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bm := bitmap.NewRegion(dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, [16]byte{})
+	allocated := func(b uint64) bool {
+		t.Helper()
+		got, err := bm.IsAllocated(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	if allocated(applies) || allocated(after) {
+		t.Fatal("the test blocks are already allocated")
+	}
+
+	if _, err := newChecker(dev).PlanRelease(slot, false); err == nil || !strings.Contains(err.Error(), "add -salvage") {
+		t.Fatalf("PlanRelease of a replayable journal without salvage or force: %v", err)
+	}
+
+	starting := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	restore := fsck.SetReleaseHooks(nil, func() {
+		if _, err := starting.Register(context.Background(), "starting"); err != nil {
+			t.Error(err)
+		}
+	})
+	c := newChecker(dev)
+	plan, err := c.PlanRelease(slot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Release(plan, true); err == nil || !strings.Contains(err.Error(), "changed its node registry slot") {
+		t.Fatalf("Release with salvage while a node starts: %v", err)
+	}
+	restore()
+	if allocated(applies) {
+		t.Fatal("salvage replayed a transaction after a node started")
+	}
+	if slots, err := newChecker(dev).Slots(); err != nil || !slots[slot].InUse() || slots[slot].JournalFresh {
+		t.Fatalf("after the stopped salvage, slot %d: %+v, %v; want it taken with its journal kept", slot, slots[slot], err)
+	}
+	if err := starting.Unregister(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	editSlot(t, dev, sb, slot, func(s []byte) {
+		binary.LittleEndian.PutUint64(s[172:180], uint64(time.Now().Add(-time.Hour).Unix()))
+	})
+
+	c = newChecker(dev)
+	plan, err = c.PlanRelease(slot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Replayable == "" || len(plan.Journal.Pending) != 3 {
+		t.Fatalf("plan: replayable %q, %d pending; want a replayable journal with 3 transactions", plan.Replayable, len(plan.Journal.Pending))
+	}
+	first, second, third := plan.Journal.Pending[0].Seq, plan.Journal.Pending[1].Seq, plan.Journal.Pending[2].Seq
+
+	salvaged, err := c.Release(plan, true)
+	if err != nil {
+		t.Fatalf("Release with salvage: %v", err)
+	}
+	if !salvaged.Replayed[first] || salvaged.Replayed[second] || salvaged.Replayed[third] || salvaged.FailedSeq != second {
+		t.Errorf("salvage replayed %v and failed at %d; want only txn %d replayed and txn %d failed", salvaged.Replayed, salvaged.FailedSeq, first, second)
+	}
+	if !errors.Is(salvaged.Err, bitmap.ErrBlockOutOfRange) {
+		t.Errorf("salvage stopped with %v, want the failed transaction's ErrBlockOutOfRange", salvaged.Err)
+	}
+	if !allocated(applies) || !allocated(applies+1) || allocated(after) {
+		t.Errorf("after salvage: blocks %d-%d allocated %v %v, block %d allocated %v; want only the first transaction's blocks",
+			applies, applies+1, allocated(applies), allocated(applies+1), after, allocated(after))
+	}
+
+	slots, err := newChecker(dev).Slots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := slots[slot]; s.InUse() || !s.JournalFresh {
+		t.Errorf("after salvage slot %d is in use=%v with journal %q", slot, s.InUse(), s.Journal)
+	}
+	if result, err := journal.ScanAndRecover(dev, journalAt, sb.JournalSlotSize(), nil, nil); result != nil || err != nil {
+		t.Errorf("mount recovery of the salvaged journal = %+v, %v; want nothing to recover", result, err)
 	}
 }
 
@@ -148,7 +255,8 @@ func TestReleaseSlotLease(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return c.Release(plan)
+		_, err = c.Release(plan, false)
+		return err
 	}
 
 	slot := goneNode(t, dev, sb)
@@ -217,7 +325,7 @@ func TestReleaseSlotCrash(t *testing.T) {
 
 			crash := errors.New("fsck crashed")
 			raw := readSector(t, dev, int64(sb.NodeRegistryOffset)+int64(slot)*node.SlotSize)
-			released, err := node.NewRegistry(dev, sb.NodeRegistryOffset).ReleaseSlot(slot, raw, func() error {
+			released, err := node.NewRegistry(dev, sb.NodeRegistryOffset).ReleaseSlot(slot, raw, func(func() error) error {
 				if tt.resetFirst {
 					writeSector(t, dev, journalAt, nil)
 				}

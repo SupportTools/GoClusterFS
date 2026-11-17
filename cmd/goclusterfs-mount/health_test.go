@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
@@ -29,9 +30,24 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			s.broadcastOn = false
 			return s
 		}(), want: api.HealthStatusOK, code: http.StatusOK},
+		{name: "heartbeats late", src: func() healthSources {
+			s := fineSources()
+			s.heartbeatAge = func() time.Duration { return 3 * time.Second }
+			return s
+		}(), want: api.HealthStatusDegraded, code: http.StatusOK, problem: "heartbeat"},
+		{name: "not registered yet", src: func() healthSources {
+			s := fineSources()
+			s.heartbeatAge = func() time.Duration { return 0 }
+			return s
+		}(), want: api.HealthStatusOK, code: http.StatusOK},
 		{name: "replaying a crashed peer", src: func() healthSources {
 			s := fineSources()
 			s.replaying = func() []int { return []int{3, 7} }
+			return s
+		}(), want: api.HealthStatusDegraded, code: http.StatusOK, problem: "recovery"},
+		{name: "a crashed peer's replay keeps failing", src: func() healthSources {
+			s := fineSources()
+			s.failingReplays = func() []node.FailingReplay { return []node.FailingReplay{{Slot: 5, Failures: 3, Err: "bad record"}} }
 			return s
 		}(), want: api.HealthStatusDegraded, code: http.StatusOK, problem: "recovery"},
 		{name: "broadcast down", src: func() healthSources {
@@ -74,8 +90,8 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if resp.Status != tt.want {
 				t.Errorf("status = %s, want %s: %+v", resp.Status, tt.want, resp.Checks)
 			}
-			if len(resp.Checks) != 5 {
-				t.Errorf("checks = %v, want device, journal, recovery, broadcast and broadcast-peers", resp.Checks)
+			if len(resp.Checks) != 6 {
+				t.Errorf("checks = %v, want device, journal, recovery, broadcast, broadcast-peers and heartbeat", resp.Checks)
 			}
 			for name, check := range resp.Checks {
 				if (name == tt.problem) != (check.Status != api.HealthStatusOK) {
@@ -103,8 +119,15 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 }
 
 func TestHealthMessagesNameTheSlotsAndTheError(t *testing.T) {
-	if msg := recoveryHealth([]int{3, 7}).Message; !strings.Contains(msg, "slot 3, 7") {
+	if msg := recoveryHealth([]int{3, 7}, nil).Message; !strings.Contains(msg, "slot 3, 7") {
 		t.Errorf("recovery message = %q", msg)
+	}
+	failing := []node.FailingReplay{{Slot: 5, Failures: 4, Err: "bad record"}}
+	if msg := recoveryHealth([]int{5}, failing).Message; !strings.Contains(msg, "slot 5 failed 4 times in a row: bad record") || !strings.Contains(msg, "-inspect-slot 5") {
+		t.Errorf("failing recovery message = %q", msg)
+	}
+	if msg := heartbeatHealth(3200 * time.Millisecond).Message; !strings.Contains(msg, "3.2s ago") || !strings.Contains(msg, "at 5s this node stops") {
+		t.Errorf("heartbeat message = %q", msg)
 	}
 	if msg := deviceHealth(errors.New("input/output error")).Message; !strings.Contains(msg, "input/output error") || !strings.Contains(msg, "goclusterfs-fsck") {
 		t.Errorf("device message = %q", msg)
@@ -122,8 +145,10 @@ func fineSources() healthSources {
 		deviceError:      func() error { return nil },
 		journal:          func() *api.JournalStatsResponse { return &api.JournalStatsResponse{State: "dirty"} },
 		replaying:        func() []int { return nil },
+		failingReplays:   func() []node.FailingReplay { return nil },
 		broadcastOn:      true,
 		broadcastProblem: func() string { return "" },
 		silentPeers:      func() ([]string, time.Duration) { return nil, 90 * time.Second },
+		heartbeatAge:     func() time.Duration { return 800 * time.Millisecond },
 	}
 }

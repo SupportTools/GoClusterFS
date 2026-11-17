@@ -568,25 +568,32 @@ func TestFsckExtentTree(t *testing.T) {
 	}
 }
 
-func TestFsckRefusesHashedLockRecords(t *testing.T) {
-	dev, cleanup := testDevice(t, 20)
-	defer cleanup()
-	sb := superblock.New(dev.Size(), 0)
-	sb.TotalBlocks, sb.FreeBlocks = 9, 9
-	sb.RequiredFlags &^= superblock.RequiredTypedLockRecords
-	if _, err := dev.WriteAt(sb.Serialize(), 0); err != nil {
-		t.Fatal(err)
-	}
+func TestFsckRefusesOlderLockRecordLayouts(t *testing.T) {
+	for name, missing := range map[string]uint64{
+		"hashed lock records": superblock.RequiredTypedLockRecords,
+		"no file I/O locks":   superblock.RequiredFileIOLocks,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dev, cleanup := testDevice(t, 20)
+			defer cleanup()
+			sb := superblock.New(dev.Size(), 0)
+			sb.TotalBlocks, sb.FreeBlocks = 9, 9
+			sb.RequiredFlags &^= missing
+			if _, err := dev.WriteAt(sb.Serialize(), 0); err != nil {
+				t.Fatal(err)
+			}
 
-	opts := fsck.DefaultOptions()
-	opts.Output = &bytes.Buffer{}
-	result := fsck.New(dev, opts).Check()
-	found := false
-	for _, p := range result.Problems {
-		found = found || p.Phase == fsck.PhaseSuperblock && p.Severity == fsck.Fatal && strings.Contains(p.Message, "reformat with -format")
-	}
-	if !result.Aborted || !found {
-		t.Fatalf("fsck of a volume without per-type lock records: aborted=%v, problems %v; want a fatal superblock problem saying to reformat",
-			result.Aborted, result.Problems)
+			opts := fsck.DefaultOptions()
+			opts.Output = &bytes.Buffer{}
+			result := fsck.New(dev, opts).Check()
+			found := false
+			for _, p := range result.Problems {
+				found = found || p.Phase == fsck.PhaseSuperblock && p.Severity == fsck.Fatal && strings.Contains(p.Message, "reformat with -format")
+			}
+			if !result.Aborted || !found {
+				t.Fatalf("fsck of a volume with %s: aborted=%v, problems %v; want a fatal superblock problem saying to reformat",
+					name, result.Aborted, result.Problems)
+			}
+		})
 	}
 }

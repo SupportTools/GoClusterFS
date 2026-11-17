@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1116,6 +1117,143 @@ func TestSlotLossMessages(t *testing.T) {
 	}
 }
 
+func TestStatsCountReplaysAndHeartbeatAge(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if st := reg.Stats(); st.HeartbeatAge != 0 || st.Replays != 0 {
+		t.Fatalf("before registering: %+v, want zeros", st)
+	}
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	inReplay := make(chan []int, 1)
+	ok := func(*FailedNodeInfo) error { inReplay <- reg.Stats().Replaying; return nil }
+	failing := func(*FailedNodeInfo) error { return errors.New("bad record") }
+	if err := reg.replay(ok, 7, &FailedNodeInfo{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-inReplay; fmt.Sprint(got) != "[7]" {
+		t.Errorf("during the replay of slot 7, Replaying = %v", got)
+	}
+	if err := reg.replay(failing, 7, &FailedNodeInfo{}); err == nil {
+		t.Fatal("a failing replay returned nil")
+	}
+	st := reg.Stats()
+	if st.Replays != 1 || st.ReplayFailures != 1 || len(st.Replaying) != 0 {
+		t.Errorf("after one replay and one failure: %+v", st)
+	}
+	if st.HeartbeatAge <= 0 || st.HeartbeatAge > HeartbeatTimeout {
+		t.Errorf("heartbeat age right after registering = %v", st.HeartbeatAge)
+	}
+}
+
+func TestPeerReplayBacksOffAfterIdenticalFailures(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	const dead = 4
+	deadNode := func(uuid byte) {
+		t.Helper()
+		if err := reg.writeSlot(dead, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: [16]byte{uuid}, RecoveryOwner: [16]byte{9}, RecoveryStart: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadNode(5)
+	var replayErr error
+	tries := 0
+	reg.SetRecoveryHandler(func(*FailedNodeInfo) error { tries++; return replayErr })
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+
+	// scan runs failure detection after this node has seen the dead slot unchanged for quiet.
+	scan := func(quiet time.Duration) (tried bool, logged string) {
+		t.Helper()
+		slot, err := reg.readSlot(dead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		silence(reg, dead, slot, quiet)
+		before := tries
+		logs.Reset()
+		reg.detectAndRecoverFailedNodes()
+		return tries > before, logs.String()
+	}
+	lapsed := recoveryLease + time.Second
+	failing := func() string { return fmt.Sprint(reg.FailingReplays()) }
+
+	for k, err := range []error{fmt.Errorf("%w: inode 9", ErrReplayContended), ErrLeaseLost, fmt.Errorf("%w: inode 9", ErrReplayContended), ErrLeaseLost} {
+		replayErr = err
+		if tried, _ := scan(lapsed); !tried {
+			t.Fatalf("after %d lock timeouts and lost leases, no retry once the lease lapsed", k)
+		}
+	}
+	if got := failing(); got != "[]" {
+		t.Fatalf("lock timeouts and lost leases made the slot failing: %s", got)
+	}
+
+	replayErr = errors.New("bad record")
+	var logged string
+	for k := 1; k <= replayRepeats; k++ {
+		var tried bool
+		if tried, logged = scan(lapsed); !tried || !strings.Contains(logged, "bad record") {
+			t.Fatalf("failure %d: tried %v, logged %q", k, tried, logged)
+		}
+	}
+	if !strings.Contains(logged, "3 times in a row") || !strings.Contains(logged, "-inspect-slot 4") {
+		t.Errorf("third identical failure logged %q", logged)
+	}
+	if got := failing(); got != "[{4 3 bad record}]" {
+		t.Errorf("FailingReplays after 3 identical failures = %s", got)
+	}
+	if tried, _ := scan(ReplayBackoff - time.Minute); tried {
+		t.Fatal("retried within the backoff")
+	}
+	if tried, logged := scan(ReplayBackoff + time.Second); !tried || logged != "" {
+		t.Fatalf("after the backoff: tried %v, logged %q; want a retry that logs nothing within the hour", tried, logged)
+	}
+	reg.mu.Lock()
+	reg.failures[dead].logged = time.Now().Add(-failureLogEvery)
+	reg.mu.Unlock()
+	if _, logged := scan(ReplayBackoff + time.Second); !strings.Contains(logged, "5 times in a row") {
+		t.Errorf("an hour after the last log, the failure logged %q", logged)
+	}
+
+	replayErr = errors.New("short read")
+	if tried, logged := scan(ReplayBackoff + time.Second); !tried || !strings.Contains(logged, "any node retries after") {
+		t.Fatalf("a different error: tried %v, logged %q", tried, logged)
+	}
+	if got := failing(); got != "[]" {
+		t.Errorf("a different error kept the slot failing: %s", got)
+	}
+	if tried, _ := scan(lapsed); !tried {
+		t.Fatal("a different error kept the backoff")
+	}
+	replayErr = nil
+	if tried, _ := scan(lapsed); !tried || len(reg.failures) != 0 {
+		t.Fatalf("successful replay: tried %v, failures %v", tried, reg.failures)
+	}
+
+	deadNode(6)
+	replayErr = errors.New("bad record")
+	for range replayRepeats {
+		scan(lapsed)
+	}
+	if got := failing(); got != "[{4 3 bad record}]" {
+		t.Fatalf("FailingReplays for the next dead node = %s", got)
+	}
+	if err := reg.writeSlot(dead, &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatTime: time.Now().Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	if tried, _ := scan(0); tried || failing() != "[]" {
+		t.Errorf("a new node in the slot: tried %v, FailingReplays = %s", tried, failing())
+	}
+}
+
 func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -1220,6 +1358,31 @@ func writeLocalSlotAt(t *testing.T, reg *Registry, idx int, pid int, heartbeat t
 	return slot
 }
 
+func TestReleaseSlotKeepsOrphans(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	orphans := []Orphan{{Inode: 12, Birth: 3}, {Inode: 40, Birth: 9}}
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5}, HeartbeatTime: time.Now().Add(-time.Hour).Unix(), Orphans: orphans}
+	if err := reg.writeSlot(2, gone); err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := reg.readSlotRaw(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released, err := reg.ReleaseSlot(2, raw, func(func() error) error { return nil }); !released || err != nil {
+		t.Fatalf("ReleaseSlot = %v, %v", released, err)
+	}
+	slot, err := reg.readSlot(2)
+	if err != nil || slot.State != NodeStateEmpty || !slices.Equal(slot.Orphans, orphans) {
+		t.Fatalf("released slot: %+v, %v; want empty with orphans %v", slot, err, orphans)
+	}
+	if all, err := reg.AllOrphans(); err != nil || !slices.Equal(all, orphans) {
+		t.Errorf("AllOrphans after the release = %v, %v; want %v, so live nodes still free them", all, err, orphans)
+	}
+}
+
 func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -1235,7 +1398,7 @@ func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	released, err := reg.ReleaseSlot(0, raw, func() error {
+	released, err := reg.ReleaseSlot(0, raw, func(func() error) error {
 		time.Sleep(2 * claimSettle)
 		return nil
 	})
@@ -1244,6 +1407,71 @@ func TestReleaseSlotGivesUpOnSlowReset(t *testing.T) {
 	}
 	if slot, err := reg.readSlot(0); err != nil || slot.State != NodeStateDead || slot.RecoveryOwner != reg.localUUID {
 		t.Errorf("slot after the abandoned release: %+v, %v; want dead under this registry's lease", slot, err)
+	}
+}
+
+func TestReleaseSlotRenewsItsLease(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	t.Cleanup(SetRecoveryLease(8 * claimSettle))
+	defer func(old time.Duration) { releaseLeaseBudget = old }(releaseLeaseBudget)
+	releaseLeaseBudget = 2 * claimSettle
+
+	reg := NewRegistry(dev, 0)
+	orphans := []Orphan{{Inode: 12, Birth: 3}}
+	gone := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{5}, HeartbeatTime: time.Now().Add(-time.Hour).Unix(), Orphans: orphans}
+	for _, idx := range []int{0, 1} {
+		if err := reg.writeSlot(idx, gone); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, _, err := reg.readSlotRaw(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var starts []int64
+	released, err := reg.ReleaseSlot(0, raw, func(renew func() error) error {
+		for range 6 {
+			time.Sleep(claimSettle)
+			if err := renew(); err != nil {
+				return err
+			}
+			slot, err := reg.readSlot(0)
+			if err != nil {
+				return err
+			}
+			starts = append(starts, slot.RecoveryStart)
+		}
+		return nil
+	})
+	if !released || err != nil {
+		t.Fatalf("ReleaseSlot with a reset that renews for %v, past the %v budget = %v, %v", 6*claimSettle, releaseLeaseBudget, released, err)
+	}
+	if starts[0] == starts[len(starts)-1] {
+		t.Errorf("the lease start never moved during the reset: %v", starts)
+	}
+	if slot, err := reg.readSlot(0); err != nil || slot.State != NodeStateEmpty || !slices.Equal(slot.Orphans, orphans) {
+		t.Errorf("released slot: %+v, %v; want empty with orphans %v", slot, err, orphans)
+	}
+
+	raw, _, err = reg.readSlotRaw(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released, err = reg.ReleaseSlot(1, raw, func(renew func() error) error {
+		taken, err := reg.readSlot(1)
+		if err != nil {
+			return err
+		}
+		taken.RecoveryOwner = [16]byte{9}
+		if err := reg.writeSlot(1, taken); err != nil {
+			return err
+		}
+		return renew()
+	})
+	if released || !errors.Is(err, ErrLeaseLost) {
+		t.Errorf("ReleaseSlot after another node took the lease = %v, %v; want ErrLeaseLost", released, err)
 	}
 }
 

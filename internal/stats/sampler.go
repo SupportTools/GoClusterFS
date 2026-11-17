@@ -42,6 +42,7 @@ type NodeSource interface {
 	LocalUUID() [16]byte
 	LocalSlot() int
 	Slots() ([]*node.Slot, error)
+	Stats() node.Stats
 }
 
 // Sources are the managers a Sampler reads. Leave Journal or Trim nil when the
@@ -56,6 +57,14 @@ type Sources struct {
 	Nodes     NodeSource
 	Reserve   ReserveSource
 	BlockSize uint64
+	// MountReplay is what this node did with its own slot's journal when it mounted.
+	MountReplay MountReplay
+}
+
+// MountReplay records the mount's replay of a journal its slot's previous owner left.
+type MountReplay struct {
+	Transactions int
+	Discarded    bool
 }
 
 // Sampler implements api.StatsProvider and the capacity half of
@@ -157,6 +166,17 @@ func (s *Sampler) sampleCounters() {
 	s.current.Trim = &api.TrimStatsResponse{}
 	if s.src.Trim != nil {
 		s.current.Trim = trimResponse(s.src.Trim.Stats())
+	}
+	if s.src.Nodes != nil {
+		n := s.src.Nodes.Stats()
+		s.current.Node = &api.NodeStatsResponse{
+			HeartbeatAgeSeconds:       n.HeartbeatAge.Seconds(),
+			PeerReplays:               n.Replays,
+			PeerReplayFailures:        n.ReplayFailures,
+			ReplayingSlots:            n.Replaying,
+			MountReplayedTransactions: s.src.MountReplay.Transactions,
+			MountDiscardedJournal:     s.src.MountReplay.Discarded,
+		}
 	}
 	s.current.CollectedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	s.publish()

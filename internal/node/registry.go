@@ -17,6 +17,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,6 +90,7 @@ type Slot struct {
 	RecoveryStart int64     // Dead slots: when that replay last renewed its lease (Unix s)
 	PIDNamespace  uint64    // Inode of the mount process's PID namespace
 	Orphans       []Orphan  // Files this node unlinked that some node may still have open
+	LockLayout    uint32    // How the node's build maps locks to lock records; 0 before builds recorded it
 	Checksum      uint32    // CRC32C of bytes 0-4091
 }
 
@@ -98,9 +100,12 @@ type Orphan struct {
 	Birth uint32
 }
 
-const MaxOrphans = (SlotSize - 4 - orphansOffset - 4) / 8
+const MaxOrphans = (lockLayoutOffset - orphansOffset - 4) / 8
 
-const orphansOffset = 188
+const (
+	orphansOffset    = 188
+	lockLayoutOffset = SlotSize - 8
+)
 
 // Registry manages node registration and heartbeats.
 type Registry struct {
@@ -120,6 +125,7 @@ type Registry struct {
 	hostname   string
 	bootID     [16]byte
 	pidNS      uint64
+	lockLayout uint32
 	onSlotLost func(SlotLoss)
 
 	onOwnerDead   func(owner [16]byte, slot int) (done func(replayed bool))
@@ -144,6 +150,9 @@ type Registry struct {
 	failureCheckInterval time.Duration // How often to scan for failed nodes
 	recoveryInProgress   map[int]bool  // Slots currently being recovered
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
+	replays              atomic.Uint64
+	replayFailures       atomic.Uint64
+	failures             map[int]*replayFailure // the last run of identical replay failures per slot
 }
 
 // emptySlot is a slot no node ever wrote; it has no checksum.
@@ -159,6 +168,9 @@ var (
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
 	ErrOrphansFull        = errors.New("this node's registry slot has no room for another orphan")
+	ErrLockLayout         = errors.New("a live node maps locks to lock records differently from this build")
+	// ErrReplayContended marks a replay that failed waiting on other nodes, such as for a lock; it never counts toward a backoff.
+	ErrReplayContended = errors.New("the replay waited too long on other nodes")
 )
 
 // FailedNodeInfo contains information about a failed node for recovery.
@@ -196,6 +208,7 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 		orphanKick:           make(chan struct{}, 1),
 		failureCheckInterval: FailureCheckInterval,
 		recoveryInProgress:   make(map[int]bool),
+		failures:             make(map[int]*replayFailure),
 		sightings:            make(map[int]sighting),
 		seen:                 make(map[int]*Slot),
 		bootID:               readBootID(),
@@ -320,6 +333,9 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	var name [64]byte
 	copy(name[:], hostname)
 	r.hostname = string(bytes.TrimRight(name[:], "\x00"))
+	if err := r.checkLockLayouts(); err != nil {
+		return -1, err
+	}
 
 	empty := func(slot *Slot) bool { return slot.State == NodeStateEmpty }
 	ownFailed := func(slot *Slot) bool {
@@ -364,6 +380,48 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 		err = ErrNoFreeSlots
 	}
 	return i, err
+}
+
+// SetLockLayout sets the lock record layout Register writes in this node's
+// slot. Register refuses to join while a live node's slot holds another one.
+func (r *Registry) SetLockLayout(id uint32) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lockLayout = id
+}
+
+// checkLockLayouts returns ErrLockLayout naming a node whose slot holds another
+// lock layout, unless its heartbeat stays unchanged for silentSlotWatch: two
+// such nodes would not exclude each other. Called with r.mu held.
+func (r *Registry) checkLockLayouts() error {
+	slots, err := r.readAllSlots()
+	if err != nil {
+		return err
+	}
+	differs := func(s *Slot) bool {
+		return s != nil && (s.State == NodeStateActive || s.State == NodeStateLeaving) && s.LockLayout != r.lockLayout &&
+			(!r.sameHost(s) || !r.deadLocalOwner(s))
+	}
+	var other []int
+	for i, s := range slots {
+		if differs(s) {
+			other = append(other, i)
+		}
+	}
+	if len(other) == 0 {
+		return nil
+	}
+	silent := map[int]bool{}
+	for _, w := range r.awaitSilentSlots(other, silentSlotWatch) {
+		silent[w.slot] = true
+	}
+	for _, i := range other {
+		if _, s, err := r.readSlotRaw(i); err == nil && !silent[i] && differs(s) {
+			return fmt.Errorf("%w: node %s in slot %d (%x) has lock layout %08x, this build %08x",
+				ErrLockLayout, s.Host(), i, s.UUID[:8], s.LockLayout, r.lockLayout)
+		}
+	}
+	return nil
 }
 
 // PreferSlot makes Register try slot first: it takes it if it is empty, or if
@@ -739,6 +797,7 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		PID:           uint32(os.Getpid()),
 		ProcStart:     processStart,
 		PIDNamespace:  r.pidNS,
+		LockLayout:    r.lockLayout,
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
@@ -943,6 +1002,7 @@ func serializeSlot(slot *Slot) []byte {
 		binary.LittleEndian.PutUint32(buf[at:], o.Inode)
 		binary.LittleEndian.PutUint32(buf[at+4:], o.Birth)
 	}
+	binary.LittleEndian.PutUint32(buf[lockLayoutOffset:], slot.LockLayout)
 
 	// Compute checksum
 	checksum := storage.CRC32C(buf[:SlotSize-4])
@@ -981,6 +1041,7 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 		ProcStart:     int64(binary.LittleEndian.Uint64(buf[148:156])),
 		RecoveryStart: int64(binary.LittleEndian.Uint64(buf[172:180])),
 		PIDNamespace:  binary.LittleEndian.Uint64(buf[180:188]),
+		LockLayout:    binary.LittleEndian.Uint32(buf[lockLayoutOffset:]),
 		Checksum:      stored,
 	}
 	copy(slot.UUID[:], buf[8:24])
@@ -1055,9 +1116,12 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		r.mu.Lock()
 		r.remember(i, slot)
 		r.observe(i, slot)
+		if f := r.failures[i]; f != nil && (slot.UUID != f.uuid || slot.State != NodeStateDead) {
+			delete(r.failures, i)
+		}
 
 		// Peers wait for a failed node's locks until its replay ends, so only a node proven dead, not one paused, is replayed.
-		if !r.stale(i, slot, deadAfter) {
+		if !r.stale(i, slot, deadAfter) || r.backingOff(i, slot) {
 			r.mu.Unlock()
 			continue
 		}
@@ -1082,22 +1146,82 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		err = r.replay(handler, i, info)
 		done(err == nil)
 		if err != nil {
-			log.Printf("[Recovery] Replaying slot %d (node %x) failed: %v; any node retries after %v. To discard its journal instead, mount a node with -skip-recovery=%d",
-				i, info.UUID[:8], err, recoveryLease, i)
 			r.mu.Lock()
 			delete(r.recoveryInProgress, i)
+			msg := r.replayFailed(i, info.UUID, err)
 			r.mu.Unlock()
+			if msg != "" {
+				log.Print(msg)
+			}
 			continue
 		}
 
 		if err := r.clearFailedSlot(i, info.UUID); err != nil {
-			log.Printf("[Recovery] Clearing slot %d (node %x) after replay failed: %v; any node replays it again after %v",
+			log.Printf("[Recovery] Replayed slot %d (node %x), but emptying the slot failed: %v; any node replays it again after %v",
 				i, info.UUID[:8], err, recoveryLease)
 		}
 		r.mu.Lock()
 		delete(r.recoveryInProgress, i)
+		delete(r.failures, i)
 		r.mu.Unlock()
 	}
+}
+
+const (
+	// replayRepeats identical failures in a row make this node back off from a slot's replay.
+	replayRepeats = 3
+	// ReplayBackoff is how long a backed-off slot must stay unchanged before this node replays it again.
+	// Every attempt, by any node, renews the slot's lease, so once all nodes back off the cluster tries about this often.
+	ReplayBackoff = 10 * time.Minute
+	// failureLogEvery is how often a backed-off slot's failures are logged.
+	failureLogEvery = time.Hour
+)
+
+// replayFailure is a run of replay failures of one dead node's slot, all with the same error.
+type replayFailure struct {
+	uuid   [16]byte
+	err    string
+	count  int
+	logged time.Time
+}
+
+// backingOff reports whether this node leaves slot i alone for now. Called with r.mu held after observe.
+func (r *Registry) backingOff(i int, slot *Slot) bool {
+	f := r.failures[i]
+	return f != nil && f.count >= replayRepeats && r.silentFor(i, slot) < ReplayBackoff
+}
+
+// replayFailed counts a failed replay of slot i and returns what to log, or "" once the slot is backed off
+// and was logged within failureLogEvery. Called with r.mu held.
+func (r *Registry) replayFailed(i int, uuid [16]byte, err error) string {
+	failed := fmt.Sprintf("[Recovery] Replaying slot %d (node %x) failed: %v", i, uuid[:8], err)
+	if errors.Is(err, ErrReplayContended) || errors.Is(err, ErrLeaseLost) {
+		return fmt.Sprintf("%s; any node retries after %v", failed, recoveryLease)
+	}
+	f := r.failures[i]
+	if f == nil || f.uuid != uuid || f.err != err.Error() {
+		f = &replayFailure{uuid: uuid, err: err.Error()}
+		r.failures[i] = f
+	}
+	f.count++
+	switch {
+	case f.count < replayRepeats:
+		return fmt.Sprintf("%s; any node retries after %v. To see what its journal holds, run goclusterfs-fsck -inspect-slot %d; "+
+			"to discard it, mount a node with -skip-recovery=%d", failed, recoveryLease, i, i)
+	case f.count == replayRepeats || time.Since(f.logged) >= failureLogEvery:
+		f.logged = time.Now()
+		return fmt.Sprintf("%s, %d times in a row; this node now retries it after %v without a change and logs this at most hourly. "+
+			"Files it had locked stay locked until a replay succeeds. Run goclusterfs-fsck -inspect-slot %d, then see Damaged Journal Slot in OPERATIONS.md",
+			failed, f.count, ReplayBackoff, i)
+	}
+	return ""
+}
+
+// FailingReplay is a dead node's slot whose replay failed on this node with the same error several times in a row.
+type FailingReplay struct {
+	Slot     int
+	Failures int
+	Err      string
 }
 
 // acquireForRecovery marks a failed node's slot Dead with this node as the
@@ -1196,15 +1320,14 @@ var releaseLeaseBudget = recoveryLease / 2
 // still holds expected, the raw bytes the caller checked. Like a peer that
 // replays a crashed node's journal, it first takes the slot's recovery lease,
 // so neither Register nor failure detection touches the slot while reset
-// clears its journal; then it empties the slot. It returns false without
-// running reset if the slot changed or another node won the lease.
-func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error) (bool, error) {
+// clears its journal; then it empties the slot. A long reset calls renew, as a
+// replay does before each transaction: it keeps the lease and fails once
+// another node holds it. ReleaseSlot returns false without running reset if
+// the slot changed or another node won the lease.
+func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func(renew func() error) error) (bool, error) {
 	if slotIdx < 0 || slotIdx >= MaxNodes {
 		return false, fmt.Errorf("slot index out of range: %d", slotIdx)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	slot, err := deserializeSlot(expected)
 	if err != nil {
 		return false, err
@@ -1215,26 +1338,57 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func() error)
 	leaseStart := time.Now()
 	slot.RecoveryStart = leaseStart.Unix()
 	leased := serializeSlot(slot)
-	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
-		return false, err
-	}
-	time.Sleep(claimSettle)
-	if current, _, err := r.readSlotRaw(slotIdx); err != nil || !bytes.Equal(current, leased) {
+	if ok, err := r.takeReleaseLease(slotIdx, expected, leased); err != nil || !ok {
 		return false, err
 	}
 
-	if err := reset(); err != nil {
+	held := leaseStart
+	check := r.leaseCheck(slotIdx, slot.UUID, leaseStart)
+	renew := func() error {
+		if err := check(); err != nil {
+			return err
+		}
+		held = time.Now()
+		return nil
+	}
+	if err := reset(renew); err != nil {
 		return false, err
 	}
-	if age := time.Since(leaseStart); age > releaseLeaseBudget {
-		return false, fmt.Errorf("the journal reset took %s, too long to trust the slot's recovery lease; "+
+	if age := time.Since(held); age > releaseLeaseBudget {
+		return false, fmt.Errorf("the journal reset ran %s without renewing the slot's recovery lease, too long to trust it; "+
 			"the slot stays dead until the lease lapses", age.Round(time.Millisecond))
 	}
-	ok, err := r.casSlot(slotIdx, leased, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, current, err := r.readSlotRaw(slotIdx)
+	if err != nil {
+		return false, err
+	}
+	// Renewals move only RecoveryStart; any other change means another writer.
+	renewed := *current
+	renewed.RecoveryStart = slot.RecoveryStart
+	if !bytes.Equal(serializeSlot(&renewed), leased) {
+		return false, fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
+	}
+	// No node replayed this slot to take over its orphans, so the slot keeps them for live nodes and its next owner.
+	ok, err := r.casSlot(slotIdx, raw, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty, Orphans: current.Orphans}))
 	if err == nil && !ok {
 		err = fmt.Errorf("slot %d changed while its recovery lease was held", slotIdx)
 	}
 	return ok, err
+}
+
+// takeReleaseLease writes leased over expected and reports whether the slot still holds it after claimSettle.
+func (r *Registry) takeReleaseLease(slotIdx int, expected, leased []byte) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if ok, err := r.casSlot(slotIdx, expected, leased); err != nil || !ok {
+		return false, err
+	}
+	time.Sleep(claimSettle)
+	current, _, err := r.readSlotRaw(slotIdx)
+	return err == nil && bytes.Equal(current, leased), err
 }
 
 // GetFailedNodes returns information about nodes that have failed (stale heartbeat).
@@ -1271,7 +1425,32 @@ func (r *Registry) replay(handler RecoveryHandler, slotIdx int, info *FailedNode
 	bit := uint64(1) << slotIdx
 	r.replaying.Or(bit)
 	defer r.replaying.And(^bit)
-	return handler(info)
+	err := handler(info)
+	if err != nil {
+		r.replayFailures.Add(1)
+	} else {
+		r.replays.Add(1)
+	}
+	return err
+}
+
+// Stats is what the registry tells monitoring about this node's liveness and its replays of other nodes' journals.
+type Stats struct {
+	// HeartbeatAge is how long ago this node's last heartbeat landed; 0 before it registered.
+	HeartbeatAge   time.Duration
+	Replays        uint64 // other nodes' journals this node replayed
+	ReplayFailures uint64 // replays that failed and were left for a retry
+	Replaying      []int  // slots whose journal this node is replaying now
+	Failing        []FailingReplay
+}
+
+// Stats returns this node's liveness and replay counts.
+func (r *Registry) Stats() Stats {
+	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays()}
+	if r.lastBeat.Load() != nil {
+		st.HeartbeatAge = r.sinceLastBeat()
+	}
+	return st
 }
 
 // Replaying returns the slots whose journal this node is replaying now.
@@ -1281,6 +1460,20 @@ func (r *Registry) Replaying() []int {
 		slots = append(slots, bits.TrailingZeros64(mask))
 	}
 	return slots
+}
+
+// FailingReplays returns the slots this node backs off from, after their replay failed the same way replayRepeats times in a row.
+func (r *Registry) FailingReplays() []FailingReplay {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var failing []FailingReplay
+	for i, f := range r.failures {
+		if f.count >= replayRepeats {
+			failing = append(failing, FailingReplay{Slot: i, Failures: f.count, Err: f.err})
+		}
+	}
+	slices.SortFunc(failing, func(a, b FailingReplay) int { return a.Slot - b.Slot })
+	return failing
 }
 
 // RecoverFailedNode manually triggers recovery for a specific node.

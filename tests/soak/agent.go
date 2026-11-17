@@ -39,6 +39,7 @@ type response struct {
 	Sum   string   `json:"sum,omitempty"`
 	Names []string `json:"names,omitempty"`
 	Text  string   `json:"text,omitempty"`
+	Data  []byte   `json:"data,omitempty"`
 }
 
 // genData returns n bytes that depend only on seed, so the driver and the agents produce the same data.
@@ -127,6 +128,10 @@ func serve(root string, req request) response {
 		var data []byte
 		if data, err = os.ReadFile(p); err == nil {
 			resp.Size, resp.Sum = int64(len(data)), sum(data)
+		}
+	case "readall":
+		if resp.Data, err = os.ReadFile(p); err == nil {
+			resp.Size, resp.Sum = int64(len(resp.Data)), sum(resp.Data)
 		}
 	case "list":
 		var entries []os.DirEntry

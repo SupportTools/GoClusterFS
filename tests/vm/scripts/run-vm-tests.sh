@@ -2577,6 +2577,86 @@ test_rename_file() {
     return 0
 }
 
+# Waits up to 5 s for a shell check, run in the mount on a node, to pass: a node may show old names for -attr-timeout.
+settle_on_vm() {
+    local vm_id=$1 check=$2 i
+    for i in $(seq 1 25); do
+        ssh_run "$vm_id" "cd /mnt/goclusterfs && $check" >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    log_error "On VM $vm_id, still false after 5 s: $check"
+    return 1
+}
+
+# Test: two VMs rename at once: onto one name, a rename racing an unlink of its source or a create of its target,
+# and crossing directory moves. Based on the Go TestMultiNodeRenamesOntoOneName, TestMultiNodeRenameRacesUnlinkOfItsSource,
+# TestMultiNodeRenameRacesCreateOfItsTarget and TestMultiNodeCrossMovesCannotFormALoop.
+test_multinode_rename() {
+    log_info "Testing renames from two VMs at once..."
+    ensure_cluster_healthy 2 || return 1
+    local n1=1 n2=2 m=/mnt/goclusterfs i p1 p2 r1 r2 got want
+    for i in 1 2 3 4 5; do
+        ssh_run "$n1" "printf a$i > $m/rn_a$i" && ssh_run "$n2" "printf b$i > $m/rn_b$i" || return 1
+        ssh_run "$n1" "mv $m/rn_a$i $m/rn_t$i" & p1=$!
+        ssh_run "$n2" "mv $m/rn_b$i $m/rn_t$i" & p2=$!
+        wait $p1; r1=$?; wait $p2; r2=$?
+        if [[ $r1 -ne 0 || $r2 -ne 0 ]]; then
+            log_error "round $i: renames onto one name exited $r1 and $r2, want both 0"
+            return 1
+        fi
+        settle_on_vm "$n1" "test ! -e rn_a$i && test ! -e rn_b$i" || return 1
+        got=$(ssh_run "$n1" "cat $m/rn_t$i")
+        if [[ "$got" != "a$i" && "$got" != "b$i" ]]; then
+            log_error "round $i: rn_t$i holds '$got', want a$i or b$i"
+            return 1
+        fi
+        settle_on_vm "$n2" "test ! -e rn_a$i && test ! -e rn_b$i && test \"\$(cat rn_t$i)\" = $got" || return 1
+
+        ssh_run "$n1" "printf s$i > $m/rn_s$i" || return 1
+        settle_on_vm "$n2" "test \"\$(cat rn_s$i)\" = s$i" || return 1
+        ssh_run "$n1" "mv $m/rn_s$i $m/rn_d$i" 2>/dev/null & p1=$!
+        ssh_run "$n2" "rm $m/rn_s$i" 2>/dev/null & p2=$!
+        wait $p1; r1=$?; wait $p2; r2=$?
+        if [[ $r1 -eq 0 && $r2 -ne 0 ]]; then
+            want="test ! -e rn_s$i && test \"\$(cat rn_d$i)\" = s$i"
+        elif [[ $r2 -eq 0 && $r1 -ne 0 ]]; then
+            want="test ! -e rn_s$i && test ! -e rn_d$i"
+        else
+            log_error "round $i: rename and unlink of one name exited $r1 and $r2, want exactly one 0"
+            return 1
+        fi
+        settle_on_vm "$n1" "$want" && settle_on_vm "$n2" "$want" || return 1
+
+        ssh_run "$n1" "printf m$i > $m/rn_m$i" || return 1
+        ssh_run "$n1" "mv $m/rn_m$i $m/rn_c$i" & p1=$!
+        ssh_run "$n2" "set -C; printf c$i > $m/rn_c$i" 2>/dev/null & p2=$!
+        wait $p1; r1=$?; wait $p2
+        if [[ $r1 -ne 0 ]]; then
+            log_error "round $i: a rename racing a create of its target exited $r1, want 0"
+            return 1
+        fi
+        want="test ! -e rn_m$i && test \"\$(cat rn_c$i)\" = m$i"
+        settle_on_vm "$n1" "$want" && settle_on_vm "$n2" "$want" || return 1
+
+        ssh_run "$n1" "mkdir $m/rn_x$i $m/rn_y$i" || return 1
+        settle_on_vm "$n2" "test -d rn_x$i && test -d rn_y$i" || return 1
+        ssh_run "$n1" "mv $m/rn_x$i $m/rn_y$i/x" 2>/dev/null & p1=$!
+        ssh_run "$n2" "mv $m/rn_y$i $m/rn_x$i/y" 2>/dev/null & p2=$!
+        wait $p1; r1=$?; wait $p2; r2=$?
+        if [[ $r1 -eq 0 && $r2 -ne 0 ]]; then
+            want="test -d rn_y$i/x && test ! -e rn_x$i"
+        elif [[ $r2 -eq 0 && $r1 -ne 0 ]]; then
+            want="test -d rn_x$i/y && test ! -e rn_y$i"
+        else
+            log_error "round $i: crossing directory moves exited $r1 and $r2, want exactly one 0"
+            return 1
+        fi
+        settle_on_vm "$n1" "$want" && settle_on_vm "$n2" "$want" || return 1
+    done
+    log_info "Multi-node rename test passed"
+    return 0
+}
+
 # Test: Single-node stress test
 # Rapidly creates, reads, verifies, and deletes files to stress test the filesystem
 test_stress_single_node() {
@@ -2883,6 +2963,69 @@ test_concurrent_same_file_writes() {
 
     log_info "Concurrent same-file writes (2 VMs) test passed"
     return 0
+}
+
+# The tear scripts run on each node with sh -s: one node overwrites a 1 MB file
+# with one 1 MB write of a single letter at a time, while readers read it whole
+# with O_DIRECT and count reads that hold more than one letter.
+TEAR_PATTERNS='for c in A B C D E F G H; do head -c 1048576 /dev/zero | tr "\000" "$c" > /tmp/tear_$c; done'
+TEAR_WRITER='end=$(( $(date +%s) + $2 ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    for c in A B C D E F G H; do
+        dd if=/tmp/tear_$c of="$1" bs=1048576 count=1 conv=notrunc 2>/dev/null || exit 1
+    done
+done'
+TEAR_READER='end=$(( $(date +%s) + $2 )); reads=0; torn=0
+while [ "$(date +%s)" -lt "$end" ]; do
+    dd if="$1" of=/tmp/tear_read bs=1048576 count=1 iflag=direct 2>/dev/null || exit 1
+    c=$(head -c 1 /tmp/tear_read)
+    cmp -s /tmp/tear_read "/tmp/tear_$c" || torn=$((torn + 1))
+    reads=$((reads + 1))
+done
+echo "$reads $torn"'
+
+# Test: a read on any VM never returns parts of two 1 MB writes from VM 1
+test_reads_never_see_part_of_a_write() {
+    log_info "Testing that whole-file reads never mix two writes..."
+    ensure_cluster_healthy 2
+
+    local file=/mnt/goclusterfs/tear.bin seconds=10 vm
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        ssh_run "$vm" "$TEAR_PATTERNS" || return 1
+    done
+    ssh_run 1 "cp /tmp/tear_A $file" || return 1
+    sleep 2
+
+    local out
+    out=$(mktemp -d)
+    ssh_run 1 "sh -s -- $file $seconds" <<< "$TEAR_WRITER" &
+    local writer=$! readers=()
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        ssh_run "$vm" "sh -s -- $file $seconds" <<< "$TEAR_READER" > "$out/$vm" &
+        readers+=($!)
+    done
+    local failed=0 pid
+    wait "$writer" || { log_error "VM 1's writes failed"; failed=1; }
+    for pid in "${readers[@]}"; do
+        wait "$pid" || { log_error "a reader failed"; failed=1; }
+    done
+
+    local reads torn
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        read -r reads torn < "$out/$vm" || { reads=0; torn=0; }
+        log_info "VM $vm: $torn of $reads reads mixed two writes"
+        if [ "${torn:-0}" -ne 0 ]; then
+            log_error "VM $vm: $torn of $reads reads returned parts of two writes"
+            failed=1
+        fi
+        if [ "${reads:-0}" -lt 5 ]; then
+            log_error "VM $vm made only ${reads:-0} reads"
+            failed=1
+        fi
+    done
+    rm -rf "$out"
+    [ "$failed" -eq 0 ] || return 1
+    log_info "Whole-file reads never mixed two writes"
 }
 
 # Test 11: Three VMs write to same file at different offsets
@@ -4324,12 +4467,14 @@ main() {
     run_test "Rename File" test_rename_file
     run_test "Stress Single Node" test_stress_single_node
     run_test "Concurrent Directory Ops" test_concurrent_directory_ops
+    run_test "Multi-Node Rename" test_multinode_rename
     run_test "Long-Running Stability" test_stability
 
     # Run concurrent same-file write tests (using pre-extension pattern)
     run_test "Concurrent First Write Same Block" test_concurrent_first_write_same_block
     run_test "Concurrent Same-File Writes (2 VMs)" test_concurrent_same_file_writes
     run_test "Concurrent Same-File Writes (3 VMs)" test_concurrent_same_file_writes_3vms
+    run_test "Reads Never See Part Of A Write" test_reads_never_see_part_of_a_write
     run_test "Mixed Size Writes" test_mixed_size_writes
     run_test "Overlapping Block Writes" test_overlapping_block_writes
     run_test "Concurrent Write Stress" test_concurrent_write_stress

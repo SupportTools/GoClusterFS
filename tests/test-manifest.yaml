@@ -740,9 +740,23 @@ scenarios:
     environments:
       go: journal_slots_test.go::TestMountRefusesDamagedJournal
 
+  - id: journal-off-honors-slot-journal
+    name: -journal=false still honors the slot's journal
+    description: A node restarted with -journal=false after a crash replays its slot's journal before serving, and -journal=false with -skip-recovery naming the slot really resets a damaged journal, so a later mount with the journal on succeeds
+    priority: go_only
+    environments:
+      go: journal_slots_test.go::TestJournalOffStillHonorsTheSlotsJournal
+
+  - id: journal-unusable-state-refused
+    name: A journal in an unusable state is refused, not overwritten
+    description: A journal whose header passes its checksum but whose state is corrupt or unknown makes the mount's replay and a peer's replay fail with ErrJournalCorrupt instead of treating it as clean
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestRecoveryRefusesUnusableJournalState
+
   - id: skip-recovery-discards-only-named-slot
     name: -skip-recovery discards only the named slot
-    description: A mount that takes another host's crashed slot ignores -skip-recovery naming a different slot and replays that slot, also on a retry after its own failed mount stamped the slot; -skip-recovery naming the slot discards its journal
+    description: With -skip-recovery naming a different slot, a mount leaves another host's crashed slot and its damaged journal alone and takes an empty slot; -skip-recovery naming the crashed slot takes it and starts a new journal over the damaged one
     priority: go_only
     environments:
       go: journal_slots_test.go::TestSkipRecoveryDiscardsOnlyNamedSlot
@@ -1573,7 +1587,7 @@ scenarios:
 
   - id: fsck-release-dead-slot
     name: fsck releases a dead node's slot
-    description: -release-slot exits 8 while the node is mounted; after the node dies with a damaged journal header, -list-slots shows the damage, -release-slot prints what it discards without writing, -discard-journal frees the slot, and a mount then uses it
+    description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot refuses to act without -salvage or -discard-journal, prints what it discards without writing, -discard-journal -report FILE frees the slot and writes the discarded journal to FILE, and a mount then uses it
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against a real mount.
     environments:
@@ -1886,6 +1900,42 @@ scenarios:
     environments:
       go: internal/goclusterfs/rename_power_cut_test.go::TestPowerCutDuringRenameOverAnEmptyDirectory
 
+  - id: multinode-rename-onto-one-name
+    name: Two nodes rename onto one name at once
+    description: Each node renames its own file onto one new name. Without RENAME_NOREPLACE both succeed and the name ends with one of the files on both nodes; with it exactly one succeeds and the other gets EEXIST. fsck is clean afterwards (Docker and VM run the plain rename)
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeRenamesOntoOneName
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
+  - id: multinode-rename-races-unlink
+    name: A rename races an unlink of its source on another node
+    description: Exactly one of the rename and the unlink succeeds and the other gets ENOENT; both nodes then agree on the names
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeRenameRacesUnlinkOfItsSource
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
+  - id: multinode-rename-races-create
+    name: A rename races a create of its target on another node
+    description: A plain rename always ends as the target, replacing the new file if the create came first; with RENAME_NOREPLACE exactly one of the rename and the O_EXCL create succeeds (Docker and VM run the plain rename)
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeRenameRacesCreateOfItsTarget
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
+  - id: multinode-rename-cross-moves
+    name: Crossing directory moves on two nodes cannot form a loop
+    description: One node moves x into y while another moves y into x; exactly one succeeds and the other gets EINVAL or ENOENT, and fsck finds no loop
+    priority: high
+    environments:
+      go: rename_multinode_test.go::TestMultiNodeCrossMovesCannotFormALoop
+      docker: run-tests.sh::test_multinode_rename
+      vm: run-vm-tests.sh::test_multinode_rename
+
   - id: mkdir-power-failure
     name: Power failure during mkdir
     description: Power fails at each write; the root counts a link for the new directory exactly when it names it, and fsck finds only leaks
@@ -1902,17 +1952,52 @@ scenarios:
 
   - id: mkdir-eio-parent-links
     name: A write that fails mkdir keeps the parent's link count
-    description: Each write of one mkdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    description: Each write of one mkdir fails with EIO in turn; the root's link count still matches its subdirectories, on the running node and after a crash and replay
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedMkdirWriteKeepsParentLinks
 
   - id: rmdir-eio-parent-links
     name: A write that fails rmdir keeps the parent's link count
-    description: Each write of one rmdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    description: Each write of one rmdir fails with EIO in turn; the root's link count still matches its subdirectories, on the running node and after a crash and replay
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedRmdirWriteKeepsParentLinks
+
+  - id: rename-eio-one-name
+    name: A write that fails a rename leaves one name
+    description: Each write of a rename over a file in another directory fails with EIO in turn; the file has exactly one name and fsck finds only leaks, on the running node and after a crash and replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRenameWriteLeavesOneName
+
+  - id: directory-move-eio-one-name
+    name: A write that fails a directory move leaves one name
+    description: Each write of a directory move between parents fails with EIO in turn; the directory has exactly one name, its ".." names that parent, both link counts are right and fsck finds only leaks, on the running node and after a crash and replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedDirectoryMoveWriteLeavesOneName
+
+  - id: rename-eio-peer-waits
+    name: A rename that fails partway finishes before a peer changes its old parent
+    description: Each write of a rename between directories fails with EIO in turn while another node waits to add a file to the old parent; the rename finishes under its locks first, so the file has exactly one name, the peer's file is there and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRenameFinishesBeforeAPeerChangesTheOldParent
+
+  - id: rename-stuck-keeps-locks
+    name: A rename that cannot finish stops its node with its locks held
+    description: Every write fails from the old-name removal on; the rename stops the node without releasing its locks, a peer waiting for the old parent stays blocked, and replay then leaves exactly one name
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestStuckRenameKeepsItsLocksUntilReplay
+
+  - id: failed-commit-not-replayed
+    name: A failed journal commit is not replayed onto a reused inode
+    description: Each write of one create fails with EIO in turn, a second create may reuse its inode slot, and the node crashes; after replay the two names never share an inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedCreateThenCrashKeepsNamesApart
 
   - id: fsck-directory-tree
     name: fsck checks the directory tree
@@ -2000,6 +2085,41 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotWithoutBirthIsOrphan
 
+  - id: metrics-for-operators
+    name: Metrics for operators
+    description: /metrics exports lock give-ups by type, this node's heartbeat age, peer journal replays by result and running, the mount's own replay, and registered nodes by state
+    priority: go_only
+    environments:
+      go: internal/api/metrics_ops_test.go::TestMetricsForOperators
+
+  - id: metrics-count-api-responses
+    name: Metrics count API responses
+    description: goclusterfs_api_requests_total counts responses by route and status code, including 401s and the rate limiter's 429s
+    priority: go_only
+    environments:
+      go: internal/api/metrics_ops_test.go::TestMetricsCountAPIResponses
+
+  - id: lock-stats-count-give-ups
+    name: Lock stats count acquires that give up
+    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire; a file I/O AcquireAs that times out counts too
+    priority: go_only
+    environments:
+      go: internal/lock/lock_test.go::TestStatsCountAcquiresThatGiveUp
+
+  - id: registry-stats-replays-heartbeat
+    name: Registry reports replays and heartbeat age
+    description: The registry counts replays of crashed nodes' journals that succeeded and failed, lists replays in progress, and reports how long ago its own heartbeat landed
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestStatsCountReplaysAndHeartbeatAge
+
+  - id: peer-replay-backs-off
+    name: Peer replay backs off after repeated identical failures
+    description: After 3 failures of a dead peer's replay with the same error, a node retries that slot only once the slot has stayed unchanged for 10 minutes, logs the third failure and then at most hourly, and lists the slot as failing; lock timeouts and a lost lease never count, a different error starts the count again, and a successful replay or a new node in the slot clears it
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestPeerReplayBacksOffAfterIdenticalFailures
+
   - id: api-lookup-file
     name: API path lookup inside the filesystem
     description: The API finds a file by walking directories in the filesystem, without the kernel, and refuses a symlink anywhere on the path, a directory, a non-directory in the middle, a missing name and an unclean path
@@ -2077,6 +2197,27 @@ scenarios:
     environments:
       go: internal/goclusterfs/stale_bytes_test.go::TestTruncateWhileAppending
 
+  - id: growing-write-keeps-other-nodes-append
+    name: Zeroing before a growing write never wipes another node's append
+    description: One node appends records while another writes past the end of the file; every acknowledged record survives the zeroing of the gap before the second write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestGrowingWriteNeverZeroesAnotherNodesAppend
+
+  - id: sequential-write-writes-data-once
+    name: A sequential write writes its data once
+    description: Writing 16 MiB in FUSE's 128 KiB pieces passes about 1x its size to write calls, with no block of zeros before each new block
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestSequentialWriteWritesDataOnce
+
+  - id: zero-range-stays-in-range
+    name: Zeroing part of a block leaves the blocks around it alone
+    description: The buffer pool rounds sizes up, so zeroing a block's tail must not also zero the start of the next block, which another file or directory owns
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestZeroRangeZeroesOnlyItsRange
+
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
     description: -repair refuses while a node heartbeats or a stopped node's journal is dirty; -force overrides only the journal check; dry runs and checks still run
@@ -2084,12 +2225,40 @@ scenarios:
     environments:
       go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
 
+  - id: fsck-inspect-slot
+    name: fsck inspects a node registry slot without writing
+    description: -inspect-slot reports the slot's node, lease and orphans, the journal header, every committed transaction a replay would apply with the inodes and blocks it changes, and where a damaged journal stops the scan; it writes nothing, so it runs on a mounted device
+    priority: go_only
+    environments:
+      go: internal/fsck/inspect_test.go::TestInspectSlot
+
+  - id: journal-entry-touches
+    name: Journal entries name what they change
+    description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
+    priority: go_only
+    environments:
+      go: internal/journal/describe_test.go::TestEntryTouches
+
   - id: fsck-release-slot
     name: fsck slot release checks
     description: Release refuses while any node runs or the slot's heartbeat or recovery lease is recent; an expired slot with a damaged journal is released, its journal reads as never initialized, and a new node registers in it
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: fsck-release-slot-salvage
+    name: fsck slot release salvages a journal's good transactions
+    description: With salvage, release replays the slot's committed transactions in order until one fails to apply, reports that one as failed and every later one as discarded, then resets the journal and frees the slot; a journal a mount could replay is refused without salvage or force; salvage stops before its next transaction once another registry slot changes, leaving the journal and the slot for a later run
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotSalvage
+
+  - id: release-slot-renews-lease
+    name: Slot release keeps its lease through a long reset
+    description: A reset that renews the recovery lease through ReleaseSlot's renew function may run past the lease budget and still frees the slot, keeping its orphans; renew fails once another node takes the lease
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotRenewsItsLease
 
   - id: fsck-release-slot-refusals
     name: fsck slot release refusals
@@ -2118,6 +2287,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/node/registry_test.go::TestReleaseSlotGivesUpOnSlowReset
+
+  - id: release-slot-keeps-orphans
+    name: Slot release keeps the slot's orphan list
+    description: A slot fsck releases keeps the list of files its node unlinked while they were open, so live nodes learn them and the next node in the slot frees them, instead of leaking them until repair
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestReleaseSlotKeepsOrphans
 
   - id: fsck-bad-layout
     name: fsck stops on a layout it cannot trust
@@ -2910,12 +3086,19 @@ scenarios:
     environments:
       go: internal/superblock/superblock_test.go::TestCanMountRefusesHashedLockRecords
 
-  - id: fsck-refuses-hashed-lock-records
-    name: fsck refuses volumes without per-type lock records
-    description: fsck phase 1 reports a missing RequiredTypedLockRecords flag as fatal, with advice to reformat
+  - id: mount-refuses-lock-records-without-file-io
+    name: Mount refuses volumes formatted before file I/O locks
+    description: A superblock without RequiredFileIOLocks fails CanMount with advice to reformat, since its lock records belong to other types
     priority: go_only
     environments:
-      go: internal/fsck/fsck_test.go::TestFsckRefusesHashedLockRecords
+      go: internal/superblock/superblock_test.go::TestCanMountRefusesLockRecordsWithoutFileIOLocks
+
+  - id: fsck-refuses-hashed-lock-records
+    name: fsck refuses volumes with an older lock record layout
+    description: fsck phase 1 reports a missing RequiredTypedLockRecords or RequiredFileIOLocks flag as fatal, with advice to reformat
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckRefusesOlderLockRecordLayouts
 
   - id: create-stuck-inode-lock-eio
     name: Create fails with EIO when the new inode's lock is never freed
@@ -5070,6 +5253,69 @@ scenarios:
     environments:
       go: history/history_test.go::TestRenameShowsExactlyOneName
 
+  - id: history-checker-rename-old-name
+    name: Coherence checker lets a renamed-away name open the moved file for a window
+    description: Within the cache window after a rename, a read or stat of the old name may see the moved file's current content; after it, the old name is gone
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenamedAwayNameMayOpenTheMovedFileForAWindow
+
+  - id: history-checker-read-across-rename
+    name: Coherence checker follows a file across a rename during a read
+    description: A read of a name that overlaps a rename of it may return a value written through the new name after the rename, even when a new file took the old name since
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestReadOverlappingARenameMaySeeAWriteThroughTheNewName
+
+  - id: history-checker-rename-old-name-only-moved-file
+    name: Coherence checker limits a renamed-away name to the moved file
+    description: Within the cache window after a rename, a read of the old name that sees a value no write gave the moved file is still a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenamedAwayNameSeesOnlyTheMovedFile
+
+  - id: history-checker-renaming-node
+    name: Coherence checker gives the renaming node no stale entry for the old name
+    description: The node that ran a rename has its own cached entry moved, so a read of the old name there that shows the moved file's data is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenamingNodeNeverSeesTheMovedFileThroughTheOldName
+
+  - id: history-checker-same-node-overlap
+    name: Coherence checker lets a read open across a rename on its own node see the moved file
+    description: A read that started before a rename on its own node ended may return a value written through the new name, since its open file follows the moved file
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestReadOpenAcrossARenameOnItsOwnNodeSeesTheMovedFile
+
+  - id: history-checker-rename-not-replaced-file
+    name: Coherence checker never lets a renamed-away name show the file the rename replaced
+    description: After a rename over an existing file, a read of the old name inside the cache window that shows the replaced file's data is a violation; one that shows a write through the new name after the rename passes
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenamedAwayNameNeverSeesTheReplacedFile
+
+  - id: history-checker-rename-write
+    name: Coherence checker lets a write near a rename land in either name
+    description: A write to a rename's old name within the cache window may land in the moved file; one after the window may not
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestWriteNearARenameMayLandInEitherName
+
+  - id: history-checker-rename-tear
+    name: Coherence checker accepts a page-cache tear through the other name of a rename
+    description: A torn read of a rename's old name that overlaps a same-node write through the new name passes; the same tear on another node is still a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestPageCacheTearMayComeThroughTheOtherNameOfARename
+
+  - id: history-checker-rename-estale
+    name: Coherence checker counts a rename onto a name as the name losing its file
+    description: An open may fail with ESTALE when renames replaced its name's file twice around it
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenameOntoANameCountsAsItLosingItsFile
+
   - id: history-checker-eexist
     name: Coherence checker flags EEXIST from a non-exclusive open
     description: open with O_CREAT and no O_EXCL must open the file, never fail with EEXIST
@@ -5174,7 +5420,7 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/orphans_test.go::TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose
-  # ===========================================================================
+  # ====================================================================
   # SYMLINKS
   # Inline targets of up to 92 bytes live in the inode's extent area; longer
   # ones, up to 4095 bytes, in one data block.
@@ -5307,3 +5553,97 @@ scenarios:
     environments:
       go: internal/goclusterfs/symlink_test.go::TestStaleLinkNodeAfterSlotReuse
 
+=======
+
+  - id: lock-writer-gets-file-io-from-readers
+    name: A writer gets a file I/O lock that readers on lower slots keep taking
+    description: Four lower-slot nodes keep taking a file I/O lock shared; a higher-slot node asking for it exclusive gets it each time before the acquire timeout, because readers wait behind its waiting mark
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestWriterGetsRecordWhileReadersOnLowerSlotsKeepReading
+
+  - id: lock-reader-gets-file-io-from-writer
+    name: A reader gets a file I/O lock a writer keeps taking
+    description: Readers wait behind writers only for two turns, so a reader in a lower or higher slot than a node that keeps writing gets the lock each time before the acquire timeout
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestReaderGetsRecordWhileWriterKeepsWriting
+
+  - id: lock-file-io-ranks-first
+    name: The file I/O lock ranks before every other lock type
+    description: A goroutine holding a file I/O lock takes locks of every other type; one holding any other lock is refused a file I/O lock with ErrDeadlockRisk
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestFileIOLockRanksBeforeEveryOtherType
+
+  - id: lock-held-since
+    name: HeldSince moves only when another node could have written
+    description: HeldSince stays the same while a node keeps its cached hold and moves forward after another node held the record exclusive
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestHeldSinceMovesOnlyWhenAnotherNodeCouldHaveWritten
+
+  - id: register-refuses-other-lock-layout
+    name: Register refuses to join while a live node has another lock layout
+    description: A node whose build maps locks to records differently does not register while a node with another lock layout heartbeats; the error names that node and slot
+    priority: go_only
+    environments:
+      go: internal/node/lock_layout_test.go::TestRegisterRefusesWhileALiveNodeHasAnotherLockLayout
+
+  - id: register-joins-past-silent-other-lock-layout
+    name: Register joins past a silent node with another lock layout
+    description: A slot with another lock layout whose heartbeat stays unchanged for the watch does not stop Register
+    priority: go_only
+    environments:
+      go: internal/node/lock_layout_test.go::TestRegisterJoinsPastASilentNodeWithAnotherLockLayout
+
+  - id: read-never-sees-part-of-peer-write
+    name: A read never sees part of another node's write
+    description: Node B reads two blocks while node A's two-block write has written its first block; B's read waits and returns all old or all new data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/atomic_read_test.go::TestReadNeverSeesPartOfAnotherNodesWrite
+
+  - id: read-never-sees-part-of-peer-truncate
+    name: A read never sees part of another node's truncate
+    description: Node B reads while node A's truncate has zeroed the tail of the last block but not changed the size; B's read returns the old file or the truncated one
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/atomic_read_test.go::TestReadNeverSeesPartOfAnotherNodesTruncate
+
+  - id: read-sees-peer-write-past-cached-inode
+    name: A read sees another node's write that grew an inode this node cached
+    description: Node B reads a file, node A writes past its end, and B's next read returns A's data, because the first read after B claims the file I/O lock from disk reads the inode again
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/atomic_read_test.go::TestReadSeesAnotherNodesWriteThatGrewACachedInode
+
+  - id: reads-never-see-part-of-a-write
+    name: Whole-file reads never mix two writes from another node
+    description: One node keeps overwriting a 1 MB file with one 1 MB write of a single value at a time while every node reads it whole with O_DIRECT (and, in Go, also on mounts with -direct-io); no read returns parts of two writes
+    priority: critical
+    environments:
+      go: atomic_read_test.go::TestMultiNodeReadsNeverSeePartOfAWrite
+      docker: run-tests.sh::test_reads_never_see_part_of_a_write
+      vm: run-vm-tests.sh::test_reads_never_see_part_of_a_write
+
+  - id: lock-holder-keeps-unwanted-record
+    name: A holder keeps a record no other node waits for
+    description: A node that keeps taking a lock past its turn starts a new turn instead of yielding when the record shows no other node's claim or mark, so none of its acquires wait
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestHolderKeepsRecordNobodyWaitsFor
+
+  - id: lock-contested-claim-kept-briefly
+    name: A contested holder keeps a new claim briefly
+    description: A node that has seen another node waiting for a whole turn keeps each new claim for minTurn, so an acquire right after a release joins it instead of yielding
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestContestedHolderKeepsItsNewClaimBriefly
+
+  - id: lock-read-claim-waits-two-turns-for-writer
+    name: A read claim waits two turns behind a write mark
+    description: With a live node's mark for a write claim in the row, a read claim does not get the lock within one turn and gets it only after two turns
+    priority: go_only
+    environments:
+      go: internal/lock/file_io_test.go::TestReadClaimWaitsTwoTurnsBehindALiveWriteMark

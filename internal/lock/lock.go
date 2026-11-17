@@ -30,6 +30,7 @@ package lock
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -81,7 +82,8 @@ const (
 	CacheGrace = 10 * time.Millisecond
 
 	// HoldTurn is how long a node keeps reusing a record it claimed from disk.
-	// After that it releases and yields the record when its last holder lets go.
+	// After that it releases and yields the record when its last holder lets
+	// go, unless the record shows no other node waiting for it.
 	HoldTurn = 250 * time.Millisecond
 
 	// YieldGap is how long a node waits before claiming a record it yielded, so
@@ -107,6 +109,8 @@ const (
 	LockTypeInode        LockType = 8
 	LockTypeExtent       LockType = 9
 	LockTypeInodeSector  LockType = 10
+	// LockTypeFileIO covers one file's data for a whole read or write request. It ranks before every other type.
+	LockTypeFileIO LockType = 11
 )
 
 // LockMode indicates shared (read) or exclusive (write) access.
@@ -196,6 +200,7 @@ type TypeStats struct {
 	Acquires uint64        // acquires served
 	Blocked  uint64        // acquires whose first try found the lock taken, served or not
 	Wait     time.Duration // time the blocked acquires spent in Acquire
+	Failed   uint64        // acquires that gave up with an error, such as a timeout or a failed node's lapsed replay
 }
 
 var typeNames = [numLockTypes]string{
@@ -210,6 +215,7 @@ var typeNames = [numLockTypes]string{
 	LockTypeInode:        "inode",
 	LockTypeExtent:       "extent",
 	LockTypeInodeSector:  "inode_sector",
+	LockTypeFileIO:       "file_io",
 }
 
 type lockKey struct {
@@ -228,6 +234,7 @@ type heldRecord struct {
 	mode    LockMode
 	keys    int
 	since   time.Time // when this node claimed the record
+	turn    time.Time // when this node's current turn on the record began
 	renewed time.Time // when this node last wrote its slot
 	// cacheGen identifies the current cached period; keys == 0 means cached.
 	cacheGen uint64
@@ -255,6 +262,10 @@ func covers(held, want LockMode) bool {
 // they test, before using it, so no test changes what another test's timers read.
 type timings struct {
 	cacheGrace, holdTurn, yieldGap time.Duration
+	// minTurn is how long a node keeps a new claim before another node's
+	// long wait can end its turn, so the requests of one operation, such as a
+	// truncate and a write, go through together.
+	minTurn time.Duration
 	// renewAfter is the age of a slot after which this node writes it again
 	// before relying on it, so other nodes never see a slot in use as stale.
 	renewAfter time.Duration
@@ -277,6 +288,7 @@ func defaultTimings() timings {
 		cacheGrace:     CacheGrace,
 		holdTurn:       HoldTurn,
 		yieldGap:       YieldGap,
+		minTurn:        YieldGap,
 		renewAfter:     StaleThreshold / 3,
 		acquireTimeout: DefaultTimeout,
 		tornExpiry:     StaleThreshold,
@@ -348,15 +360,16 @@ func (m *Manager) Stats() Stats {
 			Acquires: c.held.Load() + c.joined.Load() + c.cached.Load() + c.claimed.Load(),
 			Blocked:  c.blocked.Load(),
 			Wait:     time.Duration(c.waitNanos.Load()),
+			Failed:   c.failed.Load(),
 		}
-		if ts.Acquires > 0 || ts.Blocked > 0 {
+		if ts.Acquires > 0 || ts.Blocked > 0 || ts.Failed > 0 {
 			stats.Types = append(stats.Types, ts)
 		}
 	}
 	return stats
 }
 
-const numLockTypes = int(LockTypeInodeSector) + 1
+const numLockTypes = int(LockTypeFileIO) + 1
 
 // layoutRows is how many records a volume's lock region has; typeRows divides them among the types.
 const layoutRows = 256
@@ -370,10 +383,21 @@ var typeRows = [numLockTypes]uint64{
 	LockTypeRefCount:     1,
 	LockTypeLockRegion:   1,
 	LockTypeBlockBitmap:  1,
-	LockTypeSFBContainer: 8,
+	LockTypeSFBContainer: 1,
 	LockTypeInode:        128,
-	LockTypeExtent:       97,
+	LockTypeExtent:       65,
 	LockTypeInodeSector:  16,
+	LockTypeFileIO:       39,
+}
+
+// LayoutID identifies how lock keys map to records. Nodes whose IDs differ do
+// not exclude each other.
+func LayoutID() uint32 {
+	buf := binary.LittleEndian.AppendUint64(nil, layoutRows)
+	for _, rows := range typeRows {
+		buf = binary.LittleEndian.AppendUint64(buf, rows)
+	}
+	return storage.CRC32C(buf)
 }
 
 var typeFirstRow = func() (first [numLockTypes]uint64) {
@@ -386,9 +410,10 @@ var typeFirstRow = func() (first [numLockTypes]uint64) {
 // acquireCounts says how one lock type's acquires on this node were served:
 // a key this node already held, a join of a held record, a cached record, a
 // claim won on disk. retries counts tries that found the lock taken, blocked
-// the acquires that had at least one, and waitNanos their time in Acquire.
+// the acquires that had at least one, waitNanos their time in Acquire, and
+// failed the acquires that returned an error.
 type acquireCounts struct {
-	held, joined, cached, claimed, retries, blocked, waitNanos atomic.Uint64
+	held, joined, cached, claimed, retries, blocked, waitNanos, failed atomic.Uint64
 }
 
 func (m *Manager) countAcquire(lockType LockType, pick func(*acquireCounts) *atomic.Uint64) {
@@ -474,12 +499,37 @@ func (m *Manager) LogStats() {
 // needs the same record. Once the hold's turn is over, that goroutine cannot
 // join it, and both wait until the timeout.
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
+	return m.acquire(ctx, getGoroutineID(), lockType, resourceID, mode)
+}
+
+// Owner holds locks in place of a goroutine. NewOwner makes one.
+type Owner uint64
+
+var lastOwner atomic.Uint64
+
+// NewOwner returns an owner that no goroutine and no other owner uses.
+func NewOwner() Owner {
+	return Owner(1<<63 | lastOwner.Add(1))
+}
+
+// AcquireAs is Acquire for owner instead of the calling goroutine, which saves
+// reading the goroutine's ID from its stack: tens of microseconds on a deep
+// one. Lock order is checked among owner's locks only. Release with ReleaseAs.
+func (m *Manager) AcquireAs(ctx context.Context, owner Owner, lockType LockType, resourceID uint64, mode LockMode) error {
+	return m.acquire(ctx, uint64(owner), lockType, resourceID, mode)
+}
+
+func (m *Manager) acquire(ctx context.Context, gid uint64, lockType LockType, resourceID uint64, mode LockMode) (err error) {
 	if int(lockType) >= numLockTypes {
 		return fmt.Errorf("lock: unknown lock type %d", lockType)
 	}
+	defer func() {
+		if err != nil {
+			m.countAcquire(lockType, func(c *acquireCounts) *atomic.Uint64 { return &c.failed })
+		}
+	}()
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 	recordID := m.hashToRecord(lockType, resourceID)
-	gid := getGoroutineID()
 
 	m.mu.Lock()
 	if m.reuseHeldKeyLocked(key, mode, gid) {
@@ -598,6 +648,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
+	m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (!covers(rec.mode, mode) || age(rec.renewed) > m.timing.renewAfter) {
@@ -658,14 +709,15 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	}
 	m.mu.Unlock()
 
-	written, won, by, err := m.claim(recordID, key, mode)
+	written, won, by, err := m.claim(recordID, key, mode, waited < 2*m.timing.holdTurn)
 	if err != nil || !won {
 		return false, false, by, err
 	}
 	m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.claimed })
 
 	m.mu.Lock()
-	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: time.Now(), renewed: written}
+	now := time.Now()
+	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: now, turn: now, renewed: written}
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
 	return true, true, blocker{}, nil
@@ -679,12 +731,50 @@ func (m *Manager) giveUp(err error, lockType LockType, resourceID uint64, mode L
 	return fmt.Errorf("%w: %s", err, reason)
 }
 
-// turnOverLocked reports whether this node has had its turn on recordID: it has
-// held the record for holdTurn, or kept claiming it again for holdTurn since it
-// saw another node waiting.
+// turnOverLocked reports whether this node has had its turn on recordID: its
+// turn on the record lasted holdTurn, or it has kept claiming the record again
+// for holdTurn since it saw another node waiting and has held this claim for minTurn.
 func (m *Manager) turnOverLocked(recordID uint64, rec *heldRecord) bool {
+	return age(rec.turn) > m.timing.holdTurn || m.contestedTooLongLocked(recordID) && age(rec.turn) > m.timing.minTurn
+}
+
+// contestedTooLongLocked reports whether this node has kept claiming recordID
+// again for holdTurn since it saw another node waiting.
+func (m *Manager) contestedTooLongLocked(recordID uint64) bool {
 	seen, waited := m.contested[recordID]
-	return age(rec.since) > m.timing.holdTurn || waited && age(seen) > m.timing.holdTurn
+	return waited && age(seen) > m.timing.holdTurn
+}
+
+// renewIdleTurn starts a new turn on a record whose turn is over when its row
+// shows no other node waiting: no claim that conflicts with this node's hold
+// and no live mark. Giving the record up would only make this node wait
+// yieldGap. A node that starts waiting after the row read waits one more turn.
+// It runs under the record gate.
+func (m *Manager) renewIdleTurn(recordID uint64) {
+	m.mu.Lock()
+	rec, ok := m.records[recordID]
+	over := ok && m.turnOverLocked(recordID, rec)
+	ignore := -1
+	if a, ok := m.adopted[recordID]; ok {
+		ignore = a.slot
+	}
+	m.mu.Unlock()
+	if !over {
+		return
+	}
+	row, err := m.readRow(recordID)
+	if err != nil {
+		return
+	}
+	if conflict, _, _ := m.rowConflicts(recordID, row, rec.mode, ignore); conflict || m.othersWaiting(row) {
+		return
+	}
+	m.mu.Lock()
+	if m.records[recordID] == rec {
+		rec.turn = time.Now()
+		delete(m.contested, recordID)
+	}
+	m.mu.Unlock()
 }
 
 // endTurnLocked drops this node's hold on recordID, which the caller releases
@@ -722,9 +812,12 @@ func (m *Manager) addHeldKeyLocked(key lockKey, recordID uint64, mode LockMode, 
 	}
 }
 
+// goroutineHoldsAnyLocked reports whether gid holds a lock that another wait
+// or a journal replay may need: any but a file I/O lock, which ranks first and
+// which replays never take.
 func (m *Manager) goroutineHoldsAnyLocked(gid uint64) bool {
-	for _, held := range m.heldLocks {
-		if held.goroutines[gid] > 0 {
+	for key, held := range m.heldLocks {
+		if key.Type != LockTypeFileIO && held.goroutines[gid] > 0 {
 			return true
 		}
 	}
@@ -755,8 +848,16 @@ func (m *Manager) recordGate(recordID uint64) *sync.Mutex {
 // With reference counting, this decrements the local count and only releases
 // the distributed lock when the last goroutine releases.
 func (m *Manager) Release(lockType LockType, resourceID uint64) error {
+	return m.release(getGoroutineID(), lockType, resourceID)
+}
+
+// ReleaseAs releases a lock AcquireAs took for owner.
+func (m *Manager) ReleaseAs(owner Owner, lockType LockType, resourceID uint64) error {
+	return m.release(uint64(owner), lockType, resourceID)
+}
+
+func (m *Manager) release(gid uint64, lockType LockType, resourceID uint64) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
-	gid := getGoroutineID()
 
 	m.mu.Lock()
 	held, ok := m.heldLocks[key]
@@ -793,6 +894,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
+	m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
@@ -823,6 +925,7 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
+	m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
@@ -830,7 +933,8 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 		m.mu.Unlock()
 		return
 	}
-	if m.turnOverLocked(recordID, rec) {
+	// A hold that ends while another node has waited long yields, however new.
+	if m.turnOverLocked(recordID, rec) || m.contestedTooLongLocked(recordID) {
 		m.endTurnLocked(recordID)
 	} else {
 		delete(m.records, recordID)
@@ -872,13 +976,21 @@ func (m *Manager) ReleaseCached() {
 	wg.Wait()
 }
 
+// orderRank is a type's place in the lock order.
+func orderRank(t LockType) int {
+	if t == LockTypeFileIO {
+		return -1
+	}
+	return int(t)
+}
+
 // checkLockOrder refuses a lock below one this goroutine holds: a lower type, or a lower record of the same type.
 func (m *Manager) checkLockOrder(key lockKey, recordID, gid uint64) error {
 	for heldKey, held := range m.heldLocks {
 		if heldKey == key || held.goroutines[gid] == 0 {
 			continue
 		}
-		if heldKey.Type > key.Type {
+		if orderRank(heldKey.Type) > orderRank(key.Type) {
 			return fmt.Errorf("%w: cannot acquire %v while holding %v",
 				ErrDeadlockRisk, key.Type, heldKey.Type)
 		}
@@ -914,4 +1026,17 @@ func (m *Manager) hashToRecord(lockType LockType, resourceID uint64) uint64 {
 // SameRecord reports whether two locks map to one record, so one goroutine holding both holds the record in the stronger mode.
 func (m *Manager) SameRecord(aType LockType, aID uint64, bType LockType, bID uint64) bool {
 	return m.hashToRecord(aType, aID) == m.hashToRecord(bType, bID)
+}
+
+// HeldSince returns when this node claimed, from disk, the record that holds
+// a key it holds. No other node held the record in a conflicting mode since
+// then. It returns the zero time if this node does not hold the key.
+func (m *Manager) HeldSince(lockType LockType, resourceID uint64) time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	held, ok := m.heldLocks[lockKey{Type: lockType, ResourceID: resourceID}]
+	if !ok {
+		return time.Time{}
+	}
+	return m.records[held.RecordID].since
 }

@@ -270,6 +270,7 @@ func TestFsckReleasesDeadSlot(t *testing.T) {
 	image := cluster.ImagePath
 
 	expectFsck(t, 8, "mounted by node "+slot, "-release-slot", slot, image)
+	expectFsck(t, 0, "Nothing was written", "-inspect-slot", slot, image)
 
 	if err := cluster.KillNode(0); err != nil {
 		t.Fatalf("kill: %v", err)
@@ -278,10 +279,19 @@ func TestFsckReleasesDeadSlot(t *testing.T) {
 	damageJournalHeader(t, image, offset)
 
 	expectFsck(t, 0, "damaged: journal superblock checksum mismatch", "-list-slots", image)
-	expectFsck(t, 16, "-discard-journal needs -release-slot", "-discard-journal", image)
+	expectFsck(t, 0, "header damaged: journal superblock checksum mismatch. A replay fails here", "-inspect-slot", slot, image)
+	expectFsck(t, 16, "-inspect-slot needs a slot number", "-inspect-slot", "-2", image)
+	expectFsck(t, 16, "no such node registry slot", "-inspect-slot", "64", image)
+	expectFsck(t, 16, "need -release-slot", "-discard-journal", image)
+	expectFsck(t, 16, "pick one of -salvage and -discard-journal", "-release-slot", slot, "-salvage", "-discard-journal", image)
 	expectFsck(t, 16, "no such node registry slot", "-release-slot", "64", image)
 	expectFsck(t, 0, "Nothing was written", "-release-slot", slot, image)
-	expectFsck(t, 1, "Released slot "+slot, "-release-slot", slot, "-discard-journal", image)
+	report := filepath.Join(t.TempDir(), "release.txt")
+	expectFsck(t, 1, "Released slot "+slot, "-release-slot", slot, "-discard-journal", "-report", report, image)
+	if text, err := os.ReadFile(report); err != nil || !strings.Contains(string(text), "-release-slot "+slot+" -discard-journal at ") ||
+		!strings.Contains(string(text), "Released slot "+slot) {
+		t.Errorf("report file: %v\n%s", err, text)
+	}
 
 	restarted := &syncBuffer{}
 	mfs.Log = restarted

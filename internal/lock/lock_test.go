@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -446,5 +447,51 @@ func TestStatsCountBlockedAcquires(t *testing.T) {
 	}
 	if got := bitmap(mgr2); got.Acquires != 1 || got.Blocked != 1 || got.Wait < held {
 		t.Errorf("node 2 bitmap stats = %+v, want 1 acquire, 1 blocked, a wait of at least %v", got, held)
+	}
+}
+
+func TestStatsCountAcquiresThatGiveUp(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	var uuid1, uuid2 [16]byte
+	copy(uuid1[:], "test-node-uuid01")
+	copy(uuid2[:], "test-node-uuid02")
+	mgr1 := NewManager(dev, 0, 10<<20, uuid1, 0)
+	mgr2 := NewManager(dev, 0, 10<<20, uuid2, 1)
+	if err := mgr1.Acquire(context.Background(), LockTypeBlockBitmap, 0, LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	defer release(t, mgr1, LockTypeBlockBitmap, 0)
+	for range 2 {
+		if err := acquireWithin(mgr2, 50*time.Millisecond, LockTypeBlockBitmap, 0, LockModeExclusive); !errors.Is(err, ErrLockTimeout) {
+			t.Fatalf("Acquire of a held lock: %v, want ErrLockTimeout", err)
+		}
+	}
+	holder := NewOwner()
+	if err := mgr1.AcquireAs(context.Background(), holder, LockTypeFileIO, 0, LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := mgr1.ReleaseAs(holder, LockTypeFileIO, 0); err != nil {
+			t.Error(err)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := mgr2.AcquireAs(ctx, NewOwner(), LockTypeFileIO, 0, LockModeShared); !errors.Is(err, ErrLockTimeout) {
+		t.Fatalf("AcquireAs of a held file I/O lock: %v, want ErrLockTimeout", err)
+	}
+
+	want := map[string]uint64{"bitmap": 2, "file_io": 1}
+	for _, ts := range mgr2.Stats().Types {
+		if failed, ok := want[ts.Name]; ok {
+			if ts.Failed != failed || ts.Acquires != 0 {
+				t.Errorf("node 2 %s stats = %+v, want %d failed and no acquires", ts.Name, ts, failed)
+			}
+			delete(want, ts.Name)
+		}
+	}
+	for name := range want {
+		t.Errorf("node 2 reports no %s stats after failed acquires", name)
 	}
 }

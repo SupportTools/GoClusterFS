@@ -158,3 +158,24 @@ func TestLaneStaysInItsNamesAndRepeats(t *testing.T) {
 		t.Fatal("the same seed generated different operations")
 	}
 }
+
+// A write a fault cut short may leave each sector as before or as after, and nothing else.
+func TestTornWriteIsSectorsOfBeforeOrAfter(t *testing.T) {
+	before := genData(1, 10000)
+	op := &Op{Kind: "write", Off: 2000, Len: 9000, Seed: 2}
+	after := bytes.Clone(before)
+	applyData(op, &after)
+	torn := bytes.Clone(after[:8192])
+	torn = append(torn, before[8192:]...)
+	if !tornBetween(torn, before, after) {
+		t.Error("first two sectors written and the rest not is a torn write")
+	}
+	mixed := bytes.Clone(after)
+	mixed[5000] ^= 1
+	if tornBetween(mixed, before, after) {
+		t.Error("a sector that is neither before nor after passed")
+	}
+	if tornBetween(after[:len(before)-1], before, after) {
+		t.Error("a result shorter than the file was before passed")
+	}
+}

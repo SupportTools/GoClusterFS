@@ -15,13 +15,15 @@
 //	-force: Keep checking after a fatal error; with -repair, repair even if
 //	        a stopped node's journal still needs replay
 //	-list-slots: List node registry slots with their lease and journal
+//	-inspect-slot N: Describe slot N and what replaying its journal would change; writes nothing
 //	-release-slot N: Free the slot of a node that will not return; with
-//	        -discard-journal, reset its journal and free it
+//	        -salvage, replay its journal until a transaction fails, or with
+//	        -discard-journal, discard it unread; -report FILE keeps a record
 //
 // Exit codes, bits as with fsck(8):
 //
 //	0: No errors (warnings may remain)
-//	1: Errors were repaired, or -release-slot -discard-journal freed a slot
+//	1: Errors were repaired, or -release-slot freed a slot
 //	4: Errors remain on disk
 //	8: I/O failure, or the check could not finish or was refused
 //	16: Usage error
@@ -59,8 +61,11 @@ func main() {
 		debug        = flag.Bool("debug", false, "Print [DEBUG] log lines")
 
 		listSlots      = flag.Bool("list-slots", false, "List node registry slots with their lease and journal, then exit")
+		inspectSlotN   = flag.Int("inspect-slot", -1, "Describe registry slot N, its journal and every transaction a replay would apply, then exit; writes nothing, so it runs on a mounted device")
 		releaseSlotN   = flag.Int("release-slot", -1, "Check that registry slot N can be released and print what releasing it discards; -1 checks none")
-		discardJournal = flag.Bool("discard-journal", false, "With -release-slot, reset the slot's journal and free the slot; writes that journal holds are lost")
+		discardJournal = flag.Bool("discard-journal", false, "With -release-slot, reset the slot's journal unread and free the slot; writes that journal holds are lost")
+		salvage        = flag.Bool("salvage", false, "With -release-slot, replay the slot's journal until a transaction fails to apply or cannot be read, then reset it and free the slot; the failed transaction and every later one are lost")
+		reportPath     = flag.String("report", "", "With -release-slot, also write the slot, its journal and what happens to each transaction to `FILE`")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <device>\n\n", os.Args[0])
@@ -78,7 +83,7 @@ func main() {
 		fmt.Fprint(os.Stderr, slotsHelp)
 		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
 		fmt.Fprintf(os.Stderr, "  0: No errors (warnings may remain)\n")
-		fmt.Fprintf(os.Stderr, "  1: Errors were repaired, or -release-slot -discard-journal freed a slot\n")
+		fmt.Fprintf(os.Stderr, "  1: Errors were repaired, or -release-slot freed a slot\n")
 		fmt.Fprintf(os.Stderr, "  4: Errors remain on disk\n")
 		fmt.Fprintf(os.Stderr, "  8: I/O failure, or the check could not finish or was refused\n")
 		fmt.Fprintf(os.Stderr, "  16: Usage error\n")
@@ -116,9 +121,19 @@ func main() {
 		os.Exit(fsck.ExitUsage)
 	}
 	releasing := *releaseSlotN != -1
+	inspecting := *inspectSlotN != -1
 	switch {
-	case *discardJournal && !releasing:
-		fmt.Fprintln(os.Stderr, "Error: -discard-journal needs -release-slot")
+	case inspecting && *inspectSlotN < 0:
+		fmt.Fprintln(os.Stderr, "Error: -inspect-slot needs a slot number")
+		os.Exit(fsck.ExitUsage)
+	case inspecting && (*listSlots || releasing || *repair):
+		fmt.Fprintln(os.Stderr, "Error: -inspect-slot, -list-slots, -release-slot and -repair run separately")
+		os.Exit(fsck.ExitUsage)
+	case (*discardJournal || *salvage || *reportPath != "") && !releasing:
+		fmt.Fprintln(os.Stderr, "Error: -discard-journal, -salvage and -report need -release-slot")
+		os.Exit(fsck.ExitUsage)
+	case *discardJournal && *salvage:
+		fmt.Fprintln(os.Stderr, "Error: pick one of -salvage and -discard-journal")
 		os.Exit(fsck.ExitUsage)
 	case releasing && *releaseSlotN < 0:
 		fmt.Fprintln(os.Stderr, "Error: -release-slot needs a slot number")
@@ -154,12 +169,15 @@ func main() {
 		}
 	}()
 
-	if *listSlots || releasing {
+	if *listSlots || releasing || inspecting {
 		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose})
-		if *listSlots {
+		switch {
+		case *listSlots:
 			err = printSlots(os.Stdout, checker)
-		} else {
-			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *discardJournal, *force)
+		case inspecting:
+			err = inspectSlot(os.Stdout, checker, *inspectSlotN)
+		default:
+			err = releaseSlot(os.Stdout, checker, *releaseSlotN, *salvage, *discardJournal, *force, *reportPath)
 		}
 		switch {
 		case errors.Is(err, fsck.ErrNoSuchSlot):
@@ -168,7 +186,7 @@ func main() {
 		case err != nil:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(fsck.ExitOperational)
-		case *discardJournal:
+		case *discardJournal || *salvage:
 			os.Exit(fsck.ExitCorrected)
 		}
 		os.Exit(fsck.ExitClean)

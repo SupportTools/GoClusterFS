@@ -80,6 +80,7 @@ TestMultiNodeConcurrentWrites 0.98
 TestMultiNodeCrashRecovery 3.47
 TestMultiNodeCreateWithSignals 0.77
 TestMultiNodeCreatesInOneDirectory 7.58
+TestMultiNodeCrossMovesCannotFormALoop 3.3
 TestMultiNodeDirIndexWithoutBroadcast 1.02
 TestMultiNodeExtentCacheCoherency 0.57
 TestMultiNodeInodeReuseStaleRead 0.60
@@ -88,9 +89,13 @@ TestMultiNodeMixedSizeWrites 1.74
 TestMultiNodeNeighborInodeWrites 7.78
 TestMultiNodeOpenRefreshesCachedSize 0.50
 TestMultiNodeOverlappingBlockWrites 1.75
+TestMultiNodeReadsNeverSeePartOfAWrite 17.6
 TestMultiNodeRecoveryIdempotency 43.71
 TestMultiNodeRecoveryWithLargeFile 37.48
 TestMultiNodeRecoveryWithMultipleFiles 36.49
+TestMultiNodeRenameRacesCreateOfItsTarget 3.4
+TestMultiNodeRenameRacesUnlinkOfItsSource 2.6
+TestMultiNodeRenamesOntoOneName 4.3
 TestMultiNodeRestartKeepsPeerJournal 6.00
 TestMultiNodeReversedWriteOrder 1.54
 TestMultiNodeSequentialAccess 1.46

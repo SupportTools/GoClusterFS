@@ -57,6 +57,33 @@ func LoggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// countRequests counts every response by route and status code.
+func (s *Server) countRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rw, r)
+		s.apiRequests.WithLabelValues(routeOf(r.URL.Path), strconv.Itoa(rw.status)).Inc()
+	})
+}
+
+// apiRoutes are the route labels of goclusterfs_api_requests_total; anything else counts as "other".
+var apiRoutes = []string{"/api/v1/status", "/api/v1/stats", "/api/v1/snapshots", "/api/v1/clones", "/api/v1/admin"}
+
+func routeOf(p string) string {
+	switch p = path.Clean(p); {
+	case p == "/health" || p == "/metrics":
+		return p
+	case p == "/ui" || strings.HasPrefix(p, "/ui/"):
+		return "/ui"
+	}
+	for _, route := range apiRoutes {
+		if p == route || strings.HasPrefix(p, route+"/") {
+			return route
+		}
+	}
+	return "other"
+}
+
 // exempt reports whether p is one of paths, or lies under a path that ends in "/".
 func exempt(p string, paths []string) bool {
 	under := path.Clean(p) + "/"

@@ -7,15 +7,18 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
+	"github.com/supporttools/GoClusterFS/internal/node"
 )
 
 type healthSources struct {
 	deviceError      func() error
 	journal          func() *api.JournalStatsResponse
 	replaying        func() []int
+	failingReplays   func() []node.FailingReplay
 	broadcastOn      bool
 	broadcastProblem func() string
 	silentPeers      func() ([]string, time.Duration)
+	heartbeatAge     func() time.Duration
 }
 
 func registerHealthChecks(srv *api.Server, src healthSources) {
@@ -24,9 +27,10 @@ func registerHealthChecks(srv *api.Server, src healthSources) {
 	}
 	check("device", func() api.ComponentHealth { return deviceHealth(src.deviceError()) })
 	check("journal", func() api.ComponentHealth { return journalHealth(src.journal()) })
-	check("recovery", func() api.ComponentHealth { return recoveryHealth(src.replaying()) })
+	check("recovery", func() api.ComponentHealth { return recoveryHealth(src.replaying(), src.failingReplays()) })
 	check("broadcast", func() api.ComponentHealth { return broadcastHealth(src.broadcastOn, src.broadcastProblem()) })
 	check("broadcast-peers", func() api.ComponentHealth { return silentPeersHealth(src.silentPeers()) })
+	check("heartbeat", func() api.ComponentHealth { return heartbeatHealth(src.heartbeatAge()) })
 }
 
 func healthy(message string) api.ComponentHealth {
@@ -60,7 +64,13 @@ func journalHealth(j *api.JournalStatsResponse) api.ComponentHealth {
 	return healthy("")
 }
 
-func recoveryHealth(slots []int) api.ComponentHealth {
+func recoveryHealth(slots []int, failing []node.FailingReplay) api.ComponentHealth {
+	if len(failing) > 0 {
+		f := failing[0]
+		return degraded("the journal replay of the crashed node in slot %d failed %d times in a row: %s. Files it had locked stay locked; "+
+			"this node retries after %v without a change. Run goclusterfs-fsck -inspect-slot %d, then see Damaged Journal Slot in OPERATIONS.md",
+			f.Slot, f.Failures, f.Err, node.ReplayBackoff, f.Slot)
+	}
 	if len(slots) == 0 {
 		return healthy("")
 	}
@@ -79,6 +89,15 @@ func broadcastHealth(on bool, problem string) api.ComponentHealth {
 		return degraded("%s; peers see this node's changes only after -cache-ttl until it recovers. Check the network between the nodes and the -mcast-port and -unicast-port firewall rules", problem)
 	}
 	return healthy("")
+}
+
+// heartbeatHealth warns before the node stops itself: past node.HeartbeatTimeout/2 without a heartbeat, it exits.
+func heartbeatHealth(age time.Duration) api.ComponentHealth {
+	if age <= 2*node.HeartbeatInterval {
+		return healthy("")
+	}
+	return degraded("the last heartbeat reached this node's registry slot %v ago; at %v this node stops so peers can take over its locks. Heartbeats are writes to the shared device: check its latency",
+		age.Round(100*time.Millisecond), node.HeartbeatTimeout/2)
 }
 
 func silentPeersHealth(names []string, quiet time.Duration) api.ComponentHealth {

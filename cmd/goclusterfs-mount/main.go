@@ -91,7 +91,8 @@ func main() {
 		// Cache configuration
 		cacheStrict   = flag.Bool("cache-strict", false, "Check every cached inode against the device before using it; slower, but other nodes' changes show at once")
 		cacheTTL      = flag.Duration("cache-ttl", 5*time.Second, "How long a cached inode is used before it is checked against the device; another node's change can take this long to show when its broadcast is lost")
-		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries; stat and ls can show another node's change this late, while opening a file always sees it")
+		attrTimeout   = flag.Duration("attr-timeout", time.Second, "How long the kernel caches file attributes and directory entries; stat and ls can show another node's change this late. Opening a file always sees it, except that a name another node renamed away can still open the moved file")
+		directIO      = flag.Bool("direct-io", false, "Send every read and write of file data to the filesystem instead of the kernel page cache, so a read never returns cached pages older than another node's write. Slower for small and repeated reads, and shared mmap of files fails")
 		cacheInodes   = flag.Int("cache-inodes", cache.DefaultConfig().InodeCacheSize, "Most inodes the inode cache holds; 0 turns it off")
 		cacheExtents  = flag.Int("cache-extents", cache.DefaultConfig().ExtentCacheSize, "Most block mappings the extent cache holds; 0 turns it off")
 		cacheNegative = flag.Int("cache-negative", cache.DefaultConfig().NegativeCacheSize, "Most not-found inode lookups the negative cache holds; 0 turns it off")
@@ -283,7 +284,11 @@ func main() {
 	if *skipRecovery >= 0 {
 		nodeReg.PreferSlot(*skipRecovery)
 	}
+	nodeReg.SetLockLayout(lock.LayoutID())
 	slotIdx, err := nodeReg.Register(ctx, hostname)
+	if errors.Is(err, node.ErrLockLayout) {
+		failf("Cannot join the cluster: %v. Nodes of different GoClusterFS versions would not lock each other out: unmount that node, then mount every node with one version", err)
+	}
 	if errors.Is(err, node.ErrNoFreeSlots) {
 		failf("Cannot join the cluster: all %d node slots are taken. List them with goclusterfs-fsck -list-slots %s, and free the slot of a node that will not come back with -release-slot", node.MaxNodes, *devicePath)
 	}
@@ -335,10 +340,13 @@ func main() {
 	// -skip-recovery names the slot whose journal the operator chose to discard;
 	// a mount that takes any other slot replays that slot's journal.
 	skip := *skipRecovery >= 0 && *skipRecovery == slotIdx
+	var mountReplay stats.MountReplay
 	if *skipRecovery >= 0 && !skip {
 		log.Printf("Journal: ignoring -skip-recovery=%d: this mount took slot %d, so it replays that slot's journal", *skipRecovery, slotIdx)
 	}
-	if *journalEnabled && !skip {
+	// -journal=false only stops this mount journaling its own writes: the slot's journal is still replayed, or reset
+	// below, so no later mount replays it over newer data.
+	if !skip {
 		// Set up recovery context with our managers
 		recoveryCtx := &journal.RecoveryContext{
 			Dev:       dev,
@@ -368,11 +376,18 @@ func main() {
 			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}
 		if result != nil && result.WasNeeded {
+			mountReplay.Transactions = result.Stats.TxnCommitted
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
 				result.Stats.TxnCommitted, result.Stats.BytesScanned, result.NodeUUID[:8])
 		}
-	} else if skip {
+	} else {
+		mountReplay.Discarded = true
 		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
+		if !*journalEnabled {
+			if err := resetJournalHeader(dev, journalOffset); err != nil {
+				failf("Discarding the journal of slot %d failed: %v; check the device, then mount again", slotIdx, err)
+			}
+		}
 	}
 	releasePrevious(true)
 	if err := lockMgr.ClearForeignClaims(); err != nil {
@@ -458,6 +473,9 @@ func main() {
 	// Create filesystem with journal, TRIM, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nil, refcountReg, lockMgr, nodeUUID, dataOffset)
 	gfs.SetSymlinks(sb.RequiredFlags&superblock.RequiredSymlinks != 0)
+	gfs.SetFailStop(func(err error) {
+		failf("[ERROR] Stopping this node and keeping its locks: %v. A peer replays this node's journal and finishes the rename, or the next mount here does", err)
+	})
 	var res *reserve.Manager
 	if j != nil && *blockReserve > 0 {
 		res = reserve.New(reserve.Config{Size: *blockReserve}, bm, j, extentMgr.ReleaseBlocks, func() int {
@@ -496,12 +514,17 @@ func main() {
 	}
 	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)
 	nodeReg.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
-		if err := replayPeer(info); err != nil {
-			return err
+		err := replayPeer(info)
+		if err == nil {
+			err = gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
 		}
-		return gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
+		if errors.Is(err, lock.ErrLockTimeout) {
+			return fmt.Errorf("%w: %w", node.ErrReplayContended, err)
+		}
+		return err
 	})
 	gfs.SetOrphanRegistry(nodeReg)
+	gfs.SetDirectIO(*directIO)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
 	cacheMgr.OnOrphans(nodeReg.KickOrphans)
 	// Nothing is open here yet: let go of what this slot held before a crash.
@@ -546,8 +569,8 @@ func main() {
 			FsName:        "goclusterfs",
 			Name:          "goclusterfs",
 			Debug:         *fuseDebug,
-			MaxReadAhead:  128 * 1024, // 128KB readahead
 			MaxWrite:      goclusterfs.MaxWrite,
+			MaxReadAhead:  1 << 20,
 			DisableXAttrs: false,
 			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
 		},
@@ -572,7 +595,7 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Failed to create the API server: %v; the mount continues without it", err)
 		} else {
-			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res))
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res, mountReplay))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
@@ -583,9 +606,11 @@ func main() {
 				deviceError:      dev.LastError,
 				journal:          sampler.JournalStats,
 				replaying:        nodeReg.Replaying,
+				failingReplays:   nodeReg.FailingReplays,
 				broadcastOn:      cacheMgr.BroadcastEnabled(),
 				broadcastProblem: cacheMgr.BroadcastProblem,
 				silentPeers:      cacheMgr.SilentBroadcastPeers,
+				heartbeatAge:     func() time.Duration { return nodeReg.Stats().HeartbeatAge },
 			})
 			apiServer.SetFileService(fileops.New(gfs))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
@@ -720,8 +745,8 @@ func usageFailf(format string, args ...any) {
 	os.Exit(cli.ExitUsage)
 }
 
-func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager) stats.Sources {
-	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager, mountReplay stats.MountReplay) stats.Sources {
+	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize, MountReplay: mountReplay}
 	if res != nil {
 		src.Reserve = res
 	}
@@ -745,6 +770,14 @@ var ownerStates = map[node.Occupancy]lock.OwnerState{
 // ownReplayRetry is the first wait before a mount retries its own journal
 // replay; tests shorten it.
 var ownReplayRetry = time.Second
+
+// resetJournalHeader zeroes the journal header, as goclusterfs-fsck -release-slot does, so no mount replays it.
+func resetJournalHeader(dev *storage.Device, offset uint64) error {
+	if _, err := dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), int64(offset)); err != nil {
+		return err
+	}
+	return dev.Sync()
+}
 
 // recoverOwnJournal replays the journal this node's slot holds from its
 // previous owner. A replay that gave up waiting for another node's lock is
