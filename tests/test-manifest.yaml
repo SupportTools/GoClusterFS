@@ -2103,6 +2103,20 @@ scenarios:
     environments:
       go: internal/fsck/layout_test.go::TestFsckRepairRefusesInUseFilesystem
 
+  - id: fsck-inspect-slot
+    name: fsck inspects a node registry slot without writing
+    description: -inspect-slot reports the slot's node, lease and orphans, the journal header, every committed transaction a replay would apply with the inodes and blocks it changes, and where a damaged journal stops the scan; it writes nothing, so it runs on a mounted device
+    priority: go_only
+    environments:
+      go: internal/fsck/inspect_test.go::TestInspectSlot
+
+  - id: journal-entry-touches
+    name: Journal entries name what they change
+    description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
+    priority: go_only
+    environments:
+      go: internal/journal/describe_test.go::TestEntryTouches
+
   - id: fsck-release-slot
     name: fsck slot release checks
     description: Release refuses while any node runs or the slot's heartbeat or recovery lease is recent; an expired slot with a damaged journal is released, its journal reads as never initialized, and a new node registers in it
