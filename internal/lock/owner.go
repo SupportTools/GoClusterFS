@@ -101,6 +101,18 @@ func isReplay(ctx context.Context) bool {
 // holds. A caller that can release its locks and retry should do so.
 var ErrReplayBlocked = fmt.Errorf("%w: other locks held while a failing node holds this one", ErrLockTimeout)
 
+// ReplayBlockedError is the ErrReplayBlocked of one lock, which WaitOutReplay waits for.
+type ReplayBlockedError struct {
+	Type     LockType
+	Resource uint64
+	Mode     LockMode
+	reason   string
+}
+
+func (e *ReplayBlockedError) Error() string { return ErrReplayBlocked.Error() + ": " + e.reason }
+
+func (e *ReplayBlockedError) Unwrap() error { return ErrReplayBlocked }
+
 type retryKey struct{}
 
 // Retryable marks ctx as a caller's that releases its locks and retries on

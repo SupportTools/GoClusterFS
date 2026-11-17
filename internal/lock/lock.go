@@ -17,8 +17,10 @@
 //	Level 7: SFBContainer
 //	Level 8: Inode (by number)
 //	Level 9: Extent (by block)
-//	Level 10: InodeSector (by inode table sector), a leaf: held only around
-//	one sector's read-modify-write, with no other lock taken while held
+//	Level 10: InodeSector (by inode table sector), a leaf: no lock of another
+//	type is taken while one is held. It is held around one sector's
+//	read-modify-write, except that a rename takes the sectors of the inodes it
+//	writes, in record order, before its journal commit and holds them to the end
 //
 // Each type has its own records, laid out in type order, and locks of one type
 // are taken in record order. A goroutine's records then only go up, so waits
@@ -154,6 +156,8 @@ type Manager struct {
 	contested map[uint64]time.Time
 	// claims tracks the Acquire calls waiting for a record this node does not hold.
 	claims map[uint64]*pendingClaim
+	// retrying counts, by goroutine, the Retrying calls it is inside.
+	retrying map[uint64]int
 	// unreleased holds records whose slot this node failed to clear; the watcher clears them again.
 	unreleased map[uint64]bool
 	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
@@ -328,6 +332,7 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		yieldUntil: make(map[uint64]time.Time),
 		contested:  make(map[uint64]time.Time),
 		claims:     make(map[uint64]*pendingClaim),
+		retrying:   make(map[uint64]int),
 		adopted:    make(map[uint64]adoptedSlot),
 		unreleased: make(map[uint64]bool),
 		tornSince:  make(map[slotRef]tornSighting),
@@ -543,6 +548,7 @@ func (m *Manager) acquire(ctx context.Context, gid uint64, lockType LockType, re
 	}
 	// A goroutine holding other locks may hold one a failed node's replay needs.
 	nested := m.goroutineHoldsAnyLocked(gid)
+	retryable := isRetryable(ctx) || m.retrying[gid] > 0
 	m.addClaimWaiterLocked(recordID)
 	m.mu.Unlock()
 	defer m.dropClaimWaiter(recordID)
@@ -593,7 +599,7 @@ func (m *Manager) acquire(ctx context.Context, gid uint64, lockType LockType, re
 		}
 
 		failingWhileNested := by.failing() && nested && !replay
-		if failingWhileNested && isRetryable(ctx) {
+		if failingWhileNested && retryable {
 			return m.giveUp(ErrReplayBlocked, lockType, resourceID, mode, startTime, fmt.Sprintf(
 				"record %d is held by node %x (slot %d), which is failing or being recovered; releasing the other locks held here",
 				recordID, by.occupant[:8], by.slot))
@@ -728,7 +734,71 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 func (m *Manager) giveUp(err error, lockType LockType, resourceID uint64, mode LockMode, start time.Time, reason string) error {
 	log.Printf("[WARN] lock: gave up waiting for type=%d res=%d mode=%d after %v: %s",
 		lockType, resourceID, mode, time.Since(start).Round(time.Millisecond), reason)
+	if err == ErrReplayBlocked {
+		return &ReplayBlockedError{Type: lockType, Resource: resourceID, Mode: mode, reason: reason}
+	}
 	return fmt.Errorf("%w: %s", err, reason)
+}
+
+// Retrying runs fn with the calling goroutine marked, as Retryable marks a context, as one that releases its locks
+// and retries on ErrReplayBlocked. It reaches lock waits that take no context, such as an inode table sector's.
+func (m *Manager) Retrying(fn func() error) error {
+	gid := getGoroutineID()
+	m.mu.Lock()
+	m.retrying[gid]++
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if m.retrying[gid]--; m.retrying[gid] == 0 {
+			delete(m.retrying, gid)
+		}
+		m.mu.Unlock()
+	}()
+	return fn()
+}
+
+// UntilReplayed runs op and, each time op gives up on a lock a failing node holds while it holds other locks, waits
+// for that node's replay to end and runs op again. A caller that holds a lock gets op's error instead, since the
+// replay may need that lock. op must write nothing before its lock waits and recheck under its locks what it read
+// before, so running it again is safe even after a journal commit.
+func (m *Manager) UntilReplayed(ctx context.Context, op func() error) error {
+	m.mu.Lock()
+	holding := m.goroutineHoldsAnyLocked(getGoroutineID())
+	m.mu.Unlock()
+	if holding {
+		return op()
+	}
+	for {
+		err := m.Retrying(op)
+		if !errors.Is(err, ErrReplayBlocked) || !m.WaitOutReplay(ctx, err) {
+			return err
+		}
+	}
+}
+
+// WaitOutReplay waits for the lock err gave up on, an ErrReplayBlocked, until its failing holder's replay ends, and
+// reports whether the caller may retry. The calling goroutine must hold no lock, or the replay could wait for it.
+func (m *Manager) WaitOutReplay(ctx context.Context, err error) bool {
+	var blocked *ReplayBlockedError
+	if !errors.As(err, &blocked) {
+		return false
+	}
+	m.mu.Lock()
+	holding := m.goroutineHoldsAnyLocked(getGoroutineID())
+	m.mu.Unlock()
+	if holding {
+		log.Printf("[WARN] lock: not waiting out the replay that holds type=%d res=%d: this goroutine still holds other locks", blocked.Type, blocked.Resource)
+		return false
+	}
+	owner := NewOwner()
+	if err := m.AcquireAs(ctx, owner, blocked.Type, blocked.Resource, blocked.Mode); err != nil {
+		log.Printf("[WARN] lock: waiting out the replay that holds type=%d res=%d failed: %v", blocked.Type, blocked.Resource, err)
+		return false
+	}
+	if err := m.ReleaseAs(owner, blocked.Type, blocked.Resource); err != nil {
+		log.Printf("[WARN] lock: releasing type=%d res=%d after waiting out a replay failed: %v", blocked.Type, blocked.Resource, err)
+	}
+	return true
 }
 
 // turnOverLocked reports whether this node has had its turn on recordID: its

@@ -1992,6 +1992,15 @@ scenarios:
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedCreateThenCrashKeepsNamesApart
 
+  - id: operations-wait-out-replay
+    name: Operations blocked by a dead peer's lock wait out its replay
+    description: A peer dies holding the inode table sector of the root directory. Unlink, rmdir, create, mkdir, rename, link, symlink and chmod each need that sector while they hold another lock; each lets go of every lock, waits out the replay, and then succeeds without EIO
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestOperationsWaitOutTheReplayOfALockHolder
+      docker: TODO  # a container stop cannot cut power mid-operation, so no peer dies holding a lock
+      vm: run-vm-tests.sh::test_unlink_waits_out_peer_replay
+
   - id: fsck-directory-tree
     name: fsck checks the directory tree
     description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them

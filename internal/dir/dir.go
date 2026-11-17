@@ -189,6 +189,19 @@ func (m *Manager) Add(ctx context.Context, dirIno *inode.Inode, name string, chi
 
 // AddAndUpdate adds an entry and applies parent to the directory inode in the write that goes with it.
 func (m *Manager) AddAndUpdate(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8, parent func(*inode.Inode)) error {
+	return m.untilReplayed(ctx, func() error { return m.addAndUpdate(ctx, dirIno, name, childInode, fileType, parent) })
+}
+
+// untilReplayed runs op, which takes its own directory lock, again whenever it gives up on a lock a failing node
+// holds, once that node's replay ends. See lock.Manager.UntilReplayed.
+func (m *Manager) untilReplayed(ctx context.Context, op func() error) error {
+	if m.lockMgr == nil {
+		return op()
+	}
+	return m.lockMgr.UntilReplayed(ctx, op)
+}
+
+func (m *Manager) addAndUpdate(ctx context.Context, dirIno *inode.Inode, name string, childInode uint64, fileType uint8, parent func(*inode.Inode)) error {
 	if dirIno.Magic != inode.InodeMagic {
 		return ErrRemoved
 	}
@@ -319,6 +332,16 @@ func (m *Manager) RemoveIf(ctx context.Context, dirIno *inode.Inode, name string
 
 // RemoveIfAndUpdate is RemoveIf that applies parent to the directory inode in the write that goes with the removal.
 func (m *Manager) RemoveIfAndUpdate(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool, parent func(*inode.Inode)) (bool, error) {
+	var removed bool
+	err := m.untilReplayed(ctx, func() error {
+		var err error
+		removed, err = m.removeIfAndUpdate(ctx, dirIno, name, ok, parent)
+		return err
+	})
+	return removed, err
+}
+
+func (m *Manager) removeIfAndUpdate(ctx context.Context, dirIno *inode.Inode, name string, ok func(child uint64) bool, parent func(*inode.Inode)) (bool, error) {
 	if dirIno.Magic != inode.InodeMagic {
 		return false, ErrRemoved
 	}
@@ -445,16 +468,6 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	}
 	logging.Debugf("dir.InitDirectory: allocated physBlock=%d for inode %d", ext.PhysicalBlock, dirIno.InodeNum)
 
-	// Now acquire exclusive lock for writing directory contents
-	if m.lockMgr != nil {
-		logging.Debugf("dir.InitDirectory: acquiring inode lock for inode %d", dirIno.InodeNum)
-		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
-			return fmt.Errorf("failed to acquire directory lock: %w", err)
-		}
-		logging.Debugf("dir.InitDirectory: acquired inode lock for inode %d", dirIno.InodeNum)
-		defer m.unlock(dirIno.InodeNum)
-	}
-
 	// Create "." entry
 	dotEntry := &DirEntry{
 		InodeNum: uint64(dirIno.InodeNum),
@@ -486,27 +499,26 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	// Write ".."
 	serializeEntry(dotdotEntry, data[offset:])
 
-	// Write to disk
-	logging.Debugf("dir.InitDirectory: writing block %d for inode %d", ext.PhysicalBlock, dirIno.InodeNum)
+	// No inode on disk maps the new block yet, so no lock is needed to write it.
 	if err := m.writeBlock(ext.PhysicalBlock, data); err != nil {
 		return err
 	}
-	logging.Debugf("dir.InitDirectory: block write complete for inode %d", dirIno.InodeNum)
-
-	// Update inode size and allocated blocks
 	dirIno.Size = BlockSize
 	dirIno.AllocatedBlocks = 1
 
-	// CRITICAL: Write the inode to disk so subsequent operations
-	// (which re-read from disk for distributed consistency) see the current state.
-	// Use WriteWithLockHeld since we already hold the inode lock.
-	logging.Debugf("dir.InitDirectory: writing inode %d to disk", dirIno.InodeNum)
-	if err := m.inodeTbl.WriteWithLockHeld(dirIno); err != nil {
-		return fmt.Errorf("failed to write directory inode: %w", err)
-	}
-	logging.Debugf("dir.InitDirectory: complete for inode %d", dirIno.InodeNum)
-
-	return nil
+	// Later operations re-read the inode from disk, so write it now.
+	return m.untilReplayed(ctx, func() error {
+		if m.lockMgr != nil {
+			if err := m.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(dirIno.InodeNum), lock.LockModeExclusive); err != nil {
+				return fmt.Errorf("failed to acquire directory lock: %w", err)
+			}
+			defer m.unlock(dirIno.InodeNum)
+		}
+		if err := m.inodeTbl.WriteWithLockHeld(dirIno); err != nil {
+			return fmt.Errorf("failed to write directory inode: %w", err)
+		}
+		return nil
+	})
 }
 
 // walkChunk calls fn with each entry of a 4 KB chunk and its offset until fn

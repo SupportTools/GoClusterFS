@@ -485,6 +485,25 @@ func (f *FS) updateInodeLocked(ctx context.Context, num uint32, update func(*ino
 // updateUnderInodeLock is updateInodeLocked for a caller that already holds
 // lockInode(num).
 func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
+	var ino *inode.Inode
+	err := f.untilReplayed(ctx, func() error {
+		var err error
+		ino, err = f.updateUnderInodeLockOnce(ctx, num, update)
+		return err
+	})
+	return ino, err
+}
+
+// untilReplayed runs op, which takes its own locks, again whenever it gives up on a lock a failing node holds, once
+// that node's replay ends. See lock.Manager.UntilReplayed.
+func (f *FS) untilReplayed(ctx context.Context, op func() error) error {
+	if f.lockMgr == nil {
+		return op()
+	}
+	return f.lockMgr.UntilReplayed(ctx, op)
+}
+
+func (f *FS) updateUnderInodeLockOnce(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
 	if f.lockMgr != nil {
 		if err := f.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
