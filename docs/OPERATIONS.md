@@ -204,7 +204,7 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
    # Copy the binaries; use the same version as the other nodes
    scp goclusterfs-mount goclusterfs-fsck gfsctl node3:/usr/local/bin/
 
-   # Open UDP 31337 and 31338 to the other nodes (see the Deployment Guide's firewall rules)
+   # Open UDP 24730 and 24731 to the other nodes (see the Deployment Guide's firewall rules)
    ```
 
 2. **Configure shared storage**:
@@ -220,13 +220,13 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
    ```bash
    # Use SAME options as existing nodes; never add -format here
    goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster \
-       -mcast-group 239.192.74.75 -mcast-port 31337
+       -mcast-group 239.192.74.75 -mcast-port 24730
    ```
 
 4. **Verify cluster membership**:
    ```bash
    # Check broadcast communication
-   tcpdump -i eth0 udp port 31337 or udp port 31338
+   tcpdump -i eth0 udp port 24730 or udp port 24731
 
    # Check that the node registered
    gfsctl stats cluster
@@ -520,10 +520,10 @@ Nodes prove they are alive by writing a heartbeat to their registry slot on the 
 
 `gfsctl stats cluster` shows how many nodes are registered and healthy, and when each peer was last seen.
 
-Separately, each node sends a broadcast heartbeat over UDP every 30 seconds, an invalidation message for each metadata change, and a heartbeat every 50 ms for 500 ms after its last invalidation. Nodes send from the unicast port (31338) to the multicast port (31337):
+Separately, each node sends a broadcast heartbeat over UDP every 30 seconds, an invalidation message for each metadata change, and a heartbeat every 50 ms for 500 ms after its last invalidation. Nodes send from the unicast port (24731) to the multicast port (24730):
 
 ```bash
-tcpdump -i eth0 -c 10 udp port 31337 or udp port 31338
+tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 ```
 
 ---
@@ -594,7 +594,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
-**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `31337` by default, unicast on `31338`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Each node numbers its messages, and a node that sees a gap in a peer's numbers drops all cached inodes and extents. The heartbeats after a node's last invalidation let peers notice a lost final message too. Only when those heartbeats are lost as well do cache updates wait for `-cache-ttl`.
+**Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `24730` by default, unicast on `24731`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Each node numbers its messages, and a node that sees a gap in a peer's numbers drops all cached inodes and extents. The heartbeats after a node's last invalidation let peers notice a lost final message too. Only when those heartbeats are lost as well do cache updates wait for `-cache-ttl`.
 
 - With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
 - With `-broadcast-secret`, every message carries an HMAC-SHA256 tag. Nodes drop messages with a missing or wrong tag, so all nodes need the same secret.
@@ -610,7 +610,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 
-**Network listeners.** Each node listens on UDP port 31337 (multicast group) and UDP port 31338 (unicast) on all interfaces, and on TCP `-api-addr`. A second mount on the same host needs its own `-unicast-port` and `-api-addr`; the mount fails at startup if a port is taken. Clusters that share a LAN need their own `-mcast-group` or a `-broadcast-secret`, or they receive each other's invalidations. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
+**Network listeners.** Each node listens on UDP port 24730 (multicast group) and UDP port 24731 (unicast) on all interfaces, and on TCP `-api-addr`. A second mount on the same host needs its own `-unicast-port` and `-api-addr`; the mount fails at startup if a port is taken. On a Kubernetes node, keep these ports out of the NodePort range (30000-32767 by default): kube-proxy sends local traffic to those ports to its services, and `-preflight` warns about it. Clusters that share a LAN need their own `-mcast-group` or a `-broadcast-secret`, or they receive each other's invalidations. Limit the UDP ports, and the API port if you expose it, to the cluster nodes and your monitoring hosts with a firewall.
 
 ---
 

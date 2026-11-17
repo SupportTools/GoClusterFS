@@ -4830,6 +4830,13 @@ scenarios:
     environments:
       go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightNamesAFixForEachFailure
 
+  - id: mount-preflight-nodeports
+    name: Preflight warns about NodePort-range ports on Kubernetes nodes
+    description: On a host that looks like a Kubernetes node, -preflight warns about a broadcast or API port in 30000-32767 and names the flag to change; the default ports pass
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/preflight_test.go::TestPreflightWarnsAboutNodePorts
+
   - id: cli-shell-completions
     name: Shell completions for the CLIs
     description: goclusterfs-mount and goclusterfs-fsck print bash and zsh completion scripts built from their own flags; bash completes flag names, file and directory values, and fsck's device argument

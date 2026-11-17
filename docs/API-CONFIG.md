@@ -38,7 +38,7 @@ These are the `goclusterfs-mount` flags:
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 | `-completion` | string | (empty) | Print a `bash` or `zsh` completion script and exit |
-| `-preflight` | bool | `false` | Check FUSE, the device (O_DIRECT, filesystem), the mount point, the broadcast ports and the API address; print `PASS`, `WARN` or `FAIL` with a fix for each, change nothing, and exit 8 if a check fails |
+| `-preflight` | bool | `false` | Check FUSE, the device (O_DIRECT, filesystem), the mount point, the broadcast ports and the API address, and on a Kubernetes node whether any of those ports is in the NodePort range 30000-32767; print `PASS`, `WARN` or `FAIL` with a fix for each, change nothing, and exit 8 if a check fails |
 
 ### Cache Flags
 
@@ -72,8 +72,8 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 |------|------|---------|-------------|
 | `-broadcast` | bool | `true` | Send and receive cache invalidations over UDP so other nodes see changes sooner; correctness does not depend on it |
 | `-mcast-group` | string | `239.192.74.75` | Multicast group for broadcast messages; the same on every node |
-| `-mcast-port` | int | `31337` | UDP port for multicast messages; the same on every node |
-| `-unicast-port` | int | `31338` | UDP port for unicast; must differ from `-mcast-port` |
+| `-mcast-port` | int | `24730` | UDP port for multicast messages; the same on every node |
+| `-unicast-port` | int | `24731` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | string | (empty) | Secret that signs broadcast messages, the same on every node; visible to local users in `ps`. Empty leaves them unauthenticated |
 | `-broadcast-iface` | string | (empty) | Network interface for multicast; empty lets the kernel choose |
 | `-broadcast-max-peers` | int | `256` | Most nodes the unicast peer table and the lost-message tracking hold. When either is full, the node heard from longest ago is dropped |
@@ -238,8 +238,8 @@ Each node's journal is 4 MB, set by the on-disk layout.
 |-------|---------|------|---------|
 | `Enabled` | `true` | `-broadcast` | Send and receive cache invalidations |
 | `MulticastGroup` | `239.192.74.75` | `-mcast-group` | All nodes of a cluster must use the same group. `239.192.0.0/14` is for local administrative use |
-| `MulticastPort` | `31337` | `-mcast-port` | UDP port for multicast |
-| `UnicastPort` | `31338` | `-unicast-port` | UDP port for unicast; must differ from `MulticastPort` |
+| `MulticastPort` | `24730` | `-mcast-port` | UDP port for multicast |
+| `UnicastPort` | `24731` | `-unicast-port` | UDP port for unicast; must differ from `MulticastPort` |
 | `MulticastTTL` | `1` | | Multicast packets stay in the local subnet |
 | `MaxMulticastFailures` | `3` | | After this many multicast sends fail in a row, the node sends only to its unicast peers for 30 seconds, then tries multicast again. A successful send resets the count. `0` turns multicast off |
 | `HeartbeatInterval` | `30s` | | How often a node announces itself over UDP, so peers learn its unicast address. Failure detection uses the on-disk heartbeat, not this |

@@ -104,8 +104,8 @@ func main() {
 		// Network broadcast configuration
 		broadcastEnabled = flag.Bool("broadcast", true, "Send and receive cache invalidations over UDP so other nodes see changes sooner; correctness does not depend on it")
 		multicastGroup   = flag.String("mcast-group", "239.192.74.75", "Multicast group for broadcast messages; the same on every node")
-		multicastPort    = flag.Int("mcast-port", 31337, "UDP port for multicast messages; the same on every node")
-		unicastPort      = flag.Int("unicast-port", 31338, "UDP port for unicast messages; must differ from -mcast-port")
+		multicastPort    = flag.Int("mcast-port", broadcast.DefaultConfig().MulticastPort, "UDP port for multicast messages; the same on every node")
+		unicastPort      = flag.Int("unicast-port", broadcast.DefaultConfig().UnicastPort, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Secret that signs broadcast messages, the same on every node; visible to local users in ps. Empty leaves them unauthenticated: any host that can reach the UDP ports can make this node drop its caches")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast; empty lets the kernel choose")
 		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
