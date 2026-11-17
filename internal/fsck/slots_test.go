@@ -12,6 +12,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -253,6 +254,11 @@ func TestReleaseSlotOnline(t *testing.T) {
 		t.Fatalf("PlanRelease while the slot's node writes its slot: %v", err)
 	}
 
+	ownerLocks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, owner.LocalUUID(), slot)
+	if err := ownerLocks.Acquire(ctx, lock.LockTypeInode, 42, lock.LockModeExclusive); err != nil {
+		t.Fatal(err)
+	}
+
 	c := newChecker(dev)
 	plan, err := c.PlanRelease(slot, true)
 	if err != nil || plan.Online != "node 0 (live)" {
@@ -270,6 +276,25 @@ func TestReleaseSlotOnline(t *testing.T) {
 	}
 	if err := owner.CheckOwnership(); !errors.Is(err, node.ErrSlotLost) {
 		t.Errorf("the released node's ownership check = %v, want ErrSlotLost", err)
+	}
+
+	next := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	if got, err := next.Register(ctx, "next"); err != nil || got != slot {
+		t.Fatalf("the next node registered in slot %d (%v), want the released slot %d", got, err, slot)
+	}
+	view := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	liveLocks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, live.LocalUUID(), 0)
+	liveLocks.SetOwnerView(func(slot int, fresh bool) ([16]byte, lock.OwnerState) {
+		occupant, occupancy := view.Occupant(slot, fresh)
+		if occupancy == node.Unoccupied {
+			return occupant, lock.OwnerReleased
+		}
+		return occupant, lock.OwnerAlive
+	})
+	soon, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if err := liveLocks.Acquire(soon, lock.LockTypeInode, 42, lock.LockModeExclusive); err != nil {
+		t.Errorf("a peer taking the released node's lock after a node registered in its slot: %v", err)
 	}
 }
 

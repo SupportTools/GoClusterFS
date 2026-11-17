@@ -786,7 +786,10 @@ var ownerStates = map[node.Occupancy]lock.OwnerState{
 // replay; tests shorten it.
 var ownReplayRetry = time.Second
 
-// resetJournalHeader zeroes the journal header, as goclusterfs-fsck -release-slot does, so no mount replays it.
+// runningWatch is how long -skip-recovery watches the registry for a running
+// node: past the time peers still count a node with a late heartbeat as alive.
+var runningWatch = node.HeartbeatTimeout + node.HeartbeatInterval
+
 // skipRecoveryLoss says why discarding the journal of slot with -skip-recovery
 // would drop committed transactions while another node has the filesystem
 // mounted, or returns "" when it would not.
@@ -795,7 +798,7 @@ func skipRecoveryLoss(reg *node.Registry, dev *storage.Device, offset, size uint
 	if readErr == nil && pending == 0 {
 		return "", nil
 	}
-	running, err := reg.RunningSlots(2 * node.HeartbeatInterval)
+	running, err := reg.RunningSlots(runningWatch)
 	if err != nil {
 		return "", err
 	}
@@ -813,6 +816,7 @@ func skipRecoveryLoss(reg *node.Registry, dev *storage.Device, offset, size uint
 	return fmt.Sprintf("registry slot %d has a running node, and slot %d's journal holds %d committed transactions that discarding it drops", other, slot, pending), nil
 }
 
+// resetJournalHeader zeroes the journal header, as goclusterfs-fsck -release-slot does, so no mount replays it.
 func resetJournalHeader(dev *storage.Device, offset uint64) error {
 	if _, err := dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), int64(offset)); err != nil {
 		return err

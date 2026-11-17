@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -236,6 +237,12 @@ func (c *Checker) Release(plan *ReleasePlan, salvage bool) (*Salvage, error) {
 			return fmt.Errorf("reset the journal: %w", err)
 		}
 		reset = true
+		if err := c.dev.Sync(); err != nil {
+			return err
+		}
+		if _, err := lock.ClearSlotClaims(c.dev, c.sbData.LockBitmapOffset, c.sbData.LockBitmapSize, i); err != nil {
+			return fmt.Errorf("clear the slot's lock claims: %w", err)
+		}
 		return c.dev.Sync()
 	}
 	released, err := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).ReleaseSlot(i, plan.Slot.raw, resetJournal)

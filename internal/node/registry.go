@@ -928,9 +928,6 @@ func (r *Registry) GetActiveNodes() ([]*Slot, error) {
 	return active, nil
 }
 
-// readAllSlots reads the whole registry in one I/O, without a lock, so slow
-// storage costs a scan one round trip and never holds up the heartbeat. A slot
-// that fails to decode is nil.
 // RunningSlots returns the slots whose bytes change while it watches the registry for watch, as a running node's
 // heartbeat changes its slot every HeartbeatInterval. A stopped or paused node's slot does not change.
 func (r *Registry) RunningSlots(watch time.Duration) (map[int]bool, error) {
@@ -960,6 +957,9 @@ func (r *Registry) readRegistryRaw() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// readAllSlots reads the whole registry in one I/O, without a lock, so slow
+// storage costs a scan one round trip and never holds up the heartbeat. A slot
+// that fails to decode is nil.
 func (r *Registry) readAllSlots() ([]*Slot, error) {
 	buf := storage.GetBuffer(MaxNodes * SlotSize)
 	defer storage.PutBuffer(buf)

@@ -111,6 +111,8 @@ func TestOwnReplayStopsAtARecordThatDoesNotDecode(t *testing.T) {
 func TestSkipRecoveryRefusesLossWhileNodesRun(t *testing.T) {
 	const size = journal.DefaultJournalSlotSize
 	const deadSlot = 5
+	defer func(old time.Duration) { runningWatch = old }(runningWatch)
+	runningWatch = 2 * node.HeartbeatInterval
 	dev := dirtyJournal(t)
 	registryAt := uint64(size)
 	writeHeader := func(fill byte) {
