@@ -466,13 +466,15 @@ func pickKey(r *rand.Rand, m map[string]bool) string {
 	return pick(r, keys)
 }
 
+// pathOf returns the first of f's names in order; a hard link gives a file several.
 func (m *Model) pathOf(f *File) string {
+	first := ""
 	for p, g := range m.Files {
-		if g == f {
-			return p
+		if g == f && (first == "" || p < first) {
+			first = p
 		}
 	}
-	return ""
+	return first
 }
 
 // snapsOf returns the names of the snapshots a node must list for the file at p.

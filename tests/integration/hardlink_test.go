@@ -184,7 +184,12 @@ func TestMultiNodeLinkRacesLastUnlink(t *testing.T) {
 		if data, err := remover.ReadFile(link); err != nil || string(data) != name {
 			t.Errorf("%s after the race: %q, %v", link, data, err)
 		}
-		if _, nlink := nlinkOf(t, linker.Path(link)); nlink != 1 {
+		// The linker's kernel may keep the count it cached before the other node's unlink for -attr-timeout.
+		if _, ok := waitFor(10*time.Second, func() bool {
+			_, nlink := nlinkOf(t, linker.Path(link))
+			return nlink == 1
+		}); !ok {
+			_, nlink := nlinkOf(t, linker.Path(link))
 			t.Errorf("%s has %d links, want 1", link, nlink)
 		}
 	}
