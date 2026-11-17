@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"maps"
@@ -170,6 +171,29 @@ func TestLocksOfOneTypeAreTakenInRecordOrder(t *testing.T) {
 	requireAcquired(t, m, LockTypeInode, high, LockModeExclusive)
 	release(t, m, LockTypeInode, high)
 	release(t, m, LockTypeInode, low)
+}
+
+func TestLocksSortedByRecordAreAcquiredTogether(t *testing.T) {
+	const region = layoutRows * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	m := newTestNode(dev, 0, region, 1)
+
+	ids := []uint64{2, 900, 37, 4096, 11, 513, 64, 7}
+	for id := uint64(100); len(ids) < 10; id++ {
+		if m.Record(LockTypeInode, id) == m.Record(LockTypeInode, ids[0]) {
+			ids = append(ids, id)
+		}
+	}
+	slices.SortFunc(ids, func(a, b uint64) int {
+		return cmp.Or(cmp.Compare(m.Record(LockTypeInode, a), m.Record(LockTypeInode, b)), cmp.Compare(a, b))
+	})
+	for _, id := range ids {
+		requireAcquired(t, m, LockTypeInode, id, LockModeExclusive)
+	}
+	for _, id := range slices.Backward(ids) {
+		release(t, m, LockTypeInode, id)
+	}
 }
 
 func TestAcquireRefusesUnknownLockType(t *testing.T) {

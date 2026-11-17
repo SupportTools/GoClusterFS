@@ -20,6 +20,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/api"
 	"github.com/supporttools/GoClusterFS/internal/cli"
+	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
 func TestMain(m *testing.M) {
@@ -60,7 +61,7 @@ func (f *fakeAPI) lastToken() string {
 func startFakeAPI(t *testing.T, routes map[string]any) *fakeAPI {
 	t.Helper()
 	f := &fakeAPI{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.tokens = append(f.tokens, r.Header.Get("Authorization"))
 		f.mu.Unlock()
@@ -244,7 +245,7 @@ func TestSnapshots(t *testing.T) {
 	}
 
 	const details = "snapshot registry sector 3 fails its checksum; unmount the filesystem on every node and run goclusterfs-fsck -repair"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(api.ErrorResponse{Error: "Internal Server Error", Code: http.StatusInternalServerError, Details: details})
 	}))
@@ -348,4 +349,14 @@ func TestConfigShowHidesToken(t *testing.T) {
 	if !strings.Contains(out, "set (12 chars)") {
 		t.Errorf("config show does not say the token is set:\n%s", out)
 	}
+}
+
+// newServer is httptest.NewServer on a port the test's requests reach.
+func newServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	srv, err := testnet.NewHTTPServer(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
 }

@@ -63,9 +63,10 @@ dashboard:
 # Unit tests (fast, no FUSE needed)
 test: test-unit
 
+# UNIT_RUN in the environment limits the tests to a -run regex; CI uses it for split packages
 test-unit:
 	@echo "Running unit tests with race detector..."
-	$(GOTEST) -v -race -timeout $(UNIT_TIMEOUT) -covermode=atomic -coverprofile=$(COVER_PROFILE) $(UNIT_PKGS)
+	$(GOTEST) -v -race -timeout $(UNIT_TIMEOUT) -run "$${UNIT_RUN:-.}" -covermode=atomic -coverprofile=$(COVER_PROFILE) $(UNIT_PKGS)
 
 # Full integration suite, including what CI's -short skips (requires FUSE and built binary)
 test-integration: check-fuse build

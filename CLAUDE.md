@@ -99,7 +99,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. Every `statfs` (`df`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
-- No rename or hard links. Symlinks need a volume formatted by a build with symlink support.
+- No hard links. Rename supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`. Symlinks need a volume formatted by a build with symlink support.
 
 ## Testing
 

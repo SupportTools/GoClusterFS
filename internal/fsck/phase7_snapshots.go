@@ -100,6 +100,8 @@ func (c *Checker) checkSnapshots() error {
 	seenIDs := make(map[uint64]bool)
 	seenNames := make(map[string]uint64) // name -> snapshot ID
 	dataInodes := make(map[uint32]bool)
+	targets := make(map[uint64]uint32) // snapshot ID -> the inode it was taken of
+	var children []*SnapshotDescriptor
 	var fixes []snapshotSectorFix
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
@@ -199,11 +201,10 @@ func (c *Checker) checkSnapshots() error {
 				c.snapshotInodes[desc.DataInode] = true
 			}
 
-			// Validate parent reference (if not root snapshot)
-			if desc.ParentID != 0 && !seenIDs[desc.ParentID] {
-				// Parent might come later - this is a forward reference issue
-				// We'll check after full scan
+			if desc.ParentID != 0 {
+				children = append(children, desc)
 			}
+			targets[desc.SnapshotID] = desc.TargetInode
 
 			// Count active snapshots
 			if desc.State == SnapshotStateActive {
@@ -227,6 +228,8 @@ func (c *Checker) checkSnapshots() error {
 			return err
 		}
 	}
+
+	c.checkSnapshotParents(children, targets)
 
 	for num := range c.snapshotData {
 		if !dataInodes[num] {
@@ -280,6 +283,26 @@ func (c *Checker) writeSnapshotSectors(fixes []snapshotSectorFix) error {
 		return nil
 	}
 	return c.dev.Sync()
+}
+
+// checkSnapshotParents reports snapshots whose parent is missing, is the
+// snapshot itself, or was taken of another file. A delete re-parents the
+// deleted snapshot's children to its parent.
+func (c *Checker) checkSnapshotParents(children []*SnapshotDescriptor, targets map[uint64]uint32) {
+	for _, desc := range children {
+		loc := fmt.Sprintf("snapshot %d", desc.SnapshotID)
+		parentTarget, found := targets[desc.ParentID]
+		switch {
+		case desc.ParentID == desc.SnapshotID:
+			c.addProblem(PhaseSnapshots, Warning, loc, fmt.Sprintf("snapshot %q is its own parent", desc.Name), false)
+		case !found && len(c.snapsIncomplete) == 0:
+			c.addProblem(PhaseSnapshots, Warning, loc,
+				fmt.Sprintf("snapshot %q has parent snapshot %d, which does not exist", desc.Name, desc.ParentID), false)
+		case found && parentTarget != desc.TargetInode:
+			c.addProblem(PhaseSnapshots, Warning, loc,
+				fmt.Sprintf("snapshot %q of inode %d has parent snapshot %d, which was taken of inode %d", desc.Name, desc.TargetInode, desc.ParentID, parentTarget), false)
+		}
+	}
 }
 
 // snapshotOrphaned says why desc belongs to no existing file, or returns "".

@@ -166,10 +166,19 @@ type txnReplay struct {
 	owner   [16]byte
 	created map[uint64]bool
 	wrote   map[uint32]uint64
+	keep    map[uint64]bool // targets a replayed rename left named, so its records must not drop or free them
 }
 
 func newTxnReplay(owner [16]byte) *txnReplay {
-	return &txnReplay{owner: owner, created: make(map[uint64]bool), wrote: make(map[uint32]uint64)}
+	return &txnReplay{owner: owner, created: make(map[uint64]bool), wrote: make(map[uint32]uint64), keep: make(map[uint64]bool)}
+}
+
+// kept reports whether a rename earlier in this transaction left inode num named, and logs why op skips it.
+func (r *txnReplay) kept(op string, num uint64) bool {
+	if r.keep[num] {
+		log.Printf("[Recovery] %s: the rename did not replace inode %d, which keeps its name, skipping", op, num)
+	}
+	return r.keep[num]
 }
 
 // unchanged reports whether ino is in use and was last written before a record logged its MetaGeneration as gen, or
@@ -198,6 +207,8 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 		return applySymlinkTarget(ctx, rctx, r, entry.Payload)
 	case TxnOpDirAddEntry:
 		return applyDirAddEntry(ctx, rctx, r, entry.Payload)
+	case TxnOpDirRename:
+		return applyDirRename(ctx, rctx, r, entry.Payload)
 	case TxnOpDirRemoveEntry:
 		return applyDirRemoveEntry(ctx, rctx, entry.Payload)
 	case TxnOpBlockAlloc:
@@ -348,6 +359,9 @@ func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 	if err != nil {
 		return false, err
 	}
+	if r.kept("InodeDelete", uint64(p.InodeNum)) {
+		return false, nil
+	}
 
 	freed, err := rctx.InodeTbl.FreeIf(ctx, uint32(p.InodeNum), func(ino *inode.Inode) bool {
 		return r.unchanged(ino, p.MetaGeneration)
@@ -364,13 +378,19 @@ func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 	return true, nil
 }
 
-var errLinkDropDone = errors.New("link drop already applied or overtaken")
+var (
+	errLinkDropDone  = errors.New("link drop already applied or overtaken")
+	errParentChanged = errors.New("the parent changed since the rename logged it")
+)
 
 // applyLinkDrop redoes a lost link drop; at zero links the file is listed as an orphan, or freed if nobody holds it.
 func applyLinkDrop(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
 	p, err := DeserializeLinkDrop(payload)
 	if err != nil {
 		return false, err
+	}
+	if r.kept("LinkDrop", uint64(p.InodeNum)) {
+		return false, nil
 	}
 	num := uint32(p.InodeNum)
 	var holders uint64
@@ -457,20 +477,8 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		return false, err
 	}
 
-	var fileType uint8
-	switch p.EntryType {
-	case DirEntryRegular:
-		fileType = dir.DT_REG
-	case DirEntryDirectory:
-		fileType = dir.DT_DIR
-	case DirEntrySymlink:
-		fileType = dir.DT_LNK
-	default:
-		fileType = dir.DT_UNKNOWN
-	}
-
 	// Add checks that the parent is live and the name is free under the directory lock.
-	err = rctx.DirMgr.Add(ctx, parentIno, p.Name, p.ChildInodeNum, fileType)
+	err = rctx.DirMgr.Add(ctx, parentIno, p.Name, p.ChildInodeNum, fileTypeOf(p.EntryType))
 	switch {
 	case errors.Is(err, dir.ErrExists):
 		log.Printf("[Recovery] DirAddEntry: entry %q already exists in parent %d, skipping", p.Name, p.ParentInodeNum)
@@ -493,6 +501,139 @@ func applyDirAddEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 	log.Printf("[Recovery] DirAddEntry: added entry %q -> inode %d in parent %d",
 		p.Name, p.ChildInodeNum, p.ParentInodeNum)
 	return true, nil
+}
+
+func fileTypeOf(t DirEntryType) uint8 {
+	switch t {
+	case DirEntryRegular:
+		return dir.DT_REG
+	case DirEntryDirectory:
+		return dir.DT_DIR
+	case DirEntrySymlink:
+		return dir.DT_LNK
+	}
+	return dir.DT_UNKNOWN
+}
+
+// applyDirRename finishes a committed rename: the new name ends up naming the child and the old name is gone, unless
+// another node took the new name since, in which case the old name stays and the target keeps its name.
+func applyDirRename(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
+	p, err := DeserializeDirRename(payload)
+	if err != nil {
+		return false, err
+	}
+	if done, err := renameOvertaken(rctx, p); err != nil || done {
+		return false, err
+	}
+	placed, err := placeRenamed(ctx, rctx, r, p)
+	if err != nil || !placed {
+		if p.TargetInodeNum != 0 {
+			r.keep[p.TargetInodeNum] = true
+		}
+		return false, err
+	}
+	if oldParent, ok, err := liveDir(rctx, p.OldParentInodeNum); err != nil {
+		return true, err
+	} else if ok {
+		if _, err := rctx.DirMgr.RemoveIf(ctx, oldParent, p.OldName, func(cur uint64) bool { return cur == p.InodeNum }); err != nil && !errors.Is(err, dir.ErrNotFound) && !errors.Is(err, dir.ErrRemoved) {
+			return true, fmt.Errorf("failed to remove the old name %q: %w", p.OldName, err)
+		}
+	}
+	if p.EntryType == DirEntryDirectory && p.OldParentInodeNum != p.NewParentInodeNum {
+		if child, ok, err := liveDir(rctx, p.InodeNum); err != nil {
+			return true, err
+		} else if ok {
+			if _, err := rctx.DirMgr.PointIf(ctx, child, "..", p.NewParentInodeNum, dir.DT_DIR, func(cur uint64) bool { return cur == p.OldParentInodeNum }); err != nil && !errors.Is(err, dir.ErrNotFound) && !errors.Is(err, dir.ErrRemoved) {
+				return true, fmt.Errorf("failed to point the \"..\" of directory %d at %d: %w", p.InodeNum, p.NewParentInodeNum, err)
+			}
+		}
+	}
+	log.Printf("[Recovery] DirRename: %q in %d is %q in %d", p.OldName, p.OldParentInodeNum, p.NewName, p.NewParentInodeNum)
+	return true, nil
+}
+
+// renameOvertaken reports whether an inode the rename writes once under its locks is freed or more than one write past
+// the generation it logged. Another operation took the lock after the rename finished, so its names must stay.
+func renameOvertaken(rctx *RecoveryContext, p *DirRenamePayload) (bool, error) {
+	logged := map[uint64]uint64{p.OldParentInodeNum: p.OldParentGen, p.NewParentInodeNum: p.NewParentGen}
+	if p.EntryType == DirEntryDirectory && p.OldParentInodeNum != p.NewParentInodeNum {
+		logged[p.InodeNum] = p.MetaGeneration
+	}
+	for num, gen := range logged {
+		ino, err := rctx.InodeTbl.Read(uint32(num))
+		if err != nil {
+			return false, fmt.Errorf("failed to read inode %d: %w", num, err)
+		}
+		if ino.Magic != inode.InodeMagic || ino.MetaGeneration > gen+1 {
+			log.Printf("[Recovery] DirRename: inode %d changed after the rename of %q to %q finished, skipping", num, p.OldName, p.NewName)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// placeRenamed makes the new name name the child, if it is free, names the child, or still names the logged target.
+// Each parent's link count changes first, and only while the parent is as the rename logged it.
+func placeRenamed(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p *DirRenamePayload) (bool, error) {
+	newParent, ok, err := liveDir(rctx, p.NewParentInodeNum)
+	if !ok {
+		return false, err
+	}
+	cur, _, err := rctx.DirMgr.Lookup(ctx, newParent, p.NewName)
+	switch {
+	case err == nil && cur == p.InodeNum:
+		return true, nil
+	case err == nil && (p.TargetInodeNum == 0 || cur != p.TargetInodeNum):
+		log.Printf("[Recovery] DirRename: %q in %d names inode %d since, skipping", p.NewName, p.NewParentInodeNum, cur)
+		return false, nil
+	case err != nil && !errors.Is(err, dir.ErrNotFound):
+		return false, fmt.Errorf("failed to look up %q in %d: %w", p.NewName, p.NewParentInodeNum, err)
+	}
+
+	movesDir := p.EntryType == DirEntryDirectory && p.OldParentInodeNum != p.NewParentInodeNum
+	links := map[uint64]int{}
+	gens := map[uint64]uint64{p.OldParentInodeNum: p.OldParentGen, p.NewParentInodeNum: p.NewParentGen}
+	if movesDir {
+		links[p.OldParentInodeNum]--
+		links[p.NewParentInodeNum]++
+	}
+	if p.TargetInodeNum != 0 && p.TargetType == DirEntryDirectory {
+		links[p.NewParentInodeNum]--
+	}
+	for num, delta := range links {
+		if delta == 0 {
+			continue
+		}
+		var wrote bool
+		if err := rctx.InodeTbl.Update(ctx, uint32(num), func(parent *inode.Inode) error {
+			if wrote = r.unchanged(parent, gens[num]); !wrote {
+				return errParentChanged
+			}
+			parent.LinkCount = uint32(int64(parent.LinkCount) + int64(delta))
+			return nil
+		}); err != nil && !errors.Is(err, errParentChanged) {
+			return false, fmt.Errorf("failed to update the link count of directory %d: %w", num, err)
+		}
+		if wrote {
+			if parent, err := rctx.InodeTbl.Read(uint32(num)); err == nil {
+				r.wrote[uint32(num)] = parent.MetaGeneration
+			}
+		}
+	}
+
+	if errors.Is(err, dir.ErrNotFound) {
+		err = rctx.DirMgr.Add(ctx, newParent, p.NewName, p.InodeNum, fileTypeOf(p.EntryType))
+		if errors.Is(err, dir.ErrExists) || errors.Is(err, dir.ErrRemoved) {
+			log.Printf("[Recovery] DirRename: %q in %d was taken or removed meanwhile, skipping", p.NewName, p.NewParentInodeNum)
+			return false, nil
+		}
+		return err == nil, err
+	}
+	pointed, err := rctx.DirMgr.PointIf(ctx, newParent, p.NewName, p.InodeNum, fileTypeOf(p.EntryType), func(cur uint64) bool { return cur == p.TargetInodeNum })
+	if errors.Is(err, dir.ErrNotFound) || errors.Is(err, dir.ErrRemoved) {
+		return false, nil
+	}
+	return pointed, err
 }
 
 // liveDir reads the inode num and reports whether it is a directory in use. Another node may have removed it since
@@ -723,6 +864,9 @@ func applyExtentFree(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p
 	p, err := DeserializeExtentFree(payload)
 	if err != nil {
 		return false, err
+	}
+	if r.kept("ExtentFree", uint64(p.InodeNum)) {
+		return false, nil
 	}
 	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
 		if !r.unchanged(ino, p.MetaGeneration) {

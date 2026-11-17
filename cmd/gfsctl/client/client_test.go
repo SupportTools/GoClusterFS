@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/testnet"
 )
 
 func TestBaseURL(t *testing.T) {
@@ -30,7 +32,7 @@ func TestBaseURL(t *testing.T) {
 }
 
 func TestAPIErrorCarriesStatusAndDetails(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer secret" {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":"invalid token","code":401}`))
@@ -53,7 +55,7 @@ func TestAPIErrorCarriesStatusAndDetails(t *testing.T) {
 }
 
 func TestOversizedResponseIsRefused(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		chunk := make([]byte, 1<<20)
 		for written := 0; written <= MaxResponseSize; written += len(chunk) {
 			if _, err := w.Write(chunk); err != nil {
@@ -66,4 +68,14 @@ func TestOversizedResponseIsRefused(t *testing.T) {
 	if _, err := c.GetRaw(context.Background(), "/metrics"); err == nil || !strings.Contains(err.Error(), "larger than") {
 		t.Fatalf("oversized response: %v", err)
 	}
+}
+
+// newServer is httptest.NewServer on a port the test's requests reach.
+func newServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	srv, err := testnet.NewHTTPServer(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv
 }
