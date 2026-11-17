@@ -199,7 +199,7 @@ A crashed node's locks free up on their own once another node proves it dead and
 - An I/O error, or `journal recovery failed: ...`: the storage failed or a transaction could not be applied. The journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - `journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt` (including `its state is Corrupt` or an unknown state): the journal header is damaged and cannot be replayed.
 
-**Solution**: Only for a damaged header, discard the journal with `-skip-recovery=N`. The mount discards it only if it takes slot N again; follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot).
+**Solution**: Only for a damaged header, discard the journal with `-skip-recovery=N`, with every other node unmounted: while nodes run, the mount refuses to discard a journal it cannot read. The mount discards it only if it takes slot N again; follow the steps in [Damaged Journal Slot](OPERATIONS.md#damaged-journal-slot).
 
 ### Another Node's Change Shows Up Late
 

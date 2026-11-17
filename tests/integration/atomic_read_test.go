@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,40 +34,66 @@ func mixedAt(b []byte) int {
 	return -1
 }
 
-// readUntil reads path whole, in one request per read, until deadline, and
-// returns how many reads it made and a description of each one that mixed two writes.
-func readUntil(path string, oDirect bool, deadline time.Time) (int, []string, error) {
+// readUntil reads path whole, in one request per read, until stop closes,
+// counts its reads in reads, and describes each one that mixed two writes.
+func readUntil(path string, oDirect bool, stop <-chan struct{}, reads *atomic.Int64) ([]string, error) {
 	flags := unix.O_RDONLY
 	if oDirect {
 		flags |= unix.O_DIRECT
 	}
 	fd, err := unix.Open(path, flags, 0)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	defer func() { _ = unix.Close(fd) }()
 	buf, err := unix.Mmap(-1, 0, tearFileSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	defer func() { _ = unix.Munmap(buf) }()
-	var reads int
 	var tears []string
-	for time.Now().Before(deadline) {
+	for {
+		select {
+		case <-stop:
+			return tears, nil
+		default:
+		}
 		n, err := unix.Pread(fd, buf, 0)
 		if err != nil {
-			return reads, tears, err
+			return tears, err
 		}
 		if n != tearFileSize {
-			return reads, tears, fmt.Errorf("read %d bytes of %d", n, tearFileSize)
+			return tears, fmt.Errorf("read %d bytes of %d", n, tearFileSize)
 		}
-		reads++
+		reads.Add(1)
 		if at := mixedAt(buf); at >= 0 {
 			tears = append(tears, fmt.Sprintf("write %d up to byte %d, then write %d",
 				binary.LittleEndian.Uint64(buf), at, binary.LittleEndian.Uint64(buf[at:])))
 		}
 	}
-	return reads, tears, nil
+}
+
+// enoughReads waits until every node made minReads whole reads and minTime
+// passed. After maxTime it fails, naming the node furthest behind.
+func enoughReads(reads []atomic.Int64, minTime, maxTime time.Duration) error {
+	const minReads = 10
+	start := time.Now()
+	for {
+		slowest := 0
+		for i := range reads {
+			if reads[i].Load() < reads[slowest].Load() {
+				slowest = i
+			}
+		}
+		n := reads[slowest].Load()
+		switch {
+		case n >= minReads && time.Since(start) >= minTime:
+			return nil
+		case time.Since(start) >= maxTime:
+			return fmt.Errorf("node %d made only %d whole reads in %v while node 0 wrote, want %d", slowest, n, maxTime, minReads)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // One node keeps overwriting a 1 MB file, each write one value throughout,
@@ -115,7 +140,7 @@ func TestMultiNodeReadsNeverSeePartOfAWrite(t *testing.T) {
 				}
 			}
 
-			deadline := time.Now().Add(duration)
+			stop := make(chan struct{})
 			var writes atomic.Int64
 			var wg sync.WaitGroup
 			wg.Go(func() {
@@ -125,7 +150,12 @@ func TestMultiNodeReadsNeverSeePartOfAWrite(t *testing.T) {
 					return
 				}
 				defer mustClose(t, f)
-				for v := uint64(1); time.Now().Before(deadline); v++ {
+				for v := uint64(1); ; v++ {
+					select {
+					case <-stop:
+						return
+					default:
+					}
 					if _, err := f.WriteAt(fillWords(v), 0); err != nil {
 						t.Errorf("node 0 write %d: %v", v, err)
 						return
@@ -133,27 +163,35 @@ func TestMultiNodeReadsNeverSeePartOfAWrite(t *testing.T) {
 					writes.Add(1)
 				}
 			})
-			reads := make([]int, cluster.NodeCount())
+			reads := make([]atomic.Int64, cluster.NodeCount())
 			tears := make([][]string, cluster.NodeCount())
 			for i := range cluster.NodeCount() {
 				wg.Go(func() {
 					var err error
-					reads[i], tears[i], err = readUntil(cluster.Node(i).Path("tear"), tc.oDirect, deadline)
+					tears[i], err = readUntil(cluster.Node(i).Path("tear"), tc.oDirect, stop, &reads[i])
 					if err != nil {
 						t.Errorf("node %d read: %v", i, err)
 					}
 				})
 			}
+			if err := enoughReads(reads, duration, time.Minute); err != nil {
+				t.Error(err)
+			}
+			close(stop)
 			wg.Wait()
 
-			t.Logf("%d writes on node 0; reads per node %v", writes.Load(), reads)
+			counts := make([]int64, len(reads))
+			for i := range reads {
+				counts[i] = reads[i].Load()
+			}
+			t.Logf("%d writes on node 0; reads per node %v", writes.Load(), counts)
+			if writes.Load() < 10 {
+				t.Errorf("node 0 made only %d writes while the other nodes read, want at least 10", writes.Load())
+			}
 			for i, torn := range tears {
 				if len(torn) > 0 {
-					t.Errorf("node %d: %d of %d reads mixed two writes, first: %s", i, len(torn), reads[i], torn[0])
+					t.Errorf("node %d: %d of %d reads mixed two writes, first: %s", i, len(torn), counts[i], torn[0])
 				}
-			}
-			if writes.Load() < 10 || slices.Min(reads) < 10 {
-				t.Errorf("too little overlap to judge: %d writes, reads per node %v", writes.Load(), reads)
 			}
 		})
 	}

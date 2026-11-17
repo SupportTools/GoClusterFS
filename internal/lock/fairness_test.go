@@ -158,3 +158,64 @@ func TestContestedHolderKeepsItsNewClaimBriefly(t *testing.T) {
 		}
 	}
 }
+
+// slowDevice makes each of m's slot writes and row reads take delay, as a loaded host's storage does.
+func slowDevice(m *Manager, delay time.Duration) {
+	delaySlotWrites(m, func() time.Duration { return delay })
+	m.rowRead = func(buf []byte, offset int64) (int, error) {
+		time.Sleep(delay)
+		return m.dev.ReadAtUnsharded(buf, offset)
+	}
+}
+
+// A node in the lowest slot that keeps taking a lock must still let other nodes
+// in when their claims take longer than its yield gap: there it claimed again
+// before a waiter's claim finished, and a lower slot wins every collision.
+func TestSlowWaitersGetTurnsFromALowSlotThatKeepsTheLock(t *testing.T) {
+	const region = layoutRows * RowSize
+	dev, cleanup := createTestDevice(t, region)
+	defer cleanup()
+	low := newTestNode(dev, 0, region, 0)
+	deadline := time.Now().Add(3 * time.Second)
+	var lowGot int
+	var holder sync.WaitGroup
+	holder.Go(func() {
+		for time.Now().Before(deadline) {
+			if acquireWithin(low, time.Until(deadline), LockTypeFileIO, 7, LockModeExclusive) != nil {
+				return
+			}
+			lowGot++
+			time.Sleep(5 * time.Millisecond)
+			release(t, low, LockTypeFileIO, 7)
+		}
+	})
+	time.Sleep(20 * time.Millisecond)
+
+	waiters := []*Manager{newTestNode(dev, 0, region, 1), newTestNode(dev, 0, region, 2)}
+	got := make([]int, len(waiters))
+	var wg sync.WaitGroup
+	for i, w := range waiters {
+		slowDevice(w, 40*time.Millisecond)
+		wg.Go(func() {
+			for time.Now().Before(deadline) {
+				if acquireWithin(w, time.Until(deadline), LockTypeFileIO, 7, LockModeShared) != nil {
+					return
+				}
+				got[i]++
+				time.Sleep(5 * time.Millisecond)
+				release(t, w, LockTypeFileIO, 7)
+			}
+		})
+	}
+	wg.Wait()
+	holder.Wait()
+	for i, n := range got {
+		if n < 3 {
+			t.Errorf("node in slot %d whose claims take 80 ms got the lock %d times in 3s from a node in slot 0 that keeps taking it, want at least 3: %v", i+1, n, got)
+		}
+	}
+	if lowGot < 3 {
+		t.Errorf("the node in slot 0 got the lock only %d times in 3s while the slow nodes took turns, want at least 3", lowGot)
+	}
+	t.Logf("acquires: slot 0 %d, slow nodes %v", lowGot, got)
+}
