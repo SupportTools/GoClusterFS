@@ -377,8 +377,8 @@ var typeRows = [numLockTypes]uint64{
 	LockTypeLockRegion:   1,
 	LockTypeBlockBitmap:  1,
 	LockTypeSFBContainer: 1,
-	LockTypeInode:        96,
-	LockTypeExtent:       97,
+	LockTypeInode:        128,
+	LockTypeExtent:       65,
 	LockTypeInodeSector:  16,
 	LockTypeFileIO:       39,
 }
