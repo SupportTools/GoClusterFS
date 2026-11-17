@@ -4361,6 +4361,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_dir_test.go::TestFsckChecksEveryDirectoryEntry
 
+  - id: fsck-repair-dot-entries
+    name: fsck repairs a wrong "." or ".." after a rename
+    description: After a rename moves a directory, a ".." left at the old parent and a "." naming another directory are reported with both inode numbers; a dry run changes nothing and repair points them at the right directories
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_tree_test.go::TestFsckRepairsDotEntriesAfterRename
+
   - id: fsck-snapshot-parents
     name: fsck checks snapshot parents
     description: fsck reports a snapshot whose parent snapshot is missing, is itself, or was taken of another file, and accepts a parent of the same file
