@@ -119,7 +119,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-journal` | `true` | Write-ahead journal; turn it off for testing only, since a crash can then leave the filesystem inconsistent |
-| `-skip-recovery=N` | `-1` (off) | Emergency only: discard the journal of registry slot N instead of replaying it, if the mount takes slot N. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot) |
+| `-skip-recovery=N` | `-1` (off) | Emergency only: discard the journal of registry slot N instead of replaying it, if the mount takes slot N. Refuses while other nodes run if the journal holds a committed transaction. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot) |
 
 ### Network Broadcast Options
 

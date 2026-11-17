@@ -45,7 +45,6 @@ func TestReleaseSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	gone.Stop()
-	refused(slot, "mounted by node 1 (live)")
 	if err := live.Unregister(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -194,6 +193,83 @@ func TestReleaseSlotSalvage(t *testing.T) {
 	}
 	if result, err := journal.ScanAndRecover(dev, journalAt, sb.JournalSlotSize(), nil, nil); result != nil || err != nil {
 		t.Errorf("mount recovery of the salvaged journal = %+v, %v; want nothing to recover", result, err)
+	}
+}
+
+func TestReleaseSlotOnline(t *testing.T) {
+	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
+	t.Cleanup(fsck.SetOnlineWatch(6*node.HeartbeatInterval, 6*node.HeartbeatInterval))
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
+	ctx := context.Background()
+	live := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	if _, err := live.Register(ctx, "live"); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer live.Stop()
+	owner := node.NewRegistry(dev, sb.NodeRegistryOffset)
+	slot, err := owner.Register(ctx, "paused")
+	if err != nil {
+		t.Fatal(err)
+	}
+	journalAt := int64(sb.JournalRegionOffset + uint64(slot)*sb.JournalSlotSize())
+	refused := func(reasons ...string) {
+		t.Helper()
+		_, err := newChecker(dev).PlanRelease(slot, true)
+		for _, reason := range reasons {
+			if err == nil || !strings.Contains(err.Error(), reason) {
+				t.Fatalf("PlanRelease while a node runs: %v, want an error containing %q", err, reason)
+			}
+		}
+	}
+
+	j, err := journal.Init(dev, uint64(journalAt), sb.JournalSlotSize(), [16]byte{1}, 1, journal.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := j.Begin()
+	if err := txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Commit(txn); err != nil {
+		t.Fatal(err)
+	}
+	refused("node 0 (live) has the filesystem mounted", "holds 1 committed transaction that releasing would drop", "Stop the cluster", "goclusterfs-fsck -repair")
+	damageJournal(t, dev, sb, slot)
+	refused("cannot tell what slot")
+	writeSector(t, dev, journalAt, nil)
+
+	planned := make(chan error, 1)
+	go func() {
+		_, err := newChecker(dev).PlanRelease(slot, true)
+		planned <- err
+	}()
+	time.Sleep(3 * node.HeartbeatInterval)
+	setHeartbeat(t, dev, sb, slot, time.Now())
+	if err := <-planned; err == nil || !strings.Contains(err.Error(), "changed while fsck watched it") {
+		t.Fatalf("PlanRelease while the slot's node writes its slot: %v", err)
+	}
+
+	c := newChecker(dev)
+	plan, err := c.PlanRelease(slot, true)
+	if err != nil || plan.Online != "node 0 (live)" {
+		t.Fatalf("PlanRelease of a quiet slot with nothing committed while a node runs: %+v, %v", plan, err)
+	}
+	if salvaged, err := c.Release(plan, true); err != nil || salvaged != nil {
+		t.Fatalf("Release with salvage while a node runs = %+v, %v; want a release that replays nothing", salvaged, err)
+	}
+	slots, err := newChecker(dev).Slots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := slots[slot]; s.InUse() || !s.JournalFresh {
+		t.Errorf("after the online release slot %d is in use=%v with journal %q", slot, s.InUse(), s.Journal)
+	}
+	if err := owner.CheckOwnership(); !errors.Is(err, node.ErrSlotLost) {
+		t.Errorf("the released node's ownership check = %v, want ErrSlotLost", err)
 	}
 }
 

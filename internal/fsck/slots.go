@@ -1,8 +1,10 @@
 package fsck
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,12 +82,25 @@ type ReleasePlan struct {
 	// Replayable says why a mount could still replay the journal; empty when it could not.
 	Replayable string
 	Journal    *SlotInspection
+	// Online names a node that has the filesystem mounted; empty when none does.
+	Online string
 }
 
+// How long a release with nodes running watches the slot unchanged before it
+// counts the slot's node as gone: twice as long as peers wait before they
+// replay a node, or past a peer's recovery lease for a dead slot.
+var (
+	onlineActiveWatch = 4 * node.HeartbeatTimeout
+	onlineDeadWatch   = time.Minute + node.HeartbeatTimeout
+)
+
 // PlanRelease checks that slot i can be released: mount would accept the
-// superblock, no node runs, the slot is readable, its lease ended
-// ReleaseMargin ago, and, unless force is set, a mount could not replay its
-// journal instead. It writes nothing.
+// superblock, the slot is readable, and its node is gone. With no node
+// running, the slot's lease must have ended ReleaseMargin ago, and unless
+// force is set, a mount must not be able to replay its journal instead. With
+// nodes running, fsck watches the slot unchanged instead, and refuses a
+// journal that holds a committed transaction or that it cannot read, since
+// nothing may be lost while nodes use the filesystem. It writes nothing.
 func (c *Checker) PlanRelease(i int, force bool) (*ReleasePlan, error) {
 	if _, err := superblock.Read(c.dev); err != nil {
 		return nil, fmt.Errorf("release refused: mount would reject the superblock (%v); run fsck first", err)
@@ -97,14 +112,21 @@ func (c *Checker) PlanRelease(i int, force bool) (*ReleasePlan, error) {
 	if i < 0 || i >= len(slots) {
 		return nil, fmt.Errorf("%w: slot %d; slots are 0 to %d", ErrNoSuchSlot, i, len(slots)-1)
 	}
+	online := ""
 	for _, s := range slots {
-		if s.Running {
-			return nil, fmt.Errorf("release refused: the filesystem is mounted by %s; unmount it on every node first", s.Name())
+		switch {
+		case s.Running && s.Index == i:
+			return nil, fmt.Errorf("release refused: the filesystem is mounted by %s, the node in that slot", s.Name())
+		case s.Running && online == "":
+			online = s.Name()
 		}
 	}
 	s := slots[i]
 	if s.Err != nil {
 		return nil, fmt.Errorf("release refused: slot %d is unreadable (%v)", i, s.Err)
+	}
+	if online != "" {
+		return c.planOnline(s, online)
 	}
 	if after := s.Slot.LeaseExpiry().Add(ReleaseMargin); time.Now().Before(after) {
 		return nil, fmt.Errorf("release refused: %s may still be alive; run again after %s",
@@ -118,18 +140,78 @@ func (c *Checker) PlanRelease(i int, force bool) (*ReleasePlan, error) {
 	return &ReleasePlan{Slot: s, Discards: discards, Replayable: keep, Journal: c.inspect(s)}, nil
 }
 
+// planOnline checks slot s for a release while the node online names has the
+// filesystem mounted: the journal holds no committed transaction, and the slot
+// stays unchanged while fsck watches it on its own clock.
+func (c *Checker) planOnline(s SlotStatus, online string) (*ReleasePlan, error) {
+	offset, size := c.journalArea(s.Index)
+	pending, err := journal.PendingCommitted(c.dev, offset, size)
+	loss := ""
+	switch {
+	case err != nil:
+		loss = fmt.Sprintf("fsck cannot tell what slot %d's journal holds (%v)", s.Index, rootCause(err))
+	case pending == 1:
+		loss = fmt.Sprintf("slot %d's journal holds 1 committed transaction that releasing would drop", s.Index)
+	case pending > 1:
+		loss = fmt.Sprintf("slot %d's journal holds %d committed transactions that releasing would drop", s.Index, pending)
+	}
+	if loss != "" {
+		return nil, fmt.Errorf("release refused: %s has the filesystem mounted, and %s. Stop the cluster: unmount every node, "+
+			"release the slot with -salvage or -discard-journal, then run goclusterfs-fsck -repair before mounting again", online, loss)
+	}
+	if err := c.watchSlot(s, online); err != nil {
+		return nil, err
+	}
+	discards, _ := journalContents(c.slotJournal(s.Index))
+	return &ReleasePlan{Slot: s, Discards: discards, Journal: c.inspect(s), Online: online}, nil
+}
+
+// watchSlot fails if slot s changes within the online watch for its state, since then its node is running or a peer
+// is replaying it.
+func (c *Checker) watchSlot(s SlotStatus, online string) error {
+	watch := onlineActiveWatch
+	switch s.Slot.State {
+	case node.NodeStateEmpty:
+		return nil
+	case node.NodeStateDead:
+		watch = onlineDeadWatch
+	}
+	_, _ = fmt.Fprintf(c.opts.Output, "%s has the filesystem mounted, so fsck watches slot %d for %s to prove its node is gone...\n",
+		online, s.Index, watch)
+	offset := c.sbData.NodeRegistryOffset + uint64(s.Index)*node.SlotSize
+	buf := storage.NewAlignedBuffer(node.SlotSize).Bytes()
+	for deadline := time.Now().Add(watch); time.Now().Before(deadline); {
+		time.Sleep(node.HeartbeatInterval / 2)
+		if err := c.readSector(buf, offset); err != nil {
+			return fmt.Errorf("read node registry slot %d: %w", s.Index, err)
+		}
+		if !bytes.Equal(buf, s.raw) {
+			return fmt.Errorf("release refused: slot %d changed while fsck watched it: its node is running, "+
+				"or another node is replaying its journal; check -list-slots again", s.Index)
+		}
+	}
+	return nil
+}
+
 // Release takes the plan's slot under a recovery lease, resets its journal
 // and empties the slot, so a node can register there with a new journal. With
-// salvage set it first replays the journal until a transaction fails to apply
-// or a record cannot be read, and returns how far it got. It writes nothing if
-// any registry slot changed since PlanRelease watched it.
+// salvage set and no node running, it first replays the journal until a
+// transaction fails to apply or a record cannot be read, and returns how far
+// it got. It writes nothing if a registry slot changed since PlanRelease
+// checked it: any slot with no node running, or else the plan's slot.
 func (c *Checker) Release(plan *ReleasePlan, salvage bool) (*Salvage, error) {
 	i := plan.Slot.Index
 	now, err := c.readRegistry()
 	if err != nil {
 		return nil, fmt.Errorf("read the node registry: %w", err)
 	}
-	if changed := changedSlots(c.registry, now); len(changed) > 0 {
+	changed := changedSlots(c.registry, now)
+	if plan.Online != "" {
+		// Running nodes change their slots all the time, and replay without cluster locks would race them.
+		changed = slices.DeleteFunc(changed, func(slot int) bool { return slot != i })
+		salvage = false
+	}
+	if len(changed) > 0 {
 		return nil, fmt.Errorf("release stopped: node registry slot %d changed since fsck checked it; nothing was written", changed[0])
 	}
 	if beforeReleaseWrites != nil {

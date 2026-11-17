@@ -18,6 +18,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -301,6 +302,132 @@ func TestFsckReleasesDeadSlot(t *testing.T) {
 	if got := mustMatch(t, journalInitRe, restarted, "journal init"); got != offset {
 		t.Errorf("mount started its journal at offset %s, want the released slot's offset %s", got, offset)
 	}
+}
+
+// TestFsckOnlineRelease frees a paused node's slot with goclusterfs-fsck while
+// another node runs; the paused node, resumed, stops at its write gate. A dead
+// node's committed transaction refuses an online release and an online
+// -skip-recovery.
+func TestFsckOnlineRelease(t *testing.T) {
+	env := []string{"GOCLUSTERFS_TEST_HEARTBEAT_HOLD=30s", "GOCLUSTERFS_TEST_NO_PEER_REPLAY=1"}
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	a, b := cluster.Node(0), cluster.Node(1)
+	a.Env, b.Env = env, env
+	logA := &syncBuffer{}
+	a.Log = logA
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start node A: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("start node B: %v", err)
+	}
+	slot := mustMatch(t, slotRe, logA, "node A registration")
+	image := cluster.ImagePath
+	if err := b.WriteFile("fenced", bytes.Repeat([]byte{'0'}, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.WriteFileAt("fenced", bytes.Repeat([]byte{'A'}, 4096), 0); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(time.Second) {
+		code, out := runFsck(t, "-inspect-slot", slot, image)
+		if code == 0 && strings.Contains(out, " 0 committed transactions to replay") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("node A's journal still holds committed transactions after 30s:\n%s", out)
+		}
+	}
+
+	pid := a.PID()
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop node A: %v", err)
+	}
+	defer func() { _ = cluster.KillNode(0) }()
+	out := expectFsck(t, 1, "Released slot "+slot, "-release-slot", slot, "-discard-journal", image)
+	if !strings.Contains(out, "has the filesystem mounted") || !strings.Contains(out, "Online: ") {
+		t.Errorf("online release did not say it ran online:\n%s", out)
+	}
+	if err := b.WriteFileAt("fenced", bytes.Repeat([]byte{'B'}, 4096), 0); err != nil {
+		t.Fatalf("node B writes after the release: %v", err)
+	}
+
+	if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+		t.Fatalf("resume node A: %v", err)
+	}
+	go func() { _ = a.WriteFileAt("fenced", bytes.Repeat([]byte{'A'}, 4096), 0) }()
+	lost := "Node registry slot " + slot + " is no longer this node's"
+	for deadline := time.Now().Add(45 * time.Second); !strings.Contains(logA.String(), lost) && time.Now().Before(deadline); {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !strings.Contains(logA.String(), lost) {
+		t.Fatal("node A did not stop after resuming from the release")
+	}
+	if !strings.Contains(logA.String(), "checking the slot before a write") {
+		t.Error("node A stopped without its write gate checking the slot")
+	}
+	if got, err := b.ReadFile("fenced"); err != nil || !bytes.Equal(got, bytes.Repeat([]byte{'B'}, 4096)) {
+		t.Fatalf("file after node A resumed: %v; want node B's data", err)
+	}
+	_ = cluster.KillNode(0)
+	_ = a.Unmount()
+
+	gone, journalAt, journalSize := deadNodeWithCommittedTxn(t, image)
+	for _, args := range [][]string{{"-salvage"}, {"-discard-journal", "-force"}} {
+		out := expectFsck(t, 8, "holds 1 committed transaction that releasing would drop", append(append([]string{"-release-slot", gone}, args...), image)...)
+		if !strings.Contains(out, "Stop the cluster") || !strings.Contains(out, "goclusterfs-fsck -repair") {
+			t.Errorf("online release refusal with %v does not say how to proceed:\n%s", args, out)
+		}
+	}
+	refused := &syncBuffer{}
+	a.Log = refused
+	a.ExtraArgs = []string{"-skip-recovery=" + gone}
+	if err := cluster.StartNode(0, false); err == nil {
+		t.Fatal("a mount with -skip-recovery dropped a committed transaction while node B runs")
+	}
+	if out := refused.String(); !strings.Contains(out, "-skip-recovery="+gone+" refused") || !strings.Contains(out, "has a running node") {
+		t.Errorf("mount with -skip-recovery while node B runs:\n%s", out)
+	}
+	dev, err := storage.Open(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dev.Close() }()
+	if pending, err := journal.PendingCommitted(dev, journalAt, journalSize); pending != 1 || err != nil {
+		t.Errorf("the dead node's journal after the refusals: %d committed transactions, %v; want its 1 untouched", pending, err)
+	}
+}
+
+// deadNodeWithCommittedTxn registers a node in the image that never heartbeats and
+// commits one transaction to its journal, as a node that crashed right after a write.
+func deadNodeWithCommittedTxn(t *testing.T, imagePath string) (slot string, journalAt, journalSize uint64) {
+	t.Helper()
+	dev, err := storage.Open(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dev.Close() }()
+	sb, err := superblock.Read(dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, err := node.NewRegistry(dev, sb.NodeRegistryOffset).Register(context.Background(), "gone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	journalAt, journalSize = sb.JournalRegionOffset+uint64(i)*sb.JournalSlotSize(), sb.JournalSlotSize()
+	j, err := journal.Init(dev, journalAt, journalSize, [16]byte{7}, 1, journal.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := j.Begin()
+	if err := txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Commit(txn); err != nil {
+		t.Fatal(err)
+	}
+	return strconv.Itoa(i), journalAt, journalSize
 }
 
 func backdateHeartbeat(t *testing.T, imagePath, slot string, by time.Duration) {

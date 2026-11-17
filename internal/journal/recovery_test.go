@@ -333,6 +333,76 @@ func TestDryRunRecover(t *testing.T) {
 	}
 }
 
+func TestPendingCommitted(t *testing.T) {
+	const size = uint64(DefaultJournalSlotSize)
+	dev, cleanup := createTestDevice(t, int64(6*size))
+	defer cleanup()
+	uuid := [16]byte{1}
+	journalAt := func(i int) uint64 { return uint64(i) * size }
+	initAt := func(i int) *Region {
+		t.Helper()
+		region, err := InitRegion(dev, journalAt(i), size, uuid, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return region
+	}
+	write := func(region *Region, data []byte) {
+		t.Helper()
+		if _, err := region.WriteAt(data); err != nil {
+			t.Fatal(err)
+		}
+		if err := region.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	initAt(1)
+	uncommitted := initAt(2)
+	if err := uncommitted.MarkDirty(); err != nil {
+		t.Fatal(err)
+	}
+	write(uncommitted, make([]byte, 100))
+	j, err := Init(dev, journalAt(3), size, uuid, 1, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		txn := j.Begin()
+		if err := txn.LogInodeCreate(&InodeCreatePayload{InodeNum: uint64(100 + i)}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Commit(txn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	initAt(4)
+	damageJournalHeader(t, dev, int64(journalAt(4)), func(h []byte) { h[100] ^= 0xff })
+	initAt(5)
+	damageJournalHeader(t, dev, int64(journalAt(5)), func(h []byte) {
+		binary.LittleEndian.PutUint32(h[40:44], uint32(JournalStateCorrupt))
+		binary.LittleEndian.PutUint32(h[JournalSuperblockSize-4:], storage.CRC32C(h[:JournalSuperblockSize-4]))
+	})
+
+	for i, want := range []struct {
+		name    string
+		pending int
+		err     error
+	}{
+		{"never initialized", 0, nil},
+		{"clean", 0, nil},
+		{"only an uncommitted transaction", 0, nil},
+		{"two committed transactions", 2, nil},
+		{"damaged header", 0, ErrJournalChecksumMismatch},
+		{"corrupt state", 0, ErrJournalCorrupt},
+	} {
+		pending, err := PendingCommitted(dev, journalAt(i), size)
+		if pending != want.pending || !errors.Is(err, want.err) || (want.err == nil) != (err == nil) {
+			t.Errorf("%s: PendingCommitted = %d, %v; want %d, %v", want.name, pending, err, want.pending, want.err)
+		}
+	}
+}
+
 func TestRecoveryCleanState(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10*1024*1024)
 	defer cleanup()
