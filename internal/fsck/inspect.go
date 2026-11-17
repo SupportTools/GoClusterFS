@@ -50,7 +50,7 @@ func (c *Checker) InspectSlot(i int) (*SlotInspection, error) {
 	case errors.Is(err, journal.ErrJournalUninitialized):
 		return in, nil
 	case err != nil:
-		in.HeaderErr = err
+		in.HeaderErr = rootCause(err)
 		return in, nil
 	}
 	header := region.Superblock()
