@@ -74,6 +74,9 @@ func TestModelRenamesAsTheFilesystemDoes(t *testing.T) {
 	step(t, m, &Op{Kind: "rename", Path: a, Path2: d}, int(syscall.EISDIR))
 	step(t, m, &Op{Kind: "rename", Path: d, Path2: b}, int(syscall.ENOTDIR))
 	step(t, m, &Op{Kind: "rename", Path: d, Path2: d + "/l0-d3"}, int(syscall.EINVAL))
+	step(t, m, &Op{Kind: "create", Path: d + "/l0-f9"}, 0)
+	step(t, m, &Op{Kind: "rename", Path: d + "/l0-f9", Path2: d}, int(syscall.ENOTEMPTY))
+	step(t, m, &Op{Kind: "unlink", Path: d + "/l0-f9"}, 0)
 
 	step(t, m, &Op{Kind: "rename", Path: a, Path2: b}, 0)
 	if m.Files[a] != nil || string(m.Files[b].Data) != string(genData(1, 5)) || m.Snaps["l0-s2"].Owner != nil || m.Snaps["l0-s1"].Owner != m.Files[b] {

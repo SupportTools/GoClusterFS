@@ -77,6 +77,9 @@ var beforeShareMark func()
 // file's inode, before it writes the inode back.
 var duringShareMark func()
 
+// MaxWrite is the largest write request the kernel sends the daemon; a snapshot captures each request whole.
+const MaxWrite = 128 << 10
+
 // MaxWriteRetries is the maximum number of retry attempts for Write operations
 // when concurrent modifications are detected. Back-to-back snapshots on another
 // node can force a retry each time; with conflictBackoff, 10 tries span up to 5s.
@@ -119,6 +122,9 @@ type FS struct {
 	fs.Inode
 
 	mu sync.RWMutex
+
+	// mounted is set by MarkMounted once a FUSE server serves the root, so kernel notifications have somewhere to go.
+	mounted atomic.Bool
 
 	// Storage layer
 	dev *storage.Device
@@ -3544,6 +3550,11 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 // Setxattr sets an extended attribute on the file.
 // Used for snapshot creation via user.snapshot attribute and clone creation via user.clone.
 func (f *File) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
+	return f.setxattr(ctx, attr, data)
+}
+
+// setxattr runs a snapshot or clone attribute, for Setxattr and for the HTTP API, which calls it without the kernel.
+func (f *File) setxattr(ctx context.Context, attr string, data []byte) syscall.Errno {
 	ctx = detach(ctx)
 	if attr == "user.snapshot" || attr == "user.clone" {
 		unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeShared)

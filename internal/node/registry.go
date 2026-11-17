@@ -125,7 +125,7 @@ type Registry struct {
 	bootID     [16]byte
 	pidNS      uint64
 	lockLayout uint32
-	onSlotLost func(slot int, owner [16]byte)
+	onSlotLost func(SlotLoss)
 
 	onOwnerDead   func(owner [16]byte, slot int) (done func(replayed bool))
 	onOrphans     func(slot int, orphans []Orphan)
@@ -222,9 +222,32 @@ func (r *Registry) SetRecoveryHandler(handler RecoveryHandler) {
 	r.recoveryHandler = handler
 }
 
-// SetSlotLostHandler sets what the heartbeat does when it finds another node in this node's slot.
-// Without a handler it only logs.
-func (r *Registry) SetSlotLostHandler(fn func(slot int, owner [16]byte)) {
+// SlotLoss is why this node must stop writing: its slot no longer names it as alive, or its heartbeats stopped landing.
+type SlotLoss struct {
+	Slot int
+	// Taken is set when the slot no longer names this node as alive; Owner is then the UUID the slot names.
+	Taken bool
+	Owner [16]byte
+	// Local is this node's UUID, and Stalled how long its heartbeats had failed.
+	Local   [16]byte
+	Stalled time.Duration
+}
+
+// String names the loss for a log line, with "owner" only when another node holds the slot.
+func (l SlotLoss) String() string {
+	switch {
+	case !l.Taken:
+		return fmt.Sprintf("Heartbeats to registry slot %d failed for %v", l.Slot, l.Stalled.Round(time.Millisecond))
+	case l.Owner == l.Local:
+		return fmt.Sprintf("Node registry slot %d is no longer this node's: a peer declared this node dead", l.Slot)
+	case l.Owner == [16]byte{}:
+		return fmt.Sprintf("Node registry slot %d is no longer this node's: the slot is empty", l.Slot)
+	}
+	return fmt.Sprintf("Node registry slot %d is no longer this node's (owner %x)", l.Slot, l.Owner[:8])
+}
+
+// SetSlotLostHandler sets what the heartbeat does when this node loses its slot. Without a handler it only logs.
+func (r *Registry) SetSlotLostHandler(fn func(SlotLoss)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onSlotLost = fn
@@ -695,17 +718,14 @@ func (r *Registry) beat(slotIdx int) error {
 		return nil
 	}
 	if r.lost.CompareAndSwap(false, true) {
-		owner := r.localUUID
+		loss := SlotLoss{Slot: slotIdx, Taken: takenOver, Local: r.localUUID, Stalled: sinceBeat}
 		if takenOver {
-			owner = slot.UUID
-		} else {
-			log.Printf("ERROR: heartbeats to node registry slot %d have failed for %v", slotIdx, sinceBeat.Round(time.Millisecond))
+			loss.Owner = slot.UUID
 		}
 		if onSlotLost != nil {
-			onSlotLost(slotIdx, owner)
+			onSlotLost(loss)
 		} else {
-			log.Printf("ERROR: node registry slot %d is no longer this node's (owner %x); "+
-				"this node no longer owns its journal region", slotIdx, owner[:8])
+			log.Printf("ERROR: %s; this node no longer owns its journal region", loss)
 		}
 	}
 	return ErrSlotLost

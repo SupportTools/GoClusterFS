@@ -886,8 +886,8 @@ func TestHeartbeatReportsLostSlot(t *testing.T) {
 	defer cleanup()
 
 	reg := NewRegistry(dev, 0)
-	lost := make(chan [16]byte, 1)
-	reg.SetSlotLostHandler(func(slot int, owner [16]byte) { lost <- owner })
+	lost := make(chan SlotLoss, 1)
+	reg.SetSlotLostHandler(func(loss SlotLoss) { lost <- loss })
 	slot, err := reg.Register(context.Background(), "node")
 	if err != nil {
 		t.Fatal(err)
@@ -901,9 +901,9 @@ func TestHeartbeatReportsLostSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case owner := <-lost:
-		if owner != ([16]byte{8}) {
-			t.Errorf("lost slot to %x, want 08", owner)
+	case loss := <-lost:
+		if loss.Owner != ([16]byte{8}) || !strings.HasSuffix(loss.String(), "(owner 0800000000000000)") {
+			t.Errorf("lost slot to %x, saying %q; want owner 08", loss.Owner, loss.String())
 		}
 	case <-time.After(3 * HeartbeatInterval):
 		t.Error("heartbeat did not report the lost slot")
@@ -1099,13 +1099,30 @@ func TestRegisterReportsItsDeadPreviousIncarnation(t *testing.T) {
 	}
 }
 
+func TestSlotLossMessages(t *testing.T) {
+	local, other := [16]byte{1, 2, 3}, [16]byte{0xab, 0xcd}
+	for _, tc := range []struct {
+		loss SlotLoss
+		want string
+	}{
+		{SlotLoss{Slot: 3, Local: local, Stalled: 7277 * time.Millisecond}, "Heartbeats to registry slot 3 failed for 7.277s"},
+		{SlotLoss{Slot: 3, Local: local, Taken: true, Owner: other}, "Node registry slot 3 is no longer this node's (owner abcd000000000000)"},
+		{SlotLoss{Slot: 3, Local: local, Taken: true, Owner: local}, "Node registry slot 3 is no longer this node's: a peer declared this node dead"},
+		{SlotLoss{Slot: 3, Local: local, Taken: true}, "Node registry slot 3 is no longer this node's: the slot is empty"},
+	} {
+		if got := tc.loss.String(); got != tc.want {
+			t.Errorf("%+v: %q, want %q", tc.loss, got, tc.want)
+		}
+	}
+}
+
 func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
 
 	reg := NewRegistry(dev, 0)
-	lost := make(chan struct{}, 1)
-	reg.SetSlotLostHandler(func(int, [16]byte) { lost <- struct{}{} })
+	lost := make(chan SlotLoss, 1)
+	reg.SetSlotLostHandler(func(loss SlotLoss) { lost <- loss })
 	if _, err := reg.Register(context.Background(), "node"); err != nil {
 		t.Fatal(err)
 	}
@@ -1118,7 +1135,10 @@ func TestHeartbeatStopsWhenWritesFail(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-lost:
+	case loss := <-lost:
+		if msg := loss.String(); !strings.HasPrefix(msg, "Heartbeats to registry slot") || strings.Contains(msg, "owner") {
+			t.Errorf("after failed heartbeats the node says %q, want the stall without an owner", msg)
+		}
 	case <-time.After(HeartbeatTimeout):
 		t.Error("node kept running while its heartbeats failed; peers would prove it dead and take its locks")
 	}
@@ -1129,8 +1149,8 @@ func TestHeartbeatStopsWhenSlotIsMarkedDead(t *testing.T) {
 	defer cleanup()
 
 	reg := NewRegistry(dev, 0)
-	lost := make(chan struct{}, 1)
-	reg.SetSlotLostHandler(func(int, [16]byte) { lost <- struct{}{} })
+	lost := make(chan SlotLoss, 1)
+	reg.SetSlotLostHandler(func(loss SlotLoss) { lost <- loss })
 	slot, err := reg.Register(context.Background(), "node")
 	if err != nil {
 		t.Fatal(err)
@@ -1149,7 +1169,10 @@ func TestHeartbeatStopsWhenSlotIsMarkedDead(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-lost:
+	case loss := <-lost:
+		if msg := loss.String(); !strings.HasSuffix(msg, "a peer declared this node dead") {
+			t.Errorf("in a slot marked dead the node says %q", msg)
+		}
 	case <-time.After(3 * HeartbeatInterval):
 		t.Error("heartbeat kept running in a slot another node marked dead")
 	}
@@ -1506,7 +1529,7 @@ func TestCheckOwnershipFailsOnceSlotIsTakenOver(t *testing.T) {
 		t.Fatal(err)
 	}
 	var lost []string
-	reg.SetSlotLostHandler(func(slot int, owner [16]byte) { lost = append(lost, fmt.Sprintf("%d %x", slot, owner[:1])) })
+	reg.SetSlotLostHandler(func(loss SlotLoss) { lost = append(lost, fmt.Sprintf("%d %x", loss.Slot, loss.Owner[:1])) })
 
 	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: reg.LocalUUID(), RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Unix()}); err != nil {
 		t.Fatal(err)
