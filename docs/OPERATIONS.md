@@ -297,7 +297,7 @@ Lock slot reads and writes do not take the device's per-region I/O lock, so a no
 
 A read request sees each write request whole: up to MaxWrite, 1 MiB. Larger operations are several requests:
 
-- The kernel splits a `write()` larger than MaxWrite into several requests, and another node can read between them.
+- The kernel can send one `write()` as several requests: always when it is larger than MaxWrite, and sometimes when a page fault in the caller's buffer cuts a copy short. Another node can read between them, and this node's own `stat` can see the size in between.
 - Reads through the page cache come in requests of up to 1 MB, and the kernel keeps the pages it read. One `read()` can return pages this node cached before another node's write together with pages it fetched after it. The cached pages are dropped when this node next opens the file or refreshes its attributes, after `-attr-timeout` (1 second by default).
 - A read through the page cache that overlaps a write on the same node can return a mix of old and new data split at any byte, even inside an 8-byte word, as on ext4 or tmpfs: the kernel copies a page out to the reader while the write copies into it, and neither reaches GoClusterFS.
 - A read with `O_DIRECT`, or any read on a mount with `-direct-io`, skips the page cache: each `read()` of up to 1 MB is one request and never mixes two writes. `-direct-io` sends every read and write of file data to the filesystem, so small and repeated reads are slower, and a shared `mmap` of a file fails with `ENODEV`.
