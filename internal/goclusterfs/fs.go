@@ -3198,8 +3198,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 // Setattr sets file attributes (used for truncate, chmod, etc.).
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	ctx = detach(ctx)
-	size, resizing := in.GetSize()
-	if resizing {
+	if _, resizing := in.GetSize(); resizing {
 		unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeExclusive)
 		if err != nil {
 			log.Printf("[ERROR] Setattr inode %d: %v", f.inodeNum, err)
@@ -3207,6 +3206,12 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		}
 		defer unlockIO()
 	}
+	return f.setattrIOLocked(ctx, fh, in, out)
+}
+
+// setattrIOLocked is Setattr for a caller that holds the file's I/O lock when in changes the size.
+func (f *File) setattrIOLocked(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	size, resizing := in.GetSize()
 	for attempt := 0; ; attempt++ {
 		unlock := f.fs.lockInode(f.inodeNum)
 		errno, err := f.growTo(ctx, size, resizing)

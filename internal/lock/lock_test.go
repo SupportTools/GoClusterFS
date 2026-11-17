@@ -467,10 +467,15 @@ func TestStatsCountAcquiresThatGiveUp(t *testing.T) {
 			t.Fatalf("Acquire of a held lock: %v, want ErrLockTimeout", err)
 		}
 	}
-	if err := mgr1.Acquire(context.Background(), LockTypeFileIO, 0, LockModeExclusive); err != nil {
+	holder := NewOwner()
+	if err := mgr1.AcquireAs(context.Background(), holder, LockTypeFileIO, 0, LockModeExclusive); err != nil {
 		t.Fatal(err)
 	}
-	defer release(t, mgr1, LockTypeFileIO, 0)
+	defer func() {
+		if err := mgr1.ReleaseAs(holder, LockTypeFileIO, 0); err != nil {
+			t.Error(err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if err := mgr2.AcquireAs(ctx, NewOwner(), LockTypeFileIO, 0, LockModeShared); !errors.Is(err, ErrLockTimeout) {
