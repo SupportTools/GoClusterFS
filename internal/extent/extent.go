@@ -63,6 +63,7 @@ var (
 	ErrInvalidExtent     = errors.New("invalid extent")
 	ErrBlockNotAllocated = errors.New("block not allocated")
 	ErrCoWRequired       = errors.New("copy-on-write required for shared block")
+	ErrInlineTarget      = errors.New("symlink keeps its target where extents go")
 )
 
 // CoWResult contains the result of a copy-on-write operation.
@@ -173,6 +174,9 @@ func (m *Manager) LookupPhysical(ino *inode.Inode, logicalBlock uint64) (uint64,
 func (m *Manager) Insert(ctx context.Context, ino *inode.Inode, ext *Extent) error {
 	if ext.Length == 0 {
 		return ErrInvalidExtent
+	}
+	if ino.HasInlineTarget() {
+		return ErrInlineTarget
 	}
 	e, err := m.edit(ctx, ino)
 	if err != nil {

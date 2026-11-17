@@ -203,6 +203,8 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 		return applyInodeDelete(ctx, rctx, r, entry.Payload)
 	case TxnOpLinkDrop:
 		return applyLinkDrop(ctx, rctx, r, entry.Payload)
+	case TxnOpSymlinkTarget:
+		return applySymlinkTarget(ctx, rctx, r, entry.Payload)
 	case TxnOpDirAddEntry:
 		return applyDirAddEntry(ctx, rctx, r, entry.Payload)
 	case TxnOpDirRename:
@@ -294,6 +296,37 @@ func initCreated(ctx context.Context, rctx *RecoveryContext, ino *inode.Inode, p
 	}
 	ino.LinkCount = 2
 	return rctx.DirMgr.InitDirectory(ctx, ino, p.ParentInodeNum)
+}
+
+// applySymlinkTarget gives a symlink its target, only when replay created it in this transaction and nothing wrote it since.
+func applySymlinkTarget(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payload []byte) (bool, error) {
+	p, err := DeserializeSymlinkTarget(payload)
+	if err != nil {
+		return false, err
+	}
+	if !r.created[p.InodeNum] {
+		log.Printf("[Recovery] SymlinkTarget: replay did not create inode %d, skipping", p.InodeNum)
+		return false, nil
+	}
+	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+		if !ino.IsSymlink() || !r.unchanged(ino, 0) || ino.HasInlineTarget() {
+			return false, nil
+		}
+		if p.DiskBlock == 0 {
+			ino.SetInlineTarget(p.Target)
+			return true, nil
+		}
+		if _, _, err := rctx.ExtentMgr.Lookup(ino, 0); err == nil {
+			return false, nil
+		}
+		ext := &extent.Extent{PhysicalBlock: p.DiskBlock, Length: 1, Flags: extent.FlagAllocated}
+		if err := rctx.ExtentMgr.AddExtentForRecovery(ctx, ino, ext); err != nil {
+			return false, fmt.Errorf("failed to map symlink block: %w", err)
+		}
+		ino.Size = uint64(len(p.Target))
+		ino.AllocatedBlocks, ino.WrittenBlocks = 1, 1
+		return true, nil
+	})
 }
 
 // applyInodeUpdate updates an inode's metadata.

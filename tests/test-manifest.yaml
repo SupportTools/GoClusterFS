@@ -5053,3 +5053,121 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/orphans_test.go::TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose
+  # ===========================================================================
+  # SYMLINKS
+  # Inline targets of up to 92 bytes live in the inode's extent area; longer
+  # ones, up to 4095 bytes, in one data block.
+  # ===========================================================================
+
+  - id: inode-inline-symlink-target
+    name: Inline symlink target round trip
+    description: An inline target fills the extent area and decodes with no extents, so nothing reads target bytes as blocks
+    priority: go_only
+    environments:
+      go: internal/inode/inode_test.go::TestInlineSymlinkTargetRoundTrip
+
+  - id: inode-inline-target-flag-symlinks-only
+    name: Inline target flag only marks symlinks
+    description: A regular file with the inline-target bit set keeps its extents
+    priority: go_only
+    environments:
+      go: internal/inode/inode_test.go::TestInlineTargetFlagOnlyMarksSymlinks
+
+  - id: journal-symlink-target-payload
+    name: SymlinkTarget payload
+    description: A symlink target round trips through the journal, and one longer than PATH_MAX is refused
+    priority: go_only
+    environments:
+      go: internal/journal/reserve_test.go::TestSymlinkTargetPayload
+
+  - id: symlink-targets-read-back
+    name: Symlink targets read back
+    description: Targets of 1, 92, 93 and 4095 bytes read back exactly from the new node and a fresh lookup, with lstat showing mode, size and link count
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestSymlinkTargetsReadBack
+
+  - id: symlink-directory-listing
+    name: Symlinks in directory listings
+    description: Readdir lists a symlink with the symlink type, in a subdirectory too
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestSymlinkInDirectoryListing
+
+  - id: symlink-refusals
+    name: Symlink refusals
+    description: An empty or over-long target, an existing name, and a volume formatted before symlinks are refused with ENOENT, ENAMETOOLONG, EEXIST and EOPNOTSUPP
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestSymlinkRefusals
+
+  - id: symlink-unlink-frees-block
+    name: Unlinking a symlink frees its block
+    description: Unlinking a symlink frees its inode and, for a long target, its block; the old node reads as stale
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestUnlinkSymlinkFreesBlock
+
+  - id: symlink-setattr
+    name: Symlink setattr
+    description: lchown and lutimes change a symlink, chmod returns EOPNOTSUPP, truncate EINVAL, and a symlink node takes no xattrs
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestSymlinkSetattr
+
+  - id: symlink-replay-after-crash
+    name: Symlink replay after a crash
+    description: A crash after the commit or after the claim leaves a symlink that replay finishes with its full inline or block target
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestSymlinkReplayAfterCrash
+
+  - id: symlink-replay-reused-slot
+    name: Symlink replay skips a reused slot
+    description: Replay leaves a symlink's inode slot alone once another node took it, and adds no name
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestSymlinkReplaySkipsReusedSlot
+
+  - id: symlink-power-cut
+    name: Power cut during a symlink create
+    description: Power fails before each write of an inline and a block symlink create; the name is then missing or holds the whole target, and nothing leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestPowerCutDuringSymlink
+
+  - id: fsck-bad-symlinks
+    name: fsck reports bad symlinks
+    description: fsck reports a symlink with a bad link count, length, layout, padding or NUL in its target, and repair leaves it alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestFsckReportsBadSymlinks
+
+  - id: fsck-symlink-entry-types
+    name: fsck checks symlink entry types
+    description: fsck reports a symlink whose directory entry is not typed as one, and an entry typed as a symlink for another inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestFsckReportsSymlinkEntryTypes
+
+  - id: fsck-repair-unnamed-symlink
+    name: fsck repair frees an unnamed symlink
+    description: A symlink no directory names, as a crash between claim and name leaves, is freed by repair together with its block
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestFsckRepairFreesUnnamedSymlink
+
+  - id: symlink-unlink-with-peer
+    name: Unlinking a symlink with a peer mounted frees it at once
+    description: No node can hold a symlink open, so its last unlink frees it and its block at once instead of listing it as an orphan
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestUnlinkSymlinkWithPeerFreesAtOnce
+
+  - id: symlink-stale-node-after-reuse
+    name: A stale symlink node does not reach the next symlink in its slot
+    description: After a symlink is unlinked and another symlink takes its inode, readlink and lchown through the old node return ESTALE and leave the new link alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestStaleLinkNodeAfterSlotReuse
+

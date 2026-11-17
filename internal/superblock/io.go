@@ -266,7 +266,7 @@ func New(deviceSize int64, bytesPerInode uint64) *Superblock {
 	sb := &Superblock{
 		Version:       CurrentVersion,
 		FeatureFlags:  FeatureSparseFiles | FeatureLargeFiles,
-		RequiredFlags: RequiredJournal | RequiredTypedLockRecords,
+		RequiredFlags: RequiredJournal | RequiredTypedLockRecords | RequiredSymlinks,
 
 		// Geometry
 		BlockSize:     storage.DefaultBlockSize,  // 1MB

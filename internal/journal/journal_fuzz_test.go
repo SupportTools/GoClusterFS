@@ -93,6 +93,15 @@ func FuzzTxnRecord(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(reserveTxn)
+	link := NewTransaction(8, fuzzNode, 1)
+	if err := link.LogSymlinkTarget(&SymlinkTargetPayload{InodeNum: 9, DiskBlock: 40, Target: []byte("../lib/libfoo.so.1")}); err != nil {
+		f.Fatal(err)
+	}
+	linkTxn, err := link.Serialize()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(linkTxn)
 	f.Add(NewIntentCompletion(5).Serialize())
 	f.Add([]byte{})
 
@@ -251,6 +260,7 @@ func decodeAllPayloads(p []byte) {
 	_, _ = DeserializeSnapshotDelete(p)
 	_, _ = DeserializeRefCountUpdate(p)
 	_, _ = DeserializeBlockRuns(p)
+	_, _ = DeserializeSymlinkTarget(p)
 }
 
 func heapAllocBytes() uint64 {

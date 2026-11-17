@@ -132,6 +132,8 @@ type FS struct {
 	cacheMgr    *cache.Manager     // Inode cache for read optimization
 	journal     *journal.Journal   // Per-node journal for crash consistency (WAL)
 	reserve     *reserve.Manager   // this node's batch of data blocks; nil without a journal
+	symlinks    bool               // the volume was formatted with RequiredSymlinks
+	noSymlinks  sync.Once          // warns once that this volume cannot hold symlinks
 	trimMgr     *trim.Manager      // TRIM manager for batched block discards
 	sfbMgr      *sfb.Manager       // SFB manager for small file storage (optional)
 	refcountReg *refcount.Region   // Reference count table for CoW/snapshots (optional)
@@ -695,6 +697,9 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 	out.Attr.Ctime = uint64(childIno.Ctime / 1e9)
 	out.Attr.Ctimensec = uint32(childIno.Ctime % 1e9)
 
+	if childIno.IsSymlink() {
+		return f.linkNode(ctx, &f.Inode, childIno, out), 0
+	}
 	if fileType == dir.DT_DIR {
 		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0777))
 		out.Attr.Size = BlockSize
@@ -915,6 +920,15 @@ func (f *FS) owner(ctx context.Context) (uint32, uint32) {
 
 // logCreate commits the intent to create inode num with mode and to name it in directory parentNum.
 func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32, entryType journal.DirEntryType) (uint64, error) {
+	txn, err := f.createTxn(num, parentNum, name, mode, uid, gid, entryType, nil)
+	if err != nil {
+		return 0, err
+	}
+	return f.journal.Commit(txn)
+}
+
+// createTxn builds the transaction that creates inode num, with link's target when it is a symlink, and names it.
+func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid uint32, entryType journal.DirEntryType, link *journal.SymlinkTargetPayload) (*journal.Transaction, error) {
 	txn := f.journal.Begin()
 	err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 		InodeNum:       uint64(num),
@@ -925,6 +939,9 @@ func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32
 		NameHash:       hashString(name),
 		MetaGeneration: f.freeSlotGeneration(num),
 	})
+	if err == nil && link != nil {
+		err = txn.LogSymlinkTarget(link)
+	}
 	if err == nil {
 		err = txn.LogDirAddEntry(&journal.DirAddEntryPayload{
 			ParentInodeNum: uint64(parentNum),
@@ -935,9 +952,9 @@ func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32
 	}
 	if err != nil {
 		f.journal.Abort(txn)
-		return 0, err
+		return nil, err
 	}
-	return f.journal.Commit(txn)
+	return txn, nil
 }
 
 // announceDir caches directory num as it is on disk and tells other nodes it changed.
@@ -1353,6 +1370,9 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	out.Attr.Ctime = uint64(childIno.Ctime / 1e9)
 	out.Attr.Ctimensec = uint32(childIno.Ctime % 1e9)
 
+	if childIno.IsSymlink() {
+		return d.fs.linkNode(ctx, &d.Inode, childIno, out), 0
+	}
 	if fileType == dir.DT_DIR {
 		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0777))
 		out.Attr.Size = BlockSize // Directories have fixed size
@@ -1526,7 +1546,8 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	// Rmdir removes only empty directories, whose link count also counts their own "." entry.
 	willFreeInode := isDir
 	var live uint64
-	if !isDir && childIno.LinkCount == 1 {
+	// No node can hold a symlink open, so its last unlink frees it at once.
+	if !isDir && childIno.LinkCount == 1 && !childIno.IsSymlink() {
 		if live, err = d.fs.reserveOrphan(childIno); err != nil {
 			if errors.Is(err, errOrphansFull) {
 				log.Printf("[WARN] unlink %q: %v", name, err)

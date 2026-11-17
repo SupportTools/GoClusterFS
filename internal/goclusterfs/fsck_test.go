@@ -97,7 +97,9 @@ func openFormattedComponents(t *testing.T, path string) *FS {
 	inodeTbl.SetTreeFlusher(extentMgr)
 	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
-	return NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
+	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
+	fsys.SetSymlinks(sb.RequiredFlags&superblock.RequiredSymlinks != 0)
+	return fsys
 }
 
 // createFile adds a regular file to the root directory as Create does.
