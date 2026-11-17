@@ -1580,7 +1580,7 @@ scenarios:
 
   - id: fsck-online-release
     name: fsck releases a slot online only when nothing committed is lost
-    description: With node B mounted, -release-slot frees paused node A's slot after watching it unchanged, B then writes A's file, and A, resumed, stops at its write gate without its write landing; with committed transactions in a dead node's journal, -release-slot with -salvage or -discard-journal and a mount with -skip-recovery all refuse while B runs and name the steps to stop the cluster and run -repair
+    description: With node B mounted, -release-slot frees paused node A's slot after watching it unchanged, B then writes A's file, and A, resumed, stops on the slot loss without its write landing; with committed transactions in a dead node's journal, -release-slot with -salvage or -discard-journal and a mount with -skip-recovery all refuse while B runs and name the steps to stop the cluster and run -repair
     priority: high
     # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against real mounts.
     environments:

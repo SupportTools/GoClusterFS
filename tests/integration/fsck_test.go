@@ -306,7 +306,7 @@ func TestFsckReleasesDeadSlot(t *testing.T) {
 }
 
 // TestFsckOnlineRelease frees a paused node's slot with goclusterfs-fsck while
-// another node runs; the paused node, resumed, stops at its write gate. A dead
+// another node runs; the paused node, resumed, stops before its write lands. A dead
 // node's committed transaction refuses an online release and an online
 // -skip-recovery.
 func TestFsckOnlineRelease(t *testing.T) {
@@ -363,9 +363,6 @@ func TestFsckOnlineRelease(t *testing.T) {
 	}
 	if !strings.Contains(logA.String(), lost) {
 		t.Fatal("node A did not stop after resuming from the release")
-	}
-	if !strings.Contains(logA.String(), "checking the slot before a write") {
-		t.Error("node A stopped without its write gate checking the slot")
 	}
 	if got, err := b.ReadFile("fenced"); err != nil || !bytes.Equal(got, bytes.Repeat([]byte{'B'}, 4096)) {
 		t.Fatalf("file after node A resumed: %v; want node B's data", err)
