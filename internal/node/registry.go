@@ -370,7 +370,7 @@ func (r *Registry) checkLockLayouts() error {
 	}
 	differs := func(s *Slot) bool {
 		return s != nil && (s.State == NodeStateActive || s.State == NodeStateLeaving) && s.LockLayout != r.lockLayout &&
-			!(r.sameHost(s) && r.deadLocalOwner(s))
+			(!r.sameHost(s) || !r.deadLocalOwner(s))
 	}
 	var other []int
 	for i, s := range slots {
