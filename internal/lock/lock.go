@@ -82,7 +82,8 @@ const (
 	CacheGrace = 10 * time.Millisecond
 
 	// HoldTurn is how long a node keeps reusing a record it claimed from disk.
-	// After that it releases and yields the record when its last holder lets go.
+	// After that it releases and yields the record when its last holder lets
+	// go, unless the record shows no other node waiting for it.
 	HoldTurn = 250 * time.Millisecond
 
 	// YieldGap is how long a node waits before claiming a record it yielded, so
@@ -232,6 +233,7 @@ type heldRecord struct {
 	mode    LockMode
 	keys    int
 	since   time.Time // when this node claimed the record
+	turn    time.Time // when this node's current turn on the record began
 	renewed time.Time // when this node last wrote its slot
 	// cacheGen identifies the current cached period; keys == 0 means cached.
 	cacheGen uint64
@@ -489,12 +491,32 @@ func (m *Manager) LogStats() {
 // needs the same record. Once the hold's turn is over, that goroutine cannot
 // join it, and both wait until the timeout.
 func (m *Manager) Acquire(ctx context.Context, lockType LockType, resourceID uint64, mode LockMode) error {
+	return m.acquire(ctx, getGoroutineID(), lockType, resourceID, mode)
+}
+
+// Owner holds locks in place of a goroutine. NewOwner makes one.
+type Owner uint64
+
+var lastOwner atomic.Uint64
+
+// NewOwner returns an owner that no goroutine and no other owner uses.
+func NewOwner() Owner {
+	return Owner(1<<63 | lastOwner.Add(1))
+}
+
+// AcquireAs is Acquire for owner instead of the calling goroutine, which saves
+// reading the goroutine's ID from its stack: tens of microseconds on a deep
+// one. Lock order is checked among owner's locks only. Release with ReleaseAs.
+func (m *Manager) AcquireAs(ctx context.Context, owner Owner, lockType LockType, resourceID uint64, mode LockMode) error {
+	return m.acquire(ctx, uint64(owner), lockType, resourceID, mode)
+}
+
+func (m *Manager) acquire(ctx context.Context, gid uint64, lockType LockType, resourceID uint64, mode LockMode) error {
 	if int(lockType) >= numLockTypes {
 		return fmt.Errorf("lock: unknown lock type %d", lockType)
 	}
 	key := lockKey{Type: lockType, ResourceID: resourceID}
 	recordID := m.hashToRecord(lockType, resourceID)
-	gid := getGoroutineID()
 
 	m.mu.Lock()
 	if m.reuseHeldKeyLocked(key, mode, gid) {
@@ -613,6 +635,7 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
+	m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	if rec, ok := m.records[recordID]; ok && rec.keys == 0 && (!covers(rec.mode, mode) || age(rec.renewed) > m.timing.renewAfter) {
@@ -680,7 +703,8 @@ func (m *Manager) attemptAcquire(key lockKey, recordID uint64, mode LockMode, gi
 	m.countAcquire(key.Type, func(c *acquireCounts) *atomic.Uint64 { return &c.claimed })
 
 	m.mu.Lock()
-	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: time.Now(), renewed: written}
+	now := time.Now()
+	m.records[recordID] = &heldRecord{mode: mode, keys: 1, since: now, turn: now, renewed: written}
 	m.addHeldKeyLocked(key, recordID, mode, gid)
 	m.mu.Unlock()
 	return true, true, blocker{}, nil
@@ -694,12 +718,44 @@ func (m *Manager) giveUp(err error, lockType LockType, resourceID uint64, mode L
 	return fmt.Errorf("%w: %s", err, reason)
 }
 
-// turnOverLocked reports whether this node has had its turn on recordID: it has
-// held the record for holdTurn, or kept claiming it again for holdTurn since it
-// saw another node waiting.
+// turnOverLocked reports whether this node has had its turn on recordID: its
+// turn on the record lasted holdTurn, or it kept claiming the record again for
+// holdTurn since it saw another node waiting.
 func (m *Manager) turnOverLocked(recordID uint64, rec *heldRecord) bool {
 	seen, waited := m.contested[recordID]
-	return age(rec.since) > m.timing.holdTurn || waited && age(seen) > m.timing.holdTurn
+	return age(rec.turn) > m.timing.holdTurn || waited && age(seen) > m.timing.holdTurn
+}
+
+// renewIdleTurn starts a new turn on a record whose turn is over when its row
+// shows no other node waiting: no claim that conflicts with this node's hold
+// and no live mark. Giving the record up would only make this node wait
+// yieldGap. A node that starts waiting after the row read waits one more turn.
+// It runs under the record gate.
+func (m *Manager) renewIdleTurn(recordID uint64) {
+	m.mu.Lock()
+	rec, ok := m.records[recordID]
+	over := ok && m.turnOverLocked(recordID, rec)
+	ignore := -1
+	if a, ok := m.adopted[recordID]; ok {
+		ignore = a.slot
+	}
+	m.mu.Unlock()
+	if !over {
+		return
+	}
+	row, err := m.readRow(recordID)
+	if err != nil {
+		return
+	}
+	if conflict, _, _ := m.rowConflicts(recordID, row, rec.mode, ignore); conflict || m.othersWaiting(row) {
+		return
+	}
+	m.mu.Lock()
+	if m.records[recordID] == rec {
+		rec.turn = time.Now()
+		delete(m.contested, recordID)
+	}
+	m.mu.Unlock()
 }
 
 // endTurnLocked drops this node's hold on recordID, which the caller releases
@@ -773,8 +829,16 @@ func (m *Manager) recordGate(recordID uint64) *sync.Mutex {
 // With reference counting, this decrements the local count and only releases
 // the distributed lock when the last goroutine releases.
 func (m *Manager) Release(lockType LockType, resourceID uint64) error {
+	return m.release(getGoroutineID(), lockType, resourceID)
+}
+
+// ReleaseAs releases a lock AcquireAs took for owner.
+func (m *Manager) ReleaseAs(owner Owner, lockType LockType, resourceID uint64) error {
+	return m.release(uint64(owner), lockType, resourceID)
+}
+
+func (m *Manager) release(gid uint64, lockType LockType, resourceID uint64) error {
 	key := lockKey{Type: lockType, ResourceID: resourceID}
-	gid := getGoroutineID()
 
 	m.mu.Lock()
 	held, ok := m.heldLocks[key]
@@ -811,6 +875,7 @@ func (m *Manager) dropRecordKey(recordID uint64) error {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
+	m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
@@ -841,6 +906,7 @@ func (m *Manager) expireCached(recordID uint64, gen uint64) {
 	gate := m.recordGate(recordID)
 	gate.Lock()
 	defer gate.Unlock()
+	m.renewIdleTurn(recordID)
 
 	m.mu.Lock()
 	rec, ok := m.records[recordID]

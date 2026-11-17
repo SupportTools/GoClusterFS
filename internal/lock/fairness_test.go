@@ -113,3 +113,20 @@ func TestHolderYieldsOnlyToLiveWaiters(t *testing.T) {
 		})
 	}
 }
+
+func TestHolderKeepsRecordNobodyWaitsFor(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	m := newTestNode(dev, 0, 1<<20, 1)
+	m.timing.holdTurn = 20 * time.Millisecond
+	for deadline := time.Now().Add(10 * m.timing.holdTurn); time.Now().Before(deadline); {
+		requireAcquired(t, m, LockTypeInode, 3, LockModeShared)
+		time.Sleep(time.Millisecond)
+		release(t, m, LockTypeInode, 3)
+	}
+	for _, ts := range m.Stats().Types {
+		if ts.Name == "inode" && ts.Blocked > 0 {
+			t.Errorf("%d of %d acquires waited, though no other node wanted the record", ts.Blocked, ts.Acquires)
+		}
+	}
+}

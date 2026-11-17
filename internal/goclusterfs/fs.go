@@ -415,12 +415,15 @@ func (f *FS) lockFileIO(ctx context.Context, num uint32, mode lock.LockMode) (fu
 	if f.lockMgr == nil {
 		return unlockLocal, nil
 	}
-	if err := f.lockMgr.Acquire(ctx, lock.LockTypeFileIO, uint64(num), mode); err != nil {
+	owner := lock.NewOwner()
+	if err := f.lockMgr.AcquireAs(ctx, owner, lock.LockTypeFileIO, uint64(num), mode); err != nil {
 		unlockLocal()
 		return nil, err
 	}
 	return func() {
-		f.release(lock.LockTypeFileIO, uint64(num), "file I/O")
+		if err := f.lockMgr.ReleaseAs(owner, lock.LockTypeFileIO, uint64(num)); err != nil {
+			log.Printf("[WARN] releasing the file I/O lock on inode %d failed: %v", num, err)
+		}
 		unlockLocal()
 	}, nil
 }
