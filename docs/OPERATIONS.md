@@ -458,7 +458,7 @@ goclusterfs-mount -device /dev/device -mount /mnt/cluster
 
 ## Health Checks
 
-`gfsctl health` and `GET /health` only show that the mount's API answers; they check nothing else yet. Use the script below to check the filesystem itself.
+`gfsctl health` and `GET /health` report the mount's device, journal, peer replays, broadcast and heartbeat: see [HTTP API Health](API-CONFIG.md#http-api-health-and-shutdown). They do not read or write files. Use the script below to check the filesystem itself.
 
 ### Quick Health Check Script
 
@@ -610,7 +610,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 **HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`) it also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
 
 - To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
-- `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
+- `/health` and `/metrics` never need the token, on purpose: load balancers, probes and Prometheus can read them without a secret. Anyone who can reach the port can read them too. They show no file names or data, but `/health` messages name peers' hostnames and registry slot numbers.
 - Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.

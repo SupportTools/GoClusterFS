@@ -1970,6 +1970,34 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotWithoutBirthIsOrphan
 
+  - id: metrics-for-operators
+    name: Metrics for operators
+    description: /metrics exports lock give-ups by type, this node's heartbeat age, peer journal replays by result and running, the mount's own replay, and registered nodes by state
+    priority: go_only
+    environments:
+      go: internal/api/metrics_ops_test.go::TestMetricsForOperators
+
+  - id: metrics-count-api-responses
+    name: Metrics count API responses
+    description: goclusterfs_api_requests_total counts responses by route and status code, including 401s and the rate limiter's 429s
+    priority: go_only
+    environments:
+      go: internal/api/metrics_ops_test.go::TestMetricsCountAPIResponses
+
+  - id: lock-stats-count-give-ups
+    name: Lock stats count acquires that give up
+    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire
+    priority: go_only
+    environments:
+      go: internal/lock/lock_test.go::TestStatsCountAcquiresThatGiveUp
+
+  - id: registry-stats-replays-heartbeat
+    name: Registry reports replays and heartbeat age
+    description: The registry counts replays of crashed nodes' journals that succeeded and failed, lists replays in progress, and reports how long ago its own heartbeat landed
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestStatsCountReplaysAndHeartbeatAge
+
   - id: api-lookup-file
     name: API path lookup inside the filesystem
     description: The API finds a file by walking directories in the filesystem, without the kernel, and refuses a symlink anywhere on the path, a directory, a non-directory in the middle, a missing name and an unclean path
