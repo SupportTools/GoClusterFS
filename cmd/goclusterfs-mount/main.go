@@ -560,6 +560,7 @@ func main() {
 	if err != nil {
 		failf("Failed to mount at %s: %v. Check that /dev/fuse exists, fusermount3 is installed, and nothing else is mounted there (fusermount3 -u %s)", *mountPoint, err, *mountPoint)
 	}
+	gfs.MarkMounted()
 
 	// Start API server for management and monitoring
 	var apiServer *api.Server
@@ -585,11 +586,7 @@ func main() {
 				broadcastProblem: cacheMgr.BroadcastProblem,
 				silentPeers:      cacheMgr.SilentBroadcastPeers,
 			})
-			var snaps fileops.Snapshots
-			if gfs.SnapshotRegistry() != nil {
-				snaps = gfs
-			}
-			apiServer.SetFileService(fileops.New(*mountPoint, snaps))
+			apiServer.SetFileService(fileops.New(gfs))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start the API server: %v; the mount continues without it. Choose a free -api-addr, or pass -api=false", err)
@@ -626,8 +623,7 @@ func main() {
 		sampler.Stop()
 	}
 
-	// The API stops before the unmount: its snapshot and clone requests go
-	// through the mount, and the unmount fails while they hold files open.
+	// The API stops before the unmount, so no snapshot or clone request runs while the filesystem shuts down.
 	var unmounted atomic.Bool
 	// The watch runs from the signal, or from an unmount another tool started, to the exit.
 	watch := &goclusterfs.ShutdownWatch{Limit: 8 * time.Second}
