@@ -50,7 +50,11 @@ func runPreflight(w io.Writer, cfg preflightConfig) int {
 	}
 	checks = append(checks, checkBroadcast(cfg.network)...)
 	checks = append(checks, checkAPIAddr(cfg.apiAddr))
-	checks = append(checks, checkNodePorts(cfg.network, cfg.apiAddr, cfg.kubeNode()))
+	kubeNode := ""
+	if cfg.kubeNode != nil {
+		kubeNode = cfg.kubeNode()
+	}
+	checks = append(checks, checkNodePorts(cfg.network, cfg.apiAddr, kubeNode))
 
 	failed, warned := 0, 0
 	for _, c := range checks {

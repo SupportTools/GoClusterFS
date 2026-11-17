@@ -94,7 +94,7 @@ func TestPreflightNamesAFixForEachFailure(t *testing.T) {
 		"FAIL  fusermount", "fix: install fuse3",
 		"FAIL  mount point", "fix: mkdir -p " + missing,
 		"FAIL  device", "fix: check the path",
-		"4 of 6 checks failed",
+		"4 of 7 checks failed",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q:\n%s", want, out)
