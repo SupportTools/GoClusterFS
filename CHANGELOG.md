@@ -88,6 +88,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The HTTP API answered a path no endpoint matched, such as `/api/v1%2F` with an escaped slash, with a plain-text 404. It now answers with the same JSON error body as every other API error.
 - `goclusterfs-fsck` never checked a directory's `.` entry. It now reports a missing `.` or one that names another inode, with both inode numbers. `-repair` points a wrong `.` back at the directory and a wrong `..` at the directory that names it, found by walking the names down from the root, for example after a crash in the middle of a rename that moves a directory.
 - A power failure or an I/O error during mkdir or rmdir could leave the parent directory's link count off by one: the entry and the count were written under separate locks, and replay did not fix the count. Both now change in one write of the parent's inode. Replay, or the failed mkdir or rmdir itself, then sets the parent's count from its subdirectories.
 - `goclusterfs-fsck` checked a directory entry's type only when the entry's inode number was below the count of inodes in use, and then only that the type was a valid value. It now reports every entry whose type differs from its inode's, which lookup, unlink and rmdir trust: an unlink could remove a directory that its entry calls a file. It also reports an entry whose inode number is past the inode table; before, a number past 2^32 wrapped and could pass as an inode in use.

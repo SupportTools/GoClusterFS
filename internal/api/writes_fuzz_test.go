@@ -112,7 +112,7 @@ func FuzzWriteRequests(f *testing.F) {
 			t.Fatalf("status %d", rec.Code)
 		}
 		redirect := rec.Code >= 300 && rec.Code < 400
-		if strings.HasPrefix(req.URL.Path, "/api/v1/") && !redirect && req.Method != http.MethodHead && rec.Body.Len() > 0 && !json.Valid(rec.Body.Bytes()) {
+		if req.URL.Path != "/metrics" && !redirect && req.Method != http.MethodHead && rec.Body.Len() > 0 && !json.Valid(rec.Body.Bytes()) {
 			t.Fatalf("%s %s answered %d with a body that is not JSON: %q", req.Method, target, rec.Code, rec.Body.String())
 		}
 		if len(services.calls) == 0 {
