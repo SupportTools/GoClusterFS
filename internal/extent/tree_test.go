@@ -33,7 +33,7 @@ type treeEnv struct {
 // shrinks both leaf and index capacity so tests reach splits quickly.
 func newTreeEnv(t *testing.T, nodeCap int) *treeEnv {
 	t.Helper()
-	dev, cleanup := createTestDevice(t, 8<<20)
+	dev, cleanup := createTestDevice(t, treeTestDataOffset+treeTestBlocks*BlockSize)
 	t.Cleanup(cleanup)
 	var uuid [16]byte
 	env := &treeEnv{
