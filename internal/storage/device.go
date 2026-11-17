@@ -345,7 +345,6 @@ func (d *Device) Fd() uintptr {
 	return d.file.Fd()
 }
 
-// validateAlignment checks that buffer and offset meet O_DIRECT requirements.
 // checkRange refuses n bytes at offset unless they fit inside the device; offsets come from on-disk numbers, which
 // damage can make negative or past the end.
 func (d *Device) checkRange(offset int64, n int) error {
@@ -355,6 +354,7 @@ func (d *Device) checkRange(offset int64, n int) error {
 	return nil
 }
 
+// validateAlignment checks that buffer and offset meet O_DIRECT requirements.
 func validateAlignment(buf []byte, offset int64) error {
 	if offset%SectorSize != 0 {
 		return fmt.Errorf("offset %d is not aligned to sector size %d", offset, SectorSize)
