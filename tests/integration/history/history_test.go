@@ -262,6 +262,15 @@ func TestRenamedAwayNameSeesOnlyTheMovedFile(t *testing.T) {
 	expect(t, b, "stale or unknown value")
 }
 
+func TestRenamingNodeNeverSeesTheMovedFileThroughTheOldName(t *testing.T) {
+	b := &builder{}
+	b.write("a", 1, 0, 10)
+	b.add(Op{Kind: Rename, Name: "a", To: "b", Node: 1}, 2000, 2010)
+	b.add(Op{Kind: Write, Name: "b", Value: 2, Node: 2}, 2100, 2110)
+	b.read("a", 2, 2200, 2210)
+	expect(t, b, "stale or unknown value")
+}
+
 func TestRenamedAwayNameNeverSeesTheReplacedFile(t *testing.T) {
 	b := &builder{}
 	b.write("n0", 1, 0, 10)
@@ -276,7 +285,7 @@ func TestRenamedAwayNameNeverSeesTheReplacedFile(t *testing.T) {
 func TestWriteNearARenameMayLandInEitherName(t *testing.T) {
 	b := &builder{}
 	b.write("a", 1, 0, 10)
-	b.add(Op{Kind: Rename, Name: "a", To: "b"}, 2000, 2010)
+	b.add(Op{Kind: Rename, Name: "a", To: "b", Node: 2}, 2000, 2010)
 	b.write("b", 2, 2100, 2110)
 	b.write("a", 3, 2900, 2950)
 	b.read("b", 3, 4000, 4010)

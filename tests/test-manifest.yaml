@@ -5006,6 +5006,13 @@ scenarios:
     environments:
       go: history/history_test.go::TestRenamedAwayNameSeesOnlyTheMovedFile
 
+  - id: history-checker-renaming-node
+    name: Coherence checker gives the renaming node no stale entry for the old name
+    description: The node that ran a rename has its own cached entry moved, so a read of the old name there that shows the moved file's data is a violation
+    priority: go_only
+    environments:
+      go: history/history_test.go::TestRenamingNodeNeverSeesTheMovedFileThroughTheOldName
+
   - id: history-checker-rename-not-replaced-file
     name: Coherence checker never lets a renamed-away name show the file the rename replaced
     description: After a rename over an existing file, a read of the old name inside the cache window that shows the replaced file's data is a violation; one that shows a write through the new name after the rename passes
