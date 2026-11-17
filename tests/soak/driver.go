@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -201,6 +202,7 @@ func (d *driver) call(n *node, req request) (response, error) {
 func (d *driver) comparePath(n *node, p string) error {
 	d.model.mu.Lock()
 	f, isDir := d.model.Files[p], d.model.Dirs[p]
+	target, isLink := d.model.Links[p]
 	var size int64
 	var want string
 	if f != nil {
@@ -223,6 +225,15 @@ func (d *driver) comparePath(n *node, p string) error {
 		}
 		if resp.Errno != 0 {
 			return fmt.Errorf("%s: list errno %d (%s), want a directory", p, resp.Errno, resp.Err)
+		}
+	case isLink:
+		// Reading would follow the link, so look for it in its directory's listing.
+		resp, err := d.call(n, request{Op: "list", Path: path.Dir(p)})
+		if err != nil {
+			return err
+		}
+		if want := "l:" + path.Base(p) + ":" + target; resp.Errno != 0 || !slices.Contains(resp.Names, want) {
+			return fmt.Errorf("%s: parent lists %v (errno %d), want %s", p, resp.Names, resp.Errno, want)
 		}
 	default:
 		resp, err := d.call(n, request{Op: "read", Path: p})
@@ -390,7 +401,7 @@ func (d *driver) check(op *Op) {
 		d.model.mu.Unlock()
 	}
 	paths := []string{op.Path}
-	if op.Path2 != "" {
+	if op.Path2 != "" && op.Kind != "symlink" {
 		paths = append(paths, op.Path2)
 	}
 	for _, m := range d.upNodes() {
