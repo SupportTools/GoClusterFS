@@ -29,6 +29,16 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			s.broadcastOn = false
 			return s
 		}(), want: api.HealthStatusOK, code: http.StatusOK},
+		{name: "heartbeats late", src: func() healthSources {
+			s := fineSources()
+			s.heartbeatAge = func() time.Duration { return 3 * time.Second }
+			return s
+		}(), want: api.HealthStatusDegraded, code: http.StatusOK, problem: "heartbeat"},
+		{name: "not registered yet", src: func() healthSources {
+			s := fineSources()
+			s.heartbeatAge = func() time.Duration { return 0 }
+			return s
+		}(), want: api.HealthStatusOK, code: http.StatusOK},
 		{name: "replaying a crashed peer", src: func() healthSources {
 			s := fineSources()
 			s.replaying = func() []int { return []int{3, 7} }
@@ -74,8 +84,8 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if resp.Status != tt.want {
 				t.Errorf("status = %s, want %s: %+v", resp.Status, tt.want, resp.Checks)
 			}
-			if len(resp.Checks) != 5 {
-				t.Errorf("checks = %v, want device, journal, recovery, broadcast and broadcast-peers", resp.Checks)
+			if len(resp.Checks) != 6 {
+				t.Errorf("checks = %v, want device, journal, recovery, broadcast, broadcast-peers and heartbeat", resp.Checks)
 			}
 			for name, check := range resp.Checks {
 				if (name == tt.problem) != (check.Status != api.HealthStatusOK) {
@@ -106,6 +116,9 @@ func TestHealthMessagesNameTheSlotsAndTheError(t *testing.T) {
 	if msg := recoveryHealth([]int{3, 7}).Message; !strings.Contains(msg, "slot 3, 7") {
 		t.Errorf("recovery message = %q", msg)
 	}
+	if msg := heartbeatHealth(3200 * time.Millisecond).Message; !strings.Contains(msg, "3.2s ago") || !strings.Contains(msg, "at 5s this node stops") {
+		t.Errorf("heartbeat message = %q", msg)
+	}
 	if msg := deviceHealth(errors.New("input/output error")).Message; !strings.Contains(msg, "input/output error") || !strings.Contains(msg, "goclusterfs-fsck") {
 		t.Errorf("device message = %q", msg)
 	}
@@ -125,5 +138,6 @@ func fineSources() healthSources {
 		broadcastOn:      true,
 		broadcastProblem: func() string { return "" },
 		silentPeers:      func() ([]string, time.Duration) { return nil, 90 * time.Second },
+		heartbeatAge:     func() time.Duration { return 800 * time.Millisecond },
 	}
 }

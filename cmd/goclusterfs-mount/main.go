@@ -340,6 +340,7 @@ func main() {
 	// -skip-recovery names the slot whose journal the operator chose to discard;
 	// a mount that takes any other slot replays that slot's journal.
 	skip := *skipRecovery >= 0 && *skipRecovery == slotIdx
+	var mountReplay stats.MountReplay
 	if *skipRecovery >= 0 && !skip {
 		log.Printf("Journal: ignoring -skip-recovery=%d: this mount took slot %d, so it replays that slot's journal", *skipRecovery, slotIdx)
 	}
@@ -373,10 +374,12 @@ func main() {
 			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}
 		if result != nil && result.WasNeeded {
+			mountReplay.Transactions = result.Stats.TxnCommitted
 			log.Printf("Journal recovery: replayed %d committed transactions (%d bytes scanned) from crashed node %x",
 				result.Stats.TxnCommitted, result.Stats.BytesScanned, result.NodeUUID[:8])
 		}
 	} else if skip {
+		mountReplay.Discarded = true
 		log.Printf("Journal: WARNING - discarding the journal of slot %d (-skip-recovery)", slotIdx)
 	}
 	releasePrevious(true)
@@ -463,6 +466,9 @@ func main() {
 	// Create filesystem with journal, TRIM, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nil, refcountReg, lockMgr, nodeUUID, dataOffset)
 	gfs.SetSymlinks(sb.RequiredFlags&superblock.RequiredSymlinks != 0)
+	gfs.SetFailStop(func(err error) {
+		failf("[ERROR] Stopping this node and keeping its locks: %v. A peer replays this node's journal and finishes the rename, or the next mount here does", err)
+	})
 	var res *reserve.Manager
 	if j != nil && *blockReserve > 0 {
 		res = reserve.New(reserve.Config{Size: *blockReserve}, bm, j, extentMgr.ReleaseBlocks, func() int {
@@ -578,7 +584,7 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Failed to create the API server: %v; the mount continues without it", err)
 		} else {
-			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res))
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res, mountReplay))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
@@ -592,6 +598,7 @@ func main() {
 				broadcastOn:      cacheMgr.BroadcastEnabled(),
 				broadcastProblem: cacheMgr.BroadcastProblem,
 				silentPeers:      cacheMgr.SilentBroadcastPeers,
+				heartbeatAge:     func() time.Duration { return nodeReg.Stats().HeartbeatAge },
 			})
 			apiServer.SetFileService(fileops.New(gfs))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
@@ -726,8 +733,8 @@ func usageFailf(format string, args ...any) {
 	os.Exit(cli.ExitUsage)
 }
 
-func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager) stats.Sources {
-	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize}
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager, mountReplay stats.MountReplay) stats.Sources {
+	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize, MountReplay: mountReplay}
 	if res != nil {
 		src.Reserve = res
 	}

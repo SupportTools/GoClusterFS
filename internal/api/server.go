@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // listen opens the server's socket; tests replace it.
@@ -38,6 +40,8 @@ type Server struct {
 
 	// Prometheus metrics handler (lazily initialized)
 	metricsHandler http.Handler
+	// apiRequests counts responses by route and status code, refusals by the rate limiter included.
+	apiRequests *prometheus.CounterVec
 
 	// Services behind the write endpoints (optional)
 	fileService  FileService
@@ -67,6 +71,12 @@ func NewServer(cfg Config) (*Server, error) {
 	s := &Server{
 		config: cfg,
 		router: http.NewServeMux(),
+		apiRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: "api",
+			Name:      "requests_total",
+			Help:      "API responses by route and HTTP status code; 4xx and 5xx are errors",
+		}, []string{"route", "code"}),
 	}
 
 	// Create rate limiter if enabled
@@ -84,7 +94,7 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.Dashboard != nil {
 		exempt = append(exempt, "/ui/")
 	}
-	middlewares := []Middleware{RateLimitMiddleware(s.rateLimiter, exempt...), LoggingMiddleware}
+	middlewares := []Middleware{s.countRequests, RateLimitMiddleware(s.rateLimiter, exempt...), LoggingMiddleware}
 	if cfg.AuthToken == "" && cfg.LoopbackOnly() {
 		middlewares = append(middlewares, LoopbackHostMiddleware)
 	}

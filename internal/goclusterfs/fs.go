@@ -8,7 +8,6 @@ package goclusterfs
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -150,6 +149,7 @@ type FS struct {
 	// Configuration
 	nodeUUID   [16]byte
 	dataOffset uint64 // Offset where data blocks start on disk
+	failStop   func(error)
 
 	// Runtime state
 	uid uint32
@@ -336,6 +336,11 @@ func (f *FS) SetReserve(r *reserve.Manager) {
 	if f.journal != nil {
 		f.reserve = r
 	}
+}
+
+// SetFailStop sets what stops this node when an operation cannot finish and must not let go of its locks.
+func (f *FS) SetFailStop(fn func(error)) {
+	f.failStop = fn
 }
 
 // Close closes the filesystem and releases resources.
@@ -2113,12 +2118,24 @@ func retryOnTreeConflict(err error) error {
 	return err
 }
 
-func (f *FS) zeroBlock(physBlock uint64) error {
-	buf := storage.GetBuffer(BlockSize)
+// zeroRange zeroes bytes [from, to) of a data block; both are multiples of the sector size.
+func (f *FS) zeroRange(physBlock, from, to uint64) error {
+	if to <= from {
+		return nil
+	}
+	buf := storage.GetBuffer(int(to - from))
 	defer storage.PutBuffer(buf)
 	clear(buf.Bytes())
-	_, err := f.dev.WriteAt(buf.Bytes(), int64(f.dataOffset+physBlock*BlockSize))
+	_, err := f.dev.WriteAt(buf.Bytes()[:to-from], int64(f.dataOffset+physBlock*BlockSize+from))
 	return err
+}
+
+// alignSector rounds n to a sector boundary, up or down.
+func alignSector(n uint64, up bool) uint64 {
+	if up {
+		n += storage.SectorSize - 1
+	}
+	return n &^ (storage.SectorSize - 1)
 }
 
 // testHookBeforeInodeCommit, when set by a test, runs before writeInternal's final
@@ -2223,6 +2240,9 @@ func (f *File) allocateBlockLocked(ctx context.Context, ino *inode.Inode, blockN
 // Returns errRetryWrite if a concurrent modification is detected and the caller should retry.
 func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (int, error) {
 	bytesWritten := 0
+	requested, writeStart := len(data), offset
+	// writtenEnd is the end of the data this write has put on disk so far; oldEnd is the file's size it started from.
+	writtenEnd, oldEnd := uint64(0), uint64(0)
 
 	// Track if we hold the inode lock
 	lockHeld := false
@@ -2314,6 +2334,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if !lockHeld || f.fs.lockMgr == nil {
 			return nil
 		}
+		// Once the lock drops, another node's growth may zero the rest of the block the file ended in. Cover what
+		// this write put there; a write that started at a block boundary stays invisible until it completes.
+		if oldEnd%BlockSize != 0 && writtenEnd > ino.Size {
+			ino.Size = min(writtenEnd, (oldEnd/BlockSize+1)*BlockSize)
+			inoDirty = true
+		}
 		if inoDirty {
 			if err := logReserveUse(); err != nil {
 				releaseInodeLock()
@@ -2369,8 +2395,34 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}
 
+	// A write that grows the file holds the inode lock exclusively from its first data write through its size update,
+	// so another node's growth cannot zero bytes this write put past the end before its size covers them.
+	if f.fs.lockMgr != nil && offset+uint64(len(data)) > ino.Size {
+		if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeExclusive); err != nil {
+			logging.Debugf("Write inode %d: failed to acquire inode lock to grow the file: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+		lockHeld = true
+		if ino, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
+			return 0, syscall.EIO
+		}
+	}
+	oldEnd = ino.Size
+	segments, err := f.growthSegments(ino, data, offset)
+	if err != nil {
+		return 0, err
+	}
+	offset, data = segments[0].off, segments[0].data
+
 	// Regular extent-based write path
-	for bytesWritten < len(data) {
+	for {
+		if bytesWritten == len(data) {
+			if segments = segments[1:]; len(segments) == 0 {
+				break
+			}
+			offset, data, bytesWritten = segments[0].off, segments[0].data, 0
+			continue
+		}
 		blockNum := offset / BlockSize
 		blockOffset := offset % BlockSize
 		zeroFirst := false
@@ -2664,9 +2716,16 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			duringInPlaceWrite()
 		}
 
-		// The rest of a block first written here would otherwise expose old disk contents.
+		// A block first written here keeps its old disk contents outside the write. Zero what lies below the end of
+		// the file; growing the file later zeroes the rest.
 		if zeroFirst {
-			if err := f.fs.zeroBlock(physBlock); err != nil {
+			blockStart := blockNum * BlockSize
+			below := min(BlockSize, max(ino.Size, blockStart)-blockStart)
+			err := f.fs.zeroRange(physBlock, 0, alignSector(blockOffset, true))
+			if from := alignSector(blockOffset+uint64(toWrite), false); err == nil && below > from {
+				err = f.fs.zeroRange(physBlock, from, alignSector(below, true))
+			}
+			if err != nil {
 				logging.Debugf("Write inode %d: zeroing block %d failed: %v", f.inodeNum, physBlock, err)
 				if extentLockHeld {
 					f.fs.release(lock.LockTypeExtent, physBlock, "block")
@@ -2728,6 +2787,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		bytesWritten += toWrite
 		offset += uint64(toWrite)
+		writtenEnd = offset
 	}
 
 	// Update inode size if extended
@@ -2756,6 +2816,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		logging.Debugf("Write inode %d: re-read inode failed: %v", f.inodeNum, err)
 		return 0, syscall.EIO
 	}
+	onDisk := freshIno.Size
 	// ino was read before the lock, so it can miss another node's extents.
 	if acquiredLockForSize {
 		ino = freshIno
@@ -2896,6 +2957,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		return errRetryWrite
 	}
 
+	// A peer resized the file after growthSegments chose what to zero; the retry zeroes from the new size.
+	if onDisk < writeStart && onDisk != oldEnd && onDisk%BlockSize != 0 {
+		return 0, writeFailed(fmt.Errorf("%w: inode %d is %d bytes, not %d as the write planned", extent.ErrTreeConflict, f.inodeNum, onDisk, oldEnd))
+	}
+
 	if testHookBeforeInodeCommit != nil {
 		if err := testHookBeforeInodeCommit(); err != nil {
 			return 0, writeFailed(err)
@@ -2939,7 +3005,37 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}
 
-	return bytesWritten, nil
+	return requested, nil
+}
+
+type writeSegment struct {
+	off  uint64
+	data []byte
+}
+
+// growthSegments returns what a write must put on disk. Past the end of the file, the rest of its last block may hold
+// old bytes, from before a truncate or a disk block's earlier owner; a write that grows the file over them zeroes them
+// first, through the same path, so a block shared with a snapshot or clone is copied rather than changed.
+func (f *File) growthSegments(ino *inode.Inode, data []byte, offset uint64) ([]writeSegment, error) {
+	end := ino.Size
+	if offset <= end || end%BlockSize == 0 || ino.IsSFBBacked() {
+		return []writeSegment{{offset, data}}, nil
+	}
+	ext, _, err := f.fs.extentMgr.Lookup(ino, end/BlockSize)
+	switch {
+	case errors.Is(err, extent.ErrStaleTree):
+		return nil, errRetryWrite
+	case errors.Is(err, extent.ErrExtentNotFound), err == nil && ext.Flags&extent.FlagUnwritten != 0:
+		return []writeSegment{{offset, data}}, nil
+	case err != nil:
+		return nil, syscall.EIO
+	}
+	gapEnd := min(offset, (end/BlockSize+1)*BlockSize)
+	zeros := make([]byte, gapEnd-end)
+	if gapEnd == offset {
+		return []writeSegment{{end, append(zeros, data...)}}, nil
+	}
+	return []writeSegment{{end, zeros}, {offset, data}}, nil
 }
 
 // sfbSlotOffset returns the disk offset of an SFB-backed inode's data. SFB
@@ -3112,16 +3208,10 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		defer unlockIO()
 	}
 	for attempt := 0; ; attempt++ {
-		// Holding the inode lock from the zeroing through the size change keeps this node's writes out between them.
 		unlock := f.fs.lockInode(f.inodeNum)
-		var zeroedAt uint64
-		var errno syscall.Errno
-		var err error
-		if resizing {
-			zeroedAt, errno, err = f.zeroPastEnd(ctx, size)
-		}
+		errno, err := f.growTo(ctx, size, resizing)
 		if err == nil && errno == 0 {
-			errno, err = f.setattr(ctx, fh, in, out, zeroedAt)
+			errno, err = f.setattr(ctx, fh, in, out)
 		}
 		unlock()
 		if err == nil {
@@ -3134,49 +3224,31 @@ func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 }
 
-// zeroPastEnd zeroes the bytes a shrink to size leaves in its last block, before the size changes, so growing the
-// file later reads zeros there instead of the old data. It writes through Write, which copies a shared block first.
-// It returns the MetaGeneration its decision rests on, or 0 when no shrink into a block needs it; setattr starts over
-// if the inode changed since. The caller holds the inode lock.
-func (f *File) zeroPastEnd(ctx context.Context, size uint64) (uint64, syscall.Errno, error) {
-	f.fs.invalidateInode(f.inodeNum)
+// growTo grows the file to size, if that is larger, as an empty write at size: it zeroes the old bytes the rest of
+// the last block may hold before the size covers them. The caller holds the inode lock.
+func (f *File) growTo(ctx context.Context, size uint64, resizing bool) (syscall.Errno, error) {
+	if !resizing {
+		return 0, nil
+	}
 	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
-		return 0, syscall.EIO, nil
+		return syscall.EIO, nil
 	}
-	end := min(ino.Size, (size/BlockSize+1)*BlockSize)
-	if size%BlockSize == 0 || size >= end {
-		return 0, 0, nil
+	if size <= ino.Size {
+		return 0, nil
 	}
-	if ino.IsSFBBacked() {
-		return ino.MetaGeneration, 0, nil
+	if _, err := f.writeInternal(ctx, nil, size); err != nil {
+		if err == errRetryWrite {
+			return 0, err
+		}
+		return errToErrno(err), nil
 	}
-	ext, _, err := f.fs.extentMgr.Lookup(ino, size/BlockSize)
-	switch {
-	case errors.Is(err, extent.ErrStaleTree):
-		return 0, 0, errRetryWrite
-	case errors.Is(err, extent.ErrExtentNotFound), err == nil && ext.Flags&extent.FlagUnwritten != 0:
-		return ino.MetaGeneration, 0, nil
-	case err != nil:
-		return 0, syscall.EIO, nil
-	}
-	n, err := f.writeInternal(ctx, make([]byte, end-size), size)
-	if err == errRetryWrite {
-		return 0, 0, err
-	}
-	if err != nil || uint64(n) != end-size {
-		return 0, cmp.Or(errToErrno(err), syscall.EIO), nil
-	}
-	f.fs.invalidateInode(f.inodeNum)
-	if ino, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
-		return 0, syscall.EIO, nil
-	}
-	return ino.MetaGeneration, 0, nil
+	return 0, nil
 }
 
 // setattr applies one Setattr attempt. A non-nil error means another node
 // changed the inode's extent tree first and the attempt should be redone.
-func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut, zeroedAt uint64) (syscall.Errno, error) {
+func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) (syscall.Errno, error) {
 	// Invalidate cache before modifying - ensures we read fresh data
 	f.fs.invalidateInode(f.inodeNum)
 
@@ -3204,10 +3276,6 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		}
 	}
 	readGen := ino.MetaGeneration
-	// Another change since zeroPastEnd looked, such as an SFB migration, may have mapped bytes past the new end again.
-	if zeroedAt != 0 && readGen != zeroedAt {
-		return 0, errRetryWrite
-	}
 
 	now := time.Now().UnixNano()
 
@@ -3398,7 +3466,10 @@ func (f *File) Allocate(ctx context.Context, fh fs.FileHandle, off uint64, size 
 
 	for attempt := 0; ; attempt++ {
 		unlock := f.fs.lockInode(f.inodeNum)
-		errno, err := f.allocate(ctx, off, size, mode)
+		errno, err := f.growTo(ctx, off+size, mode == 0)
+		if err == nil && errno == 0 {
+			errno, err = f.allocate(ctx, off, size, mode)
+		}
 		unlock()
 		if err == nil {
 			return errno

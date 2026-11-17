@@ -34,6 +34,8 @@ type MountedFS struct {
 
 	// portArgs give the node its own broadcast and API ports; ExtraArgs come after and win.
 	portArgs []string
+	tail     *logTail
+	watchdog *watchdog
 }
 
 // freeUDPPorts returns n distinct UDP ports that were free on all interfaces.
@@ -225,10 +227,13 @@ func (m *MountedFS) Format() error {
 }
 
 func (m *MountedFS) output() io.Writer {
-	if m.Log == nil {
-		return os.Stdout
+	if m.tail == nil {
+		m.tail = &logTail{}
 	}
-	return io.MultiWriter(os.Stdout, m.Log)
+	if m.Log == nil {
+		return io.MultiWriter(m.tail, os.Stdout)
+	}
+	return io.MultiWriter(m.tail, os.Stdout, m.Log)
 }
 
 // Mount mounts the filesystem in the background.
@@ -261,6 +266,7 @@ func (m *MountedFS) Mount(debug bool) error {
 		return err
 	}
 
+	m.startWatchdog()
 	m.t.Logf("Mounted at %s", m.MountPoint)
 	return nil
 }
@@ -294,6 +300,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 		return err
 	}
 
+	m.startWatchdog()
 	m.t.Logf("Formatted and mounted at %s", m.MountPoint)
 	return nil
 }
@@ -305,12 +312,8 @@ func processExited(p *os.Process) bool {
 	if p == nil {
 		return false
 	}
-	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", p.Pid))
-	if err != nil {
-		return true
-	}
-	_, after, ok := strings.Cut(string(stat), ") ")
-	return ok && strings.HasPrefix(after, "Z")
+	state := procState(fmt.Sprintf("/proc/%d/stat", p.Pid))
+	return state == 0 || state == 'Z'
 }
 
 // mountWait is how long a mount may take: one whose -skip-recovery names
@@ -351,6 +354,7 @@ const unmountBusyTimeout = 10 * time.Second
 // the dead mount, so a later Mount at the same path can work, and returns an
 // error.
 func (m *MountedFS) Unmount() error {
+	m.stopWatchdog()
 	var unmountErr error
 	start := time.Now()
 	for busy := 0; ; busy++ {
@@ -568,6 +572,7 @@ func (m *MountedFS) Kill() error {
 	if m.MountCmd == nil || m.MountCmd.Process == nil {
 		return fmt.Errorf("mount process not running")
 	}
+	m.stopWatchdog()
 	if err := m.MountCmd.Process.Kill(); err != nil {
 		return err
 	}
@@ -618,6 +623,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 		return err
 	}
 
+	m.startWatchdog()
 	m.t.Logf("Formatted and mounted at %s with SFB enabled", m.MountPoint)
 	return nil
 }
@@ -652,6 +658,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 		return err
 	}
 
+	m.startWatchdog()
 	m.t.Logf("Mounted at %s with SFB enabled", m.MountPoint)
 	return nil
 }

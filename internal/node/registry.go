@@ -149,6 +149,8 @@ type Registry struct {
 	failureCheckInterval time.Duration // How often to scan for failed nodes
 	recoveryInProgress   map[int]bool  // Slots currently being recovered
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
+	replays              atomic.Uint64
+	replayFailures       atomic.Uint64
 }
 
 // emptySlot is a slot no node ever wrote; it has no checksum.
@@ -1325,7 +1327,31 @@ func (r *Registry) replay(handler RecoveryHandler, slotIdx int, info *FailedNode
 	bit := uint64(1) << slotIdx
 	r.replaying.Or(bit)
 	defer r.replaying.And(^bit)
-	return handler(info)
+	err := handler(info)
+	if err != nil {
+		r.replayFailures.Add(1)
+	} else {
+		r.replays.Add(1)
+	}
+	return err
+}
+
+// Stats is what the registry tells monitoring about this node's liveness and its replays of other nodes' journals.
+type Stats struct {
+	// HeartbeatAge is how long ago this node's last heartbeat landed; 0 before it registered.
+	HeartbeatAge   time.Duration
+	Replays        uint64 // other nodes' journals this node replayed
+	ReplayFailures uint64 // replays that failed and were left for a retry
+	Replaying      []int  // slots whose journal this node is replaying now
+}
+
+// Stats returns this node's liveness and replay counts.
+func (r *Registry) Stats() Stats {
+	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying()}
+	if r.lastBeat.Load() != nil {
+		st.HeartbeatAge = r.sinceLastBeat()
+	}
+	return st
 }
 
 // Replaying returns the slots whose journal this node is replaying now.

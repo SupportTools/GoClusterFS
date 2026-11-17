@@ -1837,17 +1837,52 @@ scenarios:
 
   - id: mkdir-eio-parent-links
     name: A write that fails mkdir keeps the parent's link count
-    description: Each write of one mkdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    description: Each write of one mkdir fails with EIO in turn; the root's link count still matches its subdirectories, on the running node and after a crash and replay
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedMkdirWriteKeepsParentLinks
 
   - id: rmdir-eio-parent-links
     name: A write that fails rmdir keeps the parent's link count
-    description: Each write of one rmdir fails with EIO in turn, with no crash after it; the root's link count still matches its subdirectories
+    description: Each write of one rmdir fails with EIO in turn; the root's link count still matches its subdirectories, on the running node and after a crash and replay
     priority: go_only
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedRmdirWriteKeepsParentLinks
+
+  - id: rename-eio-one-name
+    name: A write that fails a rename leaves one name
+    description: Each write of a rename over a file in another directory fails with EIO in turn; the file has exactly one name and fsck finds only leaks, on the running node and after a crash and replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRenameWriteLeavesOneName
+
+  - id: directory-move-eio-one-name
+    name: A write that fails a directory move leaves one name
+    description: Each write of a directory move between parents fails with EIO in turn; the directory has exactly one name, its ".." names that parent, both link counts are right and fsck finds only leaks, on the running node and after a crash and replay
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedDirectoryMoveWriteLeavesOneName
+
+  - id: rename-eio-peer-waits
+    name: A rename that fails partway finishes before a peer changes its old parent
+    description: Each write of a rename between directories fails with EIO in turn while another node waits to add a file to the old parent; the rename finishes under its locks first, so the file has exactly one name, the peer's file is there and fsck finds only leaks
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedRenameFinishesBeforeAPeerChangesTheOldParent
+
+  - id: rename-stuck-keeps-locks
+    name: A rename that cannot finish stops its node with its locks held
+    description: Every write fails from the old-name removal on; the rename stops the node without releasing its locks, a peer waiting for the old parent stays blocked, and replay then leaves exactly one name
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestStuckRenameKeepsItsLocksUntilReplay
+
+  - id: failed-commit-not-replayed
+    name: A failed journal commit is not replayed onto a reused inode
+    description: Each write of one create fails with EIO in turn, a second create may reuse its inode slot, and the node crashes; after replay the two names never share an inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/eio_sweep_test.go::TestFailedCreateThenCrashKeepsNamesApart
 
   - id: fsck-directory-tree
     name: fsck checks the directory tree
@@ -1935,6 +1970,34 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotWithoutBirthIsOrphan
 
+  - id: metrics-for-operators
+    name: Metrics for operators
+    description: /metrics exports lock give-ups by type, this node's heartbeat age, peer journal replays by result and running, the mount's own replay, and registered nodes by state
+    priority: go_only
+    environments:
+      go: internal/api/metrics_ops_test.go::TestMetricsForOperators
+
+  - id: metrics-count-api-responses
+    name: Metrics count API responses
+    description: goclusterfs_api_requests_total counts responses by route and status code, including 401s and the rate limiter's 429s
+    priority: go_only
+    environments:
+      go: internal/api/metrics_ops_test.go::TestMetricsCountAPIResponses
+
+  - id: lock-stats-count-give-ups
+    name: Lock stats count acquires that give up
+    description: An acquire that times out on a lock another node holds counts as failed for its lock type, not as an acquire
+    priority: go_only
+    environments:
+      go: internal/lock/lock_test.go::TestStatsCountAcquiresThatGiveUp
+
+  - id: registry-stats-replays-heartbeat
+    name: Registry reports replays and heartbeat age
+    description: The registry counts replays of crashed nodes' journals that succeeded and failed, lists replays in progress, and reports how long ago its own heartbeat landed
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestStatsCountReplaysAndHeartbeatAge
+
   - id: api-lookup-file
     name: API path lookup inside the filesystem
     description: The API finds a file by walking directories in the filesystem, without the kernel, and refuses a symlink anywhere on the path, a directory, a non-directory in the middle, a missing name and an unclean path
@@ -2011,6 +2074,27 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/stale_bytes_test.go::TestTruncateWhileAppending
+
+  - id: growing-write-keeps-other-nodes-append
+    name: Zeroing before a growing write never wipes another node's append
+    description: One node appends records while another writes past the end of the file; every acknowledged record survives the zeroing of the gap before the second write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestGrowingWriteNeverZeroesAnotherNodesAppend
+
+  - id: sequential-write-writes-data-once
+    name: A sequential write writes its data once
+    description: Writing 16 MiB in FUSE's 128 KiB pieces passes about 1x its size to write calls, with no block of zeros before each new block
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestSequentialWriteWritesDataOnce
+
+  - id: zero-range-stays-in-range
+    name: Zeroing part of a block leaves the blocks around it alone
+    description: The buffer pool rounds sizes up, so zeroing a block's tail must not also zero the start of the next block, which another file or directory owns
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/stale_bytes_test.go::TestZeroRangeZeroesOnlyItsRange
 
   - id: fsck-repair-in-use
     name: fsck -repair refuses an in-use filesystem
@@ -2604,6 +2688,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/testnet/testnet_test.go::TestPortsReachThisProcess
+
+  - id: integration-watchdog-connection
+    name: The hang watchdog aborts only its own mount's FUSE connection
+    description: The integration harness finds a mount's FUSE connection by its exact mount point in mountinfo, takes the top of stacked mounts, and finds none when a non-FUSE mount covers it
+    priority: go_only
+    environments:
+      go: tests/integration/watchdog_test.go::TestWatchdogFindsTheMountsOwnFUSEConnection
 
   - id: broadcast-silent-peers
     name: Silent broadcast peers are reported

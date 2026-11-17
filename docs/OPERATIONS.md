@@ -45,6 +45,7 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 | `Journal: disabled (no crash consistency guarantees)` | `-journal=false`. This node also skipped replaying its slot's journal. |
 | `[Recovery] Replaying slot N (node ...) failed` | Another node's journal cannot be replayed. See [Damaged Journal Slot](#damaged-journal-slot). |
 | `ERROR: heartbeats to node registry slot N have failed` | This node cannot write the device. It stops. |
+| `[ERROR] Stopping this node and keeping its locks: rename of ... is half done` | A rename hit a write error after its journal commit, and three tries to redo the missing writes failed too. The mount exits without releasing its locks, so another node replays its journal and finishes the rename. See [Handling Node Failure](#handling-node-failure). Check the device before mounting this node again. |
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Failed to start cache broadcast: ...` | The mount stops before it touches the device. See [Mount Fails: "Failed to start cache broadcast"](TROUBLESHOOTING.md#mount-fails-failed-to-start-cache-broadcast). |
 | `Warning: Failed to start API server` | The API port is taken. The mount runs without the API, `/metrics`, `gfsctl` and the dashboard. |
@@ -338,6 +339,8 @@ When a node fails unexpectedly:
 2. **Locks and journal.** Once the failed node is proven dead, one surviving node takes over its exclusive locks, replays its journal, then frees the locks. Until then, operations that need its locks wait, however long that takes. See [Node Requirements](#node-requirements).
 3. **No action is needed** on the surviving nodes.
 
+A node also stops on purpose when a rename hits a lasting I/O error after its journal commit. A rename changes two directory entries in separate writes, so the node first redoes the writes that failed while it still holds its locks. If they keep failing, it logs `[ERROR] Stopping this node and keeping its locks` with the names, the inode numbers and the error, and exits. Its locks stay claimed, so no other node can change those directories until failover replays its journal and finishes the rename. The file or directory then has its new name only. Other operations that fail after their commit leave at most an inode or blocks that no name reaches; `goclusterfs-fsck -repair` reclaims those.
+
 **When the failed node comes back**, mount it again with the same options. If it gets its old registry slot back (same hostname and boot ID), it replays its own journal before serving. Don't run fsck while other nodes have the device mounted: `-repair` refuses, and a check-only run reads metadata that is changing.
 
 ```bash
@@ -464,7 +467,7 @@ goclusterfs-mount -device /dev/device -mount /mnt/cluster
 
 ## Health Checks
 
-`gfsctl health` and `GET /health` only show that the mount's API answers; they check nothing else yet. Use the script below to check the filesystem itself.
+`gfsctl health` and `GET /health` report the mount's device, journal, peer replays, broadcast and heartbeat: see [HTTP API Health](API-CONFIG.md#http-api-health-and-shutdown). They do not read or write files. Use the script below to check the filesystem itself.
 
 ### Quick Health Check Script
 
@@ -616,7 +619,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 **HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`) it also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
 
 - To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
-- `/health` and `/metrics` never need the token, so anyone who can reach the port can read them.
+- `/health` and `/metrics` never need the token, on purpose: load balancers, probes and Prometheus can read them without a secret. Anyone who can reach the port can read them too. They show no file names or data, but `/health` messages name peers' hostnames and registry slot numbers.
 - Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.

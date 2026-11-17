@@ -183,6 +183,7 @@ type LockTypeStats struct {
 	Acquires    uint64  `json:"acquires"`
 	Blocked     uint64  `json:"blocked"`
 	WaitSeconds float64 `json:"wait_seconds"`
+	Failed      uint64  `json:"failed"`
 }
 
 // SFBStatsResponse is returned by GET /api/v1/stats/sfb.
@@ -232,6 +233,17 @@ type AllStatsResponse struct {
 	SFB         *SFBStatsResponse     `json:"sfb,omitempty"`
 	Cluster     *ClusterInfoResponse  `json:"cluster,omitempty"`
 	Reserve     *ReserveStatsResponse `json:"reserve,omitempty"`
+	Node        *NodeStatsResponse    `json:"node,omitempty"`
+}
+
+// NodeStatsResponse is this node's liveness and its journal replays since it mounted.
+type NodeStatsResponse struct {
+	HeartbeatAgeSeconds       float64 `json:"heartbeat_age_seconds"`
+	PeerReplays               uint64  `json:"peer_replays"`
+	PeerReplayFailures        uint64  `json:"peer_replay_failures"`
+	ReplayingSlots            []int   `json:"replaying_slots,omitempty"`
+	MountReplayedTransactions int     `json:"mount_replayed_transactions"`
+	MountDiscardedJournal     bool    `json:"mount_discarded_journal"`
 }
 
 // ReserveStatsResponse counts this node's block reserve since it mounted.

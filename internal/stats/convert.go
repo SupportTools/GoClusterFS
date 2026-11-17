@@ -62,7 +62,7 @@ func lockResponse(l lock.Stats) *api.LockStatsResponse {
 		PendingLocks:     l.Waiting,
 	}
 	for _, t := range l.Types {
-		r.Types = append(r.Types, api.LockTypeStats{Type: t.Name, Acquires: t.Acquires, Blocked: t.Blocked, WaitSeconds: t.Wait.Seconds()})
+		r.Types = append(r.Types, api.LockTypeStats{Type: t.Name, Acquires: t.Acquires, Blocked: t.Blocked, WaitSeconds: t.Wait.Seconds(), Failed: t.Failed})
 	}
 	return r
 }
