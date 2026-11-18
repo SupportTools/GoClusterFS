@@ -24,6 +24,7 @@ const (
 
 	// JournalVersion is the current journal format version. Version 2 records carry consecutive seqs in the order
 	// they are written, and completions are headed records, so recovery can tell a stale record from the next one.
+	// Bump it when an existing record's encoding changes; new ops need no bump.
 	JournalVersion uint32 = 2
 
 	// DefaultJournalSlotSize is the default size per node (4MB).

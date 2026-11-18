@@ -63,6 +63,7 @@ For tests where several nodes write to one file at the same time, create the fil
 - Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit messages and pull request titles, for example `fix(journal): replay batches in order`. Common types here are `feat`, `fix`, `perf`, `test`, `docs`, `ci`, and `chore`.
 - Keep each pull request to one concern. Send a refactor, a fix, and a feature as separate pull requests.
 - Fill in the pull request template: what changed, why, and which test suites you ran.
+- If you change how an existing journal record is encoded, bump `JournalVersion` in `internal/journal/superblock.go`. New op types need no bump, because older builds stop at an op they don't know.
 
 ## Releasing
 
