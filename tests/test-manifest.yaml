@@ -4638,6 +4638,20 @@ scenarios:
     environments:
       go: internal/lock/release_retry_test.go::TestFailedReleaseWriteIsRetried
 
+  - id: snapshot-registry-rereads-torn-sector
+    name: Snapshot registry reads a torn sector again on its own
+    description: The registry reads its region in one I/O; a sector whose checksum fails in that read, as one a peer was writing, is read again by itself, so a listing still returns its snapshots, and a sector damaged on disk still fails with UnreadableSectorError
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestRegistryRereadsATornSector
+
+  - id: snapshot-registry-list-during-peer-writes
+    name: Snapshot listings while a peer rewrites a slot
+    description: While a second registry on the same device rewrites one descriptor in a loop, every listing by the first succeeds and includes a snapshot in the same sector that never changes
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestRegistryListsWhileAPeerRewritesASlot
+
   - id: snapshot-unreadable-sector-not-rewritten
     name: An unreadable snapshot registry sector is not rewritten
     description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
