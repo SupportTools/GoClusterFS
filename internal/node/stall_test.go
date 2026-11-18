@@ -65,6 +65,33 @@ func (n *stalledNode) stallAfterBeatRead(t *testing.T, gap time.Duration, during
 	return <-done
 }
 
+// stallFor makes the node's last heartbeat age old, by its own clock and in its slot.
+func (n *stalledNode) stallFor(t *testing.T, age time.Duration) {
+	t.Helper()
+	n.reg.lastBeat.Store(int64(bootClock() - age))
+	slot, err := n.reg.readSlot(n.slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot.HeartbeatTime = time.Now().Add(-age).Unix()
+	if err := n.reg.writeSlot(n.slot, slot); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// resumesAndStops resumes the node's heartbeat after newcomer took its slot,
+// and checks that the node stops and newcomer keeps the slot.
+func (n *stalledNode) resumesAndStops(t *testing.T, newcomer *Registry) {
+	t.Helper()
+	if err := n.reg.beat(n.slot); !errors.Is(err, ErrSlotLost) {
+		t.Errorf("stalled node's heartbeat after its slot was taken = %v, want ErrSlotLost", err)
+	}
+	n.stopped(t)
+	if err := newcomer.beat(n.slot); err != nil {
+		t.Errorf("new mount's heartbeat after the stalled node resumed: %v", err)
+	}
+}
+
 // refusesDataWrites checks that a data write fails with ErrSlotLost and leaves the device unchanged.
 func refusesDataWrites(t *testing.T, dev *storage.Device, offset int64) {
 	t.Helper()
@@ -263,5 +290,82 @@ func TestShortStallKeepsSlotFromSameHostMount(t *testing.T) {
 	}
 	if _, err := dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), 1<<20); err != nil {
 		t.Errorf("data write after the stall: %v", err)
+	}
+}
+
+// A new mount on the same host cannot prove by PID that a stalled mount is
+// gone, so it takes the slot only once the heartbeat is deadAfter old.
+func TestSameHostMountTakesStalledSlotOnlyOnceSilentForDeadAfter(t *testing.T) {
+	for _, tc := range []struct {
+		age   time.Duration
+		takes bool
+	}{
+		{deadAfter - 2*time.Second, false},
+		{deadAfter + time.Second, true},
+	} {
+		t.Run(tc.age.String(), func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			n := registerStalledNode(t, dev)
+			if n.reg.bootID == ([16]byte{}) {
+				t.Skip("no kernel boot ID")
+			}
+			n.stallFor(t, tc.age)
+
+			newcomer := NewRegistry(dev, 0)
+			slot, err := newcomer.Register(context.Background(), "stalled")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (slot == n.slot) != tc.takes {
+				t.Fatalf("with the stalled node's heartbeat %v old, a same-host mount took slot %d; taking the stalled node's slot %d should be %v", tc.age, slot, n.slot, tc.takes)
+			}
+			if tc.takes {
+				n.resumesAndStops(t, newcomer)
+			}
+		})
+	}
+}
+
+// A mount that cannot judge a stalled node's heartbeat by its own clock
+// watches the slot for deadAfter before it takes it.
+func TestWatchingMountTakesStalledSlotOnlyAfterDeadAfter(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		host  string
+		setup func(t *testing.T, newcomer *Registry, stalled int)
+	}{
+		{"named by -skip-recovery", "elsewhere", func(_ *testing.T, newcomer *Registry, stalled int) {
+			newcomer.PreferSlot(stalled)
+		}},
+		{"rebooted host", "stalled", func(_ *testing.T, newcomer *Registry, _ int) {
+			newcomer.bootID = [16]byte{0xEE}
+		}},
+		{"another host with no empty slot", "elsewhere", func(t *testing.T, newcomer *Registry, stalled int) {
+			fillWithReplays(t, newcomer, stalled+1)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			n := registerStalledNode(t, dev)
+			if n.reg.bootID == ([16]byte{}) {
+				t.Skip("no kernel boot ID")
+			}
+			n.stallFor(t, HeartbeatTimeout+time.Second)
+			newcomer := NewRegistry(dev, 0)
+			tc.setup(t, newcomer, n.slot)
+
+			start := time.Now()
+			slot, err := newcomer.Register(context.Background(), tc.host)
+			if err != nil || slot != n.slot {
+				t.Fatalf("Register = %d, %v; want the stalled node's slot %d", slot, err, n.slot)
+			}
+			if waited := time.Since(start); waited < deadAfter {
+				t.Errorf("mount took the stalled node's slot after watching it %v, want at least %v", waited, deadAfter)
+			}
+			n.resumesAndStops(t, newcomer)
+		})
 	}
 }
