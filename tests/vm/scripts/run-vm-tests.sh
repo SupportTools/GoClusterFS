@@ -3749,13 +3749,13 @@ hostile_replayed_since() {
     sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
 }
 
-# VM 1, back from a stall during which VM 2 replayed it, stopped, either on its
-# own stall or on finding its slot taken, and acknowledged no create but one
-# whose writes were already queued when the stall began.
+# VM 1, back from a stall during which VM 2 replayed it, stopped, on its own
+# stall, on finding its slot taken, or on the device refusing its write, and
+# acknowledged no create but one whose writes were already queued when the stall began.
 hostile_check_taken_slot_stops() {
     local acked
-    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)|may no longer be this node's: it went"; then
-        log_error "VM 1 did not stop on its stall or on finding its slot taken"
+    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)|may no longer be this node's: it went|The device refused a write from this node"; then
+        log_error "VM 1 did not stop on its stall, on finding its slot taken, or on a refused write"
         sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|no longer|stopping' | head -5
         return 1
     fi
