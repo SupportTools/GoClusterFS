@@ -72,6 +72,10 @@ var beforeSizeUpdate func(*File)
 // its blocks, before it marks the file shared.
 var beforeShareMark func()
 
+// beforeActivate lets tests act after a snapshot shared the file's blocks,
+// before it becomes active.
+var beforeActivate func()
+
 // duringShareMark lets tests act on other nodes after the mark read the
 // file's inode, before it writes the inode back.
 var duringShareMark func()
@@ -149,6 +153,7 @@ type FS struct {
 	refcountReg *refcount.Region   // Reference count table for CoW/snapshots (optional)
 	snapshotReg *snapshot.Registry // Snapshot registry for managing snapshot descriptors
 	snapshotWkr *snapshot.Worker   // Background worker for async refcount updates
+	snapshotsUp atomic.Bool        // snapshotReg and snapshotWkr are set, for the failure detector's goroutine
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -300,6 +305,7 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 	// Create snapshot registry
 	f.snapshotReg = snapshot.NewRegistry(f.dev, snapshotOffset, snapshotSize, lockMgr)
 	f.snapshotReg.SetNodeSlot(nodeSlot)
+	f.snapshotReg.SetOwner(f.nodeUUID)
 
 	// Scan registry to rebuild state
 	stats, err := f.snapshotReg.Scan(ctx)
@@ -316,14 +322,40 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 	cfg := snapshot.DefaultWorkerConfig()
 	f.snapshotWkr = snapshot.NewWorker(f.snapshotReg, f.extentMgr, f.inodeTbl, cfg)
 	f.snapshotWkr.Start()
+	f.snapshotsUp.Store(true)
 
 	// Recover any incomplete jobs from crash
-	if err := f.snapshotWkr.RecoverIncompleteJobs(ctx); err != nil {
+	if err := f.snapshotWkr.RecoverIncompleteJobs(ctx, f.creatorGone); err != nil {
 		log.Printf("[snapshot] Warning: failed to recover incomplete jobs: %v", err)
 		// Continue anyway - snapshots may be in inconsistent state but won't crash
 	}
 
 	return nil
+}
+
+// creatorGone reports whether the node creating a snapshot can no longer
+// finish it: its registry slot is empty or another node holds it. A dead
+// creator keeps its slot until its replay, which rolls back its snapshots.
+func (f *FS) creatorGone(c snapshot.Creator) bool {
+	if f.orphanReg == nil {
+		return true
+	}
+	owner, occupancy := f.orphanReg.Occupant(int(c.Slot), true)
+	switch {
+	case occupancy == node.Unoccupied:
+		return true
+	case owner == [16]byte{}:
+		return false // Occupant names no owner for a slot it cannot read
+	}
+	return !c.Is(owner)
+}
+
+// RollBackSnapshotsOf rolls back the snapshots that the dead node with UUID
+// owner in registry slot slot was still creating. Call it after its replay.
+func (f *FS) RollBackSnapshotsOf(ctx context.Context, slot int, owner [16]byte) {
+	if f.snapshotsUp.Load() {
+		f.snapshotWkr.RollBackCreatedBy(ctx, slot, owner)
+	}
 }
 
 // SetDirectIO makes the kernel send every read and write of file data to this
@@ -4015,7 +4047,14 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 
 	err = f.fs.shareInto(ctx, f.inodeNum, data, nil)
 	if err == nil {
+		if beforeActivate != nil {
+			beforeActivate()
+		}
 		err = f.fs.snapshotReg.Activate(ctx, desc.SnapshotID)
+	}
+	if errors.Is(err, snapshot.ErrSnapshotInvalidState) || errors.Is(err, snapshot.ErrSnapshotNotFound) {
+		log.Printf("[snapshot] Another node rolled back '%s' (ID=%d) of inode %d before it became active, and deletes it", name, desc.SnapshotID, f.inodeNum)
+		return syscall.EAGAIN
 	}
 	if err != nil {
 		log.Printf("[snapshot] Failed to create '%s' for inode %d: %v", name, f.inodeNum, err)

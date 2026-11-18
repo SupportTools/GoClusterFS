@@ -317,9 +317,10 @@ func (w *Worker) resultHandler() {
 
 // RecoverIncompleteJobs deletes snapshots that a crash left creating or
 // deleting. A snapshot still creating was never reported as created, so it is
-// rolled back, unless another node activates it first. Call this on mount,
-// after Start.
-func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
+// rolled back once gone reports that its creator can no longer finish it. A
+// nil gone, or a snapshot from a build that did not record its creator, rolls
+// it back at once. Call this on mount, after Start.
+func (w *Worker) RecoverIncompleteJobs(ctx context.Context, gone func(Creator) bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -330,16 +331,15 @@ func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
 
 	var recovered int
 	for _, snap := range snapshots {
-		switch snap.State {
-		case StateCreating:
-			if err := w.registry.Abandon(ctx, snap.SnapshotID); err != nil {
-				log.Printf("[snapshot/worker] Not rolling back snapshot %d: %v", snap.SnapshotID, err)
+		switch {
+		case snap.State == StateDeleting:
+			if !w.queueCleanup(ctx, snap.SnapshotID) {
 				continue
 			}
-		case StateDeleting:
-		}
-		if _, err := w.QueueDeleteJob(ctx, snap.SnapshotID); err != nil {
-			log.Printf("[snapshot/worker] Failed to queue cleanup of snapshot %d: %v", snap.SnapshotID, err)
+		case snap.Flags&FlagHasCreator != 0 && gone != nil && !gone(snap.Creator):
+			log.Printf("[snapshot/worker] Leaving snapshot %d to node slot %d, which may still create it", snap.SnapshotID, snap.Creator.Slot)
+			continue
+		case !w.rollBack(ctx, snap):
 			continue
 		}
 		recovered++
@@ -351,6 +351,40 @@ func (w *Worker) RecoverIncompleteJobs(ctx context.Context) error {
 		log.Printf("[snapshot/worker] Cleaning up %d incomplete snapshot(s)", recovered)
 	}
 	return nil
+}
+
+// RollBackCreatedBy rolls back the snapshots that the node with UUID owner in
+// registry slot slot was still creating, and queues their deletes. Call it
+// once that node is dead and its journal is replayed.
+func (w *Worker) RollBackCreatedBy(ctx context.Context, slot int, owner [16]byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	snapshots, err := w.registry.unfinished()
+	if err != nil {
+		log.Printf("[snapshot/worker] Rolling back node slot %d's snapshots in readable registry sectors only; the next mount rolls back the rest: %v", slot, err)
+	}
+	for _, snap := range snapshots {
+		if snap.State == StateCreating && snap.Flags&FlagHasCreator != 0 && int(snap.Creator.Slot) == slot && snap.Creator.Is(owner) {
+			w.rollBack(ctx, snap)
+		}
+	}
+}
+
+func (w *Worker) rollBack(ctx context.Context, snap *Descriptor) bool {
+	if err := w.registry.Abandon(ctx, snap.SnapshotID); err != nil {
+		log.Printf("[snapshot/worker] Not rolling back snapshot %d: %v", snap.SnapshotID, err)
+		return false
+	}
+	return w.queueCleanup(ctx, snap.SnapshotID)
+}
+
+func (w *Worker) queueCleanup(ctx context.Context, snapshotID uint64) bool {
+	if _, err := w.QueueDeleteJob(ctx, snapshotID); err != nil {
+		log.Printf("[snapshot/worker] Failed to queue cleanup of snapshot %d: %v", snapshotID, err)
+		return false
+	}
+	return true
 }
 
 // PendingJobs returns the number of jobs waiting in the queue.

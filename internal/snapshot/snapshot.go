@@ -121,7 +121,21 @@ const (
 	// FlagHasTargetBirth marks a descriptor that records its file's birth generation, which tells the file apart from
 	// a later file in the same inode slot. Without it the snapshot cannot prove which file it belongs to.
 	FlagHasTargetBirth Flags = 1 << 5
+
+	// FlagHasCreator marks a descriptor being created that records its Creator where RefCountJobID goes later.
+	FlagHasCreator Flags = 1 << 6
 )
+
+// Creator names the mount creating a snapshot: its node registry slot and the first bytes of its node UUID.
+type Creator struct {
+	Slot  uint8
+	Owner [7]byte
+}
+
+// Is reports whether the node with UUID owner created the snapshot.
+func (c Creator) Is(owner [16]byte) bool {
+	return c.Owner == [7]byte(owner[:7])
+}
 
 // birthMask keeps the 48 bits of a birth generation a descriptor has room for.
 const birthMask = 1<<48 - 1
@@ -188,7 +202,7 @@ func (e *UnreadableSectorError) Unwrap() []error { return []error{syscall.EIO, e
 //	44      8     TotalSize (file size at snapshot time)
 //	52      8     CreateTime (Unix timestamp)
 //	60      8     DeleteTime (Unix timestamp, 0 if not deleted)
-//	68      8     RefCountJobID (background job ID for refcount updates)
+//	68      8     RefCountJobID (background job ID for refcount updates); with FlagHasCreator, Creator.Slot at 68 and Creator.Owner at 69-75
 //	76      48    Name (null-terminated UTF-8 string)
 //	124     4     Checksum (CRC32C of bytes 0-123)
 type Descriptor struct {
@@ -205,6 +219,7 @@ type Descriptor struct {
 	CreateTime    int64                    // Creation timestamp
 	DeleteTime    int64                    // Deletion timestamp (0 if active)
 	RefCountJobID uint64                   // Background refcount job ID
+	Creator       Creator                  // Only with FlagHasCreator
 	Name          [MaxSnapshotNameLen]byte // Snapshot name
 	Checksum      uint32                   // CRC32C checksum
 }
@@ -283,6 +298,7 @@ type Registry struct {
 	maxDescriptors  uint64        // Maximum number of descriptors
 	lockMgr         *lock.Manager // For distributed locking (optional)
 	nodeSlot        int           // This node's slot in the node registry
+	owner           [16]byte      // This node's UUID; zero records no creator
 	nextID          uint64        // Next available snapshot ID (cached)
 	descriptorCount uint64        // Active descriptor count (cached)
 }
@@ -295,6 +311,15 @@ func (r *Registry) SetNodeSlot(slot int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.nodeSlot = slot % node.MaxNodes
+}
+
+// SetOwner tells the registry this mount's node UUID. Snapshots it creates
+// then record their creator, so another node's mount can tell whether this
+// one may still finish them.
+func (r *Registry) SetOwner(owner [16]byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.owner = owner
 }
 
 // NewRegistry creates a new snapshot registry manager.
@@ -381,6 +406,11 @@ func (r *Registry) CreateFor(ctx context.Context, name string, target Target,
 	if target.Birth != 0 {
 		flags |= FlagHasTargetBirth
 	}
+	var creator Creator
+	if r.owner != [16]byte{} {
+		flags |= FlagHasCreator
+		creator = Creator{Slot: uint8(r.nodeSlot), Owner: [7]byte(r.owner[:7])}
+	}
 	desc := &Descriptor{
 		Magic:       DescriptorMagic,
 		SnapshotID:  snapshotID,
@@ -393,6 +423,7 @@ func (r *Registry) CreateFor(ctx context.Context, name string, target Target,
 		TotalBlocks: totalBlocks,
 		TotalSize:   totalSize,
 		CreateTime:  time.Now().Unix(),
+		Creator:     creator,
 	}
 	if err := desc.SetName(name); err != nil {
 		return nil, err
@@ -537,6 +568,10 @@ func (r *Registry) updateState(ctx context.Context, snapshotID uint64, newState,
 		return ErrSnapshotInvalidState
 	}
 	desc.State = newState
+	if newState != StateCreating {
+		desc.Flags &^= FlagHasCreator
+		desc.Creator = Creator{}
+	}
 	if newState == StateDeleting {
 		desc.DeleteTime = time.Now().Unix()
 	}
@@ -564,6 +599,7 @@ func (r *Registry) SetRefCountJobID(ctx context.Context, snapshotID, jobID uint6
 	if err != nil {
 		return err
 	}
+	desc.Flags &^= FlagHasCreator
 	desc.RefCountJobID = jobID
 	return r.writeDescriptor(slot, desc)
 }
@@ -942,20 +978,24 @@ func decodeDescriptor(sectorData []byte, descIdx uint64) (*Descriptor, error) {
 	}
 
 	desc := &Descriptor{
-		Magic:         magic,
-		SnapshotID:    binary.LittleEndian.Uint64(data[4:12]),
-		ParentID:      binary.LittleEndian.Uint64(data[12:20]),
-		TargetInode:   binary.LittleEndian.Uint32(data[20:24]),
-		State:         State(data[24]),
-		Flags:         Flags(data[25]),
-		DataInode:     binary.LittleEndian.Uint32(data[28:32]),
-		TotalBlocks:   binary.LittleEndian.Uint64(data[36:44]),
-		TotalSize:     binary.LittleEndian.Uint64(data[44:52]),
-		CreateTime:    int64(binary.LittleEndian.Uint64(data[52:60])),
-		DeleteTime:    int64(binary.LittleEndian.Uint64(data[60:68])),
-		RefCountJobID: binary.LittleEndian.Uint64(data[68:76]),
-		TargetBirth:   uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36])),
-		Checksum:      stored,
+		Magic:       magic,
+		SnapshotID:  binary.LittleEndian.Uint64(data[4:12]),
+		ParentID:    binary.LittleEndian.Uint64(data[12:20]),
+		TargetInode: binary.LittleEndian.Uint32(data[20:24]),
+		State:       State(data[24]),
+		Flags:       Flags(data[25]),
+		DataInode:   binary.LittleEndian.Uint32(data[28:32]),
+		TotalBlocks: binary.LittleEndian.Uint64(data[36:44]),
+		TotalSize:   binary.LittleEndian.Uint64(data[44:52]),
+		CreateTime:  int64(binary.LittleEndian.Uint64(data[52:60])),
+		DeleteTime:  int64(binary.LittleEndian.Uint64(data[60:68])),
+		TargetBirth: uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36])),
+		Checksum:    stored,
+	}
+	if desc.Flags&FlagHasCreator != 0 {
+		desc.Creator = Creator{Slot: data[68], Owner: [7]byte(data[69:76])}
+	} else {
+		desc.RefCountJobID = binary.LittleEndian.Uint64(data[68:76])
 	}
 	copy(desc.Name[:], data[76:124])
 
@@ -990,7 +1030,12 @@ func encodeDescriptor(sectorData []byte, descIdx uint64, desc *Descriptor) {
 	binary.LittleEndian.PutUint64(data[44:52], desc.TotalSize)
 	binary.LittleEndian.PutUint64(data[52:60], uint64(desc.CreateTime))
 	binary.LittleEndian.PutUint64(data[60:68], uint64(desc.DeleteTime))
-	binary.LittleEndian.PutUint64(data[68:76], desc.RefCountJobID)
+	if desc.Flags&FlagHasCreator != 0 {
+		data[68] = desc.Creator.Slot
+		copy(data[69:76], desc.Creator.Owner[:])
+	} else {
+		binary.LittleEndian.PutUint64(data[68:76], desc.RefCountJobID)
+	}
 	copy(data[76:124], desc.Name[:])
 
 	// Compute and store checksum

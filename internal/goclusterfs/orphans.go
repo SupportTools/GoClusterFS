@@ -22,6 +22,7 @@ type orphanRegistry interface {
 	DropOrphans(func(node.Orphan) bool) error
 	AllOrphans() ([]node.Orphan, error)
 	PeersFailing() bool
+	Occupant(slot int, fresh bool) ([16]byte, node.Occupancy)
 }
 
 type openFiles struct {

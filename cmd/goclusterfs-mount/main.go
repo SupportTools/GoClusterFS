@@ -548,6 +548,9 @@ func main() {
 		if err == nil {
 			err = gfs.ForgetSlot(lock.ForReplay(context.Background()), info.SlotIndex, info.Orphans)
 		}
+		if err == nil {
+			gfs.RollBackSnapshotsOf(context.Background(), info.SlotIndex, info.UUID)
+		}
 		if errors.Is(err, lock.ErrLockTimeout) {
 			return fmt.Errorf("%w: %w", node.ErrReplayContended, err)
 		}
