@@ -48,7 +48,7 @@ func EntryTouches(op TxnOpType, payload []byte) (Touches, error) {
 		if p, err = DeserializeInodeDelete(payload); err == nil {
 			inodes(p.InodeNum)
 		}
-	case TxnOpLinkDrop:
+	case TxnOpLinkDrop, TxnOpLinkAdd:
 		var p *LinkDropPayload
 		if p, err = DeserializeLinkDrop(payload); err == nil {
 			inodes(p.InodeNum)
