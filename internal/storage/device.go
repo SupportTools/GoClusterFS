@@ -7,6 +7,7 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +39,17 @@ const (
 	// This aligns with DefaultBlockSize so most operations hit a single shard.
 	IOShardSize = 1 << 20 // 1MB
 )
+
+// stopBeforeWrite names a trigger file for tests: the first data or journal write that starts with the file's
+// contents, after every gate passed, removes it and stops this process with SIGSTOP. That stalls a node in the window
+// only storage fencing closes.
+var stopBeforeWrite = os.Getenv("GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE")
+
+func stopIfTriggered(buf []byte) {
+	if want, err := os.ReadFile(stopBeforeWrite); err == nil && bytes.HasPrefix(buf, want) && os.Remove(stopBeforeWrite) == nil {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+	}
+}
 
 // ErrOutOfRange is the error for a read or write that reaches outside the device.
 var ErrOutOfRange = errors.New("I/O outside the device")
@@ -278,6 +290,9 @@ func (d *Device) writeIfFresh(buf []byte, offset int64, sharded bool) (landed bo
 	}
 	if fresh := d.writeFresh.Load(); fresh != nil && !(*fresh)(offset) {
 		return false, 0, nil
+	}
+	if sharded && stopBeforeWrite != "" {
+		stopIfTriggered(buf)
 	}
 	n, err = d.file.WriteAt(buf, offset)
 	d.record(err)

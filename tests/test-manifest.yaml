@@ -5228,6 +5228,27 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: fencing-stalled-writer
+    name: Storage fencing refuses a stalled node's queued write
+    description: VM 1 stops itself just before a write of A reaches the device; VM 2 proves it dead, revokes its key and writes B. On a fenced volume the storage refuses the write and VM 1 stops, so B stays; the unfenced control shows A landing over B
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_stalled_writer
+
+  - id: fencing-paused-vm
+    name: A paused, fenced node's queued writes fail after resume
+    description: A node VM paused by QEMU while it writes is revoked by its peer; after resume it stops and the file keeps the peer's data
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_paused_vm
+
+  - id: fencing-idle-node
+    name: A fenced idle node stops soon after resume
+    description: A node stopped with SIGSTOP and revoked while idle stops within 10 seconds of resuming
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_idle_node
+
   - id: storage-last-error
     name: Device remembers its last I/O failure
     description: LastError holds the latest failed read, write or sync until one succeeds, and ignores EOF

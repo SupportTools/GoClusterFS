@@ -43,6 +43,17 @@ SHARED_DISK_SIZE_MB=${VM_CLUSTER_SIZE_MB:-1024}
 # Network settings (each VM gets sequential ports)
 SSH_BASE_PORT=${VM_SSH_BASE_PORT:-2222}
 
+# VM_STORAGE=iscsi serves the cluster image from VM ${TARGET_VM_ID} over iSCSI (Linux LIO, with SCSI-3 persistent
+# reservations), so nodes fence each other. virtio, the default, shares the image as a virtio disk without reservations.
+VM_STORAGE=${VM_STORAGE:-virtio}
+TARGET_VM_ID=9
+ISCSI_PORT=$((SSH_BASE_PORT + 100))
+ISCSI_TARGET_IQN="iqn.2026-11.dev.goclusterfs:target"
+# The virt ISO's kernel lacks LIO's target modules; the standard ISO has them.
+STD_ISO_NAME="alpine-standard-${ALPINE_VERSION}.0-x86_64.iso"
+STD_ISO_PATH="${VM_DIR}/${STD_ISO_NAME}"
+STD_ISO_SHA256="4cf7cd3bad64122a8a2423e78369a486a02334d4d88645aab9d08120bb76b0f9"
+
 # VM resources
 VM_MEMORY="512M"
 VM_CPUS=1
@@ -238,18 +249,26 @@ EOF
 # Alpine ISO Management
 # =============================================================================
 download_iso() {
-    if [[ -f "${ISO_PATH}" ]]; then
-        log_info "Alpine ISO already downloaded"
+    download_pinned "${ISO_PATH}" "${ISO_URL}" "${ISO_SHA256}" || return 1
+    if [[ "$VM_STORAGE" == iscsi ]]; then
+        download_pinned "${STD_ISO_PATH}" "${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/x86_64/${STD_ISO_NAME}" "${STD_ISO_SHA256}"
+    fi
+}
+
+download_pinned() {
+    local path="$1" url="$2" sha="$3"
+    if [[ -f "$path" ]]; then
+        log_info "$(basename "$path") already downloaded"
     else
-        log_info "Downloading Alpine Linux ISO..."
+        log_info "Downloading $(basename "$path")..."
         mkdir -p "${VM_DIR}"
-        wget -q --show-progress -O "${ISO_PATH}" "${ISO_URL}"
-        log_success "Downloaded: ${ISO_PATH}"
+        wget -q --show-progress -O "$path" "$url"
+        log_success "Downloaded: $path"
     fi
 
-    if ! echo "${ISO_SHA256}  ${ISO_PATH}" | sha256sum -c --status; then
-        log_error "${ISO_PATH} does not match the pinned SHA-256; removed it, rerun to download again"
-        rm -f "${ISO_PATH}"
+    if ! echo "${sha}  ${path}" | sha256sum -c --status; then
+        log_error "$path does not match the pinned SHA-256; removed it, rerun to download again"
+        rm -f "$path"
         return 1
     fi
 }
@@ -387,9 +406,12 @@ start_vm() {
 
     download_iso || return 1
     create_shared_disk || return 1
+    if [[ "$VM_STORAGE" == iscsi && "$vm_id" != "$TARGET_VM_ID" ]]; then
+        start_vm "$TARGET_VM_ID" || return 1
+    fi
 
     for attempt in $(seq 1 "$VM_BOOT_ATTEMPTS"); do
-        if boot_vm "$vm_id"; then
+        if boot_vm "$vm_id" && attach_storage "$vm_id"; then
             return 0
         fi
         log_warn "VM $vm_id bring-up failed (attempt $attempt of $VM_BOOT_ATTEMPTS)"
@@ -397,6 +419,62 @@ start_vm() {
     done
     log_error "VM $vm_id failed to start"
     return 1
+}
+
+# attach_storage serves the cluster image when VM $1 is the iSCSI target, and logs in to it from a node VM.
+attach_storage() {
+    [[ "$VM_STORAGE" == iscsi ]] || return 0
+    if [[ "$1" == "$TARGET_VM_ID" ]]; then
+        configure_iscsi_target
+    else
+        login_iscsi "$1"
+    fi
+}
+
+# configure_iscsi_target exports the target VM's /dev/vda, the cluster image, as one LUN with LIO through configfs,
+# with an ACL per node VM. LIO saves the reservations in /var/target/pr.
+configure_iscsi_target() {
+    ssh_run "$TARGET_VM_ID" "sh -s" <<SCRIPT
+set -e
+for m in target_core_mod target_core_iblock iscsi_target_mod; do modprobe \$m; done
+mount | grep -q ' /sys/kernel/config ' || mount -t configfs none /sys/kernel/config
+mkdir -p /var/target/pr
+cd /sys/kernel/config/target
+mkdir -p core/iblock_0/lun0
+echo udev_path=/dev/vda > core/iblock_0/lun0/control
+echo 1 > core/iblock_0/lun0/enable
+tpg=iscsi/${ISCSI_TARGET_IQN}/tpgt_1
+mkdir -p \$tpg/lun/lun_0 \$tpg/np/0.0.0.0:3260
+ln -s /sys/kernel/config/target/core/iblock_0/lun0 \$tpg/lun/lun_0/disk
+for n in 1 2 3 4 5 6 7 8; do
+    mkdir -p \$tpg/acls/iqn.2026-11.dev.goclusterfs:vm\$n/lun_0
+    ln -s /sys/kernel/config/target/\$tpg/lun/lun_0 \$tpg/acls/iqn.2026-11.dev.goclusterfs:vm\$n/lun_0/lun
+done
+echo 0 > \$tpg/attrib/authentication
+echo 1 > \$tpg/enable
+SCRIPT
+}
+
+# login_iscsi logs node VM $1 in to the target as its own initiator, which fails I/O after 5 s instead of queuing it.
+login_iscsi() {
+    local vm_id="$1" portal="10.0.2.2:${ISCSI_PORT}"
+    ssh_run "$vm_id" "sh -s" <<SCRIPT
+set -e
+apk add --no-cache open-iscsi > /dev/null
+modprobe iscsi_tcp
+echo InitiatorName=iqn.2026-11.dev.goclusterfs:vm${vm_id} > /etc/iscsi/initiatorname.iscsi
+rc-service iscsid start > /dev/null 2>&1 || true
+iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -o new > /dev/null
+iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -o update -n node.session.timeo.replacement_timeout -v 5
+iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null
+for t in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -b /dev/sda ] && exit 0; sleep 1; done
+exit 1
+SCRIPT
+}
+
+# cluster_device is the cluster image's device on a node VM.
+cluster_device() {
+    if [[ "$VM_STORAGE" == iscsi ]]; then echo /dev/sda; else echo /dev/vda; fi
 }
 
 # Boot the Alpine live ISO, log in on the serial console and run the setup disk
@@ -409,6 +487,11 @@ boot_vm() {
     local pid_file=$(get_vm_pid_file "$vm_id")
     local accelerator=$(get_accelerator)
     local cpu_type=$(get_cpu_type)
+    local iso="${ISO_PATH}" forwards="hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+    if [[ "$vm_id" == "$TARGET_VM_ID" ]]; then
+        iso="${STD_ISO_PATH}"
+        forwards="${forwards},hostfwd=tcp:127.0.0.1:${ISCSI_PORT}-:3260"
+    fi
 
     # Clean up old sockets before starting (avoids "Address already in use")
     rm -f "$monitor_socket" "$serial_socket"
@@ -427,11 +510,11 @@ boot_vm() {
         -cpu ${cpu_type} \
         -m "${VM_MEMORY}" \
         -smp ${VM_CPUS} \
-        -cdrom "${ISO_PATH}" \
+        -cdrom "${iso}" \
         -boot d \
         -drive "file=${SHARED_DISK_PATH},format=raw,if=virtio,cache=none,discard=unmap,file.locking=off" \
         -drive "file=${VM_RUN_DIR}/setup.img,format=raw,if=virtio,readonly=on" \
-        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22" \
+        -netdev "user,id=net0,${forwards}" \
         -device "virtio-net-pci,netdev=net0" \
         -device virtio-serial-pci \
         -chardev "file,id=mountlog,path=$(get_vm_mount_log "$vm_id"),append=on" \
@@ -546,7 +629,9 @@ setup_goclusterfs() {
     # Extra environment for the mount process, such as a test failpoint
     local mount_env="${3:-}"
     # Block device to mount, such as a device-mapper device over the shared disk
-    local device="${4:-/dev/vda}"
+    local device="${4:-$(cluster_device)}"
+    # Extra mount flags, such as -fencing=none with a format
+    local extra_args="${5:-}"
     local ssh_port=$(get_vm_ssh_port "$vm_id")
 
     log_info "Setting up GoClusterFS on VM $vm_id (format=$format_disk)..."
@@ -560,7 +645,7 @@ setup_goclusterfs() {
         "${binaries[@]}" "${SSH_USER}@127.0.0.1:/usr/local/bin/"
 
     # Mount GoClusterFS
-    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device}"
+    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device} ${extra_args}"
     if [[ "$format_disk" == "true" ]]; then
         log_info "Formatting shared disk on VM $vm_id..."
         # One inode per 64 KB gives the 1 GB disk 16384 inodes, enough for test_more_than_4096_files

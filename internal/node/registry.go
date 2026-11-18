@@ -236,6 +236,7 @@ func (r *Registry) fenceOut(owner [16]byte) error {
 	if err := r.preempt(owner); err != nil {
 		return fmt.Errorf("revoking node %x's access to the device: %w", owner[:8], err)
 	}
+	log.Printf("[Recovery] Revoked node %x's access to the device", owner[:8])
 	return nil
 }
 
