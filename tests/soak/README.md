@@ -26,6 +26,8 @@
 
   The files go to `stalls/`, at most once a minute and never during a fault, which stalls calls on purpose.
 - **fsck:** every `-fsck-every`, all operations stop, every node unmounts and goclusterfs-fsck runs. Anything other than leaks and orphan snapshots is a failure. Leaks are repaired.
+- **Known failures:** a bug hunt may count a filesystem bug whose fix is on the way instead of failing on it, to keep looking for other bugs. Each one has a flag, off by default, that its fix removes. A release-candidate run uses none.
+  - `-known-abandoned-snapshot`: a node's mount abandons every snapshot still being created, including one a live peer is making, and the peer's snapshot gets EIO. The soak counts it only if the node logged the failed activation for that snapshot while the call ran, a peer's mount logged abandoning the same snapshot ID, and the node then shows no snapshot.
 
 The first failure stops the run. `result.txt` says what failed, `ops.jsonl` logs every operation, fault and fsck, and `cluster.img` keeps the shared disk.
 
