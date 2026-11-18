@@ -4,9 +4,15 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -135,3 +141,102 @@ func TestUnreadableSectorFailsLookupsWithEIO(t *testing.T) {
 }
 
 func second[T any](_ T, err error) error { return err }
+
+// A sector whose checksum fails in the one-I/O read, as one a peer was writing, is read again on its own.
+func TestRegistryRereadsATornSector(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+	registry := NewRegistry(dev, 0, 16*SectorSize, nil)
+	kept, err := registry.Create(ctx, "kept", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counter := &countingDevice{device: dev}
+	registry.dev = counter
+	afterBulkRead = func(region []byte) { region[100] ^= 0xFF }
+	defer func() { afterBulkRead = nil }()
+
+	descs, err := registry.ListForInode(ctx, 100)
+	if err != nil || len(descs) != 1 || descs[0].SnapshotID != kept.SnapshotID {
+		t.Fatalf("listing with sector 0 torn in the bulk read: %v, %v; want snapshot %d", descs, err, kept.SnapshotID)
+	}
+	if counter.reads != 2 {
+		t.Errorf("%d reads, want the bulk read and one read of the torn sector", counter.reads)
+	}
+
+	afterBulkRead = nil
+	breakSectorChecksum(t, dev)
+	var unreadable *UnreadableSectorError
+	if _, err := registry.ListForInode(ctx, 100); !errors.As(err, &unreadable) || unreadable.Sector != 0 {
+		t.Errorf("listing with sector 0 damaged on disk: %v, want UnreadableSectorError for sector 0", err)
+	}
+}
+
+// deviceOutsideTmpfs makes a device in the package directory. tmpfs, where CI keeps other test images, tears an
+// O_DIRECT read inside a sector while a write to it runs, which no real device does.
+func deviceOutsideTmpfs(t *testing.T, size int64) *storage.Device {
+	t.Helper()
+	var st unix.Statfs_t
+	if err := unix.Statfs(".", &st); err != nil || st.Type == unix.TMPFS_MAGIC {
+		t.Skipf("the package directory is on tmpfs or cannot be checked (%v)", err)
+	}
+	path := fmt.Sprintf("peer-writes-%d.bin", time.Now().UnixNano())
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := storage.Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Close() })
+	return dev
+}
+
+func TestRegistryListsWhileAPeerRewritesASlot(t *testing.T) {
+	dev := deviceOutsideTmpfs(t, 10<<20)
+	ctx := context.Background()
+	const size = 16 * SectorSize
+	peer := NewRegistry(dev, 0, size, nil)
+	stable, err := peer.Create(ctx, "stable", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy, err := peer.Create(ctx, "busy", 200, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stop atomic.Bool
+	var rewrites atomic.Int64
+	writerErr := make(chan error, 1)
+	go func() {
+		for i := uint64(1); !stop.Load(); i++ {
+			if err := peer.SetRefCountJobID(ctx, busy.SnapshotID, i); err != nil {
+				writerErr <- err
+				return
+			}
+			rewrites.Add(1)
+		}
+		writerErr <- nil
+	}()
+	lister := NewRegistry(dev, 0, size, nil)
+	for i := range 500 {
+		descs, err := lister.ListForInode(ctx, 100)
+		if err != nil || len(descs) != 1 || descs[0].SnapshotID != stable.SnapshotID {
+			stop.Store(true)
+			t.Fatalf("listing %d while the peer rewrites its slot: %v, %v; want snapshot %d", i, descs, err, stable.SnapshotID)
+		}
+	}
+	stop.Store(true)
+	if err := <-writerErr; err != nil {
+		t.Fatal(err)
+	}
+	if rewrites.Load() == 0 {
+		t.Error("the peer never rewrote its slot during the listings")
+	}
+}

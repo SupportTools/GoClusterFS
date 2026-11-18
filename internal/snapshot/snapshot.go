@@ -13,12 +13,15 @@
 package snapshot
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"iter"
 	"log"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -701,10 +704,11 @@ type ScanStats struct {
 func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 	free, owned := r.maxDescriptors, r.maxDescriptors
 	var maxID uint64
-	for sector := uint64(0); sector*DescriptorsPerSector < r.maxDescriptors; sector++ {
-		data, err := r.readSector(sector)
+	var found, readErr error
+	r.eachSector(func(sector uint64, data []byte, err error) bool {
 		if err != nil {
-			return 0, 0, err
+			readErr = err
+			return false
 		}
 		for i := uint64(0); i < DescriptorsPerSector; i++ {
 			slot := sector*DescriptorsPerSector + i
@@ -720,10 +724,15 @@ func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 				continue
 			}
 			if desc.IsValid() && desc.GetName() == name {
-				return 0, 0, fmt.Errorf("%w: %q", ErrSnapshotExists, name)
+				found = fmt.Errorf("%w: %q", ErrSnapshotExists, name)
+				return false
 			}
 			maxID = max(maxID, desc.SnapshotID)
 		}
+		return true
+	})
+	if err := cmp.Or(readErr, found); err != nil {
+		return 0, 0, err
 	}
 	if owned < r.maxDescriptors {
 		return owned, maxID, nil
@@ -740,13 +749,10 @@ func (r *Registry) freeSlotAndMaxID(name string) (uint64, uint64, error) {
 func (r *Registry) descriptors() (all iter.Seq2[uint64, *Descriptor], unreadable func() error) {
 	var readErr error
 	all = func(yield func(uint64, *Descriptor) bool) {
-		for sector := range r.maxDescriptors / DescriptorsPerSector {
-			data, err := r.readSector(sector)
+		r.eachSector(func(sector uint64, data []byte, err error) bool {
 			if err != nil {
-				if readErr == nil {
-					readErr = err
-				}
-				continue
+				readErr = cmp.Or(readErr, err)
+				return true
 			}
 			for i := range uint64(DescriptorsPerSector) {
 				desc, err := decodeDescriptor(data, i)
@@ -754,12 +760,57 @@ func (r *Registry) descriptors() (all iter.Seq2[uint64, *Descriptor], unreadable
 					continue
 				}
 				if !yield(sector*DescriptorsPerSector+i, desc) {
-					return
+					return false
 				}
 			}
-		}
+			return true
+		})
 	}
 	return all, func() error { return readErr }
+}
+
+// afterBulkRead lets tests change the registry as one read found it.
+var afterBulkRead func(region []byte)
+
+// eachSector calls visit with each sector's descriptor bytes, or with the error
+// readSector gives for it, until visit returns false. It reads the region in one
+// I/O. A sector whose checksum fails in that read, as one a peer was writing
+// meanwhile, is read again on its own, as is every sector if that I/O fails.
+func (r *Registry) eachSector(visit func(sector uint64, data []byte, err error) bool) {
+	sectors := r.maxDescriptors / DescriptorsPerSector
+	size := int(sectors * SectorSize)
+	buf := storage.GetBuffer(size)
+	defer storage.PutBuffer(buf)
+	region := buf.Bytes()[:size]
+	if _, err := r.dev.ReadAt(region, int64(r.offset)); err != nil {
+		region = nil
+	} else if afterBulkRead != nil {
+		afterBulkRead(region)
+	}
+	for sector := range sectors {
+		var data []byte
+		var err error
+		ok := false
+		if region != nil {
+			data, ok = checkedSector(region[sector*SectorSize : (sector+1)*SectorSize])
+		}
+		if !ok {
+			data, err = r.readSector(sector)
+		}
+		if !visit(sector, data, err) {
+			return
+		}
+	}
+}
+
+// checkedSector returns the descriptor bytes of a sector as read, or false if
+// its checksum fails. An all-zero sector is an unused one.
+func checkedSector(raw []byte) ([]byte, bool) {
+	stored := binary.LittleEndian.Uint32(raw[SectorSize-ChecksumSize:])
+	if stored == 0 && !slices.ContainsFunc(raw[:SectorSize-ChecksumSize], func(b byte) bool { return b != 0 }) {
+		return raw[:BytesPerSector], true
+	}
+	return raw[:BytesPerSector], stored == storage.CRC32C(raw[:SectorSize-ChecksumSize])
 }
 
 // find returns the valid descriptor match accepts and its slot. It fails with
@@ -831,43 +882,17 @@ func (r *Registry) writeDescriptor(slot uint64, desc *Descriptor) error {
 // readSector reads a snapshot registry sector from disk.
 func (r *Registry) readSector(sectorIdx uint64) ([]byte, error) {
 	offset := int64(r.offset) + int64(sectorIdx)*SectorSize
-
 	buf := storage.GetBuffer(SectorSize)
 	defer storage.PutBuffer(buf)
-
-	if _, err := r.dev.ReadAt(buf.Bytes(), offset); err != nil {
+	raw := buf.Bytes()[:SectorSize]
+	if _, err := r.dev.ReadAt(raw, offset); err != nil {
 		return nil, &UnreadableSectorError{Sector: sectorIdx, Err: err}
 	}
-
-	data := buf.Bytes()
-
-	// Verify checksum (skip for all-zero sectors)
-	storedChecksum := binary.LittleEndian.Uint32(data[SectorSize-ChecksumSize:])
-	computedChecksum := storage.CRC32C(data[:SectorSize-ChecksumSize])
-
-	// All-zero sector is valid (initial state)
-	if storedChecksum == 0 {
-		allZero := true
-		for i := 0; i < SectorSize-ChecksumSize; i++ {
-			if data[i] != 0 {
-				allZero = false
-				break
-			}
-		}
-		if allZero {
-			result := make([]byte, BytesPerSector)
-			return result, nil
-		}
-	}
-
-	if storedChecksum != computedChecksum {
+	data, ok := checkedSector(raw)
+	if !ok {
 		return nil, &UnreadableSectorError{Sector: sectorIdx, Err: ErrChecksumMismatch}
 	}
-
-	// Return a copy of the data portion
-	result := make([]byte, BytesPerSector)
-	copy(result, data[:BytesPerSector])
-	return result, nil
+	return bytes.Clone(data), nil
 }
 
 // writeSector writes a snapshot registry sector to disk with checksum.
