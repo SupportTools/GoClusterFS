@@ -33,7 +33,7 @@ func (c *Checker) keepUnnamed(num uint32, ino *InodeData) string {
 	switch {
 	case num < inode.InodeFirstUsable:
 		return "it is a reserved inode"
-	case c.snapshotTargets[num] && !c.snapshotData[num]:
+	case c.snapshotRefs[num] || c.snapshotTargets[num] && !c.snapshotData[num]:
 		return "a snapshot refers to it"
 	case ino.InodeNum != num:
 		return fmt.Sprintf("it stores inode number %d", ino.InodeNum)

@@ -167,3 +167,37 @@ func TestFsckRepairFreesOrphanDataInAnOrphanSnapshotsSlot(t *testing.T) {
 	}
 	expectOrphanReport(t, reopened, `snapshot "s" is an orphan: inode`)
 }
+
+// A snapshot's data inode whose snapshot-data flag is gone is an error repair cannot fix. Repair must still keep it,
+// since the snapshot's captured data is in it.
+func TestFsckRepairKeepsADataInodeThatLostItsFlag(t *testing.T) {
+	t.Parallel()
+	path := newFormattedImage(t)
+	fsys := openFormattedFS(t, path)
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f := createFile(t, fsys, "file.bin")
+	writeAt(t, f, pattern(5, BlockSize), 0)
+	setxattr(t, f, "user.snapshot", "s")
+	desc, err := fsys.snapshotReg.GetByName(ctx, "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := fsys.inodeTbl.Read(desc.DataInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data.Flags &^= inode.FlagSnapshotData
+	if err := fsys.inodeTbl.Write(ctx, data); err != nil {
+		t.Fatal(err)
+	}
+
+	r := runFsck(t, fsys, repairOpts())
+	expectProblem(t, r, fmt.Sprintf("data inode %d is not a snapshot data inode", desc.DataInode))
+	expectProblem(t, r, fmt.Sprintf("inode %d: unnamed: no directory names it; kept, because a snapshot refers to it", desc.DataInode))
+	if !inodeInUse(t, openFormattedFS(t, path), desc.DataInode) {
+		t.Errorf("repair freed snapshot s's data inode %d:%s", desc.DataInode, problemList(r))
+	}
+}

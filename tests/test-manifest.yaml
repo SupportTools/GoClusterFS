@@ -4666,6 +4666,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairFreesOrphanDataInAnOrphanSnapshotsSlot
 
+  - id: fsck-keeps-data-inode-without-flag
+    name: fsck -repair keeps a snapshot's data inode that lost its snapshot-data flag
+    description: A data inode a snapshot points at is reported as an error repair cannot fix, and repair keeps it because it holds the snapshot's captured data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairKeepsADataInodeThatLostItsFlag
+
   - id: fsck-checks-every-dir-entry
     name: fsck checks every directory entry's type and inode range
     description: fsck reports an entry whose type does not match its inode whatever the inode number, and an entry whose inode number is past the inode table, including one that would wrap to a used inode
