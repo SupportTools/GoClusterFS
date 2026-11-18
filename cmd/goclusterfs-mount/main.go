@@ -326,6 +326,7 @@ func main() {
 		failf("%s; stopping so two nodes never share a journal. "+
 			"Check that the device is reachable and that this node did not stall, then mount again", loss)
 	})
+	dev.SetFencedHandler(nodeReg.Fenced)
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
 	}
@@ -811,10 +812,6 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 		failf("%s is fenced, and reserving it failed: %v; release the other reservation first", devicePath, err)
 	}
 	reg.SetPreempter(func(owner [16]byte) error { return pr.Preempt(fence.NodeKey(owner)) })
-	dev.SetFencedHandler(func(err error) {
-		failf("The device refused a write (%v): another node declared this node dead and revoked its access, so it stops before anything else it holds reaches the volume. "+
-			"Check that this node did not stall, then mount again", err)
-	})
 	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
 	return pr
 }

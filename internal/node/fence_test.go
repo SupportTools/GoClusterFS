@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"syscall"
 	"testing"
 	"time"
 
@@ -145,4 +146,33 @@ func TestMountingIntoADeadSlotPreempts(t *testing.T) {
 	if !slices.Equal(target.Preempted(), []uint64{dead.Key()}) {
 		t.Errorf("preempted %x, want the dead node's key", target.Preempted())
 	}
+}
+
+// The device can refuse the heartbeat's own write, which holds the registry lock. Fenced must still stop the node once
+// and refuse its later writes.
+func TestFencedStopsTheNodeOnce(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	n := registerStalledNode(t, dev)
+	_ = n.stallAfterBeatRead(t, 0, func() {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			n.reg.Fenced(syscall.EBADE)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Fenced waited for the registry lock the heartbeat holds")
+		}
+	})
+	n.reg.Fenced(syscall.EBADE)
+	n.stopped(t)
+	if len(n.losses) == 1 && !errors.Is(n.losses[0].Fenced, syscall.EBADE) {
+		t.Errorf("slot loss %+v, want the device's EBADE", n.losses[0])
+	}
+	if err := n.reg.CheckOwnership(); !errors.Is(err, ErrSlotLost) {
+		t.Errorf("CheckOwnership after the refused write = %v, want ErrSlotLost", err)
+	}
+	refusesDataWrites(t, dev, 1<<20)
 }
