@@ -63,6 +63,8 @@ type Device struct {
 	path          string
 	size          int64
 	lastErr       atomic.Pointer[error]
+	fenced        atomic.Pointer[func(error)]
+	fencedOnce    sync.Once
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -360,7 +362,18 @@ func (d *Device) record(err error) {
 		}
 	case !errors.Is(err, io.EOF):
 		d.lastErr.Store(&err)
+		if errors.Is(err, syscall.EBADE) {
+			if fenced := d.fenced.Load(); fenced != nil {
+				d.fencedOnce.Do(func() { (*fenced)(err) })
+			}
+		}
 	}
+}
+
+// SetFencedHandler makes the first I/O that fails with a reservation conflict (EBADE) call fenced: another node
+// revoked this node's access to the device, so none of its writes can land any more.
+func (d *Device) SetFencedHandler(fenced func(error)) {
+	d.fenced.Store(&fenced)
 }
 
 // Fd returns the file descriptor for use with syscalls.

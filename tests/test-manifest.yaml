@@ -5107,6 +5107,83 @@ scenarios:
     environments:
       go: internal/dir/index_test.go::TestDamagedDirectoryFailsLookups
 
+  - id: fence-node-key
+    name: Reservation keys derive from the node's registry UUID
+    description: A node's key is the GC prefix and the first 6 bytes of its per-mount UUID, never 0, so peers derive a dead node's key from its slot; tool keys carry GF and are random
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestNodeKey
+
+  - id: fence-ioctl-numbers
+    name: Persistent reservation ioctl numbers match linux/pr.h
+    description: IOC_PR_REGISTER, RESERVE and PREEMPT_ABORT are encoded as the kernel defines them
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestIoctlNumbers
+
+  - id: fence-preempt
+    name: A preempt revokes the dead node's access
+    description: After a survivor preempts a key, that initiator may not write, cannot preempt back or unregister (ErrFenced), and a second preempt of the gone key succeeds through the own-key probe
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestPreemptRevokesTheVictim
+
+  - id: fence-preempt-guards
+    name: Preempt refuses key 0 and its own key
+    description: Key 0 would remove every other registrant, so neither reaches the device
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestPreemptRefusesKeyZeroAndItsOwn
+
+  - id: fence-unsupported-device
+    name: A device without reservations reports ErrUnsupported
+    description: The reservation ioctls on a regular file fail with ENOTTY, which the fence package reports as ErrUnsupported
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestBlockOnRegularFileIsUnsupported
+
+  - id: storage-fenced-handler
+    name: A reservation conflict calls the fenced handler once
+    description: The first I/O that fails with EBADE calls the device's fenced handler; later ones do not
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestFencedHandlerRunsOnce
+
+  - id: superblock-reservations-flag
+    name: Fenced volumes need a build that knows fencing
+    description: RequiredReservations is optional, but a build without it refuses a volume that sets it
+    priority: go_only
+    environments:
+      go: internal/superblock/superblock_test.go::TestReservationsFlagIsOptionalButKnown
+
+  - id: registry-preempt-before-dead
+    name: Recovery preempts before it marks a slot dead
+    description: A survivor preempts the dead node's key before any write to its slot, so a queued write of the dead node cannot land over the Dead mark or the replay
+    priority: go_only
+    environments:
+      go: internal/node/fence_test.go::TestRecoveryPreemptsBeforeMarkingDead
+
+  - id: registry-preempt-failure
+    name: A failed preempt stops the recovery
+    description: When the preempt fails, the slot stays as it was and nothing replays
+    priority: go_only
+    environments:
+      go: internal/node/fence_test.go::TestRecoveryStopsWhenPreemptFails
+
+  - id: registry-preempt-release
+    name: Releasing a slot preempts before the journal reset
+    description: ReleaseSlot preempts the slot's key before its reset runs
+    priority: go_only
+    environments:
+      go: internal/node/fence_test.go::TestReleaseSlotPreemptsBeforeTheReset
+
+  - id: registry-preempt-claim
+    name: Mounting into a dead node's slot preempts its key
+    description: Register preempts the previous owner's key before it writes over the slot
+    priority: go_only
+    environments:
+      go: internal/node/fence_test.go::TestMountingIntoADeadSlotPreempts
+
   - id: storage-last-error
     name: Device remembers its last I/O failure
     description: LastError holds the latest failed read, write or sync until one succeeds, and ignores EOF

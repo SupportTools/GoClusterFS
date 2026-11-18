@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -536,5 +537,18 @@ func TestDeviceRefusesIOOutsideIt(t *testing.T) {
 	}
 	if _, err := dev.ReadAt(one, SectorSize); err != nil {
 		t.Errorf("read of the last sector: %v", err)
+	}
+}
+
+// A reservation conflict means another node fenced this one: the handler runs once, whichever I/O hit it first.
+func TestFencedHandlerRunsOnce(t *testing.T) {
+	var d Device
+	var calls []error
+	d.SetFencedHandler(func(err error) { calls = append(calls, err) })
+	d.record(syscall.EIO)
+	d.record(syscall.EBADE)
+	d.record(fmt.Errorf("write: %w", syscall.EBADE))
+	if len(calls) != 1 || !errors.Is(calls[0], syscall.EBADE) {
+		t.Errorf("fenced handler calls: %v, want one with EBADE", calls)
 	}
 }
