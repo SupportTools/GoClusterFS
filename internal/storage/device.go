@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -58,7 +59,10 @@ func stopIfTriggered(buf []byte) (resume func()) {
 	}
 	issued := make(chan struct{})
 	stoppedWrite.Store(&issued)
-	_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+	// Sent to this thread, which then stops before the write; a process-wide SIGSTOP can let it issue the write first.
+	runtime.LockOSThread()
+	_ = syscall.Tgkill(os.Getpid(), syscall.Gettid(), syscall.SIGSTOP)
+	runtime.UnlockOSThread()
 	return func() {
 		stoppedWrite.Store(nil)
 		close(issued)
