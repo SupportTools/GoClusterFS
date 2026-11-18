@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -59,6 +60,43 @@ func TestEntryPastTheInodeTableIsEIO(t *testing.T) {
 	after, err := fsys.inodeTbl.Read(inode.InodeRoot)
 	if err != nil || after.MetaGeneration != root.MetaGeneration || after.LinkCount != root.LinkCount {
 		t.Errorf("root inode after the refused operations: %+v, %v; want it unchanged", after, err)
+	}
+}
+
+// Every lookup of a damaged entry fails, but the error is logged once, so a program that retries it does not flood the log.
+func TestDamagedEntryLoggedOnce(t *testing.T) {
+	ctx := context.Background()
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	root, err := fsys.inodeTbl.Read(inode.InodeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.dirMgr.Add(ctx, root, "bad", 1<<32+uint64(inode.InodeRoot), dir.DT_REG); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	for i := range 5 {
+		if _, errno := fsys.Lookup(ctx, "bad", &fuse.EntryOut{}); errno != syscall.EIO {
+			t.Fatalf("lookup %d of the damaged entry: %v, want EIO", i, errno)
+		}
+	}
+	if n := strings.Count(logs.String(), `entry "bad" names inode`); n != 1 {
+		t.Errorf("five lookups logged the damaged entry %d times, want once:\n%s", n, logs.String())
+	}
+
+	past := uint64(fsys.inodeTbl.TotalInodes())
+	for i := range 3 * maxBadEntries {
+		if errno := fsys.childInRange(inode.InodeRoot, fmt.Sprintf("bad-%d", i), past); errno != syscall.EIO {
+			t.Fatalf("entry %d: %v, want EIO", i, errno)
+		}
+	}
+	fsys.badEntriesMu.Lock()
+	remembered := len(fsys.badEntries)
+	fsys.badEntriesMu.Unlock()
+	if remembered > maxBadEntries {
+		t.Errorf("%d damaged entries remembered, want at most %d", remembered, maxBadEntries)
 	}
 }
 
