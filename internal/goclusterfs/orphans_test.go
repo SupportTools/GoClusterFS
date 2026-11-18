@@ -153,7 +153,7 @@ func TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose(t *testing.T) {
 	checkAt(t, f, pattern(2, 4096), 0)
 	checkAt(t, g, pattern(3, 4096), 0)
 
-	nodeA.LearnOrphans(1, cluster.list(1))
+	nodeA.LearnOrphans(context.Background(), 1, cluster.list(1))
 	if readInode(t, nodeA, f.inodeNum).Magic != inode.InodeMagic {
 		t.Fatal("node A let go of a file it still has open")
 	}
@@ -163,7 +163,7 @@ func TestFileUnlinkedByAPeerWhileOpenStaysUntilLastClose(t *testing.T) {
 	if ino := readInode(t, nodeA, f.inodeNum); ino.Magic != 0 {
 		t.Fatalf("after node A's last close: magic %#x, holders %#b; want the slot free", ino.Magic, ino.Holders)
 	}
-	nodeB.LearnOrphans(1, cluster.list(1))
+	nodeB.LearnOrphans(context.Background(), 1, cluster.list(1))
 	if got := cluster.list(1); len(got) != 0 {
 		t.Errorf("node B still lists %v after the orphan was freed", got)
 	}
@@ -310,14 +310,14 @@ func TestPeerReleasesAnOrphanItSawBeforeTheDrop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodeA.LearnOrphans(1, cluster.list(1))
+	nodeA.LearnOrphans(context.Background(), 1, cluster.list(1))
 	if err := nodeB.dropLink(ctx, f.inodeNum, live); err != nil {
 		t.Fatal(err)
 	}
 	if ino := readInode(t, nodeA, f.inodeNum); ino.LinkCount != 0 || ino.Holders != 1 {
 		t.Fatalf("after the drop: links %d, holders %#b; want an orphan node A holds", ino.LinkCount, ino.Holders)
 	}
-	nodeA.LearnOrphans(1, cluster.list(1))
+	nodeA.LearnOrphans(context.Background(), 1, cluster.list(1))
 	if ino := readInode(t, nodeA, f.inodeNum); ino.Magic != 0 {
 		t.Fatalf("node A never let go: magic %#x, holders %#b", ino.Magic, ino.Holders)
 	}
@@ -332,7 +332,7 @@ func TestOwnPassKeepsAReservedOrphan(t *testing.T) {
 	if _, err := fsys.reserveOrphan(readInode(t, fsys, f.inodeNum)); err != nil {
 		t.Fatal(err)
 	}
-	fsys.LearnOrphans(0, cluster.list(0))
+	fsys.LearnOrphans(context.Background(), 0, cluster.list(0))
 	if !slices.Contains(cluster.list(0), o) {
 		t.Fatalf("this node's own pass dropped %v before the drop", o)
 	}
@@ -358,7 +358,7 @@ func TestCreateHoldsAFileAPeerUnlinksAtOnce(t *testing.T) {
 				if errno := nodeB.Unlink(ctx, "f"); errno != 0 {
 					t.Errorf("node B unlink: %v", errno)
 				}
-				nodeA.LearnOrphans(1, cluster.list(1))
+				nodeA.LearnOrphans(context.Background(), 1, cluster.list(1))
 			})
 		}
 	}

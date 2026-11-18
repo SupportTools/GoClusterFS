@@ -129,7 +129,7 @@ type Registry struct {
 	onSlotLost func(SlotLoss)
 
 	onOwnerDead   func(owner [16]byte, slot int) (done func(replayed bool))
-	onOrphans     func(slot int, orphans []Orphan)
+	onOrphans     func(ctx context.Context, slot int, orphans []Orphan)
 	orphanKick    chan struct{}
 	previousOwner *[16]byte
 	sightings     map[int]sighting

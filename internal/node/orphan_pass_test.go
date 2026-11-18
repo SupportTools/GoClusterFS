@@ -21,7 +21,7 @@ func TestBlockedOrphanPassLetsDetectionReplay(t *testing.T) {
 	}
 	reg.failureCheckInterval = 20 * time.Millisecond
 	entered, release := make(chan struct{}, 1), make(chan struct{})
-	reg.SetOrphanHandler(func(int, []Orphan) {
+	reg.SetOrphanHandler(func(context.Context, int, []Orphan) {
 		select {
 		case entered <- struct{}{}:
 		default:
@@ -53,6 +53,41 @@ func TestBlockedOrphanPassLetsDetectionReplay(t *testing.T) {
 	}
 }
 
+// A pass waiting on a lock must not hold up Stop, and so unmount.
+func TestStopEndsAStuckOrphanPass(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{}, 1)
+	reg.SetOrphanHandler(func(ctx context.Context, _ int, _ []Orphan) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+	})
+	reg.SetRecoveryHandler(func(*FailedNodeInfo) error { return nil })
+	reg.StartFailureDetection()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no orphan pass started")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		reg.Stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop waited for an orphan pass that waits on a lock")
+	}
+}
+
 func TestOrphanPassSkipsAFailedPeer(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -68,15 +103,15 @@ func TestOrphanPassSkipsAFailedPeer(t *testing.T) {
 		}
 	}
 	var passed []int
-	reg.SetOrphanHandler(func(slot int, _ []Orphan) { passed = append(passed, slot) })
+	reg.SetOrphanHandler(func(_ context.Context, slot int, _ []Orphan) { passed = append(passed, slot) })
 	slots, err := reg.readAllSlots()
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg.passOrphans(slots)
+	reg.passOrphans(context.Background(), slots)
 	silence(reg, 2, slots[2], 2*HeartbeatTimeout)
 	passed = nil
-	reg.passOrphans(slots)
+	reg.passOrphans(context.Background(), slots)
 	if len(passed) != 2 || passed[0] != 0 || passed[1] != 1 {
 		t.Errorf("passed slots %v, want [0 1]: slot 2's heartbeat stopped, so its replay adopts its orphans", passed)
 	}

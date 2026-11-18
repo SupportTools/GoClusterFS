@@ -2032,6 +2032,13 @@ scenarios:
     environments:
       go: internal/node/orphan_pass_test.go::TestBlockedOrphanPassLetsDetectionReplay
 
+  - id: stop-ends-stuck-orphan-pass
+    name: Stop ends an orphan pass stuck on a lock
+    description: An orphan pass waiting on a lock, as it does for a peer that failed mid-pass, ends when the registry stops, so unmount does not wait for that peer's replay
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestStopEndsAStuckOrphanPass
+
   - id: occupant-judges-latest-read
     name: Lock owner checks judge the slot read other checks saw
     description: When another check reads a slot's later heartbeat, Occupant judges that read, so a slot that stays silent turns failing instead of looking alive on every check
