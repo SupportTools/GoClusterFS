@@ -16,7 +16,7 @@ func TestNodeKey(t *testing.T) {
 	if b := NodeKey([16]byte{}); b == 0 {
 		t.Error("a zero UUID gave key 0, which a preempt would treat as every other node")
 	}
-	if ToolKey()>>48 != toolPrefix || ToolKey() == ToolKey() {
+	if first, second := ToolKey(), ToolKey(); first>>48 != toolPrefix || first == second {
 		t.Error("tool keys should carry the GF prefix and be random")
 	}
 }
