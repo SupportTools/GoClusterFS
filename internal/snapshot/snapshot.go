@@ -978,19 +978,19 @@ func decodeDescriptor(sectorData []byte, descIdx uint64) (*Descriptor, error) {
 	}
 
 	desc := &Descriptor{
-		Magic:         magic,
-		SnapshotID:    binary.LittleEndian.Uint64(data[4:12]),
-		ParentID:      binary.LittleEndian.Uint64(data[12:20]),
-		TargetInode:   binary.LittleEndian.Uint32(data[20:24]),
-		State:         State(data[24]),
-		Flags:         Flags(data[25]),
-		DataInode:     binary.LittleEndian.Uint32(data[28:32]),
-		TotalBlocks:   binary.LittleEndian.Uint64(data[36:44]),
-		TotalSize:     binary.LittleEndian.Uint64(data[44:52]),
-		CreateTime:    int64(binary.LittleEndian.Uint64(data[52:60])),
-		DeleteTime:    int64(binary.LittleEndian.Uint64(data[60:68])),
-		TargetBirth:   uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36])),
-		Checksum:      stored,
+		Magic:       magic,
+		SnapshotID:  binary.LittleEndian.Uint64(data[4:12]),
+		ParentID:    binary.LittleEndian.Uint64(data[12:20]),
+		TargetInode: binary.LittleEndian.Uint32(data[20:24]),
+		State:       State(data[24]),
+		Flags:       Flags(data[25]),
+		DataInode:   binary.LittleEndian.Uint32(data[28:32]),
+		TotalBlocks: binary.LittleEndian.Uint64(data[36:44]),
+		TotalSize:   binary.LittleEndian.Uint64(data[44:52]),
+		CreateTime:  int64(binary.LittleEndian.Uint64(data[52:60])),
+		DeleteTime:  int64(binary.LittleEndian.Uint64(data[60:68])),
+		TargetBirth: uint64(binary.LittleEndian.Uint16(data[26:28]))<<32 | uint64(binary.LittleEndian.Uint32(data[32:36])),
+		Checksum:    stored,
 	}
 	if desc.Flags&FlagHasCreator != 0 {
 		desc.Creator = Creator{Slot: data[68], Owner: [7]byte(data[69:76])}
