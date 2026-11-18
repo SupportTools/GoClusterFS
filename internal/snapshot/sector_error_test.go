@@ -183,7 +183,7 @@ func deviceOutsideTmpfs(t *testing.T, size int64) *storage.Device {
 	}
 	path := fmt.Sprintf("peer-writes-%d.bin", time.Now().UnixNano())
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
-		t.Fatal(err)
+		t.Skipf("cannot write a device into the package directory: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
 	if err := os.Truncate(path, size); err != nil {
