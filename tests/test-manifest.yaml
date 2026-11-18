@@ -1626,9 +1626,16 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckRebuildsCorruptRefcountSector
 
+  - id: timed-out-free-retried
+    name: A block free that times out on a lock is retried
+    description: When another node holds the bitmap and refcount locks past the wait limit, a file's freed blocks stay allocated and queued instead of leaked; the node's next free gives them back, and FlushDeferred, which unmount runs, reports none left, with fsck finding no leak
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestTimedOutFreeIsRetried
+
   - id: fsck-reclaim-leaked-blocks
     name: fsck -repair frees leaked blocks
-    description: A failed write and frees that gave up on a lock leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
+    description: A failed write, and frees that gave up on a lock whose node then stopped before retrying them, leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
