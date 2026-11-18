@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,4 +169,37 @@ func TestHeartbeatLandingLateStopsTheNode(t *testing.T) {
 	dev.SetWriteObserver(nil)
 	n.stopped(t)
 	refusesDataWrites(t, dev, 1<<20)
+}
+
+// What fencing has to close: a stall after the last check lets the heartbeat's
+// one write land over a node that registered in the emptied slot meanwhile.
+// Neither node stays up: the old one stops on the late write, and the new one
+// on its next heartbeat, which finds the slot no longer its own.
+func TestHeartbeatLandingLateOverANewOwnerStopsBothNodes(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	n := registerStalledNode(t, dev)
+	newcomer := NewRegistry(dev, 0)
+	var stalled atomic.Bool
+	dev.SetWriteObserver(func(offset int64, _ int) {
+		if offset >= MaxNodes*SlotSize || !stalled.CompareAndSwap(false, true) {
+			return
+		}
+		releaseSlot(t, dev, n.slot)
+		if got, err := newcomer.Register(context.Background(), "newcomer"); err != nil || got != n.slot {
+			t.Errorf("new node registered in slot %d (%v), want the released slot %d", got, err, n.slot)
+		}
+		late := time.Now().Add(-deadAfter - 5*time.Second)
+		n.reg.lastBeat.Store(&late)
+	})
+
+	if err := n.reg.beat(n.slot); !errors.Is(err, ErrSlotLost) {
+		t.Errorf("heartbeat that landed late = %v, want ErrSlotLost", err)
+	}
+	dev.SetWriteObserver(nil)
+	n.stopped(t)
+	refusesDataWrites(t, dev, 1<<20)
+	if err := newcomer.beat(n.slot); !errors.Is(err, ErrSlotLost) {
+		t.Errorf("new node's heartbeat after the late write landed over it = %v, want ErrSlotLost", err)
+	}
 }

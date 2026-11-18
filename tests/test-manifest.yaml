@@ -4631,21 +4631,28 @@ scenarios:
     description: A heartbeat paused between its slot read and its write while a peer replays and empties the slot does not write; the node stops, the write gate refuses data writes without reading the slot, and the slot stays empty
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestStalledBeatStopsWithoutRewritingAReplayedSlot
+      go: internal/node/stall_test.go::TestStalledBeatStopsWithoutRewritingAReplayedSlot
 
   - id: registry-stalled-beat-keeps-new-owner
     name: A stalled heartbeat leaves a new node's registration in place
     description: A heartbeat paused while a peer empties the slot and a new node registers in it does not overwrite the new registration; the old node stops and the new node keeps the slot
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestStalledBeatLeavesNewOwnerInItsSlot
+      go: internal/node/stall_test.go::TestStalledBeatLeavesNewOwnerInItsSlot
 
   - id: registry-late-beat-stops
     name: A heartbeat that lands late stops the node
     description: A heartbeat whose write completes more than HeartbeatTimeout after the last successful one stops the node, and the write gate then refuses data writes
     priority: go_only
     environments:
-      go: internal/node/registry_test.go::TestHeartbeatLandingLateStopsTheNode
+      go: internal/node/stall_test.go::TestHeartbeatLandingLateStopsTheNode
+
+  - id: registry-late-beat-over-new-owner-stops-both
+    name: A late heartbeat over a new owner stops both nodes
+    description: A stall after the last check lets one heartbeat write land over a node that registered in the emptied slot; the old node stops on the late write and the new node on its next heartbeat, so neither stays up next to the other
+    priority: go_only
+    environments:
+      go: internal/node/stall_test.go::TestHeartbeatLandingLateOverANewOwnerStopsBothNodes
 
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
