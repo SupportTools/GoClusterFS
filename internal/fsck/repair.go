@@ -163,6 +163,9 @@ func (c *Checker) startRepair() error {
 		return fmt.Errorf("repair refused: %s, so the journal may hold changes fsck cannot see; "+
 			"mount the filesystem so the journal is replayed and unmount it, or pass -force", strings.Join(unclean, "; "))
 	}
+	if err := c.fenceStoppedNodes(); err != nil {
+		return err
+	}
 	if c.superblockFix != nil {
 		if err := c.superblockFix(); err != nil {
 			return fmt.Errorf("repair superblock checksum: %w", err)
@@ -209,6 +212,27 @@ func (c *Checker) nodes() (live, unclean []string) {
 		}
 	}
 	return live, unclean
+}
+
+// fenceStoppedNodes revokes the device access of every node a slot still names: none runs, but a stalled one could
+// still write over the repair.
+func (c *Checker) fenceStoppedNodes() error {
+	if c.opts.Preempt == nil {
+		return nil
+	}
+	slots, err := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).Slots()
+	if err != nil {
+		return fmt.Errorf("repair refused: the node registry is unreadable, so fsck cannot fence its nodes: %w", err)
+	}
+	for i, slot := range slots {
+		if slot == nil || slot.State == node.NodeStateEmpty {
+			continue
+		}
+		if err := c.opts.Preempt(slot.UUID); err != nil {
+			return fmt.Errorf("repair refused: revoking the device access of %s failed: %w", slotName(i, slot), err)
+		}
+	}
+	return nil
 }
 
 // slotName names node i after the first readable copy of its slot.

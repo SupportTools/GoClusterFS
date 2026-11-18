@@ -41,6 +41,9 @@ func sightingOf(slot *Slot) sighting {
 
 var processStart = time.Now().UnixNano()
 
+// LocalBootID is this host's kernel boot ID, which a node records in its slot.
+func LocalBootID() [16]byte { return readBootID() }
+
 func readBootID() (id [16]byte) {
 	b, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil {

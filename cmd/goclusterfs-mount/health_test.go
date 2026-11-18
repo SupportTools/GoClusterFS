@@ -152,3 +152,12 @@ func fineSources() healthSources {
 		heartbeatAge:     func() time.Duration { return 800 * time.Millisecond },
 	}
 }
+
+func TestFencingHealthNamesAMissingFence(t *testing.T) {
+	if h := fencingHealth("none"); h.Status != api.HealthStatusOK || !strings.HasPrefix(h.Message, "none:") {
+		t.Errorf("unfenced: %+v, want healthy with a message that starts with none:", h)
+	}
+	if h := fencingHealth("pr"); h.Status != api.HealthStatusOK || strings.HasPrefix(h.Message, "none") {
+		t.Errorf("fenced: %+v", h)
+	}
+}

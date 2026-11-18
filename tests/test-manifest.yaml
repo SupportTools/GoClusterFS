@@ -5184,6 +5184,36 @@ scenarios:
     environments:
       go: internal/node/fence_test.go::TestMountingIntoADeadSlotPreempts
 
+  - id: fsck-release-fences
+    name: fsck revokes a node's access before releasing its slot
+    description: -release-slot preempts the slot's node before it resets the journal, and a failed preempt leaves the slot and journal as they were
+    priority: go_only
+    environments:
+      go: internal/fsck/fence_test.go::TestReleaseSlotFencesTheNode
+
+  - id: fsck-repair-fences
+    name: fsck repair revokes stopped nodes' access before it writes
+    description: Repair preempts every node a slot still names after it confirms none runs, and refuses when a preempt fails
+    priority: go_only
+    environments:
+      go: internal/fsck/fence_test.go::TestRepairFencesStoppedNodes
+
+  - id: mount-fencing-health
+    name: /health reports whether the volume is fenced
+    description: The fencing check reports none with the stalled-writer hazard on an unfenced volume, and persistent reservations otherwise
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/health_test.go::TestFencingHealthNamesAMissingFence
+
+  - id: fencing-file-image
+    name: Fencing flags on a device without reservations
+    description: -format -fencing=pr refuses a file image, the default formats it unfenced and warns, /health shows fencing none, and -require-fencing refuses to mount it
+    priority: medium
+    environments:
+      go: fencing_test.go::TestFencingOnAFileImage
+      docker: TODO
+      vm: TODO
+
   - id: storage-last-error
     name: Device remembers its last I/O failure
     description: LastError holds the latest failed read, write or sync until one succeeds, and ignores EOF

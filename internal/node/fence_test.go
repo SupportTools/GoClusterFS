@@ -30,6 +30,9 @@ func fencedPair(t *testing.T, target *fence.Target) (survivor *Registry, failing
 		if err := n.Register(); err != nil {
 			t.Fatal(err)
 		}
+		if err := n.Reserve(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	survivor.SetPreempter(func(owner [16]byte) error { return own.Preempt(fence.NodeKey(owner)) })
 

@@ -28,6 +28,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/cli"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
+	"github.com/supporttools/GoClusterFS/internal/fence"
 	"github.com/supporttools/GoClusterFS/internal/fileops"
 	"github.com/supporttools/GoClusterFS/internal/goclusterfs"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -102,6 +103,8 @@ func main() {
 
 		// Journal configuration
 		journalEnabled = flag.Bool("journal", true, "Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only")
+		fencingMode    = flag.String("fencing", "auto", "With -format: pr fences dead nodes with persistent reservations and fails if the device lacks them, none formats without fencing, and auto picks pr when the device supports it")
+		requireFencing = flag.Bool("require-fencing", false, "Refuse to mount a volume formatted without fencing, on which a stalled node's last writes can land after another node takes over")
 		skipRecovery   = flag.Int("skip-recovery", -1, "Emergency use only: discard the journal of registry slot N instead of replaying it, if this mount takes slot N, losing the writes it holds; -1 replays as normal")
 
 		// Network broadcast configuration
@@ -253,7 +256,15 @@ func main() {
 
 	var sb *superblock.Superblock
 	if *format {
+		if *fencingMode != "auto" && *fencingMode != "pr" && *fencingMode != "none" {
+			usageFailf("-fencing=%s: use auto, pr or none", *fencingMode)
+		}
+		formatFence := formatFencer(dev, *devicePath, *fencingMode)
 		sb, err = superblock.Format(dev, *inodeRatio)
+		if err == nil && formatFence.Kind() == "pr" {
+			sb.RequiredFlags |= superblock.RequiredReservations
+			err = superblock.Write(dev, sb)
+		}
 	} else {
 		sb, err = superblock.Read(dev)
 	}
@@ -282,6 +293,7 @@ func main() {
 	// Create node registry for distributed coordination
 	nodeReg := node.NewRegistry(dev, nodeRegistryOffset)
 	nodeReg.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
+	fencer := joinFencing(dev, *devicePath, sb, nodeReg, *requireFencing)
 	hostname, _ := os.Hostname()
 	if *skipRecovery >= 0 {
 		if *skipRecovery >= int(sb.MaxNodes) {
@@ -627,6 +639,7 @@ func main() {
 				broadcastProblem: cacheMgr.BroadcastProblem,
 				silentPeers:      cacheMgr.SilentBroadcastPeers,
 				heartbeatAge:     func() time.Duration { return nodeReg.Stats().HeartbeatAge },
+				fencing:          fencer.Kind(),
 			})
 			apiServer.SetFileService(fileops.New(gfs))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
@@ -735,6 +748,9 @@ func main() {
 			cacheStats.InvalidationsSent, cacheStats.InvalidationsReceived, cacheStats.BroadcastDuplicates, cacheStats.BroadcastLost)
 	}
 
+	if err := fencer.Unregister(); err != nil {
+		log.Printf("[WARN] Removing this node's reservation key failed: %v; the next node to mount into slot %d removes it", err, slotIdx)
+	}
 	log.Println("Filesystem unmounted.")
 	_ = dev.Close()
 	watch.End()
@@ -749,6 +765,60 @@ Exit codes:
 `
 
 // failf logs why the mount cannot go on and exits with cli.ExitFailure.
+// formatFencer registers a reservation key before -format writes anything, if mode and the device allow fencing.
+// The node's own key replaces it once the registry exists.
+func formatFencer(dev *storage.Device, devicePath, mode string) fence.Fencer {
+	if mode == "none" {
+		return fence.None{}
+	}
+	pr := fence.Block(dev.Fd(), fence.ToolKey())
+	err := pr.Register()
+	switch {
+	case errors.Is(err, fence.ErrUnsupported) && mode == "auto":
+		log.Printf("[WARN] %s does not support persistent reservations, so this volume is formatted without storage fencing: "+
+			"if a node stalls, its last writes can land after another node takes over and corrupt metadata. "+
+			"Format on a device with persistent reservations, and mount with -require-fencing to refuse unfenced volumes", devicePath)
+		return fence.None{}
+	case err != nil:
+		failf("-fencing=%s: registering a reservation key on %s failed: %v; format as root on a device with persistent reservations, or pass -fencing=none", mode, devicePath, err)
+	}
+	if err := pr.Reserve(); err != nil {
+		failf("-fencing=%s: reserving %s failed: %v; release the other reservation, or pass -fencing=none", mode, devicePath, err)
+	}
+	return pr
+}
+
+// joinFencing registers this node's reservation key before its first write on a fenced volume, and makes the
+// registry revoke dead nodes' keys. On an unfenced volume it warns, or with require refuses to mount.
+func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblock, reg *node.Registry, require bool) fence.Fencer {
+	if sb.RequiredFlags&superblock.RequiredReservations == 0 {
+		if require {
+			failf("%s has no storage fencing and -require-fencing is set; format it with -fencing=pr on a device with persistent reservations", devicePath)
+		}
+		log.Printf("[WARN] %s has no storage fencing: if a node stalls, its last writes can land after another node takes over and corrupt metadata. "+
+			"Format on a device with persistent reservations, and mount with -require-fencing to refuse unfenced volumes", devicePath)
+		return fence.None{}
+	}
+	if err := syscall.Flock(int(dev.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		failf("Another process on this host has %s open for fencing, maybe a stopped goclusterfs-mount (%v). "+
+			"A host has one reservation key per device, so stop that process first", devicePath, err)
+	}
+	pr := fence.Block(dev.Fd(), fence.NodeKey(reg.LocalUUID()))
+	if err := pr.Register(); err != nil {
+		failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
+	}
+	if err := pr.Reserve(); err != nil {
+		failf("%s is fenced, and reserving it failed: %v; release the other reservation first", devicePath, err)
+	}
+	reg.SetPreempter(func(owner [16]byte) error { return pr.Preempt(fence.NodeKey(owner)) })
+	dev.SetFencedHandler(func(err error) {
+		failf("The device refused a write (%v): another node declared this node dead and revoked its access, so it stops before anything else it holds reaches the volume. "+
+			"Check that this node did not stall, then mount again", err)
+	})
+	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
+	return pr
+}
+
 func failf(format string, args ...any) {
 	log.Printf(format, args...)
 	os.Exit(cli.ExitFailure)
