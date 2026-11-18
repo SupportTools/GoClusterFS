@@ -125,6 +125,10 @@ type FS struct {
 	// mounted is set by MarkMounted once a FUSE server serves the root, so kernel notifications have somewhere to go.
 	mounted atomic.Bool
 
+	// badEntries holds the damaged directory entries childInRange has logged, at most maxBadEntries of them.
+	badEntriesMu sync.Mutex
+	badEntries   map[badEntry]bool
+
 	// Storage layer
 	dev *storage.Device
 	sb  *superblock.Superblock
@@ -1560,12 +1564,37 @@ func sameForRemoval(was, cur *inode.Inode) bool {
 // names an inode at or past the end of the inode table. Only a damaged entry
 // does, and narrowing its number to the table's uint32 could reach a real inode.
 func (f *FS) childInRange(dirNum uint32, name string, num uint64) syscall.Errno {
-	if total := f.inodeTbl.TotalInodes(); num >= total {
+	total := f.inodeTbl.TotalInodes()
+	if num < total {
+		return 0
+	}
+	if f.firstSighting(badEntry{dirNum, name}) {
 		log.Printf("[ERROR] Directory %d: entry %q names inode %d, past the inode table's %d inodes. "+
 			"Unmount the filesystem on every node and run goclusterfs-fsck", dirNum, name, num, total)
-		return syscall.EIO
 	}
-	return 0
+	return syscall.EIO
+}
+
+type badEntry struct {
+	dir  uint32
+	name string
+}
+
+// maxBadEntries caps how many damaged entries are remembered; past it the set starts over, so each is logged again.
+const maxBadEntries = 256
+
+// firstSighting reports whether e is not yet in the set of logged damaged entries, and adds it.
+func (f *FS) firstSighting(e badEntry) bool {
+	f.badEntriesMu.Lock()
+	defer f.badEntriesMu.Unlock()
+	if f.badEntries[e] {
+		return false
+	}
+	if f.badEntries == nil || len(f.badEntries) >= maxBadEntries {
+		f.badEntries = make(map[badEntry]bool)
+	}
+	f.badEntries[e] = true
+	return true
 }
 
 // removeEntryOnce returns EAGAIN when another node changes the child between the lookup and the removal.
