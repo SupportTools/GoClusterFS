@@ -4505,6 +4505,13 @@ scenarios:
     environments:
       go: internal/storage/device_test.go::TestWriteGateRefusesWrites
 
+  - id: storage-write-gate-recheck-after-shard-wait
+    name: A write checks its gate again after waiting for its shard lock
+    description: A write that passed the gate and then waited for another write to the same 1 MB region asks again right before it lands, and fails without reaching the device when the gate turned against it meanwhile
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestWriteRechecksGateAfterWaitingForItsShard
+
   - id: trim-discard-refused-by-write-gate
     name: Discard refused by the write gate
     description: A queued discard does not run when the device's write gate refuses it
@@ -4532,6 +4539,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/node/registry_test.go::TestWriteGateRefusesWritesOnceSlotIsLost
+
+  - id: registry-write-fresh-probe
+    name: Registry freshness probe matches the write gate without I/O
+    description: WriteFresh passes a data write only while CheckOwnership would pass it without writing a heartbeat, and always passes registry writes
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestWriteFreshNeedsAHeartbeatCheckOwnershipWouldTrust
 
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale

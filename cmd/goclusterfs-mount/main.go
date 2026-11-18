@@ -318,6 +318,7 @@ func main() {
 		failf("Failed to start node heartbeat: %v", err)
 	}
 	dev.SetWriteGate(nodeReg.WriteGate)
+	dev.SetWriteFresh(nodeReg.WriteFresh)
 	nodeUUID := nodeReg.LocalUUID()
 	log.Printf("Registered as node %d (UUID: %x)", slotIdx, nodeUUID[:8])
 	journalOffset, journalSize := nodeReg.LocalJournal()

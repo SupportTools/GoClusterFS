@@ -1830,3 +1830,24 @@ func TestWriteGateRefusesWritesOnceSlotIsLost(t *testing.T) {
 		t.Error("the refused write reached the device")
 	}
 }
+
+// WriteFresh trusts a heartbeat only as long as CheckOwnership would without I/O.
+func TestWriteFreshNeedsAHeartbeatCheckOwnershipWouldTrust(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	reg := NewRegistry(dev, 0)
+	if _, err := reg.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	if !reg.WriteFresh(1 << 20) {
+		t.Fatal("a data write right after Register is not fresh")
+	}
+	paused := time.Now().Add(-HeartbeatTimeout)
+	reg.lastBeat.Store(&paused)
+	if reg.WriteFresh(1 << 20) {
+		t.Error("a data write is fresh with a heartbeat CheckOwnership would rewrite first")
+	}
+	if !reg.WriteFresh(SlotSize) {
+		t.Error("a registry write is not fresh; the heartbeat itself could not land")
+	}
+}
