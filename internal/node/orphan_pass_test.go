@@ -69,6 +69,7 @@ func TestStopEndsAStuckOrphanPass(t *testing.T) {
 		}
 		<-ctx.Done()
 	})
+	reg.SetRecoveryHandler(func(*FailedNodeInfo) error { return nil })
 	reg.StartFailureDetection()
 	select {
 	case <-entered:
