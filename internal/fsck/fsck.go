@@ -396,10 +396,11 @@ type Checker struct {
 	dirNames        map[uint32]int   // directory inode -> names it holds
 	namesIncomplete []string         // why dirEntryRefs may miss names
 	unnamed         []uint32         // inodes other than root that no directory names
-	snapshotInodes  map[uint32]bool  // inodes referenced by snapshots
+	snapshotTargets map[uint32]bool  // inodes snapshots were taken of; an orphan's slot may now hold a later inode
+	snapshotRefs    map[uint32]bool  // snapshot data inodes that a snapshot's DataInode points at
 	snapshotData    map[uint32]bool  // inodes holding a snapshot's captured extents
 	orphanData      map[uint32]int   // phase 7's problem for each data inode no snapshot refers to
-	snapsIncomplete []string         // why snapshotInodes may miss references
+	snapsIncomplete []string         // why snapshotTargets and snapshotRefs may miss references
 	sfbContainers   map[uint64]bool  // blocks holding small files of older versions
 	extentTrees     map[uint32]*extentTree
 	uncounted       map[uint32]int  // inodes an older version shared -> problem index
@@ -481,7 +482,8 @@ func New(dev *storage.Device, opts Options) *Checker {
 		entryType:       make(map[uint32]uint8),
 		dirEntryRefs:    make(map[uint32]int),
 		dirNames:        make(map[uint32]int),
-		snapshotInodes:  make(map[uint32]bool),
+		snapshotTargets: make(map[uint32]bool),
+		snapshotRefs:    make(map[uint32]bool),
 		snapshotData:    make(map[uint32]bool),
 		orphanData:      make(map[uint32]int),
 		sfbContainers:   make(map[uint64]bool),

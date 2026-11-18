@@ -65,10 +65,10 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	t.Cleanup(func() { _ = dev.Close() })
 
 	slot := int(snapFSNodes.Add(1)-1) % 64
-	var nodeUUID [16]byte
-	copy(nodeUUID[:], "testnode12345678")
-	nodeUUID[15] = byte(slot)
+	nodeUUID := snapNodeUUID(slot)
 	locks := lock.NewManager(dev, snapFSLockOffset, superblock.LockRegionSize, nodeUUID, slot)
+	// Like a mount whose peers keep beating: a live node's claim never frees by age.
+	locks.SetOwnerView(func(slot int, _ bool) ([16]byte, lock.OwnerState) { return snapNodeUUID(slot), lock.OwnerAlive })
 	t.Cleanup(locks.ReleaseCached)
 	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
@@ -82,6 +82,13 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	}
 	t.Cleanup(fsys.snapshotWkr.Stop)
 	return fsys
+}
+
+func snapNodeUUID(slot int) [16]byte {
+	var u [16]byte
+	copy(u[:], "testnode12345678")
+	u[15] = byte(slot)
+	return u
 }
 
 func setxattr(t *testing.T, f *File, attr, value string) {
@@ -110,6 +117,27 @@ func truncateFile(t *testing.T, f *File, size uint64) {
 	in.Valid = fuse.FATTR_SIZE
 	in.Size = size
 	if errno := f.Setattr(context.Background(), nil, in, &fuse.AttrOut{}); errno != 0 {
+		t.Fatalf("truncate inode %d to %d: %v", f.inodeNum, size, errno)
+	}
+}
+
+// writeBelowIOLock and truncateBelowIOLock change f as if this node held the
+// file's I/O lock. That lock orders writes and snapshots of one file across
+// nodes, so only these let a test race them to check the protocol under it.
+func writeBelowIOLock(t *testing.T, f *File, data []byte, off int64) {
+	t.Helper()
+	n, errno := f.writeIOLocked(context.Background(), data, off)
+	if errno != 0 || int(n) != len(data) {
+		t.Fatalf("inode %d: write %d bytes at %d: n=%d errno=%v", f.inodeNum, len(data), off, n, errno)
+	}
+}
+
+func truncateBelowIOLock(t *testing.T, f *File, size uint64) {
+	t.Helper()
+	in := &fuse.SetAttrIn{}
+	in.Valid = fuse.FATTR_SIZE
+	in.Size = size
+	if errno := f.setattrIOLocked(context.Background(), nil, in, &fuse.AttrOut{}); errno != 0 {
 		t.Fatalf("truncate inode %d to %d: %v", f.inodeNum, size, errno)
 	}
 }
@@ -443,7 +471,7 @@ func TestConcurrentCopyOnWriteAcrossNodes(t *testing.T) {
 	t.Cleanup(func() { beforeCoWCommit = nil })
 	beforeCoWCommit = func() {
 		beforeCoWCommit = nil
-		writeAt(t, f, pattern(2, 100), 0)
+		writeBelowIOLock(t, f, pattern(2, 100), 0)
 	}
 	writeAt(t, fileNode(nodeB, f.inodeNum), pattern(3, 100), 200)
 	if beforeCoWCommit != nil {
@@ -502,7 +530,7 @@ func TestSnapshotDuringInPlaceWriteAcrossNodes(t *testing.T) {
 				beforeInPlaceWrite = nil
 				setxattr(t, fileNode(nodeB, f.inodeNum), "user.snapshot", "mid")
 			}
-			writeAt(t, f, pattern(2, 4096), 0)
+			writeBelowIOLock(t, f, pattern(2, 4096), 0)
 			if beforeInPlaceWrite != nil {
 				t.Fatal("node A's write never reached an in-place write")
 			}
@@ -559,11 +587,75 @@ func TestSnapshotMarkKeepsConcurrentAppend(t *testing.T) {
 	checkFile(t, lookupFile(t, nodeB, "snap-clone"), original)
 }
 
-// Node A has checked a block and is writing it in place when node B's snapshot
-// counts the block and node C starts a write that must copy it. C copies the
-// block only after A's data lands, so neither acknowledged write is lost, even
-// when C commits before A updates the inode's size and mtime.
-func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
+// Node A is writing a block in place when the block gains a second owner and
+// node C starts a write to the same file that must copy the block. C waits for
+// A's write to end, so its copy holds A's data and neither write is lost.
+func TestCopyOnWriteWaitsForConcurrentInPlaceWrite(t *testing.T) {
+	path := newSnapshotFSImage(t)
+	nodeA := openSnapshotFS(t, path)
+	ctx := context.Background()
+	if err := nodeA.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	original := pattern(1, BlockSize)
+	f := newRegularFile(t, nodeA)
+	writeAt(t, f, original, 0)
+	setxattr(t, f, "user.snapshot", "gone")
+	if errno := f.Removexattr(ctx, "user.snapshot.gone"); errno != 0 {
+		t.Fatalf("delete snapshot: %v", errno)
+	}
+	waitSnapshotGone(t, nodeA, "gone")
+	shared := physicalBlock(t, nodeA, f.inodeNum, 0)
+
+	nodeB := openSnapshotFS(t, path)
+	nodeC := openSnapshotFS(t, path)
+	copying := make(chan struct{})
+	cDone := make(chan syscall.Errno, 1)
+	var copyStarted sync.Once
+	// The hooks are set before node C's goroutine starts and stay set, so they need no locking.
+	t.Cleanup(func() { duringInPlaceWrite, beforeCoWCommit = nil, nil })
+	beforeCoWCommit = func() { copyStarted.Do(func() { close(copying) }) }
+	inPlace := false
+	duringInPlaceWrite = func() {
+		if inPlace {
+			return
+		}
+		inPlace = true
+		if _, err := nodeB.refcountReg.Share(ctx, []uint64{shared}); err != nil {
+			t.Error(err)
+		}
+		go func() {
+			_, errno := (fileNode(nodeC, f.inodeNum)).Write(ctx, nil, pattern(3, 4096), BlockSize/2)
+			cDone <- errno
+		}()
+		select {
+		case <-copying:
+			t.Error("node C reached its copy of the block while node A was still writing it in place")
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	writeAt(t, f, pattern(2, 4096), 0)
+	if !inPlace {
+		t.Fatal("node A's write never wrote in place")
+	}
+	if errno := <-cDone; errno != 0 {
+		t.Fatalf("node C write: %v", errno)
+	}
+
+	after := openSnapshotFS(t, path)
+	if physicalBlock(t, after, f.inodeNum, 0) == shared {
+		t.Fatal("node C wrote in place instead of copying the block it saw shared")
+	}
+	want := overwritten(overwritten(original, 0, pattern(2, 4096)), BlockSize/2, pattern(3, 4096))
+	checkFile(t, fileNode(after, f.inodeNum), want)
+}
+
+// Below the file's I/O lock: node A has checked a block and is writing it in
+// place when node B's snapshot counts the block and node C starts a write that
+// must copy it. C copies the block only after A's data lands, so neither
+// acknowledged write is lost, even when C commits before A updates the inode's
+// size and mtime.
+func TestCopyOnWriteKeepsInPlaceWriteBelowIOLock(t *testing.T) {
 	path := newSnapshotFSImage(t)
 	nodeA := openSnapshotFS(t, path)
 	ctx := context.Background()
@@ -613,7 +705,7 @@ func TestCopyOnWriteKeepsConcurrentInPlaceWrite(t *testing.T) {
 		}()
 		<-copying
 	}
-	writeAt(t, f, pattern(2, 4096), 0)
+	writeBelowIOLock(t, f, pattern(2, 4096), 0)
 	if !inPlace {
 		t.Fatal("node A's write never wrote in place")
 	}
@@ -667,19 +759,19 @@ func TestSnapshotRetriesWhenFileChangesWhileSharing(t *testing.T) {
 		want       func(original []byte) []byte
 	}{
 		{"in-place write", false,
-			func(t *testing.T, f *File) { writeAt(t, f, pattern(2, 4096), 0) },
+			func(t *testing.T, f *File) { writeBelowIOLock(t, f, pattern(2, 4096), 0) },
 			func(o []byte) []byte { return overwritten(o, 0, pattern(2, 4096)) }},
 		{"copy on write", true,
-			func(t *testing.T, f *File) { writeAt(t, f, pattern(2, 4096), 0) },
+			func(t *testing.T, f *File) { writeBelowIOLock(t, f, pattern(2, 4096), 0) },
 			func(o []byte) []byte { return overwritten(o, 0, pattern(2, 4096)) }},
 		{"truncate", false,
-			func(t *testing.T, f *File) { truncateFile(t, f, BlockSize) },
+			func(t *testing.T, f *File) { truncateBelowIOLock(t, f, BlockSize) },
 			func(o []byte) []byte { return o[:BlockSize] }},
 		{"truncate once shared", true,
-			func(t *testing.T, f *File) { truncateFile(t, f, BlockSize) },
+			func(t *testing.T, f *File) { truncateBelowIOLock(t, f, BlockSize) },
 			func(o []byte) []byte { return o[:BlockSize] }},
 		{"append", false,
-			func(t *testing.T, f *File) { writeAt(t, f, pattern(3, 4096), 2*BlockSize) },
+			func(t *testing.T, f *File) { writeBelowIOLock(t, f, pattern(3, 4096), 2*BlockSize) },
 			func(o []byte) []byte { return append(bytes.Clone(o), pattern(3, 4096)...) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

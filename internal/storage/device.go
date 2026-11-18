@@ -39,6 +39,9 @@ const (
 	IOShardSize = 1 << 20 // 1MB
 )
 
+// ErrOutOfRange is the error for a read or write that reaches outside the device.
+var ErrOutOfRange = errors.New("I/O outside the device")
+
 // Device represents a block device opened with O_DIRECT.
 // I/O operations are protected by sharded locks to allow parallel access
 // to different regions of the device. Operations within the same 1MB region
@@ -48,6 +51,9 @@ type Device struct {
 	closeMu  sync.RWMutex            // Protects close; held shared during I/O
 	// writeGate, when set, runs before every write and can refuse it.
 	writeGate atomic.Pointer[func(offset int64) error]
+	// writeFresh, when set, says without I/O whether a write that passed the
+	// gate may still land once it holds its locks.
+	writeFresh atomic.Pointer[func(offset int64) bool]
 	// readFault, when a test sets it, runs before every read and can fail it.
 	readFault atomic.Pointer[func(offset int64) error]
 	// writeObserver and syncObserver let tests model a volatile write cache.
@@ -197,6 +203,9 @@ func (d *Device) readAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if err := d.checkRange(offset, len(buf)); err != nil {
+		return 0, err
+	}
 	if fault := d.readFault.Load(); fault != nil {
 		if err := (*fault)(offset); err != nil {
 			return 0, err
@@ -237,31 +246,54 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
 	}
+	if err := d.checkRange(offset, len(buf)); err != nil {
+		return 0, err
+	}
 	if err := d.CheckWrite(offset); err != nil {
 		return 0, err
 	}
 	if observe := d.writeObserver.Load(); observe != nil {
 		(*observe)(offset, len(buf))
 	}
+	for {
+		if landed, n, err := d.writeIfFresh(buf, offset, sharded); landed {
+			return n, err
+		}
+		if err := d.CheckWrite(offset); err != nil {
+			return 0, err
+		}
+	}
+}
 
-	// Acquire shared close lock to prevent device close during I/O
+// writeIfFresh writes buf unless the gate went stale while it waited for its
+// locks. The gate itself may do I/O, which cannot take closeMu again here.
+func (d *Device) writeIfFresh(buf []byte, offset int64, sharded bool) (landed bool, n int, err error) {
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
-
 	if sharded {
 		startShard, endShard := d.lockIORange(offset, len(buf))
 		defer d.unlockIORange(startShard, endShard)
 	}
-
-	n, err := d.file.WriteAt(buf, offset)
+	if fresh := d.writeFresh.Load(); fresh != nil && !(*fresh)(offset) {
+		return false, 0, nil
+	}
+	n, err = d.file.WriteAt(buf, offset)
 	d.record(err)
-	return n, err
+	return true, n, err
 }
 
 // SetWriteGate makes every write call gate with its offset first, and fail
 // with gate's error instead of writing.
 func (d *Device) SetWriteGate(gate func(offset int64) error) {
 	d.writeGate.Store(&gate)
+}
+
+// SetWriteFresh makes every write that passed the gate ask fresh again once it
+// holds its locks, right before it lands. When fresh says no, the write lets go
+// of its locks and runs the gate again, so a write that waited past what its
+// gate proved cannot land on the strength of the old check.
+func (d *Device) SetWriteFresh(fresh func(offset int64) bool) {
+	d.writeFresh.Store(&fresh)
 }
 
 // SetReadFault makes fault run before every read; a read it returns an error for fails with that error.
@@ -334,6 +366,15 @@ func (d *Device) record(err error) {
 // Fd returns the file descriptor for use with syscalls.
 func (d *Device) Fd() uintptr {
 	return d.file.Fd()
+}
+
+// checkRange refuses n bytes at offset unless they fit inside the device; offsets come from on-disk numbers, which
+// damage can make negative or past the end.
+func (d *Device) checkRange(offset int64, n int) error {
+	if offset < 0 || int64(n) > d.size || offset > d.size-int64(n) {
+		return fmt.Errorf("%w: %d bytes at offset %d, device has %d", ErrOutOfRange, n, offset, d.size)
+	}
+	return nil
 }
 
 // validateAlignment checks that buffer and offset meet O_DIRECT requirements.

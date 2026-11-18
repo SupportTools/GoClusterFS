@@ -64,7 +64,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-journal` | bool | `true` | Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only. The mount still replays the journal its registry slot holds from an earlier crash, and `-skip-recovery` still discards it |
-| `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data) |
+| `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data). Refuses while other nodes run if the journal holds a committed transaction or cannot be read |
 | `-block-reserve` | int | `64` | Data blocks each node takes from the bitmap at once and hands out to writes without the cluster-wide bitmap lock; `0` turns reserves off. Needs `-journal`. See [Block Reserves](OPERATIONS.md#block-reserves) |
 
 ### Network Broadcast Flags
@@ -123,7 +123,7 @@ Each mount on a host needs its own `-api-addr`. When the port is taken, mount lo
 
 These endpoints change the filesystem or this node's state, and listing snapshots reads filesystem metadata. They only work with a token, also on loopback: the Host check stops web pages, not other local processes. Without a token they answer 403, and mount logs `API: snapshot, clone and admin endpoints are off`. The API refuses cross-origin writes: a CORS preflight for any method but `GET` or `HEAD` fails, and a write whose `Origin` header names another site gets 403. Same-origin pages and non-browser clients can call them.
 
-Snapshots belong to single files. A snapshot stays with the file it was taken of: once that file is deleted, the snapshot is an orphan, which only the full listing shows and only a delete without `path` removes. A later file that reuses the inode number does not see it. Snapshots written by versions before this record cannot prove their file, so they are orphans too. A request names the file by its path in the mount, such as `/dir/file`. The path must be absolute and clean, and may not go through a symlink or out of the mount. Snapshot names are unique in the filesystem. The API creates and clones only names without `:`, `/` or NUL, because `user.snapshot.clone` splits at the first `:`. It deletes any name; escape `/` as `%2F` in the URL.
+Snapshots belong to single files. A snapshot stays with the file it was taken of: once that file loses its last name, the snapshot is an orphan, which only the full listing shows and only a delete without `path` removes. That holds even while a node still has the unlinked file open, since no path reaches it; a new snapshot of an unlinked file fails with ENOENT. A later file that reuses the inode number does not see it. Snapshots written by versions before this record cannot prove their file, so they are orphans too. A request names the file by its path in the mount, such as `/dir/file`. The path must be absolute and clean, and may not go through a symlink or out of the mount. Snapshot names are unique in the filesystem. The API creates and clones only names without `:`, `/` or NUL, because `user.snapshot.clone` splits at the first `:`. It deletes any name; escape `/` as `%2F` in the URL.
 
 | Method and path | Body | Does the same as | Success |
 |-----------------|------|------------------|---------|

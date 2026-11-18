@@ -479,19 +479,42 @@ func RecoverPrint(txn *RecoveredTxn) error {
 	return nil
 }
 
+// PendingCommitted counts the committed transactions a replay of the journal at offset would apply, which resetting
+// the journal drops. It returns an error when it cannot tell: the header or a record cannot be read, or the state is
+// unusable.
+func PendingCommitted(dev *storage.Device, offset, size uint64) (int, error) {
+	region, err := OpenRegionForRecovery(dev, offset, size)
+	if errors.Is(err, ErrJournalUninitialized) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = region.Close() }()
+	if err := region.Superblock().checkState(); err != nil {
+		return 0, err
+	}
+	_, stats, err := DryRunRecover(region)
+	return stats.TxnCommitted - stats.IntentsSkipped, err
+}
+
 // DryRunRecover scans the journal without modifying state.
 // Returns the list of transactions that would be replayed.
 func DryRunRecover(region *Region) ([]*RecoveredTxn, *RecoveryStats, error) {
 	if !region.NeedsRecovery() {
 		return nil, &RecoveryStats{}, nil
 	}
+	if err := region.Superblock().checkVersion(); err != nil {
+		return nil, &RecoveryStats{}, err
+	}
 
 	var txns []*RecoveredTxn
 	stats := &RecoveryStats{}
 
+	// A replay stops at a transaction it cannot apply, so the dry run lists that one last.
 	handler := func(txn *RecoveredTxn) error {
 		txns = append(txns, txn)
-		return nil
+		return unknownOpIn(txn)
 	}
 
 	// On an error, txns holds the transactions read before it.

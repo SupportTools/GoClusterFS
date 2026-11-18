@@ -875,28 +875,28 @@ scenarios:
 
   - id: hostile-storage-short-stalls
     name: Short storage stalls on one node
-    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; the node keeps running and is never replayed, during the 5s stall its peer never waits on it as a failing node (a node counts as failing after 10s of silence), every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_short_stalls
 
   - id: hostile-storage-long-stall
     name: Long storage stall fences the node
-    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: One node's path stalls for 25s and then 35s. After 25s the node either keeps running with its slot untouched, or is replayed and stops on finding its slot taken without acknowledging new creates. After 35s it must be replayed 17 to 32s after the stall began (deadAfter judged at FailureCheckInterval scans) and stop that way. Every acknowledged file reads back and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_long_stall
 
   - id: hostile-storage-short-eio
     name: Short EIO burst on one node
-    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: Every I/O on one node's path fails for 2s; the node keeps running, its peer never waits on it as a failing node or replays it, every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_short_eio
 
   - id: hostile-storage-long-eio
     name: Long EIO burst fences the node
-    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: Every I/O on one node's path fails for 8s; the node stops itself once its heartbeat writes have failed for 5 to 9s, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_long_eio
@@ -1578,6 +1578,16 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: fsck-online-release
+    name: fsck releases a slot online only when nothing committed is lost
+    description: With node B mounted, -release-slot frees paused node A's slot after watching it unchanged, B then writes A's file, and A, resumed, stops on the slot loss without its write landing; with committed transactions in a dead node's journal, -release-slot with -salvage or -discard-journal and a mount with -skip-recovery all refuse while B runs and name the steps to stop the cluster and run -repair
+    priority: high
+    # Docker/VM: their images do not ship goclusterfs-fsck. The Go test runs both binaries against real mounts.
+    environments:
+      go: fsck_test.go::TestFsckOnlineRelease
+      docker: TODO
+      vm: TODO
+
   - id: fsck-release-dead-slot
     name: fsck releases a dead node's slot
     description: -release-slot exits 8 while the node is mounted and -inspect-slot reads the live slot; after the node dies with a damaged journal header, -list-slots and -inspect-slot show the damage, -release-slot refuses to act without -salvage or -discard-journal, prints what it discards without writing, -discard-journal -report FILE frees the slot and writes the discarded journal to FILE, and a mount then uses it
@@ -1616,9 +1626,16 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckRebuildsCorruptRefcountSector
 
+  - id: timed-out-free-retried
+    name: A block free that times out on a lock is retried
+    description: When another node holds the bitmap and refcount locks past the wait limit, a file's freed blocks stay allocated and queued instead of leaked; the node's next free gives them back, and FlushDeferred, which unmount runs, reports none left, with fsck finding no leak
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestTimedOutFreeIsRetried
+
   - id: fsck-reclaim-leaked-blocks
     name: fsck -repair frees leaked blocks
-    description: A failed write and frees that gave up on a lock leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
+    description: A failed write, and frees that gave up on a lock whose node then stopped before retrying them, leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
@@ -2094,6 +2111,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestOrphanSnapshotListedAndDeletable
 
+  - id: orphan-snapshot-of-unlinked-open-file
+    name: A snapshot of a file unlinked while another node holds it open is an orphan
+    description: Before the unlink, deleting the snapshot without its file fails with EBUSY. Once another node unlinks the file while a node still has it open, the full listing marks the snapshot an orphan and the no-path delete removes it; a new snapshot through the open handle fails with ENOENT, the holder keeps reading and writing its data, and after its last close the inode is freed and fsck finds no problem
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotOfAnUnlinkedFileIsAnOrphanWhileHeld
+
   - id: snapshot-without-birth-is-orphan
     name: A snapshot without its file's birth generation is an orphan
     description: A descriptor as older versions wrote it cannot prove which file it belongs to; the file does not list it, the full listing marks it an orphan, and fsck reports it
@@ -2248,6 +2272,27 @@ scenarios:
     environments:
       go: internal/fsck/inspect_test.go::TestInspectSlot
 
+  - id: fs-entry-past-inode-table-logged-once
+    name: A damaged directory entry is logged once
+    description: Every lookup of a directory entry naming an inode past the inode table fails with EIO, but the error is logged once per directory and name, and the set of logged entries stays under its cap however many damaged entries are looked up
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/child_range_test.go::TestDamagedEntryLoggedOnce
+
+  - id: replay-rejects-inode-past-table
+    name: Replay refuses an inode number past the inode table
+    description: A record naming inode 2^32+2, or any number at or past the inode table's size, as the inode a create, delete, extent change or rename writes or as the child a directory entry gets, fails replay with ErrInodeOutOfRange and changes nothing, instead of wrapping onto a real inode such as the root
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayRefusesInodePastTheTable
+
+  - id: fs-entry-past-inode-table
+    name: A directory entry naming an inode past the table fails with EIO
+    description: With a directory entry naming inode 2^32+2, lookup in the root and in a subdirectory, unlink, rename and the API's path lookup all fail with EIO and log the entry, and the root inode, which the number would wrap onto, is unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/child_range_test.go::TestEntryPastTheInodeTableIsEIO
+
   - id: journal-entry-touches
     name: Journal entries name what they change
     description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
@@ -2261,6 +2306,41 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlot
+
+  - id: skip-recovery-online-refusal
+    name: -skip-recovery refuses to drop committed transactions while nodes run
+    description: skipRecoveryLoss names the running node and the committed transactions when the named slot's journal holds some or cannot be read while another node heartbeats, and allows the discard once no other node runs or the journal holds nothing committed
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/recovery_test.go::TestSkipRecoveryRefusesLossWhileNodesRun
+
+  - id: fsck-release-slot-online
+    name: fsck slot release while other nodes run
+    description: While another node heartbeats, release watches the slot unchanged on its own clock (longer for a slot under a recovery lease) and refuses if it changes, refuses a journal with committed transactions, one it cannot read or one in an unusable state, never replays, and frees a slot whose journal holds nothing committed; the released node's CheckOwnership then fails, and the release clears the slot's lock claims, so after another node registers in the slot a peer takes the released node's lock at once
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotOnline
+
+  - id: replay-refuses-unknown-op
+    name: Replay refuses a journal it cannot fully read
+    description: A committed transaction holding an op type this build does not define fails both a peer's replay and a node's own replay with ErrUnknownOp before any of its entries apply; the transactions before it stay applied, the ones after it do not, and the journal stays in recovery for an admin. DryRunRecover stops at it with the same error, and replay and DryRunRecover refuse a journal whose header names a newer format version
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestReplayRefusesUnknownOp
+
+  - id: journal-pending-committed
+    name: Count the committed transactions a journal reset would drop
+    description: PendingCommitted is 0 for a journal never initialized, a clean one, or one whose only transaction is uncommitted, counts committed transactions, and errors on a damaged header, an unusable state or a record it cannot read
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestPendingCommitted
+
+  - id: registry-running-slots
+    name: Registry reports which slots change during a watch
+    description: RunningSlots lists the slots whose bytes change while it watches, such as a heartbeating node's, and not a stopped node's or an empty slot
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestRunningSlots
 
   - id: fsck-release-slot-salvage
     name: fsck slot release salvages a journal's good transactions
@@ -3688,11 +3768,18 @@ scenarios:
       go: internal/goclusterfs/snapshot_test.go::TestSnapshotDuringInPlaceWriteAcrossNodes
 
   - id: cow-keeps-concurrent-inplace-write
-    name: Copy-on-write keeps an in-place write landing on another node
-    description: Node A is writing a block in place when node B's snapshot counts it and node C copies it; C copies the data only under the exclusive inode lock, after A's write landed, so neither write is lost
+    name: Copy-on-write waits for an in-place write landing on another node
+    description: Node A is writing a block in place when the block gains a second owner and node C starts a write to the same file that must copy it; C waits for A's write to end, so its copy holds A's data and neither write is lost
     priority: go_only
     environments:
-      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsConcurrentInPlaceWrite
+      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteWaitsForConcurrentInPlaceWrite
+
+  - id: cow-keeps-inplace-write-below-io-lock
+    name: Copy-on-write keeps an in-place write that got past the file I/O lock
+    description: With node A's in-place write below the file I/O lock, node B's snapshot counts the block and node C copies it; C copies the data only under the exclusive inode lock, after A's write landed, so neither write is lost
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsInPlaceWriteBelowIOLock
 
   - id: snapshot-mark-keeps-concurrent-append
     name: Snapshot mark keeps another node's append
@@ -3807,7 +3894,7 @@ scenarios:
 
   - id: fuzz-journal-replay
     name: Fuzz journal replay
-    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s; every error fsck then finds names an inode or block the records touched or one those map
+    description: Journals of well-formed records written by the real journal, some completed or torn, replay over a small filesystem within 30s without a panic, even when a record sends replay to a block outside the device; every error fsck then finds names an inode or block the records touched or one those map
     priority: go_only
     environments:
       go: internal/fsck/replay_fuzz_test.go::FuzzReplay
@@ -4476,6 +4563,13 @@ scenarios:
     environments:
       go: internal/storage/device_test.go::TestWriteGateRefusesWrites
 
+  - id: storage-write-gate-recheck-after-shard-wait
+    name: A write checks its gate again after waiting for its shard lock
+    description: A write that passed the gate and then waited for another write to the same 1 MB region asks again right before it lands, and fails without reaching the device when the gate turned against it meanwhile
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestWriteRechecksGateAfterWaitingForItsShard
+
   - id: trim-discard-refused-by-write-gate
     name: Discard refused by the write gate
     description: A queued discard does not run when the device's write gate refuses it
@@ -4503,6 +4597,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/node/registry_test.go::TestWriteGateRefusesWritesOnceSlotIsLost
+
+  - id: registry-write-fresh-probe
+    name: Registry freshness probe matches the write gate without I/O
+    description: WriteFresh passes a data write only while CheckOwnership would pass it without writing a heartbeat, and always passes registry writes
+    priority: go_only
+    environments:
+      go: internal/node/registry_test.go::TestWriteFreshNeedsAHeartbeatCheckOwnershipWouldTrust
 
   - id: lock-leaked-shared-count-goes-stale
     name: Leaked read claim goes stale
@@ -4623,6 +4724,20 @@ scenarios:
     environments:
       go: internal/lock/release_retry_test.go::TestFailedReleaseWriteIsRetried
 
+  - id: snapshot-registry-rereads-torn-sector
+    name: Snapshot registry reads a torn sector again on its own
+    description: The registry reads its region in one I/O; a sector whose checksum fails in that read, as one a peer was writing, is read again by itself, so a listing still returns its snapshots, and a sector damaged on disk still fails with UnreadableSectorError
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestRegistryRereadsATornSector
+
+  - id: snapshot-registry-list-during-peer-writes
+    name: Snapshot listings while a peer rewrites a slot
+    description: While a second registry on the same device rewrites one descriptor in a loop, every listing by the first succeeds and includes a snapshot in the same sector that never changes
+    priority: go_only
+    environments:
+      go: internal/snapshot/sector_error_test.go::TestRegistryListsWhileAPeerRewritesASlot
+
   - id: snapshot-unreadable-sector-not-rewritten
     name: An unreadable snapshot registry sector is not rewritten
     description: With a registry sector that fails its checksum, a snapshot create and a descriptor write fail instead of replacing the sector, so the snapshots it holds are still there once it reads again
@@ -4643,6 +4758,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
+
+  - id: fsck-frees-orphan-data-in-orphan-snapshot-slot
+    name: fsck -repair frees an orphan snapshot data inode in an orphan snapshot's old slot
+    description: An orphan snapshot still names the slot of the file it was taken of; a snapshot data inode that no snapshot refers to in that slot must be freed, and the orphan snapshot kept
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairFreesOrphanDataInAnOrphanSnapshotsSlot
+
+  - id: fsck-keeps-data-inode-without-flag
+    name: fsck -repair keeps a snapshot's data inode that lost its snapshot-data flag
+    description: A data inode a snapshot points at is reported as an error repair cannot fix, and repair keeps it because it holds the snapshot's captured data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairKeepsADataInodeThatLostItsFlag
 
   - id: fsck-checks-every-dir-entry
     name: fsck checks every directory entry's type and inode range
@@ -5000,6 +5129,34 @@ scenarios:
     priority: go_only
     environments:
       go: cmd/goclusterfs-mount/health_test.go::TestHealthChecksSeparateDegradedFromDown
+
+  - id: storage-io-out-of-range
+    name: Device refuses I/O outside it
+    description: Reads and writes at a negative offset, past the end, across the end or at an overflowed block offset fail with ErrOutOfRange instead of panicking in the shard locks
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestDeviceRefusesIOOutsideIt
+
+  - id: recovery-extent-out-of-range
+    name: Replay refuses to map blocks past the data region
+    description: AddExtentForRecovery fails with ErrBlockOutOfRange for an extent that starts or ends past the data region, including one whose end overflows
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestAddExtentForRecoveryRefusesBlocksPastTheDataRegion
+
+  - id: tree-root-out-of-range
+    name: A tree root past the data region fails lookups
+    description: An inode whose extent tree root is past the data region fails Lookup with ErrBlockOutOfRange instead of reading another region as a tree node
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestTreeRootPastTheDataRegionFailsLookups
+
+  - id: damaged-directory-blocks
+    name: A damaged directory fails lookups instead of crashing
+    description: A directory whose extent points past the data region or the device, or whose size exceeds the data region, fails Lookup with ErrBlockOutOfRange
+    priority: go_only
+    environments:
+      go: internal/dir/index_test.go::TestDamagedDirectoryFailsLookups
 
   - id: storage-last-error
     name: Device remembers its last I/O failure
@@ -5627,7 +5784,7 @@ scenarios:
 
   - id: reads-never-see-part-of-a-write
     name: Whole-file reads never mix two writes from another node
-    description: One node keeps overwriting a 1 MB file with one 1 MB write of a single value at a time while every node reads it whole with O_DIRECT (and, in Go, also on mounts with -direct-io); no read returns parts of two writes
+    description: One node keeps overwriting a 1 MB file with one 1 MB write of a single value at a time while every node reads it whole with O_DIRECT (and, in Go, also on mounts with -direct-io); no read returns parts of two writes. In Go the run lasts until every node made 10 reads, and fails naming a node that could not within 60s
     priority: critical
     environments:
       go: atomic_read_test.go::TestMultiNodeReadsNeverSeePartOfAWrite
@@ -5636,7 +5793,7 @@ scenarios:
 
   - id: lock-holder-keeps-unwanted-record
     name: A holder keeps a record no other node waits for
-    description: A node that keeps taking a lock past its turn starts a new turn instead of yielding when the record shows no other node's claim or mark, so none of its acquires wait
+    description: A node that keeps taking a lock past its turn starts a new turn instead of yielding when the record shows no other node's claim or mark, so none of its acquires wait, even with a 1ns turn that runs out between its row check and its release
     priority: go_only
     environments:
       go: internal/lock/fairness_test.go::TestHolderKeepsRecordNobodyWaitsFor
@@ -5654,3 +5811,10 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/file_io_test.go::TestReadClaimWaitsTwoTurnsBehindALiveWriteMark
+
+  - id: lock-slow-waiters-get-turns
+    name: Nodes with slow claims get turns from a low slot that keeps a lock
+    description: A node in slot 0 keeps taking a file I/O lock while two nodes whose slot writes and row reads each take 40 ms ask for it; both slow nodes and slot 0 get it at least 3 times in 3s
+    priority: go_only
+    environments:
+      go: internal/lock/fairness_test.go::TestSlowWaitersGetTurnsFromALowSlotThatKeepsTheLock

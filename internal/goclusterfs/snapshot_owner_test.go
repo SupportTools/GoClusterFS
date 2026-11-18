@@ -2,11 +2,13 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/fsck"
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 )
 
@@ -105,6 +107,53 @@ func TestOrphanSnapshotListedAndDeletable(t *testing.T) {
 	if got := snapshotList(t, reused); !strings.HasPrefix(got, "live:") {
 		t.Errorf("the new file lists %q, want its own snapshot live", got)
 	}
+}
+
+// A file unlinked while another node holds it open has no name to delete its snapshots through, so they are orphans
+// at once. Deleting one leaves the holder's data alone, since the snapshot holds its own references to the blocks.
+func TestSnapshotOfAnUnlinkedFileIsAnOrphanWhileHeld(t *testing.T) {
+	path := newFormattedImage(t)
+	cluster := newFakeCluster(0, 1)
+	holder := cluster.join(t, withBridge(openFormattedFS(t, path)), 0)
+	peer := cluster.join(t, openFormattedFS(t, path), 1)
+	ctx := context.Background()
+
+	f := createOpen(t, holder, "f")
+	data := pattern(1, 2*BlockSize)
+	writeAt(t, f, data, 0)
+	setxattr(t, f, "user.snapshot", "s")
+	if err := peer.DeleteOrphanSnapshot(ctx, "s"); !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("deleting a named file's snapshot without the file: %v, want EBUSY", err)
+	}
+	if errno := peer.Unlink(ctx, "f"); errno != 0 {
+		t.Fatalf("unlink on the peer: %v", errno)
+	}
+	if ino := readInode(t, peer, f.inodeNum); ino.Magic != inode.InodeMagic || ino.LinkCount != 0 {
+		t.Fatalf("after the unlink: magic %#x, links %d; want an inode the holder still has open", ino.Magic, ino.LinkCount)
+	}
+
+	all, err := peer.AllSnapshots(ctx)
+	if err != nil || len(all) != 1 || all[0].GetName() != "s" || !all[0].Orphan {
+		t.Fatalf("full listing after the unlink: %+v, %v; want s as an orphan", all, err)
+	}
+	if errno := f.Setxattr(ctx, "user.snapshot", []byte("t"), 0); errno != syscall.ENOENT {
+		t.Errorf("a new snapshot through the unlinked file's open handle: %v, want ENOENT", errno)
+	}
+	if err := peer.DeleteOrphanSnapshot(ctx, "s"); err != nil {
+		t.Fatalf("delete of the orphan s: %v", err)
+	}
+	waitSnapshotGone(t, peer, "s")
+
+	checkAt(t, f, data, 0)
+	writeAt(t, f, pattern(2, BlockSize), 0)
+	checkAt(t, f, append(pattern(2, BlockSize), data[BlockSize:]...), 0)
+	if errno := f.Release(ctx, nil); errno != 0 {
+		t.Fatalf("release: %v", errno)
+	}
+	if ino := readInode(t, holder, f.inodeNum); ino.Magic != 0 {
+		t.Fatalf("after the holder's last close: magic %#x; want the inode freed", ino.Magic)
+	}
+	expectNoProblems(t, peer, "after the orphan snapshot was deleted and the file closed")
 }
 
 // Descriptors written before snapshots recorded their file's birth generation cannot prove which file they belong to,

@@ -7,10 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"os"
 	"os/signal"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -282,6 +284,19 @@ func main() {
 	nodeReg.SetJournalArea(sb.JournalRegionOffset, sb.JournalSlotSize())
 	hostname, _ := os.Hostname()
 	if *skipRecovery >= 0 {
+		if *skipRecovery >= int(sb.MaxNodes) {
+			usageFailf("-skip-recovery=%d names no slot; slots are 0 to %d", *skipRecovery, sb.MaxNodes-1)
+		}
+		offset := sb.JournalRegionOffset + uint64(*skipRecovery)*sb.JournalSlotSize()
+		loss, err := skipRecoveryLoss(nodeReg, dev, offset, sb.JournalSlotSize(), *skipRecovery)
+		if err != nil {
+			failf("-skip-recovery=%d: reading the node registry failed: %v; check the device, then mount again", *skipRecovery, err)
+		}
+		if loss != "" {
+			failf("-skip-recovery=%d refused: %s. Nothing may be lost while nodes use the filesystem, so stop the cluster: "+
+				"unmount every node, mount one with -skip-recovery=%d, unmount it, and run goclusterfs-fsck -repair before mounting the others",
+				*skipRecovery, loss, *skipRecovery)
+		}
 		nodeReg.PreferSlot(*skipRecovery)
 	}
 	nodeReg.SetLockLayout(lock.LayoutID())
@@ -303,6 +318,7 @@ func main() {
 		failf("Failed to start node heartbeat: %v", err)
 	}
 	dev.SetWriteGate(nodeReg.WriteGate)
+	dev.SetWriteFresh(nodeReg.WriteFresh)
 	nodeUUID := nodeReg.LocalUUID()
 	log.Printf("Registered as node %d (UUID: %x)", slotIdx, nodeUUID[:8])
 	journalOffset, journalSize := nodeReg.LocalJournal()
@@ -770,6 +786,36 @@ var ownerStates = map[node.Occupancy]lock.OwnerState{
 // ownReplayRetry is the first wait before a mount retries its own journal
 // replay; tests shorten it.
 var ownReplayRetry = time.Second
+
+// runningWatch is how long -skip-recovery watches the registry for a running
+// node: past the time peers still count a node with a late heartbeat as alive.
+var runningWatch = node.HeartbeatTimeout + node.HeartbeatInterval
+
+// skipRecoveryLoss says why discarding the journal of slot with -skip-recovery
+// would drop committed transactions while another node has the filesystem
+// mounted, or returns "" when it would not.
+func skipRecoveryLoss(reg *node.Registry, dev *storage.Device, offset, size uint64, slot int) (string, error) {
+	pending, readErr := journal.PendingCommitted(dev, offset, size)
+	if readErr == nil && pending == 0 {
+		return "", nil
+	}
+	running, err := reg.RunningSlots(runningWatch)
+	if err != nil {
+		return "", err
+	}
+	delete(running, slot)
+	if len(running) == 0 {
+		return "", nil
+	}
+	other := slices.Min(slices.Collect(maps.Keys(running)))
+	switch {
+	case readErr != nil:
+		return fmt.Sprintf("registry slot %d has a running node, and slot %d's journal cannot be read (%v), so this mount cannot tell what discarding it drops", other, slot, readErr), nil
+	case pending == 1:
+		return fmt.Sprintf("registry slot %d has a running node, and slot %d's journal holds 1 committed transaction that discarding it drops", other, slot), nil
+	}
+	return fmt.Sprintf("registry slot %d has a running node, and slot %d's journal holds %d committed transactions that discarding it drops", other, slot, pending), nil
+}
 
 // resetJournalHeader zeroes the journal header, as goclusterfs-fsck -release-slot does, so no mount replays it.
 func resetJournalHeader(dev *storage.Device, offset uint64) error {

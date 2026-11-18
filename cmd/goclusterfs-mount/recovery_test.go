@@ -1,20 +1,24 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 // dirtyJournal returns a device holding a journal with one committed,
-// unreplayed transaction, as a crashed node leaves its slot.
+// unreplayed transaction, as a crashed node leaves its slot, and room for a
+// node registry after it.
 func dirtyJournal(t *testing.T) *storage.Device {
 	t.Helper()
 	dir := os.Getenv("GOCLUSTERFS_TEST_DIR")
@@ -26,7 +30,7 @@ func dirtyJournal(t *testing.T) *storage.Device {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Remove(path) })
-	if err := os.Truncate(path, int64(journal.DefaultJournalSlotSize)); err != nil {
+	if err := os.Truncate(path, int64(journal.DefaultJournalSlotSize)+1<<20); err != nil {
 		t.Fatal(err)
 	}
 	dev, err := storage.Open(path)
@@ -101,5 +105,58 @@ func TestOwnReplayStopsAtARecordThatDoesNotDecode(t *testing.T) {
 	}
 	if _, err := recoverWithin(t, 5*time.Second, dev, handler); err == nil || calls != 1 {
 		t.Fatalf("recoverOwnJournal = %v after %d tries; want one failed try", err, calls)
+	}
+}
+
+func TestSkipRecoveryRefusesLossWhileNodesRun(t *testing.T) {
+	const size = journal.DefaultJournalSlotSize
+	const deadSlot = 5
+	defer func(old time.Duration) { runningWatch = old }(runningWatch)
+	runningWatch = 2 * node.HeartbeatInterval
+	dev := dirtyJournal(t)
+	registryAt := uint64(size)
+	writeHeader := func(fill byte) {
+		t.Helper()
+		buf := storage.NewAlignedBuffer(storage.SectorSize)
+		for i := range buf.Bytes() {
+			buf.Bytes()[i] = fill
+		}
+		if _, err := dev.WriteAt(buf.Bytes(), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lossNow := func() string {
+		t.Helper()
+		loss, err := skipRecoveryLoss(node.NewRegistry(dev, registryAt), dev, 0, size, deadSlot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return loss
+	}
+
+	running := node.NewRegistry(dev, registryAt)
+	runningSlot, err := running.Register(context.Background(), "running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := running.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	if loss := lossNow(); !strings.Contains(loss, fmt.Sprintf("registry slot %d has a running node", runningSlot)) ||
+		!strings.Contains(loss, "holds 1 committed transaction that discarding it drops") {
+		t.Errorf("committed transaction while a node runs: loss %q", loss)
+	}
+	writeHeader(0xff)
+	if loss := lossNow(); !strings.Contains(loss, "cannot be read") {
+		t.Errorf("unreadable journal while a node runs: loss %q", loss)
+	}
+	writeHeader(0)
+	if loss := lossNow(); loss != "" {
+		t.Errorf("journal never initialized while a node runs: loss %q, want none", loss)
+	}
+	running.Stop()
+	writeHeader(0xff)
+	if loss := lossNow(); loss != "" {
+		t.Errorf("unreadable journal with no node running: loss %q, want none", loss)
 	}
 }

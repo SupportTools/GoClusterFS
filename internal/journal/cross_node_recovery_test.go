@@ -74,6 +74,38 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 	return rctx, cleanup
 }
 
+func TestReplayRefusesInodePastTheTable(t *testing.T) {
+	rctx, cleanup := testRecoveryContext(t)
+	defer cleanup()
+	ctx := context.Background()
+	const wrapsToRoot = 1<<32 + uint64(inode.InodeRoot)
+	past := rctx.InodeTbl.TotalInodes()
+	for _, tt := range []struct {
+		name    string
+		op      TxnOpType
+		payload []byte
+	}{
+		{"create", TxnOpInodeCreate, (&InodeCreatePayload{InodeNum: wrapsToRoot, Mode: 0o40755}).Serialize()},
+		{"delete", TxnOpInodeDelete, (&InodeDeletePayload{InodeNum: wrapsToRoot}).Serialize()},
+		{"link add", TxnOpLinkAdd, (&LinkAddPayload{InodeNum: wrapsToRoot}).Serialize()},
+		{"extent add", TxnOpExtentAdd, (&ExtentAddPayload{InodeNum: wrapsToRoot, DiskBlock: 3, Length: 1}).Serialize()},
+		{"directory child", TxnOpDirAddEntry, (&DirAddEntryPayload{ParentInodeNum: 50, ChildInodeNum: wrapsToRoot, Name: "x"}).Serialize()},
+		{"rename", TxnOpDirRename, (&DirRenamePayload{OldParentInodeNum: 50, NewParentInodeNum: 50, InodeNum: wrapsToRoot, OldName: "a", NewName: "b"}).Serialize()},
+		{"past the table", TxnOpInodeCreate, (&InodeCreatePayload{InodeNum: past, Mode: 0o100644}).Serialize()},
+	} {
+		entry := &RecoveredEntry{Entry: &TxnEntry{OpType: tt.op, Length: uint32(len(tt.payload))}, Payload: tt.payload}
+		if _, err := applyEntry(ctx, rctx, newTxnReplay([16]byte{}), entry); !errors.Is(err, inode.ErrInodeOutOfRange) {
+			t.Errorf("%s: applyEntry = %v, want ErrInodeOutOfRange", tt.name, err)
+		}
+	}
+	if root, err := rctx.InodeTbl.Read(inode.InodeRoot); err != nil || root.Magic == inode.InodeMagic {
+		t.Errorf("inode %d after the refused records: %+v, %v; want it still free", inode.InodeRoot, root, err)
+	}
+	if got, err := tableInode(wrapsToRoot); !errors.Is(err, inode.ErrInodeOutOfRange) {
+		t.Errorf("tableInode(%d) = %d, %v; want ErrInodeOutOfRange", wrapsToRoot, got, err)
+	}
+}
+
 // TestApplyInodeCreate tests creating an inode during recovery.
 func TestApplyInodeCreate(t *testing.T) {
 	rctx, cleanup := testRecoveryContext(t)

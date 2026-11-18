@@ -9,7 +9,7 @@ github.com/supporttools/GoClusterFS/internal/goclusterfs TestConcurrentDirReadsD
 github.com/supporttools/GoClusterFS/internal/goclusterfs TestConcurrentFirstWritesToFallocatedBlock 5.53
 github.com/supporttools/GoClusterFS/internal/goclusterfs TestConcurrentRefcountReadsDoNotDelaySnapshots 0.40
 github.com/supporttools/GoClusterFS/internal/goclusterfs TestConcurrentWritersShareReserve 3.38
-github.com/supporttools/GoClusterFS/internal/goclusterfs TestCopyOnWriteKeepsConcurrentInPlaceWrite 0.40
+github.com/supporttools/GoClusterFS/internal/goclusterfs TestCopyOnWriteWaitsForConcurrentInPlaceWrite 0.40
 github.com/supporttools/GoClusterFS/internal/goclusterfs TestCountedFreesAndSharesAcrossNodes 4.37
 github.com/supporttools/GoClusterFS/internal/goclusterfs TestCrashBetweenClaimAndNameReplaysTheName 1.13
 github.com/supporttools/GoClusterFS/internal/goclusterfs TestCreateHoldsAFileAPeerUnlinksAtOnce 0.46

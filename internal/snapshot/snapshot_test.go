@@ -653,15 +653,17 @@ func TestRegistryScan(t *testing.T) {
 
 type countingDevice struct {
 	device
-	reads int
+	reads, bytes int
 }
 
 func (d *countingDevice) ReadAt(buf []byte, offset int64) (int, error) {
 	d.reads++
+	d.bytes += len(buf)
 	return d.device.ReadAt(buf, offset)
 }
 
-// Mount scans the registry, and reading a sector per descriptor made that 31 times slower.
+// Mount scans the registry, and reading a sector per descriptor made that 31 times slower; one read per sector made
+// a listing on a loaded disk take seconds.
 func TestRegistryReadsEachSectorOnce(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -697,12 +699,12 @@ func TestRegistryReadsEachSectorOnce(t *testing.T) {
 		"Remove":           func() error { return registry.Remove(ctx, missing) },
 	}
 	for name, walk := range walks {
-		counter.reads = 0
+		counter.reads, counter.bytes = 0, 0
 		if err := walk(); err != nil && !errors.Is(err, ErrSnapshotNotFound) {
 			t.Errorf("%s: %v", name, err)
 		}
-		if counter.reads != sectors {
-			t.Errorf("%s read %d sectors, want %d", name, counter.reads, sectors)
+		if counter.reads != 1 || counter.bytes != sectors*SectorSize {
+			t.Errorf("%s made %d reads of %d bytes, want one read of the %d sectors", name, counter.reads, counter.bytes, sectors)
 		}
 	}
 }

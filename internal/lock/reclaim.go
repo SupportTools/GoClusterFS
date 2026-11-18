@@ -128,6 +128,30 @@ func (m *Manager) clearForeignClaim(recordID uint64) error {
 	return m.writeSlot(recordID, m.nodeSlot, nil)
 }
 
+// ClearSlotClaims clears every claim and waiting mark in registry slot slot's
+// column of the lock records at offset, so a node that registers in the slot
+// later does not inherit them. Only the slot's node, or a peer holding the
+// slot's recovery lease, writes that column, so call it only under that lease,
+// as a release does. It returns how many it cleared.
+func ClearSlotClaims(dev *storage.Device, offset, size uint64, slot int) (int, error) {
+	m := &Manager{dev: dev, offset: offset, size: size}
+	buf := storage.NewAlignedBuffer(SlotSize)
+	cleared := 0
+	for recordID := uint64(0); recordID < size/RowSize; recordID++ {
+		if _, err := dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, slot)); err != nil {
+			return cleared, err
+		}
+		if isZeroSlot(buf.Bytes()) {
+			continue
+		}
+		if err := m.writeSlot(recordID, slot, nil); err != nil {
+			return cleared, err
+		}
+		cleared++
+	}
+	return cleared, nil
+}
+
 // ForgetAdopted drops this node's own record of the adoptions in records and
 // leaves their claims on the device, after a replay that failed. The dead
 // node's locks then stay held until another replay adopts and releases them,

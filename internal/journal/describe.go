@@ -48,7 +48,7 @@ func EntryTouches(op TxnOpType, payload []byte) (Touches, error) {
 		if p, err = DeserializeInodeDelete(payload); err == nil {
 			inodes(p.InodeNum)
 		}
-	case TxnOpLinkDrop:
+	case TxnOpLinkDrop, TxnOpLinkAdd:
 		var p *LinkDropPayload
 		if p, err = DeserializeLinkDrop(payload); err == nil {
 			inodes(p.InodeNum)
@@ -140,7 +140,9 @@ func EntryTouches(op TxnOpType, payload []byte) (Touches, error) {
 			blocks(p.BlockNum, 1)
 		}
 	default:
-		err = fmt.Errorf("unknown entry type %#x", uint32(op))
+		if !op.Known() {
+			return Touches{}, unknownOp(op)
+		}
 	}
 	if err != nil {
 		return Touches{}, fmt.Errorf("%s entry: %w", op, err)

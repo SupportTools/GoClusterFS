@@ -343,3 +343,32 @@ func TestSameNodeEditsKeepEveryEntry(t *testing.T) {
 		}
 	}
 }
+
+// A directory whose extent or size is damaged on disk fails its lookups with ErrBlockOutOfRange, instead of reading
+// outside the data region or crashing. The block past the device is the one a FuzzReplay input produced.
+func TestDamagedDirectoryFailsLookups(t *testing.T) {
+	ctx, m, tbl, cleanup := testSetup(t)
+	defer cleanup()
+	for _, tc := range []struct {
+		name   string
+		damage func(*inode.Inode)
+	}{
+		{"block past the data region", func(ino *inode.Inode) { ino.InlineExtents[0].PhysicalBlock = m.extentMgr.TotalBlocks() }},
+		{"block past the device", func(ino *inode.Inode) { ino.InlineExtents[0].PhysicalBlock = 0x3231383031303130 }},
+		{"size past the data region", func(ino *inode.Inode) { ino.Size = 1 << 62 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newNode(t, m, inode.S_IFDIR|0o755)
+			if err := m.InitDirectory(ctx, d, uint64(d.InodeNum)); err != nil {
+				t.Fatal(err)
+			}
+			tc.damage(d)
+			if err := tbl.Write(ctx, d); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := m.Lookup(ctx, d, "x"); !errors.Is(err, extent.ErrBlockOutOfRange) {
+				t.Errorf("lookup in the damaged directory: %v, want ErrBlockOutOfRange", err)
+			}
+		})
+	}
+}

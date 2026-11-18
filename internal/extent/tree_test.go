@@ -33,7 +33,7 @@ type treeEnv struct {
 // shrinks both leaf and index capacity so tests reach splits quickly.
 func newTreeEnv(t *testing.T, nodeCap int) *treeEnv {
 	t.Helper()
-	dev, cleanup := createTestDevice(t, 8<<20)
+	dev, cleanup := createTestDevice(t, treeTestDataOffset+treeTestBlocks*BlockSize)
 	t.Cleanup(cleanup)
 	var uuid [16]byte
 	env := &treeEnv{
@@ -937,5 +937,41 @@ func TestFoldOfUncommittedTreeKeepsReleases(t *testing.T) {
 	env.write(ino)
 	if got := env.bm.FreeCount(); got != free-1 {
 		t.Fatalf("free blocks = %d after commit, want %d (only block 0 still mapped)", got, free-1)
+	}
+}
+
+// Replay maps the blocks a journal record names. One past the data region can only come from damage, and mapping it
+// would send later reads and writes outside the region.
+func TestAddExtentForRecoveryRefusesBlocksPastTheDataRegion(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	for _, ext := range []Extent{
+		{0, treeTestBlocks, 1, FlagAllocated},
+		{0, treeTestBlocks - 1, 2, FlagAllocated},
+		{0, 1<<64 - 1, 2, FlagAllocated},
+	} {
+		if err := env.mgr.AddExtentForRecovery(env.ctx, ino, &ext); !errors.Is(err, ErrBlockOutOfRange) {
+			t.Errorf("map %d blocks at %d: %v, want ErrBlockOutOfRange", ext.Length, ext.PhysicalBlock, err)
+		}
+	}
+	if err := env.mgr.AddExtentForRecovery(env.ctx, ino, &Extent{0, treeTestBlocks - 1, 1, FlagAllocated}); err != nil {
+		t.Errorf("map the last block: %v", err)
+	}
+}
+
+// An inode whose tree root was damaged to a block past the data region fails its lookups, instead of reading another
+// region's bytes as a tree node.
+func TestTreeRootPastTheDataRegionFailsLookups(t *testing.T) {
+	env := newTreeEnv(t, 4)
+	ino := env.newInode()
+	env.insertScattered(ino, 10)
+	env.write(ino)
+	if !ino.HasExtentTree() {
+		t.Fatal("ten scattered extents should overflow into a tree")
+	}
+	ino.ExtentTreeRoot = treeTestBlocks
+	env.remount(4)
+	if _, _, err := env.mgr.Lookup(ino, 0); !errors.Is(err, ErrBlockOutOfRange) {
+		t.Errorf("lookup through a tree root past the data region: %v, want ErrBlockOutOfRange", err)
 	}
 }

@@ -10,6 +10,7 @@
 
 # Test artifacts
 *.img
+internal/snapshot/peer-writes-*.bin
 tests/docker/results/
 
 # IDE

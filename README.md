@@ -11,7 +11,8 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Distributed Locking**: CAS-based on-disk locks for safe concurrent access
 - **Network Cache Invalidation**: UDP multicast for near-instant cross-node cache updates
 - **Copy-on-Write Snapshots**: File snapshots and clones that share blocks until a write (experimental)
-- **Symlinks**: Targets of up to 92 bytes live in the inode, longer ones up to 4095 bytes in one block; no hard links yet
+- **Symlinks**: Targets of up to 92 bytes live in the inode, longer ones up to 4095 bytes in one block
+- **Hard links**: `link(2)` gives a regular file up to 65,000 names; directories and symlinks get `EPERM`
 - **Thin Provisioning**: Allocate-on-write with TRIM/BLKDISCARD support
 - **8-Phase fsck**: Comprehensive filesystem consistency checker with repair mode
 
@@ -27,6 +28,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 ## Limits and Status
 
 - **Linux only.** GoClusterFS needs FUSE and O_DIRECT.
+- **Rename takes one flag.** `RENAME_NOREPLACE` works; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
 - **Every file with data uses at least one full 1 MB block.** The block size is 1 MB, and small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **`ls -l` of a large directory is slow.** Each lookup reads two inodes from disk, about 0.3 ms on our test host, and `ls -l` repeats its lookups once it runs longer than `-attr-timeout`. In one test, `ls -l` took 0.14 s on 1,000 files and 14 s on 10,000.
 - **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime. A file that stays open can use the old size and block mappings for about twice `-attr-timeout`. Opening the file again reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
@@ -119,7 +121,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-journal` | `true` | Write-ahead journal; turn it off for testing only, since a crash can then leave the filesystem inconsistent |
-| `-skip-recovery=N` | `-1` (off) | Emergency only: discard the journal of registry slot N instead of replaying it, if the mount takes slot N. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot) |
+| `-skip-recovery=N` | `-1` (off) | Emergency only: discard the journal of registry slot N instead of replaying it, if the mount takes slot N. Refuses while other nodes run if the journal holds a committed transaction. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot) |
 
 ### Network Broadcast Options
 
@@ -200,6 +202,7 @@ For clustered deployments:
 4. **Limits**: At most 64 nodes mount a device at once; run NTP so file times agree
 5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
 6. **Stalled nodes**: Other nodes declare a node dead after about 20 seconds of silence, for example a paused VM, and replay its journal. The stalled node checks its registry slot before each write, so when it resumes it refuses new writes and exits. A write it started before the stall can still land. Only storage fencing closes that gap, such as SCSI-3 persistent reservations, which GoClusterFS does not use. See [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits)
+7. **A dead node's damaged journal**: If peers cannot replay it, they retry every minute, and after 3 failures with the same error every 10 minutes, with `/health` degraded. List what it holds with `goclusterfs-fsck -inspect-slot N`, and free the slot with `-release-slot N` and `-salvage` or `-discard-journal`. While other nodes are mounted, the release refuses to drop a committed transaction. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot)
 
 Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:
 
@@ -239,6 +242,8 @@ Run fsck on an unmounted device. The device is a positional argument, and flags 
 Exit codes follow fsck(8) and add up; see [Exit Codes and Debug Output](#exit-codes-and-debug-output).
 
 `-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
+
+fsck also manages node registry slots. `-list-slots` and `-inspect-slot N` only read, so they run on a mounted device. `-release-slot N` frees the slot of a node that will not return; see [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot).
 
 ## Exit Codes and Debug Output
 

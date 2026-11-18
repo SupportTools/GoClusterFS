@@ -125,6 +125,10 @@ type FS struct {
 	// mounted is set by MarkMounted once a FUSE server serves the root, so kernel notifications have somewhere to go.
 	mounted atomic.Bool
 
+	// badEntries holds the damaged directory entries childInRange has logged, at most maxBadEntries of them.
+	badEntriesMu sync.Mutex
+	badEntries   map[badEntry]bool
+
 	// Storage layer
 	dev *storage.Device
 	sb  *superblock.Superblock
@@ -353,6 +357,15 @@ func (f *FS) Close() error {
 	// Unused reserved blocks go back before TRIM and the journal stop.
 	if f.reserve != nil {
 		ShutdownStep("block reserve return", func() { f.reserve.Stop(context.Background()) })
+	}
+	if f.extentMgr != nil {
+		ShutdownStep("waiting block frees", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if left := f.extentMgr.FlushDeferred(ctx); left > 0 {
+				log.Printf("[WARN] %d freed blocks stay allocated: their frees kept waiting for a lock. goclusterfs-fsck -repair gives them back", left)
+			}
+		})
 	}
 
 	// Stop TRIM manager to flush pending discards
@@ -745,6 +758,9 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return nil, syscall.EIO
 	}
 	logging.Debugf("FS.Lookup: found %q -> inode %d, type %d", name, childInodeNum, fileType)
+	if errno := f.childInRange(inode.InodeRoot, name, childInodeNum); errno != 0 {
+		return nil, errno
+	}
 
 	// Read the child inode to populate attributes
 	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
@@ -1418,6 +1434,9 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return nil, syscall.EIO
 	}
 	logging.Debugf("Lookup: found %q -> inode %d, type %d", name, childInodeNum, fileType)
+	if errno := d.fs.childInRange(d.inodeNum, name, childInodeNum); errno != 0 {
+		return nil, errno
+	}
 
 	// Read the child inode to populate attributes
 	childIno, err := d.fs.inodeTbl.Read(uint32(childInodeNum))
@@ -1569,6 +1588,43 @@ func sameForRemoval(was, cur *inode.Inode) bool {
 	return !was.IsDir() || cur.MetaGeneration == was.MetaGeneration
 }
 
+// childInRange returns EIO, and logs the entry, for a directory entry that
+// names an inode at or past the end of the inode table. Only a damaged entry
+// does, and narrowing its number to the table's uint32 could reach a real inode.
+func (f *FS) childInRange(dirNum uint32, name string, num uint64) syscall.Errno {
+	total := f.inodeTbl.TotalInodes()
+	if num < total {
+		return 0
+	}
+	if f.firstSighting(badEntry{dirNum, name}) {
+		log.Printf("[ERROR] Directory %d: entry %q names inode %d, past the inode table's %d inodes. "+
+			"Unmount the filesystem on every node and run goclusterfs-fsck", dirNum, name, num, total)
+	}
+	return syscall.EIO
+}
+
+type badEntry struct {
+	dir  uint32
+	name string
+}
+
+// maxBadEntries caps how many damaged entries are remembered; past it the set starts over, so each is logged again.
+const maxBadEntries = 256
+
+// firstSighting reports whether e is not yet in the set of logged damaged entries, and adds it.
+func (f *FS) firstSighting(e badEntry) bool {
+	f.badEntriesMu.Lock()
+	defer f.badEntriesMu.Unlock()
+	if f.badEntries[e] {
+		return false
+	}
+	if f.badEntries == nil || len(f.badEntries) >= maxBadEntries {
+		f.badEntries = make(map[badEntry]bool)
+	}
+	f.badEntries[e] = true
+	return true
+}
+
 // removeEntryOnce returns EAGAIN when another node changes the child between the lookup and the removal.
 func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) syscall.Errno {
 	// Invalidate parent directory cache before modifying
@@ -1582,6 +1638,9 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
 		return nameErrno(err)
+	}
+	if errno := d.fs.childInRange(d.inodeNum, name, childInodeNum); errno != 0 {
+		return errno
 	}
 
 	// Invalidate child inode cache - it's being removed
@@ -2057,6 +2116,11 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 		return 0, errToErrno(err)
 	}
 	defer unlockIO()
+	return f.writeIOLocked(ctx, data, off)
+}
+
+// writeIOLocked is Write for a caller that holds the file's I/O lock.
+func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to extend the same file simultaneously, they may race
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
@@ -4221,6 +4285,9 @@ func (f *FS) DeleteOrphanSnapshot(ctx context.Context, name string) error {
 	return f.dropSnapshot(ctx, desc.SnapshotID)
 }
 
+// snapshotOrphan reports whether d's file has no name left to reach it through:
+// it was freed, its slot holds a later file, or it was unlinked while a node
+// still holds it open.
 func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
 	ino, err := f.inodeTbl.Read(d.TargetInode)
 	if errors.Is(err, inode.ErrInodeOutOfRange) {
@@ -4229,7 +4296,7 @@ func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ino.Magic == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
+	return ino.Magic == 0 || ino.LinkCount == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
 }
 
 // blockExtent returns the single block of ext at offset, so per-block checks

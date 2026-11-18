@@ -769,10 +769,21 @@ func (r *Registry) CheckOwnership() error {
 // WriteGate is a device write gate: it passes writes to the registry, which
 // the heartbeat itself must make, and checks ownership before any other write.
 func (r *Registry) WriteGate(offset int64) error {
-	if offset >= int64(r.offset) && offset < int64(r.offset)+MaxNodes*SlotSize {
+	if r.inRegistry(offset) {
 		return nil
 	}
 	return r.CheckOwnership()
+}
+
+// WriteFresh reports, without I/O, whether a write at offset that passed
+// WriteGate may still land: a registry write always may, any other only while
+// CheckOwnership would pass it without writing a heartbeat.
+func (r *Registry) WriteFresh(offset int64) bool {
+	return r.inRegistry(offset) || (!r.lost.Load() && r.sinceLastBeat() < HeartbeatTimeout/2)
+}
+
+func (r *Registry) inRegistry(offset int64) bool {
+	return offset >= int64(r.offset) && offset < int64(r.offset)+MaxNodes*SlotSize
 }
 
 func (r *Registry) sinceLastBeat() time.Duration {
@@ -928,6 +939,35 @@ func (r *Registry) GetActiveNodes() ([]*Slot, error) {
 	return active, nil
 }
 
+// RunningSlots returns the slots whose bytes change while it watches the registry for watch, as a running node's
+// heartbeat changes its slot every HeartbeatInterval. A stopped or paused node's slot does not change.
+func (r *Registry) RunningSlots(watch time.Duration) (map[int]bool, error) {
+	before, err := r.readRegistryRaw()
+	if err != nil {
+		return nil, err
+	}
+	time.Sleep(watch)
+	after, err := r.readRegistryRaw()
+	if err != nil {
+		return nil, err
+	}
+	running := make(map[int]bool)
+	for i := range MaxNodes {
+		if !bytes.Equal(before[i*SlotSize:(i+1)*SlotSize], after[i*SlotSize:(i+1)*SlotSize]) {
+			running[i] = true
+		}
+	}
+	return running, nil
+}
+
+func (r *Registry) readRegistryRaw() ([]byte, error) {
+	buf := storage.NewAlignedBuffer(MaxNodes * SlotSize)
+	if _, err := r.dev.ReadAtUnsharded(buf.Bytes(), int64(r.offset)); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // readAllSlots reads the whole registry in one I/O, without a lock, so slow
 // storage costs a scan one round trip and never holds up the heartbeat. A slot
 // that fails to decode is nil.
@@ -1067,10 +1107,18 @@ func (r *Registry) StartFailureDetection() {
 	}
 	r.mu.RUnlock()
 
+	if testNoPeerReplay {
+		log.Printf("[WARN] node: GOCLUSTERFS_TEST_NO_PEER_REPLAY is set: this node replays no other node's journal; use it only in tests")
+	}
 	r.detectAndRecoverFailedNodes()
 	r.heartbeatWg.Add(1)
 	go r.failureDetectionLoop()
 }
+
+// testNoPeerReplay, from GOCLUSTERFS_TEST_NO_PEER_REPLAY and for tests only,
+// stops failure detection replaying other nodes, so a test can free a stopped
+// node's slot with goclusterfs-fsck while this node runs.
+var testNoPeerReplay = os.Getenv("GOCLUSTERFS_TEST_NO_PEER_REPLAY") != ""
 
 // failureDetectionLoop scans for failed nodes and triggers recovery.
 func (r *Registry) failureDetectionLoop() {
@@ -1109,6 +1157,9 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 		return
 	}
 	r.passOrphans(slots)
+	if testNoPeerReplay {
+		return
+	}
 	for i, slot := range slots {
 		if i == localSlot || slot == nil {
 			continue

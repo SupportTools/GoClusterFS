@@ -24,3 +24,10 @@ func SetReleaseHooks(before, during func()) (restore func()) {
 	beforeReleaseWrites, whileReleaseHoldsLease = before, during
 	return func() { beforeReleaseWrites, whileReleaseHoldsLease = oldBefore, oldDuring }
 }
+
+// SetOnlineWatch shortens how long a release with nodes running watches the slot.
+func SetOnlineWatch(active, dead time.Duration) (restore func()) {
+	oldActive, oldDead := onlineActiveWatch, onlineDeadWatch
+	onlineActiveWatch, onlineDeadWatch = active, dead
+	return func() { onlineActiveWatch, onlineDeadWatch = oldActive, oldDead }
+}

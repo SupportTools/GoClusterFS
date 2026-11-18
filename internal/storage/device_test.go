@@ -413,6 +413,56 @@ func TestWriteGateRefusesWrites(t *testing.T) {
 	}
 }
 
+// A write that passed its gate and then waited for its shard lock asks again
+// before it lands, so a gate that turned against it while it waited stops it.
+func TestWriteRechecksGateAfterWaitingForItsShard(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	refused := errors.New("refused")
+	var stale atomic.Bool
+	passed := make(chan struct{})
+	var once sync.Once
+	dev.SetWriteGate(func(int64) error {
+		if stale.Load() {
+			return refused
+		}
+		once.Do(func() { close(passed) })
+		return nil
+	})
+	dev.SetWriteFresh(func(int64) bool { return !stale.Load() })
+
+	startShard, endShard := dev.lockIORange(0, SectorSize)
+	buf := NewAlignedBuffer(SectorSize)
+	copy(buf.Bytes(), bytes.Repeat([]byte{'x'}, SectorSize))
+	done := make(chan error, 1)
+	go func() {
+		_, err := dev.WriteAt(buf.Bytes(), 0)
+		done <- err
+	}()
+	<-passed
+	stale.Store(true)
+	dev.unlockIORange(startShard, endShard)
+
+	if err := <-done; !errors.Is(err, refused) {
+		t.Fatalf("write whose gate went stale while it waited = %v, want %v", err, refused)
+	}
+	got := NewAlignedBuffer(SectorSize)
+	if _, err := dev.ReadAt(got.Bytes(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), make([]byte, SectorSize)) {
+		t.Error("a write refused after its wait reached the device")
+	}
+}
+
 func TestLastErrorHoldsTheLatestFailureUntilASuccess(t *testing.T) {
 	var d Device
 	if d.LastError() != nil {
@@ -445,5 +495,46 @@ func TestFailedReadIsRecorded(t *testing.T) {
 	_ = dev.file.Close()
 	if _, err := dev.ReadAt(buf, 0); err == nil || dev.LastError() == nil {
 		t.Errorf("ReadAt on a closed file = %v, LastError = %v, want both set", err, dev.LastError())
+	}
+}
+
+// Offsets come from on-disk block numbers, so damage can put them anywhere: every read and write outside the device
+// fails with ErrOutOfRange instead of reaching the shard locks.
+func TestDeviceRefusesIOOutsideIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	fromFuzz := uint64(0x8303130327600000)
+	one, two := NewAlignedBuffer(SectorSize).Bytes(), NewAlignedBuffer(2*SectorSize).Bytes()
+	cases := []struct {
+		name   string
+		buf    []byte
+		offset int64
+	}{
+		{"negative", one, -SectorSize},
+		{"block number that overflowed", one, int64(fromFuzz)},
+		{"at the end", one, 2 * SectorSize},
+		{"across the end", two, SectorSize},
+		{"near the largest offset", one, (1<<63 - 1) &^ (SectorSize - 1)},
+	}
+	ops := map[string]func([]byte, int64) (int, error){
+		"ReadAt": dev.ReadAt, "ReadAtUnsharded": dev.ReadAtUnsharded, "WriteAt": dev.WriteAt, "WriteAtUnsharded": dev.WriteAtUnsharded,
+	}
+	for _, c := range cases {
+		for name, op := range ops {
+			if _, err := op(c.buf, c.offset); !errors.Is(err, ErrOutOfRange) {
+				t.Errorf("%s %s (%d bytes at %d) = %v, want ErrOutOfRange", name, c.name, len(c.buf), c.offset, err)
+			}
+		}
+	}
+	if _, err := dev.ReadAt(one, SectorSize); err != nil {
+		t.Errorf("read of the last sector: %v", err)
 	}
 }

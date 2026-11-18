@@ -64,6 +64,7 @@ var (
 	ErrBlockNotAllocated = errors.New("block not allocated")
 	ErrCoWRequired       = errors.New("copy-on-write required for shared block")
 	ErrInlineTarget      = errors.New("symlink keeps its target where extents go")
+	ErrBlockOutOfRange   = errors.New("block past the data region")
 )
 
 // CoWResult contains the result of a copy-on-write operation.
@@ -121,6 +122,24 @@ func NewManager(dev *storage.Device, bm *bitmap.Region, lockMgr *lock.Manager, d
 		leafCap:    defaultLeafCap,
 		indexCap:   MaxNodeEntries,
 	}
+}
+
+// TotalBlocks returns the number of blocks in the data region, or 0 for a manager without a bitmap.
+func (m *Manager) TotalBlocks() uint64 {
+	if m.bitmap == nil {
+		return 0
+	}
+	return m.bitmap.TotalBlocks()
+}
+
+// CheckRange returns ErrBlockOutOfRange unless the n blocks from phys lie in the data region. Block numbers read from
+// disk go through it before they reach the device.
+func (m *Manager) CheckRange(phys, n uint64) error {
+	total := m.TotalBlocks()
+	if total == 0 || phys < total && n <= total-phys {
+		return nil
+	}
+	return fmt.Errorf("%w: %d blocks at %d, the data region has %d", ErrBlockOutOfRange, n, phys, total)
 }
 
 // Lookup finds the extent containing the given logical block.
@@ -564,6 +583,9 @@ func BlockToOffset(block uint64) uint64 {
 // AddExtentForRecovery adds an extent during recovery.
 // Callers check with Lookup first; an overlap means another recovery won.
 func (m *Manager) AddExtentForRecovery(ctx context.Context, ino *inode.Inode, ext *Extent) error {
+	if err := m.CheckRange(ext.PhysicalBlock, ext.Length); err != nil {
+		return err
+	}
 	return m.Insert(ctx, ino, ext)
 }
 
