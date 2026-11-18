@@ -48,6 +48,7 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 | `[ERROR] Stopping this node and keeping its locks: rename of ... is half done` | A rename hit a write error after its journal commit, and three tries to redo the missing writes failed too. The mount exits without releasing its locks, so another node replays its journal and finishes the rename. See [Handling Node Failure](#handling-node-failure). Check the device before mounting this node again. |
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Node registry slot N may no longer be this node's: it went ... without a heartbeat` | This node went more than 15 seconds without a heartbeat, for example a paused process or a suspended host. Another node may have replayed it, so it exits without writing to the device again. |
+| `The device refused a write from this node (...): another node declared it dead and revoked its access` | On a fenced volume, another node proved this node dead and revoked its reservation key. The mount exits. See [Storage Fencing](#storage-fencing). |
 | `Failed to start cache broadcast: ...` | The mount stops before it touches the device. See [Mount Fails: "Failed to start cache broadcast"](TROUBLESHOOTING.md#mount-fails-failed-to-start-cache-broadcast). |
 | `Warning: Failed to start API server` | The API port is taken. The mount runs without the API, `/metrics`, `gfsctl` and the dashboard. |
 | `[broadcast] missed N messages from ...` | This node lost broadcast messages, usually because its receive buffer filled during a burst of changes on another node. It dropped all cached inodes and extents and rereads them from the device. Logged at most every 10 seconds. If it repeats, raise `net.core.rmem_max` to at least 1 MB (`sysctl -w net.core.rmem_max=1048576`) and remount. |
@@ -195,8 +196,23 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 ### Known Gaps in Slot Ownership
 
 - Slot claims use a read-compare-write on the device, then re-read the slot after 100 ms. Two nodes can still both keep a slot if one node's write lands more than 100 ms after its read, for example during a storage stall.
-- A node paused for more than about 20 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to running nodes and to a new mount, which can take its slot and replay and reset its journal. When the paused node resumes, it refuses further writes and exits, but writes it started before the pause can still land.
+- A node paused for more than about 20 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to running nodes and to a new mount, which can take its slot and replay and reset its journal. When the paused node resumes, it refuses further writes and exits, but on a volume without [storage fencing](#storage-fencing) writes it started before the pause can still land.
 - A restarted container comes back in a new PID namespace, so its mount cannot prove by PID that the previous incarnation exited. It waits until the old slot's heartbeat is about 20 seconds old, then replays that journal before serving.
+
+### Storage Fencing
+
+On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead nodes at the storage. Every node registers its own reservation key before its first write, and the device accepts writes only from registered nodes. Before a node acts on another node's death, it removes that node's key; acting on a death means marking its slot dead, replaying its journal, taking its locks or mounting into its slot. From then on the device refuses the dead node's writes, including writes it queued before it stalled. `goclusterfs-fsck` does the same before `-repair` or `-release-slot` writes over a node.
+
+- **Turning it on:** `-format` with `-fencing=auto`, the default, fences when the device supports persistent reservations; `-fencing=pr` requires them and `-fencing=none` turns fencing off. The superblock records the choice, so every node fences, and older builds refuse the volume. Files, loop devices, virtio-blk disks and partitions have no reservations; a reservation covers the whole disk, so format the whole disk. Format and every mount warn, `/health` reports `fencing` as `none:`, and `-require-fencing` refuses to mount such a volume.
+- **A fenced node:** its next write fails with `EBADE` (a reservation conflict), and it stops, as when it loses its registry slot. It writes its heartbeat every second, so it stops at most about 1 second after its key is removed, or 1 second after it resumes from a stall. Until then it can still answer reads from its page and inode caches, and it can still read the device, because the reservation blocks only writes.
+- **APTPL must be on:** registrations must survive a restart of the storage target. Linux sets the target's "persist through power loss" (APTPL) flag when it registers a key. If the target loses the registrations anyway, every node's next write fails and the whole cluster stops; nothing is corrupted, but every node must mount again. A Linux LIO target saves them in `/var/target/pr/aptpl_<serial>`. To rebuild an LIO target without losing them:
+  1. Copy `/var/target/pr/aptpl_*` before you tear the target down.
+  2. Create the backstore again, for example `core/iblock_0/lun0` under `/sys/kernel/config/target`.
+  3. Before any node logs in, write the saved file into the backstore: `cat aptpl_<serial> > /sys/kernel/config/target/core/iblock_0/lun0/pr/res_aptpl_metadata`.
+  4. Create the LUN, ACLs and portal, and enable the target. Each node's registration and the reservation come back when the node logs in again, and a node fenced before the rebuild stays fenced.
+- **One fenced mount per host:** a registration belongs to the host's storage initiator, not to a process, so two mounts of one fenced device on one host could not fence each other. A fenced mount locks the device on its host, and a second mount refuses while the first process exists, even stopped. Kill a stopped mount before mounting again.
+- **Permissions and multipath:** on Linux 6.5 and later, registering a key needs the device opened for writing; older kernels need root (`CAP_SYS_ADMIN`). With dm-multipath, the kernel registers the key on every path.
+- **fsck:** on a fenced volume, a run that writes uses the key of the node mounted on the same host, or registers a key of its own and removes it when done. Run `-repair` and `-release-slot` on a host where no node is mounted: when fsck revokes a dead node's key there, a Linux LIO target also drops the mounted node's writes in flight, and that node can stop.
 
 ### Adding a New Node
 
@@ -281,7 +297,7 @@ Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, 
 - a write that stalled after its last check, which runs once the write holds its locks, right before it reaches the device, and I/O the kernel or the storage queued during the stall;
 - writes in the second after the takeover, if the stalled node resumed while the other node was marking its slot dead.
 
-Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap, for example SCSI-3 persistent reservations (or NVMe reservations), with which surviving nodes revoke a dead node's access to the device. GoClusterFS does not use them.
+Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap: on a device with persistent reservations, see [Storage Fencing](#storage-fencing).
 
 Common causes of a stall:
 
@@ -315,7 +331,7 @@ Writers go first. A node that wants to read a file while another node waits to w
 |-------|-----|
 | Run chrony or NTP on every node | File times and `fsck -release-slot` use the wall clock; failover does not |
 | No node may stall for 15 seconds or more while mounted | Peers prove a node dead after about 20 seconds of silence and take its locks |
-| Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
+| Storage I/O must fail, not queue, within 10 seconds | Without [storage fencing](#storage-fencing), a queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
 | Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |
 
 If a node did stall for 15 seconds or more while mounted (hung-task warnings in `dmesg`, a VM pause, a path failover), stop its mount process before it does more writes, then check the data from a healthy node.

@@ -245,7 +245,9 @@ func (c *Checker) Release(plan *ReleasePlan, salvage bool) (*Salvage, error) {
 		}
 		return c.dev.Sync()
 	}
-	released, err := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset).ReleaseSlot(i, plan.Slot.raw, resetJournal)
+	reg := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset)
+	reg.SetPreempter(c.opts.Preempt)
+	released, err := reg.ReleaseSlot(i, plan.Slot.raw, resetJournal)
 	switch {
 	case err != nil && reset:
 		return salvaged, fmt.Errorf("release slot %d: %w; its journal is reset but the slot is not free, run again", i, err)

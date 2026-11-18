@@ -457,3 +457,19 @@ func BenchmarkDeserialize(b *testing.B) {
 		_, _ = Deserialize(data)
 	}
 }
+
+// Fencing is optional per volume, but a build that does not know it must refuse a fenced volume: its node would
+// neither register a key nor could peers fence it.
+func TestReservationsFlagIsOptionalButKnown(t *testing.T) {
+	base := RequiredJournal | RequiredLockLayout | RequiredSymlinks
+	for _, flags := range []uint64{base, base | RequiredReservations} {
+		if err := CheckRequiredFlags(flags); err != nil {
+			t.Errorf("flags %#x: %v", flags, err)
+		}
+	}
+	defer func(saved uint64) { FlagsWeSupport = saved }(FlagsWeSupport)
+	FlagsWeSupport &^= RequiredReservations
+	if err := CheckRequiredFlags(base | RequiredReservations); !errors.Is(err, ErrUnknownRequired) {
+		t.Errorf("a build without fencing mounting a fenced volume: %v, want ErrUnknownRequired", err)
+	}
+}

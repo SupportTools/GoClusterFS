@@ -19,6 +19,7 @@ type healthSources struct {
 	broadcastProblem func() string
 	silentPeers      func() ([]string, time.Duration)
 	heartbeatAge     func() time.Duration
+	fencing          string
 }
 
 func registerHealthChecks(srv *api.Server, src healthSources) {
@@ -31,6 +32,7 @@ func registerHealthChecks(srv *api.Server, src healthSources) {
 	check("broadcast", func() api.ComponentHealth { return broadcastHealth(src.broadcastOn, src.broadcastProblem()) })
 	check("broadcast-peers", func() api.ComponentHealth { return silentPeersHealth(src.silentPeers()) })
 	check("heartbeat", func() api.ComponentHealth { return heartbeatHealth(src.heartbeatAge()) })
+	check("fencing", func() api.ComponentHealth { return fencingHealth(src.fencing) })
 }
 
 func healthy(message string) api.ComponentHealth {
@@ -105,4 +107,11 @@ func silentPeersHealth(names []string, quiet time.Duration) api.ComponentHealth 
 		return healthy("")
 	}
 	return degraded("no broadcast heard from %s for over %v, though the registry shows them mounted; this node sees their changes only after -cache-ttl. Check that multicast reaches this node, and that they run with -broadcast and the same -mcast-group and -mcast-port", strings.Join(names, ", "), quiet)
+}
+
+func fencingHealth(kind string) api.ComponentHealth {
+	if kind == "none" {
+		return healthy("none: this volume has no storage fencing, so a stalled node's last writes can land after another node takes over")
+	}
+	return healthy("persistent reservations: a node that another node declares dead can no longer write")
 }

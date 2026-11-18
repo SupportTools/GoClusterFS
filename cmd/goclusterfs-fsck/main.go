@@ -169,8 +169,19 @@ func main() {
 		}
 	}()
 
+	writing := (mode != fsck.CheckOnly && !*dryRun) || (releasing && (*discardJournal || *salvage))
+	preempt, releaseFence, err := fsckFencing(dev, devicePath, writing)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(fsck.ExitOperational)
+	}
+	exit := func(code int) {
+		releaseFence()
+		os.Exit(code)
+	}
+
 	if *listSlots || releasing || inspecting {
-		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose})
+		checker := fsck.New(dev, fsck.Options{Output: os.Stdout, Verbose: *verbose, Preempt: preempt})
 		switch {
 		case *listSlots:
 			err = printSlots(os.Stdout, checker)
@@ -182,14 +193,14 @@ func main() {
 		switch {
 		case errors.Is(err, fsck.ErrNoSuchSlot):
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(fsck.ExitUsage)
+			exit(fsck.ExitUsage)
 		case err != nil:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(fsck.ExitOperational)
+			exit(fsck.ExitOperational)
 		case *discardJournal || *salvage:
-			os.Exit(fsck.ExitCorrected)
+			exit(fsck.ExitCorrected)
 		}
-		os.Exit(fsck.ExitClean)
+		exit(fsck.ExitClean)
 	}
 
 	// Configure fsck options
@@ -201,6 +212,7 @@ func main() {
 		SkipPhases:        make(map[fsck.Phase]bool),
 		DryRun:            *dryRun,
 		AllowUncleanNodes: *force,
+		Preempt:           preempt,
 	}
 
 	// Handle skip-phase
@@ -261,7 +273,7 @@ func main() {
 			fmt.Printf("Repaired %d problems; %d errors remain\n", result.RepairedCount, result.UnrepairedErrors())
 		}
 	}
-	os.Exit(result.ExitCode())
+	exit(result.ExitCode())
 }
 
 const repairHelp = `

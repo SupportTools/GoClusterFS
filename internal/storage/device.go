@@ -7,10 +7,12 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -39,6 +41,41 @@ const (
 	IOShardSize = 1 << 20 // 1MB
 )
 
+// stopBeforeWrite names a trigger file for tests: the first data or journal write that starts with the file's
+// contents, after every gate passed, removes it and stops this process with SIGSTOP. That stalls a node in the window
+// only storage fencing closes. Other writers wait before their gate until the stopped write is issued, and so does
+// the node's stop (AwaitStoppedWrite), so after SIGCONT it reaches the device first, the worst case after a stall.
+var stopBeforeWrite = os.Getenv("GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE")
+
+// stoppedWrite is closed once the write stopBeforeWrite stopped was issued; nil while none is stopped.
+var stoppedWrite atomic.Pointer[chan struct{}]
+
+// stopIfTriggered stops the process before buf is written, if buf matches the trigger file; call resume once the
+// write was issued.
+func stopIfTriggered(buf []byte) (resume func()) {
+	want, err := os.ReadFile(stopBeforeWrite)
+	if err != nil || !bytes.HasPrefix(buf, want) || os.Remove(stopBeforeWrite) != nil {
+		return func() {}
+	}
+	issued := make(chan struct{})
+	stoppedWrite.Store(&issued)
+	// Sent to this thread, which then stops before the write; a process-wide SIGSTOP can let it issue the write first.
+	runtime.LockOSThread()
+	_ = syscall.Tgkill(os.Getpid(), syscall.Gettid(), syscall.SIGSTOP)
+	runtime.UnlockOSThread()
+	return func() {
+		stoppedWrite.Store(nil)
+		close(issued)
+	}
+}
+
+// AwaitStoppedWrite returns once no write is stopped by stopBeforeWrite, at once outside tests.
+func AwaitStoppedWrite() {
+	if issued := stoppedWrite.Load(); issued != nil {
+		<-*issued
+	}
+}
+
 // ErrOutOfRange is the error for a read or write that reaches outside the device.
 var ErrOutOfRange = errors.New("I/O outside the device")
 
@@ -63,6 +100,8 @@ type Device struct {
 	path          string
 	size          int64
 	lastErr       atomic.Pointer[error]
+	fenced        atomic.Pointer[func(error)]
+	fencedOnce    sync.Once
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -277,7 +316,12 @@ func (d *Device) writeIfFresh(buf []byte, offset int64, sharded bool) (landed bo
 	if fresh := d.writeFresh.Load(); fresh != nil && !(*fresh)(offset) {
 		return false, 0, nil
 	}
+	resume := func() {}
+	if sharded && stopBeforeWrite != "" {
+		resume = stopIfTriggered(buf)
+	}
 	n, err = d.file.WriteAt(buf, offset)
+	resume()
 	d.record(err)
 	return true, n, err
 }
@@ -322,6 +366,7 @@ func (d *Device) SetSyncObserver(synced func()) {
 // CheckWrite runs the write gate for a write at offset. Callers that change the
 // device without WriteAt, such as a discard, call it first.
 func (d *Device) CheckWrite(offset int64) error {
+	AwaitStoppedWrite()
 	if gate := d.writeGate.Load(); gate != nil {
 		return (*gate)(offset)
 	}
@@ -360,12 +405,45 @@ func (d *Device) record(err error) {
 		}
 	case !errors.Is(err, io.EOF):
 		d.lastErr.Store(&err)
+		if errors.Is(err, syscall.EBADE) {
+			if fenced := d.fenced.Load(); fenced != nil {
+				d.fencedOnce.Do(func() { (*fenced)(err) })
+			}
+		}
 	}
+}
+
+// SetFencedHandler makes the first I/O that fails with a reservation conflict (EBADE) call fenced: another node
+// revoked this node's access to the device, so none of its writes can land any more.
+func (d *Device) SetFencedHandler(fenced func(error)) {
+	d.fenced.Store(&fenced)
 }
 
 // Fd returns the file descriptor for use with syscalls.
 func (d *Device) Fd() uintptr {
 	return d.file.Fd()
+}
+
+// Quiesce runs fn while none of this device's reads, writes, syncs or discards is in flight, and holds new ones until
+// fn returns.
+func (d *Device) Quiesce(fn func() error) error {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	return fn()
+}
+
+// blkDiscard is BLKDISCARD from <linux/fs.h>, _IO(0x12, 119).
+const blkDiscard = 0x1277
+
+// Discard tells the device that length bytes at offset hold no data any more.
+func (d *Device) Discard(offset, length uint64) error {
+	d.closeMu.RLock()
+	defer d.closeMu.RUnlock()
+	args := [2]uint64{offset, length}
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.file.Fd(), blkDiscard, uintptr(unsafe.Pointer(&args[0]))); errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // checkRange refuses n bytes at offset unless they fit inside the device; offsets come from on-disk numbers, which

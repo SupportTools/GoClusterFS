@@ -48,13 +48,17 @@ const (
 	// RequiredFileIOLocks means reads and writes take file I/O locks, which have lock records of their own; builds without it give those records to other types.
 	RequiredFileIOLocks uint64 = 1 << 6
 
+	// RequiredReservations means every node registers a persistent reservation key before it writes, so builds
+	// without fencing, which could neither write nor be fenced, must not mount the volume.
+	RequiredReservations uint64 = 1 << 7
+
 	// RequiredLockLayout is the lock record layout of this build.
 	RequiredLockLayout = RequiredTypedLockRecords | RequiredFileIOLocks
 )
 
 // FlagsWeSupport defines which required flags this version understands.
 // Update this as new features are implemented.
-var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks
+var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks | RequiredReservations
 
 // Errors
 var (

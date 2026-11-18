@@ -363,6 +363,9 @@ type Options struct {
 	// AllowUncleanNodes lets Repair run although a node left the filesystem
 	// without unmounting. Repair never runs while a node has it mounted.
 	AllowUncleanNodes bool
+
+	// Preempt revokes a node's access to the device before fsck writes over its state; nil on an unfenced volume.
+	Preempt func(owner [16]byte) error
 }
 
 // DefaultOptions returns the default fsck options.

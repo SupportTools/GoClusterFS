@@ -18,16 +18,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 const (
-	// BLKDISCARD is the Linux ioctl for TRIM/discard.
-	// Defined in <linux/fs.h> as _IO(0x12, 119) = 0x1277
-	BLKDISCARD = 0x1277
-
 	// DefaultBatchSize is the number of blocks before triggering a flush.
 	DefaultBatchSize = 256
 
@@ -374,27 +369,11 @@ func (m *Manager) issueDiscard(r blockRange) error {
 		return m.config.Discard(byteOffset, byteLength)
 	}
 
-	// BLKDISCARD takes [2]uint64{offset, length}
-	args := [2]uint64{byteOffset, byteLength}
-
-	// Issue ioctl
-	fd := m.dev.Fd()
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		fd,
-		BLKDISCARD,
-		uintptr(unsafe.Pointer(&args[0])),
-	)
-
-	if errno != 0 {
-		// EOPNOTSUPP is common for file-backed devices - treat as warning, not error
-		if errno == syscall.EOPNOTSUPP || errno == syscall.ENOTTY {
-			return errDiscardUnsupported
-		}
-		return errno
+	err := m.dev.Discard(byteOffset, byteLength)
+	if errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOTTY) {
+		return errDiscardUnsupported
 	}
-
-	return nil
+	return err
 }
 
 // Stats returns TRIM manager statistics.

@@ -3473,6 +3473,261 @@ test_stalled_node_writes_stop_at_write_gate() {
 }
 
 # =============================================================================
+# Storage fencing (VM_STORAGE=iscsi)
+# =============================================================================
+
+# fencing_restart formats the volume with -fencing=$1 through VM 1, whose mount runs with environment $2, and mounts
+# the other nodes, so each fencing test starts from a known volume.
+fencing_restart() {
+    local fencing="$1" env1="${2:-}" vm
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
+        fi
+        ssh_run "$vm" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
+    done
+    setup_goclusterfs 1 true "$env1" "" "-fencing=$fencing" || return 1
+    for vm in $(seq 2 "$NODE_COUNT"); do
+        setup_goclusterfs "$vm" false || return 1
+    done
+}
+
+# wait_log waits up to $3 seconds for VM $1's mount log to show $2 after the last marker line $4.
+wait_log() {
+    local vm="$1" pattern="$2" limit="$3" marker="$4" waited=0
+    until sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -q "$pattern"; do
+        if [[ $waited -ge $limit ]]; then
+            log_error "VM $vm: no '$pattern' in its mount log within ${limit}s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# wait_stopped waits up to $2 seconds for goclusterfs-mount on VM $1 to exit.
+wait_stopped() {
+    local vm="$1" limit="$2" waited=0
+    while [[ -n "$(mount_pids "$vm")" ]]; do
+        if [[ $waited -ge $limit ]]; then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+}
+
+# fenced_file_byte prints the first byte of the test file as VM $1 reads it from the device, past every cache.
+fenced_file_byte() {
+    ssh_run "$1" "sync; echo 3 > /proc/sys/vm/drop_caches; dd if=${GOCLUSTERFS_MOUNT}/fenced iflag=direct bs=4096 count=1 2>/dev/null | head -c 1"
+}
+
+# fencing_stalled_case formats with -fencing=$1 and stops VM 1 with SIGSTOP just before its write of A reaches the
+# device, after every software check passed. VM 2 proves it dead and writes B, then VM 1 resumes. FENCED_BYTE gets the
+# file's first byte afterwards: B when the storage refused the stale write, A when it landed.
+fencing_stalled_case() {
+    local fencing="$1" stalled=1 peer=2 pids waited
+    FENCED_BYTE=""
+    # The held heartbeat keeps the resumed node from noticing its lost slot before the stopped write runs.
+    fencing_restart "$fencing" "GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE=/tmp/stop-before-write GOCLUSTERFS_TEST_HEARTBEAT_HOLD=30s" || return 1
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/fenced && sync"
+    ssh_run "$stalled" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/fenced.A"
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/fenced.B"
+    pids=$(mount_pids "$stalled")
+    local marker="fencing stalled writer ${fencing} $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$stalled" "printf AAAAAAAA > /tmp/stop-before-write; nohup dd if=/tmp/fenced.A of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync < /dev/null > /dev/null 2>&1 &"
+    waited=0
+    until ssh_run "$stalled" "grep -q '^State:.*stopped' /proc/${pids%% *}/status"; do
+        if [[ $waited -ge 30 ]]; then
+            log_error "VM $stalled did not stop before its write of A within 30s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! wait_log "$peer" "Starting journal replay for node" 120 "$marker"; then
+        ssh_run "$stalled" "kill -CONT $(echo $pids)"
+        return 1
+    fi
+    sleep 3
+    if ! ssh_run "$peer" "dd if=/tmp/fenced.B of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null"; then
+        log_error "VM $peer could not write after taking over"
+        ssh_run "$stalled" "kill -CONT $(echo $pids)"
+        return 1
+    fi
+    ssh_run "$stalled" "kill -CONT $(echo $pids)"
+    wait_stopped "$stalled" 45 || log_error "VM $stalled still runs 45s after it resumed"
+    FENCED_BYTE=$(fenced_file_byte "$peer")
+}
+
+# The proof that fencing closes the window no software check can: a write that passed every gate just before its node
+# stalled. On an unfenced volume, the control, it lands over the peer's data after the takeover, which shows the test
+# sees the hazard. On a fenced volume the storage refuses it, and the node stops.
+test_fencing_stalled_writer() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0
+    fencing_stalled_case none || result=1
+    if [[ "$FENCED_BYTE" != A ]]; then
+        log_error "control: on an unfenced volume the stalled write should land over VM 2's data, but the file starts with '$FENCED_BYTE'"
+        result=1
+    fi
+    fencing_stalled_case pr || result=1
+    if [[ "$FENCED_BYTE" != B ]]; then
+        log_error "fenced: the file starts with '$FENCED_BYTE', want VM 2's B"
+        result=1
+    fi
+    if ! sed -n '/fencing stalled writer pr/,$p' "$(get_vm_mount_log 1)" | grep -q "The device refused a write"; then
+        log_error "VM 1 did not report the refused write"
+        result=1
+    fi
+    if ! sed -n '/fencing stalled writer pr/,$p' "$(get_vm_mount_log 2)" | grep -q "Revoked node"; then
+        log_error "VM 2 did not report revoking VM 1's access"
+        result=1
+    fi
+    ssh_run 1 "rm -f /tmp/stop-before-write"
+    fencing_restart pr || result=1
+    [[ $result -eq 0 ]] && log_info "The storage refused the stalled write; the control shows it lands without fencing"
+    return $result
+}
+
+# A node VM paused while it writes is proven dead and fenced. When it resumes, its queued writes fail and it stops,
+# and the file keeps the peer's data.
+test_fencing_paused_vm() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local paused=1 peer=2 result=0
+    fencing_restart pr || return 1
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/fenced && sync"
+    ssh_run "$paused" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/fenced.A"
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/fenced.B"
+    local marker="fencing paused vm $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$paused" "nohup sh -c 'while dd if=/tmp/fenced.A of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null; do :; done' < /dev/null > /dev/null 2>&1 &"
+    sleep 2
+    echo stop | nc -U -q1 "$(get_vm_monitor_socket "$paused")" > /dev/null
+    if ! wait_log "$peer" "Revoked node" 120 "$marker"; then
+        echo cont | nc -U -q1 "$(get_vm_monitor_socket "$paused")" > /dev/null
+        return 1
+    fi
+    sleep 3
+    ssh_run "$peer" "dd if=/tmp/fenced.B of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null" || result=1
+    echo cont | nc -U -q1 "$(get_vm_monitor_socket "$paused")" > /dev/null
+    if ! wait_stopped "$paused" 30; then
+        log_error "VM $paused still runs 30s after it resumed"
+        result=1
+    fi
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log "$paused")" | grep -q "The device refused a write"; then
+        log_info "VM $paused stopped on a refused write"
+    else
+        log_info "VM $paused stopped without a refused write: an I/O error or its slot check came first"
+    fi
+    local byte
+    byte=$(fenced_file_byte "$peer")
+    if [[ "$byte" != B ]]; then
+        log_error "the file starts with '$byte' after VM $paused resumed, want VM $peer's B"
+        result=1
+    fi
+    ssh_run "$paused" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fence[d]'; true"
+    fencing_restart pr || result=1
+    return $result
+}
+
+# A fenced node that writes nothing still stops soon after it resumes: its next heartbeat write fails.
+test_fencing_idle_node() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local idle=1 peer=2 result=0 pids
+    fencing_restart pr || return 1
+    pids=$(mount_pids "$idle")
+    local marker="fencing idle node $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$idle" "kill -STOP $(echo $pids)"
+    if ! wait_log "$peer" "Revoked node" 120 "$marker"; then
+        ssh_run "$idle" "kill -CONT $(echo $pids)"
+        return 1
+    fi
+    ssh_run "$idle" "kill -CONT $(echo $pids)"
+    if ! wait_stopped "$idle" 10; then
+        log_error "VM $idle still runs 10s after it resumed with its key revoked"
+        result=1
+    fi
+    fencing_restart pr || result=1
+    return $result
+}
+
+# A node revokes a stopped peer while its own writes are in flight. LIO tags every command with the reservation
+# holder's key, so a preempt that does not drain this node's I/O first drops its own writes without a status.
+test_fencing_busy_survivor() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local stopped=1 peer=2 result=0 pids
+    fencing_restart pr || return 1
+    ssh_run "$peer" "rm -f /tmp/busy.stop; dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/busy bs=1M count=2 conv=fsync 2>/dev/null"
+    pids=$(mount_pids "$stopped")
+    local marker="fencing busy survivor $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$peer" "nohup sh -c 'while [ ! -e /tmp/busy.stop ]; do dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/busy bs=1M count=2 conv=notrunc,fsync 2>/dev/null; done' < /dev/null > /dev/null 2>&1 &"
+    ssh_run "$stopped" "kill -STOP $(echo $pids)"
+    if ! wait_log "$peer" "Revoked node" 120 "$marker"; then
+        sed -n "/$marker/,\$p" "$(get_vm_mount_log "$peer")" | grep -E "Not recovering|stopping" | head -3
+        result=1
+    fi
+    ssh_run "$peer" "touch /tmp/busy.stop"
+    ssh_run "$stopped" "kill -CONT $(echo $pids)"
+    if [[ -z "$(mount_pids "$peer")" ]]; then
+        log_error "VM $peer stopped while it revoked VM $stopped"
+        result=1
+    elif ! ssh_run "$peer" "dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/busy.after bs=4096 count=1 conv=fsync 2>/dev/null"; then
+        log_error "VM $peer cannot write after it revoked VM $stopped"
+        result=1
+    fi
+    fencing_restart pr || result=1
+    return $result
+}
+
+# registered_initiators lists the initiators the target holds a reservation key for, one per line.
+registered_initiators() {
+    ssh_run "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
+}
+
+# A clean unmount removes the node's reservation key, after its last write.
+test_fencing_unmount_removes_key() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local vm=2 result=0
+    fencing_restart pr || return 1
+    if ! registered_initiators | grep -q "goclusterfs:vm$vm,"; then
+        log_error "VM $vm has no reservation key while mounted: $(registered_initiators | tr '\n' ' ')"
+        return 1
+    fi
+    local marker="fencing unmount $(date +%s)"
+    mark_vm_logs "$marker"
+    unmount_goclusterfs "$vm" || return 1
+    if registered_initiators | grep -q "goclusterfs:vm$vm,"; then
+        log_error "VM $vm's reservation key stays after a clean unmount: $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -q "reservation key failed"; then
+        log_error "VM $vm could not remove its reservation key at unmount"
+        result=1
+    fi
+    setup_goclusterfs "$vm" false || result=1
+    return $result
+}
+
+# =============================================================================
 # Hostile storage and clocks
 # =============================================================================
 # VM 1 mounts through a device-mapper device over the shared disk, so its path
@@ -3482,13 +3737,13 @@ test_stalled_node_writes_stop_at_write_gate() {
 HOSTILE_DM=gcfs-path
 
 hostile_dm_load() {
-    ssh_run 1 "sz=\$(blockdev --getsz /dev/vda) && dmsetup suspend $HOSTILE_DM && dmsetup load $HOSTILE_DM --table \"0 \$sz $1\" && dmsetup resume $HOSTILE_DM"
+    ssh_run 1 "sz=\$(blockdev --getsz $(cluster_device)) && dmsetup suspend $HOSTILE_DM && dmsetup load $HOSTILE_DM --table \"0 \$sz $1\" && dmsetup resume $HOSTILE_DM"
 }
 
 hostile_setup() {
     ensure_cluster_healthy 2 || return 1
     unmount_goclusterfs 1 || { log_error "VM 1: unmount failed"; return 1; }
-    if ! ssh_run 1 "apk add --no-cache device-mapper > /dev/null && modprobe dm-delay && modprobe dm-flakey && { dmsetup remove $HOSTILE_DM 2>/dev/null; dmsetup create $HOSTILE_DM --table \"0 \$(blockdev --getsz /dev/vda) linear /dev/vda 0\"; }"; then
+    if ! ssh_run 1 "apk add --no-cache device-mapper > /dev/null && modprobe dm-delay && modprobe dm-flakey && { dmsetup remove $HOSTILE_DM 2>/dev/null; dmsetup create $HOSTILE_DM --table \"0 \$(blockdev --getsz $(cluster_device)) linear $(cluster_device) 0\"; }"; then
         log_error "VM 1: device-mapper setup failed"
         return 1
     fi
@@ -3526,13 +3781,13 @@ hostile_replayed_since() {
     sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
 }
 
-# VM 1, back from a stall during which VM 2 replayed it, stopped, either on its
-# own stall or on finding its slot taken, and acknowledged no create but one
-# whose writes were already queued when the stall began.
+# VM 1, back from a stall during which VM 2 replayed it, stopped, on its own
+# stall, on finding its slot taken, or on the device refusing its write, and
+# acknowledged no create but one whose writes were already queued when the stall began.
 hostile_check_taken_slot_stops() {
     local acked
-    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)|may no longer be this node's: it went"; then
-        log_error "VM 1 did not stop on its stall or on finding its slot taken"
+    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)|may no longer be this node's: it went|The device refused a write from this node"; then
+        log_error "VM 1 did not stop on its stall, on finding its slot taken, or on a refused write"
         sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|no longer|stopping' | head -5
         return 1
     fi
@@ -3586,11 +3841,11 @@ hostile_fsck_and_restore() {
     if [[ -n "$(mount_pids 2)" ]]; then
         unmount_goclusterfs 2 || { log_error "VM 2: unmount failed"; result=1; }
     fi
-    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -repair /dev/vda 2>&1; echo rc=\$?")
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -repair $(cluster_device) 2>&1; echo rc=\$?")
     rc=${out##*rc=}
     log_info "fsck -repair exit $rc, $(echo "$out" | grep -c 'leaked') leaked-block lines"
     echo "$out" | grep '^\[' | grep -v leaked | head -10
-    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck /dev/vda 2>&1; echo rc=\$?")
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck $(cluster_device) 2>&1; echo rc=\$?")
     rc=${out##*rc=}
     if [[ "$rc" != 0 ]]; then
         echo "$out" | grep '^\[' | head -20
@@ -3683,10 +3938,10 @@ hostile_delay_spikes() {
     local ms
     for ms in 100 500 1000 2000; do
         log_info "VM 1 path: ${ms}ms per I/O for 15s"
-        hostile_dm_load "delay /dev/vda 0 $ms" || return 1
+        hostile_dm_load "delay $(cluster_device) 0 $ms" || return 1
         sleep 15
     done
-    hostile_dm_load "linear /dev/vda 0"
+    hostile_dm_load "linear $(cluster_device) 0"
 }
 
 hostile_stall() {
@@ -3701,14 +3956,14 @@ hostile_eio() {
     log_info "VM 1 path: every I/O fails with EIO for ${HOSTILE_EIO}s"
     hostile_dm_load "error" || return 1
     sleep "$HOSTILE_EIO"
-    hostile_dm_load "linear /dev/vda 0"
+    hostile_dm_load "linear $(cluster_device) 0"
 }
 
 hostile_flaky() {
     log_info "VM 1 path: 1s of EIO every 4s, for 40s"
-    hostile_dm_load "flakey /dev/vda 0 3 1" || return 1
+    hostile_dm_load "flakey $(cluster_device) 0 3 1" || return 1
     sleep 40
-    hostile_dm_load "linear /dev/vda 0"
+    hostile_dm_load "linear $(cluster_device) 0"
 }
 
 test_storage_latency_spikes() { hostile_scenario "latency spikes" hostile_delay_spikes survives; }
@@ -3827,7 +4082,7 @@ test_fsck_repair_after_power_failure() {
     done
 
     local out rc
-    out=$(ssh_run "$survivor" "$fsck -repair /dev/vda 2>&1; echo rc=\$?")
+    out=$(ssh_run "$survivor" "$fsck -repair $(cluster_device) 2>&1; echo rc=\$?")
     rc=${out##*rc=}
     echo "$out" | grep '^\[' | head -20
     log_info "fsck -repair exit $rc, $(echo "$out" | grep -c 'leaked') leaked-block lines"
@@ -3835,7 +4090,7 @@ test_fsck_repair_after_power_failure() {
         log_error "fsck -repair exited $rc"
         return 1
     fi
-    out=$(ssh_run "$survivor" "$fsck /dev/vda 2>&1; echo rc=\$?")
+    out=$(ssh_run "$survivor" "$fsck $(cluster_device) 2>&1; echo rc=\$?")
     rc=${out##*rc=}
     if [[ "$rc" != 0 ]] || echo "$out" | grep -q 'leaked'; then
         echo "$out" | grep '^\[' | head -20
@@ -3963,7 +4218,7 @@ restart_and_expect_only_leaks() {
     done
 
     # Snapshots of files earlier tests deleted are orphans, which is not damage.
-    out=$(ssh_run 1 "$fsck /dev/vda 2>&1")
+    out=$(ssh_run 1 "$fsck $(cluster_device) 2>&1")
     problems=$(echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
     if echo "$problems" | grep -v -e '^$' -e 'leaked' -e 'will never be freed' -e 'unnamed: no directory names it' -e 'belongs to no snapshot' | grep -q .; then
         log_error "fsck after the power failure found more than leaks:"
@@ -3972,8 +4227,8 @@ restart_and_expect_only_leaks() {
     fi
     if [[ -n "$problems" ]]; then
         log_info "fsck found $(echo "$problems" | wc -l) leaks; repairing"
-        ssh_run 1 "$fsck -repair /dev/vda > /dev/null 2>&1"
-        out=$(ssh_run 1 "$fsck /dev/vda 2>&1" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
+        ssh_run 1 "$fsck -repair $(cluster_device) > /dev/null 2>&1"
+        out=$(ssh_run 1 "$fsck $(cluster_device) 2>&1" | grep -E '^ *\[(WARN|ERROR)\]' | grep -v 'is an orphan')
         if [[ -n "$out" ]]; then
             log_error "fsck after repair still finds problems:"
             echo "$out" | head -20 >&2
@@ -4616,6 +4871,11 @@ main() {
     run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure
     run_test "TRIM Reuse Power Failure" test_trim_reuse_power_failure
     run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
+    run_test "Fencing: Stalled Writer" test_fencing_stalled_writer
+    run_test "Fencing: Paused VM" test_fencing_paused_vm
+    run_test "Fencing: Idle Node" test_fencing_idle_node
+    run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
+    run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall

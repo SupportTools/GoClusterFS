@@ -418,7 +418,7 @@ ip maddr show
 
 Nodes coordinate through the shared device, not the network, so a network partition alone does not let them write independently. It only stops cache invalidations, and each node catches up after `-cache-ttl`.
 
-Two nodes can write the same metadata when a node stalls (VM pause, storage path failover) while it holds a lock, or when two nodes share a registry slot. See [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) and [Known Gaps in Slot Ownership](OPERATIONS.md#known-gaps-in-slot-ownership). If you suspect this:
+Two nodes can write the same metadata when a node stalls (VM pause, storage path failover) while it holds a lock on a volume without [storage fencing](OPERATIONS.md#storage-fencing), or when two nodes share a registry slot. See [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) and [Known Gaps in Slot Ownership](OPERATIONS.md#known-gaps-in-slot-ownership). If you suspect this:
 
 ```bash
 # Step 1: Unmount on every node
@@ -484,9 +484,10 @@ fusermount3 -u /mnt/cluster
 
 1. **Always unmount cleanly** before shutting down
 2. **Keep journaling on** (`-journal`, on by default)
-3. **Avoid stalls, and run NTP on every node** (see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits))
-4. **Run periodic fsck** during maintenance windows
-5. **Maintain backups** - no filesystem is immune to hardware failure
+3. **Format on a device with persistent reservations**, so a stalled node cannot write after its takeover (see [Storage Fencing](OPERATIONS.md#storage-fencing))
+4. **Avoid stalls, and run NTP on every node** (see [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits))
+5. **Run periodic fsck** during maintenance windows
+6. **Maintain backups** - no filesystem is immune to hardware failure
 
 ---
 

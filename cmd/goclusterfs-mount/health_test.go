@@ -90,8 +90,8 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if resp.Status != tt.want {
 				t.Errorf("status = %s, want %s: %+v", resp.Status, tt.want, resp.Checks)
 			}
-			if len(resp.Checks) != 6 {
-				t.Errorf("checks = %v, want device, journal, recovery, broadcast, broadcast-peers and heartbeat", resp.Checks)
+			if len(resp.Checks) != 7 {
+				t.Errorf("checks = %v, want device, journal, recovery, broadcast, broadcast-peers, heartbeat and fencing", resp.Checks)
 			}
 			for name, check := range resp.Checks {
 				if (name == tt.problem) != (check.Status != api.HealthStatusOK) {
@@ -150,5 +150,14 @@ func fineSources() healthSources {
 		broadcastProblem: func() string { return "" },
 		silentPeers:      func() ([]string, time.Duration) { return nil, 90 * time.Second },
 		heartbeatAge:     func() time.Duration { return 800 * time.Millisecond },
+	}
+}
+
+func TestFencingHealthNamesAMissingFence(t *testing.T) {
+	if h := fencingHealth("none"); h.Status != api.HealthStatusOK || !strings.HasPrefix(h.Message, "none:") {
+		t.Errorf("unfenced: %+v, want healthy with a message that starts with none:", h)
+	}
+	if h := fencingHealth("pr"); h.Status != api.HealthStatusOK || strings.HasPrefix(h.Message, "none") {
+		t.Errorf("fenced: %+v", h)
 	}
 }
