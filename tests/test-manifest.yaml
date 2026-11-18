@@ -4626,6 +4626,13 @@ scenarios:
     environments:
       go: internal/node/registry_test.go::TestWriteFreshNeedsAHeartbeatCheckOwnershipWouldTrust
 
+  - id: registry-short-stall-keeps-node-up
+    name: A heartbeat stalled for less than 15 seconds keeps the node up
+    description: A heartbeat paused 12s between its slot read and its write, with the slot still its own, writes; the node keeps its slot and its data writes pass the write gate
+    priority: go_only
+    environments:
+      go: internal/node/stall_test.go::TestShortStalledBeatKeepsTheNodeUp
+
   - id: registry-stalled-beat-stops-after-replay
     name: A heartbeat stalled across a peer's replay stops the node without rewriting the slot
     description: A heartbeat paused between its slot read and its write while a peer replays and empties the slot does not write; the node stops, the write gate refuses data writes without reading the slot, and the slot stays empty

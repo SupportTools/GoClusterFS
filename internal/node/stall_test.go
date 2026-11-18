@@ -59,8 +59,7 @@ func (n *stalledNode) stallAfterBeatRead(t *testing.T, gap time.Duration, during
 	done := make(chan error, 1)
 	go func() { done <- n.reg.beat(n.slot) }()
 	<-paused
-	stalled := time.Now().Add(-gap)
-	n.reg.lastBeat.Store(&stalled)
+	n.reg.lastBeat.Store(int64(bootClock() - gap))
 	during()
 	close(resume)
 	return <-done
@@ -158,8 +157,7 @@ func TestHeartbeatLandingLateStopsTheNode(t *testing.T) {
 	n := registerStalledNode(t, dev)
 	dev.SetWriteObserver(func(offset int64, _ int) {
 		if offset < MaxNodes*SlotSize {
-			late := time.Now().Add(-deadAfter - 5*time.Second)
-			n.reg.lastBeat.Store(&late)
+			n.reg.lastBeat.Store(int64(bootClock() - deadAfter - 5*time.Second))
 		}
 	})
 
@@ -189,8 +187,7 @@ func TestHeartbeatLandingLateOverANewOwnerStopsBothNodes(t *testing.T) {
 		if got, err := newcomer.Register(context.Background(), "newcomer"); err != nil || got != n.slot {
 			t.Errorf("new node registered in slot %d (%v), want the released slot %d", got, err, n.slot)
 		}
-		late := time.Now().Add(-deadAfter - 5*time.Second)
-		n.reg.lastBeat.Store(&late)
+		n.reg.lastBeat.Store(int64(bootClock() - deadAfter - 5*time.Second))
 	})
 
 	if err := n.reg.beat(n.slot); !errors.Is(err, ErrSlotLost) {
@@ -201,5 +198,26 @@ func TestHeartbeatLandingLateOverANewOwnerStopsBothNodes(t *testing.T) {
 	refusesDataWrites(t, dev, 1<<20)
 	if err := newcomer.beat(n.slot); !errors.Is(err, ErrSlotLost) {
 		t.Errorf("new node's heartbeat after the late write landed over it = %v, want ErrSlotLost", err)
+	}
+}
+
+// A 12s stall, as in a storage path failover, ends before any peer may replay
+// the node, so its heartbeat writes and the node keeps writing data.
+func TestShortStalledBeatKeepsTheNodeUp(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	n := registerStalledNode(t, dev)
+
+	if err := n.stallAfterBeatRead(t, 12*time.Second, func() {}); err != nil {
+		t.Errorf("heartbeat after a 12s stall = %v, want nil", err)
+	}
+	n.mu.Lock()
+	if len(n.losses) != 0 {
+		t.Errorf("slot-lost handler called after a 12s stall: %v", n.losses)
+	}
+	n.mu.Unlock()
+	data := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := dev.WriteAt(data.Bytes(), 1<<20); err != nil {
+		t.Errorf("data write after a 12s stall: %v", err)
 	}
 }
