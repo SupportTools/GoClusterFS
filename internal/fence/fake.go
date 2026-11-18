@@ -1,6 +1,9 @@
 package fence
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // Target is an in-memory device with persistent reservations for tests; Node gives each initiator a Fencer.
 type Target struct {
@@ -98,4 +101,16 @@ func (d *fakeDevice) clear(key uint64) error {
 	t.keys = map[string]uint64{}
 	t.reserved = false
 	return nil
+}
+
+func (d *fakeDevice) readKeys() ([]uint64, error) {
+	t := d.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	keys := make([]uint64, 0, len(t.keys))
+	for _, key := range t.keys {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys, nil
 }

@@ -71,6 +71,7 @@ type device interface {
 	reserve(key uint64) error
 	preemptAbort(own, victim uint64) error
 	clear(key uint64) error
+	readKeys() ([]uint64, error)
 }
 
 // PR fences with a Write Exclusive, All Registrants reservation: every registered node may write, and no other
@@ -112,6 +113,9 @@ func (p *PR) Preempt(victim uint64) error {
 	}
 	return nil
 }
+
+// Keys lists the keys registered on the device. ErrUnsupported means the kernel or the device cannot list them.
+func (p *PR) Keys() ([]uint64, error) { return p.dev.readKeys() }
 
 // Clear removes every initiator's key, p's too, and with them the reservation. Only a registered key may clear, so it
 // registers p's key first.

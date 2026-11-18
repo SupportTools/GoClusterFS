@@ -52,7 +52,7 @@ func TestFencingOnAFileImage(t *testing.T) {
 	}
 	fsckBinary := findFsckBinary(t)
 	clear := func() (string, error) {
-		out, err := exec.Command(fsckBinary, "-clear-reservations", mfs.ImagePath).CombinedOutput()
+		out, err := exec.Command(fsckBinary, "-clear-reservations", "-confirm", mfs.ImagePath).CombinedOutput()
 		return string(out), err
 	}
 	if out, err := clear(); err == nil || !strings.Contains(out, "clearing refused: the filesystem is mounted by") {
@@ -61,8 +61,9 @@ func TestFencingOnAFileImage(t *testing.T) {
 	if err := mfs.Unmount(); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := clear(); err == nil || !strings.Contains(out, "does not support persistent reservations") {
-		t.Errorf("fsck -clear-reservations on a file image: %v\n%s", err, out)
+	if out, err := clear(); err == nil || !strings.Contains(out, "cannot list the reservation keys") ||
+		!strings.Contains(out, "does not support persistent reservations") {
+		t.Errorf("fsck -clear-reservations -confirm on a file image: %v\n%s", err, out)
 	}
 
 	mountPoint := filepath.Join(t.TempDir(), "mnt")

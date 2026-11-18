@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 
@@ -27,6 +28,7 @@ func TestNodeKey(t *testing.T) {
 func TestIoctlNumbers(t *testing.T) {
 	for got, want := range map[uintptr]uintptr{
 		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
+		iocReadKeys: 0xc01070ce,
 	} {
 		if got != want {
 			t.Errorf("ioctl %#x, want %#x", got, want)
@@ -50,8 +52,15 @@ func TestClearRemovesEveryKeyAndTheReservation(t *testing.T) {
 	if target.MayWrite("tool") {
 		t.Fatal("an unregistered initiator may write under the reservation")
 	}
-	if err := target.Node("tool", ToolKey()).Clear(); err != nil {
+	tool := target.Node("tool", ToolKey())
+	if keys, err := tool.Keys(); err != nil || !slices.Equal(keys, []uint64{a.Key(), b.Key()}) {
+		t.Fatalf("Keys before Clear = %x, %v; want a's and b's", keys, err)
+	}
+	if err := tool.Clear(); err != nil {
 		t.Fatalf("Clear: %v", err)
+	}
+	if keys, err := tool.Keys(); err != nil || len(keys) != 0 {
+		t.Errorf("Keys after Clear = %x, %v; want none", keys, err)
 	}
 	for _, initiator := range []string{"a", "b", "tool", "other"} {
 		if !target.MayWrite(initiator) {
@@ -199,6 +208,7 @@ func (d statusDevice) register(old, new uint64, ignore bool) error {
 func (d statusDevice) reserve(uint64) error                  { return nil }
 func (d statusDevice) preemptAbort(own, victim uint64) error { return ioctlResult(d.preemptStatus, 0) }
 func (d statusDevice) clear(uint64) error                    { return nil }
+func (d statusDevice) readKeys() ([]uint64, error)           { return nil, nil }
 
 // Preempt reads a conflict alike from SCSI and NVMe, and stops on any other status.
 func TestPreemptStatusesFromBothTransports(t *testing.T) {

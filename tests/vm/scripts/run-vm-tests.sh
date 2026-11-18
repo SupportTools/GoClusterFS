@@ -3695,8 +3695,9 @@ test_fencing_busy_survivor() {
     return $result
 }
 
-# fsck -clear-reservations refuses while nodes run. Once VM 1 unmounted and VM 2 crashed, leaving its key, it removes
-# every key and the reservation, after which both nodes mount again.
+# fsck -clear-reservations refuses while nodes run, even with -force. Once VM 1 unmounted and VM 2 crashed, leaving
+# its key, it lists and keeps the keys without -confirm, and with -confirm removes every key and the reservation, after
+# which both nodes mount again.
 test_fencing_clear_reservations() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
@@ -3704,7 +3705,7 @@ test_fencing_clear_reservations() {
     fi
     local result=0 out pr=/sys/kernel/config/target/core/iblock_0/lun0/pr
     fencing_restart pr || return 1
-    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -clear-reservations $(cluster_device) 2>&1; echo rc=\$?")
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm -force $(cluster_device) 2>&1; echo rc=\$?")
     if [[ "$out" != *"clearing refused: the filesystem is mounted by"* ]]; then
         log_error "fsck -clear-reservations while both nodes run did not refuse: $out"
         result=1
@@ -3716,8 +3717,13 @@ test_fencing_clear_reservations() {
         result=1
     fi
     out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck -clear-reservations $(cluster_device) 2>&1; echo rc=\$?")
-    if [[ "$out" != *"rc=0"* ]]; then
-        log_error "fsck -clear-reservations with no node running failed: $out"
+    if [[ "$out" != *"Nothing was changed"*"rc=0"* ]] || ! registered_initiators | grep -q "goclusterfs:vm2,"; then
+        log_error "fsck -clear-reservations without -confirm changed something or failed: $out"
+        result=1
+    fi
+    out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"Removed every reservation key"*"rc=0"* ]]; then
+        log_error "fsck -clear-reservations -confirm with no node running failed: $out"
         result=1
     fi
     if registered_initiators | grep -q "goclusterfs:vm"; then
@@ -3729,6 +3735,7 @@ test_fencing_clear_reservations() {
         log_error "the target still holds a reservation after fsck -clear-reservations: $out"
         result=1
     fi
+    ssh_run 2 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
     setup_goclusterfs 1 false || result=1
     setup_goclusterfs 2 false || result=1
     return $result

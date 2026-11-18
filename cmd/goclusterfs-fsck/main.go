@@ -66,7 +66,8 @@ func main() {
 		discardJournal = flag.Bool("discard-journal", false, "With -release-slot, reset the slot's journal unread and free the slot; writes that journal holds are lost")
 		salvage        = flag.Bool("salvage", false, "With -release-slot, replay the slot's journal until a transaction fails to apply or cannot be read, then reset it and free the slot; the failed transaction and every later one are lost")
 		reportPath     = flag.String("report", "", "With -release-slot, also write the slot, its journal and what happens to each transaction to `FILE`")
-		clearReserve   = flag.Bool("clear-reservations", false, "Remove every node's persistent reservation key and the device's reservation, then exit. Only when no node runs: until a node mounts again, any host can write to the device. -force skips the check for running nodes")
+		clearReserve   = flag.Bool("clear-reservations", false, "Emergency reset of storage fencing: list the device's persistent reservation keys, and with -confirm remove every key and the reservation, then exit. Refused while a node runs; until a node mounts again, any host can write to the device")
+		confirm        = flag.Bool("confirm", false, "With -clear-reservations, remove the keys instead of only listing them")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <device>\n\n", os.Args[0])
@@ -80,7 +81,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -repair -dry-run /dev/sdc     # Show what repair would change\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -list-slots /dev/sdb          # Show node registry slots\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -release-slot 3 /dev/sdb      # Show what releasing slot 3 discards\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -clear-reservations /dev/sdb  # Remove every reservation key once no node runs\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -clear-reservations /dev/sdb  # List the reservation keys; add -confirm to remove them all\n", os.Args[0])
 		fmt.Fprint(os.Stderr, repairHelp)
 		fmt.Fprint(os.Stderr, slotsHelp)
 		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
@@ -146,6 +147,9 @@ func main() {
 	case *clearReserve && (*listSlots || releasing || inspecting || *repair):
 		fmt.Fprintln(os.Stderr, "Error: -clear-reservations runs alone")
 		os.Exit(fsck.ExitUsage)
+	case *confirm && !*clearReserve:
+		fmt.Fprintln(os.Stderr, "Error: -confirm needs -clear-reservations")
+		os.Exit(fsck.ExitUsage)
 	}
 	devicePath := flag.Arg(0)
 
@@ -175,7 +179,7 @@ func main() {
 	}()
 
 	if *clearReserve {
-		if err := clearReservations(os.Stdout, dev, devicePath, *force); err != nil {
+		if err := clearReservations(os.Stdout, dev, devicePath, *confirm, *force); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(fsck.ExitOperational)
 		}

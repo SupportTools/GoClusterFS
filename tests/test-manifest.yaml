@@ -5340,6 +5340,13 @@ scenarios:
     environments:
       go: internal/node/fence_test.go::TestMountingIntoADeadSlotPreempts
 
+  - id: registry-preempt-after-silence
+    name: A mount preempts another host's slot only after its silence watch
+    description: A slot whose heartbeat moves during the watch keeps its owner's key, and a silent one is preempted no sooner than silentSlotWatch
+    priority: go_only
+    environments:
+      go: internal/node/fence_test.go::TestMountPreemptsOnlyAfterTheSilenceWatch
+
   - id: registry-fenced-stop-once
     name: A refused write stops the node once, without the registry lock
     description: Fenced runs the slot-lost handler once even while a heartbeat holds the registry lock, and afterwards the node refuses writes
@@ -5416,7 +5423,7 @@ scenarios:
 
   - id: fencing-clear-reservations
     name: fsck -clear-reservations removes every key once no node runs
-    description: fsck -clear-reservations refuses while VM 1 runs; once VM 1 unmounts, it removes VM 1's and the crashed VM 2's keys and the reservation, and both nodes mount again
+    description: fsck -clear-reservations refuses while both nodes run, even with -force; once VM 1 unmounts and VM 2 crashes, it changes nothing without -confirm, and with -confirm removes the crashed VM 2's key and the reservation, and both nodes mount again
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_clear_reservations
