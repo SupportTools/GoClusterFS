@@ -1,9 +1,12 @@
 package node
 
-import "slices"
+import (
+	"context"
+	"slices"
+)
 
-// SetOrphanHandler sets fn, which failure detection calls with each live slot's orphan list.
-func (r *Registry) SetOrphanHandler(fn func(slot int, orphans []Orphan)) {
+// SetOrphanHandler sets fn, which the orphan loop calls with each live slot's orphan list and a context that ends at Stop.
+func (r *Registry) SetOrphanHandler(fn func(ctx context.Context, slot int, orphans []Orphan)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.onOrphans = fn
@@ -21,13 +24,19 @@ func (r *Registry) KickOrphans() {
 // failed node's inode lock, which only that node's replay frees.
 func (r *Registry) orphanLoop() {
 	defer r.heartbeatWg.Done()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-r.stopCh
+		cancel()
+	}()
 	for {
 		select {
 		case <-r.stopCh:
 			return
 		case <-r.orphanKick:
 			if slots, err := r.readAllSlots(); err == nil {
-				r.passOrphans(slots)
+				r.passOrphans(ctx, slots)
 			}
 		}
 	}
@@ -35,7 +44,7 @@ func (r *Registry) orphanLoop() {
 
 // passOrphans hands the handler this node's orphan list and each live peer's.
 // A failed peer's list waits for its replay, which adopts it.
-func (r *Registry) passOrphans(slots []*Slot) {
+func (r *Registry) passOrphans(ctx context.Context, slots []*Slot) {
 	r.mu.Lock()
 	fn, local := r.onOrphans, r.localSlot
 	live := make([]bool, len(slots))
@@ -50,11 +59,11 @@ func (r *Registry) passOrphans(slots []*Slot) {
 		return
 	}
 	if local >= 0 && slots[local] != nil {
-		fn(local, slots[local].Orphans)
+		fn(ctx, local, slots[local].Orphans)
 	}
 	for i, s := range slots {
 		if live[i] && len(s.Orphans) > 0 {
-			fn(i, s.Orphans)
+			fn(ctx, i, s.Orphans)
 		}
 	}
 }
