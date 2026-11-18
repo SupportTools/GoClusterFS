@@ -1327,7 +1327,7 @@ func silence(reg *Registry, idx int, slot *Slot, d time.Duration) {
 
 func TestOwnClockDecidesDeathNotWallClock(t *testing.T) {
 	for _, beat := range []time.Duration{-time.Hour, 3 * time.Minute} {
-		reg := &Registry{sightings: make(map[int]sighting)}
+		reg := &Registry{sightings: make(map[int]sighting), seen: make(map[int]*Slot)}
 		slot := &Slot{UUID: [16]byte{4}, State: NodeStateActive, HeartbeatSeq: 1, HeartbeatTime: time.Now().Add(beat).Unix()}
 
 		reg.observe(1, slot)

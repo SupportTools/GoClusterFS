@@ -2009,6 +2009,43 @@ scenarios:
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedCreateThenCrashKeepsNamesApart
 
+  - id: operations-wait-out-replay
+    name: Operations blocked by a dead peer's lock wait out its replay
+    description: A peer dies holding the inode table sector of the root directory. Unlink, rmdir, create, mkdir, rename, link, symlink and chmod each need that sector while they hold another lock; each lets go of every lock, waits out the replay, and then succeeds without EIO
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestOperationsWaitOutTheReplayOfALockHolder
+      docker: TODO  # a container stop cannot cut power mid-operation, so no peer dies holding a lock
+      vm: run-vm-tests.sh::test_unlink_waits_out_peer_replay
+
+  - id: unlink-past-commit-outlasts-replay
+    name: An unlink past its commit outlasts a dead peer's replay
+    description: A peer dies holding a directory's inode table sector while a live node, past its unlink's journal commit, is inside RemoveIfAndUpdate on that directory; the peer's replay takes the directory's inode lock while the unlink waits holding none, and the unlink then finishes with no EIO, no fail-stop and fsck clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestUnlinkPastItsCommitOutlastsADeadPeersReplay
+
+  - id: orphan-pass-apart-from-detection
+    name: A blocked orphan pass does not hold up failure detection
+    description: While the orphan handler waits, as it does for a failed node's inode lock, failure detection still replays a dead node; a peer whose heartbeat stopped has its orphan list skipped, since its replay adopts it
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestBlockedOrphanPassLetsDetectionReplay
+
+  - id: occupant-judges-latest-read
+    name: Lock owner checks judge the slot read other checks saw
+    description: When another check reads a slot's later heartbeat, Occupant judges that read, so a slot that stays silent turns failing instead of looking alive on every check
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestOccupantSeesASilentSlotThatOthersRead
+
+  - id: rename-sectors-before-commit
+    name: A rename waits for its inode table sectors before its commit
+    description: With a dead peer holding the new parent's inode table sector, a rename lets go of its locks and waits before it commits, then finishes once the peer is replayed, with one commit, one name and no fail-stop
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestRenameWaitsForItsSectorsBeforeItsCommit
+
   - id: fsck-directory-tree
     name: fsck checks the directory tree
     description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them

@@ -3252,6 +3252,48 @@ test_reversed_write_order() {
     return 0
 }
 
+# Test: a VM loses power while it creates and unlinks files in the root directory, so it may die holding a lock on
+# the root. The other VM unlinks files in the root across the failover, and none of its unlinks may fail: an
+# operation that waits on the dead node's lock waits out its replay instead of returning EIO.
+# Based on the Go TestOperationsWaitOutTheReplayOfALockHolder.
+test_unlink_waits_out_peer_replay() {
+    log_info "Testing unlinks across a peer's power failure..."
+    ensure_cluster_healthy 2 || return 1
+    local survivor=1 victim=2 m=/mnt/goclusterfs count=600
+    local log="$RESULTS_DIR/unlink_waits_out_peer_replay.log"
+
+    ssh_run "$survivor" "for i in \$(seq 1 $count); do : > $m/uw_\$i || exit 1; done" || return 1
+    ssh_run "$victim" "i=0; while true; do i=\$((i+1)); : > $m/uv_\$i && rm -f $m/uv_\$i; done" >/dev/null 2>&1 &
+    local churn=$!
+    # One unlink every 0.1 s, so the unlinks span the failover.
+    ssh_run "$survivor" "for i in \$(seq 1 $count); do rm $m/uw_\$i 2>&1 || echo FAILED uw_\$i; sleep 0.1; done" > "$log" 2>&1 &
+    local unlinks=$!
+    sleep 3
+    log_info "Simulating power failure on VM $victim while it unlinks in the same directory..."
+    kill_vm "$victim" || return 1
+    wait $churn 2>/dev/null || true
+    wait $unlinks
+    local rc=$?
+
+    if [[ $rc -ne 0 ]] || grep -q "FAILED" "$log"; then
+        log_error "Unlinks on VM $survivor failed across the failover (exit $rc):"
+        head -20 "$log" >&2
+        return 1
+    fi
+    local left
+    left=$(ssh_run "$survivor" "ls $m | grep -c '^uw_'")
+    if [[ "$left" != "0" ]]; then
+        log_error "$left of the unlinked files are still listed on VM $survivor"
+        return 1
+    fi
+    log_info "All $count unlinks on VM $survivor succeeded across VM $victim's power failure"
+
+    start_vm "$victim" false
+    wait_vm_healthy "$victim"
+    setup_goclusterfs "$victim" false
+    return 0
+}
+
 # Test 16: Power failure during concurrent writes
 test_concurrent_writes_power_failure() {
     log_info "Testing power failure during concurrent writes..."
@@ -4567,6 +4609,7 @@ main() {
     run_test "Concurrent Write Stress" test_concurrent_write_stress
     run_test "Reversed Write Order" test_reversed_write_order
     run_test "Concurrent Writes Power Failure" test_concurrent_writes_power_failure
+    run_test "Unlink Waits Out Peer Replay Power Failure" test_unlink_waits_out_peer_replay
     run_test "fsck Repair After Power Failure" test_fsck_repair_after_power_failure
     run_test "Copy-on-Write Power Failure" test_cow_write_power_failure
     run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure
