@@ -277,7 +277,7 @@ Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, 
 
 **The hazard: a stalled node's last writes.** If a node stops for about 20 seconds while it holds a lock, other nodes prove it dead, replay its journal and take its locks. Before every device write, a node checks that it wrote its heartbeat less than 5 seconds ago. If not, it writes a heartbeat first, and if its registry slot is no longer its own, it refuses the write and exits. Some writes still land after the takeover:
 
-- a write that passed the check just before the stall, and I/O the kernel or the storage queued during it;
+- a write that stalled after its last check, which runs once the write holds its locks, right before it reaches the device, and I/O the kernel or the storage queued during the stall;
 - writes in the second after the takeover, if the stalled node resumed while the other node was marking its slot dead.
 
 Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap, for example SCSI-3 persistent reservations (or NVMe reservations), with which surviving nodes revoke a dead node's access to the device. GoClusterFS does not use them.

@@ -413,6 +413,56 @@ func TestWriteGateRefusesWrites(t *testing.T) {
 	}
 }
 
+// A write that passed its gate and then waited for its shard lock asks again
+// before it lands, so a gate that turned against it while it waited stops it.
+func TestWriteRechecksGateAfterWaitingForItsShard(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	refused := errors.New("refused")
+	var stale atomic.Bool
+	passed := make(chan struct{})
+	var once sync.Once
+	dev.SetWriteGate(func(int64) error {
+		if stale.Load() {
+			return refused
+		}
+		once.Do(func() { close(passed) })
+		return nil
+	})
+	dev.SetWriteFresh(func(int64) bool { return !stale.Load() })
+
+	startShard, endShard := dev.lockIORange(0, SectorSize)
+	buf := NewAlignedBuffer(SectorSize)
+	copy(buf.Bytes(), bytes.Repeat([]byte{'x'}, SectorSize))
+	done := make(chan error, 1)
+	go func() {
+		_, err := dev.WriteAt(buf.Bytes(), 0)
+		done <- err
+	}()
+	<-passed
+	stale.Store(true)
+	dev.unlockIORange(startShard, endShard)
+
+	if err := <-done; !errors.Is(err, refused) {
+		t.Fatalf("write whose gate went stale while it waited = %v, want %v", err, refused)
+	}
+	got := NewAlignedBuffer(SectorSize)
+	if _, err := dev.ReadAt(got.Bytes(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Bytes(), make([]byte, SectorSize)) {
+		t.Error("a write refused after its wait reached the device")
+	}
+}
+
 func TestLastErrorHoldsTheLatestFailureUntilASuccess(t *testing.T) {
 	var d Device
 	if d.LastError() != nil {

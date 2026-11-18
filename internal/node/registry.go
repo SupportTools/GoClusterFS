@@ -769,10 +769,21 @@ func (r *Registry) CheckOwnership() error {
 // WriteGate is a device write gate: it passes writes to the registry, which
 // the heartbeat itself must make, and checks ownership before any other write.
 func (r *Registry) WriteGate(offset int64) error {
-	if offset >= int64(r.offset) && offset < int64(r.offset)+MaxNodes*SlotSize {
+	if r.inRegistry(offset) {
 		return nil
 	}
 	return r.CheckOwnership()
+}
+
+// WriteFresh reports, without I/O, whether a write at offset that passed
+// WriteGate may still land: a registry write always may, any other only while
+// CheckOwnership would pass it without writing a heartbeat.
+func (r *Registry) WriteFresh(offset int64) bool {
+	return r.inRegistry(offset) || (!r.lost.Load() && r.sinceLastBeat() < HeartbeatTimeout/2)
+}
+
+func (r *Registry) inRegistry(offset int64) bool {
+	return offset >= int64(r.offset) && offset < int64(r.offset)+MaxNodes*SlotSize
 }
 
 func (r *Registry) sinceLastBeat() time.Duration {
