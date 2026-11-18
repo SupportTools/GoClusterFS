@@ -323,6 +323,7 @@ func main() {
 		failf("Cannot join the cluster: %v; check the device, then mount again", err)
 	}
 	nodeReg.SetSlotLostHandler(func(loss node.SlotLoss) {
+		storage.AwaitStoppedWrite()
 		failf("%s; stopping so two nodes never share a journal. "+
 			"Check that the device is reachable and that this node did not stall, then mount again", loss)
 	})

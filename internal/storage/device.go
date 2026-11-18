@@ -43,8 +43,8 @@ const (
 
 // stopBeforeWrite names a trigger file for tests: the first data or journal write that starts with the file's
 // contents, after every gate passed, removes it and stops this process with SIGSTOP. That stalls a node in the window
-// only storage fencing closes. Other writers wait before their gate until the stopped write is issued, so after
-// SIGCONT it reaches the device first, the worst case after a stall.
+// only storage fencing closes. Other writers wait before their gate until the stopped write is issued, and so does
+// the node's stop (AwaitStoppedWrite), so after SIGCONT it reaches the device first, the worst case after a stall.
 var stopBeforeWrite = os.Getenv("GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE")
 
 // stoppedWrite is closed once the write stopBeforeWrite stopped was issued; nil while none is stopped.
@@ -66,6 +66,13 @@ func stopIfTriggered(buf []byte) (resume func()) {
 	return func() {
 		stoppedWrite.Store(nil)
 		close(issued)
+	}
+}
+
+// AwaitStoppedWrite returns once no write is stopped by stopBeforeWrite, at once outside tests.
+func AwaitStoppedWrite() {
+	if issued := stoppedWrite.Load(); issued != nil {
+		<-*issued
 	}
 }
 
@@ -314,8 +321,8 @@ func (d *Device) writeIfFresh(buf []byte, offset int64, sharded bool) (landed bo
 		resume = stopIfTriggered(buf)
 	}
 	n, err = d.file.WriteAt(buf, offset)
-	d.record(err)
 	resume()
+	d.record(err)
 	return true, n, err
 }
 
@@ -359,9 +366,7 @@ func (d *Device) SetSyncObserver(synced func()) {
 // CheckWrite runs the write gate for a write at offset. Callers that change the
 // device without WriteAt, such as a discard, call it first.
 func (d *Device) CheckWrite(offset int64) error {
-	if issued := stoppedWrite.Load(); issued != nil {
-		<-*issued
-	}
+	AwaitStoppedWrite()
 	if gate := d.writeGate.Load(); gate != nil {
 		return (*gate)(offset)
 	}
