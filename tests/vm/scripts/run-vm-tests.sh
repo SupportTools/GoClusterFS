@@ -3663,6 +3663,38 @@ test_fencing_idle_node() {
     return $result
 }
 
+# registered_initiators lists the initiators the target holds a reservation key for, one per line.
+registered_initiators() {
+    ssh_run "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
+}
+
+# A clean unmount removes the node's reservation key, after its last write.
+test_fencing_unmount_removes_key() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local vm=2 result=0
+    fencing_restart pr || return 1
+    if ! registered_initiators | grep -q "goclusterfs:vm$vm,"; then
+        log_error "VM $vm has no reservation key while mounted: $(registered_initiators | tr '\n' ' ')"
+        return 1
+    fi
+    local marker="fencing unmount $(date +%s)"
+    mark_vm_logs "$marker"
+    unmount_goclusterfs "$vm" || return 1
+    if registered_initiators | grep -q "goclusterfs:vm$vm,"; then
+        log_error "VM $vm's reservation key stays after a clean unmount: $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -q "reservation key failed"; then
+        log_error "VM $vm could not remove its reservation key at unmount"
+        result=1
+    fi
+    setup_goclusterfs "$vm" false || result=1
+    return $result
+}
+
 # =============================================================================
 # Hostile storage and clocks
 # =============================================================================
@@ -4809,6 +4841,7 @@ main() {
     run_test "Fencing: Stalled Writer" test_fencing_stalled_writer
     run_test "Fencing: Paused VM" test_fencing_paused_vm
     run_test "Fencing: Idle Node" test_fencing_idle_node
+    run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall

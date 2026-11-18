@@ -92,7 +92,7 @@ func TestBlockOnRegularFileIsUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = f.Close() }()
-	if err := Block(f.Fd(), ToolKey()).Register(); !errors.Is(err, ErrUnsupported) {
+	if err := Block(f, ToolKey()).Register(); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("register on a regular file: %v, want ErrUnsupported", err)
 	}
 }

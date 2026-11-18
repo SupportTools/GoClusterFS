@@ -5321,6 +5321,13 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fencing_idle_node
 
+  - id: fencing-unmount-removes-key
+    name: A clean unmount removes the node's reservation key
+    description: After a clean unmount the target no longer lists the node's initiator, and the mount log shows no failed key removal
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_unmount_removes_key
+
   - id: storage-last-error
     name: Device remembers its last I/O failure
     description: LastError holds the latest failed read, write or sync until one succeeds, and ignores EOF

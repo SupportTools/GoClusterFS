@@ -259,7 +259,7 @@ func main() {
 		if *fencingMode != "auto" && *fencingMode != "pr" && *fencingMode != "none" {
 			usageFailf("-fencing=%s: use auto, pr or none", *fencingMode)
 		}
-		formatFence := formatFencer(dev, *devicePath, *fencingMode)
+		formatFence := formatFencer(*devicePath, *fencingMode)
 		sb, err = superblock.Format(dev, *inodeRatio)
 		if err == nil && formatFence.Kind() == "pr" {
 			sb.RequiredFlags |= superblock.RequiredReservations
@@ -764,14 +764,13 @@ Exit codes:
   16: Usage error; nothing was changed
 `
 
-// failf logs why the mount cannot go on and exits with cli.ExitFailure.
 // formatFencer registers a reservation key before -format writes anything, if mode and the device allow fencing.
 // The node's own key replaces it once the registry exists.
-func formatFencer(dev *storage.Device, devicePath, mode string) fence.Fencer {
+func formatFencer(devicePath, mode string) fence.Fencer {
 	if mode == "none" {
 		return fence.None{}
 	}
-	pr := fence.Block(dev.Fd(), fence.ToolKey())
+	pr := fence.Block(openForFencing(devicePath), fence.ToolKey())
 	err := pr.Register()
 	switch {
 	case errors.Is(err, fence.ErrUnsupported) && mode == "auto":
@@ -799,11 +798,12 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 			"Format on a device with persistent reservations, and mount with -require-fencing to refuse unfenced volumes", devicePath)
 		return fence.None{}
 	}
-	if err := syscall.Flock(int(dev.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	f := openForFencing(devicePath)
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		failf("Another process on this host has %s open for fencing, maybe a stopped goclusterfs-mount (%v). "+
 			"A host has one reservation key per device, so stop that process first", devicePath, err)
 	}
-	pr := fence.Block(dev.Fd(), fence.NodeKey(reg.LocalUUID()))
+	pr := fence.Block(f, fence.NodeKey(reg.LocalUUID()))
 	if err := pr.Register(); err != nil {
 		failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
 	}
@@ -819,6 +819,17 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 	return pr
 }
 
+// openForFencing opens the device again for its reservation ioctls and host lock, which must outlive the device's
+// close at unmount: the node removes its key after its last write.
+func openForFencing(devicePath string) *os.File {
+	f, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	if err != nil {
+		failf("Opening %s for its persistent reservations failed: %v", devicePath, err)
+	}
+	return f
+}
+
+// failf logs why the mount cannot go on and exits with cli.ExitFailure.
 func failf(format string, args ...any) {
 	log.Printf(format, args...)
 	os.Exit(cli.ExitFailure)

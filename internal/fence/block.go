@@ -2,14 +2,15 @@ package fence
 
 import (
 	"fmt"
+	"os"
 	"syscall"
 	"unsafe"
 )
 
-// Block fences through the block layer's persistent reservation ioctls on fd, which SCSI and NVMe disks implement.
-func Block(fd uintptr, key uint64) *PR { return &PR{dev: blockDevice(fd), key: key} }
+// Block fences through the block layer's persistent reservation ioctls on f, which SCSI and NVMe disks implement.
+func Block(f *os.File, key uint64) *PR { return &PR{dev: blockDevice{f}, key: key} }
 
-type blockDevice uintptr
+type blockDevice struct{ f *os.File }
 
 const (
 	typeWriteExclusiveAllRegs = 5
@@ -44,7 +45,7 @@ type preemption struct {
 }
 
 func (d blockDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
-	r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(d), req, uintptr(arg))
+	r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), req, uintptr(arg))
 	return ioctlResult(r, errno)
 }
 

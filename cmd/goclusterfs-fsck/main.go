@@ -170,7 +170,7 @@ func main() {
 	}()
 
 	writing := (mode != fsck.CheckOnly && !*dryRun) || (releasing && (*discardJournal || *salvage))
-	preempt, releaseFence, err := fsckFencing(dev, writing)
+	preempt, releaseFence, err := fsckFencing(dev, devicePath, writing)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(fsck.ExitOperational)
