@@ -738,8 +738,8 @@ func (m *Manager) ReleaseBlocks(ctx context.Context, blocks []uint64) {
 
 // freeBlocks drops one owner from each block and returns the blocks no owner
 // holds to the bitmap. A caller holding an inode lock cannot take the refcount
-// or bitmap lock, so those frees wait for the next freeBlocks call made
-// without it.
+// or bitmap lock, and a lock wait can give up, so those frees wait for the next
+// freeBlocks call.
 func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 	m.deferredMu.Lock()
 	blocks = append(blocks, m.deferred...)
@@ -757,8 +757,7 @@ func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 	// read under that lock stays 0 while the block is freed.
 	counted, err := m.bitmap.FreeIf(ctx, blocks, uncounted)
 	switch {
-	case errors.Is(err, lock.ErrDeadlockRisk):
-		m.deferFree(blocks...)
+	case m.requeue(err, "free", blocks):
 		return
 	case err != nil:
 		log.Printf("[extent] free %d blocks: %v; leaving the rest allocated", len(blocks), err)
@@ -769,19 +768,40 @@ func (m *Manager) freeBlocks(ctx context.Context, blocks []uint64) {
 
 	free, err := m.refs.Release(ctx, counted)
 	switch {
-	case errors.Is(err, lock.ErrDeadlockRisk):
-		m.deferFree(counted...)
+	case m.requeue(err, "release", counted):
 		return
 	case err != nil:
 		log.Printf("[extent] release %d blocks: %v; leaving them allocated", len(counted), err)
 		return
 	}
 	switch err := m.bitmap.FreeBatch(ctx, free); {
-	case errors.Is(err, lock.ErrDeadlockRisk):
-		m.deferFree(free...)
+	case m.requeue(err, "free released", free):
 	case err != nil:
 		log.Printf("[extent] free %d released blocks: %v", len(free), err)
 	}
+}
+
+// requeue keeps blocks for the next free when err comes from a lock it did not
+// get, so nothing was written: one this goroutine may not wait for, or a wait
+// that gave up. It reports whether it did.
+func (m *Manager) requeue(err error, what string, blocks []uint64) bool {
+	switch {
+	case errors.Is(err, lock.ErrDeadlockRisk):
+	case errors.Is(err, lock.ErrLockTimeout):
+		log.Printf("[WARN] [extent] %s %d blocks: %v; they stay allocated until the next free retries them", what, len(blocks), err)
+	default:
+		return false
+	}
+	m.deferFree(blocks...)
+	return true
+}
+
+// FlushDeferred retries the frees that are waiting for a lock and returns how many blocks still wait.
+func (m *Manager) FlushDeferred(ctx context.Context) int {
+	m.freeBlocks(ctx, nil)
+	m.deferredMu.Lock()
+	defer m.deferredMu.Unlock()
+	return len(m.deferred)
 }
 
 func (m *Manager) deferFree(blocks ...uint64) {

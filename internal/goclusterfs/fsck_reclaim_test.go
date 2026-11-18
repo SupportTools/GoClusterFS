@@ -34,7 +34,9 @@ func leakBlock(t *testing.T, fsys *FS) {
 
 // deleteWithTimedOutFree removes name as Unlink does, but its block free gives
 // up on the bitmap and refcount locks another node holds, as it does after the 30s lock-wait
-// limit. Unlink detaches from its caller's context, so it would wait the full 30s.
+// limit. Unlink detaches from its caller's context, so it would wait the full 30s. The blocks
+// wait in fsys's retry queue, which only fsys's next free drains: a test that opens the image
+// again leaves them leaked, as a node that stops before the retry does.
 func deleteWithTimedOutFree(t *testing.T, fsys *FS, name string) {
 	t.Helper()
 	ctx := context.Background()
@@ -81,6 +83,33 @@ func deleteWithTimedOutFree(t *testing.T, fsys *FS, name string) {
 	if err := fsys.inodeTbl.Free(ctx, ino.InodeNum); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// A free that gives up on a lock another node holds keeps its blocks queued, and
+// the node's next free gives them back, so nothing leaks while the node runs.
+func TestTimedOutFreeIsRetried(t *testing.T) {
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	ctx := context.Background()
+	victim := createFile(t, fsys, "victim.bin")
+	writeAt(t, victim, pattern(2, 2*BlockSize), 0)
+	other := createFile(t, fsys, "other.bin")
+	writeAt(t, other, pattern(3, BlockSize), 0)
+	free := fsys.bitmapMgr.FreeCount()
+
+	deleteWithTimedOutFree(t, fsys, "victim.bin")
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Fatalf("after the timed-out free: %d free blocks, want %d, with the blocks waiting for a retry", got, free)
+	}
+	if errno := fsys.Unlink(ctx, "other.bin"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	if got := fsys.bitmapMgr.FreeCount(); got != free+3 {
+		t.Fatalf("after the next free: %d free blocks, want %d", got, free+3)
+	}
+	if left := fsys.extentMgr.FlushDeferred(ctx); left != 0 {
+		t.Errorf("%d blocks still wait for a free", left)
+	}
+	expectNoProblems(t, fsys, "after the retried free")
 }
 
 func freeBlocksOnDisk(t *testing.T, path string) uint64 {
