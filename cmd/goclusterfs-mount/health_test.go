@@ -90,8 +90,8 @@ func TestHealthChecksSeparateDegradedFromDown(t *testing.T) {
 			if resp.Status != tt.want {
 				t.Errorf("status = %s, want %s: %+v", resp.Status, tt.want, resp.Checks)
 			}
-			if len(resp.Checks) != 6 {
-				t.Errorf("checks = %v, want device, journal, recovery, broadcast, broadcast-peers and heartbeat", resp.Checks)
+			if len(resp.Checks) != 7 {
+				t.Errorf("checks = %v, want device, journal, recovery, broadcast, broadcast-peers, heartbeat and fencing", resp.Checks)
 			}
 			for name, check := range resp.Checks {
 				if (name == tt.problem) != (check.Status != api.HealthStatusOK) {
