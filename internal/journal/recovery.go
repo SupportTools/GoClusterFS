@@ -504,13 +504,17 @@ func DryRunRecover(region *Region) ([]*RecoveredTxn, *RecoveryStats, error) {
 	if !region.NeedsRecovery() {
 		return nil, &RecoveryStats{}, nil
 	}
+	if err := region.Superblock().checkVersion(); err != nil {
+		return nil, &RecoveryStats{}, err
+	}
 
 	var txns []*RecoveredTxn
 	stats := &RecoveryStats{}
 
+	// A replay stops at a transaction it cannot apply, so the dry run lists that one last.
 	handler := func(txn *RecoveredTxn) error {
 		txns = append(txns, txn)
-		return nil
+		return unknownOpIn(txn)
 	}
 
 	// On an error, txns holds the transactions read before it.

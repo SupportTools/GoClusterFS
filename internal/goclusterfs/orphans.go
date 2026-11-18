@@ -252,10 +252,12 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 	return nil
 }
 
-// LearnOrphans lets go of each listed orphan this node does not have open.
-func (f *FS) LearnOrphans(slot int, list []node.Orphan) {
-	ctx := context.Background()
+// LearnOrphans lets go of each listed orphan this node does not have open, until ctx ends.
+func (f *FS) LearnOrphans(ctx context.Context, slot int, list []node.Orphan) {
 	for _, o := range list {
+		if ctx.Err() != nil {
+			return
+		}
 		if f.opened(o.Inode) || f.alreadyCleared(o) {
 			continue
 		}

@@ -123,8 +123,10 @@ func (s *Slot) LeaseExpiry() time.Time {
 	return time.Time{}
 }
 
-// observe records what this node read in a slot. Called with r.mu held.
+// observe records what this node read in a slot, and keeps it for Occupant so
+// both judge the same read. Called with r.mu held.
 func (r *Registry) observe(slotIdx int, slot *Slot) {
+	r.remember(slotIdx, slot)
 	next := sightingOf(slot)
 	if last, seen := r.sightings[slotIdx]; seen && last.sinceless() == next {
 		return
@@ -176,7 +178,6 @@ func (r *Registry) Occupant(slotIdx int, fresh bool) ([16]byte, Occupancy) {
 		if err != nil {
 			return [16]byte{}, OccupiedLive
 		}
-		r.remember(slotIdx, read)
 		slot = read
 	}
 	r.mu.Lock()

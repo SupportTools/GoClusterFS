@@ -98,6 +98,15 @@ func (m *Manager) renameLocked(ctx context.Context, op *RenameOp) (*Renamed, err
 			return nil, err
 		}
 		defer unlock()
+		written := []uint32{op.OldParent, op.NewParent}
+		if movesDir {
+			written = append(written, uint32(op.Child))
+		}
+		unlockSectors, err := m.lockSectors(ctx, written)
+		if err != nil {
+			return nil, err
+		}
+		defer unlockSectors()
 	}
 
 	p, err := m.checkRename(op, movesDir)
@@ -413,6 +422,36 @@ func (m *Manager) lockInodes(ctx context.Context, nums []uint32) (func(), error)
 	return unlock, nil
 }
 
+// lockSectors takes the inode table sectors of the inodes a rename writes, in record order, so that the rename never
+// waits for a lock after its commit. A goroutine that holds a sector lock otherwise takes no other lock, so these
+// waits cannot form a cycle.
+func (m *Manager) lockSectors(ctx context.Context, inodes []uint32) (func(), error) {
+	var sectors []uint64
+	for _, n := range inodes {
+		sectors = append(sectors, uint64(n)/inode.InodesPerSector)
+	}
+	slices.SortFunc(sectors, func(a, b uint64) int {
+		return cmp.Or(cmp.Compare(m.lockMgr.Record(lock.LockTypeInodeSector, a), m.lockMgr.Record(lock.LockTypeInodeSector, b)), cmp.Compare(a, b))
+	})
+	sectors = slices.Compact(sectors)
+	held := 0
+	unlock := func() {
+		for _, sector := range slices.Backward(sectors[:held]) {
+			if err := m.lockMgr.Release(lock.LockTypeInodeSector, sector); err != nil {
+				log.Printf("[WARN] rename: releasing inode table sector %d failed: %v", sector, err)
+			}
+		}
+	}
+	for _, sector := range sectors {
+		if err := m.lockMgr.Acquire(ctx, lock.LockTypeInodeSector, sector, lock.LockModeExclusive); err != nil {
+			unlock()
+			return nil, fmt.Errorf("failed to acquire inode table sector %d: %w", sector, err)
+		}
+		held++
+	}
+	return unlock, nil
+}
+
 // liveInode rereads num under its lock; a different type or a freed slot means the name changed since the lookup.
 func (m *Manager) liveInode(num uint64, isDir bool) (*inode.Inode, error) {
 	ino, err := m.inodeTbl.Read(uint32(num))
@@ -536,6 +575,16 @@ func (m *Manager) grow(ctx context.Context, num uint32, need uint16) error {
 
 // PointIf makes name in dirIno name child, of type ftype, if ok accepts the inode it names now; ok runs under the directory lock.
 func (m *Manager) PointIf(ctx context.Context, dirIno *inode.Inode, name string, child uint64, ftype uint8, ok func(cur uint64) bool) (bool, error) {
+	var pointed bool
+	err := m.untilReplayed(ctx, func() error {
+		var err error
+		pointed, err = m.pointIf(ctx, dirIno, name, child, ftype, ok)
+		return err
+	})
+	return pointed, err
+}
+
+func (m *Manager) pointIf(ctx context.Context, dirIno *inode.Inode, name string, child uint64, ftype uint8, ok func(cur uint64) bool) (bool, error) {
 	if dirIno.Magic != inode.InodeMagic {
 		return false, ErrRemoved
 	}

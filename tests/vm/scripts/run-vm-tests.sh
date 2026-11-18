@@ -3252,6 +3252,48 @@ test_reversed_write_order() {
     return 0
 }
 
+# Test: a VM loses power while it creates and unlinks files in the root directory, so it may die holding a lock on
+# the root. The other VM unlinks files in the root across the failover, and none of its unlinks may fail: an
+# operation that waits on the dead node's lock waits out its replay instead of returning EIO.
+# Based on the Go TestOperationsWaitOutTheReplayOfALockHolder.
+test_unlink_waits_out_peer_replay() {
+    log_info "Testing unlinks across a peer's power failure..."
+    ensure_cluster_healthy 2 || return 1
+    local survivor=1 victim=2 m=/mnt/goclusterfs count=600
+    local log="$RESULTS_DIR/unlink_waits_out_peer_replay.log"
+
+    ssh_run "$survivor" "for i in \$(seq 1 $count); do : > $m/uw_\$i || exit 1; done" || return 1
+    ssh_run "$victim" "i=0; while true; do i=\$((i+1)); : > $m/uv_\$i && rm -f $m/uv_\$i; done" >/dev/null 2>&1 &
+    local churn=$!
+    # One unlink every 0.1 s, so the unlinks span the failover.
+    ssh_run "$survivor" "for i in \$(seq 1 $count); do rm $m/uw_\$i 2>&1 || echo FAILED uw_\$i; sleep 0.1; done" > "$log" 2>&1 &
+    local unlinks=$!
+    sleep 3
+    log_info "Simulating power failure on VM $victim while it unlinks in the same directory..."
+    kill_vm "$victim" || return 1
+    wait $churn 2>/dev/null || true
+    wait $unlinks
+    local rc=$?
+
+    if [[ $rc -ne 0 ]] || grep -q "FAILED" "$log"; then
+        log_error "Unlinks on VM $survivor failed across the failover (exit $rc):"
+        head -20 "$log" >&2
+        return 1
+    fi
+    local left
+    left=$(ssh_run "$survivor" "ls $m | grep -c '^uw_'")
+    if [[ "$left" != "0" ]]; then
+        log_error "$left of the unlinked files are still listed on VM $survivor"
+        return 1
+    fi
+    log_info "All $count unlinks on VM $survivor succeeded across VM $victim's power failure"
+
+    start_vm "$victim" false
+    wait_vm_healthy "$victim"
+    setup_goclusterfs "$victim" false
+    return 0
+}
+
 # Test 16: Power failure during concurrent writes
 test_concurrent_writes_power_failure() {
     log_info "Testing power failure during concurrent writes..."
@@ -3675,6 +3717,55 @@ hostile_replayed_since() {
     sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
 }
 
+# VM 1, back from a stall during which VM 2 replayed it, stopped on finding its
+# slot taken, and acknowledged no create but one whose writes were already queued when the stall began.
+hostile_check_taken_slot_stops() {
+    local acked
+    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)"; then
+        log_error "VM 1 did not stop on finding its slot taken"
+        sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|no longer|stopping' | head -5
+        return 1
+    fi
+    acked=$(ssh_run 1 "wc -l < /tmp/hostile.acked")
+    if (( acked - HOSTILE_ACKED_BEFORE > 1 )); then
+        log_error "VM 1 acknowledged $((acked - HOSTILE_ACKED_BEFORE)) creates after the stall began, although VM 2 replayed it"
+        return 1
+    fi
+}
+
+# VM 2 replayed VM 1 17 to 32s after the stall began. The window follows from
+# internal/node: VM 2 counts VM 1 dead once its heartbeat stays unchanged for
+# deadAfter (20s), judged at its scans every FailureCheckInterval (5s), so the
+# replay lands 19 to 30s in; the rest is slack for a loaded host.
+hostile_check_stall_fence() {
+    local stamp at
+    hostile_check_taken_slot_stops "$1" || return 1
+    stamp=$(sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -m1 "Starting journal replay for node" | awk '{print $1" "$2}' | tr / -)
+    [[ -n "$stamp" ]] || return 1
+    at=$(( $(ssh_run 2 "date -d '$stamp' +%s") - HOSTILE_T0 ))
+    log_info "VM 2 replayed VM 1 ${at}s after the stall began"
+    if [[ $at -lt 17 || $at -gt 32 ]]; then
+        log_error "VM 2 replayed VM 1 ${at}s after the stall began, want 17 to 32s"
+        return 1
+    fi
+}
+
+# VM 1 stopped itself because its heartbeat writes failed for just over the 5s limit, plus the 1s between beats and some load.
+hostile_check_self_fence() {
+    local stalled
+    stalled=$(sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -m1 -oE "Heartbeats to registry slot [0-9]+ failed for [0-9.]+m?s" | grep -oE "[0-9.]+m?s$")
+    if [[ -z "$stalled" ]]; then
+        log_error "VM 1 did not stop itself for failed heartbeat writes"
+        sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|no longer|stopping' | head -5
+        return 1
+    fi
+    log_info "VM 1 stopped itself after its heartbeat writes failed for $stalled"
+    if ! awk -v d="$stalled" 'BEGIN { s = d + 0; if (d ~ /ms$/) s /= 1000; exit !(s >= 5 && s < 9) }'; then
+        log_error "VM 1's heartbeat writes failed for $stalled before it stopped, want 5 to 9s"
+        return 1
+    fi
+}
+
 # Unmounts both nodes, removes the device-mapper device, checks the disk with fsck -repair then fsck, and remounts both.
 hostile_fsck_and_restore() {
     local result=0 out rc
@@ -3702,19 +3793,45 @@ hostile_fsck_and_restore() {
 }
 
 # Runs one scenario: $1 names it, $2 is a function that disturbs VM 1's path,
-# and $3 is "survives" when VM 1 must keep running unreplayed or "fenced" when
-# it must stop and VM 2 must replay it.
+# $3 is "survives" when VM 1 must keep running unreplayed, "unnoticed" when
+# VM 2 must also never wait on it as a failing node, "fenced" when it must
+# stop and VM 2 must replay it, or "either" when both outcomes pass, and $4
+# optionally names a function that checks more, given the scenario's log marker.
 hostile_scenario() {
-    local name=$1 disturb=$2 expect=$3 result=0
+    local name=$1 disturb=$2 expect=$3 check=${4:-} result=0
     hostile_setup || return 1
     local marker="hostile: $name $(date +%s)"
     mark_vm_logs "$marker"
     hostile_writers_start
     sleep 5
+    HOSTILE_T0=$(ssh_run 2 "date +%s")
     "$disturb"
     sleep 5
     hostile_writers_stop
-    if [[ "$expect" == fenced ]]; then
+    if [[ "$expect" == either ]]; then
+        local waited=0
+        while [[ -z "$(mount_pids 1)" ]] && ! hostile_replayed_since "$marker" && [[ $waited -lt 90 ]]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if hostile_replayed_since "$marker"; then
+            log_info "$name: VM 1 was fenced and VM 2 replayed it"
+            if [[ -n "$(mount_pids 1)" ]]; then
+                log_error "VM 2 replayed VM 1 while VM 1 is still mounted"
+                result=1
+            fi
+            hostile_check_taken_slot_stops "$marker" || result=1
+        elif [[ -n "$(mount_pids 1)" ]]; then
+            log_info "$name: VM 1 kept running and was not replayed"
+            if sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -q "is no longer this node's"; then
+                log_error "VM 1 found its slot taken although VM 2 did not replay it"
+                result=1
+            fi
+        else
+            log_error "VM 1 stopped and VM 2 did not replay it within 90s"
+            result=1
+        fi
+    elif [[ "$expect" == fenced ]]; then
         local waited=0
         while ! hostile_replayed_since "$marker" && [[ $waited -lt 90 ]]; do
             sleep 1
@@ -3738,6 +3855,14 @@ hostile_scenario() {
             sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|WARN' | head -10
             result=1
         fi
+        if [[ "$expect" == unnoticed ]] && sed -n "/$marker/,\$p" "$(get_vm_mount_log 2)" | grep -q "is failing or being recovered"; then
+            log_error "VM 2 waited on VM 1 as a failing node although VM 1 was only slowed"
+            sed -n "/$marker/,\$p" "$(get_vm_mount_log 2)" | grep -m3 "is failing or being recovered"
+            result=1
+        fi
+    fi
+    if [[ -n "$check" ]]; then
+        "$check" "$marker" || result=1
     fi
     hostile_check_acked 2 || result=1
     hostile_fsck_and_restore || result=1
@@ -3757,6 +3882,7 @@ hostile_delay_spikes() {
 hostile_stall() {
     log_info "VM 1 path: stalled for ${HOSTILE_STALL}s"
     ssh_run 1 "dmsetup suspend $HOSTILE_DM"
+    HOSTILE_ACKED_BEFORE=$(ssh_run 1 "wc -l < /tmp/hostile.acked")
     sleep "$HOSTILE_STALL"
     ssh_run 1 "dmsetup resume $HOSTILE_DM"
 }
@@ -3777,12 +3903,15 @@ hostile_flaky() {
 
 test_storage_latency_spikes() { hostile_scenario "latency spikes" hostile_delay_spikes survives; }
 test_storage_short_stalls() {
-    HOSTILE_STALL=5 hostile_scenario "5s stall" hostile_stall survives || return 1
+    HOSTILE_STALL=5 hostile_scenario "5s stall" hostile_stall unnoticed || return 1
     HOSTILE_STALL=12 hostile_scenario "12s stall" hostile_stall survives
 }
-test_storage_long_stall() { HOSTILE_STALL=30 hostile_scenario "30s stall" hostile_stall fenced; }
-test_storage_short_eio() { HOSTILE_EIO=2 hostile_scenario "2s of EIO" hostile_eio survives; }
-test_storage_long_eio() { HOSTILE_EIO=10 hostile_scenario "10s of EIO" hostile_eio fenced; }
+test_storage_long_stall() {
+    HOSTILE_STALL=25 hostile_scenario "25s stall" hostile_stall either || return 1
+    HOSTILE_STALL=35 hostile_scenario "35s stall" hostile_stall fenced hostile_check_stall_fence
+}
+test_storage_short_eio() { HOSTILE_EIO=2 hostile_scenario "2s of EIO" hostile_eio unnoticed; }
+test_storage_long_eio() { HOSTILE_EIO=8 hostile_scenario "8s of EIO" hostile_eio fenced hostile_check_self_fence; }
 test_storage_flaky_eio() { hostile_scenario "flaky EIO" hostile_flaky survives; }
 
 # A node that never mounted the volume, with its clock 2 minutes ahead, must
@@ -4671,6 +4800,7 @@ main() {
     run_test "Concurrent Write Stress" test_concurrent_write_stress
     run_test "Reversed Write Order" test_reversed_write_order
     run_test "Concurrent Writes Power Failure" test_concurrent_writes_power_failure
+    run_test "Unlink Waits Out Peer Replay Power Failure" test_unlink_waits_out_peer_replay
     run_test "fsck Repair After Power Failure" test_fsck_repair_after_power_failure
     run_test "Copy-on-Write Power Failure" test_cow_write_power_failure
     run_test "Snapshot Create/Delete Power Failure" test_snapshot_create_delete_power_failure

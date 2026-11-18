@@ -302,6 +302,9 @@ func journalContents(region *journal.Region, err error) (discards, keep string) 
 		discards = "1 committed transaction that was never replayed"
 	}
 	switch {
+	case errors.Is(err, journal.ErrUnknownOp):
+		return discards + ", from the first one this build cannot replay on",
+			fmt.Sprintf("this build cannot replay all of it (%v), but a newer build may", rootCause(err))
 	case err != nil:
 		return discards + ", and whatever follows a record fsck cannot read",
 			fmt.Sprintf("fsck could not read all of it (%v), so a mount may still replay it", err)

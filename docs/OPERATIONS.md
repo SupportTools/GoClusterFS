@@ -53,7 +53,7 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 | `[broadcast] WARN: no broadcast heard from node ...` | The registry shows that node mounted, but this node has heard none of its broadcasts for 3 `-broadcast-heartbeat` intervals (90 seconds by default). A network that drops multicast causes this, as does a node with `-broadcast=false` or another `-mcast-group` or `-mcast-port`. Until it is fixed, this node sees that node's directory changes only after `-cache-ttl`. `/health` reports it as `broadcast-peers`, and the mount logs `heard from node ... again` when it ends. |
 | `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
 | `[WARN] lock: ... which holds it and is failing or being recovered` | A lock wait for a failed node. It repeats every 30 seconds and ends when that node's journal replay ends. |
-| `[WARN] lock: gave up waiting for ...` | A lock wait gave up: after 30 seconds (`DefaultTimeout`) on a live holder, after 30 seconds on a failed holder while the operation held another lock, at once when the holder's replay failed, or because a background task stopped at unmount. The line names the holder. A file operation that was waiting fails with EIO; during block allocation it fails with ENOSPC. See [Distributed Lock Limits](#distributed-lock-limits). |
+| `[WARN] lock: gave up waiting for ...` | A lock wait gave up: after 30 seconds (`DefaultTimeout`) on a live holder, on a failed holder while the operation held another lock, at once when the holder's replay failed, or because a background task stopped at unmount. The line names the holder. After a give-up on a failed holder, the operation lets go of its locks, waits for the replay and retries, so it does not fail. If that replay keeps failing, the wait lasts until an admin releases the slot; see [Damaged Journal Slot](#damaged-journal-slot). Otherwise a file operation that was waiting fails with EIO; during block allocation it fails with ENOSPC. See [Distributed Lock Limits](#distributed-lock-limits). |
 | `[WARN] lock: this node has held record N for ...` | This node has held a lock for over 60 seconds. Other nodes wait for it until it is released. |
 
 ### Journal
@@ -174,7 +174,7 @@ setfattr -n user.clone -v /data.db.copy /mnt/fs/data.db
 setfattr -x user.snapshot.snap1 /mnt/fs/data.db
 ```
 
-A snapshot stays with the file it was taken of. When you delete the file, its snapshots become orphans: `getfattr` on any file no longer lists them, and `GET /api/v1/snapshots` lists them with `orphan: true`. Delete an orphan with `DELETE /api/v1/snapshots/<name>` and no `path`. Snapshots made by older versions are orphans after an upgrade, because they do not record which file they were taken of. `goclusterfs-fsck` warns about each orphan.
+A snapshot stays with the file it was taken of. When you delete the file's last name, its snapshots become orphans, even while a node still has the file open: `getfattr` on any file no longer lists them, and `GET /api/v1/snapshots` lists them with `orphan: true`. Delete an orphan with `DELETE /api/v1/snapshots/<name>` and no `path`. Snapshots made by older versions are orphans after an upgrade, because they do not record which file they were taken of. `goclusterfs-fsck` warns about each orphan.
 
 Snapshots and clones share blocks with the file and copy a block on its first write. A block is freed when no file, snapshot, or clone uses it. Before you mount an image with snapshots or clones using a newer build, read the upgrade notes in [CHANGELOG.md](../CHANGELOG.md).
 
@@ -368,6 +368,7 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 
 - **Storage or replay errors** (an I/O error, or `journal recovery failed: ...`): the journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery=N`, with the slot number N from the error, which discards slot N's journal.
+- **A journal from a newer build** (`cannot replay: unknown op 0x...`, or `journal format is newer than this build`): this build stops rather than skip what it cannot read, and applies nothing from that transaction on. Replay the journal by mounting a node with the newer build. Peers of the older build fail the same way and keep the slot for you.
 
 `-skip-recovery` is for emergencies only: it throws away changes the node had committed, which may have been only partly applied. Never put it in a unit file or script. `goclusterfs-fsck -list-slots` shows each slot's journal state first, and `goclusterfs-fsck -inspect-slot N` lists every transaction a replay of slot N would apply, with the inodes and blocks each one touches. Both only read, so they run while nodes have the filesystem mounted.
 
@@ -634,6 +635,8 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
+**The registry and journals.** Nodes take registry slots, write heartbeats, replay each other's journals and free dead nodes' slots by writing sectors on the device, and each node trusts the others to follow those rules. A host that can write the device can take any node's slot, which makes that node stop, and can rewrite or reset any journal. `goclusterfs-fsck -release-slot` frees a slot by those same rules; see [Damaged Journal Slot](#damaged-journal-slot).
+
 **Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `24730` by default, unicast on `24731`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Each node numbers its messages, and a node that sees a gap in a peer's numbers drops all cached inodes and extents. The heartbeats after a node's last invalidation let peers notice a lost final message too. Only when those heartbeats are lost as well do cache updates wait for `-cache-ttl`.
 
 - With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
@@ -642,11 +645,13 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`) it also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`), every `/api/v1/...` request needs it, reads included, and the API also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
 
 - To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
 - `/health` and `/metrics` never need the token, on purpose: load balancers, probes and Prometheus can read them without a secret. Anyone who can reach the port can read them too. They show no file names or data, but `/health` messages name peers' hostnames and registry slot numbers.
 - Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
+- The dashboard's files under `/ui/` need no token: they hold no data, and the page's own API calls follow the same token rules as any client. See [Web Dashboard](API-CONFIG.md#web-dashboard).
+- `-api-rate-limit` caps requests per client IP, and never limits `/health`, `/metrics` or `/ui/`. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 

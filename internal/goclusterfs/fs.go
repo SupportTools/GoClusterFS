@@ -125,6 +125,10 @@ type FS struct {
 	// mounted is set by MarkMounted once a FUSE server serves the root, so kernel notifications have somewhere to go.
 	mounted atomic.Bool
 
+	// badEntries holds the damaged directory entries childInRange has logged, at most maxBadEntries of them.
+	badEntriesMu sync.Mutex
+	badEntries   map[badEntry]bool
+
 	// Storage layer
 	dev *storage.Device
 	sb  *superblock.Superblock
@@ -354,6 +358,15 @@ func (f *FS) Close() error {
 	if f.reserve != nil {
 		ShutdownStep("block reserve return", func() { f.reserve.Stop(context.Background()) })
 	}
+	if f.extentMgr != nil {
+		ShutdownStep("waiting block frees", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if left := f.extentMgr.FlushDeferred(ctx); left > 0 {
+				log.Printf("[WARN] %d freed blocks stay allocated: their frees kept waiting for a lock. goclusterfs-fsck -repair gives them back", left)
+			}
+		})
+	}
 
 	// Stop TRIM manager to flush pending discards
 	if f.trimMgr != nil {
@@ -485,6 +498,25 @@ func (f *FS) updateInodeLocked(ctx context.Context, num uint32, update func(*ino
 // updateUnderInodeLock is updateInodeLocked for a caller that already holds
 // lockInode(num).
 func (f *FS) updateUnderInodeLock(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
+	var ino *inode.Inode
+	err := f.untilReplayed(ctx, func() error {
+		var err error
+		ino, err = f.updateUnderInodeLockOnce(ctx, num, update)
+		return err
+	})
+	return ino, err
+}
+
+// untilReplayed runs op, which takes its own locks, again whenever it gives up on a lock a failing node holds, once
+// that node's replay ends. See lock.Manager.UntilReplayed.
+func (f *FS) untilReplayed(ctx context.Context, op func() error) error {
+	if f.lockMgr == nil {
+		return op()
+	}
+	return f.lockMgr.UntilReplayed(ctx, op)
+}
+
+func (f *FS) updateUnderInodeLockOnce(ctx context.Context, num uint32, update func(*inode.Inode) error) (*inode.Inode, error) {
 	if f.lockMgr != nil {
 		if err := f.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(num), lock.LockModeExclusive); err != nil {
 			return nil, fmt.Errorf("failed to acquire inode lock: %w", err)
@@ -1560,12 +1592,37 @@ func sameForRemoval(was, cur *inode.Inode) bool {
 // names an inode at or past the end of the inode table. Only a damaged entry
 // does, and narrowing its number to the table's uint32 could reach a real inode.
 func (f *FS) childInRange(dirNum uint32, name string, num uint64) syscall.Errno {
-	if total := f.inodeTbl.TotalInodes(); num >= total {
+	total := f.inodeTbl.TotalInodes()
+	if num < total {
+		return 0
+	}
+	if f.firstSighting(badEntry{dirNum, name}) {
 		log.Printf("[ERROR] Directory %d: entry %q names inode %d, past the inode table's %d inodes. "+
 			"Unmount the filesystem on every node and run goclusterfs-fsck", dirNum, name, num, total)
-		return syscall.EIO
 	}
-	return 0
+	return syscall.EIO
+}
+
+type badEntry struct {
+	dir  uint32
+	name string
+}
+
+// maxBadEntries caps how many damaged entries are remembered; past it the set starts over, so each is logged again.
+const maxBadEntries = 256
+
+// firstSighting reports whether e is not yet in the set of logged damaged entries, and adds it.
+func (f *FS) firstSighting(e badEntry) bool {
+	f.badEntriesMu.Lock()
+	defer f.badEntriesMu.Unlock()
+	if f.badEntries[e] {
+		return false
+	}
+	if f.badEntries == nil || len(f.badEntries) >= maxBadEntries {
+		f.badEntries = make(map[badEntry]bool)
+	}
+	f.badEntries[e] = true
+	return true
 }
 
 // removeEntryOnce returns EAGAIN when another node changes the child between the lookup and the removal.
@@ -4228,6 +4285,9 @@ func (f *FS) DeleteOrphanSnapshot(ctx context.Context, name string) error {
 	return f.dropSnapshot(ctx, desc.SnapshotID)
 }
 
+// snapshotOrphan reports whether d's file has no name left to reach it through:
+// it was freed, its slot holds a later file, or it was unlinked while a node
+// still holds it open.
 func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
 	ino, err := f.inodeTbl.Read(d.TargetInode)
 	if errors.Is(err, inode.ErrInodeOutOfRange) {
@@ -4236,7 +4296,7 @@ func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ino.Magic == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
+	return ino.Magic == 0 || ino.LinkCount == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
 }
 
 // blockExtent returns the single block of ext at offset, so per-block checks

@@ -875,28 +875,28 @@ scenarios:
 
   - id: hostile-storage-short-stalls
     name: Short storage stalls on one node
-    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; the node keeps running and is never replayed, during the 5s stall its peer never waits on it as a failing node (a node counts as failing after 10s of silence), every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_short_stalls
 
   - id: hostile-storage-long-stall
     name: Long storage stall fences the node
-    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: One node's path stalls for 25s and then 35s. After 25s the node either keeps running with its slot untouched, or is replayed and stops on finding its slot taken without acknowledging new creates. After 35s it must be replayed 17 to 32s after the stall began (deadAfter judged at FailureCheckInterval scans) and stop that way. Every acknowledged file reads back and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_long_stall
 
   - id: hostile-storage-short-eio
     name: Short EIO burst on one node
-    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: Every I/O on one node's path fails for 2s; the node keeps running, its peer never waits on it as a failing node or replays it, every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_short_eio
 
   - id: hostile-storage-long-eio
     name: Long EIO burst fences the node
-    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: Every I/O on one node's path fails for 8s; the node stops itself once its heartbeat writes have failed for 5 to 9s, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_long_eio
@@ -1626,9 +1626,16 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckRebuildsCorruptRefcountSector
 
+  - id: timed-out-free-retried
+    name: A block free that times out on a lock is retried
+    description: When another node holds the bitmap and refcount locks past the wait limit, a file's freed blocks stay allocated and queued instead of leaked; the node's next free gives them back, and FlushDeferred, which unmount runs, reports none left, with fsck finding no leak
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reclaim_test.go::TestTimedOutFreeIsRetried
+
   - id: fsck-reclaim-leaked-blocks
     name: fsck -repair frees leaked blocks
-    description: A failed write and frees that gave up on a lock leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
+    description: A failed write, and frees that gave up on a lock whose node then stopped before retrying them, leave blocks no inode maps, one with a refcount of 2; check reports them, a dry run changes nothing, repair frees them and clears the count, a second repair changes nothing, and files, snapshots and clones keep their data and counts
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_reclaim_test.go::TestFsckRepairReclaimsLeakedBlocks
@@ -2002,6 +2009,50 @@ scenarios:
     environments:
       go: internal/goclusterfs/eio_sweep_test.go::TestFailedCreateThenCrashKeepsNamesApart
 
+  - id: operations-wait-out-replay
+    name: Operations blocked by a dead peer's lock wait out its replay
+    description: A peer dies holding the inode table sector of the root directory. Unlink, rmdir, create, mkdir, rename, link, symlink and chmod each need that sector while they hold another lock; each lets go of every lock, waits out the replay, and then succeeds without EIO
+    priority: high
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestOperationsWaitOutTheReplayOfALockHolder
+      docker: TODO  # a container stop cannot cut power mid-operation, so no peer dies holding a lock
+      vm: run-vm-tests.sh::test_unlink_waits_out_peer_replay
+
+  - id: unlink-past-commit-outlasts-replay
+    name: An unlink past its commit outlasts a dead peer's replay
+    description: A peer dies holding a directory's inode table sector while a live node, past its unlink's journal commit, is inside RemoveIfAndUpdate on that directory; the peer's replay takes the directory's inode lock while the unlink waits holding none, and the unlink then finishes with no EIO, no fail-stop and fsck clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestUnlinkPastItsCommitOutlastsADeadPeersReplay
+
+  - id: orphan-pass-apart-from-detection
+    name: A blocked orphan pass does not hold up failure detection
+    description: While the orphan handler waits, as it does for a failed node's inode lock, failure detection still replays a dead node; a peer whose heartbeat stopped has its orphan list skipped, since its replay adopts it
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestBlockedOrphanPassLetsDetectionReplay
+
+  - id: stop-ends-stuck-orphan-pass
+    name: Stop ends an orphan pass stuck on a lock
+    description: An orphan pass waiting on a lock, as it does for a peer that failed mid-pass, ends when the registry stops, so unmount does not wait for that peer's replay
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestStopEndsAStuckOrphanPass
+
+  - id: occupant-judges-latest-read
+    name: Lock owner checks judge the slot read other checks saw
+    description: When another check reads a slot's later heartbeat, Occupant judges that read, so a slot that stays silent turns failing instead of looking alive on every check
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestOccupantSeesASilentSlotThatOthersRead
+
+  - id: rename-sectors-before-commit
+    name: A rename waits for its inode table sectors before its commit
+    description: With a dead peer holding the new parent's inode table sector, a rename lets go of its locks and waits before it commits, then finishes once the peer is replayed, with one commit, one name and no fail-stop
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/replay_retry_test.go::TestRenameWaitsForItsSectorsBeforeItsCommit
+
   - id: fsck-directory-tree
     name: fsck checks the directory tree
     description: fsck reports a directory with a second name, a ".." naming another parent, a wrong directory link count, and a ".." loop; a tree built by mkdir has none of them
@@ -2080,6 +2131,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestOrphanSnapshotListedAndDeletable
+
+  - id: orphan-snapshot-of-unlinked-open-file
+    name: A snapshot of a file unlinked while another node holds it open is an orphan
+    description: Before the unlink, deleting the snapshot without its file fails with EBUSY. Once another node unlinks the file while a node still has it open, the full listing marks the snapshot an orphan and the no-path delete removes it; a new snapshot through the open handle fails with ENOENT, the holder keeps reading and writing its data, and after its last close the inode is freed and fsck finds no problem
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotOfAnUnlinkedFileIsAnOrphanWhileHeld
 
   - id: snapshot-without-birth-is-orphan
     name: A snapshot without its file's birth generation is an orphan
@@ -2235,6 +2293,13 @@ scenarios:
     environments:
       go: internal/fsck/inspect_test.go::TestInspectSlot
 
+  - id: fs-entry-past-inode-table-logged-once
+    name: A damaged directory entry is logged once
+    description: Every lookup of a directory entry naming an inode past the inode table fails with EIO, but the error is logged once per directory and name, and the set of logged entries stays under its cap however many damaged entries are looked up
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/child_range_test.go::TestDamagedEntryLoggedOnce
+
   - id: replay-rejects-inode-past-table
     name: Replay refuses an inode number past the inode table
     description: A record naming inode 2^32+2, or any number at or past the inode table's size, as the inode a create, delete, extent change or rename writes or as the child a directory entry gets, fails replay with ErrInodeOutOfRange and changes nothing, instead of wrapping onto a real inode such as the root
@@ -2276,6 +2341,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlotOnline
+
+  - id: replay-refuses-unknown-op
+    name: Replay refuses a journal it cannot fully read
+    description: A committed transaction holding an op type this build does not define fails both a peer's replay and a node's own replay with ErrUnknownOp before any of its entries apply; the transactions before it stay applied, the ones after it do not, and the journal stays in recovery for an admin. DryRunRecover stops at it with the same error, and replay and DryRunRecover refuse a journal whose header names a newer format version
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestReplayRefusesUnknownOp
 
   - id: journal-pending-committed
     name: Count the committed transactions a journal reset would drop

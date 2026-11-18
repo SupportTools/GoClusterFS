@@ -219,21 +219,34 @@ func (t *Table) Read(inodeNum uint32) (*Inode, error) {
 // Write writes an inode to disk.
 // The inode must have a valid InodeNum set.
 func (t *Table) Write(ctx context.Context, inode *Inode) error {
-	committed, err := t.lockedWrite(ctx, inode, nil)
-	if committed != nil {
-		committed()
-	}
-	return err
+	return t.untilReplayed(ctx, func() error {
+		committed, err := t.lockedWrite(ctx, inode, nil)
+		if committed != nil {
+			committed()
+		}
+		return err
+	})
 }
 
 // WriteIfUnchanged is Write for an inode read at MetaGeneration gen. If another
 // write landed since, it writes nothing and returns ErrTreeConflict.
 func (t *Table) WriteIfUnchanged(ctx context.Context, inode *Inode, gen uint64) error {
-	committed, err := t.lockedWrite(ctx, inode, &gen)
-	if committed != nil {
-		committed()
+	return t.untilReplayed(ctx, func() error {
+		committed, err := t.lockedWrite(ctx, inode, &gen)
+		if committed != nil {
+			committed()
+		}
+		return err
+	})
+}
+
+// untilReplayed runs op, which takes its own inode lock, again whenever it gives up on a lock a failing node holds,
+// once that node's replay ends. See lock.Manager.UntilReplayed.
+func (t *Table) untilReplayed(ctx context.Context, op func() error) error {
+	if t.lockMgr == nil {
+		return op()
 	}
-	return err
+	return t.lockMgr.UntilReplayed(ctx, op)
 }
 
 func (t *Table) lockedWrite(ctx context.Context, inode *Inode, wantGen *uint64) (func(), error) {
@@ -271,11 +284,13 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode, wantGen *uint64) 
 
 // Update applies change to inode num and writes it back, holding the inode lock from the read to the write.
 func (t *Table) Update(ctx context.Context, num uint32, change func(*Inode) error) error {
-	committed, err := t.lockedUpdate(ctx, num, change)
-	if committed != nil {
-		committed()
-	}
-	return err
+	return t.untilReplayed(ctx, func() error {
+		committed, err := t.lockedUpdate(ctx, num, change)
+		if committed != nil {
+			committed()
+		}
+		return err
+	})
 }
 
 func (t *Table) lockedUpdate(ctx context.Context, num uint32, change func(*Inode) error) (func(), error) {
@@ -454,6 +469,16 @@ func (t *Table) ClaimSlotAs(ctx context.Context, num uint32, init func(*Inode)) 
 }
 
 func (t *Table) claimSlot(ctx context.Context, num uint32, ok func(free *Inode) bool, init func(*Inode)) (*Inode, error) {
+	var claimed *Inode
+	err := t.untilReplayed(ctx, func() error {
+		var err error
+		claimed, err = t.claimSlotOnce(ctx, num, ok, init)
+		return err
+	})
+	return claimed, err
+}
+
+func (t *Table) claimSlotOnce(ctx context.Context, num uint32, ok func(free *Inode) bool, init func(*Inode)) (*Inode, error) {
 	if uint64(num) >= t.totalInodes {
 		return nil, ErrInodeOutOfRange
 	}
@@ -527,6 +552,16 @@ func (t *Table) Free(ctx context.Context, inodeNum uint32) error {
 
 // FreeIf frees the inode if ok accepts it, read under the inode's lock, and reports whether it did.
 func (t *Table) FreeIf(ctx context.Context, inodeNum uint32, ok func(*Inode) bool) (bool, error) {
+	var freed bool
+	err := t.untilReplayed(ctx, func() error {
+		var err error
+		freed, err = t.freeIfOnce(ctx, inodeNum, ok)
+		return err
+	})
+	return freed, err
+}
+
+func (t *Table) freeIfOnce(ctx context.Context, inodeNum uint32, ok func(*Inode) bool) (bool, error) {
 	if uint64(inodeNum) >= t.totalInodes {
 		return false, ErrInodeOutOfRange
 	}

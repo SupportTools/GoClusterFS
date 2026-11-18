@@ -129,7 +129,7 @@ type Registry struct {
 	onSlotLost func(SlotLoss)
 
 	onOwnerDead func(owner [16]byte, slot int) (done func(replayed bool))
-	onOrphans   func(slot int, orphans []Orphan)
+	onOrphans   func(ctx context.Context, slot int, orphans []Orphan)
 	// preempt revokes a dead node's access to the device before this node acts on its death; nil when unfenced.
 	preempt       func(owner [16]byte) error
 	orphanKick    chan struct{}
@@ -1136,8 +1136,9 @@ func (r *Registry) StartFailureDetection() {
 		log.Printf("[WARN] node: GOCLUSTERFS_TEST_NO_PEER_REPLAY is set: this node replays no other node's journal; use it only in tests")
 	}
 	r.detectAndRecoverFailedNodes()
-	r.heartbeatWg.Add(1)
+	r.heartbeatWg.Add(2)
 	go r.failureDetectionLoop()
+	go r.orphanLoop()
 }
 
 // testNoPeerReplay, from GOCLUSTERFS_TEST_NO_PEER_REPLAY and for tests only,
@@ -1158,10 +1159,6 @@ func (r *Registry) failureDetectionLoop() {
 			return
 		case <-ticker.C:
 			r.detectAndRecoverFailedNodes()
-		case <-r.orphanKick:
-			if slots, err := r.readAllSlots(); err == nil {
-				r.passOrphans(slots)
-			}
 		}
 	}
 }
@@ -1181,7 +1178,7 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 	if err != nil {
 		return
 	}
-	r.passOrphans(slots)
+	r.KickOrphans()
 	if testNoPeerReplay {
 		return
 	}
@@ -1190,7 +1187,6 @@ func (r *Registry) detectAndRecoverFailedNodes() {
 			continue
 		}
 		r.mu.Lock()
-		r.remember(i, slot)
 		r.observe(i, slot)
 		if f := r.failures[i]; f != nil && (slot.UUID != f.uuid || slot.State != NodeStateDead) {
 			delete(r.failures, i)
