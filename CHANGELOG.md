@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Devices must be at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
 - Mount also refuses version 3 devices formatted before lock records had one claim slot per node, before each lock type had its own lock records, or before reads and writes took file I/O locks. Older builds refuse devices this version formats. Copy the data off with the build that formatted them and reformat.
 - Volumes this version formats carry the `RequiredSymlinks` and `RequiredFileIOLocks` flags. Older builds refuse them with `unknown required flags 0x40`, or `0x60` before symlinks, or `0x70` before per-type lock records. On version 3 volumes formatted before symlinks but after file I/O locks, creating a symlink returns EOPNOTSUPP; reformat to use symlinks.
+- Volumes formatted on a device with persistent reservations carry the `RequiredReservations` flag, and older builds refuse them with `unknown required flags 0x80`.
 - Upgrade all nodes together: unmount on every node, upgrade, then mount again. Don't mount one shared device with a mix of old and new binaries.
   - Older binaries reset an inode's generation counters to 0 when they free it, so other nodes can serve stale data after the inode number is reused.
   - Older binaries zero the extent-tree generation (inode bytes 188–195) when they rewrite an inode. Newer binaries then cannot read that file if it has more than two extents, because such files use an extent tree.
@@ -28,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Storage fencing on devices with SCSI-3 or NVMe persistent reservations: each node registers its own key, and before a node acts on another node's death, it removes that node's key, so the device refuses the dead node's writes. `-format -fencing=auto` (the default) turns it on when the device supports it; `-require-fencing` refuses to mount an unfenced volume. `/health` reports it as the `fencing` check, and `goclusterfs-fsck` removes a node's key before `-repair` or `-release-slot` writes over it. See Storage Fencing in OPERATIONS.
 - Hard links for regular files: `link(2)` gives a file another name, up to 65,000. Directories and symlinks get `EPERM`, and a file with no link left gets `ENOENT`. The journal records the added link, and `goclusterfs-fsck` checks each regular file's link count against its names; `-repair` sets it to the names it finds.
 - Symlinks: `ln -s`, `readlink`, `lstat`, `lchown` and `touch -h`. A target of up to 92 bytes is kept in the inode, a longer one, up to 4095 bytes, in one data block. Creating a link is one journal transaction, so a crash leaves either no name or the whole target. fsck checks symlink inodes, targets and entry types and reports bad ones without repairing them. Snapshots and clones of a symlink are refused, as the kernel refuses user xattrs on symlinks.
 - `goclusterfs-mount`: a FUSE filesystem that several Linux nodes can mount from one shared block device.
