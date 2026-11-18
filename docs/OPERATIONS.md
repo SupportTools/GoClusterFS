@@ -619,6 +619,8 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
+**The registry and journals.** Nodes take registry slots, write heartbeats, replay each other's journals and free dead nodes' slots by writing sectors on the device, and each node trusts the others to follow those rules. A host that can write the device can take any node's slot, which makes that node stop, and can rewrite or reset any journal. `goclusterfs-fsck -release-slot` frees a slot by those same rules; see [Damaged Journal Slot](#damaged-journal-slot).
+
 **Broadcast cache invalidation.** Nodes send UDP messages (multicast group `239.192.74.75`, port `24730` by default, unicast on `24731`) that tell peers to drop cached inodes and extents. Heartbeat and announce messages add unicast peers, which a node uses when multicast sends fail. Messages carry inode numbers but no file data. Each node numbers its messages, and a node that sees a gap in a peer's numbers drops all cached inodes and extents. The heartbeats after a node's last invalidation let peers notice a lost final message too. Only when those heartbeats are lost as well do cache updates wait for `-cache-ttl`.
 
 - With an empty `-broadcast-secret` (the default), messages are not authenticated. Any host that can send to the port can make nodes drop their caches, and can add any address as a unicast peer. Mount logs a `WARNING` line at startup in this case.
@@ -627,11 +629,13 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`) it also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`), every `/api/v1/...` request needs it, reads included, and the API also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
 
 - To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
 - `/health` and `/metrics` never need the token, on purpose: load balancers, probes and Prometheus can read them without a secret. Anyone who can reach the port can read them too. They show no file names or data, but `/health` messages name peers' hostnames and registry slot numbers.
 - Without a token, the API rejects requests whose `Host` header is not a loopback name, and mount refuses `-api-cors '*'`. Both stop web pages that a local user opens from reading the API.
+- The dashboard's files under `/ui/` need no token: they hold no data, and the page's own API calls follow the same token rules as any client. See [Web Dashboard](API-CONFIG.md#web-dashboard).
+- `-api-rate-limit` caps requests per client IP, and never limits `/health`, `/metrics` or `/ui/`. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
 - The API uses plain HTTP. Put a TLS proxy in front of it, or use an SSH tunnel, if the token crosses a network.
 - Keep the token in a 0600 file (`-api-token-file`) or `GOCLUSTERFS_API_TOKEN`. `-api-token` shows it to every local user in `ps`, so mount logs a `WARNING` for it.
 
