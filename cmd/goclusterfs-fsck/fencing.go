@@ -2,10 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/supporttools/GoClusterFS/internal/fence"
+	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -68,4 +71,37 @@ func mountedHere(dev *storage.Device, sb *superblock.Superblock) (uint64, bool) 
 		}
 	}
 	return 0, false
+}
+
+// clearReservations removes every reservation key and the reservation from devicePath, unless a node runs on the
+// volume and force is not set.
+func clearReservations(out io.Writer, dev *storage.Device, devicePath string, force bool) error {
+	if !force {
+		slots, err := fsck.New(dev, fsck.Options{Output: io.Discard}).Slots()
+		if err != nil {
+			return fmt.Errorf("clearing refused: fsck cannot tell whether a node runs (%v); pass -force to clear anyway", err)
+		}
+		var running []string
+		for _, s := range slots {
+			if s.Running {
+				running = append(running, s.Name())
+			}
+		}
+		if len(running) > 0 {
+			return fmt.Errorf("clearing refused: the filesystem is mounted by %s; unmount it on every node first", strings.Join(running, ", "))
+		}
+	}
+	f, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s for its reservations failed: %w", devicePath, err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("clearing refused: another process on this host holds %s for fencing, maybe a stopped goclusterfs-mount (%v)", devicePath, err)
+	}
+	if err := fence.Block(f, fence.ToolKey()).Clear(); err != nil {
+		return fmt.Errorf("clearing the reservations of %s failed: %w", devicePath, err)
+	}
+	_, err = fmt.Fprintf(out, "Removed every reservation key and the reservation from %s. Until a node mounts it again, any host can write to it.\n", devicePath)
+	return err
 }

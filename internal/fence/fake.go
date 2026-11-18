@@ -87,3 +87,15 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	t.preempted = append(t.preempted, victim)
 	return nil
 }
+
+func (d *fakeDevice) clear(key uint64) error {
+	t := d.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cur, registered := t.keys[d.initiator]; !registered || cur != key {
+		return ErrReservationConflict
+	}
+	t.keys = map[string]uint64{}
+	t.reserved = false
+	return nil
+}

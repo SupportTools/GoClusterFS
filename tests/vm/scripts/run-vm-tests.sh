@@ -3695,6 +3695,45 @@ test_fencing_busy_survivor() {
     return $result
 }
 
+# fsck -clear-reservations refuses while nodes run. Once VM 1 unmounted and VM 2 crashed, leaving its key, it removes
+# every key and the reservation, after which both nodes mount again.
+test_fencing_clear_reservations() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 out pr=/sys/kernel/config/target/core/iblock_0/lun0/pr
+    fencing_restart pr || return 1
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -clear-reservations $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"clearing refused: the filesystem is mounted by"* ]]; then
+        log_error "fsck -clear-reservations while both nodes run did not refuse: $out"
+        result=1
+    fi
+    unmount_goclusterfs 1 || return 1
+    crash_goclusterfs 2 || return 1
+    if ! registered_initiators | grep -q "goclusterfs:vm2,"; then
+        log_error "the crashed VM 2 has no key left to clear: $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+    out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck -clear-reservations $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"rc=0"* ]]; then
+        log_error "fsck -clear-reservations with no node running failed: $out"
+        result=1
+    fi
+    if [[ -n "$(registered_initiators | tr -d '[:space:]')" ]]; then
+        log_error "keys left after fsck -clear-reservations: $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+    out=$(ssh_run "$TARGET_VM_ID" "tr -d '\\000' < $pr/res_pr_type")
+    if [[ "$out" != *"No SPC-3 Reservation holder"* ]]; then
+        log_error "the target still holds a reservation after fsck -clear-reservations: $out"
+        result=1
+    fi
+    setup_goclusterfs 1 false || result=1
+    setup_goclusterfs 2 false || result=1
+    return $result
+}
+
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
     ssh_run "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
@@ -4875,6 +4914,7 @@ main() {
     run_test "Fencing: Paused VM" test_fencing_paused_vm
     run_test "Fencing: Idle Node" test_fencing_idle_node
     run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
+    run_test "Fencing: Clear Reservations" test_fencing_clear_reservations
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls

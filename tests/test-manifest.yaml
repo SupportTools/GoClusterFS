@@ -5270,6 +5270,13 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestBlockOnRegularFileIsUnsupported
 
+  - id: fence-clear
+    name: Clear removes every key and the reservation
+    description: After Clear every initiator may write, and a node whose key was cleared finds it gone
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestClearRemovesEveryKeyAndTheReservation
+
   - id: fence-partition-refused
     name: A partition gets no reservations
     description: Every reservation command on a partition fails with ErrPartition, which is ErrUnsupported, before it reaches the device; sysfs tells a partition from a whole disk
@@ -5363,7 +5370,7 @@ scenarios:
 
   - id: fencing-file-image
     name: Fencing flags on a device without reservations
-    description: -format -fencing=pr refuses a file image, the default formats it unfenced and warns, /health shows fencing none, and -require-fencing refuses to mount it
+    description: -format -fencing=pr refuses a file image, the default formats it unfenced and warns, /health shows fencing none, -require-fencing refuses to mount it, and fsck -clear-reservations refuses while a node runs and reports no reservations once none does
     priority: medium
     environments:
       go: fencing_test.go::TestFencingOnAFileImage
@@ -5406,6 +5413,13 @@ scenarios:
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_busy_survivor
+
+  - id: fencing-clear-reservations
+    name: fsck -clear-reservations removes every key once no node runs
+    description: fsck -clear-reservations refuses while VM 1 runs; once VM 1 unmounts, it removes VM 1's and the crashed VM 2's keys and the reservation, and both nodes mount again
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_clear_reservations
 
   - id: fencing-unmount-removes-key
     name: A clean unmount removes the node's reservation key

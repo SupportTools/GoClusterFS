@@ -786,7 +786,7 @@ func formatFencer(devicePath, mode string) fence.Fencer {
 		failf("-fencing=%s: registering a reservation key on %s failed: %v; format as root on a device with persistent reservations, or pass -fencing=none", mode, devicePath, err)
 	}
 	if err := pr.Reserve(); err != nil {
-		failf("-fencing=%s: reserving %s failed: %v; release the other reservation, or pass -fencing=none", mode, devicePath, err)
+		failf("-fencing=%s: reserving %s failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s, or pass -fencing=none", mode, devicePath, err, devicePath)
 	}
 	return pr
 }
@@ -812,7 +812,7 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 		failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
 	}
 	if err := pr.Reserve(); err != nil {
-		failf("%s is fenced, and reserving it failed: %v; release the other reservation first", devicePath, err)
+		failf("%s is fenced, and reserving it failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s", devicePath, err, devicePath)
 	}
 	// LIO tags every command with the holder's key, so PREEMPT AND ABORT also drops this node's in-flight I/O without a status.
 	reg.SetPreempter(func(owner [16]byte) error {

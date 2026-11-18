@@ -47,6 +47,7 @@ var (
 	iocRegister     = ioc(1, 200, unsafe.Sizeof(registration{}))
 	iocReserve      = ioc(1, 201, unsafe.Sizeof(reservation{}))
 	iocPreemptAbort = ioc(1, 204, unsafe.Sizeof(preemption{}))
+	iocClear        = ioc(1, 205, unsafe.Sizeof(clearing{}))
 )
 
 func ioc(dir, nr, size uintptr) uintptr { return dir<<30 | size<<16 | 'p'<<8 | nr }
@@ -64,6 +65,11 @@ type reservation struct {
 type preemption struct {
 	own, victim uint64
 	typ, flags  uint32
+}
+
+type clearing struct {
+	key        uint64
+	flags, pad uint32
 }
 
 func (d blockDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
@@ -106,4 +112,9 @@ func (d blockDevice) reserve(key uint64) error {
 func (d blockDevice) preemptAbort(own, victim uint64) error {
 	p := preemption{own: own, victim: victim, typ: typeWriteExclusiveAllRegs}
 	return d.ioctl(iocPreemptAbort, unsafe.Pointer(&p))
+}
+
+func (d blockDevice) clear(key uint64) error {
+	c := clearing{key: key}
+	return d.ioctl(iocClear, unsafe.Pointer(&c))
 }

@@ -25,10 +25,41 @@ func TestNodeKey(t *testing.T) {
 
 // The ioctl numbers are the kernel's, from linux/pr.h.
 func TestIoctlNumbers(t *testing.T) {
-	for got, want := range map[uintptr]uintptr{iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreemptAbort: 0x401870cc} {
+	for got, want := range map[uintptr]uintptr{
+		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
+	} {
 		if got != want {
 			t.Errorf("ioctl %#x, want %#x", got, want)
 		}
+	}
+}
+
+// Clear removes every key and the reservation: any initiator may write until a node reserves the device again, and a
+// node whose key was cleared finds it gone.
+func TestClearRemovesEveryKeyAndTheReservation(t *testing.T) {
+	target := NewTarget()
+	a, b := target.Node("a", NodeKey([16]byte{1})), target.Node("b", NodeKey([16]byte{2}))
+	for _, n := range []*PR{a, b} {
+		if err := n.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	if target.MayWrite("tool") {
+		t.Fatal("an unregistered initiator may write under the reservation")
+	}
+	if err := target.Node("tool", ToolKey()).Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	for _, initiator := range []string{"a", "b", "tool", "other"} {
+		if !target.MayWrite(initiator) {
+			t.Errorf("%s may not write after Clear", initiator)
+		}
+	}
+	if err := a.Unregister(); !errors.Is(err, ErrFenced) {
+		t.Errorf("a's key after Clear: Unregister = %v, want ErrFenced", err)
 	}
 }
 
@@ -167,6 +198,7 @@ func (d statusDevice) register(old, new uint64, ignore bool) error {
 }
 func (d statusDevice) reserve(uint64) error                  { return nil }
 func (d statusDevice) preemptAbort(own, victim uint64) error { return ioctlResult(d.preemptStatus, 0) }
+func (d statusDevice) clear(uint64) error                    { return nil }
 
 // Preempt reads a conflict alike from SCSI and NVMe, and stops on any other status.
 func TestPreemptStatusesFromBothTransports(t *testing.T) {

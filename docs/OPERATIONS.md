@@ -213,6 +213,7 @@ On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead
 - **One fenced mount per host:** a registration belongs to the host's storage initiator, not to a process, so two mounts of one fenced device on one host could not fence each other. A fenced mount locks the device on its host, and a second mount refuses while the first process exists, even stopped. Kill a stopped mount before mounting again.
 - **Permissions and multipath:** on Linux 6.5 and later, registering a key needs the device opened for writing; older kernels need root (`CAP_SYS_ADMIN`). With dm-multipath, the kernel registers the key on every path.
 - **fsck:** on a fenced volume, a run that writes uses the key of the node mounted on the same host, or registers a key of its own and removes it when done. Run `-repair` and `-release-slot` on a host where no node is mounted: when fsck revokes a dead node's key there, a Linux LIO target also drops the mounted node's writes in flight, and that node can stop.
+- **Clearing reservations:** `goclusterfs-fsck -clear-reservations DEVICE` removes every key and the reservation. Use it when a mount refuses because the device holds another reservation, when keys of hosts that will not return are left, or before you format the device with `-fencing=none`. It refuses while a node runs; `-force` skips that check. Until a node mounts again and reserves the device, any host can write to it.
 
 ### Adding a New Node
 
