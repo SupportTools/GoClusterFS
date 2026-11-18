@@ -2242,6 +2242,13 @@ scenarios:
     environments:
       go: internal/fsck/inspect_test.go::TestInspectSlot
 
+  - id: fs-entry-past-inode-table-logged-once
+    name: A damaged directory entry is logged once
+    description: Every lookup of a directory entry naming an inode past the inode table fails with EIO, but the error is logged once per directory and name, and the set of logged entries stays under its cap however many damaged entries are looked up
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/child_range_test.go::TestDamagedEntryLoggedOnce
+
   - id: replay-rejects-inode-past-table
     name: Replay refuses an inode number past the inode table
     description: A record naming inode 2^32+2, or any number at or past the inode table's size, as the inode a create, delete, extent change or rename writes or as the child a directory entry gets, fails replay with ErrInodeOutOfRange and changes nothing, instead of wrapping onto a real inode such as the root
