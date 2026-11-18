@@ -13,6 +13,7 @@ func TestEntryTouches(t *testing.T) {
 	}{
 		{TxnOpInodeCreate, (&InodeCreatePayload{InodeNum: 12, ParentInodeNum: 2}).Serialize(), Touches{Inodes: []uint64{12, 2}}},
 		{TxnOpInodeUpdate, (&InodeUpdatePayload{InodeNum: 12}).Serialize(), Touches{Inodes: []uint64{12}}},
+		{TxnOpLinkAdd, (&LinkAddPayload{InodeNum: 12}).Serialize(), Touches{Inodes: []uint64{12}}},
 		{TxnOpDirRename, (&DirRenamePayload{OldParentInodeNum: 2, NewParentInodeNum: 7, InodeNum: 12, TargetInodeNum: 30, OldName: "a", NewName: "b"}).Serialize(),
 			Touches{Inodes: []uint64{2, 7, 12, 30}}},
 		{TxnOpBlockAlloc, (&BlockAllocPayload{InodeNum: 12, StartBlock: 100, Count: 4}).Serialize(), Touches{Inodes: []uint64{12}, Blocks: []BlockRun{{100, 4}}}},

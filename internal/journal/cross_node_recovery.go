@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
@@ -198,6 +199,9 @@ func (r *txnReplay) unchanged(ino *inode.Inode, gen uint64) bool {
 // applyEntry applies a single journal entry idempotently.
 // Returns true if the operation was applied, false if it was already applied or must not be.
 func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry *RecoveredEntry) (bool, error) {
+	if err := inodesInTable(rctx, entry); err != nil {
+		return false, err
+	}
 	switch entry.Entry.OpType {
 	case TxnOpInodeCreate:
 		return applyInodeCreate(ctx, rctx, r, entry.Payload)
@@ -243,7 +247,11 @@ func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		return false, err
 	}
 
-	ino, err := rctx.InodeTbl.ClaimSlotIf(ctx, uint32(p.InodeNum), func(free *inode.Inode) bool {
+	num, err := tableInode(p.InodeNum)
+	if err != nil {
+		return false, err
+	}
+	ino, err := rctx.InodeTbl.ClaimSlotIf(ctx, num, func(free *inode.Inode) bool {
 		return free.MetaGeneration == p.MetaGeneration
 	})
 	if errors.Is(err, inode.ErrInodeInUse) {
@@ -272,7 +280,11 @@ func applyInodeCreate(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 // ownClaim returns the slot's inode if the create's own claim landed and nothing wrote the inode since: the logging
 // node wrote it last, and at most as often as a create does before adding the name.
 func (r *txnReplay) ownClaim(rctx *RecoveryContext, p *InodeCreatePayload) (*inode.Inode, error) {
-	ino, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
+	num, err := tableInode(p.InodeNum)
+	if err != nil {
+		return nil, err
+	}
+	ino, err := rctx.InodeTbl.Read(num)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +327,10 @@ func applyLinkAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, payl
 	if err != nil {
 		return false, err
 	}
-	num := uint32(p.InodeNum)
+	num, err := tableInode(p.InodeNum)
+	if err != nil {
+		return false, err
+	}
 	err = rctx.InodeTbl.Update(ctx, num, func(ino *inode.Inode) error {
 		if !r.unchanged(ino, p.MetaGeneration) || !ino.IsFile() || ino.LinkCount == 0 {
 			return errLinkAddSkipped
@@ -349,7 +364,7 @@ func applySymlinkTarget(ctx context.Context, rctx *RecoveryContext, r *txnReplay
 		log.Printf("[Recovery] SymlinkTarget: replay did not create inode %d, skipping", p.InodeNum)
 		return false, nil
 	}
-	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+	return updateExtents(ctx, rctx, r, p.InodeNum, func(ino *inode.Inode) (bool, error) {
 		if !ino.IsSymlink() || !r.unchanged(ino, 0) || ino.HasInlineTarget() {
 			return false, nil
 		}
@@ -378,8 +393,11 @@ func applyInodeUpdate(ctx context.Context, rctx *RecoveryContext, payload []byte
 		return false, err
 	}
 
-	// Read current inode
-	ino, err := rctx.InodeTbl.Read(uint32(p.InodeNum))
+	num, err := tableInode(p.InodeNum)
+	if err != nil {
+		return false, err
+	}
+	ino, err := rctx.InodeTbl.Read(num)
 	if err != nil {
 		// Inode doesn't exist - this is an error during recovery
 		return false, fmt.Errorf("inode %d not found for update", p.InodeNum)
@@ -404,7 +422,11 @@ func applyInodeDelete(ctx context.Context, rctx *RecoveryContext, r *txnReplay, 
 		return false, nil
 	}
 
-	freed, err := rctx.InodeTbl.FreeIf(ctx, uint32(p.InodeNum), func(ino *inode.Inode) bool {
+	num, err := tableInode(p.InodeNum)
+	if err != nil {
+		return false, err
+	}
+	freed, err := rctx.InodeTbl.FreeIf(ctx, num, func(ino *inode.Inode) bool {
 		return r.unchanged(ino, p.MetaGeneration)
 	})
 	if errors.Is(err, inode.ErrInodeNotInUse) || err == nil && !freed {
@@ -433,7 +455,10 @@ func applyLinkDrop(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pay
 	if r.kept("LinkDrop", uint64(p.InodeNum)) {
 		return false, nil
 	}
-	num := uint32(p.InodeNum)
+	num, err := tableInode(p.InodeNum)
+	if err != nil {
+		return false, err
+	}
 	var holders uint64
 	if rctx.OrphanHolders != nil {
 		if holders, err = rctx.OrphanHolders(num); err != nil {
@@ -618,8 +643,12 @@ func renameOvertaken(rctx *RecoveryContext, p *DirRenamePayload) (bool, error) {
 	if p.EntryType == DirEntryDirectory && p.OldParentInodeNum != p.NewParentInodeNum {
 		logged[p.InodeNum] = p.MetaGeneration
 	}
-	for num, gen := range logged {
-		ino, err := rctx.InodeTbl.Read(uint32(num))
+	for logNum, gen := range logged {
+		num, err := tableInode(logNum)
+		if err != nil {
+			return false, err
+		}
+		ino, err := rctx.InodeTbl.Read(num)
 		if err != nil {
 			return false, fmt.Errorf("failed to read inode %d: %w", num, err)
 		}
@@ -659,13 +688,17 @@ func placeRenamed(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p *D
 	if p.TargetInodeNum != 0 && p.TargetType == DirEntryDirectory {
 		links[p.NewParentInodeNum]--
 	}
-	for num, delta := range links {
+	for logNum, delta := range links {
 		if delta == 0 {
 			continue
 		}
+		num, err := tableInode(logNum)
+		if err != nil {
+			return false, err
+		}
 		var wrote bool
-		if err := rctx.InodeTbl.Update(ctx, uint32(num), func(parent *inode.Inode) error {
-			if wrote = r.unchanged(parent, gens[num]); !wrote {
+		if err := rctx.InodeTbl.Update(ctx, num, func(parent *inode.Inode) error {
+			if wrote = r.unchanged(parent, gens[logNum]); !wrote {
 				return errParentChanged
 			}
 			parent.LinkCount = uint32(int64(parent.LinkCount) + int64(delta))
@@ -674,8 +707,8 @@ func placeRenamed(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p *D
 			return false, fmt.Errorf("failed to update the link count of directory %d: %w", num, err)
 		}
 		if wrote {
-			if parent, err := rctx.InodeTbl.Read(uint32(num)); err == nil {
-				r.wrote[uint32(num)] = parent.MetaGeneration
+			if parent, err := rctx.InodeTbl.Read(num); err == nil {
+				r.wrote[num] = parent.MetaGeneration
 			}
 		}
 	}
@@ -695,10 +728,45 @@ func placeRenamed(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p *D
 	return pointed, err
 }
 
+// inodesInTable fails for an entry that names an inode at or past the end of
+// the inode table, which only a damaged record does. Replay would otherwise
+// write that number into a directory entry, or narrow it onto a real inode.
+// An entry that does not decode is left for its apply function to report.
+func inodesInTable(rctx *RecoveryContext, entry *RecoveredEntry) error {
+	if rctx.InodeTbl == nil {
+		return nil
+	}
+	touched, err := EntryTouches(entry.Entry.OpType, entry.Payload)
+	if err != nil {
+		return nil
+	}
+	total := rctx.InodeTbl.TotalInodes()
+	for _, num := range touched.Inodes {
+		if num >= total {
+			return fmt.Errorf("%s entry names inode %d, past the inode table's %d inodes: %w", entry.Entry.OpType, num, total, inode.ErrInodeOutOfRange)
+		}
+	}
+	return nil
+}
+
+// tableInode narrows a logged inode number to the inode table's uint32. Only a
+// damaged record holds 2^32 or more, and narrowing that would wrap onto a real
+// inode, so it fails as a number past the table does.
+func tableInode(num uint64) (uint32, error) {
+	if num > math.MaxUint32 {
+		return 0, fmt.Errorf("inode %d: %w", num, inode.ErrInodeOutOfRange)
+	}
+	return uint32(num), nil
+}
+
 // liveDir reads the inode num and reports whether it is a directory in use. Another node may have removed it since
 // the record was logged.
 func liveDir(rctx *RecoveryContext, num uint64) (*inode.Inode, bool, error) {
-	ino, err := rctx.InodeTbl.Read(uint32(num))
+	tableNum, err := tableInode(num)
+	if err != nil {
+		return nil, false, err
+	}
+	ino, err := rctx.InodeTbl.Read(tableNum)
 	if err != nil {
 		return nil, false, fmt.Errorf("parent inode %d not found", num)
 	}
@@ -734,7 +802,12 @@ func removeLoggedEntry(ctx context.Context, rctx *RecoveryContext, p *DirRemoveE
 			log.Printf("[Recovery] DirRemoveEntry: %q now names inode %d, not %d, skipping", p.Name, childNum, p.ChildInodeNum)
 			return false
 		}
-		child, err := rctx.InodeTbl.Read(uint32(childNum))
+		tableNum, err := tableInode(childNum)
+		if err != nil {
+			readErr = err
+			return false
+		}
+		child, err := rctx.InodeTbl.Read(tableNum)
 		if err != nil {
 			readErr = fmt.Errorf("child inode %d not found: %w", childNum, err)
 			return false
@@ -821,7 +894,7 @@ func applyExtentAdd(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pa
 		return false, err
 	}
 
-	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+	return updateExtents(ctx, rctx, r, p.InodeNum, func(ino *inode.Inode) (bool, error) {
 		if !r.unchanged(ino, p.MetaGeneration) {
 			log.Printf("[Recovery] ExtentAdd: inode %d is free or was written since, skipping", p.InodeNum)
 			return false, nil
@@ -859,7 +932,11 @@ var beforeReplayWrite func(inodeNum uint32)
 
 // updateExtents reads an inode, applies change, and writes it back when change
 // reports an update. If any write landed since the read, it starts over.
-func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, inodeNum uint32, change func(*inode.Inode) (bool, error)) (bool, error) {
+func updateExtents(ctx context.Context, rctx *RecoveryContext, r *txnReplay, logNum uint64, change func(*inode.Inode) (bool, error)) (bool, error) {
+	inodeNum, err := tableInode(logNum)
+	if err != nil {
+		return false, err
+	}
 	const attempts = 5
 	for attempt := 1; ; attempt++ {
 		ino, err := rctx.InodeTbl.Read(inodeNum)
@@ -934,7 +1011,7 @@ func applyExtentFree(ctx context.Context, rctx *RecoveryContext, r *txnReplay, p
 	if r.kept("ExtentFree", uint64(p.InodeNum)) {
 		return false, nil
 	}
-	return updateExtents(ctx, rctx, r, uint32(p.InodeNum), func(ino *inode.Inode) (bool, error) {
+	return updateExtents(ctx, rctx, r, p.InodeNum, func(ino *inode.Inode) (bool, error) {
 		if !r.unchanged(ino, p.MetaGeneration) {
 			log.Printf("[Recovery] ExtentFree: inode %d is free or was written since, skipping", p.InodeNum)
 			return false, nil
