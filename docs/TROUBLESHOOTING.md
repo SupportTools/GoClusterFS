@@ -145,7 +145,7 @@ head -c 16 /dev/device | hexdump -C
 
 **Symptom**: Mount exits with `Cannot join the cluster: a live node maps locks to lock records differently from this build: node <host> in slot <n> (<uuid>) has lock layout <id>, this build <id>. ...`
 
-**Cause**: The named node runs another GoClusterFS version, and the two versions use lock records differently, so they would not lock each other out. Mount checks this before it takes a registry slot. A node whose heartbeat stays unchanged for about 12 seconds, such as one that crashed, does not count.
+**Cause**: The named node runs another GoClusterFS version, and the two versions use lock records differently, so they would not lock each other out. Mount checks this before it takes a registry slot. A node whose heartbeat stays unchanged for about 20 seconds, such as one that crashed, does not count.
 
 **Solution**: Unmount the named node, then mount every node with one version.
 
@@ -434,7 +434,7 @@ fusermount3 -u /mnt/cluster
 
 **Symptom**: A mount stops with `heartbeats to node registry slot N have failed`, `Node registry slot N is no longer this node's`, or `Node registry slot N may no longer be this node's`.
 
-**Cause**: Node heartbeats are writes to the shared device every second, not network messages. A node stops when its heartbeat writes fail for 5 seconds, when it went more than 15 seconds between heartbeats (a paused process or a suspended host), or when another node took its slot after it looked dead (heartbeat older than 10 seconds to a new mount, about 20 seconds to running nodes).
+**Cause**: Node heartbeats are writes to the shared device every second, not network messages. A node stops when its heartbeat writes fail for 5 seconds, when it went more than 15 seconds between heartbeats (a paused process or a suspended host), or when another node took its slot after its heartbeat stopped for about 20 seconds.
 
 **Solutions**:
 ```bash

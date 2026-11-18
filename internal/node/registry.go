@@ -347,7 +347,7 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	empty := func(slot *Slot) bool { return slot.State == NodeStateEmpty }
 	ownFailed := func(slot *Slot) bool {
 		return r.sameHost(slot) && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) &&
-			(r.deadLocalOwner(slot) || heartbeatOlderThan(slot, HeartbeatTimeout))
+			(r.deadLocalOwner(slot) || heartbeatOlderThan(slot, deadAfter))
 	}
 	// The slot -skip-recovery names comes first: the operator chose it.
 	if r.preferred >= 0 {
@@ -443,9 +443,9 @@ func (r *Registry) PreferSlot(slot int) {
 }
 
 // silentSlotWatch is how long Register watches another host's slot before it
-// takes it, if its heartbeat never changed: past HeartbeatTimeout, so a node
-// that only stalled checks its slot before its next write. Tests shorten it.
-var silentSlotWatch = HeartbeatTimeout + 2*HeartbeatInterval
+// takes it, if its heartbeat never changed: as long as peers watch before they
+// replay, so a node that stalled for less than stallLimit keeps its slot. Tests shorten it.
+var silentSlotWatch = deadAfter
 
 // earlierBootSlots returns the slots registered under this node's hostname in
 // another kernel boot whose heartbeat looks old by this node's clock.
@@ -487,6 +487,7 @@ var afterSilentWatch func()
 // so a slot a peer marked dead, or whose node beat again, since is left alone.
 func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
 	for _, w := range slots {
+		issued := bootClock()
 		if err := r.claimSlot(w.slot, w.raw); err != nil {
 			if errors.Is(err, ErrSlotTaken) {
 				continue
@@ -497,7 +498,7 @@ func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
 		if err != nil {
 			return -1, err
 		}
-		r.took(w.slot, slot)
+		r.took(w.slot, slot, issued)
 		return w.slot, nil
 	}
 	return -1, nil
@@ -548,23 +549,25 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 		if err != nil || !claimable(slot) {
 			continue
 		}
+		issued := bootClock()
 		if err := r.claimSlot(i, raw); err != nil {
 			if errors.Is(err, ErrSlotTaken) {
 				continue
 			}
 			return -1, err
 		}
-		r.took(i, slot)
+		r.took(i, slot, issued)
 		return i, nil
 	}
 	return -1, nil
 }
 
-// took records that this node registered in slot i, which held slot. Called with r.mu held.
-func (r *Registry) took(i int, slot *Slot) {
+// took records that this node registered in slot i, which held slot, with a
+// claim write issued at bootClock time issued. Called with r.mu held.
+func (r *Registry) took(i int, slot *Slot, issued time.Duration) {
 	r.localSlot = i
 	r.beatSeq = 1
-	r.lastBeat.Store(int64(bootClock()))
+	r.lastBeat.Store(int64(issued))
 	if slot.State != NodeStateEmpty {
 		r.previousOwner = &slot.UUID
 	}
@@ -581,13 +584,13 @@ func (r *Registry) awaitOtherNamespaceSlots() []int {
 	watch := map[int]beat{}
 	for i := 0; i < MaxNodes; i++ {
 		_, slot, err := r.readSlotRaw(i)
-		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !heartbeatOlderThan(slot, HeartbeatTimeout) {
+		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !heartbeatOlderThan(slot, deadAfter) {
 			watch[i] = beat{slot.HeartbeatSeq, slot.HeartbeatTime}
 		}
 	}
 
 	var stale []int
-	deadline := time.Now().Add(HeartbeatTimeout + 2*HeartbeatInterval)
+	deadline := time.Now().Add(deadAfter + 2*HeartbeatInterval)
 	for len(watch) > 0 && time.Now().Before(deadline) {
 		time.Sleep(HeartbeatInterval / 4)
 		for i, last := range watch {
@@ -595,7 +598,7 @@ func (r *Registry) awaitOtherNamespaceSlots() []int {
 			switch {
 			case err != nil || beat{slot.HeartbeatSeq, slot.HeartbeatTime} != last:
 				delete(watch, i)
-			case heartbeatOlderThan(slot, HeartbeatTimeout):
+			case heartbeatOlderThan(slot, deadAfter):
 				stale = append(stale, i)
 				delete(watch, i)
 			}
@@ -1588,7 +1591,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 	}
 
 	r.observe(slotIdx, slot)
-	if !r.stale(slotIdx, slot, HeartbeatTimeout) {
+	if !r.stale(slotIdx, slot, deadAfter) {
 		r.mu.Unlock()
 		return errors.New("node is not in a failed state")
 	}
@@ -1606,7 +1609,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 		r.mu.Unlock()
 	}()
 
-	info, err := r.acquireForRecovery(slotIdx, slot, HeartbeatTimeout)
+	info, err := r.acquireForRecovery(slotIdx, slot, deadAfter)
 	if err != nil {
 		return err
 	}

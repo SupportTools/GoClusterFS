@@ -149,8 +149,8 @@ func TestStalledBeatLeavesNewOwnerInItsSlot(t *testing.T) {
 	}
 }
 
-// A heartbeat whose write completes more than HeartbeatTimeout after the last
-// one may have landed after a peer replayed this node, so the node stops.
+// A heartbeat whose write completes more than stallLimit after the last one
+// may have landed after a peer replayed this node, so the node stops.
 func TestHeartbeatLandingLateStopsTheNode(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -219,5 +219,49 @@ func TestShortStalledBeatKeepsTheNodeUp(t *testing.T) {
 	data := storage.NewAlignedBuffer(storage.SectorSize)
 	if _, err := dev.WriteAt(data.Bytes(), 1<<20); err != nil {
 		t.Errorf("data write after a 12s stall: %v", err)
+	}
+}
+
+// A new mount on the same host takes a slot only once its heartbeat is
+// deadAfter old, so a node back from a stall just under stallLimit still owns
+// its slot, and both nodes keep running.
+func TestShortStallKeepsSlotFromSameHostMount(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	n := registerStalledNode(t, dev)
+	if n.reg.bootID == ([16]byte{}) {
+		t.Skip("no kernel boot ID")
+	}
+
+	newcomer := NewRegistry(dev, 0)
+	newSlot := -1
+	err := n.stallAfterBeatRead(t, stallLimit-time.Second, func() {
+		peer := NewRegistry(dev, 0)
+		slot, err := peer.readSlot(n.slot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The wall clock shows the stall, plus up to a second since heartbeat times are whole seconds.
+		slot.HeartbeatTime = time.Now().Add(-stallLimit).Unix()
+		if err := peer.writeSlot(n.slot, slot); err != nil {
+			t.Fatal(err)
+		}
+		if newSlot, err = newcomer.Register(context.Background(), "stalled"); err != nil || newSlot == n.slot {
+			t.Errorf("same-host mount registered in slot %d (%v) during a %v stall, want a slot other than %d", newSlot, err, stallLimit-time.Second, n.slot)
+		}
+	})
+	if err != nil {
+		t.Errorf("heartbeat after the stall = %v, want nil", err)
+	}
+	n.mu.Lock()
+	if len(n.losses) != 0 {
+		t.Errorf("slot-lost handler called after the stall: %v", n.losses)
+	}
+	n.mu.Unlock()
+	if err := newcomer.beat(newSlot); err != nil {
+		t.Errorf("same-host mount's heartbeat after the stall: %v", err)
+	}
+	if _, err := dev.WriteAt(storage.NewAlignedBuffer(storage.SectorSize).Bytes(), 1<<20); err != nil {
+		t.Errorf("data write after the stall: %v", err)
 	}
 }
