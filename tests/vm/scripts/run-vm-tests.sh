@@ -3454,8 +3454,8 @@ test_stalled_node_writes_stop_at_write_gate() {
         log_error "VM $stalled did not stop after resuming from its takeover"
         result=1
     fi
-    if ! sed -n "/$marker/,\$p" "$stalled_log" | grep -q "checking the slot before a write"; then
-        log_error "VM $stalled stopped without its write gate checking the slot"
+    if ! sed -n "/$marker/,\$p" "$stalled_log" | grep -qE "checking the slot before a write|may no longer be this node's"; then
+        log_error "VM $stalled stopped without its write gate or heartbeat checking the slot"
         result=1
     fi
 
@@ -3526,12 +3526,13 @@ hostile_replayed_since() {
     sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
 }
 
-# VM 1, back from a stall during which VM 2 replayed it, stopped on finding its
-# slot taken, and acknowledged no create but one whose writes were already queued when the stall began.
+# VM 1, back from a stall during which VM 2 replayed it, stopped, either on its
+# own stall or on finding its slot taken, and acknowledged no create but one
+# whose writes were already queued when the stall began.
 hostile_check_taken_slot_stops() {
     local acked
-    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)"; then
-        log_error "VM 1 did not stop on finding its slot taken"
+    if ! sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -qE "is no longer this node's: (the slot is empty|a peer declared this node dead)|may no longer be this node's: it went"; then
+        log_error "VM 1 did not stop on its stall or on finding its slot taken"
         sed -n "/$1/,\$p" "$(get_vm_mount_log 1)" | grep -E 'ERROR|no longer|stopping' | head -5
         return 1
     fi

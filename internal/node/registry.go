@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -138,8 +140,8 @@ type Registry struct {
 	seenMu sync.Mutex
 	seen   map[int]*Slot
 
-	// lastBeat is when this node last wrote its own slot; beatSeq is its last heartbeat number.
-	lastBeat atomic.Pointer[time.Time]
+	// lastBeat is the bootClock reading when this node issued its last good heartbeat, 0 before any; beatSeq is its last heartbeat number.
+	lastBeat atomic.Int64
 	beatSeq  uint64
 	// lost is set once this node's slot was taken over or its heartbeats failed.
 	lost  atomic.Bool
@@ -238,11 +240,16 @@ type SlotLoss struct {
 	// Local is this node's UUID, and Stalled how long its heartbeats had failed.
 	Local   [16]byte
 	Stalled time.Duration
+	// Paused is set when this node went so long without a heartbeat that a peer may have replayed it.
+	Paused bool
 }
 
 // String names the loss for a log line, with "owner" only when another node holds the slot.
 func (l SlotLoss) String() string {
 	switch {
+	case l.Paused:
+		return fmt.Sprintf("Node registry slot %d may no longer be this node's: it went %v without a heartbeat, so a peer may have replayed it",
+			l.Slot, l.Stalled.Round(time.Millisecond))
 	case !l.Taken:
 		return fmt.Sprintf("Heartbeats to registry slot %d failed for %v", l.Slot, l.Stalled.Round(time.Millisecond))
 	case l.Owner == l.Local:
@@ -340,7 +347,7 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	empty := func(slot *Slot) bool { return slot.State == NodeStateEmpty }
 	ownFailed := func(slot *Slot) bool {
 		return r.sameHost(slot) && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) &&
-			(r.deadLocalOwner(slot) || heartbeatOlderThan(slot, HeartbeatTimeout))
+			(r.deadLocalOwner(slot) || heartbeatOlderThan(slot, deadAfter))
 	}
 	// The slot -skip-recovery names comes first: the operator chose it.
 	if r.preferred >= 0 {
@@ -436,9 +443,9 @@ func (r *Registry) PreferSlot(slot int) {
 }
 
 // silentSlotWatch is how long Register watches another host's slot before it
-// takes it, if its heartbeat never changed: past HeartbeatTimeout, so a node
-// that only stalled checks its slot before its next write. Tests shorten it.
-var silentSlotWatch = HeartbeatTimeout + 2*HeartbeatInterval
+// takes it, if its heartbeat never changed: as long as peers watch before they
+// replay, so a node that stalled for less than stallLimit keeps its slot. Tests shorten it.
+var silentSlotWatch = deadAfter
 
 // earlierBootSlots returns the slots registered under this node's hostname in
 // another kernel boot whose heartbeat looks old by this node's clock.
@@ -480,6 +487,7 @@ var afterSilentWatch func()
 // so a slot a peer marked dead, or whose node beat again, since is left alone.
 func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
 	for _, w := range slots {
+		issued := bootClock()
 		if err := r.claimSlot(w.slot, w.raw); err != nil {
 			if errors.Is(err, ErrSlotTaken) {
 				continue
@@ -490,7 +498,7 @@ func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
 		if err != nil {
 			return -1, err
 		}
-		r.took(w.slot, slot)
+		r.took(w.slot, slot, issued)
 		return w.slot, nil
 	}
 	return -1, nil
@@ -541,24 +549,25 @@ func (r *Registry) claimFirst(slots []int, claimable func(*Slot) bool) (int, err
 		if err != nil || !claimable(slot) {
 			continue
 		}
+		issued := bootClock()
 		if err := r.claimSlot(i, raw); err != nil {
 			if errors.Is(err, ErrSlotTaken) {
 				continue
 			}
 			return -1, err
 		}
-		r.took(i, slot)
+		r.took(i, slot, issued)
 		return i, nil
 	}
 	return -1, nil
 }
 
-// took records that this node registered in slot i, which held slot. Called with r.mu held.
-func (r *Registry) took(i int, slot *Slot) {
+// took records that this node registered in slot i, which held slot, with a
+// claim write issued at bootClock time issued. Called with r.mu held.
+func (r *Registry) took(i int, slot *Slot, issued time.Duration) {
 	r.localSlot = i
 	r.beatSeq = 1
-	now := time.Now()
-	r.lastBeat.Store(&now)
+	r.lastBeat.Store(int64(issued))
 	if slot.State != NodeStateEmpty {
 		r.previousOwner = &slot.UUID
 	}
@@ -575,13 +584,13 @@ func (r *Registry) awaitOtherNamespaceSlots() []int {
 	watch := map[int]beat{}
 	for i := 0; i < MaxNodes; i++ {
 		_, slot, err := r.readSlotRaw(i)
-		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !heartbeatOlderThan(slot, HeartbeatTimeout) {
+		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !heartbeatOlderThan(slot, deadAfter) {
 			watch[i] = beat{slot.HeartbeatSeq, slot.HeartbeatTime}
 		}
 	}
 
 	var stale []int
-	deadline := time.Now().Add(HeartbeatTimeout + 2*HeartbeatInterval)
+	deadline := time.Now().Add(deadAfter + 2*HeartbeatInterval)
 	for len(watch) > 0 && time.Now().Before(deadline) {
 		time.Sleep(HeartbeatInterval / 4)
 		for i, last := range watch {
@@ -589,7 +598,7 @@ func (r *Registry) awaitOtherNamespaceSlots() []int {
 			switch {
 			case err != nil || beat{slot.HeartbeatSeq, slot.HeartbeatTime} != last:
 				delete(watch, i)
-			case heartbeatOlderThan(slot, HeartbeatTimeout):
+			case heartbeatOlderThan(slot, deadAfter):
 				stale = append(stale, i)
 				delete(watch, i)
 			}
@@ -699,50 +708,74 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 	}
 }
 
+// afterBeatRead lets tests pause a heartbeat between its slot read and its write, as a stall would.
+var afterBeatRead func()
+
 // beat writes a heartbeat while slotIdx is still this node's. Peers prove a
 // silent node dead and take its locks, so a node whose slot was taken over, or
 // whose heartbeats have failed for HeartbeatTimeout/2, must stop: beat tells the
-// slot-lost handler once and returns ErrSlotLost.
+// slot-lost handler once and returns ErrSlotLost. So must a node that went
+// stallLimit without a beat, before its write or by the time the write
+// completed: a peer may have replayed it and emptied or reused the slot since
+// the read, and writing the stale copy back would make two owners.
 func (r *Registry) beat(slotIdx int) error {
 	r.mu.Lock()
 	slot, err := r.readSlot(slotIdx)
+	if afterBeatRead != nil {
+		afterBeatRead()
+	}
 	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
 	takenOver := err == nil && !ours
-	if ours {
+	paused := r.sinceLastBeat()
+	if ours && paused <= stallLimit {
 		r.beatSeq++
 		slot.HeartbeatSeq = r.beatSeq
 		slot.HeartbeatTime = time.Now().Unix()
+		issued := bootClock()
 		if r.writeSlot(slotIdx, slot) == nil {
-			now := time.Now()
-			r.lastBeat.Store(&now)
+			if paused = r.sinceLastBeat(); paused <= stallLimit {
+				r.lastBeat.Store(int64(issued))
+			}
 		}
 	}
 	onSlotLost := r.onSlotLost
 	r.mu.Unlock()
 
 	sinceBeat := r.sinceLastBeat()
-	if !takenOver && sinceBeat <= HeartbeatTimeout/2 {
+	var loss SlotLoss
+	switch {
+	case takenOver:
+		loss = SlotLoss{Slot: slotIdx, Taken: true, Owner: slot.UUID, Local: r.localUUID, Stalled: sinceBeat}
+	case paused > stallLimit:
+		loss = SlotLoss{Slot: slotIdx, Paused: true, Local: r.localUUID, Stalled: paused}
+	case sinceBeat > HeartbeatTimeout/2:
+		loss = SlotLoss{Slot: slotIdx, Local: r.localUUID, Stalled: sinceBeat}
+	default:
 		return nil
 	}
-	if r.lost.CompareAndSwap(false, true) {
-		loss := SlotLoss{Slot: slotIdx, Taken: takenOver, Local: r.localUUID, Stalled: sinceBeat}
-		if takenOver {
-			loss.Owner = slot.UUID
-		}
-		if onSlotLost != nil {
-			onSlotLost(loss)
-		} else {
-			log.Printf("ERROR: %s; this node no longer owns its journal region", loss)
-		}
-	}
+	r.loseSlot(loss, onSlotLost)
 	return ErrSlotLost
+}
+
+// loseSlot tells the slot-lost handler, once, that this node lost its slot.
+func (r *Registry) loseSlot(loss SlotLoss, onSlotLost func(SlotLoss)) {
+	if !r.lost.CompareAndSwap(false, true) {
+		return
+	}
+	if onSlotLost != nil {
+		onSlotLost(loss)
+	} else {
+		log.Printf("ERROR: %s; this node no longer owns its journal region", loss)
+	}
 }
 
 // CheckOwnership returns nil while this node still owns its registry slot and
 // ErrSlotLost once it may not, so a node that stalled past its failover stops
 // writing. A heartbeat written within HeartbeatTimeout/2 proves ownership
 // without I/O, because peers declare a node dead only after 2*HeartbeatTimeout
-// of silence. Otherwise it writes a heartbeat first, as the heartbeat loop would.
+// of silence. Up to stallLimit it writes a heartbeat first, as the
+// heartbeat loop would. After longer, no read of the slot proves anything: a
+// stalled heartbeat may already have written it back as this node's.
 func (r *Registry) CheckOwnership() error {
 	if r.lost.Load() {
 		return ErrSlotLost
@@ -757,9 +790,16 @@ func (r *Registry) CheckOwnership() error {
 	}
 	r.mu.RLock()
 	slotIdx := r.localSlot
+	onSlotLost := r.onSlotLost
 	r.mu.RUnlock()
 	if slotIdx < 0 {
 		return ErrNotRegistered
+	}
+	if paused := r.sinceLastBeat(); paused > stallLimit {
+		log.Printf("[WARN] node: the last heartbeat to registry slot %d was %v ago; refusing writes without trusting the slot",
+			slotIdx, paused.Round(time.Millisecond))
+		r.loseSlot(SlotLoss{Slot: slotIdx, Paused: true, Local: r.localUUID, Stalled: paused}, onSlotLost)
+		return ErrSlotLost
 	}
 	log.Printf("[WARN] node: the last heartbeat to registry slot %d was %v ago; checking the slot before a write",
 		slotIdx, r.sinceLastBeat().Round(time.Millisecond))
@@ -788,10 +828,19 @@ func (r *Registry) inRegistry(offset int64) bool {
 
 func (r *Registry) sinceLastBeat() time.Duration {
 	t := r.lastBeat.Load()
-	if t == nil {
+	if t == 0 {
 		return math.MaxInt64
 	}
-	return max(time.Since(*t), time.Now().Round(0).Sub(t.Round(0)))
+	return bootClock() - time.Duration(t)
+}
+
+// bootClock reads CLOCK_BOOTTIME, which unlike Go's monotonic clock keeps counting while the host is suspended, and ignores wall clock steps.
+func bootClock() time.Duration {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts); err != nil {
+		panic(fmt.Sprintf("node: read CLOCK_BOOTTIME: %v", err))
+	}
+	return time.Duration(ts.Nano())
 }
 
 // claimSlot replaces the slot bytes Register judged claimable with this node's
@@ -1494,7 +1543,7 @@ type Stats struct {
 // Stats returns this node's liveness and replay counts.
 func (r *Registry) Stats() Stats {
 	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays()}
-	if r.lastBeat.Load() != nil {
+	if r.lastBeat.Load() != 0 {
 		st.HeartbeatAge = r.sinceLastBeat()
 	}
 	return st
@@ -1542,7 +1591,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 	}
 
 	r.observe(slotIdx, slot)
-	if !r.stale(slotIdx, slot, HeartbeatTimeout) {
+	if !r.stale(slotIdx, slot, deadAfter) {
 		r.mu.Unlock()
 		return errors.New("node is not in a failed state")
 	}
@@ -1560,7 +1609,7 @@ func (r *Registry) RecoverFailedNode(slotIdx int) error {
 		r.mu.Unlock()
 	}()
 
-	info, err := r.acquireForRecovery(slotIdx, slot, HeartbeatTimeout)
+	info, err := r.acquireForRecovery(slotIdx, slot, deadAfter)
 	if err != nil {
 		return err
 	}
