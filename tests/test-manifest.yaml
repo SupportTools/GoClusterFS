@@ -6008,13 +6008,6 @@ scenarios:
     environments:
       go: tests/soak/model_test.go::TestModelFollowsTheFilesystemRules
 
-  - id: soak-known-abandoned-snapshot
-    name: Soak counts a snapshot a peer's mount abandoned only in its exact form
-    description: With -known-abandoned-snapshot, a snapshot EIO counts as known only when the node logged the invalid-state failure for that name while the call ran and a peer's mount abandoned the same snapshot ID before its cleanup line
-    priority: go_only
-    environments:
-      go: tests/soak/known_test.go::TestAbandonedByPeer
-
   - id: symlink-stale-node-after-reuse
     name: A stale symlink node does not reach the next symlink in its slot
     description: After a symlink is unlinked and another symlink takes its inode, readlink and lchown through the old node return ESTALE and leave the new link alone

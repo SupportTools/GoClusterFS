@@ -43,7 +43,6 @@ func main() {
 		fs.DurationVar(&cfg.fsckEvery, "fsck-every", time.Hour, "interval between quiesced fsck runs; 0 for none")
 		fs.DurationVar(&cfg.barrierEvery, "barrier-every", 5*time.Minute, "interval between full directory checks; 0 for none")
 		fs.DurationVar(&cfg.window, "window", 30*time.Second, "how long a node may take to show an acknowledged change, including waiting out a failed node")
-		fs.BoolVar(&cfg.knownAbandon, "known-abandoned-snapshot", false, "bug hunts only, never a release candidate: count, instead of failing on, a snapshot that got EIO because a peer's mount abandoned it while it was being created; remove once a snapshot records the node creating it")
 		fs.BoolVar(&cfg.inflight, "inflight", false, "let faults cut operations short; the model takes what the node shows after recovery")
 		fs.DurationVar(&cfg.coherence, "coherence", 6*time.Second, "the documented coherence window; slower checks are logged")
 		fs.DurationVar(&cfg.stopFor, "stop-for", 25*time.Second, "how long a stop fault keeps the mount stopped; past the 10s heartbeat timeout")
