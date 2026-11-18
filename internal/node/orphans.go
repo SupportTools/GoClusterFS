@@ -9,7 +9,7 @@ func (r *Registry) SetOrphanHandler(fn func(slot int, orphans []Orphan)) {
 	r.onOrphans = fn
 }
 
-// KickOrphans makes the failure detection loop pass every orphan list to the handler soon; it never blocks.
+// KickOrphans makes the orphan loop pass every orphan list to the handler soon; it never blocks.
 func (r *Registry) KickOrphans() {
 	select {
 	case r.orphanKick <- struct{}{}:
@@ -17,10 +17,35 @@ func (r *Registry) KickOrphans() {
 	}
 }
 
+// orphanLoop runs apart from failure detection: the handler may wait for a
+// failed node's inode lock, which only that node's replay frees.
+func (r *Registry) orphanLoop() {
+	defer r.heartbeatWg.Done()
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-r.orphanKick:
+			if slots, err := r.readAllSlots(); err == nil {
+				r.passOrphans(slots)
+			}
+		}
+	}
+}
+
+// passOrphans hands the handler this node's orphan list and each live peer's.
+// A failed peer's list waits for its replay, which adopts it.
 func (r *Registry) passOrphans(slots []*Slot) {
-	r.mu.RLock()
+	r.mu.Lock()
 	fn, local := r.onOrphans, r.localSlot
-	r.mu.RUnlock()
+	live := make([]bool, len(slots))
+	for i, s := range slots {
+		if i != local && s != nil && s.State != NodeStateDead {
+			r.observe(i, s)
+			live[i] = !r.stale(i, s, HeartbeatTimeout)
+		}
+	}
+	r.mu.Unlock()
 	if fn == nil {
 		return
 	}
@@ -28,7 +53,7 @@ func (r *Registry) passOrphans(slots []*Slot) {
 		fn(local, slots[local].Orphans)
 	}
 	for i, s := range slots {
-		if i != local && s != nil && len(s.Orphans) > 0 && s.State != NodeStateDead {
+		if live[i] && len(s.Orphans) > 0 {
 			fn(i, s.Orphans)
 		}
 	}

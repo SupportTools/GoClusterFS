@@ -2025,6 +2025,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/replay_retry_test.go::TestUnlinkPastItsCommitOutlastsADeadPeersReplay
 
+  - id: orphan-pass-apart-from-detection
+    name: A blocked orphan pass does not hold up failure detection
+    description: While the orphan handler waits, as it does for a failed node's inode lock, failure detection still replays a dead node; a peer whose heartbeat stopped has its orphan list skipped, since its replay adopts it
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestBlockedOrphanPassLetsDetectionReplay
+
+  - id: occupant-judges-latest-read
+    name: Lock owner checks judge the slot read other checks saw
+    description: When another check reads a slot's later heartbeat, Occupant judges that read, so a slot that stays silent turns failing instead of looking alive on every check
+    priority: go_only
+    environments:
+      go: internal/node/orphan_pass_test.go::TestOccupantSeesASilentSlotThatOthersRead
+
   - id: rename-sectors-before-commit
     name: A rename waits for its inode table sectors before its commit
     description: With a dead peer holding the new parent's inode table sector, a rename lets go of its locks and waits before it commits, then finishes once the peer is replayed, with one commit, one name and no fail-stop
