@@ -2298,6 +2298,13 @@ scenarios:
     environments:
       go: internal/fsck/slots_test.go::TestReleaseSlotOnline
 
+  - id: replay-refuses-unknown-op
+    name: Replay refuses a journal it cannot fully read
+    description: A committed transaction holding an op type this build does not define fails both a peer's replay and a node's own replay with ErrUnknownOp before any of its entries apply; the transactions before it stay applied, the ones after it do not, and the journal stays in recovery for an admin. DryRunRecover stops at it with the same error, and replay and DryRunRecover refuse a journal whose header names a newer format version
+    priority: go_only
+    environments:
+      go: internal/journal/recovery_test.go::TestReplayRefusesUnknownOp
+
   - id: journal-pending-committed
     name: Count the committed transactions a journal reset would drop
     description: PendingCommitted is 0 for a journal never initialized, a clean one, or one whose only transaction is uncommitted, counts committed transactions, and errors on a damaged header, an unusable state or a record it cannot read
