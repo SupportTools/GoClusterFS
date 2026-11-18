@@ -5277,6 +5277,13 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestClearRemovesEveryKeyAndTheReservation
 
+  - id: fence-keys-unlistable
+    name: A kernel without the key-listing ioctl reports it unsupported
+    description: EINVAL and ENOTTY from IOC_PR_READ_KEYS are ErrUnsupported, and other errors are not
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestKeyListingWithoutTheIoctlIsUnsupported
+
   - id: fence-partition-refused
     name: A partition gets no reservations
     description: Every reservation command on a partition fails with ErrPartition, which is ErrUnsupported, before it reaches the device; sysfs tells a partition from a whole disk

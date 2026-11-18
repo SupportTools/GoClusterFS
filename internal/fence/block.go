@@ -1,6 +1,7 @@
 package fence
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -76,7 +77,7 @@ type clearing struct {
 
 type keyList struct {
 	generation, count uint32
-	keys              uintptr
+	keys              uint64
 }
 
 // maxListedKeys bounds a key listing: a volume has at most 64 nodes, plus fsck's and format's keys.
@@ -131,8 +132,8 @@ func (d blockDevice) clear(key uint64) error {
 
 func (d blockDevice) readKeys() ([]uint64, error) {
 	keys := make([]uint64, maxListedKeys)
-	list := keyList{count: maxListedKeys, keys: uintptr(unsafe.Pointer(&keys[0]))}
-	err := d.ioctl(iocReadKeys, unsafe.Pointer(&list))
+	list := keyList{count: maxListedKeys, keys: uint64(uintptr(unsafe.Pointer(&keys[0])))}
+	err := unlistable(d.ioctl(iocReadKeys, unsafe.Pointer(&list)))
 	runtime.KeepAlive(keys)
 	if err != nil {
 		return nil, err
@@ -141,4 +142,13 @@ func (d blockDevice) readKeys() ([]uint64, error) {
 		return keys, fmt.Errorf("the device lists %d keys, more than the %d a volume can hold", list.count, maxListedKeys)
 	}
 	return keys[:list.count], nil
+}
+
+// unlistable reports EINVAL from a key listing as ErrUnsupported: on kernels without IOC_PR_READ_KEYS, sd passes the
+// unknown command to scsi_ioctl, which answers EINVAL instead of ENOTTY.
+func unlistable(err error) error {
+	if errors.Is(err, syscall.EINVAL) {
+		return fmt.Errorf("%w (%v)", ErrUnsupported, err)
+	}
+	return err
 }
