@@ -123,7 +123,13 @@ func (f *FS) lookupName(ctx context.Context, parent *inode.Inode, name, p string
 	if errors.Is(err, dir.ErrNotFound) {
 		return 0, fmt.Errorf("%s: %w", p, syscall.ENOENT)
 	}
-	return uint32(num), err
+	if err != nil {
+		return 0, err
+	}
+	if errno := f.childInRange(parent.InodeNum, name, num); errno != 0 {
+		return 0, fmt.Errorf("%s: %w", p, errno)
+	}
+	return uint32(num), nil
 }
 
 // notifyKernel expires this node's cached attributes of p and a cached miss for newPath; it runs off the request and holds no lock.
