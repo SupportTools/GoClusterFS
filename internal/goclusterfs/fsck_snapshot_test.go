@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/fsck"
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -126,4 +127,43 @@ func TestFsckChecksSnapshotParents(t *testing.T) {
 	if list := problemList(r); strings.Contains(list, fmt.Sprintf("snapshot %d:", id["a2"])) {
 		t.Errorf("fsck reported a2, whose parent a1 was taken of the same file:%s", list)
 	}
+}
+
+// An orphan snapshot still names the inode slot of the file it was taken of. A crash while a snapshot is created can
+// leave a data inode that no snapshot refers to in that slot. Repair must free it and keep the orphan snapshot.
+func TestFsckRepairFreesOrphanDataInAnOrphanSnapshotsSlot(t *testing.T) {
+	t.Parallel()
+	path := newFormattedImage(t)
+	fsys := openFormattedFS(t, path)
+	ctx := context.Background()
+	if err := fsys.InitRoot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	old := createFile(t, fsys, "old")
+	writeAt(t, old, pattern(1, BlockSize), 0)
+	setxattr(t, old, "user.snapshot", "s")
+	if errno := fsys.Unlink(ctx, "old"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	data, err := fsys.claimInode(ctx, func(ino *inode.Inode) {
+		ino.Mode = inode.S_IFREG | 0o644
+		ino.Flags |= inode.FlagSnapshotData
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.InodeNum != old.inodeNum {
+		t.Fatalf("the data inode got inode %d, want the freed inode %d", data.InodeNum, old.inodeNum)
+	}
+
+	r := runFsck(t, fsys, repairOpts())
+	expectProblem(t, r, "snapshot data inode belongs to no snapshot, as a crash while a snapshot is created or deleted leaves it [FIXED]")
+	reopened := openFormattedFS(t, path)
+	if inodeInUse(t, reopened, data.InodeNum) {
+		t.Errorf("repair kept the orphan data inode %d:%s", data.InodeNum, problemList(r))
+	}
+	if _, err := reopened.snapshotReg.GetByName(ctx, "s"); err != nil {
+		t.Errorf("repair dropped the orphan snapshot: %v", err)
+	}
+	expectOrphanReport(t, reopened, `snapshot "s" is an orphan: inode`)
 }

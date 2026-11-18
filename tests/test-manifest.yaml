@@ -4659,6 +4659,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
 
+  - id: fsck-frees-orphan-data-in-orphan-snapshot-slot
+    name: fsck -repair frees an orphan snapshot data inode in an orphan snapshot's old slot
+    description: An orphan snapshot still names the slot of the file it was taken of; a snapshot data inode that no snapshot refers to in that slot must be freed, and the orphan snapshot kept
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairFreesOrphanDataInAnOrphanSnapshotsSlot
+
   - id: fsck-checks-every-dir-entry
     name: fsck checks every directory entry's type and inode range
     description: fsck reports an entry whose type does not match its inode whatever the inode number, and an entry whose inode number is past the inode table, including one that would wrap to a used inode

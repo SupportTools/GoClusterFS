@@ -99,8 +99,7 @@ func (c *Checker) checkSnapshots() error {
 	// Track snapshot IDs and names for duplicate detection
 	seenIDs := make(map[uint64]bool)
 	seenNames := make(map[string]uint64) // name -> snapshot ID
-	dataInodes := make(map[uint32]bool)
-	targets := make(map[uint64]uint32) // snapshot ID -> the inode it was taken of
+	targets := make(map[uint64]uint32)   // snapshot ID -> the inode it was taken of
 	var children []*SnapshotDescriptor
 	var fixes []snapshotSectorFix
 
@@ -188,7 +187,7 @@ func (c *Checker) checkSnapshots() error {
 
 			// Record snapshot inode reference
 			if desc.TargetInode > 0 {
-				c.snapshotInodes[desc.TargetInode] = true
+				c.snapshotTargets[desc.TargetInode] = true
 			}
 
 			if desc.Flags&SnapshotFlagHasData != 0 && desc.DataInode != 0 {
@@ -197,8 +196,7 @@ func (c *Checker) checkSnapshots() error {
 						fmt.Sprintf("data inode %d is not a snapshot data inode", desc.DataInode),
 						false)
 				}
-				dataInodes[desc.DataInode] = true
-				c.snapshotInodes[desc.DataInode] = true
+				c.snapshotRefs[desc.DataInode] = true
 			}
 
 			if desc.ParentID != 0 {
@@ -232,7 +230,7 @@ func (c *Checker) checkSnapshots() error {
 	c.checkSnapshotParents(children, targets)
 
 	for num := range c.snapshotData {
-		if !dataInodes[num] {
+		if !c.snapshotRefs[num] {
 			c.addProblem(PhaseSnapshots, Warning, fmt.Sprintf("inode %d", num),
 				"snapshot data inode belongs to no snapshot, as a crash while a snapshot is created or deleted leaves it",
 				true)
