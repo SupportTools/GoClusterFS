@@ -6,14 +6,6 @@ import (
 	"time"
 )
 
-func backdateSighting(reg *Registry, slot int, by time.Duration) {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-	s := reg.sightings[slot]
-	s.since = s.since.Add(-by)
-	reg.sightings[slot] = s
-}
-
 // The orphan handler can wait for a failed node's inode lock until that node's
 // replay frees it, so a blocked orphan pass must not keep failure detection
 // from replaying.
@@ -82,7 +74,7 @@ func TestOrphanPassSkipsAFailedPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg.passOrphans(slots)
-	backdateSighting(reg, 2, 2*HeartbeatTimeout)
+	silence(reg, 2, slots[2], 2*HeartbeatTimeout)
 	passed = nil
 	reg.passOrphans(slots)
 	if len(passed) != 2 || passed[0] != 0 || passed[1] != 1 {
@@ -104,11 +96,11 @@ func TestOccupantSeesASilentSlotThatOthersRead(t *testing.T) {
 	if _, occ := reg.Occupant(1, true); occ != OccupiedLive {
 		t.Fatalf("occupancy %d, want live", occ)
 	}
-	writeOtherNamespaceSlot(t, reg, 1, time.Now())
+	latest := writeOtherNamespaceSlot(t, reg, 1, time.Now())
 	if _, err := reg.GetActiveNodes(); err != nil {
 		t.Fatal(err)
 	}
-	backdateSighting(reg, 1, 2*HeartbeatTimeout)
+	silence(reg, 1, latest, 2*HeartbeatTimeout)
 
 	if _, occ := reg.Occupant(1, false); occ != OccupiedFailing {
 		t.Errorf("occupancy %d, want failing: the slot's heartbeat has not changed for %v", occ, 2*HeartbeatTimeout)
