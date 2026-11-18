@@ -43,7 +43,7 @@ func (d *fakeDevice) register(old, new uint64, ignore bool) error {
 	defer t.mu.Unlock()
 	cur, registered := t.keys[d.initiator]
 	if !ignore && (registered && cur != old || !registered && old != 0) {
-		return errConflict
+		return ErrReservationConflict
 	}
 	if new != 0 {
 		t.keys[d.initiator] = new
@@ -61,7 +61,7 @@ func (d *fakeDevice) reserve(key uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.keys[d.initiator] != key || key == 0 {
-		return errConflict
+		return ErrReservationConflict
 	}
 	t.reserved = true
 	return nil
@@ -72,7 +72,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if cur, registered := t.keys[d.initiator]; !registered || cur != own {
-		return errConflict
+		return ErrReservationConflict
 	}
 	found := false
 	for initiator, key := range t.keys {
@@ -82,7 +82,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 		}
 	}
 	if !found {
-		return errConflict
+		return ErrReservationConflict
 	}
 	t.preempted = append(t.preempted, victim)
 	return nil

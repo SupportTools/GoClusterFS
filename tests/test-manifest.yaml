@@ -5128,6 +5128,20 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestPreemptRevokesTheVictim
 
+  - id: fence-ioctl-statuses
+    name: Both transports' reservation conflicts read as one error
+    description: An ioctl return of 0x18 (SCSI) or 0x83 (NVMe) is ErrReservationConflict, ENOTTY and EOPNOTSUPP are ErrUnsupported, and any other device status is an error
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestIoctlResultMapsBothTransports
+
+  - id: fence-preempt-statuses
+    name: Preempt reads SCSI and NVMe conflicts alike
+    description: A conflict from either transport is a victim already gone while this node's own key holds, ErrFenced once it is gone, and any other status stops the takeover
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestPreemptStatusesFromBothTransports
+
   - id: fence-preempt-guards
     name: Preempt refuses key 0 and its own key
     description: Key 0 would remove every other registrant, so neither reaches the device

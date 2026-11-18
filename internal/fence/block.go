@@ -45,13 +45,19 @@ type preemption struct {
 
 func (d blockDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
 	r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(d), req, uintptr(arg))
+	return ioctlResult(r, errno)
+}
+
+// ioctlResult maps a reservation ioctl's outcome: a positive return is the device's status, and any status but a
+// conflict is an error that stops the caller.
+func ioctlResult(r uintptr, errno syscall.Errno) error {
 	switch {
 	case errno == syscall.ENOTTY || errno == syscall.EOPNOTSUPP:
 		return fmt.Errorf("%w (%v)", ErrUnsupported, errno)
 	case errno != 0:
 		return errno
 	case r == statusConflict || r == nvmeStatusConflict:
-		return errConflict
+		return ErrReservationConflict
 	case r != 0:
 		return fmt.Errorf("persistent reservation command failed with status %#x", r)
 	}

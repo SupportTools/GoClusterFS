@@ -14,7 +14,8 @@ var (
 	// ErrFenced means another node removed this node's key: the storage refuses its writes.
 	ErrFenced             = errors.New("this node's reservation key is gone: another node revoked its access to the device")
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
-	errConflict           = errors.New("reservation conflict")
+	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
+	ErrReservationConflict = errors.New("reservation conflict")
 )
 
 // Fencer registers this node's key on the device and revokes the keys of nodes proven dead.
@@ -83,7 +84,7 @@ func (p *PR) Key() uint64 { return p.key }
 func (p *PR) Register() error { return p.dev.register(0, p.key, true) }
 
 func (p *PR) Reserve() error {
-	if err := p.dev.reserve(p.key); errors.Is(err, errConflict) {
+	if err := p.dev.reserve(p.key); errors.Is(err, ErrReservationConflict) {
 		return ErrForeignReservation
 	} else if err != nil {
 		return err
@@ -96,11 +97,11 @@ func (p *PR) Preempt(victim uint64) error {
 		return fmt.Errorf("refusing to preempt key %#x: key 0 would remove every other node, and %#x is this node's", victim, p.key)
 	}
 	err := p.dev.preemptAbort(p.key, victim)
-	if !errors.Is(err, errConflict) {
+	if !errors.Is(err, ErrReservationConflict) {
 		return err
 	}
 	// A conflict means the victim is gone already or this node's key is: only a registered key can register itself again.
-	if err := p.dev.register(p.key, p.key, false); errors.Is(err, errConflict) {
+	if err := p.dev.register(p.key, p.key, false); errors.Is(err, ErrReservationConflict) {
 		return ErrFenced
 	} else if err != nil {
 		return err
@@ -109,7 +110,7 @@ func (p *PR) Preempt(victim uint64) error {
 }
 
 func (p *PR) Unregister() error {
-	if err := p.dev.register(p.key, 0, false); errors.Is(err, errConflict) {
+	if err := p.dev.register(p.key, 0, false); errors.Is(err, ErrReservationConflict) {
 		return ErrFenced
 	} else if err != nil {
 		return err

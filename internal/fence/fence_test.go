@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -93,5 +94,55 @@ func TestBlockOnRegularFileIsUnsupported(t *testing.T) {
 	defer func() { _ = f.Close() }()
 	if err := Block(f.Fd(), ToolKey()).Register(); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("register on a regular file: %v, want ErrUnsupported", err)
+	}
+}
+
+func TestIoctlResultMapsBothTransports(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		r     uintptr
+		errno syscall.Errno
+		want  error
+	}{
+		{"SCSI conflict", 0x18, 0, ErrReservationConflict},
+		{"NVMe conflict", 0x83, 0, ErrReservationConflict},
+		{"no persistent reservations", 0, syscall.ENOTTY, ErrUnsupported},
+		{"no pr_ops", 0, syscall.EOPNOTSUPP, ErrUnsupported},
+		{"not root", 0, syscall.EPERM, syscall.EPERM},
+		{"success", 0, 0, nil},
+	} {
+		if err := ioctlResult(tc.r, tc.errno); !errors.Is(err, tc.want) || (tc.want == nil) != (err == nil) {
+			t.Errorf("%s: %v, want %v", tc.name, err, tc.want)
+		}
+	}
+	if err := ioctlResult(0x02, 0); err == nil || errors.Is(err, ErrReservationConflict) {
+		t.Errorf("another device status: %v, want an error that is not a conflict", err)
+	}
+}
+
+// statusDevice answers each command with a raw device status, as the sd and nvme drivers return them.
+type statusDevice struct{ preemptStatus, registerStatus uintptr }
+
+func (d statusDevice) register(old, new uint64, ignore bool) error {
+	return ioctlResult(d.registerStatus, 0)
+}
+func (d statusDevice) reserve(uint64) error                  { return nil }
+func (d statusDevice) preemptAbort(own, victim uint64) error { return ioctlResult(d.preemptStatus, 0) }
+
+// Preempt reads a conflict alike from SCSI and NVMe, and stops on any other status.
+func TestPreemptStatusesFromBothTransports(t *testing.T) {
+	for _, conflict := range []uintptr{0x18, 0x83} {
+		gone := &PR{dev: statusDevice{preemptStatus: conflict}, key: 1}
+		if err := gone.Preempt(2); err != nil {
+			t.Errorf("status %#x with this node still registered: %v, want nil (the victim is gone already)", conflict, err)
+		}
+		fenced := &PR{dev: statusDevice{preemptStatus: conflict, registerStatus: conflict}, key: 1}
+		if err := fenced.Preempt(2); !errors.Is(err, ErrFenced) {
+			t.Errorf("status %#x with this node's key gone: %v, want ErrFenced", conflict, err)
+		}
+	}
+	other := &PR{dev: statusDevice{preemptStatus: 0x02}, key: 1}
+	if err := other.Preempt(2); err == nil || errors.Is(err, ErrFenced) {
+		t.Errorf("status 0x02: %v, want an error that stops the takeover", err)
 	}
 }
