@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
@@ -400,6 +403,110 @@ func TestPendingCommitted(t *testing.T) {
 		if pending != want.pending || !errors.Is(err, want.err) || (want.err == nil) != (err == nil) {
 			t.Errorf("%s: PendingCommitted = %d, %v; want %d, %v", want.name, pending, err, want.pending, want.err)
 		}
+	}
+}
+
+// A transaction with an op type this build does not define, as a newer build logs, stops replay before any of its
+// entries apply; skipping it would leave that operation half applied.
+func TestReplayRefusesUnknownOp(t *testing.T) {
+	const size = uint64(DefaultJournalSlotSize)
+	const bitmapAt = 2 * size
+	ctx := context.Background()
+	alloc := func(b uint64) func(*Transaction) error {
+		return func(txn *Transaction) error {
+			return txn.LogBlockAlloc(&BlockAllocPayload{InodeNum: 9, StartBlock: b, Count: 1})
+		}
+	}
+	unknown := func(txn *Transaction) error { return txn.addEntry(TxnOpType(0x7777), []byte{1, 2, 3}) }
+	newJournal := func(t *testing.T) (*storage.Device, *bitmap.Region) {
+		t.Helper()
+		dev, cleanup := createTestDevice(t, int64(bitmapAt+1<<20))
+		t.Cleanup(cleanup)
+		j, err := Init(dev, 0, size, [16]byte{1}, 1, DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, logs := range [][]func(*Transaction) error{{alloc(10)}, {alloc(20), unknown}, {alloc(30)}} {
+			txn := j.Begin()
+			for _, log := range logs {
+				if err := log(txn); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := j.Commit(txn); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dev, bitmap.NewRegion(dev, bitmapAt, 64, nil, [16]byte{})
+	}
+	allocated := func(t *testing.T, bm *bitmap.Region) string {
+		t.Helper()
+		var got []string
+		for _, b := range []uint64{10, 20, 30} {
+			on, err := bm.IsAllocated(b)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if on {
+				got = append(got, fmt.Sprint(b))
+			}
+		}
+		return strings.Join(got, ",")
+	}
+
+	for name, replay := range map[string]func(*storage.Device, *bitmap.Region) error{
+		"peer": func(dev *storage.Device, bm *bitmap.Region) error {
+			info := &node.FailedNodeInfo{JournalOffset: 0, JournalSize: size}
+			_, err := ReplayJournal(ctx, &RecoveryContext{Dev: dev, BitmapMgr: bm}, info)
+			return err
+		},
+		"own": func(dev *storage.Device, bm *bitmap.Region) error {
+			_, err := ScanAndRecover(dev, 0, size, CreateTxnRecoveryHandler(&RecoveryContext{Dev: dev, BitmapMgr: bm}), nil)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dev, bm := newJournal(t)
+			for attempt := range 2 {
+				if err := replay(dev, bm); !errors.Is(err, ErrUnknownOp) || !strings.Contains(err.Error(), "unknown op 0x7777") {
+					t.Fatalf("replay %d: %v, want ErrUnknownOp naming 0x7777", attempt, err)
+				}
+			}
+			if got := allocated(t, bm); got != "10" {
+				t.Errorf("blocks allocated after the refused replay: %q, want only the first transaction's 10", got)
+			}
+			region, err := OpenRegionForRecovery(dev, 0, size)
+			if err != nil || !region.NeedsRecovery() {
+				t.Errorf("journal after the refused replay: %v; want it still in recovery", err)
+			}
+		})
+	}
+
+	dev, _ := newJournal(t)
+	region, err := OpenRegionForRecovery(dev, 0, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if txns, _, err := DryRunRecover(region); len(txns) != 2 || !errors.Is(err, ErrUnknownOp) {
+		t.Errorf("dry run: %d transactions, %v; want 2 and ErrUnknownOp", len(txns), err)
+	}
+	if _, err := EntryTouches(TxnOpType(0x7777), nil); !errors.Is(err, ErrUnknownOp) {
+		t.Errorf("EntryTouches of an unknown op: %v, want ErrUnknownOp", err)
+	}
+
+	damageJournalHeader(t, dev, 0, func(h []byte) {
+		binary.LittleEndian.PutUint32(h[12:16], JournalVersion+1)
+		binary.LittleEndian.PutUint32(h[JournalSuperblockSize-4:], storage.CRC32C(h[:JournalSuperblockSize-4]))
+	})
+	info := &node.FailedNodeInfo{JournalOffset: 0, JournalSize: size}
+	if _, err := ReplayJournal(ctx, &RecoveryContext{Dev: dev}, info); !errors.Is(err, ErrJournalTooNew) {
+		t.Errorf("replay of a newer journal format: %v, want ErrJournalTooNew", err)
+	}
+	if region, err = OpenRegionForRecovery(dev, 0, size); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DryRunRecover(region); !errors.Is(err, ErrJournalTooNew) {
+		t.Errorf("dry run of a newer journal format: %v, want ErrJournalTooNew", err)
 	}
 }
 

@@ -145,6 +145,9 @@ type txnApplyResult struct {
 // applyTransaction applies a single recovered transaction idempotently.
 func applyTransaction(ctx context.Context, rctx *RecoveryContext, txn *RecoveredTxn) (*txnApplyResult, error) {
 	result := &txnApplyResult{}
+	if err := unknownOpIn(txn); err != nil {
+		return result, err
+	}
 	r := newTxnReplay(txn.Header.OwnerNodeUUID)
 
 	for _, entry := range txn.Entries {
@@ -233,8 +236,7 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 		// Read before replay to free unused reserved blocks; nothing to apply.
 		return false, nil
 	default:
-		// Unhandled operation types are logged but not an error
-		log.Printf("[Recovery] Skipping unhandled operation type: %s", entry.Entry.OpType)
+		log.Printf("[Recovery] Skipping %s, which this build no longer logs and replay does not need", entry.Entry.OpType)
 		return false, nil
 	}
 }
