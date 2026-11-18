@@ -42,12 +42,26 @@ const (
 
 // stopBeforeWrite names a trigger file for tests: the first data or journal write that starts with the file's
 // contents, after every gate passed, removes it and stops this process with SIGSTOP. That stalls a node in the window
-// only storage fencing closes.
+// only storage fencing closes. Other writers wait before their gate until the stopped write is issued, so after
+// SIGCONT it reaches the device first, the worst case after a stall.
 var stopBeforeWrite = os.Getenv("GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE")
 
-func stopIfTriggered(buf []byte) {
-	if want, err := os.ReadFile(stopBeforeWrite); err == nil && bytes.HasPrefix(buf, want) && os.Remove(stopBeforeWrite) == nil {
-		_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+// stoppedWrite is closed once the write stopBeforeWrite stopped was issued; nil while none is stopped.
+var stoppedWrite atomic.Pointer[chan struct{}]
+
+// stopIfTriggered stops the process before buf is written, if buf matches the trigger file; call resume once the
+// write was issued.
+func stopIfTriggered(buf []byte) (resume func()) {
+	want, err := os.ReadFile(stopBeforeWrite)
+	if err != nil || !bytes.HasPrefix(buf, want) || os.Remove(stopBeforeWrite) != nil {
+		return func() {}
+	}
+	issued := make(chan struct{})
+	stoppedWrite.Store(&issued)
+	_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+	return func() {
+		stoppedWrite.Store(nil)
+		close(issued)
 	}
 }
 
@@ -291,11 +305,13 @@ func (d *Device) writeIfFresh(buf []byte, offset int64, sharded bool) (landed bo
 	if fresh := d.writeFresh.Load(); fresh != nil && !(*fresh)(offset) {
 		return false, 0, nil
 	}
+	resume := func() {}
 	if sharded && stopBeforeWrite != "" {
-		stopIfTriggered(buf)
+		resume = stopIfTriggered(buf)
 	}
 	n, err = d.file.WriteAt(buf, offset)
 	d.record(err)
+	resume()
 	return true, n, err
 }
 
@@ -339,6 +355,9 @@ func (d *Device) SetSyncObserver(synced func()) {
 // CheckWrite runs the write gate for a write at offset. Callers that change the
 // device without WriteAt, such as a discard, call it first.
 func (d *Device) CheckWrite(offset int64) error {
+	if issued := stoppedWrite.Load(); issued != nil {
+		<-*issued
+	}
 	if gate := d.writeGate.Load(); gate != nil {
 		return (*gate)(offset)
 	}
