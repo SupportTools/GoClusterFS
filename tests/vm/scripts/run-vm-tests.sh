@@ -3663,6 +3663,38 @@ test_fencing_idle_node() {
     return $result
 }
 
+# A node revokes a stopped peer while its own writes are in flight. LIO tags every command with the reservation
+# holder's key, so a preempt that does not drain this node's I/O first drops its own writes without a status.
+test_fencing_busy_survivor() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local stopped=1 peer=2 result=0 pids
+    fencing_restart pr || return 1
+    ssh_run "$peer" "rm -f /tmp/busy.stop; dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/busy bs=1M count=2 conv=fsync 2>/dev/null"
+    pids=$(mount_pids "$stopped")
+    local marker="fencing busy survivor $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$peer" "nohup sh -c 'while [ ! -e /tmp/busy.stop ]; do dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/busy bs=1M count=2 conv=notrunc,fsync 2>/dev/null; done' < /dev/null > /dev/null 2>&1 &"
+    ssh_run "$stopped" "kill -STOP $(echo $pids)"
+    if ! wait_log "$peer" "Revoked node" 120 "$marker"; then
+        sed -n "/$marker/,\$p" "$(get_vm_mount_log "$peer")" | grep -E "Not recovering|stopping" | head -3
+        result=1
+    fi
+    ssh_run "$peer" "touch /tmp/busy.stop"
+    ssh_run "$stopped" "kill -CONT $(echo $pids)"
+    if [[ -z "$(mount_pids "$peer")" ]]; then
+        log_error "VM $peer stopped while it revoked VM $stopped"
+        result=1
+    elif ! ssh_run "$peer" "dd if=/dev/zero of=${GOCLUSTERFS_MOUNT}/busy.after bs=4096 count=1 conv=fsync 2>/dev/null"; then
+        log_error "VM $peer cannot write after it revoked VM $stopped"
+        result=1
+    fi
+    fencing_restart pr || result=1
+    return $result
+}
+
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
     ssh_run "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
@@ -4842,6 +4874,7 @@ main() {
     run_test "Fencing: Stalled Writer" test_fencing_stalled_writer
     run_test "Fencing: Paused VM" test_fencing_paused_vm
     run_test "Fencing: Idle Node" test_fencing_idle_node
+    run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls

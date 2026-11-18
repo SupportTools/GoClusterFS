@@ -5363,6 +5363,13 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fencing_idle_node
 
+  - id: fencing-busy-survivor
+    name: A node revokes a stopped peer while its own writes are in flight
+    description: VM 2 writes without pause while it proves the stopped VM 1 dead and revokes its key; VM 2 stays mounted and can still write afterwards
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_busy_survivor
+
   - id: fencing-unmount-removes-key
     name: A clean unmount removes the node's reservation key
     description: After a clean unmount the target no longer lists the node's initiator, and the mount log shows no failed key removal
