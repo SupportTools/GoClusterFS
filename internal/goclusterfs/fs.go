@@ -726,6 +726,9 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return nil, syscall.EIO
 	}
 	logging.Debugf("FS.Lookup: found %q -> inode %d, type %d", name, childInodeNum, fileType)
+	if errno := f.childInRange(inode.InodeRoot, name, childInodeNum); errno != 0 {
+		return nil, errno
+	}
 
 	// Read the child inode to populate attributes
 	childIno, err := f.inodeTbl.Read(uint32(childInodeNum))
@@ -1399,6 +1402,9 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return nil, syscall.EIO
 	}
 	logging.Debugf("Lookup: found %q -> inode %d, type %d", name, childInodeNum, fileType)
+	if errno := d.fs.childInRange(d.inodeNum, name, childInodeNum); errno != 0 {
+		return nil, errno
+	}
 
 	// Read the child inode to populate attributes
 	childIno, err := d.fs.inodeTbl.Read(uint32(childInodeNum))
@@ -1550,6 +1556,18 @@ func sameForRemoval(was, cur *inode.Inode) bool {
 	return !was.IsDir() || cur.MetaGeneration == was.MetaGeneration
 }
 
+// childInRange returns EIO, and logs the entry, for a directory entry that
+// names an inode at or past the end of the inode table. Only a damaged entry
+// does, and narrowing its number to the table's uint32 could reach a real inode.
+func (f *FS) childInRange(dirNum uint32, name string, num uint64) syscall.Errno {
+	if total := f.inodeTbl.TotalInodes(); num >= total {
+		log.Printf("[ERROR] Directory %d: entry %q names inode %d, past the inode table's %d inodes. "+
+			"Unmount the filesystem on every node and run goclusterfs-fsck", dirNum, name, num, total)
+		return syscall.EIO
+	}
+	return 0
+}
+
 // removeEntryOnce returns EAGAIN when another node changes the child between the lookup and the removal.
 func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) syscall.Errno {
 	// Invalidate parent directory cache before modifying
@@ -1563,6 +1581,9 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	childInodeNum, fileType, err := d.fs.dirMgr.Lookup(ctx, dirIno, name)
 	if err != nil {
 		return nameErrno(err)
+	}
+	if errno := d.fs.childInRange(d.inodeNum, name, childInodeNum); errno != 0 {
+		return errno
 	}
 
 	// Invalidate child inode cache - it's being removed

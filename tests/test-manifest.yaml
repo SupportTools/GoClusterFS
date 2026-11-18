@@ -2242,6 +2242,13 @@ scenarios:
     environments:
       go: internal/journal/cross_node_recovery_test.go::TestReplayRefusesInodePastTheTable
 
+  - id: fs-entry-past-inode-table
+    name: A directory entry naming an inode past the table fails with EIO
+    description: With a directory entry naming inode 2^32+2, lookup in the root and in a subdirectory, unlink, rename and the API's path lookup all fail with EIO and log the entry, and the root inode, which the number would wrap onto, is unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/child_range_test.go::TestEntryPastTheInodeTableIsEIO
+
   - id: journal-entry-touches
     name: Journal entries name what they change
     description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
@@ -4700,6 +4707,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairRewritesDamagedSnapshotSector
+
+  - id: fsck-frees-orphan-data-in-orphan-snapshot-slot
+    name: fsck -repair frees an orphan snapshot data inode in an orphan snapshot's old slot
+    description: An orphan snapshot still names the slot of the file it was taken of; a snapshot data inode that no snapshot refers to in that slot must be freed, and the orphan snapshot kept
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairFreesOrphanDataInAnOrphanSnapshotsSlot
+
+  - id: fsck-keeps-data-inode-without-flag
+    name: fsck -repair keeps a snapshot's data inode that lost its snapshot-data flag
+    description: A data inode a snapshot points at is reported as an error repair cannot fix, and repair keeps it because it holds the snapshot's captured data
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairKeepsADataInodeThatLostItsFlag
 
   - id: fsck-checks-every-dir-entry
     name: fsck checks every directory entry's type and inode range

@@ -65,12 +65,17 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 	if err != nil {
 		return nameErrno(err)
 	}
+	if errno := f.childInRange(oldParent, oldName, child); errno != 0 {
+		return errno
+	}
 	op := &dir.RenameOp{OldParent: oldParent, NewParent: newParent, OldName: oldName, NewName: newName,
 		Child: child, ChildIsDir: ctype == dir.DT_DIR, NoReplace: flags&renameNoReplace != 0}
 	target, ttype, err := f.dirMgr.Lookup(ctx, newDir, newName)
 	switch {
 	case err == nil && target == child:
 		return 0
+	case err == nil && f.childInRange(newParent, newName, target) != 0:
+		return syscall.EIO
 	case err == nil:
 		op.Target, op.TargetIsDir = target, ttype == dir.DT_DIR
 	case !errors.Is(err, dir.ErrNotFound):

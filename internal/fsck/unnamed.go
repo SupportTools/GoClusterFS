@@ -33,7 +33,7 @@ func (c *Checker) keepUnnamed(num uint32, ino *InodeData) string {
 	switch {
 	case num < inode.InodeFirstUsable:
 		return "it is a reserved inode"
-	case c.snapshotInodes[num]:
+	case c.snapshotRefs[num] || c.snapshotTargets[num] && !c.snapshotData[num]:
 		return "a snapshot refers to it"
 	case ino.InodeNum != num:
 		return fmt.Sprintf("it stores inode number %d", ino.InodeNum)
@@ -59,7 +59,7 @@ func (c *Checker) checkUnnamed() error {
 	var problems []int
 	kept := 0
 	for _, num := range c.unnamed {
-		if c.snapshotData[num] && (c.snapshotInodes[num] || !c.finished[PhaseSnapshots]) {
+		if c.snapshotData[num] && (c.snapshotRefs[num] || !c.finished[PhaseSnapshots]) {
 			continue
 		}
 		loc := fmt.Sprintf("inode %d", num)
