@@ -5270,6 +5270,27 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestBlockOnRegularFileIsUnsupported
 
+  - id: fence-partition-refused
+    name: A partition gets no reservations
+    description: Every reservation command on a partition fails with ErrPartition, which is ErrUnsupported, before it reaches the device; sysfs tells a partition from a whole disk
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestPartitionRefusesEveryReservationCommand
+
+  - id: fence-partition-sysfs
+    name: sysfs tells a partition from a whole disk
+    description: A device whose /sys/dev/block/MAJ:MIN directory holds a partition file is a partition
+    priority: go_only
+    environments:
+      go: internal/fence/fence_test.go::TestPartitionInSysfs
+
+  - id: storage-quiesce
+    name: Quiesce drains in-flight I/O and holds new I/O
+    description: Quiesce runs its function only after a write in flight finishes, and a read started meanwhile waits until the function returns
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestQuiesceWaitsForIOInFlightAndHoldsNewIO
+
   - id: storage-fenced-handler
     name: A reservation conflict calls the fenced handler once
     description: The first I/O that fails with EBADE calls the device's fenced handler; later ones do not
@@ -5312,6 +5333,13 @@ scenarios:
     environments:
       go: internal/node/fence_test.go::TestMountingIntoADeadSlotPreempts
 
+  - id: registry-fenced-stop-once
+    name: A refused write stops the node once, without the registry lock
+    description: Fenced runs the slot-lost handler once even while a heartbeat holds the registry lock, and afterwards the node refuses writes
+    priority: go_only
+    environments:
+      go: internal/node/fence_test.go::TestFencedStopsTheNodeOnce
+
   - id: fsck-release-fences
     name: fsck revokes a node's access before releasing its slot
     description: -release-slot preempts the slot's node before it resets the journal, and a failed preempt leaves the slot and journal as they were
@@ -5339,6 +5367,15 @@ scenarios:
     priority: medium
     environments:
       go: fencing_test.go::TestFencingOnAFileImage
+      docker: TODO
+      vm: TODO
+
+  - id: fencing-partition
+    name: Fencing flags on a partition
+    description: On a partition of a loop disk, -format -fencing=pr refuses with the whole-disk reason, and the default formats it unfenced and says why
+    priority: medium
+    environments:
+      go: fencing_test.go::TestFencingOnAPartition
       docker: TODO
       vm: TODO
 
