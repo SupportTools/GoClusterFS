@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // TestDeviceOpenNonExistent verifies error handling for missing files.
@@ -550,5 +551,71 @@ func TestFencedHandlerRunsOnce(t *testing.T) {
 	d.record(fmt.Errorf("write: %w", syscall.EBADE))
 	if len(calls) != 1 || !errors.Is(calls[0], syscall.EBADE) {
 		t.Errorf("fenced handler calls: %v, want one with EBADE", calls)
+	}
+}
+
+func TestQuiesceWaitsForIOInFlightAndHoldsNewIO(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+
+	writing, finishWrite := make(chan struct{}), make(chan struct{})
+	releaseWrite := sync.OnceFunc(func() { close(finishWrite) })
+	defer releaseWrite()
+	var once sync.Once
+	dev.SetWriteFresh(func(int64) bool {
+		once.Do(func() { close(writing); <-finishWrite })
+		return true
+	})
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := dev.WriteAt(NewAlignedBuffer(SectorSize).Bytes(), 0)
+		wrote <- err
+	}()
+	<-writing
+
+	quiesced, finishQuiesce, quiesceDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	releaseQuiesce := sync.OnceFunc(func() { close(finishQuiesce) })
+	defer releaseQuiesce()
+	go func() {
+		quiesceDone <- dev.Quiesce(func() error {
+			close(quiesced)
+			<-finishQuiesce
+			return nil
+		})
+	}()
+	select {
+	case <-quiesced:
+		t.Fatal("Quiesce ran while a write was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseWrite()
+	<-quiesced
+	if err := <-wrote; err != nil {
+		t.Fatal(err)
+	}
+
+	read := make(chan error, 1)
+	go func() {
+		_, err := dev.ReadAt(NewAlignedBuffer(SectorSize).Bytes(), SectorSize)
+		read <- err
+	}()
+	select {
+	case <-read:
+		t.Fatal("a read ran while Quiesce held the device")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseQuiesce()
+	if err := <-quiesceDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-read; err != nil {
+		t.Fatal(err)
 	}
 }

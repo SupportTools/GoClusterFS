@@ -419,6 +419,28 @@ func (d *Device) Fd() uintptr {
 	return d.file.Fd()
 }
 
+// Quiesce runs fn while none of this device's reads, writes, syncs or discards is in flight, and holds new ones until
+// fn returns.
+func (d *Device) Quiesce(fn func() error) error {
+	d.closeMu.Lock()
+	defer d.closeMu.Unlock()
+	return fn()
+}
+
+// blkDiscard is BLKDISCARD from <linux/fs.h>, _IO(0x12, 119).
+const blkDiscard = 0x1277
+
+// Discard tells the device that length bytes at offset hold no data any more.
+func (d *Device) Discard(offset, length uint64) error {
+	d.closeMu.RLock()
+	defer d.closeMu.RUnlock()
+	args := [2]uint64{offset, length}
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.file.Fd(), blkDiscard, uintptr(unsafe.Pointer(&args[0]))); errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 // checkRange refuses n bytes at offset unless they fit inside the device; offsets come from on-disk numbers, which
 // damage can make negative or past the end.
 func (d *Device) checkRange(offset int64, n int) error {

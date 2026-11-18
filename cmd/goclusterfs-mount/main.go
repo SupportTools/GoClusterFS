@@ -811,7 +811,10 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 	if err := pr.Reserve(); err != nil {
 		failf("%s is fenced, and reserving it failed: %v; release the other reservation first", devicePath, err)
 	}
-	reg.SetPreempter(func(owner [16]byte) error { return pr.Preempt(fence.NodeKey(owner)) })
+	// LIO tags every command with the holder's key, so PREEMPT AND ABORT also drops this node's in-flight I/O without a status.
+	reg.SetPreempter(func(owner [16]byte) error {
+		return dev.Quiesce(func() error { return pr.Preempt(fence.NodeKey(owner)) })
+	})
 	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
 	return pr
 }

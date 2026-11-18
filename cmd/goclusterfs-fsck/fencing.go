@@ -49,7 +49,9 @@ func fsckFencing(dev *storage.Device, devicePath string, writing bool) (preempt 
 		}
 		pr = fence.Block(f, key)
 	}
-	return func(owner [16]byte) error { return pr.Preempt(fence.NodeKey(owner)) }, release, nil
+	return func(owner [16]byte) error {
+		return dev.Quiesce(func() error { return pr.Preempt(fence.NodeKey(owner)) })
+	}, release, nil
 }
 
 // mountedHere returns the key of the node mounted on this host, which holds this host's registration.
