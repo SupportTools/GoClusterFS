@@ -22,6 +22,9 @@ func SetRecoveryLease(d time.Duration) (restore func()) {
 // it counts the slot's node as dead rather than slow, and replays it.
 const deadAfter = 2 * HeartbeatTimeout
 
+// stallLimit is how long a node may go without a heartbeat and still write: one failure scan short of deadAfter.
+const stallLimit = deadAfter - FailureCheckInterval
+
 // sighting is what this node last read in a slot: the fields a live node keeps
 // changing, and since when this node's monotonic clock has seen them unchanged.
 type sighting struct {

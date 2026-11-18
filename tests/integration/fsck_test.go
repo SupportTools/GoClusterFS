@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -357,11 +358,11 @@ func TestFsckOnlineRelease(t *testing.T) {
 		t.Fatalf("resume node A: %v", err)
 	}
 	go func() { _ = a.WriteFileAt("fenced", bytes.Repeat([]byte{'A'}, 4096), 0) }()
-	lost := "Node registry slot " + slot + " is no longer this node's"
-	for deadline := time.Now().Add(45 * time.Second); !strings.Contains(logA.String(), lost) && time.Now().Before(deadline); {
+	lost := regexp.MustCompile("Node registry slot " + slot + " (is no longer|may no longer be) this node's")
+	for deadline := time.Now().Add(45 * time.Second); !lost.MatchString(logA.String()) && time.Now().Before(deadline); {
 		time.Sleep(100 * time.Millisecond)
 	}
-	if !strings.Contains(logA.String(), lost) {
+	if !lost.MatchString(logA.String()) {
 		t.Fatal("node A did not stop after resuming from the release")
 	}
 	if got, err := b.ReadFile("fenced"); err != nil || !bytes.Equal(got, bytes.Repeat([]byte{'B'}, 4096)) {

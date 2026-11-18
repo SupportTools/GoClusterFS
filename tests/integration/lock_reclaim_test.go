@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -194,7 +193,8 @@ func TestStalledNodesWritesStopAtWriteGate(t *testing.T) {
 	}
 
 	// The held heartbeat stops A after 30s whatever the gate does; by then a write the gate let through has landed.
-	lost := regexp.MustCompile(fmt.Sprintf(`Node registry slot %d is no longer this node's`, nodeA.slot))
+	resumed := time.Now()
+	lost := regexp.MustCompile(fmt.Sprintf(`Node registry slot %d (is no longer|may no longer be) this node's`, nodeA.slot))
 	deadline := time.Now().Add(45 * time.Second)
 	for !lost.MatchString(logA.String()) && time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
@@ -209,8 +209,8 @@ func TestStalledNodesWritesStopAtWriteGate(t *testing.T) {
 	if !lost.MatchString(logA.String()) {
 		t.Fatal("node A did not stop after resuming from its takeover")
 	}
-	if !strings.Contains(logA.String(), "checking the slot before a write") {
-		t.Error("node A stopped without its write gate checking the slot")
+	if stopped := time.Since(resumed); stopped > 15*time.Second {
+		t.Errorf("node A stopped %v after resuming; its first write or heartbeat should have stopped it, not the held heartbeat", stopped.Round(time.Second))
 	}
 }
 

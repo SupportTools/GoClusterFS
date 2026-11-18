@@ -959,6 +959,9 @@ func TestRegisterLeavesLiveSlotOfOtherPIDNamespace(t *testing.T) {
 	}
 }
 
+// A restarted container cannot prove by PID that its previous mount exited, so
+// it takes that mount's slot only once the heartbeat is deadAfter old: a mount
+// that stalled for less than stallLimit keeps its slot.
 func TestRegisterTakesOtherPIDNamespaceSlotOnceStale(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -967,9 +970,9 @@ func TestRegisterTakesOtherPIDNamespaceSlotOnceStale(t *testing.T) {
 	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
 		t.Skip("no kernel boot ID or PID namespace")
 	}
-	writeOtherNamespaceSlot(t, reg, 2, time.Now().Add(-HeartbeatTimeout+time.Second))
+	beat := time.Now().Add(-stallLimit)
+	writeOtherNamespaceSlot(t, reg, 2, beat)
 
-	start := time.Now()
 	slot, err := reg.Register(context.Background(), "node")
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -977,7 +980,10 @@ func TestRegisterTakesOtherPIDNamespaceSlotOnceStale(t *testing.T) {
 	if slot != 2 {
 		t.Errorf("Register took slot %d, want slot 2 of this host's previous container once its heartbeat went stale", slot)
 	}
-	t.Logf("waited %v for the slot to go stale", time.Since(start))
+	// Heartbeat times are whole seconds, so the slot may look up to a second older than it is.
+	if age := time.Since(beat); age < deadAfter-time.Second {
+		t.Errorf("Register took the slot when its heartbeat was %v old, want at least %v", age, deadAfter-time.Second)
+	}
 }
 
 func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
@@ -1033,7 +1039,7 @@ func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
 	previous := writeOtherNamespaceSlot(t, reg, 2, time.Now())
 	go func() {
 		time.Sleep(600 * time.Millisecond)
-		previous.HeartbeatTime = time.Now().Add(-2 * HeartbeatTimeout).Unix()
+		previous.HeartbeatTime = time.Now().Add(-deadAfter - 2*time.Second).Unix()
 		if err := reg.writeSlot(2, previous); err != nil {
 			t.Error(err)
 		}
@@ -1110,6 +1116,7 @@ func TestSlotLossMessages(t *testing.T) {
 		{SlotLoss{Slot: 3, Local: local, Taken: true, Owner: other}, "Node registry slot 3 is no longer this node's (owner abcd000000000000)"},
 		{SlotLoss{Slot: 3, Local: local, Taken: true, Owner: local}, "Node registry slot 3 is no longer this node's: a peer declared this node dead"},
 		{SlotLoss{Slot: 3, Local: local, Taken: true}, "Node registry slot 3 is no longer this node's: the slot is empty"},
+		{SlotLoss{Slot: 3, Local: local, Paused: true, Stalled: 24360 * time.Millisecond}, "Node registry slot 3 may no longer be this node's: it went 24.36s without a heartbeat, so a peer may have replayed it"},
 	} {
 		if got := tc.loss.String(); got != tc.want {
 			t.Errorf("%+v: %q, want %q", tc.loss, got, tc.want)
@@ -1745,8 +1752,7 @@ func TestCheckOwnershipWritesHeartbeatAfterPause(t *testing.T) {
 		t.Fatalf("right after Register: %v", err)
 	}
 
-	paused := time.Now().Add(-HeartbeatTimeout)
-	reg.lastBeat.Store(&paused)
+	reg.lastBeat.Store(int64(bootClock() - HeartbeatTimeout*3/4))
 	before, err := reg.readSlot(slot)
 	if err != nil {
 		t.Fatal(err)
@@ -1787,8 +1793,7 @@ func TestCheckOwnershipFailsOnceSlotIsTakenOver(t *testing.T) {
 	if err := reg.CheckOwnership(); err != nil {
 		t.Fatalf("with a recent heartbeat the check needs no read: %v", err)
 	}
-	paused := time.Now().Add(-HeartbeatTimeout)
-	reg.lastBeat.Store(&paused)
+	reg.lastBeat.Store(int64(bootClock() - HeartbeatTimeout*3/4))
 	for range 2 {
 		if err := reg.CheckOwnership(); !errors.Is(err, ErrSlotLost) {
 			t.Fatalf("after peers marked the slot dead: %v, want ErrSlotLost", err)
@@ -1818,8 +1823,7 @@ func TestWriteGateRefusesWritesOnceSlotIsLost(t *testing.T) {
 	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: reg.LocalUUID(), RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Unix()}); err != nil {
 		t.Fatalf("a registry write must pass the gate: %v", err)
 	}
-	paused := time.Now().Add(-HeartbeatTimeout)
-	reg.lastBeat.Store(&paused)
+	reg.lastBeat.Store(int64(bootClock() - HeartbeatTimeout*3/4))
 	if _, err := dev.WriteAt(data.Bytes(), 2<<20); !errors.Is(err, ErrSlotLost) {
 		t.Fatalf("write after peers marked the slot dead: %v, want ErrSlotLost", err)
 	}
@@ -1842,8 +1846,7 @@ func TestWriteFreshNeedsAHeartbeatCheckOwnershipWouldTrust(t *testing.T) {
 	if !reg.WriteFresh(1 << 20) {
 		t.Fatal("a data write right after Register is not fresh")
 	}
-	paused := time.Now().Add(-HeartbeatTimeout)
-	reg.lastBeat.Store(&paused)
+	reg.lastBeat.Store(int64(bootClock() - HeartbeatTimeout))
 	if reg.WriteFresh(1 << 20) {
 		t.Error("a data write is fresh with a heartbeat CheckOwnership would rewrite first")
 	}
