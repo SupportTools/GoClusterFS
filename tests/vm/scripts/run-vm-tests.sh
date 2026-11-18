@@ -3486,7 +3486,8 @@ fenced_file_byte() {
 fencing_stalled_case() {
     local fencing="$1" stalled=1 peer=2 pids waited
     FENCED_BYTE=""
-    fencing_restart "$fencing" "GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE=/tmp/stop-before-write" || return 1
+    # The held heartbeat keeps the resumed node from noticing its lost slot before the stopped write runs.
+    fencing_restart "$fencing" "GOCLUSTERFS_TEST_STOP_BEFORE_PWRITE=/tmp/stop-before-write GOCLUSTERFS_TEST_HEARTBEAT_HOLD=30s" || return 1
     ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/fenced && sync"
     ssh_run "$stalled" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/fenced.A"
     ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/fenced.B"
@@ -3514,7 +3515,7 @@ fencing_stalled_case() {
         return 1
     fi
     ssh_run "$stalled" "kill -CONT $(echo $pids)"
-    wait_stopped "$stalled" 30 || log_error "VM $stalled still runs 30s after it resumed"
+    wait_stopped "$stalled" 45 || log_error "VM $stalled still runs 45s after it resumed"
     FENCED_BYTE=$(fenced_file_byte "$peer")
 }
 

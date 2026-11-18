@@ -528,6 +528,11 @@ boot_vm() {
     disown "$pid"
     echo "$pid" > "$pid_file"
     log_info "VM $vm_id started (PID: $pid)"
+    # The PID names QEMU only once the background job execs it; before that is_vm_running sees this shell.
+    for _ in $(seq 1 10); do
+        is_vm_running "$vm_id" && break
+        sleep 0.5
+    done
 
     if ! wait_for_console "$vm_id" "$console_offset" "login:" 120; then
         report_boot_failure "$vm_id" "$console_offset" "no login prompt on the serial console"
