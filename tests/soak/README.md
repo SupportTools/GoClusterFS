@@ -41,6 +41,8 @@ flock /tmp/goclusterfs-soak.lock systemd-run --scope -p MemoryMax=8G -p CPUQuota
 
 The VMs use SSH ports from `-ssh-base-port` (3122), so the soak can share a host with other VM test runs. It logs a summary every minute.
 
+With `VM_STORAGE=iscsi` in the environment, the nodes mount the shared disk as an iSCSI LUN from a target VM, so `-format` turns on storage fencing. The hourly fsck checks that LUN too.
+
 ## Replay
 
 ```bash

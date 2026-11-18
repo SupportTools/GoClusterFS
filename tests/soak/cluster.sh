@@ -131,7 +131,7 @@ handle() {
             ;;
         fsck)
             local out rc
-            out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck ${1:-} /dev/vda 2>&1; echo rc=\$?")
+            out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck ${1:-} $(cluster_device) 2>&1; echo rc=\$?")
             rc=${out##*rc=}
             echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | sed 's/^ */out /'
             reply "ok rc=$rc"
