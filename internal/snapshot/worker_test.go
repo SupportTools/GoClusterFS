@@ -377,7 +377,7 @@ func TestRecoverIncompleteSnapshots(t *testing.T) {
 	deleting := env.snapshot(file, "deleting", StateDeleting)
 	env.start()
 
-	if err := env.w.RecoverIncompleteJobs(env.ctx); err != nil {
+	if err := env.w.RecoverIncompleteJobs(env.ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	env.wait(2)
@@ -418,7 +418,7 @@ func TestRecoverAroundUnreadableSector(t *testing.T) {
 	}
 	env.start()
 
-	if err := env.w.RecoverIncompleteJobs(env.ctx); err != nil {
+	if err := env.w.RecoverIncompleteJobs(env.ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := env.reg.Get(env.ctx, creating.SnapshotID); err != nil || got.State != StateDeleting {

@@ -3644,6 +3644,27 @@ scenarios:
     environments:
       go: internal/snapshot/snapshot_test.go::TestRegistryIDsAfterOlderImagesAndSlotReuse
 
+  - id: snapshot-mount-leaves-live-creator
+    name: A mount leaves a snapshot a live node is creating
+    description: Node A pauses between adding a snapshot to the registry and activating it. A mount on another node leaves the snapshot alone while A still holds its registry slot, also while that slot is dead and waits for its replay, and A's snapshot succeeds. A mount rolls it back once A's slot is empty or held by another node, and A's activation then fails with EAGAIN
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_creator_test.go::TestMountLeavesSnapshotALiveNodeIsCreating
+
+  - id: snapshot-dead-creator-rolled-back
+    name: A dead node's half-made snapshot is rolled back after its replay
+    description: Node A dies between adding a snapshot to the registry and activating it. The peer that replays A's journal rolls the snapshot back and queues its delete, which frees its data inode; fsck finds no problem
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_creator_test.go::TestDeadNodesSnapshotIsRolledBackAfterReplay
+
+  - id: snapshot-descriptor-creator
+    name: Snapshot descriptor records its creator while creating
+    description: A descriptor being created records its creator's registry slot and node UUID, and drops them once it becomes active or deleting; a descriptor without them keeps its refcount job ID
+    priority: go_only
+    environments:
+      go: internal/snapshot/snapshot_test.go::TestDescriptorRecordsCreatorWhileCreating
+
   - id: snapshot-activate-requires-creating
     name: Snapshot activation after a rollback
     description: A snapshot another node rolled back cannot be marked active

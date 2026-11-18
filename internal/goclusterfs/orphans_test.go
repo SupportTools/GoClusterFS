@@ -15,13 +15,19 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/node"
 )
 
-// fakeCluster stands in for the node registry: which slots are live, and each slot's orphan list.
+// fakeCluster stands in for the node registry: which slots are live, each slot's orphan list, and who holds a slot.
 type fakeCluster struct {
-	mu      sync.Mutex
-	live    uint64
-	lists   map[int][]node.Orphan
-	max     int
-	failing bool
+	mu        sync.Mutex
+	live      uint64
+	lists     map[int][]node.Orphan
+	max       int
+	failing   bool
+	occupants map[int]occupant
+}
+
+type occupant struct {
+	owner [16]byte
+	state node.Occupancy
 }
 
 type fakeSlot struct {
@@ -30,7 +36,7 @@ type fakeSlot struct {
 }
 
 func newFakeCluster(slots ...int) *fakeCluster {
-	c := &fakeCluster{lists: map[int][]node.Orphan{}, max: node.MaxOrphans}
+	c := &fakeCluster{lists: map[int][]node.Orphan{}, max: node.MaxOrphans, occupants: map[int]occupant{}}
 	for _, s := range slots {
 		c.live |= 1 << s
 	}
@@ -81,6 +87,22 @@ func (s *fakeSlot) PeersFailing() bool {
 	s.c.mu.Lock()
 	defer s.c.mu.Unlock()
 	return s.c.failing
+}
+
+func (c *fakeCluster) occupy(slot int, owner [16]byte, state node.Occupancy) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.occupants[slot] = occupant{owner, state}
+}
+
+func (s *fakeSlot) Occupant(slot int, _ bool) ([16]byte, node.Occupancy) {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	o, ok := s.c.occupants[slot]
+	if !ok {
+		return [16]byte{}, node.Unoccupied
+	}
+	return o.owner, o.state
 }
 
 func (s *fakeSlot) AllOrphans() ([]node.Orphan, error) {

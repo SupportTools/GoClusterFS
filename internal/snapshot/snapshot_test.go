@@ -991,6 +991,62 @@ func TestRegistryIDsUniqueAcrossNodes(t *testing.T) {
 	}
 }
 
+func TestDescriptorRecordsCreatorWhileCreating(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	registry := NewRegistry(dev, 0, 10*SectorSize, nil)
+	ctx := context.Background()
+	owner := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	registry.SetNodeSlot(5)
+	registry.SetOwner(owner)
+
+	get := func(id uint64) *Descriptor {
+		t.Helper()
+		desc, err := registry.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return desc
+	}
+	activated, err := registry.Create(ctx, "activated", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Creator{Slot: 5, Owner: [7]byte{1, 2, 3, 4, 5, 6, 7}}
+	if got := get(activated.SnapshotID); got.Flags&FlagHasCreator == 0 || got.Creator != want || !got.Creator.Is(owner) {
+		t.Fatalf("creating descriptor: flags %#x, creator %+v; want %+v", got.Flags, got.Creator, want)
+	}
+	if err := registry.Activate(ctx, activated.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(activated.SnapshotID); got.Flags&FlagHasCreator != 0 || got.Creator != (Creator{}) || got.RefCountJobID != 0 {
+		t.Fatalf("active descriptor: flags %#x, creator %+v, job %d; want no creator", got.Flags, got.Creator, got.RefCountJobID)
+	}
+
+	abandoned, err := registry.Create(ctx, "abandoned", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Abandon(ctx, abandoned.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.SetRefCountJobID(ctx, abandoned.SnapshotID, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(abandoned.SnapshotID); got.Flags&FlagHasCreator != 0 || got.RefCountJobID != 42 {
+		t.Fatalf("abandoned descriptor: flags %#x, job %d; want no creator and job 42", got.Flags, got.RefCountJobID)
+	}
+
+	registry.SetOwner([16]byte{})
+	anonymous, err := registry.Create(ctx, "anonymous", 100, InvalidSnapshotID, 0, 1, 1024, FlagReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := get(anonymous.SnapshotID); got.Flags&FlagHasCreator != 0 {
+		t.Fatalf("descriptor of a registry without an owner: flags %#x, want no creator", got.Flags)
+	}
+}
+
 func TestRegistryActivateRequiresCreating(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()

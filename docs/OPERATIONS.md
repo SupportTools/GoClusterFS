@@ -178,6 +178,8 @@ setfattr -x user.snapshot.snap1 /mnt/fs/data.db
 
 A snapshot stays with the file it was taken of. When you delete the file's last name, its snapshots become orphans, even while a node still has the file open: `getfattr` on any file no longer lists them, and `GET /api/v1/snapshots` lists them with `orphan: true`. Delete an orphan with `DELETE /api/v1/snapshots/<name>` and no `path`. Snapshots made by older versions are orphans after an upgrade, because they do not record which file they were taken of. `goclusterfs-fsck` warns about each orphan.
 
+If creating a snapshot fails with `Resource temporarily unavailable` (EAGAIN), another node rolled it back before it was done, for example because this node stalled and looked dead. Try again.
+
 Snapshots and clones share blocks with the file and copy a block on its first write. A block is freed when no file, snapshot, or clone uses it. Before you mount an image with snapshots or clones using a newer build, read the upgrade notes in [CHANGELOG.md](../CHANGELOG.md).
 
 **What a snapshot captures while the file is written.** A snapshot or clone captures each write request whole: up to MaxWrite, 1 MiB. The kernel splits a larger `write()` into several requests, and a snapshot may capture some of them, as it always could from another node. For a consistent snapshot of a file that writes larger records, pause its writers first.
