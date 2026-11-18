@@ -2242,6 +2242,13 @@ scenarios:
     environments:
       go: internal/journal/cross_node_recovery_test.go::TestReplayRefusesInodePastTheTable
 
+  - id: fs-entry-past-inode-table
+    name: A directory entry naming an inode past the table fails with EIO
+    description: With a directory entry naming inode 2^32+2, lookup in the root and in a subdirectory, unlink, rename and the API's path lookup all fail with EIO and log the entry, and the root inode, which the number would wrap onto, is unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/child_range_test.go::TestEntryPastTheInodeTableIsEIO
+
   - id: journal-entry-touches
     name: Journal entries name what they change
     description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
