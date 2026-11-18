@@ -41,6 +41,8 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 	step(t, m, &Op{Kind: "create", Path: f}, 0)
 	step(t, m, &Op{Kind: "snapclone", Path: f, Name: "l0-s1", Path2: "/l0-c1"}, int(syscall.ENOENT))
 	step(t, m, &Op{Kind: "snapdelete", Path: f, Name: "l0-s1"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "orphandelete", Name: "l0-s1"}, 0)
+	step(t, m, &Op{Kind: "orphandelete", Name: "l0-s1"}, int(syscall.ENOENT))
 
 	link := "/soak/d0/l0-d1/l0-ln1"
 	step(t, m, &Op{Kind: "symlink", Path: link, Path2: "../l0-f1"}, 0)
@@ -57,6 +59,7 @@ func TestModelFollowsTheFilesystemRules(t *testing.T) {
 
 	hard := "/soak/d0/l0-hl1"
 	step(t, m, &Op{Kind: "snapshot", Path: f, Name: "l0-s2"}, 0)
+	step(t, m, &Op{Kind: "orphandelete", Name: "l0-s2"}, int(syscall.EBUSY))
 	step(t, m, &Op{Kind: "link", Path: f, Path2: hard}, 0)
 	step(t, m, &Op{Kind: "link", Path: f, Path2: hard}, int(syscall.EEXIST))
 	step(t, m, &Op{Kind: "link", Path: "/soak/d0/l0-missing", Path2: "/soak/d0/l0-hl2"}, int(syscall.ENOENT))

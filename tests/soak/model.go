@@ -56,6 +56,8 @@ func (op *Op) request() request {
 		r.Op, r.Attr, r.Value = "setxattr", "user.snapshot.clone", op.Name+":"+op.Path2
 	case "snapdelete":
 		r.Op, r.Attr, r.Value = "setxattr", "user.snapshot.delete", op.Name
+	case "orphandelete":
+		r.Op, r.Value = "apidelete", op.Name
 	}
 	return r
 }
@@ -180,6 +182,13 @@ func (m *Model) expect(op *Op) int {
 		if f == nil || m.Snaps[op.Name] == nil || m.Snaps[op.Name].Owner != f {
 			return int(syscall.ENOENT)
 		}
+	case "orphandelete":
+		switch s := m.Snaps[op.Name]; {
+		case s == nil:
+			return int(syscall.ENOENT)
+		case s.Owner != nil:
+			return int(syscall.EBUSY)
+		}
 	}
 	return 0
 }
@@ -233,6 +242,8 @@ func (m *Model) apply(op *Op) {
 	case "snapdelete":
 		delete(m.Snaps, op.Name)
 		delete(f.Snaps, op.Name)
+	case "orphandelete":
+		delete(m.Snaps, op.Name)
 	}
 }
 
@@ -278,8 +289,7 @@ func pick[T any](r *rand.Rand, xs []T) T { return xs[r.IntN(len(xs))] }
 
 // generate picks the lane's next operation from the model's current state. The caller holds m.mu.
 func (l *lane) generate(m *Model) *Op {
-	var files, dirs, snaps, links []string
-	orphans := 0
+	var files, dirs, snaps, links, orphans []string
 	for p := range m.Files {
 		if l.owns(p) {
 			files = append(files, p)
@@ -301,10 +311,11 @@ func (l *lane) generate(m *Model) *Op {
 		case s.Owner != nil:
 			snaps = append(snaps, name)
 		default:
-			orphans++
+			orphans = append(orphans, name)
 		}
 	}
 	slices.Sort(files)
+	slices.Sort(orphans)
 	slices.Sort(links)
 	slices.Sort(dirs)
 	slices.Sort(snaps)
@@ -318,7 +329,7 @@ func (l *lane) generate(m *Model) *Op {
 	}{
 		{"create", 15}, {"write", 30}, {"truncate", 8}, {"unlink", 8}, {"mkdir", 4}, {"rmdir", 4},
 		{"rename", 6}, {"snapshot", 6}, {"clone", 3}, {"snapclone", 3}, {"snapdelete", 6}, {"invalid", 3}, {"symlink", 5},
-		{"link", 4},
+		{"link", 4}, {"orphandelete", 3},
 	}
 	total := 0
 	for _, w := range weights {
@@ -384,7 +395,7 @@ func (l *lane) generate(m *Model) *Op {
 			break
 		}
 		op.Path = pick(r, files)
-		if f := m.Files[op.Path]; len(f.Snaps) > 0 && (orphans >= 20 || r.IntN(10) > 0) {
+		if f := m.Files[op.Path]; len(f.Snaps) > 0 && (len(orphans) >= 20 || r.IntN(10) > 0) {
 			op.Kind, op.Name = "snapdelete", pickKey(r, f.Snaps)
 		}
 	case "mkdir":
@@ -411,6 +422,13 @@ func (l *lane) generate(m *Model) *Op {
 		op.Path, op.Path2 = l.renamePaths(r, files, links, dirs, parents)
 	case "snapshot":
 		op.Path, op.Name = pick(r, files), l.name("s")
+	case "orphandelete":
+		// Like an operator, leave a few orphans and delete the rest through the API.
+		if len(orphans) < 5 {
+			op.Kind, op.Path, op.Name = "snapshot", pick(r, files), l.name("s")
+			break
+		}
+		op.Name = pick(r, orphans)
 	case "clone":
 		op.Path, op.Path2 = pick(r, files), "/"+l.name("c")
 	case "snapclone", "snapdelete":
