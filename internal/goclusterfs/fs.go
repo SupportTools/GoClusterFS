@@ -2038,6 +2038,11 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 		return 0, errToErrno(err)
 	}
 	defer unlockIO()
+	return f.writeIOLocked(ctx, data, off)
+}
+
+// writeIOLocked is Write for a caller that holds the file's I/O lock.
+func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to extend the same file simultaneously, they may race
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
