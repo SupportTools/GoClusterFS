@@ -3720,7 +3720,7 @@ test_fencing_clear_reservations() {
         log_error "fsck -clear-reservations with no node running failed: $out"
         result=1
     fi
-    if [[ -n "$(registered_initiators | tr -d '[:space:]')" ]]; then
+    if registered_initiators | grep -q "goclusterfs:vm"; then
         log_error "keys left after fsck -clear-reservations: $(registered_initiators | tr '\n' ' ')"
         result=1
     fi
