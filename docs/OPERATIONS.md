@@ -194,8 +194,19 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 ### Known Gaps in Slot Ownership
 
 - Slot claims use a read-compare-write on the device, then re-read the slot after 100 ms. Two nodes can still both keep a slot if one node's write lands more than 100 ms after its read, for example during a storage stall.
-- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to a new mount, which can take its slot and replay and reset its journal. Running nodes wait until it is proven dead (about 20 seconds, see above). When the paused node resumes, it refuses further writes and exits, but writes it started before the pause can still land.
+- A node paused for more than 10 seconds (VM freeze, `SIGSTOP`, a stalled path) looks failed to a new mount, which can take its slot and replay and reset its journal. Running nodes wait until it is proven dead (about 20 seconds, see above). When the paused node resumes, it refuses further writes and exits, but on a volume without [storage fencing](#storage-fencing) writes it started before the pause can still land.
 - A restarted container comes back in a new PID namespace, so its mount cannot prove by PID that the previous incarnation exited. It waits up to about 12 seconds for the old slot's heartbeat to go stale, then replays that journal before serving.
+
+### Storage Fencing
+
+On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead nodes at the storage. Every node registers its own reservation key before its first write, and the device accepts writes only from registered nodes. Before a node acts on another node's death, it removes that node's key; acting on a death means marking its slot dead, replaying its journal, taking its locks or mounting into its slot. From then on the device refuses the dead node's writes, including writes it queued before it stalled. `goclusterfs-fsck` does the same before `-repair` or `-release-slot` writes over a node.
+
+- **Turning it on:** `-format` with `-fencing=auto`, the default, fences when the device supports persistent reservations; `-fencing=pr` requires them and `-fencing=none` turns fencing off. The superblock records the choice, so every node fences, and older builds refuse the volume. Files, loop devices and virtio-blk disks have no reservations: format and every mount warn, `/health` reports `fencing` as `none:`, and `-require-fencing` refuses to mount such a volume.
+- **A fenced node:** its next write fails with `EBADE` (a reservation conflict), and it stops, as when it loses its registry slot. It writes its heartbeat every second, so it stops at most about 1 second after its key is removed, or 1 second after it resumes from a stall. Until then it can still answer reads from its page and inode caches, and it can still read the device, because the reservation blocks only writes.
+- **APTPL must be on:** registrations must survive a restart of the storage target. Linux sets the target's "persist through power loss" (APTPL) flag when it registers a key. If the target loses the registrations anyway, every node's next write fails and the whole cluster stops; nothing is corrupted, but every node must mount again. A Linux LIO target keeps them in `/var/target/pr`, which `targetcli` restores at boot.
+- **One fenced mount per host:** a registration belongs to the host's storage initiator, not to a process, so two mounts of one fenced device on one host could not fence each other. A fenced mount locks the device on its host, and a second mount refuses while the first process exists, even stopped. Kill a stopped mount before mounting again.
+- **Permissions and multipath:** registering a key needs root (`CAP_SYS_ADMIN`). With dm-multipath, the kernel registers the key on every path.
+- **fsck:** on a fenced volume, a run that writes uses the key of the node mounted on the same host, or registers a key of its own and removes it when done.
 
 ### Adding a New Node
 
@@ -280,7 +291,7 @@ Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, 
 - a write that stalled after its last check, which runs once the write holds its locks, right before it reaches the device, and I/O the kernel or the storage queued during the stall;
 - writes in the second after the takeover, if the stalled node resumed while the other node was marking its slot dead.
 
-Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap, for example SCSI-3 persistent reservations (or NVMe reservations), with which surviving nodes revoke a dead node's access to the device. GoClusterFS does not use them.
+Two nodes can then write the same metadata, which can double-allocate blocks or lose directory entries. Only fencing at the storage closes this gap: on a device with persistent reservations, see [Storage Fencing](#storage-fencing).
 
 Common causes of a stall:
 
@@ -314,7 +325,7 @@ Writers go first. A node that wants to read a file while another node waits to w
 |-------|-----|
 | Run chrony or NTP on every node | File times and `fsck -release-slot` use the wall clock; failover does not |
 | No node may stall for 15 seconds or more while mounted | Peers prove a node dead after about 20 seconds of silence and take its locks |
-| Storage I/O must fail, not queue, within 10 seconds | A queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
+| Storage I/O must fail, not queue, within 10 seconds | Without [storage fencing](#storage-fencing), a queued write that lands after takeover corrupts metadata. Do not use multipath `queue_if_no_path`; lower iSCSI `node.session.timeo.replacement_timeout` (default 120s) |
 | Unmount before you pause, migrate or snapshot a node VM | Unmounting releases its locks |
 
 If a node did stall for 15 seconds or more while mounted (hung-task warnings in `dmesg`, a VM pause, a path failover), stop its mount process before it does more writes, then check the data from a healthy node.

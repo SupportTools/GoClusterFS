@@ -34,6 +34,8 @@ These are the `goclusterfs-mount` flags:
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first |
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
+| `-fencing` | string | `auto` | With `-format`: `pr` fences dead nodes with persistent reservations and fails if the device lacks them, `none` formats without fencing, and `auto` picks `pr` when the device supports it. See [Storage Fencing](OPERATIONS.md#storage-fencing) |
+| `-require-fencing` | bool | `false` | Refuse to mount a volume formatted without fencing |
 | `-debug` | bool | `false` | Print `[DEBUG]` log lines |
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
@@ -175,7 +177,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 
 ## HTTP API Health and Shutdown
 
-`GET /health` runs six checks and reports the worst of them:
+`GET /health` runs seven checks and reports the worst of them:
 
 | Check | `ok` | `degraded` | `unhealthy` |
 |-------|------|------------|-------------|
@@ -184,6 +186,7 @@ Mount copies its managers' counters every second. While requests read capacity o
 | `recovery` | No replay is running | This node replays the journal of a crashed node, or that replay failed 3 times in a row with the same error | |
 | `broadcast` | Working, or off with `-broadcast=false` | The last invalidation send failed, or multicast is unavailable and no unicast peers are known | |
 | `broadcast-peers` | This node hears every node the registry shows mounted, or broadcast is off | A mounted node has not been heard on broadcast for 3 `-broadcast-heartbeat` intervals: multicast may not reach this node, or that node runs with `-broadcast=false` or another `-mcast-group` or `-mcast-port`. This node sees that node's changes in directories only after `-cache-ttl` | |
+| `fencing` | Always; the message starts with `none:` on a volume without storage fencing | | |
 | `heartbeat` | This node's last heartbeat reached its registry slot within 2 seconds | The last heartbeat is older than that. Heartbeats are writes to the shared device, so a slow device delays them; at 5 seconds the node stops | |
 
 `ok` and `degraded` answer 200; `unhealthy` answers 503. Degraded means the mount works with a problem: during a replay, files the crashed node had locked wait until it ends, and with broadcast down, peers see this node's changes only after `-cache-ttl`. Unhealthy means file operations fail. A mount that is not running refuses the connection. A node that loses its registry slot, or whose heartbeats fail for 5 seconds, stops at once rather than reporting degraded: its slot's journal and locks may already belong to a node that replays them, and two nodes must never share a journal. The `heartbeat` check warns before that happens. A check that is not `ok` has a `message` that says what to do. `gfsctl health` exits 0, 1 or 4 for the three states.
