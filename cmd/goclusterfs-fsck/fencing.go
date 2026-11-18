@@ -1,11 +1,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"syscall"
 
 	"github.com/supporttools/GoClusterFS/internal/fence"
+	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/node"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -68,4 +72,59 @@ func mountedHere(dev *storage.Device, sb *superblock.Superblock) (uint64, bool) 
 		}
 	}
 	return 0, false
+}
+
+// clearReservations lists the reservation keys on devicePath and, with confirm, removes every key and the reservation.
+// It refuses while fsck sees a node running; force only lets it clear a device fsck cannot read as a volume.
+func clearReservations(out io.Writer, dev *storage.Device, devicePath string, confirm, force bool) error {
+	slots, err := fsck.New(dev, fsck.Options{Output: io.Discard}).Slots()
+	switch {
+	case err != nil && !force:
+		return fmt.Errorf("clearing refused: fsck cannot tell whether a node runs (%v); pass -force to clear anyway", err)
+	case err != nil:
+		_, _ = fmt.Fprintf(out, "fsck cannot read %s as a volume (%v), so it cannot check for running nodes.\n", devicePath, err)
+	}
+	var running []string
+	for _, s := range slots {
+		if s.Running {
+			running = append(running, s.Name())
+		}
+	}
+	if len(running) > 0 {
+		return fmt.Errorf("clearing refused: the filesystem is mounted by %s; unmount it on every node first", strings.Join(running, ", "))
+	}
+	f, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s for its reservations failed: %w", devicePath, err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return fmt.Errorf("clearing refused: another process on this host holds %s for fencing, maybe a stopped goclusterfs-mount (%v)", devicePath, err)
+	}
+	pr := fence.Block(f, fence.ToolKey())
+	keys, err := pr.Keys()
+	switch {
+	case errors.Is(err, fence.ErrPartition):
+		return fmt.Errorf("%s: %w", devicePath, err)
+	case errors.Is(err, fence.ErrUnsupported):
+		_, _ = fmt.Fprintf(out, "This kernel or device cannot list the reservation keys on %s.\n", devicePath)
+	case err != nil:
+		_, _ = fmt.Fprintf(out, "Listing the reservation keys on %s failed: %v\n", devicePath, err)
+	case len(keys) == 0:
+		_, _ = fmt.Fprintf(out, "%s holds no reservation keys.\n", devicePath)
+	default:
+		_, _ = fmt.Fprintf(out, "Reservation keys on %s (nodes' start with 0x4743, format's and fsck's with 0x4746):\n", devicePath)
+		for _, key := range keys {
+			_, _ = fmt.Fprintf(out, "  %#016x\n", key)
+		}
+	}
+	if !confirm {
+		_, err := fmt.Fprintln(out, "Nothing was changed. Pass -confirm to remove every key and the reservation.")
+		return err
+	}
+	if err := pr.Clear(); err != nil {
+		return fmt.Errorf("clearing the reservations of %s failed: %w", devicePath, err)
+	}
+	_, err = fmt.Fprintf(out, "Removed every reservation key and the reservation from %s. Until a node mounts it again, any host can write to it.\n", devicePath)
+	return err
 }

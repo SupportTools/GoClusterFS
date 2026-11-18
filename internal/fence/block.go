@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -47,6 +48,8 @@ var (
 	iocRegister     = ioc(1, 200, unsafe.Sizeof(registration{}))
 	iocReserve      = ioc(1, 201, unsafe.Sizeof(reservation{}))
 	iocPreemptAbort = ioc(1, 204, unsafe.Sizeof(preemption{}))
+	iocClear        = ioc(1, 205, unsafe.Sizeof(clearing{}))
+	iocReadKeys     = ioc(3, 206, unsafe.Sizeof(keyList{}))
 )
 
 func ioc(dir, nr, size uintptr) uintptr { return dir<<30 | size<<16 | 'p'<<8 | nr }
@@ -65,6 +68,19 @@ type preemption struct {
 	own, victim uint64
 	typ, flags  uint32
 }
+
+type clearing struct {
+	key        uint64
+	flags, pad uint32
+}
+
+type keyList struct {
+	generation, count uint32
+	keys              uintptr
+}
+
+// maxListedKeys bounds a key listing: a volume has at most 64 nodes, plus fsck's and format's keys.
+const maxListedKeys = 256
 
 func (d blockDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
 	if d.partition {
@@ -106,4 +122,23 @@ func (d blockDevice) reserve(key uint64) error {
 func (d blockDevice) preemptAbort(own, victim uint64) error {
 	p := preemption{own: own, victim: victim, typ: typeWriteExclusiveAllRegs}
 	return d.ioctl(iocPreemptAbort, unsafe.Pointer(&p))
+}
+
+func (d blockDevice) clear(key uint64) error {
+	c := clearing{key: key}
+	return d.ioctl(iocClear, unsafe.Pointer(&c))
+}
+
+func (d blockDevice) readKeys() ([]uint64, error) {
+	keys := make([]uint64, maxListedKeys)
+	list := keyList{count: maxListedKeys, keys: uintptr(unsafe.Pointer(&keys[0]))}
+	err := d.ioctl(iocReadKeys, unsafe.Pointer(&list))
+	runtime.KeepAlive(keys)
+	if err != nil {
+		return nil, err
+	}
+	if list.count > maxListedKeys {
+		return keys, fmt.Errorf("the device lists %d keys, more than the %d a volume can hold", list.count, maxListedKeys)
+	}
+	return keys[:list.count], nil
 }

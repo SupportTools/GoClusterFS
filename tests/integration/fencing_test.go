@@ -14,7 +14,8 @@ import (
 )
 
 // A file image has no persistent reservations: -fencing=pr refuses to format it, the default formats it unfenced with
-// a warning that /health repeats, and -require-fencing refuses to mount it.
+// a warning that /health repeats, and -require-fencing refuses to mount it. fsck -clear-reservations refuses while a
+// node runs, and once none does, reports that the image has no reservations.
 func TestFencingOnAFileImage(t *testing.T) {
 	binary, err := findBinary()
 	if err != nil {
@@ -49,8 +50,20 @@ func TestFencingOnAFileImage(t *testing.T) {
 	if !strings.Contains(health, `"fencing"`) || !strings.Contains(health, "none: this volume has no storage fencing") {
 		t.Errorf("/health does not report the missing fencing:\n%s", health)
 	}
+	fsckBinary := findFsckBinary(t)
+	clear := func() (string, error) {
+		out, err := exec.Command(fsckBinary, "-clear-reservations", "-confirm", mfs.ImagePath).CombinedOutput()
+		return string(out), err
+	}
+	if out, err := clear(); err == nil || !strings.Contains(out, "clearing refused: the filesystem is mounted by") {
+		t.Errorf("fsck -clear-reservations while a node runs: %v\n%s", err, out)
+	}
 	if err := mfs.Unmount(); err != nil {
 		t.Fatal(err)
+	}
+	if out, err := clear(); err == nil || !strings.Contains(out, "cannot list the reservation keys") ||
+		!strings.Contains(out, "does not support persistent reservations") {
+		t.Errorf("fsck -clear-reservations -confirm on a file image: %v\n%s", err, out)
 	}
 
 	mountPoint := filepath.Join(t.TempDir(), "mnt")
@@ -97,7 +110,7 @@ func TestFencingOnAPartition(t *testing.T) {
 		if _, err := os.Stat(part); err == nil {
 			break
 		} else if time.Now().After(deadline) {
-			t.Fatalf("%s did not appear: %v", part, err)
+			t.Skipf("%s did not appear, as with a static /dev in a container: %v", part, err)
 		}
 	}
 

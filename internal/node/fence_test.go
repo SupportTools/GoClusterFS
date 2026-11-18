@@ -148,6 +148,74 @@ func TestMountingIntoADeadSlotPreempts(t *testing.T) {
 	}
 }
 
+// A mount waits out another host's slot before it takes it, and revokes the owner's key only after that wait: a slot
+// whose heartbeat moves keeps its owner's key, and a silent one is preempted no sooner than silentSlotWatch.
+func TestMountPreemptsOnlyAfterTheSilenceWatch(t *testing.T) {
+	defer func(watch time.Duration) { silentSlotWatch = watch }(silentSlotWatch)
+	silentSlotWatch = 2 * time.Second
+	for _, beating := range []bool{true, false} {
+		dev, cleanup := createTestDevice(t, 1<<20)
+		target := fence.NewTarget()
+		owner := NewRegistry(dev, 0)
+		ownerKey := target.Node("owner", fence.NodeKey(owner.LocalUUID()))
+		if err := ownerKey.Register(); err != nil {
+			t.Fatal(err)
+		}
+		slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: owner.LocalUUID(), HeartbeatSeq: 1,
+			HeartbeatTime: time.Now().Unix(), JournalOffset: 1 << 20, JournalSize: 4 << 20}
+		copy(slot.Hostname[:], "other-host")
+		writeOwnerSlot := func() {
+			owner.mu.Lock()
+			defer owner.mu.Unlock()
+			if err := owner.writeSlot(0, slot); err != nil {
+				t.Error(err)
+			}
+		}
+		writeOwnerSlot()
+		stop, stopped := make(chan struct{}), make(chan struct{})
+		go func() {
+			defer close(stopped)
+			for beating {
+				select {
+				case <-stop:
+					return
+				case <-time.After(200 * time.Millisecond):
+				}
+				slot.HeartbeatSeq++
+				slot.HeartbeatTime = time.Now().Unix()
+				writeOwnerSlot()
+			}
+		}()
+
+		mounting := NewRegistry(dev, 0)
+		own := target.Node("mounting", fence.NodeKey(mounting.LocalUUID()))
+		if err := own.Register(); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		var preemptedAfter time.Duration
+		mounting.SetPreempter(func(owner [16]byte) error {
+			preemptedAfter = time.Since(start)
+			return own.Preempt(fence.NodeKey(owner))
+		})
+		mounting.PreferSlot(0)
+		got, err := mounting.Register(context.Background(), "this-host")
+		close(stop)
+		<-stopped
+		cleanup()
+		switch {
+		case err != nil:
+			t.Fatalf("beating=%v: register: %v", beating, err)
+		case beating && (got == 0 || len(target.Preempted()) != 0):
+			t.Errorf("a live owner's slot: took slot %d and preempted %x; want another slot and no preempt", got, target.Preempted())
+		case !beating && (got != 0 || !slices.Equal(target.Preempted(), []uint64{ownerKey.Key()})):
+			t.Errorf("a silent owner's slot: took slot %d and preempted %x; want slot 0 and its owner's key", got, target.Preempted())
+		case !beating && preemptedAfter < silentSlotWatch:
+			t.Errorf("preempted a silent owner after %v, before the %v watch ended", preemptedAfter, silentSlotWatch)
+		}
+	}
+}
+
 // The device can refuse the heartbeat's own write, which holds the registry lock. Fenced must still stop the node once
 // and refuse its later writes.
 func TestFencedStopsTheNodeOnce(t *testing.T) {
