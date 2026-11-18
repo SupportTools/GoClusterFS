@@ -24,15 +24,16 @@ func (r *Registry) KickOrphans() {
 // failed node's inode lock, which only that node's replay frees.
 func (r *Registry) orphanLoop() {
 	defer r.heartbeatWg.Done()
+	stop := r.stopCh
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
-		<-r.stopCh
+		<-stop
 		cancel()
 	}()
 	for {
 		select {
-		case <-r.stopCh:
+		case <-stop:
 			return
 		case <-r.orphanKick:
 			if slots, err := r.readAllSlots(); err == nil {
