@@ -607,8 +607,8 @@ func TestQuiesceWaitsForIOInFlightAndHoldsNewIO(t *testing.T) {
 		read <- err
 	}()
 	select {
-	case <-read:
-		t.Fatal("a read ran while Quiesce held the device")
+	case err := <-read:
+		t.Fatalf("a read ran while Quiesce held the device: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
 	releaseQuiesce()
