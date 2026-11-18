@@ -2235,6 +2235,13 @@ scenarios:
     environments:
       go: internal/fsck/inspect_test.go::TestInspectSlot
 
+  - id: replay-rejects-inode-past-table
+    name: Replay refuses an inode number past the inode table
+    description: A record naming inode 2^32+2, or any number at or past the inode table's size, as the inode a create, delete, extent change or rename writes or as the child a directory entry gets, fails replay with ErrInodeOutOfRange and changes nothing, instead of wrapping onto a real inode such as the root
+    priority: go_only
+    environments:
+      go: internal/journal/cross_node_recovery_test.go::TestReplayRefusesInodePastTheTable
+
   - id: journal-entry-touches
     name: Journal entries name what they change
     description: EntryTouches decodes every journal entry type and returns the inodes and block runs it changes, and an error for a payload that does not decode
