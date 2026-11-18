@@ -4228,6 +4228,9 @@ func (f *FS) DeleteOrphanSnapshot(ctx context.Context, name string) error {
 	return f.dropSnapshot(ctx, desc.SnapshotID)
 }
 
+// snapshotOrphan reports whether d's file has no name left to reach it through:
+// it was freed, its slot holds a later file, or it was unlinked while a node
+// still holds it open.
 func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
 	ino, err := f.inodeTbl.Read(d.TargetInode)
 	if errors.Is(err, inode.ErrInodeOutOfRange) {
@@ -4236,7 +4239,7 @@ func (f *FS) snapshotOrphan(d *snapshot.Descriptor) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return ino.Magic == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
+	return ino.Magic == 0 || ino.LinkCount == 0 || !d.BelongsTo(snapshot.Target{Inode: d.TargetInode, Birth: ino.BirthGeneration}), nil
 }
 
 // blockExtent returns the single block of ext at offset, so per-block checks
