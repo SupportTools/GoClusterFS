@@ -875,28 +875,28 @@ scenarios:
 
   - id: hostile-storage-short-stalls
     name: Short storage stalls on one node
-    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; no node is declared dead, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: One node's path to the shared disk stalls for 5s and then 12s (dm suspend) while both nodes create files; the node keeps running and is never replayed, during the 5s stall its peer never waits on it as a failing node (a node counts as failing after 10s of silence), every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_short_stalls
 
   - id: hostile-storage-long-stall
     name: Long storage stall fences the node
-    description: One node's path stalls for 30s; the node stops, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: One node's path stalls for 25s and then 35s. After 25s the node either keeps running with its slot untouched, or is replayed and stops on finding its slot taken without acknowledging new creates. After 35s it must be replayed 17 to 32s after the stall began (deadAfter judged at FailureCheckInterval scans) and stop that way. Every acknowledged file reads back and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_long_stall
 
   - id: hostile-storage-short-eio
     name: Short EIO burst on one node
-    description: Every I/O on one node's path fails for 2s; the node keeps running unreplayed, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: Every I/O on one node's path fails for 2s; the node keeps running, its peer never waits on it as a failing node or replays it, every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_short_eio
 
   - id: hostile-storage-long-eio
     name: Long EIO burst fences the node
-    description: Every I/O on one node's path fails for 10s; the node fences itself, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
+    description: Every I/O on one node's path fails for 8s; the node stops itself once its heartbeat writes have failed for 5 to 9s, its peer replays it, every acknowledged file reads back, and fsck finds nothing but leaks
     priority: vm_only  # needs a device-mapper device under one node's mount
     environments:
       vm: run-vm-tests.sh::test_storage_long_eio
