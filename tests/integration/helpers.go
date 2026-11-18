@@ -317,8 +317,9 @@ func processExited(p *os.Process) bool {
 }
 
 // mountWait is how long a mount may take: one whose -skip-recovery names
-// another host's slot watches it for about 12 seconds before taking it.
-const mountWait = 30 * time.Second
+// another host's slot with a damaged journal looks for running nodes for 11
+// seconds, then watches the slot for 20 seconds before taking it.
+const mountWait = 45 * time.Second
 
 func (m *MountedFS) WaitForMount(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
