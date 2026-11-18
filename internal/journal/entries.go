@@ -3,6 +3,7 @@ package journal
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -102,6 +103,29 @@ func (op TxnOpType) String() string {
 	default:
 		return "Unknown"
 	}
+}
+
+// Known reports whether this build defines op. A newer build may log ops an older one does not know.
+func (op TxnOpType) Known() bool {
+	return op.String() != "Unknown"
+}
+
+// ErrUnknownOp is a journal entry whose op type this build does not define. Replay stops at its transaction rather
+// than skip it, since skipping would leave the operation half applied.
+var ErrUnknownOp = errors.New("cannot replay: unknown op")
+
+func unknownOp(op TxnOpType) error {
+	return fmt.Errorf("%w %#04x", ErrUnknownOp, uint32(op))
+}
+
+// unknownOpIn returns the error for the first entry of txn whose op type this build does not define, or nil.
+func unknownOpIn(txn *RecoveredTxn) error {
+	for _, e := range txn.Entries {
+		if !e.Entry.OpType.Known() {
+			return unknownOp(e.Entry.OpType)
+		}
+	}
+	return nil
 }
 
 // ============================================================================

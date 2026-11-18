@@ -300,7 +300,18 @@ func (sb *JournalSuperblock) NeedsRecovery() bool {
 func (sb JournalSuperblock) checkState() error {
 	switch sb.State {
 	case JournalStateClean, JournalStateDirty, JournalStateRecovering:
-		return nil
+		return sb.checkVersion()
 	}
 	return fmt.Errorf("%w: its state is %s", ErrJournalCorrupt, sb.State)
+}
+
+// ErrJournalTooNew is a journal in a format newer than this build reads.
+var ErrJournalTooNew = errors.New("journal format is newer than this build")
+
+// checkVersion refuses a journal a newer build wrote in a format this one does not know.
+func (sb JournalSuperblock) checkVersion() error {
+	if sb.Version > JournalVersion {
+		return fmt.Errorf("%w: version %d, this build reads up to %d; replay it with a newer build", ErrJournalTooNew, sb.Version, JournalVersion)
+	}
+	return nil
 }

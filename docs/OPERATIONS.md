@@ -353,6 +353,7 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 
 - **Storage or replay errors** (an I/O error, or `journal recovery failed: ...`): the journal stays in recovery. Fix the storage and mount again without `-skip-recovery`; the replay resumes.
 - **A damaged journal header** (`journal superblock checksum mismatch`, `invalid journal magic`, or `journal is corrupt`): the journal cannot be replayed. Only then use `-skip-recovery=N`, with the slot number N from the error, which discards slot N's journal.
+- **A journal from a newer build** (`cannot replay: unknown op 0x...`, or `journal format is newer than this build`): this build stops rather than skip what it cannot read, and applies nothing from that transaction on. Replay the journal by mounting a node with the newer build. Peers of the older build fail the same way and keep the slot for you.
 
 `-skip-recovery` is for emergencies only: it throws away changes the node had committed, which may have been only partly applied. Never put it in a unit file or script. `goclusterfs-fsck -list-slots` shows each slot's journal state first, and `goclusterfs-fsck -inspect-slot N` lists every transaction a replay of slot N would apply, with the inodes and blocks each one touches. Both only read, so they run while nodes have the filesystem mounted.
 

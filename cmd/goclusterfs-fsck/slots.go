@@ -182,11 +182,11 @@ func printTxns(p *printer, in *fsck.SlotInspection, mark func(fsck.PendingTxn) s
 		}
 		p.printf("  %s%s\n", prefix, txnLine(t))
 		if t.DecodeErr != nil {
-			p.printf("    a replay cannot decode it: %v\n", t.DecodeErr)
+			p.printf("    a replay fails here: %v\n", t.DecodeErr)
 		}
 	}
 	if in.ScanErr != nil {
-		p.printf("  the scan stopped after txn %s: %v. Nothing after it can be read.\n", lastSeq(in.Pending), in.ScanErr)
+		p.printf("  the scan stopped after txn %s: %v. A replay stops there too.\n", lastSeq(in.Pending), in.ScanErr)
 	}
 }
 
