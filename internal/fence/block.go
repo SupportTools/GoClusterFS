@@ -3,14 +3,36 @@ package fence
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // Block fences through the block layer's persistent reservation ioctls on f, which SCSI and NVMe disks implement.
-func Block(f *os.File, key uint64) *PR { return &PR{dev: blockDevice{f}, key: key} }
+func Block(f *os.File, key uint64) *PR {
+	return &PR{dev: blockDevice{f: f, partition: isPartition(f)}, key: key}
+}
 
-type blockDevice struct{ f *os.File }
+type blockDevice struct {
+	f         *os.File
+	partition bool
+}
+
+// isPartition reports whether f is a block device that sysfs lists as a partition.
+func isPartition(f *os.File) bool {
+	var st unix.Stat_t
+	if unix.Fstat(int(f.Fd()), &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return false
+	}
+	return partitionIn("/sys/dev/block", st.Rdev)
+}
+
+func partitionIn(sysDevBlock string, rdev uint64) bool {
+	_, err := os.Stat(filepath.Join(sysDevBlock, fmt.Sprintf("%d:%d", unix.Major(rdev), unix.Minor(rdev)), "partition"))
+	return err == nil
+}
 
 const (
 	typeWriteExclusiveAllRegs = 5
@@ -45,6 +67,9 @@ type preemption struct {
 }
 
 func (d blockDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
+	if d.partition {
+		return ErrPartition
+	}
 	r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), req, uintptr(arg))
 	return ioctlResult(r, errno)
 }

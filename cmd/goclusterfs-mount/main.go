@@ -776,10 +776,12 @@ func formatFencer(devicePath, mode string) fence.Fencer {
 	err := pr.Register()
 	switch {
 	case errors.Is(err, fence.ErrUnsupported) && mode == "auto":
-		log.Printf("[WARN] %s does not support persistent reservations, so this volume is formatted without storage fencing: "+
+		log.Printf("[WARN] %s: %v, so this volume is formatted without storage fencing: "+
 			"if a node stalls, its last writes can land after another node takes over and corrupt metadata. "+
-			"Format on a device with persistent reservations, and mount with -require-fencing to refuse unfenced volumes", devicePath)
+			"Format a whole disk with persistent reservations, and mount with -require-fencing to refuse unfenced volumes", devicePath, err)
 		return fence.None{}
+	case errors.Is(err, fence.ErrPartition):
+		failf("-fencing=%s: %s: %v; format the whole disk, or pass -fencing=none", mode, devicePath, err)
 	case err != nil:
 		failf("-fencing=%s: registering a reservation key on %s failed: %v; format as root on a device with persistent reservations, or pass -fencing=none", mode, devicePath, err)
 	}

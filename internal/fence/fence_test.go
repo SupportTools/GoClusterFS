@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestNodeKey(t *testing.T) {
@@ -94,6 +96,43 @@ func TestBlockOnRegularFileIsUnsupported(t *testing.T) {
 	defer func() { _ = f.Close() }()
 	if err := Block(f, ToolKey()).Register(); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("register on a regular file: %v, want ErrUnsupported", err)
+	}
+}
+
+// A reservation covers the whole disk, so a partition gets ErrPartition, which auto treats as unsupported, before any
+// command reaches the device.
+func TestPartitionRefusesEveryReservationCommand(t *testing.T) {
+	pr := &PR{dev: blockDevice{partition: true}, key: ToolKey()}
+	for name, err := range map[string]error{
+		"register": pr.Register(),
+		"reserve":  pr.Reserve(),
+		"preempt":  pr.Preempt(NodeKey([16]byte{1})),
+	} {
+		if !errors.Is(err, ErrPartition) || !errors.Is(err, ErrUnsupported) {
+			t.Errorf("%s on a partition: %v, want ErrPartition, which is ErrUnsupported", name, err)
+		}
+	}
+}
+
+func TestPartitionInSysfs(t *testing.T) {
+	sysfs := t.TempDir()
+	for _, dir := range []string{"8:0", "8:1", "259:3"} {
+		if err := os.Mkdir(filepath.Join(sysfs, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, part := range []string{"8:1", "259:3"} {
+		if err := os.WriteFile(filepath.Join(sysfs, part, "partition"), []byte("1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		major, minor uint32
+		want         bool
+	}{{8, 0, false}, {8, 1, true}, {259, 3, true}, {7, 0, false}} {
+		if got := partitionIn(sysfs, unix.Mkdev(tc.major, tc.minor)); got != tc.want {
+			t.Errorf("partitionIn(%d:%d) = %v, want %v", tc.major, tc.minor, got, tc.want)
+		}
 	}
 }
 

@@ -11,6 +11,9 @@ import (
 
 var (
 	ErrUnsupported = errors.New("the device does not support persistent reservations")
+	// ErrPartition is ErrUnsupported for a partition: a reservation covers the whole disk, and Linux 6.5 and later refuse
+	// it on a partition.
+	ErrPartition = fmt.Errorf("%w on a partition, only on the whole disk", ErrUnsupported)
 	// ErrFenced means another node removed this node's key: the storage refuses its writes.
 	ErrFenced             = errors.New("this node's reservation key is gone: another node revoked its access to the device")
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
