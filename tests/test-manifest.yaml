@@ -3703,11 +3703,18 @@ scenarios:
       go: internal/goclusterfs/snapshot_test.go::TestSnapshotDuringInPlaceWriteAcrossNodes
 
   - id: cow-keeps-concurrent-inplace-write
-    name: Copy-on-write keeps an in-place write landing on another node
-    description: Node A is writing a block in place when node B's snapshot counts it and node C copies it; C copies the data only under the exclusive inode lock, after A's write landed, so neither write is lost
+    name: Copy-on-write waits for an in-place write landing on another node
+    description: Node A is writing a block in place when the block gains a second owner and node C starts a write to the same file that must copy it; C waits for A's write to end, so its copy holds A's data and neither write is lost
     priority: go_only
     environments:
-      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsConcurrentInPlaceWrite
+      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteWaitsForConcurrentInPlaceWrite
+
+  - id: cow-keeps-inplace-write-below-io-lock
+    name: Copy-on-write keeps an in-place write that got past the file I/O lock
+    description: With node A's in-place write below the file I/O lock, node B's snapshot counts the block and node C copies it; C copies the data only under the exclusive inode lock, after A's write landed, so neither write is lost
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_test.go::TestCopyOnWriteKeepsInPlaceWriteBelowIOLock
 
   - id: snapshot-mark-keeps-concurrent-append
     name: Snapshot mark keeps another node's append
