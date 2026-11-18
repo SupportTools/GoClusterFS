@@ -358,6 +358,15 @@ func (f *FS) Close() error {
 	if f.reserve != nil {
 		ShutdownStep("block reserve return", func() { f.reserve.Stop(context.Background()) })
 	}
+	if f.extentMgr != nil {
+		ShutdownStep("waiting block frees", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if left := f.extentMgr.FlushDeferred(ctx); left > 0 {
+				log.Printf("[WARN] %d freed blocks stay allocated: their frees kept waiting for a lock. goclusterfs-fsck -repair gives them back", left)
+			}
+		})
+	}
 
 	// Stop TRIM manager to flush pending discards
 	if f.trimMgr != nil {
