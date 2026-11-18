@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Hard links for regular files: `link(2)` gives a file another name, up to 65,000. Directories and symlinks get `EPERM`, and a file with no link left gets `ENOENT`. The journal records the added link, and `goclusterfs-fsck` checks each regular file's link count against its names; `-repair` sets it to the names it finds.
 - Symlinks: `ln -s`, `readlink`, `lstat`, `lchown` and `touch -h`. A target of up to 92 bytes is kept in the inode, a longer one, up to 4095 bytes, in one data block. Creating a link is one journal transaction, so a crash leaves either no name or the whole target. fsck checks symlink inodes, targets and entry types and reports bad ones without repairing them. Snapshots and clones of a symlink are refused, as the kernel refuses user xattrs on symlinks.
 - `goclusterfs-mount`: a FUSE filesystem that several Linux nodes can mount from one shared block device.
 - `-format` sizes the block bitmap, refcount table and inode table from the device. `-bytes-per-inode` sets the inode count (default one per MB of device, 4096 to 16,777,216).
