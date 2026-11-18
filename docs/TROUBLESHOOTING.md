@@ -432,9 +432,9 @@ fusermount3 -u /mnt/cluster
 
 ### Heartbeat Failures
 
-**Symptom**: A mount stops with `heartbeats to node registry slot N have failed`, or `Node registry slot N is no longer this node's`.
+**Symptom**: A mount stops with `heartbeats to node registry slot N have failed`, `Node registry slot N is no longer this node's`, or `Node registry slot N may no longer be this node's`.
 
-**Cause**: Node heartbeats are writes to the shared device every second, not network messages. A node stops when its heartbeat writes fail for 5 seconds, or when another node took its slot after it looked dead (heartbeat older than 10 seconds to a new mount, about 20 seconds to running nodes).
+**Cause**: Node heartbeats are writes to the shared device every second, not network messages. A node stops when its heartbeat writes fail for 5 seconds, when it went more than 10 seconds between heartbeats (a paused process or VM, or the host clock stepped forward), or when another node took its slot after it looked dead (heartbeat older than 10 seconds to a new mount, about 20 seconds to running nodes).
 
 **Solutions**:
 ```bash

@@ -1110,6 +1110,7 @@ func TestSlotLossMessages(t *testing.T) {
 		{SlotLoss{Slot: 3, Local: local, Taken: true, Owner: other}, "Node registry slot 3 is no longer this node's (owner abcd000000000000)"},
 		{SlotLoss{Slot: 3, Local: local, Taken: true, Owner: local}, "Node registry slot 3 is no longer this node's: a peer declared this node dead"},
 		{SlotLoss{Slot: 3, Local: local, Taken: true}, "Node registry slot 3 is no longer this node's: the slot is empty"},
+		{SlotLoss{Slot: 3, Local: local, Paused: true, Stalled: 24360 * time.Millisecond}, "Node registry slot 3 may no longer be this node's: it went 24.36s without a heartbeat, so a peer may have replayed it"},
 	} {
 		if got := tc.loss.String(); got != tc.want {
 			t.Errorf("%+v: %q, want %q", tc.loss, got, tc.want)
@@ -1745,7 +1746,7 @@ func TestCheckOwnershipWritesHeartbeatAfterPause(t *testing.T) {
 		t.Fatalf("right after Register: %v", err)
 	}
 
-	paused := time.Now().Add(-HeartbeatTimeout)
+	paused := time.Now().Add(-HeartbeatTimeout * 3 / 4)
 	reg.lastBeat.Store(&paused)
 	before, err := reg.readSlot(slot)
 	if err != nil {
@@ -1787,7 +1788,7 @@ func TestCheckOwnershipFailsOnceSlotIsTakenOver(t *testing.T) {
 	if err := reg.CheckOwnership(); err != nil {
 		t.Fatalf("with a recent heartbeat the check needs no read: %v", err)
 	}
-	paused := time.Now().Add(-HeartbeatTimeout)
+	paused := time.Now().Add(-HeartbeatTimeout * 3 / 4)
 	reg.lastBeat.Store(&paused)
 	for range 2 {
 		if err := reg.CheckOwnership(); !errors.Is(err, ErrSlotLost) {
@@ -1818,7 +1819,7 @@ func TestWriteGateRefusesWritesOnceSlotIsLost(t *testing.T) {
 	if err := reg.writeSlot(slot, &Slot{Magic: SlotMagic, State: NodeStateDead, UUID: reg.LocalUUID(), RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Unix()}); err != nil {
 		t.Fatalf("a registry write must pass the gate: %v", err)
 	}
-	paused := time.Now().Add(-HeartbeatTimeout)
+	paused := time.Now().Add(-HeartbeatTimeout * 3 / 4)
 	reg.lastBeat.Store(&paused)
 	if _, err := dev.WriteAt(data.Bytes(), 2<<20); !errors.Is(err, ErrSlotLost) {
 		t.Fatalf("write after peers marked the slot dead: %v, want ErrSlotLost", err)

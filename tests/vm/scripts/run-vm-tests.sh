@@ -3454,8 +3454,8 @@ test_stalled_node_writes_stop_at_write_gate() {
         log_error "VM $stalled did not stop after resuming from its takeover"
         result=1
     fi
-    if ! sed -n "/$marker/,\$p" "$stalled_log" | grep -q "checking the slot before a write"; then
-        log_error "VM $stalled stopped without its write gate checking the slot"
+    if ! sed -n "/$marker/,\$p" "$stalled_log" | grep -qE "checking the slot before a write|may no longer be this node's"; then
+        log_error "VM $stalled stopped without its write gate or heartbeat checking the slot"
         result=1
     fi
 

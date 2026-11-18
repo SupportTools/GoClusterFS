@@ -238,11 +238,16 @@ type SlotLoss struct {
 	// Local is this node's UUID, and Stalled how long its heartbeats had failed.
 	Local   [16]byte
 	Stalled time.Duration
+	// Paused is set when this node went so long without a heartbeat that a peer may have replayed it.
+	Paused bool
 }
 
 // String names the loss for a log line, with "owner" only when another node holds the slot.
 func (l SlotLoss) String() string {
 	switch {
+	case l.Paused:
+		return fmt.Sprintf("Node registry slot %d may no longer be this node's: it went %v without a heartbeat, so a peer may have replayed it",
+			l.Slot, l.Stalled.Round(time.Millisecond))
 	case !l.Taken:
 		return fmt.Sprintf("Heartbeats to registry slot %d failed for %v", l.Slot, l.Stalled.Round(time.Millisecond))
 	case l.Owner == l.Local:
@@ -699,50 +704,74 @@ func (r *Registry) heartbeatLoop(slotIdx int) {
 	}
 }
 
+// afterBeatRead lets tests pause a heartbeat between its slot read and its write, as a stall would.
+var afterBeatRead func()
+
 // beat writes a heartbeat while slotIdx is still this node's. Peers prove a
 // silent node dead and take its locks, so a node whose slot was taken over, or
 // whose heartbeats have failed for HeartbeatTimeout/2, must stop: beat tells the
-// slot-lost handler once and returns ErrSlotLost.
+// slot-lost handler once and returns ErrSlotLost. So must a node that went
+// HeartbeatTimeout without a beat, before its write or by the time the write
+// completed: a peer may have replayed it and emptied or reused the slot since
+// the read, and writing the stale copy back would make two owners.
 func (r *Registry) beat(slotIdx int) error {
 	r.mu.Lock()
 	slot, err := r.readSlot(slotIdx)
+	if afterBeatRead != nil {
+		afterBeatRead()
+	}
 	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
 	takenOver := err == nil && !ours
-	if ours {
+	paused := r.sinceLastBeat()
+	if ours && paused <= HeartbeatTimeout {
 		r.beatSeq++
 		slot.HeartbeatSeq = r.beatSeq
 		slot.HeartbeatTime = time.Now().Unix()
+		issued := time.Now()
 		if r.writeSlot(slotIdx, slot) == nil {
-			now := time.Now()
-			r.lastBeat.Store(&now)
+			if paused = r.sinceLastBeat(); paused <= HeartbeatTimeout {
+				r.lastBeat.Store(&issued)
+			}
 		}
 	}
 	onSlotLost := r.onSlotLost
 	r.mu.Unlock()
 
 	sinceBeat := r.sinceLastBeat()
-	if !takenOver && sinceBeat <= HeartbeatTimeout/2 {
+	var loss SlotLoss
+	switch {
+	case takenOver:
+		loss = SlotLoss{Slot: slotIdx, Taken: true, Owner: slot.UUID, Local: r.localUUID, Stalled: sinceBeat}
+	case paused > HeartbeatTimeout:
+		loss = SlotLoss{Slot: slotIdx, Paused: true, Local: r.localUUID, Stalled: paused}
+	case sinceBeat > HeartbeatTimeout/2:
+		loss = SlotLoss{Slot: slotIdx, Local: r.localUUID, Stalled: sinceBeat}
+	default:
 		return nil
 	}
-	if r.lost.CompareAndSwap(false, true) {
-		loss := SlotLoss{Slot: slotIdx, Taken: takenOver, Local: r.localUUID, Stalled: sinceBeat}
-		if takenOver {
-			loss.Owner = slot.UUID
-		}
-		if onSlotLost != nil {
-			onSlotLost(loss)
-		} else {
-			log.Printf("ERROR: %s; this node no longer owns its journal region", loss)
-		}
-	}
+	r.loseSlot(loss, onSlotLost)
 	return ErrSlotLost
+}
+
+// loseSlot tells the slot-lost handler, once, that this node lost its slot.
+func (r *Registry) loseSlot(loss SlotLoss, onSlotLost func(SlotLoss)) {
+	if !r.lost.CompareAndSwap(false, true) {
+		return
+	}
+	if onSlotLost != nil {
+		onSlotLost(loss)
+	} else {
+		log.Printf("ERROR: %s; this node no longer owns its journal region", loss)
+	}
 }
 
 // CheckOwnership returns nil while this node still owns its registry slot and
 // ErrSlotLost once it may not, so a node that stalled past its failover stops
 // writing. A heartbeat written within HeartbeatTimeout/2 proves ownership
 // without I/O, because peers declare a node dead only after 2*HeartbeatTimeout
-// of silence. Otherwise it writes a heartbeat first, as the heartbeat loop would.
+// of silence. Up to HeartbeatTimeout it writes a heartbeat first, as the
+// heartbeat loop would. After longer, no read of the slot proves anything: a
+// stalled heartbeat may already have written it back as this node's.
 func (r *Registry) CheckOwnership() error {
 	if r.lost.Load() {
 		return ErrSlotLost
@@ -757,9 +786,16 @@ func (r *Registry) CheckOwnership() error {
 	}
 	r.mu.RLock()
 	slotIdx := r.localSlot
+	onSlotLost := r.onSlotLost
 	r.mu.RUnlock()
 	if slotIdx < 0 {
 		return ErrNotRegistered
+	}
+	if paused := r.sinceLastBeat(); paused > HeartbeatTimeout {
+		log.Printf("[WARN] node: the last heartbeat to registry slot %d was %v ago; refusing writes without trusting the slot",
+			slotIdx, paused.Round(time.Millisecond))
+		r.loseSlot(SlotLoss{Slot: slotIdx, Paused: true, Local: r.localUUID, Stalled: paused}, onSlotLost)
+		return ErrSlotLost
 	}
 	log.Printf("[WARN] node: the last heartbeat to registry slot %d was %v ago; checking the slot before a write",
 		slotIdx, r.sinceLastBeat().Round(time.Millisecond))
