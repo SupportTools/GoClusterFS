@@ -24,6 +24,8 @@ NODE_COUNT=${NODE_COUNT:-3}
 # A remount after a stop fault has taken 22s just to register on a loaded host.
 export GOCLUSTERFS_MOUNT_TIMEOUT=${GOCLUSTERFS_MOUNT_TIMEOUT:-90}
 source "${SOAK_DIR}/../vm/vm-test-harness.sh" >&2
+# Turns on the API's snapshot writes; the agent sends it to delete orphan snapshots.
+MOUNT_ENV="GOCLUSTERFS_API_TOKEN=soak-api-token"
 
 reply() { echo "$*"; }
 
@@ -43,7 +45,7 @@ kill_mount() {
 }
 
 remount() {
-    kill_mount "$1" && setup_goclusterfs "$1" false
+    kill_mount "$1" && setup_goclusterfs "$1" false "$MOUNT_ENV"
 }
 
 cut_node() {
@@ -63,7 +65,7 @@ cut_node() {
 
 restore_node() {
     if [[ $1 == power ]]; then
-        start_vm "$2" false && wait_vm_healthy "$2" && setup_goclusterfs "$2" false
+        start_vm "$2" false && wait_vm_healthy "$2" && setup_goclusterfs "$2" false "$MOUNT_ENV"
     else
         # After a stop the other nodes declared this one failed and fenced it, so it has to mount again.
         remount "$2"
@@ -96,7 +98,7 @@ handle() {
             done
             for vm_id in $(seq 1 "$NODE_COUNT"); do
                 wait_vm_healthy "$vm_id" >&2 || return 1
-                setup_goclusterfs "$vm_id" "$([[ $vm_id -eq 1 ]] && echo true || echo false)" >&2 || return 1
+                setup_goclusterfs "$vm_id" "$([[ $vm_id -eq 1 ]] && echo true || echo false)" "$MOUNT_ENV" >&2 || return 1
                 ports+=("$(get_vm_ssh_port "$vm_id")")
             done
             reply "ok $(get_ssh_key) ${ports[*]}"
@@ -124,7 +126,7 @@ handle() {
             local vm_id
             for vm_id in $(seq 1 "$NODE_COUNT"); do
                 if ! ssh_run "$vm_id" "mountpoint -q ${GOCLUSTERFS_MOUNT}"; then
-                    setup_goclusterfs "$vm_id" false >&2 || return 1
+                    setup_goclusterfs "$vm_id" false "$MOUNT_ENV" >&2 || return 1
                 fi
             done
             reply ok

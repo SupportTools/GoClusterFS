@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -133,6 +136,10 @@ func serve(root string, req request) response {
 		if resp.Data, err = os.ReadFile(p); err == nil {
 			resp.Size, resp.Sum = int64(len(resp.Data)), sum(resp.Data)
 		}
+	case "apidelete":
+		_, err = callAPI(http.MethodDelete, "/"+url.PathEscape(req.Value))
+	case "apilist":
+		resp.Names, err = listSnapshotsAPI()
 	case "list":
 		var entries []os.DirEntry
 		if entries, err = os.ReadDir(p); err == nil {
@@ -187,4 +194,55 @@ func writeSynced(p string, off int64, data []byte) error {
 		return err
 	}
 	return f.Close()
+}
+
+// apiToken matches GOCLUSTERFS_API_TOKEN in cluster.sh, which turns on the API's snapshot writes.
+const apiToken = "soak-api-token"
+
+var apiClient = &http.Client{Timeout: 5 * time.Minute}
+
+// callAPI sends a request to the node's snapshot API and turns the HTTP status into an errno.
+func callAPI(method, rest string) ([]byte, error) {
+	req, err := http.NewRequest(method, "http://127.0.0.1:8080/api/v1/snapshots"+rest, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return body, nil
+	case http.StatusNotFound:
+		return nil, fmt.Errorf("%s: %w", body, syscall.ENOENT)
+	case http.StatusConflict:
+		return nil, fmt.Errorf("%s: %w", body, syscall.EBUSY)
+	}
+	return nil, fmt.Errorf("HTTP %d: %s: %w", resp.StatusCode, body, syscall.EIO)
+}
+
+// listSnapshotsAPI returns every snapshot on the volume as "name:state".
+func listSnapshotsAPI() ([]string, error) {
+	body, err := callAPI(http.MethodGet, "")
+	if err != nil {
+		return nil, err
+	}
+	var list struct {
+		Snapshots []struct {
+			Name  string `json:"name"`
+			State string `json:"state"`
+		} `json:"snapshots"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(list.Snapshots))
+	for _, s := range list.Snapshots {
+		names = append(names, s.Name+":"+s.State)
+	}
+	return names, nil
 }

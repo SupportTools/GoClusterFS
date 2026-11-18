@@ -2,8 +2,9 @@
 
 `goclusterfs-soak` runs a random mix of operations on a 3-VM cluster for hours or days and checks every node against a model of the expected state.
 
-- **Operations:** create, write (overwrite, append, sparse), truncate, unlink, mkdir, rmdir, rename, symlink, snapshot, clone, clone from a snapshot, and snapshot delete. Renames move a lane's files, links and directories, replace its other entries, or fail as rename(2) does: a missing source or parent, a file onto a directory or the reverse, a directory onto one with entries, an entry onto a directory that holds it, or a directory into itself.
+- **Operations:** create, write (overwrite, append, sparse), truncate, unlink, mkdir, rmdir, rename, symlink, hard link, snapshot, clone, clone from a snapshot, snapshot delete, and orphan snapshot delete. Renames move a lane's files, links and directories, replace its other entries, or fail as rename(2) does: a missing source or parent, a file onto a directory or the reverse, a directory onto one with entries, an entry onto a directory that holds it, or a directory into itself.
 - **Lanes:** several lanes run at once, each on its own files and snapshots, in directories they share.
+- **Orphan snapshots:** a snapshot whose file has no names left is an orphan. Like an operator, each lane leaves a few and deletes the rest through the API's no-path `DELETE /api/v1/snapshots/{name}`. The mounts run with a test API token for that.
 - **Checks:** after every operation, each node must show its result, through a fresh open, within `-window` (30s).
   - The window covers `-attr-timeout` and `-cache-ttl`, because broadcast cannot cross the VMs' separate networks.
   - It also covers waiting out a failed node's 10s detection.

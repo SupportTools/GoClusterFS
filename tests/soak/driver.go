@@ -433,7 +433,10 @@ func (d *driver) check(op *Op) {
 		d.model.apply(op)
 		d.model.mu.Unlock()
 	}
-	paths := []string{op.Path}
+	var paths []string
+	if op.Path != "" {
+		paths = append(paths, op.Path)
+	}
 	if op.Path2 != "" && op.Kind != "symlink" {
 		paths = append(paths, op.Path2)
 	}

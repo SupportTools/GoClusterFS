@@ -150,6 +150,23 @@ func (d *driver) observe(n *node, op *Op) (string, error) {
 			return "after", nil
 		}
 		return "before", nil
+	case "orphandelete":
+		resp, err := d.call(n, request{Op: "apilist"})
+		if err != nil {
+			return "", err
+		}
+		if resp.Errno != 0 {
+			return "", fmt.Errorf("snapshot listing: errno %d (%s)", resp.Errno, resp.Err)
+		}
+		for _, s := range resp.Names {
+			if name, state, _ := strings.Cut(s, ":"); name == op.Name {
+				if state == "deleting" {
+					return "", fmt.Errorf("snapshot %s is %s: %w", op.Name, state, errUnsettled)
+				}
+				return "before", nil
+			}
+		}
+		return "after", nil
 	case "link":
 		if !d.sameContent(n, op.Path, before) {
 			return "", fmt.Errorf("link %s to %s: the source no longer reads its data", op.Path, op.Path2)

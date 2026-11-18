@@ -34,7 +34,7 @@ if grep -q 'goroutine dump begins' /usr/local/bin/goclusterfs-mount; then
   tail -c +$((before + 1)) /var/log/goclusterfs.log
 fi
 echo "== metrics"
-wget -T 3 -qO- http://127.0.0.1:8080/metrics 2>&1 | grep -E '^goclusterfs_(lock|reserve)_|wget'
+wget -T 3 -qO- --header 'Authorization: Bearer soak-api-token' http://127.0.0.1:8080/metrics 2>&1 | grep -E '^goclusterfs_(lock|reserve)_|wget'
 `
 
 const minCaptureGap = time.Minute
