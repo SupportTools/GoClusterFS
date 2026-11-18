@@ -2081,6 +2081,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/snapshot_owner_test.go::TestOrphanSnapshotListedAndDeletable
 
+  - id: orphan-snapshot-of-unlinked-open-file
+    name: A snapshot of a file unlinked while another node holds it open is an orphan
+    description: Before the unlink, deleting the snapshot without its file fails with EBUSY. Once another node unlinks the file while a node still has it open, the full listing marks the snapshot an orphan and the no-path delete removes it; a new snapshot through the open handle fails with ENOENT, the holder keeps reading and writing its data, and after its last close the inode is freed and fsck finds no problem
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/snapshot_owner_test.go::TestSnapshotOfAnUnlinkedFileIsAnOrphanWhileHeld
+
   - id: snapshot-without-birth-is-orphan
     name: A snapshot without its file's birth generation is an orphan
     description: A descriptor as older versions wrote it cannot prove which file it belongs to; the file does not list it, the full listing marks it an orphan, and fsck reports it
