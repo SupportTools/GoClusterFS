@@ -3362,7 +3362,7 @@ mount_pids() {
 # A zombie still passes kill(pid, 0), so a remount before then would not take its own slot back.
 crash_goclusterfs() {
     local vm_id=$1 pids
-    pids=$(echo $(mount_pids "$vm_id"))
+    pids=$(mount_pids "$vm_id" | xargs)
     if [[ -z "$pids" ]]; then
         log_error "VM $vm_id: no goclusterfs-mount process to kill"
         return 1
