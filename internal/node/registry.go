@@ -344,12 +344,12 @@ func (r *Registry) journalRegion(slotIdx int) (offset, size uint64) {
 	return r.journalOffset + uint64(slotIdx)*r.journalSlotSize, r.journalSlotSize
 }
 
-// Register claims a slot in the node registry and returns its index.
-// It first takes back a failed slot of this host, most likely this node's
-// previous incarnation, so the caller replays that journal before serving.
-// Slots of this host in another PID namespace (a restarted container, or a
-// host-network container) cannot be checked by PID; Register waits for each
-// to heartbeat or go stale. Otherwise it takes an empty or failed slot.
+// Register claims a slot in the node registry and returns its index. It
+// prefers a slot of this host, most likely this node's previous incarnation,
+// so the caller replays that journal before serving. It takes such a slot at
+// once if its mount process has exited, and otherwise only after the slot
+// stays unchanged for silentSlotWatch. Next it takes an empty slot, and last
+// another host's slot that stays unchanged for silentSlotWatch.
 func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
