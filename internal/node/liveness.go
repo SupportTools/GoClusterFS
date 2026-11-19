@@ -107,8 +107,8 @@ func (r *Registry) stale(slotIdx int, slot *Slot, timeout time.Duration) bool {
 	return false
 }
 
-// heartbeatOlderThan compares a heartbeat with this node's wall clock. Only a
-// slot this host wrote may be judged so, since only then did the same clock write it.
+// heartbeatOlderThan compares a heartbeat with this node's wall clock. Clocks
+// differ and step, so it only picks slots to watch and never proves a node dead.
 func heartbeatOlderThan(slot *Slot, d time.Duration) bool {
 	return time.Since(time.Unix(slot.HeartbeatTime, 0)) > d
 }
