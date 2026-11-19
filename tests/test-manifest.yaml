@@ -1378,6 +1378,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/failure_frees_test.go::TestFailedWriteFreesItsBlocks
 
+  - id: write-reread-eio
+    name: A write that cannot re-read its inode fails with EIO
+    description: A read error on the inode re-read under the inode lock, or after SFB migration, fails the write with EIO instead of panicking in its cleanup, and the next write succeeds
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_reread_test.go::TestWriteThatCannotRereadItsInodeFailsWithEIO
+
   - id: failed-mkdir-frees-block
     name: Failed mkdirs give back their block
     description: A mkdir whose inode write fails removes its entry and frees the new directory's block; fsck is clean
