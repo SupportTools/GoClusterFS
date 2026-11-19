@@ -57,10 +57,12 @@ func (d *driver) resolve(n *node, op *Op) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	d.model.mu.Lock()
+	defer d.model.mu.Unlock()
+	// Settled before the fault's verify, which must accept only this outcome.
+	delete(d.running, op)
 	if outcome == "after" {
-		d.model.mu.Lock()
 		d.model.apply(op)
-		d.model.mu.Unlock()
 	}
 	return outcome, nil
 }
