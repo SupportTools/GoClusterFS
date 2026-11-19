@@ -366,13 +366,9 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	}
 
 	empty := func(slot *Slot) bool { return slot.State == NodeStateEmpty }
-	ownFailed := func(slot *Slot) bool {
-		return r.sameHost(slot) && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) &&
-			(r.deadLocalOwner(slot) || heartbeatOlderThan(slot, deadAfter))
-	}
 	// The slot -skip-recovery names comes first: the operator chose it.
 	if r.preferred >= 0 {
-		if i, err := r.claimFirst([]int{r.preferred}, func(slot *Slot) bool { return empty(slot) || ownFailed(slot) }); i >= 0 || err != nil {
+		if i, err := r.claimFirst([]int{r.preferred}, func(slot *Slot) bool { return empty(slot) || r.deadLocalOwner(slot) }); i >= 0 || err != nil {
 			return i, err
 		}
 		// A slot under another node's recovery is taken only once its lease has lapsed unrenewed.
@@ -386,16 +382,13 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 			}
 		}
 	}
-	if i, err := r.claimFirst(allSlots(), ownFailed); i >= 0 || err != nil {
+	if i, err := r.claimFirst(allSlots(), r.deadLocalOwner); i >= 0 || err != nil {
 		return i, err
 	}
-	// A slot can go stale between scans, so recheck every slot after the wait.
-	if i, err := r.claimFirst(append(r.awaitOtherNamespaceSlots(), allSlots()...), ownFailed); i >= 0 || err != nil {
-		return i, err
-	}
-	// A slot under this hostname from an earlier boot is likely this host's mount before a crash; taking it back
-	// replays its journal before this mount serves. Another host may share the name, so it is watched first.
-	if i, err := r.claimWatched(r.awaitSilentSlots(r.earlierBootSlots(), silentSlotWatch)); i >= 0 || err != nil {
+	// A slot under this hostname is likely this host's mount before a crash, a container restart or a reboot; taking
+	// it back replays its journal before this mount serves. Its mount may still run, or another host may share the
+	// name, so it is watched first.
+	if i, err := r.claimWatched(r.awaitSilentSlots(r.ownHostSlots(), silentSlotWatch)); i >= 0 || err != nil {
 		return i, err
 	}
 	if i, err := r.claimFirst(allSlots(), empty); i >= 0 || err != nil {
@@ -463,19 +456,22 @@ func (r *Registry) PreferSlot(slot int) {
 	r.preferred = slot
 }
 
-// silentSlotWatch is how long Register watches another host's slot before it
+// silentSlotWatch is how long Register watches a slot it cannot prove dead before it
 // takes it, if its heartbeat never changed: as long as peers watch before they
 // replay, so a node that stalled for less than stallLimit keeps its slot. Tests shorten it.
 var silentSlotWatch = deadAfter
 
-// earlierBootSlots returns the slots registered under this node's hostname in
-// another kernel boot whose heartbeat looks old by this node's clock.
-func (r *Registry) earlierBootSlots() []int {
+// ownHostSlots returns the slots under this node's hostname whose mount it
+// cannot prove exited: one in another PID namespace on this boot, which a
+// restarted container left, or one whose heartbeat looks old by this node's clock.
+func (r *Registry) ownHostSlots() []int {
 	var slots []int
 	for i := 0; i < MaxNodes; i++ {
 		_, slot, err := r.readSlotRaw(i)
-		if err == nil && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) && !r.sameHost(slot) &&
-			slot.Host() == r.hostname && heartbeatOlderThan(slot, HeartbeatTimeout) {
+		if err != nil || (slot.State != NodeStateActive && slot.State != NodeStateLeaving) || slot.Host() != r.hostname {
+			continue
+		}
+		if r.sameHost(slot) && slot.PIDNamespace != r.pidNS || heartbeatOlderThan(slot, HeartbeatTimeout) {
 			slots = append(slots, i)
 		}
 	}
@@ -592,40 +588,6 @@ func (r *Registry) took(i int, slot *Slot, issued time.Duration) {
 	if slot.State != NodeStateEmpty {
 		r.previousOwner = &slot.UUID
 	}
-}
-
-// awaitOtherNamespaceSlots watches the live-looking slots of this host in
-// another PID namespace until each heartbeats or goes stale, and returns the
-// stale ones. The slots share this host's clock, so wall time judges them.
-func (r *Registry) awaitOtherNamespaceSlots() []int {
-	type beat struct {
-		seq  uint64
-		time int64
-	}
-	watch := map[int]beat{}
-	for i := 0; i < MaxNodes; i++ {
-		_, slot, err := r.readSlotRaw(i)
-		if err == nil && r.sameHost(slot) && slot.PIDNamespace != r.pidNS && !heartbeatOlderThan(slot, deadAfter) {
-			watch[i] = beat{slot.HeartbeatSeq, slot.HeartbeatTime}
-		}
-	}
-
-	var stale []int
-	deadline := time.Now().Add(deadAfter + 2*HeartbeatInterval)
-	for len(watch) > 0 && time.Now().Before(deadline) {
-		time.Sleep(HeartbeatInterval / 4)
-		for i, last := range watch {
-			_, slot, err := r.readSlotRaw(i)
-			switch {
-			case err != nil || beat{slot.HeartbeatSeq, slot.HeartbeatTime} != last:
-				delete(watch, i)
-			case heartbeatOlderThan(slot, deadAfter):
-				stale = append(stale, i)
-				delete(watch, i)
-			}
-		}
-	}
-	return stale
 }
 
 // Unregister gracefully releases the node's slot.

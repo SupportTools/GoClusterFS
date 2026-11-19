@@ -4656,21 +4656,21 @@ scenarios:
 
   - id: registry-short-stall-keeps-slot-from-same-host-mount
     name: A same-host mount does not take the slot of a node stalled for less than 15 seconds
-    description: While a heartbeat is paused 14s between its slot read and its write, and the slot's heartbeat looks 15s old, a new mount on the same host takes another slot; the stalled node's heartbeat writes, and both nodes keep their slots and keep running
+    description: While a heartbeat is paused 12s between its slot read and its write, and the slot's heartbeat looks 15s old, a new mount on the same host starts watching the slot; the stalled node's heartbeat writes, the mount takes another slot, and both nodes keep their slots and keep running
     priority: go_only
     environments:
       go: internal/node/stall_test.go::TestShortStallKeepsSlotFromSameHostMount
 
-  - id: registry-same-host-mount-takes-stalled-slot-at-20s
-    name: A same-host mount takes a stalled node's slot only once its heartbeat is 20 seconds old
-    description: With the stalled node's heartbeat 18s old, a new mount on the same host takes another slot. At 21s old it takes the stalled node's slot, and the stalled node stops when it resumes, leaving the new mount in the slot
+  - id: registry-same-host-mount-ignores-clock-jump
+    name: A forward clock jump does not let a same-host mount take a live node's slot
+    description: A live node on the same host keeps beating while its heartbeat times look 30s old, as after a forward step of the host's clock. A new mount in the same PID namespace, and one in another PID namespace as after a container restart, each take another slot and never revoke the live node's access
     priority: go_only
     environments:
-      go: internal/node/stall_test.go::TestSameHostMountTakesStalledSlotOnlyOnceSilentForDeadAfter
+      go: internal/node/clock_skew_test.go::TestSameHostMountLeavesLiveSlotAfterClockJump
 
   - id: registry-watching-mount-takes-stalled-slot-after-20s
     name: A mount that watches a stalled node's slot takes it only after 20 seconds of silence
-    description: A mount from another host naming the slot with -skip-recovery, a rebooted host under the same hostname, and another host that finds no empty slot each watch the stalled node's slot for at least 20s before taking it; the stalled node stops when it resumes, leaving the new mount in the slot
+    description: A new mount on the same host, a restarted container, a mount from another host naming the slot with -skip-recovery, a rebooted host under the same hostname, and another host that finds no empty slot each watch the stalled node's slot for at least 20s before taking it; the stalled node stops when it resumes, leaving the new mount in the slot
     priority: go_only
     environments:
       go: internal/node/stall_test.go::TestWatchingMountTakesStalledSlotOnlyAfterDeadAfter

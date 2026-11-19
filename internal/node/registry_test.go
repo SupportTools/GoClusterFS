@@ -957,33 +957,6 @@ func TestRegisterLeavesLiveSlotOfOtherPIDNamespace(t *testing.T) {
 	}
 }
 
-// A restarted container cannot prove by PID that its previous mount exited, so
-// it takes that mount's slot only once the heartbeat is deadAfter old: a mount
-// that stalled for less than stallLimit keeps its slot.
-func TestRegisterTakesOtherPIDNamespaceSlotOnceStale(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-
-	reg := NewRegistry(dev, 0)
-	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
-		t.Skip("no kernel boot ID or PID namespace")
-	}
-	beat := time.Now().Add(-stallLimit)
-	writeOtherNamespaceSlot(t, reg, 2, beat)
-
-	slot, err := reg.Register(context.Background(), "node")
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	if slot != 2 {
-		t.Errorf("Register took slot %d, want slot 2 of this host's previous container once its heartbeat went stale", slot)
-	}
-	// Heartbeat times are whole seconds, so the slot may look up to a second older than it is.
-	if age := time.Since(beat); age < deadAfter-time.Second {
-		t.Errorf("Register took the slot when its heartbeat was %v old, want at least %v", age, deadAfter-time.Second)
-	}
-}
-
 func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -1023,32 +996,6 @@ func TestLeaseCheckRenewsAndDetectsLoss(t *testing.T) {
 	}
 	if err := info.CheckLease(); !errors.Is(err, ErrLeaseLost) {
 		t.Errorf("CheckLease after another node took over: err = %v, want ErrLeaseLost", err)
-	}
-}
-
-func TestRegisterTakesOwnSlotThatGoesStaleWhileWaiting(t *testing.T) {
-	dev, cleanup := createTestDevice(t, 10<<20)
-	defer cleanup()
-
-	reg := NewRegistry(dev, 0)
-	if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
-		t.Skip("no kernel boot ID or PID namespace")
-	}
-	previous := writeOtherNamespaceSlot(t, reg, 2, time.Now())
-	go func() {
-		time.Sleep(600 * time.Millisecond)
-		previous.HeartbeatTime = time.Now().Add(-deadAfter - 2*time.Second).Unix()
-		if err := reg.writeSlot(2, previous); err != nil {
-			t.Error(err)
-		}
-	}()
-
-	slot, err := reg.Register(context.Background(), "node")
-	if err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	if slot != 2 {
-		t.Errorf("Register took slot %d, want slot 2, which went stale after the first scan", slot)
 	}
 }
 

@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 )
@@ -145,5 +146,49 @@ func TestSlowRegistryReadsDoNotStarveHeartbeat(t *testing.T) {
 	}
 	if worst >= HeartbeatTimeout/2 {
 		t.Errorf("with 100ms registry reads and registry scans running, the heartbeat went %v without a beat", worst.Round(100*time.Millisecond))
+	}
+}
+
+// A forward step of this host's clock makes a live mount's heartbeat look old.
+// A new mount on the same host, in the same PID namespace or after a container
+// restart, still leaves the slot alone and never revokes the live node's access.
+func TestSameHostMountLeavesLiveSlotAfterClockJump(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		otherPIDs uint64
+	}{{"same PID namespace", 0}, {"restarted container", 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, 10<<20)
+			defer cleanup()
+			reg := NewRegistry(dev, 0)
+			if reg.bootID == ([16]byte{}) || reg.pidNS == 0 {
+				t.Skip("no kernel boot ID or PID namespace")
+			}
+			jump := deadAfter + 10*time.Second
+			live := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 1,
+				HeartbeatTime: time.Now().Add(-jump).Unix(), BootID: reg.bootID, PID: uint32(os.Getpid()),
+				ProcStart: processStart, PIDNamespace: reg.pidNS + tc.otherPIDs}
+			copy(live.Hostname[:], "node")
+			if err := reg.writeSlot(0, live); err != nil {
+				t.Fatal(err)
+			}
+			defer keepWriting(t, reg, 0, live, jump)()
+			var revoked [][16]byte
+			reg.SetPreempter(func(owner [16]byte) error {
+				revoked = append(revoked, owner)
+				return nil
+			})
+
+			slot, err := reg.Register(context.Background(), "node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if slot == 0 {
+				t.Error("Register took the slot of a live mount on this host whose heartbeat looked old after a clock jump")
+			}
+			if len(revoked) != 0 {
+				t.Errorf("Register revoked the device access of %x, want no node's", revoked)
+			}
+		})
 	}
 }

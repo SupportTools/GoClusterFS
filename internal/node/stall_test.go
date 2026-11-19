@@ -249,9 +249,9 @@ func TestShortStalledBeatKeepsTheNodeUp(t *testing.T) {
 	}
 }
 
-// A new mount on the same host takes a slot only once its heartbeat is
-// deadAfter old, so a node back from a stall just under stallLimit still owns
-// its slot, and both nodes keep running.
+// A new mount on the same host watches a stalled node's slot before it takes
+// it, so a node back from a stall just under stallLimit keeps its slot, and
+// both nodes keep running.
 func TestShortStallKeepsSlotFromSameHostMount(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 10<<20)
 	defer cleanup()
@@ -261,24 +261,33 @@ func TestShortStallKeepsSlotFromSameHostMount(t *testing.T) {
 	}
 
 	newcomer := NewRegistry(dev, 0)
-	newSlot := -1
-	err := n.stallAfterBeatRead(t, stallLimit-time.Second, func() {
+	registered := make(chan int, 1)
+	err := n.stallAfterBeatRead(t, stallLimit-3*time.Second, func() {
 		peer := NewRegistry(dev, 0)
 		slot, err := peer.readSlot(n.slot)
 		if err != nil {
 			t.Fatal(err)
 		}
-		// The wall clock shows the stall, plus up to a second since heartbeat times are whole seconds.
 		slot.HeartbeatTime = time.Now().Add(-stallLimit).Unix()
 		if err := peer.writeSlot(n.slot, slot); err != nil {
 			t.Fatal(err)
 		}
-		if newSlot, err = newcomer.Register(context.Background(), "stalled"); err != nil || newSlot == n.slot {
-			t.Errorf("same-host mount registered in slot %d (%v) during a %v stall, want a slot other than %d", newSlot, err, stallLimit-time.Second, n.slot)
-		}
+		go func() {
+			slot, err := newcomer.Register(context.Background(), "stalled")
+			if err != nil {
+				t.Error(err)
+			}
+			registered <- slot
+		}()
+		// The stall ends while the new mount watches the slot.
+		time.Sleep(time.Second)
 	})
 	if err != nil {
 		t.Errorf("heartbeat after the stall = %v, want nil", err)
+	}
+	newSlot := <-registered
+	if newSlot == n.slot {
+		t.Errorf("same-host mount registered in the stalled node's slot %d, want another", n.slot)
 	}
 	n.mu.Lock()
 	if len(n.losses) != 0 {
@@ -293,48 +302,18 @@ func TestShortStallKeepsSlotFromSameHostMount(t *testing.T) {
 	}
 }
 
-// A new mount on the same host cannot prove by PID that a stalled mount is
-// gone, so it takes the slot only once the heartbeat is deadAfter old.
-func TestSameHostMountTakesStalledSlotOnlyOnceSilentForDeadAfter(t *testing.T) {
-	for _, tc := range []struct {
-		age   time.Duration
-		takes bool
-	}{
-		{deadAfter - 2*time.Second, false},
-		{deadAfter + time.Second, true},
-	} {
-		t.Run(tc.age.String(), func(t *testing.T) {
-			dev, cleanup := createTestDevice(t, 10<<20)
-			defer cleanup()
-			n := registerStalledNode(t, dev)
-			if n.reg.bootID == ([16]byte{}) {
-				t.Skip("no kernel boot ID")
-			}
-			n.stallFor(t, tc.age)
-
-			newcomer := NewRegistry(dev, 0)
-			slot, err := newcomer.Register(context.Background(), "stalled")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if (slot == n.slot) != tc.takes {
-				t.Fatalf("with the stalled node's heartbeat %v old, a same-host mount took slot %d; taking the stalled node's slot %d should be %v", tc.age, slot, n.slot, tc.takes)
-			}
-			if tc.takes {
-				n.resumesAndStops(t, newcomer)
-			}
-		})
-	}
-}
-
-// A mount that cannot judge a stalled node's heartbeat by its own clock
-// watches the slot for deadAfter before it takes it.
+// A mount that cannot prove a stalled node gone watches its slot for deadAfter
+// before it takes it, however old the heartbeat looks by its clock.
 func TestWatchingMountTakesStalledSlotOnlyAfterDeadAfter(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		host  string
 		setup func(t *testing.T, newcomer *Registry, stalled int)
 	}{
+		{"same-host mount", "stalled", func(*testing.T, *Registry, int) {}},
+		{"restarted container", "stalled", func(_ *testing.T, newcomer *Registry, _ int) {
+			newcomer.pidNS++
+		}},
 		{"named by -skip-recovery", "elsewhere", func(_ *testing.T, newcomer *Registry, stalled int) {
 			newcomer.PreferSlot(stalled)
 		}},
