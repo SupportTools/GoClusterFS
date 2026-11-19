@@ -3717,7 +3717,8 @@ test_fencing_clear_reservations() {
         result=1
     fi
     out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck -clear-reservations $(cluster_device) 2>&1; echo rc=\$?")
-    if [[ "$out" != *"cannot list the reservation keys"*"Nothing was changed"*"rc=0"* ]] || ! registered_initiators | grep -q "goclusterfs:vm2,"; then
+    if [[ "$out" != *"cannot list the reservation keys"*"Nothing was changed"*"rc=0"* &&
+          "$out" != *"Reservation keys on"*"Nothing was changed"*"rc=0"* ]] || ! registered_initiators | grep -q "goclusterfs:vm2,"; then
         log_error "fsck -clear-reservations without -confirm changed something or failed: $out"
         result=1
     fi
