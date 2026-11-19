@@ -1401,9 +1401,10 @@ test_restart_keeps_peer_journal() {
         echo ok \$i > /tmp/peer-writer.done"
     sleep 1
 
-    local since slot_before
+    local since slot_before uuid_a
     since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     slot_before=$(docker logs "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
+    uuid_a=$(docker logs "$node_a" 2>&1 | grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' | tail -1 | grep -o '[0-9a-f]*$')
     if ! kill_node "$node_a"; then
         exec_on_node "$node_b" touch /tmp/peer-writer.stop
         return 1
@@ -1453,9 +1454,13 @@ test_restart_keeps_peer_journal() {
     fi
     local slot_after
     slot_after=$(docker logs --since "$since" "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
+    # The restarted container watches its old slot for 20s, so node B, which watched it since the crash, may replay it first.
     if [[ "$slot_after" != "$slot_before" ]]; then
-        log "ERROR: Node A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount"
-        return 1
+        if [[ -z "$uuid_a" ]] || ! docker logs --since "$since" "$node_b" 2>&1 | grep -q "Starting journal replay for node ${uuid_a:0:8}"; then
+            log "ERROR: Node A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount, or node B to replay it"
+            return 1
+        fi
+        log "Node B replayed node A's old slot first; node A came back as '$slot_after'"
     fi
 
     exec_on_node "$node_b" rm -rf "$dir"

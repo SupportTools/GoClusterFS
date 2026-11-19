@@ -659,7 +659,7 @@ scenarios:
 
   - id: multinode-restart-keeps-peer-journal
     name: Restart while a peer writes keeps the peer's journal
-    description: Node A crashes and restarts while node B creates files. A takes back its own registry slot and journal, does not replay or reset B's live journal, and B's files stay readable. The Go test also crashes B and checks A replays B's journal from B's slot.
+    description: Node A crashes and restarts while node B creates files. A takes back its own registry slot and journal, does not replay or reset B's live journal, and B's files stay readable. In Docker the restarted container watches its old slot for 20s, so B may replay it first, and A then takes another slot. The Go test also crashes B and checks A replays B's journal from B's slot.
     priority: critical
     environments:
       go: journal_slots_test.go::TestMultiNodeRestartKeepsPeerJournal
@@ -719,7 +719,7 @@ scenarios:
 
   - id: node-restart-replays-own-journal
     name: Restarted node replays its own journal at mount
-    description: A node that crashes and restarts within the heartbeat timeout takes back its slot and replays its journal before serving
+    description: A node that crashes and restarts within the heartbeat timeout takes back its slot and replays its journal before serving. In Docker the restarted container watches its old slot for 20s, so a running peer may replay it first
     priority: high
     environments:
       go: journal_slots_test.go::TestNodeRestartReplaysOwnJournalAtMount
