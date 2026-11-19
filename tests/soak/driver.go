@@ -35,7 +35,6 @@ type config struct {
 	barrierEvery time.Duration
 	window       time.Duration
 	inflight     bool
-	knownAbandon bool
 	coherence    time.Duration
 	stopFor      time.Duration
 	opTimeout    time.Duration
@@ -88,9 +87,9 @@ type driver struct {
 	stopping atomic.Bool
 	failure  string
 
-	ops, unexpected, faults, fscks, barriers, slow, stalls, resolved, knownAbandon atomic.Int64
-	slowestMs                                                                      atomic.Int64
-	opsByKind                                                                      sync.Map
+	ops, unexpected, faults, fscks, barriers, slow, stalls, resolved atomic.Int64
+	slowestMs                                                        atomic.Int64
+	opsByKind                                                        sync.Map
 }
 
 func (d *driver) logRecord(r record) {
@@ -420,9 +419,6 @@ func (d *driver) check(op *Op) {
 	d.ops.Add(1)
 	count, _ := d.opsByKind.LoadOrStore(op.Kind, new(atomic.Int64))
 	count.(*atomic.Int64).Add(1)
-	if !matches(op.Want, op.Got) && d.knownAbandonedSnapshot(op) {
-		return
-	}
 	if !matches(op.Want, op.Got) {
 		d.unexpected.Add(1)
 		d.fail("op %d %s %s on node %d: errno %d (%s), want %d", op.Seq, op.Kind, op.Path, op.Node, op.Got, op.Err, op.Want)
@@ -641,8 +637,8 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d known_abandon=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d files=%d snapshots=%d blocks=%d [%s]",
-		d.ops.Load(), d.unexpected.Load(), d.knownAbandon.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d files=%d snapshots=%d blocks=%d [%s]",
+		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
 		files, snaps, blocks, strings.Join(kinds, " "))
 }
 
