@@ -4661,6 +4661,20 @@ scenarios:
     environments:
       go: internal/node/stall_test.go::TestShortStallKeepsSlotFromSameHostMount
 
+  - id: registry-same-host-mount-takes-stalled-slot-at-20s
+    name: A same-host mount takes a stalled node's slot only once its heartbeat is 20 seconds old
+    description: With the stalled node's heartbeat 18s old, a new mount on the same host takes another slot. At 21s old it takes the stalled node's slot, and the stalled node stops when it resumes, leaving the new mount in the slot
+    priority: go_only
+    environments:
+      go: internal/node/stall_test.go::TestSameHostMountTakesStalledSlotOnlyOnceSilentForDeadAfter
+
+  - id: registry-watching-mount-takes-stalled-slot-after-20s
+    name: A mount that watches a stalled node's slot takes it only after 20 seconds of silence
+    description: A mount from another host naming the slot with -skip-recovery, a rebooted host under the same hostname, and another host that finds no empty slot each watch the stalled node's slot for at least 20s before taking it; the stalled node stops when it resumes, leaving the new mount in the slot
+    priority: go_only
+    environments:
+      go: internal/node/stall_test.go::TestWatchingMountTakesStalledSlotOnlyAfterDeadAfter
+
   - id: registry-stalled-beat-stops-after-replay
     name: A heartbeat stalled across a peer's replay stops the node without rewriting the slot
     description: A heartbeat paused between its slot read and its write while a peer replays and empties the slot does not write; the node stops, the write gate refuses data writes without reading the slot, and the slot stays empty

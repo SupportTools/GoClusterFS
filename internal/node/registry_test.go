@@ -8,7 +8,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -123,12 +122,11 @@ func createTestDevice(t *testing.T, size int64) (*storage.Device, func()) {
 		tmpDir = "."
 	}
 
-	testFile := filepath.Join(tmpDir, "test_registry.bin")
-
-	f, err := os.Create(testFile)
+	f, err := os.CreateTemp(tmpDir, "test_registry-*.bin")
 	if err != nil {
 		t.Skipf("Cannot create test file: %v", err)
 	}
+	testFile := f.Name()
 
 	if err := f.Truncate(size); err != nil {
 		_ = f.Close()
