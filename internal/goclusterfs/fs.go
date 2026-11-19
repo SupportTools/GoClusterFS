@@ -2504,10 +2504,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 			return 0, syscall.EIO
 		}
-		ino, err = f.fs.inodeTbl.Read(f.inodeNum)
+		migrated, err := f.fs.inodeTbl.Read(f.inodeNum)
 		if err != nil {
 			return 0, syscall.EIO
 		}
+		ino = migrated
 	}
 
 	// A write that grows the file holds the inode lock exclusively from its first data write through its size update,
@@ -2518,9 +2519,11 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			return 0, syscall.EIO
 		}
 		lockHeld = true
-		if ino, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
+		locked, err := f.fs.inodeTbl.Read(f.inodeNum)
+		if err != nil {
 			return 0, syscall.EIO
 		}
+		ino = locked
 	}
 	oldEnd = ino.Size
 	segments, err := f.growthSegments(ino, data, offset)
