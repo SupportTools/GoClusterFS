@@ -185,8 +185,7 @@ func (c *Checker) checkSnapshots() error {
 					false)
 			}
 
-			// Record snapshot inode reference
-			if desc.TargetInode > 0 {
+			if desc.TargetInode > 0 && c.mayHoldTarget(desc) {
 				c.snapshotTargets[desc.TargetInode] = true
 			}
 
@@ -310,10 +309,20 @@ func (c *Checker) snapshotOrphaned(desc *SnapshotDescriptor) string {
 		return fmt.Sprintf("inode %d, the file it was taken of, is free", desc.TargetInode)
 	case desc.Flags&SnapshotFlagHasTargetBirth == 0:
 		return "an older version wrote it without the birth generation that proves which file it was taken of"
-	case desc.TargetBirth != c.inodeBirth[desc.TargetInode]&(1<<48-1):
+	case !c.sameBirth(desc):
 		return fmt.Sprintf("inode %d now holds a later file than the one it was taken of", desc.TargetInode)
 	}
 	return ""
+}
+
+// mayHoldTarget reports whether desc's target slot may still hold the file desc was taken of. Without a birth
+// generation fsck cannot tell.
+func (c *Checker) mayHoldTarget(desc *SnapshotDescriptor) bool {
+	return desc.Flags&SnapshotFlagHasTargetBirth == 0 || c.sameBirth(desc)
+}
+
+func (c *Checker) sameBirth(desc *SnapshotDescriptor) bool {
+	return desc.TargetBirth == c.inodeBirth[desc.TargetInode]&(1<<48-1)
 }
 
 // parseSnapshotDescriptor extracts a snapshot descriptor from raw bytes.

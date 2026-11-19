@@ -399,7 +399,7 @@ type Checker struct {
 	dirNames        map[uint32]int   // directory inode -> names it holds
 	namesIncomplete []string         // why dirEntryRefs may miss names
 	unnamed         []uint32         // inodes other than root that no directory names
-	snapshotTargets map[uint32]bool  // inodes snapshots were taken of; an orphan's slot may now hold a later inode
+	snapshotTargets map[uint32]bool  // inodes that may still hold a file a snapshot was taken of
 	snapshotRefs    map[uint32]bool  // snapshot data inodes that a snapshot's DataInode points at
 	snapshotData    map[uint32]bool  // inodes holding a snapshot's captured extents
 	orphanData      map[uint32]int   // phase 7's problem for each data inode no snapshot refers to

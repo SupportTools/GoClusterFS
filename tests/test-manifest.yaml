@@ -4878,6 +4878,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairKeepsADataInodeThatLostItsFlag
 
+  - id: fsck-frees-unnamed-later-file-in-orphan-snapshot-slot
+    name: fsck -repair frees an unnamed later file in an orphan snapshot's old slot
+    description: An orphan snapshot whose birth generation shows its slot holds a later file does not protect that file; repair frees it when no directory names it, and keeps the orphan snapshot
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairFreesAnUnnamedLaterFileInAnOrphanSnapshotsSlot
+
+  - id: fsck-keeps-unnamed-file-snapshot-without-birth-names
+    name: fsck -repair keeps an unnamed file that a snapshot without a birth generation names
+    description: fsck cannot tell whether a snapshot an older version wrote still belongs to the file in its slot, so repair keeps that file
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_snapshot_test.go::TestFsckRepairKeepsAnUnnamedFileASnapshotWithoutBirthNames
+
   - id: fsck-checks-every-dir-entry
     name: fsck checks every directory entry's type and inode range
     description: fsck reports an entry whose type does not match its inode whatever the inode number, and an entry whose inode number is past the inode table, including one that would wrap to a used inode
