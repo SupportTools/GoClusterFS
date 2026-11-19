@@ -154,6 +154,18 @@ func TestPartitionRefusesEveryReservationCommand(t *testing.T) {
 	}
 }
 
+// Kernels without IOC_PR_READ_KEYS answer it with EINVAL through sd, or ENOTTY; both mean the keys cannot be listed.
+func TestKeyListingWithoutTheIoctlIsUnsupported(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EINVAL, syscall.ENOTTY} {
+		if err := unlistable(ioctlResult(0, errno)); !errors.Is(err, ErrUnsupported) {
+			t.Errorf("%v from a key listing: %v, want ErrUnsupported", errno, err)
+		}
+	}
+	if err := unlistable(ioctlResult(0, syscall.EIO)); errors.Is(err, ErrUnsupported) {
+		t.Errorf("EIO from a key listing: %v, want an error that is not ErrUnsupported", err)
+	}
+}
+
 func TestPartitionInSysfs(t *testing.T) {
 	sysfs := t.TempDir()
 	for _, dir := range []string{"8:0", "8:1", "259:3"} {
