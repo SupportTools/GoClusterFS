@@ -3358,23 +3358,30 @@ mount_pids() {
     ssh_run "$1" 'for p in /proc/[0-9]*; do tr "\0" "\n" 2>/dev/null <$p/cmdline | grep -qx "/usr/local/bin/goclusterfs-moun[t]" && echo ${p#/proc/}; done; true'
 }
 
-# Kill goclusterfs-mount on VM $1 with SIGKILL, as a crash would, and fail unless it is gone within 10s.
+# Kill goclusterfs-mount on VM $1 with SIGKILL, as a crash would, and fail unless it is reaped within 30s.
+# A zombie still passes kill(pid, 0), so a remount before then would not take its own slot back.
 crash_goclusterfs() {
-    local vm_id=$1 pids waited=0
-    pids=$(mount_pids "$vm_id")
+    local vm_id=$1 pids
+    pids=$(mount_pids "$vm_id" | xargs)
     if [[ -z "$pids" ]]; then
         log_error "VM $vm_id: no goclusterfs-mount process to kill"
         return 1
     fi
-    ssh_run "$vm_id" "kill -9 $(echo $pids)"
-    while [[ -n "$(mount_pids "$vm_id")" ]]; do
-        if [[ $waited -ge 50 ]]; then
-            log_error "VM $vm_id: goclusterfs-mount still running 10s after SIGKILL"
+    local start lingered=false
+    start=$(date +%s%3N)
+    ssh_run "$vm_id" "kill -9 $pids"
+    while ssh_run "$vm_id" "for p in $pids; do [ -e /proc/\$p ] && exit 0; done; exit 1"; do
+        if (( $(date +%s%3N) - start >= 30000 )); then
+            log_error "VM $vm_id: goclusterfs-mount ($pids) not reaped 30s after SIGKILL; state, then each thread's state and wchan:"
+            ssh_run "$vm_id" "for p in $pids; do grep -E '^(State|PPid|Threads)' /proc/\$p/status | tr '\n' ' '; echo; for t in /proc/\$p/task/*; do echo \"\$t \$(cut -d' ' -f3 \$t/stat) \$(cat \$t/wchan)\"; done; done" >&2 || true
             return 1
         fi
+        lingered=true
         sleep 0.2
-        waited=$((waited + 1))
     done
+    if $lingered; then
+        log_info "VM $vm_id: goclusterfs-mount ($pids) reaped $(( $(date +%s%3N) - start ))ms after SIGKILL"
+    fi
 }
 
 # Unmount GoClusterFS on VM $1 and wait for the mount process to exit, which
