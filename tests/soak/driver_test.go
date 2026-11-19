@@ -5,7 +5,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -71,4 +75,35 @@ func TestSlowCheckLogsItsLastStaleAnswer(t *testing.T) {
 			t.Errorf("slow record %q lacks %q", out.String(), want)
 		}
 	}
+}
+
+// A write a fault cut short that resolves as never done must not pass as done in the fault's verify that follows.
+func TestCutShortWriteResolvedBeforeAcceptsOnlyTheOldData(t *testing.T) {
+	root := t.TempDir()
+	d := &driver{cfg: config{window: time.Minute, opTimeout: time.Minute}, model: newModel(), running: map[*Op]*File{}, logw: io.Discard, ctx: context.Background()}
+	d.model.apply(&Op{Kind: "create", Path: "/l1-f1"})
+	if err := os.WriteFile(filepath.Join(root, "l1-f1"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	n := &node{id: 1, agent: localAgent(t, root)}
+	write := &Op{Kind: "write", Path: "/l1-f1", Len: 5000, Seed: 1}
+	d.startWrite(write)
+	outcome, err := d.resolve(n, write)
+	if err != nil || outcome != "before" {
+		t.Fatalf("resolve = %q, %v; want before", outcome, err)
+	}
+	if got, want := d.readable("/l1-f1"), []string{content(0, sum(nil))}; !slices.Equal(got, want) {
+		t.Errorf("readable = %v, want only the empty file %v", got, want)
+	}
+}
+
+// localAgent serves agent requests on root in this process.
+func localAgent(t *testing.T, root string) *agentConn {
+	reqs, reqw := io.Pipe()
+	resps, respw := io.Pipe()
+	go func() { _ = respw.CloseWithError(runAgent(root, reqs, respw)) }()
+	a := &agentConn{enc: json.NewEncoder(reqw), pending: map[uint64]chan response{}, done: make(chan struct{})}
+	go a.read(resps)
+	t.Cleanup(func() { _ = reqw.Close() })
+	return a
 }
