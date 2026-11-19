@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -83,6 +84,8 @@ type driver struct {
 	// pending holds operations a fault cut short on each node, until the fault reads what they left.
 	pendingMu sync.Mutex
 	pending   map[int][]*uncertain
+	// running holds the writes and truncates running now, with the file each changes. model.mu guards it.
+	running map[*Op]*File
 	// stopping is set when the run's time is up, so the operations it cuts short are not failures.
 	stopping atomic.Bool
 	failure  string
@@ -176,6 +179,7 @@ func (d *driver) upNodes() []*node {
 func (d *driver) converge(what string, check func() error) error {
 	start := time.Now()
 	stale, longestCall := 0, time.Duration(0)
+	var last error
 	for {
 		callStart := time.Now()
 		err := check()
@@ -187,12 +191,17 @@ func (d *driver) converge(what string, check func() error) error {
 			}
 			if took > d.cfg.coherence {
 				d.slow.Add(1)
-				d.logRecord(record{Type: "slow", Detail: fmt.Sprintf("%s took %s: %d stale answers, longest call %s",
-					what, took.Round(time.Millisecond), stale, longestCall.Round(time.Millisecond))})
+				detail := fmt.Sprintf("%s took %s: %d stale answers, longest call %s",
+					what, took.Round(time.Millisecond), stale, longestCall.Round(time.Millisecond))
+				if last != nil {
+					detail += fmt.Sprintf("; last stale answer: %v", last)
+				}
+				d.logRecord(record{Type: "slow", Detail: detail})
 			}
 			return nil
 		}
 		stale++
+		last = err
 		if errors.Is(err, errAgentGone) || time.Since(start) > d.cfg.window || d.ctx.Err() != nil {
 			return fmt.Errorf("%v (still after %s)", err, time.Since(start).Round(time.Millisecond))
 		}
@@ -211,11 +220,7 @@ func (d *driver) comparePath(n *node, p string) error {
 	d.model.mu.Lock()
 	f, isDir := d.model.Files[p], d.model.Dirs[p]
 	target, isLink := d.model.Links[p]
-	var size int64
-	var want string
-	if f != nil {
-		size, want = int64(len(f.Data)), sum(f.Data)
-	}
+	readable := d.readable(p)
 	d.model.mu.Unlock()
 	switch {
 	case f != nil:
@@ -223,8 +228,11 @@ func (d *driver) comparePath(n *node, p string) error {
 		if err != nil {
 			return err
 		}
-		if resp.Errno != 0 || resp.Size != size || resp.Sum != want {
-			return fmt.Errorf("%s: read errno %d size %d sum %s, want size %d sum %s", p, resp.Errno, resp.Size, resp.Sum, size, want)
+		d.model.mu.Lock()
+		readable = append(readable, d.readable(p)...)
+		d.model.mu.Unlock()
+		if got := content(resp.Size, resp.Sum); resp.Errno != 0 || !slices.Contains(readable, got) {
+			return fmt.Errorf("%s: read errno %d %s, want %s", p, resp.Errno, got, strings.Join(readable, " or "))
 		}
 	case isDir:
 		resp, err := d.call(n, request{Op: "list", Path: p})
@@ -253,6 +261,42 @@ func (d *driver) comparePath(n *node, p string) error {
 		}
 	}
 	return nil
+}
+
+// readable lists what a read of p may show: p's file, and that file after each write or truncate running on it under
+// any name. The caller holds model.mu.
+func (d *driver) readable(p string) []string {
+	f := d.model.Files[p]
+	if f == nil {
+		return nil
+	}
+	out := []string{content(int64(len(f.Data)), sum(f.Data))}
+	for op, g := range d.running {
+		if g == f {
+			data := bytes.Clone(f.Data)
+			applyData(op, &data)
+			out = append(out, content(int64(len(data)), sum(data)))
+		}
+	}
+	return out
+}
+
+func content(size int64, sum string) string { return fmt.Sprintf("size %d sum %s", size, sum) }
+
+// startWrite marks a write or truncate as running on its file until the returned func is called.
+func (d *driver) startWrite(op *Op) (done func()) {
+	d.model.mu.Lock()
+	defer d.model.mu.Unlock()
+	f := d.model.Files[op.Path]
+	if f == nil || op.Kind != "write" && op.Kind != "truncate" {
+		return func() {}
+	}
+	d.running[op] = f
+	return func() {
+		d.model.mu.Lock()
+		delete(d.running, op)
+		d.model.mu.Unlock()
+	}
 }
 
 func (d *driver) compareSnaps(n *node, p string) error {
@@ -364,6 +408,7 @@ func (d *driver) runLane(l *lane) {
 // runOpLocked runs op on n, which the caller holds shared, and releases n before checking the other nodes.
 func (d *driver) runOpLocked(op *Op, n *node) {
 	op.Node = n.id
+	defer d.startWrite(op)()
 	op.At = time.Now().UnixMilli()
 	ctx, cancel := context.WithTimeout(d.ctx, d.cfg.opTimeout)
 	if d.cfg.inflight {
@@ -660,7 +705,7 @@ func newDriver(cfg config) (*driver, func(), error) {
 		return nil, nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, victims: make(chan *node)}
+	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, running: map[*Op]*File{}, victims: make(chan *node)}
 	cleanup := func() {
 		cancel()
 		for _, n := range d.nodes {

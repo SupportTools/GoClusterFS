@@ -8,7 +8,8 @@
 - **Checks:** after every operation, each node must show its result, through a fresh open, within `-window` (30s).
   - The window covers `-attr-timeout` and `-cache-ttl`, because broadcast cannot cross the VMs' separate networks.
   - It also covers waiting out a failed node's 10s detection.
-  - A check that needs longer than `-coherence` (6s) is logged as a `slow` record for review.
+  - A read that overlaps a write or truncate of the same file, through any of its names, may show the file before or after it.
+  - A check that needs longer than `-coherence` (6s) is logged as a `slow` record for review, with its last stale answer and what the model expected.
 - **Faults:** every `-fault-every`, one node is hit, picked at random from these:
   - power is cut (QEMU is killed);
   - goclusterfs-mount gets SIGKILL;
