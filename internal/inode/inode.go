@@ -162,7 +162,7 @@ type Table struct {
 	nodeUUID    [16]byte      // This node's UUID
 	treeFlusher TreeFlusher
 	syncDevice  func() error
-	scanStart   uint64 // FindFreeSlot's first slot, as an offset from InodeFirstUsable
+	scanStart   uint64        // FindFreeSlot's first slot, as an offset from InodeFirstUsable
 	resume      atomic.Uint64 // where FindFreeSlot starts reading; the slots before it, from scanStart on, were in use
 }
 
