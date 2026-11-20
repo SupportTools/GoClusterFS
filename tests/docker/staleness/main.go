@@ -1,7 +1,10 @@
 // Command gcfs-staleness measures how late one node sees another node's
 // writes. The writer stamps each version into the file's size and its last
-// bytes, which every other version moves into blocks it maps again. The reader watches the file three ways and logs every change it
-// sees, and analyze turns both logs into per-version lag.
+// bytes, which every other version moves into blocks it maps again. Every
+// state the file passes through is one whole version, so a reader that sees a
+// new size with unreadable last bytes has stale pages. The reader watches the
+// file three ways and logs every change it sees, and analyze turns both logs
+// into per-version lag.
 //
 //	gcfs-staleness write -file F -versions N
 //	gcfs-staleness read -file F -duration D -modes open,stat,reopen
@@ -81,11 +84,12 @@ func write(args []string) {
 		if err != nil {
 			fail("open: %v", err)
 		}
-		if err := f.Truncate(sizeOf(v)); err != nil {
-			fail("truncate v%d: %v", v, err)
-		}
+		// Header first, so a reader never catches the new size before the new last bytes.
 		if _, err := f.WriteAt(header(v), sizeOf(v)-headerLen); err != nil {
 			fail("write v%d: %v", v, err)
+		}
+		if err := f.Truncate(sizeOf(v)); err != nil {
+			fail("truncate v%d: %v", v, err)
 		}
 		if err := f.Close(); err != nil {
 			fail("close v%d: %v", v, err)
@@ -110,8 +114,12 @@ func read(args []string) {
 
 	var mu sync.Mutex
 	logChange := func(mode string, o observation, start, prevStart time.Time) {
+		prev := int64(0)
+		if !prevStart.IsZero() {
+			prev = prevStart.UnixNano()
+		}
 		mu.Lock()
-		fmt.Printf("R %d %s %d %d %d %d\n", time.Now().UnixNano(), mode, o.size, o.data, start.UnixNano(), prevStart.UnixNano())
+		fmt.Printf("R %d %s %d %d %d %d\n", time.Now().UnixNano(), mode, o.size, o.data, start.UnixNano(), prev)
 		mu.Unlock()
 	}
 	watch := func(mode string, look func() observation) {
