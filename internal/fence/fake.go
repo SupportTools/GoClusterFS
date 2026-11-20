@@ -3,6 +3,7 @@ package fence
 import (
 	"slices"
 	"sync"
+	"syscall"
 )
 
 // Target is an in-memory device with persistent reservations for tests; Node gives each initiator a Fencer.
@@ -18,6 +19,18 @@ func NewTarget() *Target { return &Target{keys: map[string]uint64{}} }
 // Node returns the Fencer of initiator, whose registration is separate from every other initiator's.
 func (t *Target) Node(initiator string, key uint64) *PR {
 	return &PR{dev: &fakeDevice{t: t, initiator: initiator}, key: key}
+}
+
+// SelfTest returns a self-test that runs as initiator, whose 4 KiB writes the target refuses with EBADE, as Linux does,
+// once a reservation shuts initiator out.
+func (t *Target) SelfTest(initiator string, report func(Check)) *SelfTest {
+	write := func() error {
+		if t.MayWrite(initiator) {
+			return nil
+		}
+		return syscall.EBADE
+	}
+	return newSelfTest(&fakeDevice{t: t, initiator: initiator}, write, report)
 }
 
 // MayWrite reports whether the target accepts writes from initiator.
@@ -101,6 +114,15 @@ func (d *fakeDevice) clear(key uint64) error {
 	t.keys = map[string]uint64{}
 	t.reserved = false
 	return nil
+}
+
+func (d *fakeDevice) readReservation() (uint64, uint32, error) {
+	d.t.mu.Lock()
+	defer d.t.mu.Unlock()
+	if !d.t.reserved {
+		return 0, 0, nil
+	}
+	return 0, typeWriteExclusiveAllRegs, nil
 }
 
 func (d *fakeDevice) readKeys() ([]uint64, error) {

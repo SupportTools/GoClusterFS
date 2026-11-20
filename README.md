@@ -243,6 +243,8 @@ Exit codes follow fsck(8) and add up; see [Exit Codes and Debug Output](#exit-co
 
 `-repair` refuses to run while a node has the device mounted, while a stopped node's journal still needs replay, or when mount would refuse the superblock's layout. Back up the device before you repair it. The [fsck Guide](docs/TROUBLESHOOTING.md#fsck-guide) lists what fsck checks and what `-repair` changes.
 
+Before you format fenced storage you have not used before, `goclusterfs-fsck -test-reservations DEVICE` checks that it supports every reservation command fencing sends; see [Storage Fencing](docs/OPERATIONS.md#storage-fencing).
+
 fsck also manages node registry slots. `-list-slots` and `-inspect-slot N` only read, so they run on a mounted device. `-release-slot N` frees the slot of a node that will not return; see [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot).
 
 ## Exit Codes and Debug Output
@@ -253,7 +255,7 @@ fsck also manages node registry slots. `-list-slots` and `-inspect-slot N` only 
 |------|---------------------|--------------------|----------|
 | `0` | Mounted, then unmounted cleanly | No errors (warnings may remain) | Success; `health` is ok |
 | `1` | | Errors were repaired | `health` is degraded |
-| `4` | | Errors remain on disk | `health` is unhealthy |
+| `4` | | Errors remain on disk, or the device failed a `-test-reservations` step | `health` is unhealthy |
 | `8` | Could not mount, or stopped on an error | I/O failure, or the check could not finish or was refused, for example while the device is mounted | No answer, or an error from the API |
 | `16` | Usage error | Usage error | Usage error |
 

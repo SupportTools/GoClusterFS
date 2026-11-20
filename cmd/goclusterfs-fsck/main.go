@@ -68,6 +68,11 @@ func main() {
 		reportPath     = flag.String("report", "", "With -release-slot, also write the slot, its journal and what happens to each transaction to `FILE`")
 		clearReserve   = flag.Bool("clear-reservations", false, "Emergency reset of storage fencing: list the device's persistent reservation keys, and with -confirm remove every key and the reservation, then exit. Refused while a node runs; until a node mounts again, any host can write to the device")
 		confirm        = flag.Bool("confirm", false, "With -clear-reservations, remove the keys instead of only listing them")
+		testReserve    = flag.Bool("test-reservations", false, "Qualify the device for storage fencing: send every persistent reservation command fencing sends, from temporary keys, report each answer, and remove the keys, then exit. Refused on a GoClusterFS volume unless -force")
+		victim         = flag.Bool("victim", false, "With -test-reservations, be host A of the two-host test: register, reserve, wait for host B to preempt this host, then check that the device refuses a 4 KiB write")
+		preemptKey     = flag.String("preempt", "", "With -test-reservations, be host B of the two-host test: preempt and abort the `KEY` host A printed, then keep a key for 30 seconds while host A tries its write")
+		keepKey        = flag.Bool("keep", false, "With -test-reservations, register a key and reserve, and leave both, to check with -check-kept after the device is detached and attached again or the storage restarts")
+		checkKept      = flag.String("check-kept", "", "With -test-reservations, check that the `KEY` -keep left and the reservation survived, then remove the key")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <device>\n\n", os.Args[0])
@@ -82,12 +87,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -list-slots /dev/sdb          # Show node registry slots\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -release-slot 3 /dev/sdb      # Show what releasing slot 3 discards\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -clear-reservations /dev/sdb  # List the reservation keys; add -confirm to remove them all\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -test-reservations /dev/sdb   # Check that a new disk can fence, before you format it\n", os.Args[0])
 		fmt.Fprint(os.Stderr, repairHelp)
 		fmt.Fprint(os.Stderr, slotsHelp)
 		fmt.Fprintf(os.Stderr, "\nExit codes (bits, as with fsck(8); 5 means some errors were repaired and some remain):\n")
 		fmt.Fprintf(os.Stderr, "  0: No errors (warnings may remain)\n")
 		fmt.Fprintf(os.Stderr, "  1: Errors were repaired, or -release-slot freed a slot\n")
-		fmt.Fprintf(os.Stderr, "  4: Errors remain on disk\n")
+		fmt.Fprintf(os.Stderr, "  4: Errors remain on disk, or the device failed a -test-reservations step\n")
 		fmt.Fprintf(os.Stderr, "  8: I/O failure, or the check could not finish or was refused\n")
 		fmt.Fprintf(os.Stderr, "  16: Usage error\n")
 	}
@@ -150,6 +156,27 @@ func main() {
 	case *confirm && !*clearReserve:
 		fmt.Fprintln(os.Stderr, "Error: -confirm needs -clear-reservations")
 		os.Exit(fsck.ExitUsage)
+	case *testReserve && (*clearReserve || *listSlots || releasing || inspecting || *repair):
+		fmt.Fprintln(os.Stderr, "Error: -test-reservations runs alone")
+		os.Exit(fsck.ExitUsage)
+	case (*victim || *preemptKey != "" || *keepKey || *checkKept != "") && !*testReserve:
+		fmt.Fprintln(os.Stderr, "Error: -victim, -preempt, -keep and -check-kept need -test-reservations")
+		os.Exit(fsck.ExitUsage)
+	case countTrue(*victim, *preemptKey != "", *keepKey, *checkKept != "") > 1:
+		fmt.Fprintln(os.Stderr, "Error: pick one of -victim, -preempt, -keep and -check-kept")
+		os.Exit(fsck.ExitUsage)
+	}
+	reservations := reservationTest{victim: *victim, keep: *keepKey, force: *force}
+	var keyErr error
+	switch {
+	case *preemptKey != "":
+		reservations.preempt, keyErr = parseToolKey("preempt", *preemptKey)
+	case *checkKept != "":
+		reservations.checkKept, keyErr = parseToolKey("check-kept", *checkKept)
+	}
+	if keyErr != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", keyErr)
+		os.Exit(fsck.ExitUsage)
 	}
 	devicePath := flag.Arg(0)
 
@@ -177,6 +204,18 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Warning: closing device: %v\n", err)
 		}
 	}()
+
+	if *testReserve {
+		failed, err := testReservations(os.Stdout, dev, devicePath, reservations)
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(fsck.ExitOperational)
+		case failed:
+			os.Exit(fsck.ExitUncorrected)
+		}
+		os.Exit(fsck.ExitClean)
+	}
 
 	if *clearReserve {
 		if err := clearReservations(os.Stdout, dev, devicePath, *confirm, *force); err != nil {

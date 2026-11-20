@@ -57,6 +57,9 @@ func ToolKey() uint64 {
 	return binary.BigEndian.Uint64(b[:])
 }
 
+// IsToolKey reports whether key is one ToolKey makes, which no node holds.
+func IsToolKey(key uint64) bool { return key>>48 == toolPrefix }
+
 // None is the Fencer of a volume without persistent reservations.
 type None struct{}
 
@@ -72,6 +75,7 @@ type device interface {
 	preemptAbort(own, victim uint64) error
 	clear(key uint64) error
 	readKeys() ([]uint64, error)
+	readReservation() (key uint64, typ uint32, err error)
 }
 
 // PR fences with a Write Exclusive, All Registrants reservation: every registered node may write, and no other
