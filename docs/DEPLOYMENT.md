@@ -465,7 +465,7 @@ Before you turn it on:
 - A chmod or chown on one node applies on the others within `-attr-timeout` (1 s by default), when their kernels drop the cached attributes. A process that already has the file open keeps its access, as on any filesystem.
 - The mount is `nosuid` and `nodev`, so a setuid bit on the volume grants nothing.
 - Use Linux 6.0 or later. It removes the setgid bit from a new file whose creator is not in the directory's group; FUSE does not tell GoClusterFS a caller's other groups, so it cannot do this itself. On older kernels such a file keeps the bit, which `nosuid` makes harmless.
-- The HTTP API acts as the mounting user: snapshot and clone requests through it skip these checks. Give the API token only to whoever may act as root.
+- Snapshot and clone requests through the HTTP API skip these checks, and its clones keep the source's owner. Give the API token only to whoever may act as root.
 
 ### Firewall Rules
 

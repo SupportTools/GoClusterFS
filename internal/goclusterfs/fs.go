@@ -4177,21 +4177,19 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 		return syscall.EIO
 	}
 
-	// The kernel checked only write access to this file; a snapshot's data inode keeps the file's old mode.
-	liveIno := srcIno
-	if srcNum != f.inodeNum {
-		if liveIno, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
-			return syscall.EIO
+	mode, uid, gid := srcIno.Mode, srcIno.UID, srcIno.GID
+	if caller, ok := fuse.FromContext(ctx); ok && caller.Uid != 0 {
+		// The kernel checked only write access to this file; a snapshot's data inode keeps the file's old mode.
+		liveIno := srcIno
+		if srcNum != f.inodeNum {
+			if liveIno, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
+				return syscall.EIO
+			}
 		}
-	}
-	uid, gid, _ := f.fs.newOwner(ctx, rootIno)
-	if !mayAccess(srcIno, uid, gid, 4) || !mayAccess(liveIno, uid, gid, 4) || !mayAccess(rootIno, uid, gid, 3) {
-		return syscall.EACCES
-	}
-	mode := srcIno.Mode
-	if uid == 0 {
-		uid, gid = srcIno.UID, srcIno.GID
-	} else {
+		uid, gid, _ = f.fs.newOwner(ctx, rootIno)
+		if !mayAccess(srcIno, uid, gid, 4) || !mayAccess(liveIno, uid, gid, 4) || !mayAccess(rootIno, uid, gid, 3) {
+			return syscall.EACCES
+		}
 		mode &^= inode.S_ISUID | inode.S_ISGID
 	}
 
