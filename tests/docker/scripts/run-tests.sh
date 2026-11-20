@@ -98,6 +98,16 @@ kill_node() {
     done
 }
 
+# Prints each node's log since $1; the CI log step runs after the containers are gone
+dump_logs_since() {
+    local since=$1 node
+    shift
+    for node in "$@"; do
+        log "--- $node log since $since"
+        docker logs --since "$since" "$node" 2>&1 | tail -n 100
+    done
+}
+
 # Restart a node container
 restart_node() {
     local node=$1
@@ -1413,6 +1423,7 @@ test_restart_keeps_peer_journal() {
     docker start "$node_a" >/dev/null
     if ! wait_node_healthy "$node_a" 60; then
         exec_on_node "$node_b" touch /tmp/peer-writer.stop
+        dump_logs_since "$since" "$node_a" "$node_b"
         return 1
     fi
     sleep 1
@@ -1427,6 +1438,7 @@ test_restart_keeps_peer_journal() {
     log "Node B writer finished: ${status:-timeout}"
     if [[ "$status" != ok* ]]; then
         log "ERROR: Node B could not keep writing while node A restarted"
+        dump_logs_since "$since" "$node_a" "$node_b"
         return 1
     fi
     local written=${status#ok }
@@ -1436,6 +1448,7 @@ test_restart_keeps_peer_journal() {
         [ \"\$(cat $dir/peer-\$k 2>/dev/null)\" = peer-\$k ] || echo peer-\$k; k=\$((k + 1)); done")
     if [[ -n "$bad" ]]; then
         log "ERROR: Node A cannot read node B's files: $(echo $bad | head -c 300)"
+        dump_logs_since "$since" "$node_a" "$node_b"
         return 1
     fi
 
@@ -1446,21 +1459,34 @@ test_restart_keeps_peer_journal() {
     log "Node A: $offset_a; node B: $offset_b (UUID $uuid_b)"
     if [[ -z "$offset_a" || "$offset_a" == "$offset_b" ]]; then
         log "ERROR: Node A and node B share a journal region"
+        dump_logs_since "$since" "$node_a" "$node_b"
         return 1
     fi
     if docker logs --since "$since" "$node_a" 2>&1 | grep -q "from crashed node $uuid_b"; then
         log "ERROR: Node A replayed live node B's journal during its restart"
+        dump_logs_since "$since" "$node_a" "$node_b"
         return 1
     fi
     local slot_after
     slot_after=$(docker logs --since "$since" "$node_a" 2>&1 | grep -o 'Registered as node [0-9]*' | tail -1)
-    # The restarted container watches its old slot for 20s, so node B, which watched it since the crash, may replay it first.
+    # The restarted container watches its old slot for 20s, so a peer that watched it since the crash may replay it first.
     if [[ "$slot_after" != "$slot_before" ]]; then
-        if [[ -z "$uuid_a" ]] || ! docker logs --since "$since" "$node_b" 2>&1 | grep -q "Starting journal replay for node ${uuid_a:0:8}"; then
-            log "ERROR: Node A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount, or node B to replay it"
+        local node replayer="" waited=0
+        while [[ -n "$uuid_a" && -z "$replayer" && $waited -lt 10 ]]; do
+            for node in "${NODE_ARRAY[@]}"; do
+                if [[ "$node" != "$node_a" ]] && docker logs --since "$since" "$node" 2>&1 | grep -q "Starting journal replay for node ${uuid_a:0:8}"; then
+                    replayer=$node
+                fi
+            done
+            [[ -n "$replayer" ]] || sleep 1
+            waited=$((waited + 1))
+        done
+        if [[ -z "$replayer" ]]; then
+            log "ERROR: Node A came back as '$slot_after', want its own slot '$slot_before' so it replays its journal at mount, or a peer to replay it"
+            dump_logs_since "$since" "$node_a" "$node_b"
             return 1
         fi
-        log "Node B replayed node A's old slot first; node A came back as '$slot_after'"
+        log "$replayer replayed node A's old slot first; node A came back as '$slot_after'"
     fi
 
     exec_on_node "$node_b" rm -rf "$dir"
