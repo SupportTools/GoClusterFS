@@ -775,6 +775,57 @@ test_hard_links() {
     return 0
 }
 
+# With -allow-other, users other than root get what each file's mode bits give them, from any node.
+test_non_root_users() {
+    log "Testing users other than root across nodes..."
+
+    local node="${NODE_ARRAY[0]}"
+    local other="${NODE_ARRAY[1]:-${NODE_ARRAY[0]}}"
+    local dir=/mnt/goclusterfs/nonroot_test
+    local alice=2001:3000 bob=2002:3000 carol=2003:2003
+    as_user() { local who=$1 on=$2; shift 2; docker exec -u "$who" "$on" sh -c "$*" 2>&1; }
+
+    exec_on_node "$node" sh -c "rm -rf $dir && mkdir -p $dir/team $dir/pub && chown $alice $dir/team && chmod 2770 $dir/team && chmod 1777 $dir/pub"
+    if ! as_user $alice "$node" "umask 027 && echo secret > $dir/team/a.txt && mkdir $dir/team/sub"; then
+        log "ERROR: the directory's owner cannot create in it"
+        return 1
+    fi
+    local got want
+    got=$(exec_on_node "$other" stat -c '%u %g %a' "$dir/team/a.txt" "$dir/team/sub")
+    want=$(printf '2001 3000 640\n2001 3000 2750')
+    if [[ "$got" != "$want" ]]; then
+        log "ERROR: owner, group and mode on $other: $got; want $want (setgid directory's group, setgid on the new directory)"
+        return 1
+    fi
+    if [[ "$(as_user $alice "$other" "cat $dir/team/a.txt")" != "secret" ]] || ! as_user $alice "$other" "echo more >> $dir/team/a.txt" > /dev/null; then
+        log "ERROR: the owner cannot read and write its file from $other"
+        return 1
+    fi
+    if [[ "$(as_user $bob "$other" "cat $dir/team/a.txt")" != "$(printf 'secret\nmore')" ]]; then
+        log "ERROR: a member of the file's group cannot read it"
+        return 1
+    fi
+    local refusal who on cmd why
+    for refusal in "$bob|$other|echo bob >> $dir/team/a.txt|Permission denied" \
+                   "$carol|$other|cat $dir/team/a.txt|Permission denied" \
+                   "$bob|$node|chmod 666 $dir/team/a.txt|Operation not permitted" \
+                   "$alice|$node|chown 2002 $dir/team/a.txt|Operation not permitted"; do
+        IFS='|' read -r who on cmd why <<< "$refusal"
+        if got=$(as_user "$who" "$on" "$cmd") || [[ "$got" != *"$why"* ]]; then
+            log "ERROR: $who on $on ran '$cmd' and got '$got'; want '$why'"
+            return 1
+        fi
+    done
+    as_user $alice "$node" "touch $dir/pub/alice.txt" > /dev/null
+    if got=$(as_user $bob "$other" "rm -f $dir/pub/alice.txt") || [[ "$got" != *"Operation not permitted"* ]]; then
+        log "ERROR: in a sticky directory another user removed alice's file: '$got'"
+        return 1
+    fi
+    exec_on_node "$node" rm -rf "$dir"
+    log "Users other than root test passed"
+    return 0
+}
+
 # Git, SQLite and Postgres fsync a directory after creating or removing an entry in it; each fsync must succeed.
 test_dir_fsync() {
     log "Testing directory fsync..."
@@ -3708,6 +3759,7 @@ run_test "Nested Directories" test_nested_directories
 run_test "Delete Directory" test_delete_directory
 run_test "Directory Fsync" test_dir_fsync
 run_test "Hard Links" test_hard_links
+run_test "Users Other Than Root" test_non_root_users
 run_test "Truncate File" test_truncate_file
 run_test "Append File" test_append_file
 run_test "Rename File" test_rename_file

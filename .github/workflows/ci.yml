@@ -223,6 +223,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-dev
           sudo modprobe fuse
+          # TestNonRootUsersAcrossNodes mounts with -allow-other as the runner user
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
           which fusermount || which fusermount3
 
       - name: Download dependencies

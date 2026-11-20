@@ -75,6 +75,9 @@ MOUNT_ARGS="-device $DEVICE_PATH -mount $MOUNT_POINT"
 if [ -n "$BROADCAST_HEARTBEAT" ]; then
     MOUNT_ARGS="$MOUNT_ARGS -broadcast-heartbeat $BROADCAST_HEARTBEAT"
 fi
+if [ "$ALLOW_OTHER" = "true" ]; then
+    MOUNT_ARGS="$MOUNT_ARGS -allow-other"
+fi
 
 # Only format if FORMAT_ON_START=true AND we haven't already formatted
 # This prevents data loss on container restart

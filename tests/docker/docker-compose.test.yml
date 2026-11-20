@@ -47,6 +47,7 @@ services:
       - DEBUG=${DEBUG:-false}
       # Short, so a node no longer heard on broadcast is reported within seconds
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
+      - ALLOW_OTHER=${ALLOW_OTHER:-true}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.11
@@ -80,6 +81,7 @@ services:
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
+      - ALLOW_OTHER=${ALLOW_OTHER:-true}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.12
@@ -113,6 +115,7 @@ services:
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
+      - ALLOW_OTHER=${ALLOW_OTHER:-true}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.13
@@ -146,6 +149,7 @@ services:
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
+      - ALLOW_OTHER=${ALLOW_OTHER:-true}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.14

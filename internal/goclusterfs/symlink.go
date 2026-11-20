@@ -106,7 +106,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		logging.Debugf("Symlink %q: Read parent inode %d failed: %v", name, parentNum, err)
 		return nil, syscall.EIO
 	}
-	uid, gid := f.owner(ctx)
+	uid, gid, _ := f.newOwner(ctx, dirIno)
 
 	if f.journal != nil {
 		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, target, block, reserved)

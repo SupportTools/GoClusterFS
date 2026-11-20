@@ -38,6 +38,7 @@ These are the `goclusterfs-mount` flags:
 | `-require-fencing` | bool | `false` | Refuse to mount a volume formatted without fencing |
 | `-debug` | bool | `false` | Print `[DEBUG]` log lines |
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
+| `-allow-other` | bool | `false` | Let every user on the host, not only the one that mounted, use the filesystem, with the kernel checking each file's owner, group and mode bits (`allow_other` and `default_permissions`). See [Users Other Than Root](DEPLOYMENT.md#users-other-than-root) |
 | `-version` | bool | `false` | Print the version, commit and commit date, then exit |
 | `-completion` | string | (empty) | Print a `bash` or `zsh` completion script and exit |
 | `-preflight` | bool | `false` | Check FUSE, the device (O_DIRECT, filesystem), the mount point, the broadcast ports and the API address, and on a Kubernetes node whether any of those ports is in the NodePort range 30000-32767; print `PASS`, `WARN` or `FAIL` with a fix for each, change nothing, and exit 8 if a check fails |

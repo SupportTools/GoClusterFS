@@ -62,6 +62,10 @@ const (
 	S_IFIFO  uint16 = 0o010000 // FIFO
 	S_IFSOCK uint16 = 0o140000 // Socket
 	S_IFMT   uint16 = 0o170000 // Mask for file type
+
+	S_ISUID uint16 = 0o4000
+	S_ISGID uint16 = 0o2000
+	S_ISVTX uint16 = 0o1000
 )
 
 // Inode flags
