@@ -1,7 +1,10 @@
 // Command gcfs-staleness measures how late one node sees another node's
 // writes. The writer stamps each version into the file's size and its last
-// bytes, which every other version moves into blocks it maps again. The reader watches the file three ways and logs every change it
-// sees, and analyze turns both logs into per-version lag.
+// bytes, which every other version moves into blocks it maps again. Every
+// state another node can read is one whole version, so a reader that sees a
+// new size with unreadable last bytes has stale pages. The reader watches the
+// file three ways and logs every change it sees, and analyze turns both logs
+// into per-version lag.
 //
 //	gcfs-staleness write -file F -versions N
 //	gcfs-staleness read -file F -duration D -modes open,stat,reopen
@@ -39,15 +42,18 @@ func sizeOf(v int) int64 {
 	return smallBase + int64(v)*sizeStep
 }
 
+// versionOfSize returns -1 for a size the writer never sets, such as the end of
+// the old last block that a growing write commits before it maps the new one.
 func versionOfSize(size int64) int {
 	base := int64(smallBase)
 	if size >= bigBase {
 		base = bigBase
 	}
-	if size < base || (size-base)%sizeStep != 0 {
+	v := int((size - base) / sizeStep)
+	if v < 0 || sizeOf(v) != size {
 		return -1
 	}
-	return int((size - base) / sizeStep)
+	return v
 }
 
 func header(v int) []byte { return []byte(fmt.Sprintf("%010d\n", v)) }
@@ -81,11 +87,12 @@ func write(args []string) {
 		if err != nil {
 			fail("open: %v", err)
 		}
-		if err := f.Truncate(sizeOf(v)); err != nil {
-			fail("truncate v%d: %v", v, err)
-		}
+		// Header first, so a reader never catches the new size before the new last bytes.
 		if _, err := f.WriteAt(header(v), sizeOf(v)-headerLen); err != nil {
 			fail("write v%d: %v", v, err)
+		}
+		if err := f.Truncate(sizeOf(v)); err != nil {
+			fail("truncate v%d: %v", v, err)
 		}
 		if err := f.Close(); err != nil {
 			fail("close v%d: %v", v, err)
@@ -110,8 +117,12 @@ func read(args []string) {
 
 	var mu sync.Mutex
 	logChange := func(mode string, o observation, start, prevStart time.Time) {
+		prev := int64(0)
+		if !prevStart.IsZero() {
+			prev = prevStart.UnixNano()
+		}
 		mu.Lock()
-		fmt.Printf("R %d %s %d %d %d %d\n", time.Now().UnixNano(), mode, o.size, o.data, start.UnixNano(), prevStart.UnixNano())
+		fmt.Printf("R %d %s %d %d %d %d\n", time.Now().UnixNano(), mode, o.size, o.data, start.UnixNano(), prev)
 		mu.Unlock()
 	}
 	watch := func(mode string, look func() observation) {
@@ -278,7 +289,9 @@ func analyze(args []string) {
 		for v := 1; v <= maxVersion; v++ {
 			var seen *change
 			for i := range cs {
-				if cs[i].obs.size >= v && (mode == "stat" || cs[i].obs.data >= v) {
+				// A stat showing a size the writer never sets read the file mid-write, after every version closed before the look began.
+				midWrite := mode == "stat" && cs[i].obs == observation{-1, 0} && cs[i].start > done[v]
+				if midWrite || cs[i].obs.size >= v && (mode == "stat" || cs[i].obs.data >= v) {
 					seen = &cs[i]
 					break
 				}
