@@ -2,8 +2,6 @@ package fsck
 
 import (
 	"fmt"
-
-	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 // checkExtents validates extent consistency (Phase 4).
@@ -50,15 +48,12 @@ func (c *Checker) checkExtents() error {
 
 	// Re-scan inodes to check their extents in detail
 	// (inodeBlocks already collected block references in Phase 3)
-	inodeTableOffset := sb.InodeTableOffset
-	inodeTableSize := sb.InodeTableSize
-	totalSectors := inodeTableSize / InodeSectorSize
-	sectorBuf := storage.NewAlignedBuffer(InodeSectorSize).Bytes()
+	totalSectors := sb.InodeTableSize / InodeSectorSize
+	sectors := c.inodeSectors()
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
-		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
-
-		if c.readSector(sectorBuf, sectorOffset) != nil {
+		sectorBuf, err := sectors.at(sectorIdx)
+		if err != nil {
 			continue // Already reported in Phase 3
 		}
 

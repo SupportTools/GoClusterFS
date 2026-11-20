@@ -124,8 +124,7 @@ func (c *Checker) checkInodes() error {
 	c.logf("  Inode table size: %d bytes\n", inodeTableSize)
 	c.logf("  Total inode slots: %d\n", totalInodes)
 
-	// Read inodes sector by sector
-	sectorBuf := storage.NewAlignedBuffer(InodeSectorSize).Bytes()
+	sectors := c.inodeSectors()
 	totalSectors := inodeTableSize / InodeSectorSize
 
 	usedInodes := uint64(0)
@@ -135,9 +134,8 @@ func (c *Checker) checkInodes() error {
 	checksumErrors := 0
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
-		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
-
-		if err := c.readSector(sectorBuf, sectorOffset); err != nil {
+		sectorBuf, err := sectors.at(sectorIdx)
+		if err != nil {
 			c.addProblem(PhaseInodes, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
 			c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode table sector %d", sectorIdx))
 			continue

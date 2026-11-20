@@ -81,15 +81,12 @@ func (c *Checker) checkDirectories() error {
 	totalInodes := sb.InodeTableSize / InodeSize
 
 	// Find all directory inodes and validate their entries
-	inodeTableOffset := sb.InodeTableOffset
-	inodeTableSize := sb.InodeTableSize
-	totalSectors := inodeTableSize / InodeSectorSize
-	sectorBuf := storage.NewAlignedBuffer(InodeSectorSize).Bytes()
+	totalSectors := sb.InodeTableSize / InodeSectorSize
+	sectors := c.inodeSectors()
 
 	for sectorIdx := uint64(0); sectorIdx < totalSectors; sectorIdx++ {
-		sectorOffset := inodeTableOffset + sectorIdx*InodeSectorSize
-
-		if c.readSector(sectorBuf, sectorOffset) != nil {
+		sectorBuf, err := sectors.at(sectorIdx)
+		if err != nil {
 			c.namesIncomplete = append(c.namesIncomplete, fmt.Sprintf("inode table sector %d is unreadable", sectorIdx))
 			continue
 		}
