@@ -109,18 +109,21 @@ func read(args []string) {
 	_ = fs.Parse(args)
 
 	var mu sync.Mutex
-	logChange := func(mode string, o observation) {
+	logChange := func(mode string, o observation, start, prevStart time.Time) {
 		mu.Lock()
-		fmt.Printf("R %d %s %d %d\n", time.Now().UnixNano(), mode, o.size, o.data)
+		fmt.Printf("R %d %s %d %d %d %d\n", time.Now().UnixNano(), mode, o.size, o.data, start.UnixNano(), prevStart.UnixNano())
 		mu.Unlock()
 	}
 	watch := func(mode string, look func() observation) {
 		last := observation{-2, -2}
+		var prevStart time.Time
 		for end := time.Now().Add(*duration); time.Now().Before(end); time.Sleep(*poll) {
+			start := time.Now()
 			if o := look(); o != last {
-				logChange(mode, o)
+				logChange(mode, o, start, prevStart)
 				last = o
 			}
+			prevStart = start
 		}
 	}
 	readTail := func(f *os.File, size int64) int {
@@ -215,8 +218,8 @@ func flood(args []string) {
 }
 
 type change struct {
-	at  int64
-	obs observation
+	at, start, prevStart int64
+	obs                  observation
 }
 
 func analyze(args []string) {
@@ -248,11 +251,13 @@ func analyze(args []string) {
 	for _, readerLog := range strings.Split(*readerLog, ",") {
 		looks := 0
 		scan(readerLog, func(f []string) {
-			if f[0] == "R" && len(f) == 5 {
+			if f[0] == "R" && len(f) == 7 {
 				at, _ := strconv.ParseInt(f[1], 10, 64)
 				size, _ := strconv.Atoi(f[3])
 				data, _ := strconv.Atoi(f[4])
-				changes[f[2]] = append(changes[f[2]], change{at, observation{size, data}})
+				start, _ := strconv.ParseInt(f[5], 10, 64)
+				prevStart, _ := strconv.ParseInt(f[6], 10, 64)
+				changes[f[2]] = append(changes[f[2]], change{at, start, prevStart, observation{size, data}})
 				looks++
 			}
 		})
@@ -268,24 +273,28 @@ func analyze(args []string) {
 			continue
 		}
 		var lags []time.Duration
-		var worst time.Duration
+		var worst, worstStale, slowest time.Duration
 		worstVersion, bad := 0, 0
 		for v := 1; v <= maxVersion; v++ {
-			seen := int64(-1)
-			for _, c := range cs {
-				if c.obs.size >= v && (mode == "stat" || c.obs.data >= v) {
-					seen = c.at
+			var seen *change
+			for i := range cs {
+				if cs[i].obs.size >= v && (mode == "stat" || cs[i].obs.data >= v) {
+					seen = &cs[i]
 					break
 				}
 			}
-			if seen < 0 {
+			if seen == nil {
 				continue
 			}
-			lag := time.Duration(max(0, seen-done[v]))
+			lag := time.Duration(max(0, seen.at-done[v]))
 			lags = append(lags, lag)
 			if lag > worst {
 				worst, worstVersion = lag, v
 			}
+			if seen.prevStart > 0 {
+				worstStale = max(worstStale, time.Duration(seen.prevStart-done[v]))
+			}
+			slowest = max(slowest, time.Duration(seen.at-seen.start))
 		}
 		regressions, highest := 0, observation{}
 		for _, c := range cs {
@@ -320,8 +329,9 @@ func analyze(args []string) {
 			verdict = fmt.Sprintf("NEVER SAW %d VERSIONS", maxVersion-len(lags))
 			failed = true
 		}
-		fmt.Printf("%-6s versions seen %d/%d  median %v  worst %v (v%d)  bound %v  unreadable looks %d  regressions %d  %s\n",
-			mode, len(lags), maxVersion, median.Round(time.Millisecond), worst.Round(time.Millisecond), worstVersion, *bounds[mode], bad, regressions, verdict)
+		fmt.Printf("%-6s versions seen %d/%d  median %v  worst %v (v%d)  bound %v  unreadable looks %d  regressions %d  %s  [stale-proven %v, slowest seeing look %v]\n",
+			mode, len(lags), maxVersion, median.Round(time.Millisecond), worst.Round(time.Millisecond), worstVersion, *bounds[mode], bad, regressions, verdict,
+			worstStale.Round(time.Millisecond), slowest.Round(time.Millisecond))
 	}
 	if failed {
 		os.Exit(1)
