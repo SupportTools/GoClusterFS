@@ -1612,6 +1612,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckAcceptsRuntimeImage
 
+  - id: fsck-inode-table-chunked-reads
+    name: fsck reads the inode table a megabyte at a time
+    description: Phases 3, 4 and 6 and phase 8's link count check make one read per 1 MB of inode table, not one per 4 KB sector or per file
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reads_test.go::TestFsckReadsTheInodeTableInChunks
+
+  - id: fsck-unreadable-inode-sector
+    name: fsck reports only the unreadable inode table sector
+    description: When a 1 MB inode table read fails, fsck reads its sectors one by one, so only the bad sector is reported and the inodes around it are still checked
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_reads_test.go::TestFsckReportsOnlyTheUnreadableInodeSector
+
   - id: fsck-repair-older-tree-sharing
     name: fsck -repair counts older sharing in extent trees
     description: Older sharing in inline and extent tree files, including a block shared between a tree file and an inline clone, is rebuilt and marked counted

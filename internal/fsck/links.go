@@ -19,12 +19,13 @@ func (c *Checker) checkFileLinks() error {
 	}
 	fix := map[uint32]uint32{}
 	var problems []int
+	sectors := c.inodeSectors()
 	for _, num := range slices.Sorted(maps.Keys(c.inodeUsed)) {
 		names := c.dirEntryRefs[num]
 		if names == 0 || c.entryType[num] != DT_REG {
 			continue
 		}
-		ino, err := c.readInode(num)
+		ino, err := sectors.inode(num)
 		if err != nil {
 			c.addProblem(PhaseCrossValidation, Warning, fmt.Sprintf("inode %d", num), "link count not checked: "+err.Error(), false)
 			continue
