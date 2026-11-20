@@ -1,7 +1,7 @@
 // Command gcfs-staleness measures how late one node sees another node's
 // writes. The writer stamps each version into the file's size and its last
 // bytes, which every other version moves into blocks it maps again. Every
-// state the file passes through is one whole version, so a reader that sees a
+// state another node can read is one whole version, so a reader that sees a
 // new size with unreadable last bytes has stale pages. The reader watches the
 // file three ways and logs every change it sees, and analyze turns both logs
 // into per-version lag.
@@ -42,15 +42,18 @@ func sizeOf(v int) int64 {
 	return smallBase + int64(v)*sizeStep
 }
 
+// versionOfSize returns -1 for a size the writer never sets, such as the end of
+// the old last block that a growing write commits before it maps the new one.
 func versionOfSize(size int64) int {
 	base := int64(smallBase)
 	if size >= bigBase {
 		base = bigBase
 	}
-	if size < base || (size-base)%sizeStep != 0 {
+	v := int((size - base) / sizeStep)
+	if v < 0 || sizeOf(v) != size {
 		return -1
 	}
-	return int((size - base) / sizeStep)
+	return v
 }
 
 func header(v int) []byte { return []byte(fmt.Sprintf("%010d\n", v)) }
