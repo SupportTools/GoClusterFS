@@ -289,7 +289,9 @@ func analyze(args []string) {
 		for v := 1; v <= maxVersion; v++ {
 			var seen *change
 			for i := range cs {
-				if cs[i].obs.size >= v && (mode == "stat" || cs[i].obs.data >= v) {
+				// A stat showing a size the writer never sets read the file mid-write, after every version closed before the look began.
+				midWrite := mode == "stat" && cs[i].obs == observation{-1, 0} && cs[i].start > done[v]
+				if midWrite || cs[i].obs.size >= v && (mode == "stat" || cs[i].obs.data >= v) {
 					seen = &cs[i]
 					break
 				}
