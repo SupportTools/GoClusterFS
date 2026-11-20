@@ -34,7 +34,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | Path | What it does |
 |------|--------------|
 | `cmd/goclusterfs-mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
-| `cmd/goclusterfs-fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes |
+| `cmd/goclusterfs-fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes, and journal slot tools: `-list-slots`, `-inspect-slot`, and `-release-slot` with `-salvage`, `-discard-journal` and `-report` |
 | `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics, snapshots) |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
@@ -90,7 +90,7 @@ Snapshots and clones work through extended attributes on a file (`internal/goclu
 - `setfattr -n user.clone -v /<new-name> <file>` clones the file
 - `setfattr -n user.snapshot.clone -v <snapshot>:/<new-name> <file>` clones from a snapshot
 
-Clone paths are absolute from the filesystem root, and clones can only go in the root directory. A snapshot records its file's inode number and birth generation, so a later file in the same inode slot does not see it; once its file is deleted it is an orphan, listed and deleted only through the API without a path.
+Clone paths are absolute from the filesystem root, and clones can only go in the root directory. A snapshot records its file's inode number and birth generation, so a later file in the same inode slot does not see it; once its file is deleted, or has no name left even while open, it is an orphan, listed and deleted only through the API without a path.
 
 ## Current Limitations
 
@@ -99,7 +99,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, a directory's wrong `.` or `..`, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. Every `statfs` (`df`) reads the whole inode table to count free inodes: 50 MB on a 200 GB device at the default ratio.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
-- No hard links. Rename supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`. Symlinks need a volume formatted by a build with symlink support.
+- Rename supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`. Symlinks need a volume formatted by a build with symlink support.
 
 ## Testing
 
