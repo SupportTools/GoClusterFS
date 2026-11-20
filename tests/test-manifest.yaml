@@ -331,6 +331,20 @@ scenarios:
     environments:
       go: internal/inode/alloc_test.go::TestFindFreeSlotFindsEveryFreeInode
 
+  - id: inode-search-resumes
+    name: Inode search resumes after the last free inode it found
+    description: With 40,000 inodes in use, each FindFreeSlot reads the inode table at most twice instead of rereading every used inode from the node's start
+    priority: go_only
+    environments:
+      go: internal/inode/alloc_test.go::TestFindFreeSlotReadsFromWhereItLeftOff
+
+  - id: inode-search-sees-peer-frees
+    name: Inode search finds inodes another node freed
+    description: An inode another node frees behind this node's last find is found after the search wraps, and an inode this node frees moves its search back so it reuses inodes from its start first
+    priority: go_only
+    environments:
+      go: internal/inode/alloc_test.go::TestFindFreeSlotFindsInodesAnotherNodeFreed
+
   - id: multinode-concurrent-writes
     name: Concurrent writes to different files
     description: Multiple nodes write to different files simultaneously
