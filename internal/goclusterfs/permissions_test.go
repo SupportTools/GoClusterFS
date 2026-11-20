@@ -122,5 +122,20 @@ func TestCloneChecksCallerAccess(t *testing.T) {
 		t.Fatalf("clone by root: %v", errno)
 	}
 	checkOwner(t, fsys, "root's clone", lookupFile(t, fsys, "by-root").inodeNum, alice, alice, inode.S_IFREG|0o4622)
+
+	setOwner(t, fsys, src.inodeNum, alice, alice, 0o646)
+	setxattr(t, src, "user.snapshot", "old")
+	setOwner(t, fsys, src.inodeNum, alice, alice, 0o602)
+	snapshotClone := func(name string) syscall.Errno {
+		return src.Setxattr(asCaller(bob, bob), "user.snapshot.clone", []byte("old:/"+name), 0)
+	}
+	if errno := snapshotClone("bob-old"); errno != syscall.EACCES {
+		t.Errorf("clone of a snapshot taken while bob could read the file, which he no longer can: %v, want EACCES", errno)
+	}
+	setOwner(t, fsys, src.inodeNum, alice, alice, 0o646)
+	if errno := snapshotClone("bob-old"); errno != 0 {
+		t.Fatalf("clone of a snapshot of a file bob can read: %v", errno)
+	}
+	checkOwner(t, fsys, "bob's snapshot clone", lookupFile(t, fsys, "bob-old").inodeNum, bob, bob, inode.S_IFREG|0o646)
 	expectNoProblems(t, fsys, "after the clones")
 }

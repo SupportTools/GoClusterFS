@@ -2825,7 +2825,7 @@ scenarios:
 
   - id: clone-checks-caller-access
     name: A clone checks the caller's access
-    description: A caller other than root clones a file only with read access to it and write and search access to the root directory. The clone is the caller's and loses setuid and setgid; root's clone keeps the source's owner and mode
+    description: A caller other than root clones a file, or a snapshot of it, only with read access to the file as it is now and write and search access to the root directory. The clone is the caller's and loses setuid and setgid; root's clone keeps the source's owner and mode
     priority: go_only
     environments:
       go: internal/goclusterfs/permissions_test.go::TestCloneChecksCallerAccess

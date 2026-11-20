@@ -115,7 +115,6 @@ services:
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
-      - ALLOW_OTHER=${ALLOW_OTHER:-true}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.13
@@ -149,7 +148,6 @@ services:
       - FORMAT_ON_START=false
       - DEBUG=${DEBUG:-false}
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}
-      - ALLOW_OTHER=${ALLOW_OTHER:-true}
     networks:
       cluster-net:
         ipv4_address: 192.168.168.14
