@@ -5719,6 +5719,13 @@ scenarios:
     environments:
       go: internal/node/mounted_peers_test.go::TestMountedPeersListsEveryOtherNodeThatMayWrite
 
+  - id: unfenced-refused-remount-keeps-journal
+    name: A refused remount leaves the crashed journal to a peer
+    description: A crashed node's remount without -unsafe-allow-unfenced takes back its slot and is refused; the slot stays, so a peer still replays the crashed journal and its files survive
+    priority: go_only
+    environments:
+      go: tests/integration/unfenced_test.go::TestRefusedRemountLeavesTheCrashedJournalToAPeer
+
   - id: unfenced-paused-vm-hazard
     name: An unfenced paused VM lands writes after its replay
     description: With -unsafe-allow-unfenced, a VM paused with QEMU stop past its takeover resumes and overwrites data a peer wrote after replaying it. Fails on purpose; runs only with VM_HAZARD_TESTS=1

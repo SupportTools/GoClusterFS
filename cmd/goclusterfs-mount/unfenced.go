@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"maps"
@@ -13,18 +12,17 @@ import (
 
 // joinUnfenced lets this node, registered on a volume without storage fencing, go on only when no other node has
 // the volume mounted, or when allow says the operator accepts the risk. It checks after Register, so of two nodes
-// mounting at once at least one sees the other.
-func joinUnfenced(ctx context.Context, reg *node.Registry, devicePath string, allow bool) {
+// mounting at once at least one sees the other. A refused node leaves its slot as a crash would: Register may have
+// taken back this host's crashed mount with its unreplayed journal, which a peer must then replay.
+func joinUnfenced(reg *node.Registry, devicePath string, allow bool) {
 	peers, err := reg.MountedPeers()
 	switch {
 	case err != nil && !allow:
-		_ = reg.Unregister(ctx)
 		failf("Cannot join the cluster: reading the node registry to look for other nodes failed: %v. %s has no storage fencing, "+
 			"so a node mounts it only alone, or with -unsafe-allow-unfenced", err, devicePath)
 	case len(peers) == 0:
 		return
 	case !allow:
-		_ = reg.Unregister(ctx)
 		failf("Cannot join the cluster: %s has no storage fencing, and %s. %s "+
 			"Format the volume on a device with persistent reservations (-fencing=pr) so nodes can be fenced, or mount every node "+
 			"with -unsafe-allow-unfenced to accept the risk. If those nodes are gone, release their slots with goclusterfs-fsck -release-slot",

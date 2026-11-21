@@ -343,7 +343,7 @@ func main() {
 		failf("Cannot join the cluster: %v; check the device, then mount again", err)
 	}
 	if fencer.Kind() == "none" {
-		joinUnfenced(ctx, nodeReg, *devicePath, *unsafeUnfenced)
+		joinUnfenced(nodeReg, *devicePath, *unsafeUnfenced)
 	}
 	nodeReg.SetSlotLostHandler(func(loss node.SlotLoss) {
 		storage.AwaitStoppedWrite()
