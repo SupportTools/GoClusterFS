@@ -1444,6 +1444,24 @@ test_network_partition() {
     return 0
 }
 
+# Proves broadcasts arrive: VMs 1 and 2 each hear every other node, and no mounted node has gone unheard.
+expect_broadcast_delivery() {
+    local vm_id i metrics peers silent want=$((NODE_COUNT - 1))
+    for vm_id in 1 2; do
+        for i in $(seq 1 45); do
+            metrics=$(ssh_run "$vm_id" "wget -qO- http://127.0.0.1:8080/metrics")
+            peers=$(awk '$1 == "goclusterfs_broadcast_peers" {print $2 + 0}' <<< "$metrics")
+            silent=$(awk '$1 == "goclusterfs_broadcast_silent_peers" {print $2 + 0}' <<< "$metrics")
+            [[ "$peers" == "$want" && "$silent" == 0 ]] && break
+            sleep 1
+        done
+        if [[ "$peers" != "$want" || "$silent" != 0 ]]; then
+            log_error "VM $vm_id hears ${peers:-no} broadcast peers with ${silent:-unknown} silent, want $want and 0"
+            return 1
+        fi
+    done
+}
+
 # Test: Broadcast cache invalidation
 # Verifies that cache invalidation via UDP broadcast propagates quickly between VMs.
 # This tests that VM 2 sees changes from VM 1 within ~500ms (vs 5s TTL).
@@ -1457,6 +1475,7 @@ test_broadcast_invalidation() {
 
     # Ensure all VMs are running before test (may have been killed by previous test)
     ensure_cluster_healthy 2
+    expect_broadcast_delivery || return 1
 
     local writer=1
     local reader=2
@@ -1523,6 +1542,7 @@ test_broadcast_directory_invalidation() {
 
     # Ensure all VMs are running before test (may have been killed by previous test)
     ensure_cluster_healthy 2
+    expect_broadcast_delivery || return 1
 
     local writer=1
     local reader=2
@@ -1582,6 +1602,7 @@ test_broadcast_multiple_updates() {
 
     # Ensure all VMs are running before test (may have been killed by previous test)
     ensure_cluster_healthy 2
+    expect_broadcast_delivery || return 1
 
     local writer=1
     local reader=2
@@ -1659,6 +1680,7 @@ test_broadcast_bidirectional() {
 
     # Ensure all VMs are running before test (may have been killed by previous test)
     ensure_cluster_healthy 2
+    expect_broadcast_delivery || return 1
 
     local vm1=1
     local vm2=2

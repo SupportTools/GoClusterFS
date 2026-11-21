@@ -42,6 +42,9 @@ SHARED_DISK_SIZE_MB=${VM_CLUSTER_SIZE_MB:-1024}
 
 # Network settings (each VM gets sequential ports)
 SSH_BASE_PORT=${VM_SSH_BASE_PORT:-2222}
+# Node VMs share eth1 for broadcasts: QEMU carries its frames over a multicast group on the host's loopback.
+BROADCAST_NET="230.77.0.1:$((SSH_BASE_PORT + 200))"
+BROADCAST_IFACE=eth1
 
 # VM_STORAGE=iscsi serves the cluster image from VM ${TARGET_VM_ID} over iSCSI (Linux LIO, with SCSI-3 persistent
 # reservations), so nodes fence each other. virtio, the default, shares the image as a virtio disk without reservations.
@@ -217,10 +220,16 @@ write_setup_disk() {
         echo "mountpoint='${GOCLUSTERFS_MOUNT}'"
         cat <<'EOF'
 set -x
-setup-interfaces -a
+# setup-interfaces -a leaves eth0 out once a VM has a second NIC.
+printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
 ifup eth0
 # goclusterfs-mount serves its API on 127.0.0.1, which needs loopback up.
 ip link set lo up
+# The last byte of eth1's MAC is the VM number.
+if [ -e /sys/class/net/eth1 ]; then
+    ip link set eth1 up
+    ip addr add "192.168.168.$((0x$(cut -d: -f6 /sys/class/net/eth1/address)))/24" dev eth1
+fi
 printf '%s\n' "$repo/main" "$repo/community" > /etc/apk/repositories
 tries=0
 until apk add --no-cache openssh fuse3 gcompat attr; do
@@ -517,9 +526,12 @@ boot_vm() {
     local accelerator=$(get_accelerator)
     local cpu_type=$(get_cpu_type)
     local iso="${ISO_PATH}" forwards="hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+    local broadcast_net=(-netdev "socket,id=net1,mcast=${BROADCAST_NET},localaddr=127.0.0.1"
+        -device "virtio-net-pci,netdev=net1,mac=52:54:00:a8:00:$(printf %02x "$vm_id")")
     if [[ "$vm_id" == "$TARGET_VM_ID" ]]; then
         iso="${STD_ISO_PATH}"
         forwards="${forwards},hostfwd=tcp:127.0.0.1:${ISCSI_PORT}-:3260"
+        broadcast_net=()
     fi
 
     # Clean up old sockets before starting (avoids "Address already in use")
@@ -545,6 +557,7 @@ boot_vm() {
         -drive "file=${VM_RUN_DIR}/setup.img,format=raw,if=virtio,readonly=on" \
         -netdev "user,id=net0,${forwards}" \
         -device "virtio-net-pci,netdev=net0" \
+        "${broadcast_net[@]}" \
         -device virtio-serial-pci \
         -chardev "file,id=mountlog,path=$(get_vm_mount_log "$vm_id"),append=on" \
         -device "virtserialport,chardev=mountlog,name=goclusterfs.log" \
@@ -679,7 +692,7 @@ setup_goclusterfs() {
         "${binaries[@]}" "${SSH_USER}@127.0.0.1:/usr/local/bin/"
 
     # Mount GoClusterFS
-    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device} ${extra_args}"
+    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device} -broadcast-iface ${BROADCAST_IFACE} ${extra_args}"
     if [[ "$format_disk" == "true" ]]; then
         log_info "Formatting shared disk on VM $vm_id..."
         # One inode per 64 KB gives the 1 GB disk 16384 inodes, enough for test_more_than_4096_files
