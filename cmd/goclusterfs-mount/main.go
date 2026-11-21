@@ -89,6 +89,7 @@ func main() {
 		fuseDebug  = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
 		showVer    = flag.Bool("version", false, "Print version and exit")
 		completion = flag.String("completion", "", "Print a bash or zsh completion script for goclusterfs-mount and exit")
+		allowOther = flag.Bool("allow-other", false, "Let every user on the host, not only the one that mounted, use the filesystem, with the kernel checking each file's owner, group and mode bits (allow_other and default_permissions)")
 		preflight  = flag.Bool("preflight", false, "Check that this host can mount -device on -mount: FUSE, the device, the mount point and the ports. Prints PASS, WARN or FAIL with a fix for each, changes nothing, and exits 8 if a check fails")
 
 		// Cache configuration
@@ -605,15 +606,22 @@ func main() {
 			MaxWrite:      goclusterfs.MaxWrite,
 			MaxReadAhead:  1 << 20,
 			DisableXAttrs: false,
-			// Note: AllowOther requires 'user_allow_other' in /etc/fuse.conf
+			AllowOther:    *allowOther,
 		},
 		AttrTimeout:  attrTimeout,
 		EntryTimeout: attrTimeout,
 	}
 
+	if *allowOther {
+		mountOpts.Options = append(mountOpts.Options, "default_permissions")
+	}
+
 	// Mount filesystem using go-fuse v2 API
 	log.Printf("Mounting at %s...", *mountPoint)
 	server, err := fs.Mount(*mountPoint, gfs, mountOpts)
+	if err != nil && *allowOther && os.Getuid() != 0 {
+		failf("Failed to mount at %s: %v. A mount by a user other than root needs user_allow_other in /etc/fuse.conf for -allow-other", *mountPoint, err)
+	}
 	if err != nil {
 		failf("Failed to mount at %s: %v. Check that /dev/fuse exists, fusermount3 is installed, and nothing else is mounted there (fusermount3 -u %s)", *mountPoint, err, *mountPoint)
 	}

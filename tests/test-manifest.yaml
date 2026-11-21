@@ -2807,6 +2807,29 @@ scenarios:
       docker: TODO - single-node FUSE behavior already covered by the Go mount test
       vm: TODO - same reason as docker
 
+  - id: non-root-users-across-nodes
+    name: Non-root users across nodes with -allow-other
+    description: With -allow-other on two nodes, users other than root get what the mode bits give them. A file's owner reads and writes it from either node, a member of its group reads it, and others cannot enter the directory. New files and directories take a setgid directory's group, and new directories stay setgid. Only root changes a file's owner, only the owner changes its mode, and in a sticky directory a user cannot remove another user's file
+    priority: high
+    environments:
+      go: permissions_test.go::TestNonRootUsersAcrossNodes
+      docker: run-tests.sh::test_non_root_users
+      vm: TODO - the kernel does these checks the same way on every node; Docker covers two nodes, and the VM suite adds only power failures and hostile storage
+
+  - id: new-file-owner-and-mode-bits
+    name: New files take the caller's owner, a setgid group and all mode bits
+    description: Create, mkdir and symlink give the new file the caller's uid; in a setgid directory they give it the directory's group, and a new directory is setgid too. Create, mkdir and chmod keep the setuid, setgid and sticky bits
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/permissions_test.go::TestNewFilesTakeCallerAndSetgidGroup
+
+  - id: clone-checks-caller-access
+    name: A clone checks the caller's access
+    description: A caller other than root clones a file, or a snapshot of it, only with read access to the file as it is now and write and search access to the root directory. The clone is the caller's and loses setuid and setgid; root's clone keeps the source's owner and mode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/permissions_test.go::TestCloneChecksCallerAccess
+
   - id: cache-stats-hit-rate
     name: Cache stats hit rate is a percentage
     description: The unmount cache summary prints hit rates between 0 and 100 percent

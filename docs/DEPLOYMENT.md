@@ -442,6 +442,31 @@ openssl rand -hex 32 > /etc/goclusterfs/api-token
 
 Mount refuses a non-loopback `-api-addr` without a token, and a token file that group or others can read. Don't use `-api-token`: every local user can read it in `ps`. The API speaks plain HTTP, so for remote access put a TLS proxy in front of it or use an SSH tunnel. See [HTTP API Flags](API-CONFIG.md#http-api-flags).
 
+### Users Other Than Root
+
+Without `-allow-other`, only the user that mounted can use the filesystem, and the filesystem stores mode bits without checking them. Kubernetes pods that run as another user, and other users on the host, need `-allow-other`:
+
+```bash
+./goclusterfs-mount -device /dev/sdb -mount /mnt/goclusterfs -allow-other
+```
+
+With it, the kernel checks each file's owner, group and mode bits on every access, as on a local filesystem (FUSE's `allow_other` and `default_permissions`):
+
+- New files belong to the user that creates them. In a setgid directory they take the directory's group, and new directories are setgid too.
+- Only root changes a file's owner, and only the owner or root changes its mode. In a sticky directory, such as one with mode 1777, users remove only their own files.
+- A clone (`user.clone`, `user.snapshot.clone`) by a user other than root needs read access to the file and write access to the root directory. The clone belongs to that user and loses setuid and setgid. FUSE does not pass a caller's supplementary groups, so for clones only the primary group counts.
+
+Before you turn it on:
+
+- A mount by root needs nothing else. A mount by another user needs `user_allow_other` in `/etc/fuse.conf`.
+- Files carry numeric UIDs and GIDs. Give each user the same UID and GID on every node. In Kubernetes these are the pods' `runAsUser`, `runAsGroup` and `supplementalGroups`.
+- The root directory belongs to the mounting user with mode 0755. Create a directory for each user or pod and `chown` it.
+- Check the modes of existing files: without `-allow-other` nobody else could reach them, so a file with mode 0644 becomes readable by every user.
+- A chmod or chown on one node applies on the others within `-attr-timeout` (1 s by default), when their kernels drop the cached attributes. A process that already has the file open keeps its access, as on any filesystem.
+- The mount is `nosuid` and `nodev`, so a setuid bit on the volume grants nothing.
+- Use Linux 6.0 or later. It removes the setgid bit from a new file whose creator is not in the directory's group; FUSE does not tell GoClusterFS a caller's other groups, so it cannot do this itself. On older kernels such a file keeps the bit, which `nosuid` makes harmless.
+- Snapshot and clone requests through the HTTP API skip these checks, and its clones keep the source's owner. Give the API token only to whoever may act as root.
+
 ### Firewall Rules
 
 ```bash

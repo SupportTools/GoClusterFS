@@ -752,7 +752,7 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
-	out.Mode = uint32(fuse.S_IFDIR | (ino.Mode & 0777))
+	out.Mode = uint32(fuse.S_IFDIR | (ino.Mode & 0o7777))
 	out.Nlink = uint32(ino.LinkCount)
 	out.Uid = ino.UID
 	out.Gid = ino.GID
@@ -822,7 +822,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return f.linkNode(ctx, &f.Inode, childIno, out), 0
 	}
 	if fileType == dir.DT_DIR {
-		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0777))
+		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0o7777))
 		out.Attr.Size = BlockSize
 		out.Attr.Blocks = 1 * (BlockSize / 512)
 		out.Attr.Blksize = BlockSize
@@ -836,7 +836,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		return ch, 0
 	}
 
-	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0777))
+	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0o7777))
 	out.Attr.Size = childIno.Size
 	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
 	out.Attr.Blksize = BlockSize
@@ -1039,6 +1039,30 @@ func (f *FS) owner(ctx context.Context) (uint32, uint32) {
 	return f.uid, f.gid
 }
 
+// newOwner returns the owner of a file the caller creates in dir: the caller, with dir's group when dir is setgid.
+func (f *FS) newOwner(ctx context.Context, dir *inode.Inode) (uid, gid uint32, setgid bool) {
+	uid, gid = f.owner(ctx)
+	if dir.Mode&inode.S_ISGID != 0 {
+		return uid, dir.GID, true
+	}
+	return uid, gid, false
+}
+
+// mayAccess reports whether uid with primary group gid has every permission in want (r=4, w=2, x=1) on ino.
+// FUSE does not pass supplementary groups, so they grant nothing here.
+func mayAccess(ino *inode.Inode, uid, gid uint32, want uint16) bool {
+	shift := 0
+	switch {
+	case uid == 0:
+		return true
+	case uid == ino.UID:
+		shift = 6
+	case gid == ino.GID:
+		shift = 3
+	}
+	return ino.Mode>>shift&want == want
+}
+
 // logCreate commits the intent to create inode num with mode and to name it in directory parentNum.
 func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32, entryType journal.DirEntryType) (uint64, error) {
 	txn, err := f.createTxn(num, parentNum, name, mode, uid, gid, entryType, nil)
@@ -1174,10 +1198,10 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		logging.Debugf("Create %q: Read parent inode %d failed: %v", name, parentNum, err)
 		return nil, syscall.EIO
 	}
-	uid, gid := f.owner(ctx)
+	uid, gid, _ := f.newOwner(ctx, dirIno)
 
 	if f.journal != nil {
-		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0777), uid, gid, journal.DirEntryRegular)
+		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, journal.DirEntryRegular)
 		if err != nil {
 			logging.Debugf("Create %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
@@ -1197,7 +1221,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	// Counted before the name appears: a peer may unlink it at once, and this node must hold the file for its caller.
 	f.addOpen(childIno.InodeNum, 1)
 	now := time.Now().UnixNano()
-	childIno.Mode = inode.S_IFREG | uint16(mode&0777)
+	childIno.Mode = inode.S_IFREG | uint16(mode&0o7777)
 	childIno.UID = uid
 	childIno.GID = gid
 	childIno.LinkCount = 1
@@ -1257,10 +1281,14 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		logging.Debugf("Mkdir %q: Read parent inode %d failed: %v", name, parentNum, err)
 		return nil, syscall.EIO
 	}
-	uid, gid := f.owner(ctx)
+	uid, gid, setgid := f.newOwner(ctx, dirIno)
+	perm := uint16(mode & 0o7777)
+	if setgid {
+		perm |= inode.S_ISGID
+	}
 
 	if f.journal != nil {
-		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR)|(mode&0777), uid, gid, journal.DirEntryDirectory)
+		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, journal.DirEntryDirectory)
 		if err != nil {
 			logging.Debugf("Mkdir %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
@@ -1277,7 +1305,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		return nil, claimErrno(err)
 	}
 	now := time.Now().UnixNano()
-	childIno.Mode = inode.S_IFDIR | uint16(mode&0777)
+	childIno.Mode = inode.S_IFDIR | perm
 	childIno.UID = uid
 	childIno.GID = gid
 	childIno.LinkCount = 2
@@ -1370,7 +1398,7 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
-	out.Mode = uint32(fuse.S_IFDIR | (ino.Mode & 0777))
+	out.Mode = uint32(fuse.S_IFDIR | (ino.Mode & 0o7777))
 	out.Nlink = uint32(ino.LinkCount)
 	out.Uid = ino.UID
 	out.Gid = ino.GID
@@ -1415,7 +1443,7 @@ func (f *FS) setattrDir(ctx context.Context, num uint32, in *fuse.SetAttrIn) sys
 			testHookAfterSetattrRead()
 		}
 		if mode, ok := in.GetMode(); ok {
-			ino.Mode = inode.S_IFDIR | uint16(mode&0777)
+			ino.Mode = inode.S_IFDIR | uint16(mode&0o7777)
 			ino.Ctime = now
 		}
 		if uid, ok := in.GetUID(); ok {
@@ -1498,7 +1526,7 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return d.fs.linkNode(ctx, &d.Inode, childIno, out), 0
 	}
 	if fileType == dir.DT_DIR {
-		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0777))
+		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0o7777))
 		out.Attr.Size = BlockSize // Directories have fixed size
 		out.Attr.Blocks = 1 * (BlockSize / 512)
 		out.Attr.Blksize = BlockSize
@@ -1512,7 +1540,7 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		return ch, 0
 	}
 
-	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0777))
+	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0o7777))
 	out.Attr.Size = childIno.Size
 	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
 	out.Attr.Blksize = BlockSize
@@ -1994,7 +2022,7 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	out.AttrValid = 0
 
 	out.Ino = uint64(ino.InodeNum)
-	out.Mode = uint32(fuse.S_IFREG | (ino.Mode & 0777))
+	out.Mode = uint32(fuse.S_IFREG | (ino.Mode & 0o7777))
 	out.Nlink = uint32(ino.LinkCount)
 	out.Uid = ino.UID
 	out.Gid = ino.GID
@@ -3492,7 +3520,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 
 	if mode, ok := in.GetMode(); ok {
-		ino.Mode = inode.S_IFREG | uint16(mode&0777)
+		ino.Mode = inode.S_IFREG | uint16(mode&0o7777)
 		ino.Ctime = now
 	}
 
@@ -4149,9 +4177,25 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 		return syscall.EIO
 	}
 
+	mode, uid, gid := srcIno.Mode, srcIno.UID, srcIno.GID
+	if caller, ok := fuse.FromContext(ctx); ok && caller.Uid != 0 {
+		// The kernel checked only write access to this file; a snapshot's data inode keeps the file's old mode.
+		liveIno := srcIno
+		if srcNum != f.inodeNum {
+			if liveIno, err = f.fs.inodeTbl.Read(f.inodeNum); err != nil {
+				return syscall.EIO
+			}
+		}
+		uid, gid, _ = f.fs.newOwner(ctx, rootIno)
+		if !mayAccess(srcIno, uid, gid, 4) || !mayAccess(liveIno, uid, gid, 4) || !mayAccess(rootIno, uid, gid, 3) {
+			return syscall.EACCES
+		}
+		mode &^= inode.S_ISUID | inode.S_ISGID
+	}
+
 	now := time.Now().UnixNano()
 	cloneIno, err := f.fs.claimInode(ctx, func(ino *inode.Inode) {
-		ino.Mode, ino.UID, ino.GID = srcIno.Mode, srcIno.UID, srcIno.GID
+		ino.Mode, ino.UID, ino.GID = mode, uid, gid
 		ino.Atime, ino.Mtime, ino.Ctime = now, now, now
 	})
 	if err != nil {
