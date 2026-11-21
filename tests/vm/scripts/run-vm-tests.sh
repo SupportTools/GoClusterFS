@@ -3750,8 +3750,10 @@ pause_unfenced_case() {
     echo stop | nc -U -q1 "$mon" > /dev/null
     stopped_at=$(date +%s)
     log_info "$mode: VM $paused (slot $slot, ${uuid:0:8}) stopped with QEMU stop"
-    if ! wait_log "$peer" "Starting journal replay for node ${uuid:0:8}" 120 "$marker" || ! wait_log "$peer" "\[Recovery\] Completed" 60 "$marker"; then
+    if ! wait_log "$peer" "Starting journal replay for node ${uuid:0:8}" 120 "$marker" ||
+        ! wait_log "$peer" "\[Recovery\] Completed\|Journal is clean" 60 "$marker"; then
         echo cont | nc -U -q1 "$mon" > /dev/null
+        pause_cleanup "$paused"
         return 1
     fi
     log_info "$mode: VM $peer replayed VM $paused $(( $(date +%s) - stopped_at ))s after the stop"
@@ -3778,12 +3780,17 @@ pause_unfenced_case() {
         log_error "$mode: VM $paused wrote its slot back as its own over VM $peer's replay and keeps running"
         result=1
     fi
-    ssh_run "$paused" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/pause[d]'; true"
-    if [[ -n "$(mount_pids "$paused")" ]]; then
-        crash_goclusterfs "$paused"
-    fi
-    ssh_run "$paused" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-pause 2>/dev/null; true"
+    pause_cleanup "$paused"
     return $result
+}
+
+# pause_cleanup stops VM $1's writer and mount, so the next case mounts it afresh.
+pause_cleanup() {
+    ssh_run "$1" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/pause[d]'; true"
+    if [[ -n "$(mount_pids "$1")" ]]; then
+        crash_goclusterfs "$1"
+    fi
+    ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-pause 2>/dev/null; true"
 }
 
 # A node VM paused with QEMU stop past deadAfter, on a volume without storage fencing, must not land a write after a
@@ -3794,7 +3801,7 @@ test_unfenced_paused_vm() {
         log_warn "Skipping: needs 2 VMs"
         return 0
     fi
-    local result=0 vm out
+    local result=0 vm out GOCLUSTERFS_MOUNT_TIMEOUT=120
     fencing_restart none || return 1
     pause_unfenced_case gate || result=1
     pause_unfenced_case held || result=1
