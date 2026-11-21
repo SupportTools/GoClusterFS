@@ -3060,7 +3060,7 @@ scenarios:
 
   - id: broadcast-silent-peer-reported
     name: A node reports peers it hears no broadcasts from
-    description: A node next to one that sends no broadcasts (Go) or that hears no multicast (Docker) reports its peers on /health and /metrics, and recovers when they are heard again
+    description: A node next to one that sends no broadcasts (Go) or that hears no broadcast at all (Docker) reports its peers on /health and /metrics, and recovers when they are heard again
     priority: high
     environments:
       go: broadcast_test.go::TestBroadcastReportsSilentPeer
@@ -3471,6 +3471,51 @@ scenarios:
       go: broadcast_test.go::TestBroadcastInvalidationSpeed
       docker: run-tests.sh::test_broadcast_invalidation
       vm: run-vm-tests.sh::test_broadcast_invalidation
+
+  - id: broadcast-without-multicast
+    name: Broadcast invalidation without multicast
+    description: With multicast dropped on every node, as in cloud VPCs, nodes ask each other for unicast at their registry addresses; within 20s every node hears every peer again and reports no silent peers
+    priority: high
+    environments:
+      go: internal/cache/broadcast/registry_peers_test.go::TestRequestedPeersGetUnicastWhileMulticastWorks
+      docker: run-tests.sh::test_broadcast_without_multicast
+      # QEMU user networking gives every VM the same address and no path to the others, so VMs cannot send each other unicast.
+      vm: TODO
+
+  - id: broadcast-unicast-request
+    name: A node asks peers it misses on multicast for unicast
+    description: A node sends a sequence-0 UnicastRequest to each registry peer whose multicast it has not heard within 3 heartbeats, and to no other node
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/registry_peers_test.go::TestNodeAsksPeersItMissesOnMulticastForUnicast
+
+  - id: broadcast-advertise-addr
+    name: Advertised broadcast address
+    description: -advertise-addr takes an IP or IP:port, defaults the port to -unicast-port, and rejects names, unspecified addresses, port 0 and a loopback-only interface
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/registry_peers_test.go::TestAdvertiseAddr
+
+  - id: broadcast-own-address
+    name: A node does not take its own address for a peer's
+    description: Under QEMU user networking every node advertises the same address; a node skips registry addresses that are local with its own unicast port
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/registry_peers_test.go::TestOwnAddressIsNotAPeer
+
+  - id: registry-slot-address
+    name: Registry slot keeps the advertised address
+    description: A slot round-trips an IPv4 or IPv6 broadcast address, or none
+    priority: go_only
+    environments:
+      go: internal/node/addr_test.go::TestSlotKeepsItsAdvertisedAddress
+
+  - id: registry-slot-address-orphans
+    name: Slot address never costs an orphan
+    description: The address shares the end of the orphan list; a slot with more than 483 orphans keeps every orphan and drops the address
+    priority: go_only
+    environments:
+      go: internal/node/addr_test.go::TestSlotAddressYieldsToALongOrphanList
 
   - id: broadcast-directory-invalidation
     name: Broadcast directory invalidation

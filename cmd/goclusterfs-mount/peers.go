@@ -22,6 +22,7 @@ func expectedPeers(reg *node.Registry) func() ([]broadcast.ExpectedPeer, error) 
 			peers = append(peers, broadcast.ExpectedPeer{
 				UUID: s.UUID,
 				Name: fmt.Sprintf("%s (%x)", host, s.UUID[:4]),
+				Addr: s.Addr,
 			})
 		}
 		return peers, nil

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,10 @@ type Broadcaster struct {
 
 	sendersMu sync.Mutex
 	senders   map[[16]byte]*senderSeq
+	// Peers that asked for unicast, and when; their registry addresses as last listed.
+	requests  map[[16]byte]time.Time
+	peerAddrs map[[16]byte]netip.AddrPort
+	relist    chan struct{}
 
 	started     time.Time
 	expected    atomic.Pointer[func() ([]ExpectedPeer, error)]
@@ -83,9 +88,10 @@ const (
 // senderSeq tracks one sender's sequence numbers. Bit i of seen marks
 // highest-1-i as received.
 type senderSeq struct {
-	highest uint64
-	seen    uint64
-	heard   time.Time
+	highest   uint64
+	seen      uint64
+	heard     time.Time
+	multicast time.Time
 }
 
 // NewBroadcaster creates a new cache invalidation broadcaster.
@@ -103,6 +109,9 @@ func NewBroadcaster(cfg Config, localUUID [16]byte, nodeSlot uint32, handler Inv
 		nodeSlot:  nodeSlot,
 		localPort: uint16(cfg.UnicastPort),
 		senders:   make(map[[16]byte]*senderSeq),
+		requests:  make(map[[16]byte]time.Time),
+		peerAddrs: make(map[[16]byte]netip.AddrPort),
+		relist:    make(chan struct{}, 1),
 	}
 
 	return b, nil
@@ -166,14 +175,18 @@ func (b *Broadcaster) Stop() error {
 }
 
 // handleMessage processes an incoming broadcast message.
-func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr) {
+func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr, viaMulticast bool) {
 	// Ignore messages from ourselves
 	if msg.SenderUUID == b.localUUID {
 		atomic.AddUint64(&b.messagesIgnored, 1)
 		return
 	}
+	if msg.Type == TypeUnicastRequest {
+		b.handleUnicastRequest(msg.SenderUUID, time.Now())
+		return
+	}
 
-	dup, missed := b.track(msg.SenderUUID, msg.Sequence)
+	dup, missed := b.track(msg.SenderUUID, msg.Sequence, viaMulticast)
 	if dup {
 		atomic.AddUint64(&b.duplicatesDropped, 1)
 		return
@@ -313,19 +326,27 @@ func (b *Broadcaster) handlePeerAnnounce(msg *Message, addr *net.UDPAddr) {
 // and how many of the sender's messages were skipped before seq. A seq older
 // than the window counts as handled: it was either seen, or counted missing
 // when highest passed it.
-func (b *Broadcaster) track(sender [16]byte, seq uint64) (dup bool, missed uint64) {
+func (b *Broadcaster) track(sender [16]byte, seq uint64, viaMulticast bool) (dup bool, missed uint64) {
 	b.sendersMu.Lock()
 	defer b.sendersMu.Unlock()
 
+	now := time.Now()
 	s, ok := b.senders[sender]
 	if !ok {
 		if len(b.senders) >= b.transport.config.maxPeers() {
 			delete(b.senders, oldest(b.senders, func(s *senderSeq) time.Time { return s.heard }))
 		}
-		b.senders[sender] = &senderSeq{highest: seq, heard: time.Now()}
+		s = &senderSeq{highest: seq, heard: now}
+		if viaMulticast {
+			s.multicast = now
+		}
+		b.senders[sender] = s
 		return false, 0
 	}
-	s.heard = time.Now()
+	s.heard = now
+	if viaMulticast {
+		s.multicast = now
+	}
 	switch {
 	case seq > s.highest:
 		ahead := seq - s.highest

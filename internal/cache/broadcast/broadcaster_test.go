@@ -124,7 +124,7 @@ func TestBroadcasterDuplication(t *testing.T) {
 		{seq: 1004 + seqWindow + 2},
 	}
 	for i, s := range steps {
-		dup, missed := b.track(peer, s.seq)
+		dup, missed := b.track(peer, s.seq, false)
 		if dup != s.dup || missed != s.missed {
 			t.Errorf("step %d: track(%d) = dup %v, missed %d; want dup %v, missed %d", i, s.seq, dup, missed, s.dup, s.missed)
 		}
@@ -137,8 +137,8 @@ func TestBroadcasterForgetsQuietSenders(t *testing.T) {
 		t.Fatalf("NewBroadcaster failed: %v", err)
 	}
 	quiet, active := [16]byte{8}, [16]byte{9}
-	b.track(quiet, 1)
-	b.track(active, 1)
+	b.track(quiet, 1, false)
+	b.track(active, 1, false)
 	b.senders[quiet].heard = time.Now().Add(-senderExpiry - time.Second)
 
 	b.forgetQuietSenders()
@@ -168,7 +168,7 @@ func TestBroadcasterHandleInvalidateInode(t *testing.T) {
 	msg := builder.InvalidateInode(42, 100, 200)
 
 	// Handle the message
-	b.handleMessage(msg, nil)
+	b.handleMessage(msg, nil, false)
 
 	// Check handler was called
 	invalidations := handler.getInodeInvalidations()
@@ -195,7 +195,7 @@ func TestBroadcasterHandleInvalidateExtent(t *testing.T) {
 	builder := NewMessageBuilder(remoteUUID)
 	msg := builder.InvalidateExtent(100, 50)
 
-	b.handleMessage(msg, nil)
+	b.handleMessage(msg, nil, false)
 
 	invalidations := handler.getExtentInvalidations()
 	if len(invalidations) != 1 {
@@ -221,7 +221,7 @@ func TestBroadcasterHandleInvalidateAll(t *testing.T) {
 	builder := NewMessageBuilder(remoteUUID)
 	msg := builder.InvalidateAll()
 
-	b.handleMessage(msg, nil)
+	b.handleMessage(msg, nil, false)
 
 	if handler.getClearCount() != 1 {
 		t.Errorf("Expected Clear to be called once, got %d", handler.getClearCount())
@@ -247,7 +247,7 @@ func TestBroadcasterHandleOrphans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b.handleMessage(got, nil)
+	b.handleMessage(got, nil, false)
 	if calls.Load() != 1 || got.Type.String() != "Orphans" {
 		t.Errorf("handled %s message: %d OnOrphans calls, want 1", got.Type, calls.Load())
 	}
@@ -269,7 +269,7 @@ func TestBroadcasterIgnoresOwnMessages(t *testing.T) {
 	msg := builder.InvalidateInode(42, 100, 200)
 
 	// Handle the message
-	b.handleMessage(msg, nil)
+	b.handleMessage(msg, nil, false)
 
 	// Handler should NOT be called
 	invalidations := handler.getInodeInvalidations()
@@ -300,8 +300,8 @@ func TestBroadcasterDuplicateMessages(t *testing.T) {
 	msg := builder.InvalidateInode(42, 100, 200)
 
 	// Handle the same message twice
-	b.handleMessage(msg, nil)
-	b.handleMessage(msg, nil)
+	b.handleMessage(msg, nil, false)
+	b.handleMessage(msg, nil, false)
 
 	// Handler should only be called once
 	invalidations := handler.getInodeInvalidations()
@@ -330,7 +330,7 @@ func TestBroadcasterStatsReset(t *testing.T) {
 	remoteUUID := [16]byte{5, 6, 7, 8}
 	builder := NewMessageBuilder(remoteUUID)
 	msg := builder.InvalidateInode(42, 100, 200)
-	b.handleMessage(msg, nil)
+	b.handleMessage(msg, nil, false)
 
 	stats := b.Stats()
 	if stats.InvalidationsReceived == 0 {
@@ -425,7 +425,7 @@ func TestTrackedSendersBounded(t *testing.T) {
 	sender := func(i int) [16]byte { return [16]byte{2, byte(i >> 8), byte(i)} }
 
 	for i := 0; i < 10*cfg.MaxPeers; i++ {
-		b.track(sender(i), 1)
+		b.track(sender(i), 1, false)
 		if got := b.Stats().TrackedSenders; got > cfg.MaxPeers {
 			t.Fatalf("after %d senders, TrackedSenders = %d, want at most %d", i+1, got, cfg.MaxPeers)
 		}
@@ -483,7 +483,7 @@ func TestConcurrentDeduplication(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
-				if dup, _ := b.track(peer, 12345); dup {
+				if dup, _ := b.track(peer, 12345, false); dup {
 					duplicates.Add(1)
 				}
 			}
@@ -511,7 +511,7 @@ func TestSameSequenceFromTwoSenders(t *testing.T) {
 	for i, sender := range [][16]byte{{2}, {3}} {
 		msg := NewMessageBuilder(sender).InvalidateInode(uint32(10+i), 1, 1)
 		msg.Sequence = 777
-		b.handleMessage(msg, nil)
+		b.handleMessage(msg, nil, false)
 	}
 
 	handler.mu.Lock()

@@ -72,16 +72,16 @@ func TestLostMessageDropsCaches(t *testing.T) {
 	}
 	peer := NewMessageBuilder([16]byte{2})
 
-	b.handleMessage(peer.InvalidateInode(10, 1, 1), nil)
+	b.handleMessage(peer.InvalidateInode(10, 1, 1), nil, false)
 	lost := peer.InvalidateInode(11, 1, 1)
-	b.handleMessage(peer.Heartbeat(), nil)
+	b.handleMessage(peer.Heartbeat(), nil, false)
 	waitForClears(t, handler, 1)
 	if got := b.Stats().MessagesLost; got != 1 {
 		t.Errorf("MessagesLost = %d, want 1", got)
 	}
 
-	b.handleMessage(lost, nil)
-	b.handleMessage(peer.InvalidateInode(12, 1, 1), nil)
+	b.handleMessage(lost, nil, false)
+	b.handleMessage(peer.InvalidateInode(12, 1, 1), nil, false)
 	time.Sleep(50 * time.Millisecond)
 	if got := handler.getClearCount(); got != 1 {
 		t.Errorf("Clear called %d times after the late message and the next one, want still 1", got)
@@ -102,11 +102,11 @@ func TestVeryLateMessageKeepsTracking(t *testing.T) {
 	peer := NewMessageBuilder([16]byte{2})
 	late := peer.InvalidateInode(10, 1, 1)
 	for i := 0; i < 100; i++ {
-		b.handleMessage(peer.Heartbeat(), nil)
+		b.handleMessage(peer.Heartbeat(), nil, false)
 	}
 
-	b.handleMessage(late, nil)
-	b.handleMessage(peer.InvalidateInode(11, 1, 1), nil)
+	b.handleMessage(late, nil, false)
+	b.handleMessage(peer.InvalidateInode(11, 1, 1), nil, false)
 	time.Sleep(50 * time.Millisecond)
 
 	stats := b.Stats()
@@ -151,10 +151,10 @@ func TestClearsCoalesce(t *testing.T) {
 		t.Fatal(err)
 	}
 	peer := NewMessageBuilder([16]byte{2})
-	b.handleMessage(peer.Heartbeat(), nil)
+	b.handleMessage(peer.Heartbeat(), nil, false)
 	for i := 0; i < 5; i++ {
 		peer.Heartbeat()
-		b.handleMessage(peer.Heartbeat(), nil)
+		b.handleMessage(peer.Heartbeat(), nil, false)
 	}
 	h.release <- struct{}{}
 	h.release <- struct{}{}

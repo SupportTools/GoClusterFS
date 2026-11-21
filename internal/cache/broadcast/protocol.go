@@ -64,6 +64,10 @@ const (
 
 	// TypeOrphans tells peers an orphan list changed, so they check it now instead of at their next failure scan.
 	TypeOrphans MessageType = 7
+
+	// TypeUnicastRequest tells one peer that the sender misses its multicast, so the peer also sends to the
+	// sender's registry address. It carries sequence 0 and is not tracked, since only that peer gets it.
+	TypeUnicastRequest MessageType = 8
 )
 
 // String returns a human-readable message type name.
@@ -83,6 +87,8 @@ func (t MessageType) String() string {
 		return "ReturnReserves"
 	case TypeOrphans:
 		return "Orphans"
+	case TypeUnicastRequest:
+		return "UnicastRequest"
 	default:
 		return fmt.Sprintf("Unknown(%d)", t)
 	}
@@ -452,6 +458,16 @@ func (b *MessageBuilder) Heartbeat() *Message {
 		Type:       TypeHeartbeat,
 		SenderUUID: b.senderUUID,
 		Sequence:   b.seqGen.Next(),
+		Timestamp:  time.Now().UnixNano(),
+	}
+}
+
+// UnicastRequest creates a request for unicast from one peer.
+func (b *MessageBuilder) UnicastRequest() *Message {
+	return &Message{
+		Version:    ProtocolVersion,
+		Type:       TypeUnicastRequest,
+		SenderUUID: b.senderUUID,
 		Timestamp:  time.Now().UnixNano(),
 	}
 }

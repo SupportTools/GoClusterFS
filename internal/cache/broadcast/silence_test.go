@@ -21,7 +21,7 @@ func TestSilentPeers(t *testing.T) {
 	b.started = now.Add(-10 * time.Minute)
 
 	heard, never, quiet, newcomer := [16]byte{2}, [16]byte{3}, [16]byte{4}, [16]byte{5}
-	peers := []ExpectedPeer{{local, "self"}, {heard, "heard"}, {never, "never"}, {quiet, "quiet"}}
+	peers := []ExpectedPeer{{UUID: local, Name: "self"}, {UUID: heard, Name: "heard"}, {UUID: never, Name: "never"}, {UUID: quiet, Name: "quiet"}}
 	b.WatchPeers(func() ([]ExpectedPeer, error) { return peers, nil })
 
 	b.checkPeers(now)
@@ -30,7 +30,7 @@ func TestSilentPeers(t *testing.T) {
 	}
 
 	later := now.Add(4 * time.Second)
-	peers = append(peers, ExpectedPeer{newcomer, "newcomer"})
+	peers = append(peers, ExpectedPeer{UUID: newcomer, Name: "newcomer"})
 	b.senders[heard] = &senderSeq{heard: later.Add(-time.Second)}
 	b.senders[quiet] = &senderSeq{heard: now.Add(-10 * time.Second)}
 	b.checkPeers(later)
