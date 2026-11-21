@@ -3524,6 +3524,13 @@ scenarios:
     environments:
       go: internal/node/addr_test.go::TestAdvertisedAddressComesBackWhenTheOrphanListShrinks
 
+  - id: broadcast-peer-keeps-last-address
+    name: A peer keeps its last address while it stays listed
+    description: When a peer's slot drops its address past 483 orphans, nodes keep asking it for unicast and keep answering its requests at its last address; a peer that leaves the registry listing is dropped
+    priority: go_only
+    environments:
+      go: internal/cache/broadcast/registry_peers_test.go::TestPeerKeepsItsLastAddressWhileListed
+
   - id: broadcast-directory-invalidation
     name: Broadcast directory invalidation
     description: New file creation is broadcast between nodes

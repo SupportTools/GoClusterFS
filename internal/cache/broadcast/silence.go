@@ -91,15 +91,20 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 	listed := make(map[[16]byte]time.Time, len(peers))
 	silent := map[[16]byte]ExpectedPeer{}
 	b.sendersMu.Lock()
-	clear(b.peerAddrs)
+	// A slot whose orphan list outgrew the room for its address keeps the node's last one while it stays listed.
+	addrs := make(map[[16]byte]netip.AddrPort, len(peers))
 	for _, p := range peers {
 		if p.UUID == b.localUUID {
 			continue
 		}
-		if p.Addr.IsValid() && !b.isSelf(p.Addr, local) {
-			b.peerAddrs[p.UUID] = p.Addr
+		addr, known := b.peerAddrs[p.UUID]
+		if p.Addr.IsValid() {
+			addr, known = p.Addr, !b.isSelf(p.Addr, local)
+		}
+		if known {
+			addrs[p.UUID] = addr
 			if s, ok := b.senders[p.UUID]; !ok || now.Sub(s.multicast) > quiet {
-				ask = append(ask, p.Addr)
+				ask = append(ask, addr)
 			}
 		}
 		first, ok := b.firstListed[p.UUID]
@@ -118,6 +123,7 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 			silent[p.UUID] = p
 		}
 	}
+	b.peerAddrs = addrs
 	b.applyRequestsLocked(now)
 	b.sendersMu.Unlock()
 

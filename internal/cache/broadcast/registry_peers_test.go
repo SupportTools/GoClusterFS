@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 )
@@ -185,5 +187,61 @@ func TestOwnAddressIsNotAPeer(t *testing.T) {
 		if got := b.isSelf(addr, local); got != self {
 			t.Errorf("isSelf(%v) = %v, want %v", addr, got, self)
 		}
+	}
+}
+
+// A peer whose slot drops its address, because its orphan list outgrew the
+// room, keeps its last address while it stays listed: it still gets the
+// unicast it asked for and is still asked for unicast. Leaving the listing drops it.
+func TestPeerKeepsItsLastAddressWhileListed(t *testing.T) {
+	ports := freeUDPPorts(t, 2)
+	cfg := DefaultConfig()
+	cfg.MulticastPort, cfg.UnicastPort = ports[0], ports[1]
+	cfg.HeartbeatInterval = time.Hour
+	local, peer := [16]byte{1}, [16]byte{2}
+	b, err := NewBroadcaster(cfg, local, 0, newMockHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Stop() })
+
+	peerConn := listenLoopback(t)
+	addr := loopbackAddr(peerConn.LocalAddr().(*net.UDPAddr).Port)
+	var mu sync.Mutex
+	listing := []ExpectedPeer{{UUID: peer, Name: "peer", Addr: addr}}
+	relist := func(peers []ExpectedPeer) {
+		mu.Lock()
+		listing = peers
+		mu.Unlock()
+		b.relistSoon()
+	}
+	b.WatchPeers(func() ([]ExpectedPeer, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(listing), nil
+	})
+	if msg := readMessage(peerConn, 3*time.Second); msg == nil || msg.Type != TypeUnicastRequest {
+		t.Fatalf("the listed peer got %+v, want a UnicastRequest", msg)
+	}
+	b.handleUnicastRequest(peer, time.Now())
+
+	relist([]ExpectedPeer{{UUID: peer, Name: "peer"}})
+	if msg := readMessage(peerConn, 3*time.Second); msg == nil || msg.Type != TypeUnicastRequest {
+		t.Errorf("after its slot lost the address, the peer got %+v, want a UnicastRequest at its last address", msg)
+	}
+	if got := b.transport.requestedPeers(); len(got) != 1 || got[0].AddrPort() != addr {
+		t.Errorf("after its slot lost the address, the peer that asked gets unicast at %v, want [%v]", got, addr)
+	}
+
+	relist(nil)
+	deadline := time.Now().Add(3 * time.Second)
+	for len(b.transport.requestedPeers()) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := b.transport.requestedPeers(); len(got) != 0 {
+		t.Errorf("after the peer left the listing it still gets unicast at %v", got)
 	}
 }
