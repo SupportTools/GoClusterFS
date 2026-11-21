@@ -2088,64 +2088,44 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 		return fuse.ReadResultData(data), 0
 	}
 
-	// Read data block by block
 	data := make([]byte, readSize)
-	bytesRead := 0
-
-	for bytesRead < readSize {
-		blockNum := offset / BlockSize
-		blockOffset := offset % BlockSize
-
-		// Find physical block for this logical block (uses extent cache)
+	// Bytes on contiguous disk blocks go to the device as one read.
+	var runDisk int64
+	runStart, runLen := 0, 0
+	flush := func() error {
+		if runLen == 0 {
+			return nil
+		}
+		err := f.fs.readSpan(data[runStart:runStart+runLen], runDisk)
+		runLen = 0
+		return err
+	}
+	for bytesRead := 0; bytesRead < readSize; {
+		blockNum, blockOffset := offset/BlockSize, offset%BlockSize
+		toRead := min(int(BlockSize-blockOffset), readSize-bytesRead)
 		physBlock, err := f.fs.lookupPhysical(ino, blockNum)
 		if err != nil {
 			return nil, syscall.EIO
 		}
 		if physBlock == extent.Hole {
-			toRead := int(BlockSize - blockOffset)
-			if toRead > readSize-bytesRead {
-				toRead = readSize - bytesRead
-			}
-			// data is already zeroed
-			bytesRead += toRead
-			offset += uint64(toRead)
-			continue
-		}
-
-		// Calculate physical disk location
-		diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
-
-		// Read from disk
-		toRead := int(BlockSize - blockOffset)
-		if toRead > readSize-bytesRead {
-			toRead = readSize - bytesRead
-		}
-
-		buf := storage.GetBuffer(storage.SectorSize)
-		alignedOffset := diskOffset &^ (storage.SectorSize - 1)
-		sectorOffset := diskOffset - alignedOffset
-
-		for bytesInBlock := 0; bytesInBlock < toRead; {
-			n, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset)
-			if err != nil || n != storage.SectorSize {
-				storage.PutBuffer(buf)
+			if flush() != nil {
 				return nil, syscall.EIO
 			}
-
-			copyLen := storage.SectorSize - int(sectorOffset)
-			if copyLen > toRead-bytesInBlock {
-				copyLen = toRead - bytesInBlock
+		} else {
+			diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
+			if runLen > 0 && runDisk+int64(runLen) != diskOffset && flush() != nil {
+				return nil, syscall.EIO
 			}
-			copy(data[bytesRead+bytesInBlock:], buf.Bytes()[sectorOffset:sectorOffset+int64(copyLen)])
-
-			bytesInBlock += copyLen
-			alignedOffset += storage.SectorSize
-			sectorOffset = 0
+			if runLen == 0 {
+				runDisk, runStart = diskOffset, bytesRead
+			}
+			runLen += toRead
 		}
-		storage.PutBuffer(buf)
-
 		bytesRead += toRead
 		offset += uint64(toRead)
+	}
+	if flush() != nil {
+		return nil, syscall.EIO
 	}
 
 	return fuse.ReadResultData(data), 0
@@ -2276,6 +2256,50 @@ func (f *FS) zeroRange(physBlock, from, to uint64) error {
 	defer storage.PutBuffer(buf)
 	clear(buf.Bytes())
 	_, err := f.dev.WriteAt(buf.Bytes()[:to-from], int64(f.dataOffset+physBlock*BlockSize+from))
+	return err
+}
+
+// readSpan fills dst from disk offset off with one sector-aligned device read.
+func (f *FS) readSpan(dst []byte, off int64) error {
+	start := int64(alignSector(uint64(off), false))
+	end := int64(alignSector(uint64(off)+uint64(len(dst)), true))
+	buf := storage.GetBuffer(int(end - start))
+	defer storage.PutBuffer(buf)
+	span := buf.Bytes()[:end-start]
+	if n, err := f.dev.ReadAt(span, start); err != nil || n != len(span) {
+		return fmt.Errorf("read %d bytes at %d: n=%d: %w", len(span), start, n, err)
+	}
+	copy(dst, span[off-start:])
+	return nil
+}
+
+// writeSpan writes src at disk offset off with one sector-aligned device write,
+// first reading the sectors it covers only in part.
+func (f *FS) writeSpan(src []byte, off int64) error {
+	start := int64(alignSector(uint64(off), false))
+	end := int64(alignSector(uint64(off)+uint64(len(src)), true))
+	buf := storage.GetBuffer(int(end - start))
+	defer storage.PutBuffer(buf)
+	span := buf.Bytes()[:end-start]
+	partial := false
+	readSector := func(at int64) {
+		sector := span[at-start : at-start+storage.SectorSize]
+		if _, err := f.dev.ReadAt(sector, at); err != nil {
+			clear(sector)
+		}
+		partial = true
+	}
+	if off != start {
+		readSector(start)
+	}
+	if last := end - storage.SectorSize; off+int64(len(src)) != end && (last != start || !partial) {
+		readSector(last)
+	}
+	if partial && afterSectorRead != nil {
+		afterSectorRead()
+	}
+	copy(span[off-start:], src)
+	_, err := f.dev.WriteAt(span, start)
 	return err
 }
 
@@ -2887,49 +2911,14 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 
-		// Handle unaligned writes by read-modify-write
-		buf := storage.GetBuffer(storage.SectorSize)
-		alignedOffset := diskOffset &^ (storage.SectorSize - 1)
-		sectorOffset := diskOffset - alignedOffset
-
-		for bytesInBlock := 0; bytesInBlock < toWrite; {
-			copyLen := storage.SectorSize - int(sectorOffset)
-			if copyLen > toWrite-bytesInBlock {
-				copyLen = toWrite - bytesInBlock
+		if err := f.fs.writeSpan(data[bytesWritten:bytesWritten+toWrite], diskOffset); err != nil {
+			logging.Debugf("Write inode %d: writing %d bytes at %d failed: %v", f.inodeNum, toWrite, diskOffset, err)
+			if extentLockHeld {
+				f.fs.release(lock.LockTypeExtent, physBlock, "block")
 			}
-
-			// Read existing sector unless this write replaces all of it
-			if copyLen < storage.SectorSize {
-				if _, err := f.fs.dev.ReadAt(buf.Bytes(), alignedOffset); err != nil {
-					// New sector - zero it
-					for i := range buf.Bytes() {
-						buf.Bytes()[i] = 0
-					}
-				}
-				if afterSectorRead != nil {
-					afterSectorRead()
-				}
-			}
-
-			// Modify
-			copy(buf.Bytes()[sectorOffset:], data[bytesWritten+bytesInBlock:bytesWritten+bytesInBlock+copyLen])
-
-			// Write back
-			if _, err := f.fs.dev.WriteAt(buf.Bytes(), alignedOffset); err != nil {
-				logging.Debugf("Write inode %d: WriteAt offset %d failed: %v", f.inodeNum, alignedOffset, err)
-				storage.PutBuffer(buf)
-				if extentLockHeld {
-					f.fs.release(lock.LockTypeExtent, physBlock, "block")
-				}
-				releaseInPlaceLock()
-				return 0, syscall.EIO
-			}
-
-			bytesInBlock += copyLen
-			alignedOffset += storage.SectorSize
-			sectorOffset = 0
+			releaseInPlaceLock()
+			return 0, syscall.EIO
 		}
-		storage.PutBuffer(buf)
 
 		// Release extent lock after completing write to this block
 		if extentLockHeld {

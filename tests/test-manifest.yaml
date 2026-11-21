@@ -331,6 +331,13 @@ scenarios:
     environments:
       go: internal/inode/alloc_test.go::TestFindFreeSlotFindsEveryFreeInode
 
+  - id: data-io-one-request-per-span
+    name: File data reaches the device in one I/O per contiguous span
+    description: A 1 MB write or read of one block is one device I/O instead of 256 of 4 KB; partial sectors at the ends of a write cost one read each, and a read of contiguous blocks is one I/O
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/data_io_test.go::TestDataReachesTheDeviceInOneIOPerContiguousSpan
+
   - id: inode-search-resumes
     name: Inode search resumes after the last free inode it found
     description: With 40,000 inodes in use, each FindFreeSlot reads the inode table at most twice instead of rereading every used inode from the node's start
