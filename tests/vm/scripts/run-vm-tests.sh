@@ -4142,9 +4142,27 @@ write_load() {
     ssh_run "$1" "rm -f /tmp/load.out; (i=0; while [ ! -e /tmp/load.stop ]; do i=\$((i+1)); if dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/load.vm$1.\$((i%16)) bs=64k count=4 conv=fsync 2>/dev/null; then echo ok; else echo fail; fi; sleep 0.1; done) >> /tmp/load.out 2>&1 &"
 }
 
-# A node mounted on a dm-multipath map keeps running when its iSCSI path logs out and in again. LIO keeps its key
-# under the old session's ID, so the new path's first write meets a reservation conflict. The node then registers its
-# key again with every write held, and both nodes keep writing. Afterwards fsck finds the volume clean.
+# reservation_key prints the reservation key VM $1's mount logged.
+reservation_key() {
+    sed -n 's/.*Fencing: persistent reservation key \(0x[0-9a-f]*\).*/\1/p' "$(get_vm_mount_log "$1")" | tail -1
+}
+
+# writes_go_on fails unless VM $1's mount runs and its write load made progress over 5 seconds.
+writes_go_on() {
+    local before after
+    before=$(ssh_run "$1" "grep -c ok /tmp/load.out")
+    sleep 5
+    after=$(ssh_run "$1" "grep -c ok /tmp/load.out")
+    if [[ -z "$(mount_pids "$1")" ]] || (( after <= before )); then
+        log_error "VM $1 stopped or stopped writing $2 ($before, then $after writes)"
+        return 1
+    fi
+}
+
+# A node mounted on a dm-multipath map keeps running when its iSCSI path logs out and in again. LIO goes on taking
+# its writes while the old session's registration stands, so VM 2 then preempts that registration, as a target that
+# checks writes per session would refuse them. VM 1's next write meets a reservation conflict, VM 1 registers its key
+# again with every write held, and both nodes keep writing. Afterwards fsck finds the volume clean.
 test_fencing_session_relogin() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
@@ -4173,15 +4191,10 @@ test_fencing_session_relogin() {
     disk=$(iscsi_disk 1)
     log_info "VM 1's path logged in again as /dev/$disk"
     multipath_over 1 "$disk" || result=1
+    writes_go_on 1 "after its path logged in again" || result=1
+    ssh_run 2 "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key 2) --param-sark=$(reservation_key 1) --prout-type=5 $(cluster_device) > /dev/null" || result=1
     wait_log 1 "registered it again with every write held" 60 "$marker" || result=1
-    local before after
-    before=$(ssh_run 1 "grep -c ok /tmp/load.out")
-    sleep 5
-    after=$(ssh_run 1 "grep -c ok /tmp/load.out")
-    if [[ -z "$(mount_pids 1)" ]] || (( after <= before )); then
-        log_error "VM 1 stopped or stopped writing after its path logged in again ($before, then $after writes)"
-        result=1
-    fi
+    writes_go_on 1 "after it registered its key again" || result=1
     out=$(ssh_run 1 "wget -qO- http://127.0.0.1:8080/health; echo; wget -qO- http://127.0.0.1:8080/metrics | grep '^goclusterfs_fencing_key_restores_total'")
     if [[ "$out" != *"registered its key again 1 times"* || "$out" != *"goclusterfs_fencing_key_restores_total 1"* ]]; then
         log_error "VM 1's /health and /metrics do not show the key restore: $out"
