@@ -730,6 +730,8 @@ func (r *Registry) beat(slotIdx int) error {
 		r.beatSeq++
 		slot.HeartbeatSeq = r.beatSeq
 		slot.HeartbeatTime = time.Now().Unix()
+		// A slot that held more orphans than leave room for the address lost it.
+		slot.Addr = r.advertise
 		issued := bootClock()
 		if r.writeSlot(slotIdx, slot) == nil {
 			if paused = r.sinceLastBeat(); paused <= stallLimit {

@@ -3517,6 +3517,13 @@ scenarios:
     environments:
       go: internal/node/addr_test.go::TestSlotAddressYieldsToALongOrphanList
 
+  - id: registry-slot-address-returns
+    name: The advertised address comes back after a long orphan list shrinks
+    description: A node whose orphan list outgrew the room for its address writes the address again on its next orphan edit or heartbeat
+    priority: go_only
+    environments:
+      go: internal/node/addr_test.go::TestAdvertisedAddressComesBackWhenTheOrphanListShrinks
+
   - id: broadcast-directory-invalidation
     name: Broadcast directory invalidation
     description: New file creation is broadcast between nodes
