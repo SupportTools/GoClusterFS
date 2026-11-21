@@ -91,17 +91,12 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 	listed := make(map[[16]byte]time.Time, len(peers))
 	silent := map[[16]byte]ExpectedPeer{}
 	b.sendersMu.Lock()
-	// A slot whose orphan list outgrew the room for its address keeps the node's last one while it stays listed.
 	addrs := make(map[[16]byte]netip.AddrPort, len(peers))
 	for _, p := range peers {
 		if p.UUID == b.localUUID {
 			continue
 		}
-		addr, known := b.peerAddrs[p.UUID]
-		if p.Addr.IsValid() {
-			addr, known = p.Addr, !b.isSelf(p.Addr, local)
-		}
-		if known {
+		if addr, known := b.peerAddr(p, local); known {
 			addrs[p.UUID] = addr
 			if s, ok := b.senders[p.UUID]; !ok || now.Sub(s.multicast) > quiet {
 				ask = append(ask, addr)
@@ -178,6 +173,16 @@ func (b *Broadcaster) applyRequestsLocked(now time.Time) {
 		}
 	}
 	b.transport.SetRequestedPeers(addrs)
+}
+
+// peerAddr is where a listed peer takes unicast: its slot's address or, while
+// its orphan list leaves no room for one, the last address read. The caller holds sendersMu.
+func (b *Broadcaster) peerAddr(p ExpectedPeer, local map[netip.Addr]bool) (netip.AddrPort, bool) {
+	if p.Addr.IsValid() {
+		return p.Addr, !b.isSelf(p.Addr, local)
+	}
+	addr, ok := b.peerAddrs[p.UUID]
+	return addr, ok
 }
 
 // isSelf says whether addr reaches this node: under QEMU user networking every

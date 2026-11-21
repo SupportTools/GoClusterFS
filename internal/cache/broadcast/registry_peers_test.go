@@ -188,6 +188,16 @@ func TestOwnAddressIsNotAPeer(t *testing.T) {
 			t.Errorf("isSelf(%v) = %v, want %v", addr, got, self)
 		}
 	}
+
+	twin, other := [16]byte{2}, [16]byte{3}
+	b.peerAddrs[twin] = netip.AddrPortFrom(netip.MustParseAddr("10.0.2.16"), port)
+	if addr, ok := b.peerAddr(ExpectedPeer{UUID: twin, Addr: netip.AddrPortFrom(guest, port)}, local); ok {
+		t.Errorf("a peer advertising this node's own address is reached at %v, want not at all", addr)
+	}
+	want := netip.AddrPortFrom(netip.MustParseAddr("10.0.2.17"), port)
+	if addr, ok := b.peerAddr(ExpectedPeer{UUID: other, Addr: want}, local); !ok || addr != want {
+		t.Errorf("a peer advertising %v is reached at %v, %v", want, addr, ok)
+	}
 }
 
 // A peer whose slot drops its address, because its orphan list outgrew the
