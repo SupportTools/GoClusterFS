@@ -6311,8 +6311,6 @@ scenarios:
     environments:
       go: internal/goclusterfs/symlink_test.go::TestStaleLinkNodeAfterSlotReuse
 
-=======
-
   - id: lock-writer-gets-file-io-from-readers
     name: A writer gets a file I/O lock that readers on lower slots keep taking
     description: Four lower-slot nodes keep taking a file I/O lock shared; a higher-slot node asking for it exclusive gets it each time before the acquire timeout, because readers wait behind its waiting mark

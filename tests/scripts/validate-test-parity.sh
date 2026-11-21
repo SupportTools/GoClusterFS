@@ -67,6 +67,13 @@ if [[ ! -f "$MANIFEST" ]]; then
     exit 1
 fi
 
+# The scenario parser reads line by line and skips what it does not know, so a merge that left a conflict marker would pass.
+if markers=$(grep -nE '^(<<<<<<<|\|\|\|\|\|\|\||=======|>>>>>>>)( |$)' "$MANIFEST"); then
+    echo -e "${RED}ERROR: $MANIFEST holds merge conflict markers; resolve them:${NC}"
+    echo "$markers"
+    exit 1
+fi
+
 # Function to verify a Go test exists
 verify_go_test() {
     local spec="$1"  # format: filename::FunctionName or pkg/path/file_test.go::FunctionName
