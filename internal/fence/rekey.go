@@ -27,6 +27,9 @@ type Rekeyer struct {
 	StallLimit time.Duration
 	// Restored, if set, runs after a re-register with the heartbeat age the last check read.
 	Restored func(age time.Duration)
+	// Refused, if set, runs with writes still held when Rekey fails, so the node can stop before a held write lands
+	// through a registration that a failed unregister left behind.
+	Refused func(err error)
 
 	last time.Time
 	// Tests stall here, as a pause would.
@@ -41,44 +44,52 @@ func (k *Rekeyer) Rekey() error {
 			time.Since(k.last).Round(time.Second))
 	}
 	return k.HoldWrites(func() error {
-		key := k.PR.Key()
-		switch err := k.PR.dev.register(key, key, false); {
-		case err == nil:
-			return errors.New("this host still holds its key, so the conflict has another cause")
-		case !errors.Is(err, ErrReservationConflict):
-			return fmt.Errorf("checking for this node's key: %w", err)
+		err := k.rekey()
+		if err != nil && k.Refused != nil {
+			k.Refused(err)
 		}
-		if err := k.live(); err != nil {
-			return err
-		}
-		if k.beforeRegister != nil {
-			k.beforeRegister()
-		}
-		pocStall("before-register")
-		if err := k.PR.Register(); err != nil {
-			return fmt.Errorf("registering the key again: %w", err)
-		}
-		if k.afterRegister != nil {
-			k.afterRegister()
-		}
-		pocStall("after-register")
-		age := k.HeartbeatAge()
-		err := k.live()
-		if err == nil {
-			err = k.PR.Reserve()
-		}
-		if err != nil {
-			if uerr := k.PR.Unregister(); uerr != nil && !errors.Is(uerr, ErrFenced) {
-				err = fmt.Errorf("%w; removing the key again failed: %v", err, uerr)
-			}
-			return err
-		}
-		k.last = time.Now()
-		if k.Restored != nil {
-			k.Restored(age)
-		}
-		return nil
+		return err
 	})
+}
+
+func (k *Rekeyer) rekey() error {
+	key := k.PR.Key()
+	switch err := k.PR.dev.register(key, key, false); {
+	case err == nil:
+		return errors.New("this host still holds its key, so the conflict has another cause")
+	case !errors.Is(err, ErrReservationConflict):
+		return fmt.Errorf("checking for this node's key: %w", err)
+	}
+	if err := k.live(); err != nil {
+		return err
+	}
+	if k.beforeRegister != nil {
+		k.beforeRegister()
+	}
+	pocStall("before-register")
+	if err := k.PR.Register(); err != nil {
+		return fmt.Errorf("registering the key again: %w", err)
+	}
+	if k.afterRegister != nil {
+		k.afterRegister()
+	}
+	pocStall("after-register")
+	age := k.HeartbeatAge()
+	err := k.live()
+	if err == nil {
+		err = k.PR.Reserve()
+	}
+	if err != nil {
+		if uerr := k.PR.Unregister(); uerr != nil && !errors.Is(uerr, ErrFenced) {
+			err = fmt.Errorf("%w; removing the key again failed: %v", err, uerr)
+		}
+		return err
+	}
+	k.last = time.Now()
+	if k.Restored != nil {
+		k.Restored(age)
+	}
+	return nil
 }
 
 // live checks that no peer can have taken this node over: its heartbeat is recent and its slot is its own and live.

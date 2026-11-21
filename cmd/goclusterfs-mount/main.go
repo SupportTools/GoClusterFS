@@ -870,6 +870,10 @@ func restoreKey(pr *fence.PR, dev *storage.Device, reg *node.Registry, slotIdx i
 		HeartbeatAge: reg.HeartbeatAge,
 		SlotLive:     func() error { return reg.SlotLive(slotIdx) },
 		StallLimit:   node.StallLimit,
+		Refused: func(err error) {
+			log.Printf("[WARN] Fencing: a write met a reservation conflict, and this node does not register its key again: %v", err)
+			reg.Fenced(err)
+		},
 		Restored: func(age time.Duration) {
 			reg.NoteKeyRestore()
 			log.Printf("[WARN] Fencing: the device no longer knew this node's reservation key %#x, as after its storage path logged out and in again; "+
@@ -877,11 +881,11 @@ func restoreKey(pr *fence.PR, dev *storage.Device, reg *node.Registry, slotIdx i
 		},
 	}
 	return func() error {
-		if err := k.Rekey(); err != nil {
-			log.Printf("[WARN] Fencing: a write met a reservation conflict, and this node does not register its key again: %v", err)
-			return err
+		err := k.Rekey()
+		if err != nil {
+			log.Printf("[WARN] Fencing: this node does not register its key again: %v", err)
 		}
-		return nil
+		return err
 	}
 }
 
