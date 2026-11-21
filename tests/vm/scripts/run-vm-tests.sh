@@ -3961,6 +3961,94 @@ test_fencing_reservation_self_test() {
     return $result
 }
 
+# iscsi_disk prints the disk VM $1's iSCSI session attached, which a new login can give another name.
+iscsi_disk() {
+    ssh_run "$1" "iscsiadm -m session -P 3 | sed -n 's/.*Attached scsi disk \([a-z]*\).*/\1/p' | head -1"
+}
+
+# multipath_over sets VM $1's one-path dm-multipath map gcfs-mpath on disk $2, which queues I/O while the path is gone.
+multipath_over() {
+    ssh_run "$1" "table=\"0 \$(blockdev --getsz /dev/$2) multipath 1 queue_if_no_path 0 1 1 round-robin 0 1 1 /dev/$2 1\"
+        if dmsetup info gcfs-mpath > /dev/null 2>&1; then
+            dmsetup suspend --noflush gcfs-mpath && dmsetup load gcfs-mpath --table \"\$table\" && dmsetup resume gcfs-mpath
+        else
+            dmsetup create gcfs-mpath --table \"\$table\"
+        fi"
+}
+
+# write_load writes small files with fsync on VM $1 and records ok or fail for each in /tmp/load.out.
+write_load() {
+    ssh_run "$1" "rm -f /tmp/load.out; (i=0; while [ ! -e /tmp/load.stop ]; do i=\$((i+1)); if dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/load.vm$1.\$((i%16)) bs=64k count=4 conv=fsync 2>/dev/null; then echo ok; else echo fail; fi; sleep 0.1; done) >> /tmp/load.out 2>&1 &"
+}
+
+# A node mounted on a dm-multipath map keeps running when its iSCSI path logs out and in again. LIO keeps its key
+# under the old session's ID, so the new path's first write meets a reservation conflict. The node then registers its
+# key again with every write held, and both nodes keep writing. Afterwards fsck finds the volume clean.
+test_fencing_session_relogin() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 out disk vm portal="10.0.2.2:${ISCSI_PORT}" fsck=/usr/local/bin/goclusterfs-fsck
+    for vm in 1 2; do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
+        fi
+        ssh_run "$vm" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; rm -f /tmp/load.stop; true"
+    done
+    ssh_run 1 "apk add --no-cache device-mapper > /dev/null && modprobe dm-multipath" || return 1
+    disk=$(iscsi_disk 1)
+    multipath_over 1 "$disk" || return 1
+    setup_goclusterfs 1 true "" /dev/mapper/gcfs-mpath "-fencing=pr" || return 1
+    setup_goclusterfs 2 false || return 1
+    write_load 1
+    write_load 2
+    sleep 5
+
+    local marker
+    marker="fencing relogin $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run 1 "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; sleep 2; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null" || result=1
+    disk=$(iscsi_disk 1)
+    log_info "VM 1's path logged in again as /dev/$disk"
+    multipath_over 1 "$disk" || result=1
+    wait_log 1 "registered it again with every write held" 60 "$marker" || result=1
+    local before after
+    before=$(ssh_run 1 "grep -c ok /tmp/load.out")
+    sleep 5
+    after=$(ssh_run 1 "grep -c ok /tmp/load.out")
+    if [[ -z "$(mount_pids 1)" ]] || (( after <= before )); then
+        log_error "VM 1 stopped or stopped writing after its path logged in again ($before, then $after writes)"
+        result=1
+    fi
+    out=$(ssh_run 1 "wget -qO- http://127.0.0.1:8080/health; echo; wget -qO- http://127.0.0.1:8080/metrics | grep '^goclusterfs_fencing_key_restores_total'")
+    if [[ "$out" != *"registered its key again 1 times"* || "$out" != *"goclusterfs_fencing_key_restores_total 1"* ]]; then
+        log_error "VM 1's /health and /metrics do not show the key restore: $out"
+        result=1
+    fi
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log 2)" | grep -q "failing or being recovered"; then
+        log_error "VM 2 treated VM 1 as failing while its path logged in again"
+        result=1
+    fi
+
+    ssh_run 1 "touch /tmp/load.stop"
+    ssh_run 2 "touch /tmp/load.stop"
+    sleep 1
+    log_info "writes on VM 1: $(ssh_run 1 'sort /tmp/load.out | uniq -c | tr "\n" " "'), VM 2: $(ssh_run 2 'sort /tmp/load.out | uniq -c | tr "\n" " "')"
+    unmount_goclusterfs 1 || result=1
+    unmount_goclusterfs 2 || result=1
+    out=$(ssh_run 2 "$fsck $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"rc=0" ]]; then
+        log_error "fsck after the relogin is not clean: $out"
+        result=1
+    fi
+
+    ssh_run 2 "$fsck -clear-reservations -confirm $(cluster_device) > /dev/null 2>&1" || result=1
+    ssh_run 1 "dmsetup remove gcfs-mpath; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null; for t in \$(seq 20); do [ -b $(cluster_device) ] && exit 0; sleep 1; done; exit 1" || result=1
+    fencing_restart pr || result=1
+    return $result
+}
+
 # =============================================================================
 # Hostile storage and clocks
 # =============================================================================
@@ -5136,6 +5224,7 @@ main() {
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Fencing: Reservation Self-Test" test_fencing_reservation_self_test
+    run_test "Fencing: Session Relogin" test_fencing_session_relogin
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall

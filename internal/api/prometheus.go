@@ -126,6 +126,7 @@ type fsCollector struct {
 	nodeHeartbeatAgeDesc    *prometheus.Desc
 	peerReplaysDesc         *prometheus.Desc
 	peerReplaysRunningDesc  *prometheus.Desc
+	keyRestoresDesc         *prometheus.Desc
 	mountReplayedTxnsDesc   *prometheus.Desc
 	mountDiscardedJournDesc *prometheus.Desc
 
@@ -525,6 +526,11 @@ func newFSCollector(s *Server) *fsCollector {
 			"Journals of crashed nodes this node replayed, by result: ok, or failed and left for a retry",
 			[]string{"result"}, nil,
 		),
+		keyRestoresDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "fencing", "key_restores_total"),
+			"Times this node registered its reservation key again after its storage path lost it, as an iSCSI path that logged out and in again does",
+			nil, nil,
+		),
 		peerReplaysRunningDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "journal", "peer_replays_running"),
 			"Crashed nodes' journals this node is replaying now",
@@ -643,6 +649,7 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.nodeHeartbeatAgeDesc
 	ch <- c.peerReplaysDesc
 	ch <- c.peerReplaysRunningDesc
+	ch <- c.keyRestoresDesc
 	ch <- c.mountReplayedTxnsDesc
 	ch <- c.mountDiscardedJournDesc
 
@@ -805,6 +812,7 @@ func (c *fsCollector) collectNodeStats(ch chan<- prometheus.Metric, n *NodeStats
 	ch <- prometheus.MustNewConstMetric(c.peerReplaysDesc, prometheus.CounterValue, float64(n.PeerReplays), "ok")
 	ch <- prometheus.MustNewConstMetric(c.peerReplaysDesc, prometheus.CounterValue, float64(n.PeerReplayFailures), "failed")
 	ch <- prometheus.MustNewConstMetric(c.peerReplaysRunningDesc, prometheus.GaugeValue, float64(len(n.ReplayingSlots)))
+	ch <- prometheus.MustNewConstMetric(c.keyRestoresDesc, prometheus.CounterValue, float64(n.ReservationKeyRestores))
 	ch <- prometheus.MustNewConstMetric(c.mountReplayedTxnsDesc, prometheus.GaugeValue, float64(n.MountReplayedTransactions))
 	discarded := 0.0
 	if n.MountDiscardedJournal {
