@@ -142,8 +142,8 @@ func TestRekeyStalledBeforeRegisterLandsNoWrite(t *testing.T) {
 	k.afterRegister = func() { registeredInStall = w.nodeRegistered() }
 	k.beforeRegister = func() { w.takeOver(t) }
 	err := k.Rekey()
-	if err == nil || !strings.Contains(err.Error(), "past the 15s") {
-		t.Errorf("Rekey: %v, want the second check to fail on the heartbeat age", err)
+	if err == nil || !strings.Contains(err.Error(), "from before the loss are gone") && !strings.Contains(err.Error(), "past the 15s") {
+		t.Errorf("Rekey: %v, want the checks after the register to refuse", err)
 	}
 	if !registeredInStall {
 		t.Error("the register did not reach the device, so the test proves nothing")

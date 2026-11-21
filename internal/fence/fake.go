@@ -117,7 +117,7 @@ func (d *fakeDevice) reserve(key uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.keys[d.initiator] != key || key == 0 {
+	if t.keys[d.nexuses()[0]] != key || key == 0 {
 		return ErrReservationConflict
 	}
 	t.reserved = true
