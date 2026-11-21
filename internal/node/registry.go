@@ -731,6 +731,9 @@ func (r *Registry) beat(slotIdx int) error {
 		afterBeatRead()
 	}
 	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead && slot.RecoveryOwner == [16]byte{}
+	if ours {
+		pocSleep(pocBeatStall, "heartbeat read slot %d", slotIdx)
+	}
 	takenOver := err == nil && !ours
 	paused := r.sinceLastBeat()
 	if ours && paused <= stallLimit {
@@ -1392,6 +1395,7 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		log.Printf("[Recovery] Not recovering slot %d: %v", slotIdx, err)
 		return nil, err
 	}
+	pocSleep(pocTakeoverDelay, "slot %d: intent written and node %x revoked; the Dead mark waits", slotIdx, slot.UUID[:8])
 
 	r.mu.Lock()
 	defer r.mu.Unlock()

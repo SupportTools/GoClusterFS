@@ -54,12 +54,14 @@ func (k *Rekeyer) Rekey() error {
 		if k.beforeRegister != nil {
 			k.beforeRegister()
 		}
+		pocStall("before-register")
 		if err := k.PR.Register(); err != nil {
 			return fmt.Errorf("registering the key again: %w", err)
 		}
 		if k.afterRegister != nil {
 			k.afterRegister()
 		}
+		pocStall("after-register")
 		age := k.HeartbeatAge()
 		err := k.live()
 		if err == nil {
