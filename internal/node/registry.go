@@ -759,7 +759,7 @@ func (r *Registry) beat(slotIdx int) error {
 	if afterBeatRead != nil {
 		afterBeatRead()
 	}
-	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead && slot.RecoveryOwner == [16]byte{}
+	ours := err == nil && slot.UUID == r.localUUID && !slot.TakenOver()
 	if ours {
 		pocSleep(pocBeatStall, "heartbeat read slot %d", slotIdx)
 	}
@@ -1719,6 +1719,11 @@ func (r *Registry) NoteKeyRestore() {
 // HeartbeatAge is how long ago, on CLOCK_BOOTTIME, this node issued its last heartbeat that landed within StallLimit.
 func (r *Registry) HeartbeatAge() time.Duration {
 	return r.sinceLastBeat()
+}
+
+// TakenOver reports whether a peer marked the slot Dead or wrote its intent to take the slot's node over.
+func (s *Slot) TakenOver() bool {
+	return s.State == NodeStateDead || s.RecoveryOwner != [16]byte{}
 }
 
 // SlotLive returns nil while registry slot slotIdx holds this node, is not Dead and names no peer revoking it. It takes
