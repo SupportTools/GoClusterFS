@@ -4062,10 +4062,12 @@ test_fencing_session_relogin() {
     return $result
 }
 
-# wait_log_now waits up to $3 seconds, polling every 0.1s, for VM $1's mount log to show $2 after marker $4.
+# wait_log_now waits up to $3 seconds, polling every 0.1s, for VM $1's mount log to show more than $5 lines with $2
+# after marker $4; without $5, more than when it started.
 wait_log_now() {
-    local vm="$1" pattern="$2" limit=$(( $3 * 10 )) marker="$4" waited=0
-    until sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -q "$pattern"; do
+    local vm="$1" pattern="$2" limit=$(( $3 * 10 )) marker="$4" waited=0 seen="${5:-}"
+    [[ -n "$seen" ]] || seen=$(sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -c "$pattern")
+    until (( $(sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -c "$pattern") > seen )); do
         if [[ $waited -ge $limit ]]; then
             log_error "VM $vm: no '$pattern' in its mount log within $3s"
             return 1
@@ -4081,13 +4083,14 @@ wait_log_now() {
 #   gate:            VM 1 stops while it rewrites a file.
 #   held:            VM 1 stops between a heartbeat's slot read and its write.
 #   before-register: VM 2 preempts VM 1's key with sg_persist, so VM 1 starts to register again; VM 1 stops before
-#                    its register, and the register lands after VM 2's real takeover preempted.
+#                    its register, and the register lands after VM 2's real takeover preempted. The stop comes 1.5s
+#                    into a 5s stall, once VM 1's heartbeat waits in a held write, so only the rekey reads the slot.
 #   after-register:  as before-register, but VM 1 stops between its register and its slot read.
 rekey_pause_case() {
     local mode=$1 paused=1 peer=2 result=0 env1="" stop_at="" mon marker slot uuid stopped_at byte state
     case "$mode" in
         held) env1="GOCLUSTERFS_POC_BEAT_STALL=2s" stop_at="\[POC\] heartbeat read slot" ;;
-        before-register | after-register) env1="GOCLUSTERFS_POC_REKEY_STALL=$mode:3s" stop_at="\[POC\] rekey: stalling .* $mode" ;;
+        before-register | after-register) env1="GOCLUSTERFS_POC_REKEY_STALL=$mode:5s" stop_at="\[POC\] rekey: stalling .* $mode" ;;
     esac
     fencing_restart pr "$env1" || return 1
     unmount_goclusterfs "$peer" || return 1
@@ -4105,10 +4108,13 @@ rekey_pause_case() {
     if [[ "$mode" == *register ]]; then
         ssh_run "$peer" "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key "$peer") --param-sark=$(reservation_key "$paused") --prout-type=7 $(cluster_device) > /dev/null" || result=1
     fi
-    if [[ -n "$stop_at" ]] && ! wait_log_now "$paused" "$stop_at" 30 "$marker"; then
+    local seen=""
+    [[ "$mode" == *register ]] && seen=0
+    if [[ -n "$stop_at" ]] && ! wait_log_now "$paused" "$stop_at" 30 "$marker" "$seen"; then
         rekey_pause_cleanup "$paused"
         return 1
     fi
+    [[ "$mode" == *register ]] && sleep 1.5
     echo stop | nc -U -q1 "$mon" > /dev/null
     stopped_at=$(date +%s)
     log_info "$mode: VM $paused (slot $slot, $uuid) stopped with QEMU stop"
