@@ -4011,11 +4011,30 @@ hostile_check_acked() {
     return $result
 }
 
-hostile_replayed_since() {
-    sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -q "Starting journal replay for node"
+# Prints each node VM but VM 1 that started a journal replay since marker $1; in a 3-node run any peer may replay VM 1.
+hostile_replayers_since() {
+    local vm
+    for vm in $(seq 2 "$NODE_COUNT"); do
+        if sed -n "/$1/,\$p" "$(get_vm_mount_log "$vm")" | grep -q "Starting journal replay for node"; then
+            echo "$vm"
+        fi
+    done
 }
 
-# VM 1, back from a stall during which VM 2 replayed it, stopped, on its own
+hostile_replayed_since() {
+    [[ -n "$(hostile_replayers_since "$1")" ]]
+}
+
+# Prints every node VM's mount log since marker $1, for a scenario that failed.
+hostile_dump_logs() {
+    local vm
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        log_info "--- VM $vm mount log since: $1"
+        sed -n "/$1/,\$p" "$(get_vm_mount_log "$vm")" | grep -v '\[DEBUG\]' | tail -n 60
+    done
+}
+
+# VM 1, back from a stall during which a peer replayed it, stopped, on its own
 # stall, on finding its slot taken, or on the device refusing its write, and
 # acknowledged no create but one whose writes were already queued when the stall began.
 hostile_check_taken_slot_stops() {
@@ -4027,24 +4046,26 @@ hostile_check_taken_slot_stops() {
     fi
     acked=$(ssh_run 1 "wc -l < /tmp/hostile.acked")
     if (( acked - HOSTILE_ACKED_BEFORE > 1 )); then
-        log_error "VM 1 acknowledged $((acked - HOSTILE_ACKED_BEFORE)) creates after the stall began, although VM 2 replayed it"
+        log_error "VM 1 acknowledged $((acked - HOSTILE_ACKED_BEFORE)) creates after the stall began, although a peer replayed it"
         return 1
     fi
 }
 
-# VM 2 replayed VM 1 17 to 32s after the stall began. The window follows from
-# internal/node: VM 2 counts VM 1 dead once its heartbeat stays unchanged for
+# A peer replayed VM 1 17 to 32s after the stall began. The window follows from
+# internal/node: a peer counts VM 1 dead once its heartbeat stays unchanged for
 # deadAfter (20s), judged at its scans every FailureCheckInterval (5s), so the
 # replay lands 19 to 30s in; the rest is slack for a loaded host.
 hostile_check_stall_fence() {
-    local stamp at
+    local stamp at vm
     hostile_check_taken_slot_stops "$1" || return 1
-    stamp=$(sed -n "/$1/,\$p" "$(get_vm_mount_log 2)" | grep -m1 "Starting journal replay for node" | awk '{print $1" "$2}' | tr / -)
+    vm=$(hostile_replayers_since "$1" | head -1)
+    [[ -n "$vm" ]] || return 1
+    stamp=$(sed -n "/$1/,\$p" "$(get_vm_mount_log "$vm")" | grep -m1 "Starting journal replay for node" | awk '{print $1" "$2}' | tr / -)
     [[ -n "$stamp" ]] || return 1
-    at=$(( $(ssh_run 2 "date -d '$stamp' +%s") - HOSTILE_T0 ))
-    log_info "VM 2 replayed VM 1 ${at}s after the stall began"
+    at=$(( $(ssh_run "$vm" "date -d '$stamp' +%s") - HOSTILE_T0 ))
+    log_info "VM $vm replayed VM 1 ${at}s after the stall began"
     if [[ $at -lt 17 || $at -gt 32 ]]; then
-        log_error "VM 2 replayed VM 1 ${at}s after the stall began, want 17 to 32s"
+        log_error "VM $vm replayed VM 1 ${at}s after the stall began, want 17 to 32s"
         return 1
     fi
 }
@@ -4094,7 +4115,7 @@ hostile_fsck_and_restore() {
 # Runs one scenario: $1 names it, $2 is a function that disturbs VM 1's path,
 # $3 is "survives" when VM 1 must keep running unreplayed, "unnoticed" when
 # VM 2 must also never wait on it as a failing node, "fenced" when it must
-# stop and VM 2 must replay it, or "either" when both outcomes pass, and $4
+# stop and a peer must replay it, or "either" when both outcomes pass, and $4
 # optionally names a function that checks more, given the scenario's log marker.
 hostile_scenario() {
     local name=$1 disturb=$2 expect=$3 check=${4:-} result=0
@@ -4114,20 +4135,20 @@ hostile_scenario() {
             waited=$((waited + 1))
         done
         if hostile_replayed_since "$marker"; then
-            log_info "$name: VM 1 was fenced and VM 2 replayed it"
+            log_info "$name: VM 1 was fenced and VM $(hostile_replayers_since "$marker" | head -1) replayed it"
             if [[ -n "$(mount_pids 1)" ]]; then
-                log_error "VM 2 replayed VM 1 while VM 1 is still mounted"
+                log_error "A peer replayed VM 1 while VM 1 is still mounted"
                 result=1
             fi
             hostile_check_taken_slot_stops "$marker" || result=1
         elif [[ -n "$(mount_pids 1)" ]]; then
             log_info "$name: VM 1 kept running and was not replayed"
             if sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -q "is no longer this node's"; then
-                log_error "VM 1 found its slot taken although VM 2 did not replay it"
+                log_error "VM 1 found its slot taken although no peer replayed it"
                 result=1
             fi
         else
-            log_error "VM 1 stopped and VM 2 did not replay it within 90s"
+            log_error "VM 1 stopped and no peer replayed it within 90s"
             result=1
         fi
     elif [[ "$expect" == fenced ]]; then
@@ -4137,7 +4158,7 @@ hostile_scenario() {
             waited=$((waited + 1))
         done
         if ! hostile_replayed_since "$marker"; then
-            log_error "VM 2 did not replay VM 1 within 90s"
+            log_error "No peer replayed VM 1 within 90s"
             result=1
         fi
         if [[ -n "$(mount_pids 1)" ]]; then
@@ -4146,7 +4167,7 @@ hostile_scenario() {
         fi
     else
         if hostile_replayed_since "$marker"; then
-            log_error "VM 2 declared VM 1 dead although VM 1 was only slowed"
+            log_error "VM $(hostile_replayers_since "$marker" | head -1) declared VM 1 dead although VM 1 was only slowed"
             result=1
         fi
         if [[ -z "$(mount_pids 1)" ]]; then
@@ -4165,6 +4186,7 @@ hostile_scenario() {
     fi
     hostile_check_acked 2 || result=1
     hostile_fsck_and_restore || result=1
+    [[ $result -eq 0 ]] || hostile_dump_logs "$marker"
     return $result
 }
 
@@ -4260,10 +4282,11 @@ test_clock_ahead_crash_recovered() {
         waited=$((waited + 1))
     done
     if ! hostile_replayed_since "$marker"; then
-        log_error "VM 2 did not replay crashed VM 1 within 60s; VM 1's clock was 3 minutes ahead"
+        log_error "No peer replayed crashed VM 1 within 60s; VM 1's clock was 3 minutes ahead"
+        hostile_dump_logs "$marker"
         result=1
     else
-        log_info "VM 2 replayed VM 1 ${waited}s after the crash"
+        log_info "VM $(hostile_replayers_since "$marker" | head -1) replayed VM 1 ${waited}s after the crash"
     fi
     ssh_run 1 "date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null; fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
     setup_goclusterfs 1 false || result=1
