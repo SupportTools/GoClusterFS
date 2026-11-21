@@ -78,6 +78,16 @@ type device interface {
 	readReservation() (key uint64, typ uint32, err error)
 }
 
+// keyLister lists the device's registered keys, one per registration, with the device's reservation generation.
+type keyLister interface {
+	listKeys() (generation uint32, keys []uint64, err error)
+}
+
+// pathCounter counts the paths a register goes out on, each of which holds a registration of its own.
+type pathCounter interface {
+	paths() (int, error)
+}
+
 // PR fences with a Write Exclusive, All Registrants reservation: every registered node may write, and no other
 // initiator may, while any node stays registered.
 type PR struct {
@@ -116,6 +126,30 @@ func (p *PR) Preempt(victim uint64) error {
 		return err
 	}
 	return nil
+}
+
+// Registrations returns how many registrations of this node's key the device lists, with the device's reservation
+// generation. ErrUnsupported means the kernel or the device cannot list keys.
+func (p *PR) Registrations() (generation uint32, count int, err error) {
+	l, ok := p.dev.(keyLister)
+	if !ok {
+		return 0, 0, ErrUnsupported
+	}
+	generation, keys, err := l.listKeys()
+	for _, key := range keys {
+		if key == p.key {
+			count++
+		}
+	}
+	return generation, count, err
+}
+
+// Paths returns how many paths a register of this node's key goes out on.
+func (p *PR) Paths() (int, error) {
+	if c, ok := p.dev.(pathCounter); ok {
+		return c.paths()
+	}
+	return 1, nil
 }
 
 // Keys lists the keys registered on the device. ErrUnsupported means the kernel or the device cannot list them.

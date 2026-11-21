@@ -46,6 +46,25 @@ func (d retrying) readKeys() (keys []uint64, err error) {
 	return keys, err
 }
 
+func (d retrying) listKeys() (generation uint32, keys []uint64, err error) {
+	l, ok := d.device.(keyLister)
+	if !ok {
+		return 0, nil, ErrUnsupported
+	}
+	err = d.again(func() error {
+		generation, keys, err = l.listKeys()
+		return err
+	})
+	return generation, keys, err
+}
+
+func (d retrying) paths() (int, error) {
+	if c, ok := d.device.(pathCounter); ok {
+		return c.paths()
+	}
+	return 1, nil
+}
+
 func (d retrying) readReservation() (key uint64, typ uint32, err error) {
 	err = d.again(func() error {
 		key, typ, err = d.device.readReservation()
@@ -195,17 +214,38 @@ func (d blockDevice) clear(key uint64) error {
 }
 
 func (d blockDevice) readKeys() ([]uint64, error) {
+	_, keys, err := d.listKeys()
+	return keys, err
+}
+
+func (d blockDevice) listKeys() (uint32, []uint64, error) {
 	keys := make([]uint64, maxListedKeys)
 	list := keyList{count: maxListedKeys, keys: uint64(uintptr(unsafe.Pointer(&keys[0])))}
 	err := unlistable(d.ioctl(iocReadKeys, unsafe.Pointer(&list)))
 	runtime.KeepAlive(keys)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	if list.count > maxListedKeys {
-		return keys, fmt.Errorf("the device lists %d keys, more than the %d a volume can hold", list.count, maxListedKeys)
+		return list.generation, keys, fmt.Errorf("the device lists %d keys, more than the %d a volume can hold", list.count, maxListedKeys)
 	}
-	return keys[:list.count], nil
+	return list.generation, keys[:list.count], nil
+}
+
+// paths counts the disks under a device-mapper map, which registers a key on each of them; a plain disk is one path.
+func (d blockDevice) paths() (int, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(d.f.Fd()), &st); err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(filepath.Join("/sys/dev/block", fmt.Sprintf("%d:%d", unix.Major(st.Rdev), unix.Minor(st.Rdev)), "slaves"))
+	if errors.Is(err, os.ErrNotExist) || err == nil && len(entries) == 0 {
+		return 1, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 func (d blockDevice) readReservation() (key uint64, typ uint32, err error) {
