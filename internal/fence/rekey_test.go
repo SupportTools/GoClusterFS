@@ -19,6 +19,7 @@ type rekeyWorld struct {
 	intent     atomic.Bool
 	dead       atomic.Bool
 	takenOver  atomic.Bool
+	exited     atomic.Bool
 	hold       sync.RWMutex
 	landed     atomic.Int32
 	lateWrites atomic.Int32
@@ -50,7 +51,7 @@ func newRekeyWorld(t *testing.T) *rekeyWorld {
 			default:
 			}
 			w.hold.RLock()
-			if w.target.MayWrite("n") {
+			if !w.exited.Load() && w.target.MayWrite("n") {
 				w.landed.Add(1)
 				if w.takenOver.Load() {
 					w.lateWrites.Add(1)
@@ -248,5 +249,37 @@ func TestRekeyAfterAPausedClockLandsNoWrite(t *testing.T) {
 				t.Errorf("%d writes landed after the peer's preempt, registered %v", n, w.nodeRegistered())
 			}
 		})
+	}
+}
+
+// A re-register that lands after the peer's preempt and then cannot be removed, as when the path fails again, leaves
+// this host registered. Refused stops the node while writes are still held, so none lands through that registration.
+func TestRekeyThatCannotUnregisterStopsWithWritesHeld(t *testing.T) {
+	w := newRekeyWorld(t)
+	w.loseSession()
+	w.age.Store(int64(time.Second))
+	k := w.rekeyer()
+	k.beforeRegister = func() {
+		w.revoke(t)
+		w.target.mu.Lock()
+		w.target.failUnregister = errors.New("path down")
+		w.target.mu.Unlock()
+	}
+	heldAtRefusal := false
+	k.Refused = func(error) {
+		if heldAtRefusal = !w.hold.TryRLock(); !heldAtRefusal {
+			w.hold.RUnlock()
+		}
+		w.exited.Store(true)
+	}
+	if err := k.Rekey(); err == nil || !strings.Contains(err.Error(), "path down") {
+		t.Errorf("Rekey: %v, want the intent and the failed unregister", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !w.nodeRegistered() {
+		t.Fatal("the failed unregister left no registration, so the test proves nothing")
+	}
+	if !heldAtRefusal || w.lateWrites.Load() != 0 {
+		t.Errorf("Refused ran with writes held: %v; %d writes landed after the preempt", heldAtRefusal, w.lateWrites.Load())
 	}
 }

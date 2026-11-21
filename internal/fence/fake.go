@@ -12,6 +12,8 @@ type Target struct {
 	keys      map[string]uint64
 	reserved  bool
 	preempted []uint64
+	// failUnregister, when set, is what removing a key returns, as from a path that went down.
+	failUnregister error
 }
 
 func NewTarget() *Target { return &Target{keys: map[string]uint64{}} }
@@ -74,6 +76,9 @@ func (d *fakeDevice) register(old, new uint64, ignore bool) error {
 	if new != 0 {
 		t.keys[d.initiator] = new
 		return nil
+	}
+	if t.failUnregister != nil {
+		return t.failUnregister
 	}
 	delete(t.keys, d.initiator)
 	if len(t.keys) == 0 {
