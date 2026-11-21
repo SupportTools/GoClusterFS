@@ -286,3 +286,31 @@ func TestSelfTestStopsWhenTheDeviceStopsAnswering(t *testing.T) {
 		t.Errorf("want nothing reported between the stalled step and the clean up:%s", &r)
 	}
 }
+
+// unitAttention answers the first register with status 0x2, as LIO's unit attention does to a host whose key was preempted.
+type unitAttention struct {
+	*fakeDevice
+	pending *bool
+}
+
+func (d unitAttention) register(old, new uint64, ignore bool) error {
+	if *d.pending {
+		*d.pending = false
+		return statusError(statusIOError)
+	}
+	return d.fakeDevice.register(old, new, ignore)
+}
+
+// A command sent again after status 0x2 passes, and its step says so.
+func TestSelfTestNotesACommandSentAgain(t *testing.T) {
+	pending := true
+	var r recorder
+	s := newRetryingSelfTest(unitAttention{&fakeDevice{t: NewTarget(), initiator: "a"}, &pending}, func() error { return nil }, r.report)
+	s.Run()
+	if s.Failed() || !strings.Contains(r.checks[1].Answer, "was sent again") {
+		t.Errorf("want the first register to pass after a second try, and say so:%s", &r)
+	}
+	if strings.Contains(r.checks[2].Answer, "sent again") {
+		t.Errorf("the note carried over to the next step:%s", &r)
+	}
+}

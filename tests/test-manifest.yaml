@@ -5521,6 +5521,13 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestUnitAttentionAfterAPreemptReadsAsFenced
 
+  - id: fence-self-test-sent-again
+    name: The reservation self-test notes a command sent again after status 0x2
+    description: When fence sends a command once more after status 0x2, the self-test step passes and says so, and the note does not carry over to the next step
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestNotesACommandSentAgain
+
   - id: storage-quiesce
     name: Quiesce drains in-flight I/O and holds new I/O
     description: Quiesce runs its function only after a write in flight finishes, and a read started meanwhile waits until the function returns

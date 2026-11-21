@@ -261,15 +261,15 @@ func (d *scripted) readReservation() (uint64, uint32, error) { return 0, 0, nil 
 // again, the command meets the conflict behind it, so Unregister and Preempt report ErrFenced; 0x2 twice stays an
 // error that is not.
 func TestUnitAttentionAfterAPreemptReadsAsFenced(t *testing.T) {
-	unmounting := &PR{dev: retrying{&scripted{registers: []uintptr{0x02, 0x18}}}, key: 1}
+	unmounting := &PR{dev: retrying{device: &scripted{registers: []uintptr{0x02, 0x18}}}, key: 1}
 	if err := unmounting.Unregister(); !errors.Is(err, ErrFenced) {
 		t.Errorf("Unregister after a unit attention: %v, want ErrFenced", err)
 	}
-	preempting := &PR{dev: retrying{&scripted{preempts: []uintptr{0x02, 0x18}, registers: []uintptr{0x02, 0x18}}}, key: 1}
+	preempting := &PR{dev: retrying{device: &scripted{preempts: []uintptr{0x02, 0x18}, registers: []uintptr{0x02, 0x18}}}, key: 1}
 	if err := preempting.Preempt(2); !errors.Is(err, ErrFenced) {
 		t.Errorf("Preempt after a unit attention: %v, want ErrFenced", err)
 	}
-	failing := &PR{dev: retrying{&scripted{registers: []uintptr{0x02, 0x02}}}, key: 1}
+	failing := &PR{dev: retrying{device: &scripted{registers: []uintptr{0x02, 0x02}}}, key: 1}
 	if err := failing.Unregister(); err == nil || errors.Is(err, ErrFenced) {
 		t.Errorf("Unregister answered 0x2 twice: %v, want an error that is not ErrFenced", err)
 	}

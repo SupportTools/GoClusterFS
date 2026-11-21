@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -45,13 +46,21 @@ type SelfTest struct {
 	failed  bool
 	listing bool
 	reading bool
+	retried atomic.Bool
 	hung    bool
 	stopped bool
 }
 
 // NewSelfTest tests the device f is open on. write writes 4 KiB to it with O_DIRECT.
 func NewSelfTest(f *os.File, write func() error, report func(Check)) *SelfTest {
-	return newSelfTest(retrying{blockDevice{f: f, partition: isPartition(f)}}, write, report)
+	return newRetryingSelfTest(blockDevice{f: f, partition: isPartition(f)}, write, report)
+}
+
+// newRetryingSelfTest sends commands to dev as Block does, and notes each command it sent again after status 0x2.
+func newRetryingSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
+	var s *SelfTest
+	s = newSelfTest(retrying{device: dev, retried: func() { s.retried.Store(true) }}, write, report)
+	return s
 }
 
 func newSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
@@ -130,8 +139,12 @@ func (g guarded) readReservation() (uint64, uint32, error) {
 	return r.key, r.typ, err
 }
 
-// report passes c on. Once a command got no answer, it passes on only the step that waited for it.
+// report passes c on, noting a command sent again after status 0x2. Once a command got no answer, it passes on only
+// the step that waited for it.
 func (s *SelfTest) report(c Check) {
+	if s.retried.Swap(false) {
+		c.Answer += "; the first try got status 0x2, the kernel's code for any failure but a conflict, such as the unit attention a preempted host's first command gets, and was sent again"
+	}
 	if s.hung {
 		if s.stopped {
 			return
