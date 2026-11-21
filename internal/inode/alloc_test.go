@@ -184,3 +184,28 @@ func TestFindFreeSlotFindsInodesAnotherNodeFreed(t *testing.T) {
 		t.Errorf("FindFreeSlot = %d, %v; want inode 50, the first free inode from this node's start", num, err)
 	}
 }
+
+func TestFindFreeSlotStartsOverForInodesOtherNodesFreed(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	a := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
+	b := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+	for range 20 {
+		if _, err := claimFree(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.Free(ctx, 5); err != nil {
+		t.Fatal(err)
+	}
+	if num, err := a.FindFreeSlot(); err != nil || num != 23 {
+		t.Fatalf("FindFreeSlot = %d, %v; want inode 23 before its next start over", num, err)
+	}
+
+	a.restartEvery = 0
+	if num, err := a.FindFreeSlot(); err != nil || num != 5 {
+		t.Errorf("FindFreeSlot = %d, %v; want inode 5, which the other node freed", num, err)
+	}
+}

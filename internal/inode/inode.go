@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -164,6 +165,9 @@ type Table struct {
 	syncDevice  func() error
 	scanStart   uint64        // FindFreeSlot's first slot, as an offset from InodeFirstUsable
 	resume      atomic.Uint64 // where FindFreeSlot starts reading; the slots before it, from scanStart on, were in use
+	// restartEvery is how often FindFreeSlot reads from scanStart again, to reuse inodes other nodes freed.
+	restartEvery time.Duration
+	restarted    atomic.Int64
 }
 
 // SetTreeFlusher sets the writer for pending extent-tree changes.
@@ -204,6 +208,8 @@ func NewTable(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager, n
 		lockMgr:     lockMgr,
 		nodeUUID:    nodeUUID,
 		syncDevice:  dev.Sync,
+
+		restartEvery: time.Minute,
 	}
 	t.resume.Store(uint64(InodeFirstUsable))
 	return t
@@ -415,6 +421,10 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 	defer t.mu.RUnlock()
 
 	start := t.resume.Load()
+	if now := time.Now().UnixNano(); now-t.restarted.Load() >= int64(t.restartEvery) {
+		t.restarted.Store(now)
+		start = uint64(InodeFirstUsable) + t.scanStart
+	}
 	free := uint32(0)
 	isFree := func(num, magic uint32) bool {
 		if magic == 0 {
@@ -432,8 +442,18 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 	return free, nil
 }
 
-// freedBeforeResume moves FindFreeSlot back to inode num, freed by this node, if
-// its scan would only reach num after wrapping. Called with t.mu held.
+// NoteFreed tells FindFreeSlot that another node freed inode num.
+func (t *Table) NoteFreed(num uint32) {
+	if num < InodeFirstUsable || uint64(num) >= t.totalInodes {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.freedBeforeResume(num)
+}
+
+// freedBeforeResume moves FindFreeSlot back to free inode num if its scan would
+// only reach num after wrapping. Called with t.mu held.
 func (t *Table) freedBeforeResume(num uint32) {
 	usable := t.totalInodes - uint64(InodeFirstUsable)
 	scanOrder := func(n uint64) uint64 {

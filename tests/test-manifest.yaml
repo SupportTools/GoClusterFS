@@ -345,6 +345,20 @@ scenarios:
     environments:
       go: internal/inode/alloc_test.go::TestFindFreeSlotFindsInodesAnotherNodeFreed
 
+  - id: inode-search-starts-over
+    name: Inode search starts over to reuse inodes other nodes freed
+    description: An inode another node frees behind this node's last find is reused once the search starts again at the node's start, which it does every minute
+    priority: go_only
+    environments:
+      go: internal/inode/alloc_test.go::TestFindFreeSlotStartsOverForInodesOtherNodesFreed
+
+  - id: create-reuses-inode-peer-freed
+    name: Create reuses an inode a peer freed after this node's unlink
+    description: This node unlinks a file its peer may hold, the peer lets go last and frees it, and this node's next create after its orphan pass takes that inode, as the Docker and VM inode reuse tests expect
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/orphans_test.go::TestCreateReusesAnInodeAPeerFreedAfterThisNodesUnlink
+
   - id: multinode-concurrent-writes
     name: Concurrent writes to different files
     description: Multiple nodes write to different files simultaneously

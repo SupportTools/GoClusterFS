@@ -393,3 +393,31 @@ func TestCreateHoldsAFileAPeerUnlinksAtOnce(t *testing.T) {
 		t.Fatalf("magic %#x, links %d, holders %#b; want an orphan node A holds", ino.Magic, ino.LinkCount, ino.Holders)
 	}
 }
+
+// The peer that lets go last frees a file this node unlinked; this node's next
+// creates must still reuse the inode, as the Docker inode reuse test expects.
+func TestCreateReusesAnInodeAPeerFreedAfterThisNodesUnlink(t *testing.T) {
+	path := newFormattedImage(t)
+	cluster := newFakeCluster(0, 1)
+	writer := cluster.join(t, openFormattedFS(t, path), 0)
+	peer := cluster.join(t, openFormattedFS(t, path), 1)
+	ctx := context.Background()
+
+	old := createFile(t, writer, "old")
+	if errno := writer.Unlink(ctx, "old"); errno != 0 {
+		t.Fatalf("unlink: %v", errno)
+	}
+	if g := createFile(t, writer, "g"); g.inodeNum == old.inodeNum {
+		t.Fatalf("new file took inode %d while the peer still held it", g.inodeNum)
+	}
+	peer.LearnOrphans(ctx, 0, cluster.list(0))
+	if ino := readInode(t, peer, old.inodeNum); ino.Magic != 0 {
+		t.Fatalf("after the peer let go: magic %#x, holders %#b; want the peer to have freed it", ino.Magic, ino.Holders)
+	}
+
+	writer.LearnOrphans(ctx, 0, cluster.list(0))
+	if h := createFile(t, writer, "h"); h.inodeNum != old.inodeNum {
+		t.Errorf("next create took inode %d, want inode %d, which the peer freed", h.inodeNum, old.inodeNum)
+	}
+	expectNoProblems(t, writer, "after reusing the inode")
+}
