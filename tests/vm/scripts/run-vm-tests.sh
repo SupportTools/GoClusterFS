@@ -4031,7 +4031,7 @@ test_fencing_session_relogin() {
     log_info "VM 1's path logged in again as /dev/$disk"
     multipath_over 1 "$disk" || result=1
     writes_go_on 1 "after its path logged in again" || result=1
-    ssh_run 2 "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key 2) --param-sark=$(reservation_key 1) --prout-type=5 $(cluster_device) > /dev/null" || result=1
+    ssh_run 2 "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key 2) --param-sark=$(reservation_key 1) --prout-type=7 $(cluster_device) > /dev/null" || result=1
     wait_log 1 "registered it again with every write held" 60 "$marker" || result=1
     writes_go_on 1 "after it registered its key again" || result=1
     out=$(ssh_run 1 "wget -qO- http://127.0.0.1:8080/health; echo; wget -qO- http://127.0.0.1:8080/metrics | grep '^goclusterfs_fencing_key_restores_total'")
