@@ -62,7 +62,7 @@ newgrp fuse
 | Requirement | Details |
 |-------------|---------|
 | Connectivity | All nodes on same L2 network segment |
-| Multicast | UDP multicast between all nodes. Unicast is only a fallback to peers learned over multicast. |
+| Multicast | UDP multicast between nodes where the network routes it. Where it does not, as in AWS, Azure and GCP VPCs, nodes ask each other for unicast at the address in each node's registry slot, after 3 silent `-broadcast-heartbeat` intervals. Set `-advertise-addr` when peers cannot reach the address a node picks by default, such as behind NAT. |
 | Ports | UDP 24730 (multicast) and UDP 24731 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API. On a Kubernetes node, keep all three below 30000: kube-proxy sends local traffic to ports in its NodePort range (30000-32767 by default) to its services. `-preflight` warns about it |
 | Several mounts per host | Each mount on a host needs its own `-unicast-port` and `-api-addr`. Mounts of different volumes also need their own `-mcast-group` or `-mcast-port` |
 | Several clusters per LAN | Give each cluster its own `-mcast-group`, or set `-broadcast-secret`; otherwise clusters receive each other's invalidations and peer announcements |

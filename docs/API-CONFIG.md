@@ -80,6 +80,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-unicast-port` | int | `24731` | UDP port for unicast; must differ from `-mcast-port` |
 | `-broadcast-secret` | string | (empty) | Secret that signs broadcast messages, the same on every node; visible to local users in `ps`. Empty leaves them unauthenticated |
 | `-broadcast-iface` | string | (empty) | Network interface for multicast; empty lets the kernel choose |
+| `-advertise-addr` | string | (empty) | IP or IP:port where peers that miss this node's multicast send it unicast, written to its registry slot. Empty takes the first global address of `-broadcast-iface`, or the source address of the route to `-mcast-group`, with `-unicast-port`. Set it behind NAT or on a host with several addresses |
 | `-broadcast-max-peers` | int | `256` | Most nodes the unicast peer table and the lost-message tracking hold. When either is full, the node heard from longest ago is dropped |
 | `-broadcast-heartbeat` | duration | `30s` | How often a node sends a broadcast heartbeat. A node the registry shows mounted but not heard on broadcast for 3 of these is reported in the log, on `/health` and on `/metrics` |
 

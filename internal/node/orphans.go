@@ -116,6 +116,7 @@ func (r *Registry) editOrphans(edit func([]Orphan) ([]Orphan, error)) error {
 		return err
 	}
 	slot.Orphans = list
+	slot.Addr = r.advertise
 	return r.writeSlot(r.localSlot, slot)
 }
 

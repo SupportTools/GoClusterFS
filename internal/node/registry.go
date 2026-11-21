@@ -16,6 +16,7 @@ import (
 	"log"
 	"math"
 	"math/bits"
+	"net/netip"
 	"os"
 	"slices"
 	"sync"
@@ -76,24 +77,25 @@ func (s NodeState) String() string {
 // Slot represents a node's on-disk registration entry.
 // Size: 4096 bytes (sector-aligned for O_DIRECT atomic writes)
 type Slot struct {
-	Magic         uint32    // 0x4E4F4445 "NODE"
-	State         NodeState // Current state
-	UUID          [16]byte  // Node's unique identifier
-	HeartbeatSeq  uint64    // Monotonic heartbeat counter
-	HeartbeatTime int64     // Unix timestamp of last heartbeat
-	MountTime     int64     // When this node mounted
-	JournalOffset uint64    // This node's journal region offset
-	JournalSize   uint64    // This node's journal size
-	Hostname      [64]byte  // Node hostname
-	BootID        [16]byte  // Kernel boot ID of the node's host
-	PID           uint32    // Mount process ID
-	ProcStart     int64     // Mount process start time (Unix ns)
-	RecoveryOwner [16]byte  // Dead slots: node replaying the journal
-	RecoveryStart int64     // Dead slots: when that replay last renewed its lease (Unix s)
-	PIDNamespace  uint64    // Inode of the mount process's PID namespace
-	Orphans       []Orphan  // Files this node unlinked that some node may still have open
-	LockLayout    uint32    // How the node's build maps locks to lock records; 0 before builds recorded it
-	Checksum      uint32    // CRC32C of bytes 0-4091
+	Magic         uint32         // 0x4E4F4445 "NODE"
+	State         NodeState      // Current state
+	UUID          [16]byte       // Node's unique identifier
+	HeartbeatSeq  uint64         // Monotonic heartbeat counter
+	HeartbeatTime int64          // Unix timestamp of last heartbeat
+	MountTime     int64          // When this node mounted
+	JournalOffset uint64         // This node's journal region offset
+	JournalSize   uint64         // This node's journal size
+	Hostname      [64]byte       // Node hostname
+	BootID        [16]byte       // Kernel boot ID of the node's host
+	PID           uint32         // Mount process ID
+	ProcStart     int64          // Mount process start time (Unix ns)
+	RecoveryOwner [16]byte       // Dead slots: node replaying the journal
+	RecoveryStart int64          // Dead slots: when that replay last renewed its lease (Unix s)
+	PIDNamespace  uint64         // Inode of the mount process's PID namespace
+	Orphans       []Orphan       // Files this node unlinked that some node may still have open
+	LockLayout    uint32         // How the node's build maps locks to lock records; 0 before builds recorded it
+	Addr          netip.AddrPort // Where the node takes unicast broadcasts; invalid when it advertises none
+	Checksum      uint32         // CRC32C of bytes 0-4091
 }
 
 // Orphan names an unlinked file by its inode and the low bits of its birth generation, so a reused slot never matches.
@@ -107,6 +109,11 @@ const MaxOrphans = (lockLayoutOffset - orphansOffset - 4) / 8
 const (
 	orphansOffset    = 188
 	lockLayoutOffset = SlotSize - 8
+	// The address shares the end of the orphan list: a slot holds it only while the list leaves room.
+	addrOffset  = lockLayoutOffset - addrSize
+	addrSize    = 32
+	addrOrphans = (addrOffset - orphansOffset - 4) / 8
+	addrMagic   = 0x52444441 // "ADDR"
 )
 
 // Registry manages node registration and heartbeats.
@@ -128,6 +135,7 @@ type Registry struct {
 	bootID     [16]byte
 	pidNS      uint64
 	lockLayout uint32
+	advertise  netip.AddrPort
 	onSlotLost atomic.Pointer[func(SlotLoss)]
 
 	onOwnerDead func(owner [16]byte, slot int) (done func(replayed bool))
@@ -401,6 +409,14 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 		err = ErrNoFreeSlots
 	}
 	return i, err
+}
+
+// SetAdvertiseAddr sets the broadcast unicast address Register writes in this
+// node's slot, where peers that miss its multicast send to it.
+func (r *Registry) SetAdvertiseAddr(addr netip.AddrPort) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.advertise = addr
 }
 
 // SetLockLayout sets the lock record layout Register writes in this node's
@@ -714,6 +730,8 @@ func (r *Registry) beat(slotIdx int) error {
 		r.beatSeq++
 		slot.HeartbeatSeq = r.beatSeq
 		slot.HeartbeatTime = time.Now().Unix()
+		// A slot that held more orphans than leave room for the address lost it.
+		slot.Addr = r.advertise
 		issued := bootClock()
 		if r.writeSlot(slotIdx, slot) == nil {
 			if paused = r.sinceLastBeat(); paused <= stallLimit {
@@ -845,6 +863,7 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		ProcStart:     processStart,
 		PIDNamespace:  r.pidNS,
 		LockLayout:    r.lockLayout,
+		Addr:          r.advertise,
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
@@ -1084,6 +1103,9 @@ func serializeSlot(slot *Slot) []byte {
 		binary.LittleEndian.PutUint32(buf[at:], o.Inode)
 		binary.LittleEndian.PutUint32(buf[at+4:], o.Birth)
 	}
+	if n <= addrOrphans {
+		putAddr(buf[addrOffset:lockLayoutOffset], slot.Addr)
+	}
 	binary.LittleEndian.PutUint32(buf[lockLayoutOffset:], slot.LockLayout)
 
 	// Compute checksum
@@ -1091,6 +1113,30 @@ func serializeSlot(slot *Slot) []byte {
 	binary.LittleEndian.PutUint32(buf[SlotSize-4:], checksum)
 
 	return buf
+}
+
+func putAddr(buf []byte, addr netip.AddrPort) {
+	if !addr.IsValid() {
+		return
+	}
+	ip := addr.Addr().Unmap().AsSlice()
+	binary.LittleEndian.PutUint32(buf[0:4], addrMagic)
+	binary.LittleEndian.PutUint16(buf[4:6], addr.Port())
+	buf[6] = byte(len(ip))
+	copy(buf[8:24], ip)
+	binary.LittleEndian.PutUint32(buf[28:32], storage.CRC32C(buf[:28]))
+}
+
+func parseAddr(buf []byte) netip.AddrPort {
+	if binary.LittleEndian.Uint32(buf[0:4]) != addrMagic || binary.LittleEndian.Uint32(buf[28:32]) != storage.CRC32C(buf[:28]) {
+		return netip.AddrPort{}
+	}
+	if n := int(buf[6]); n == 4 || n == 16 {
+		if ip, ok := netip.AddrFromSlice(buf[8 : 8+n]); ok {
+			return netip.AddrPortFrom(ip, binary.LittleEndian.Uint16(buf[4:6]))
+		}
+	}
+	return netip.AddrPort{}
 }
 
 // ParseSlot decodes one raw registry slot.
@@ -1131,6 +1177,9 @@ func deserializeSlot(buf []byte) (*Slot, error) {
 	copy(slot.BootID[:], buf[128:144])
 	copy(slot.RecoveryOwner[:], buf[156:172])
 	n := min(int(binary.LittleEndian.Uint32(buf[orphansOffset:])), MaxOrphans)
+	if n <= addrOrphans {
+		slot.Addr = parseAddr(buf[addrOffset:lockLayoutOffset])
+	}
 	for i := range n {
 		at := orphansOffset + 4 + 8*i
 		slot.Orphans = append(slot.Orphans, Orphan{Inode: binary.LittleEndian.Uint32(buf[at:]), Birth: binary.LittleEndian.Uint32(buf[at+4:])})

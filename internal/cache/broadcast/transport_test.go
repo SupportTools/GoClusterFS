@@ -27,7 +27,7 @@ func startTransport(t *testing.T, cfg Config) (*Transport, chan *Message) {
 		t.Fatal(err)
 	}
 	got := make(chan *Message, 16)
-	if err := tr.Start(context.Background(), func(m *Message, _ *net.UDPAddr) {
+	if err := tr.Start(context.Background(), func(m *Message, _ *net.UDPAddr, _ bool) {
 		select {
 		case got <- m:
 		default:

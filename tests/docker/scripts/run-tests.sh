@@ -2364,6 +2364,34 @@ test_broadcast_invalidation() {
     return 0
 }
 
+# Test: with all multicast dropped, as in cloud VPCs, each node asks its peers
+# for unicast at the address in its registry slot. Nodes ask after 3 silent
+# heartbeats, 6s here; then every node hears every peer again by unicast.
+test_broadcast_without_multicast() {
+    local node status metric i failed=0
+    for node in "${NODE_ARRAY[@]}"; do
+        apply_fault "$node" iptables -I INPUT -d 239.192.74.75 -j DROP || return 1
+    done
+    # Past the silence threshold, so a node still hearing peers hears them by unicast.
+    sleep 12
+    for node in "${NODE_ARRAY[@]}"; do
+        for i in $(seq 1 20); do
+            status=$(broadcast_peers_health "$node")
+            metric=$(silent_peers_metric "$node")
+            [[ "$status" == ok && "$metric" == 0 ]] && break
+            sleep 1
+        done
+        log "$node without multicast: broadcast-peers $status, silent peers $metric"
+        if [[ "$status" != ok || "$metric" != 0 ]]; then
+            log "ERROR: $node does not hear its peers by unicast"
+            failed=1
+        fi
+    done
+    test_broadcast_invalidation || failed=1
+    heal_network_faults
+    return $failed
+}
+
 # Test: Broadcast directory invalidation
 # Verifies that new file creation is broadcast between nodes.
 test_broadcast_directory_invalidation() {
@@ -2825,7 +2853,8 @@ silent_peers_metric() {
     api_get "$1" /metrics | awk '/^goclusterfs_broadcast_silent_peers /{print $2}'
 }
 
-# A node that hears no multicast must say so: on /health, on /metrics and in its log.
+# A node that hears no broadcast must say so: on /health, on /metrics and in its log.
+# Dropping only multicast is not enough: the node would ask its peers for unicast.
 test_broadcast_silent_peer_reported() {
     local reader="${NODE_ARRAY[1]}" other="${NODE_ARRAY[0]}"
     local want=$((NODE_COUNT - 1)) status metric i failed=0
@@ -2833,6 +2862,7 @@ test_broadcast_silent_peer_reported() {
     since=$(date +%s)
 
     apply_fault "$reader" iptables -I INPUT -d 239.192.74.75 -j DROP || return 1
+    apply_fault "$reader" iptables -I INPUT -p udp --dport 24731 -j DROP || return 1
     for i in $(seq 1 30); do
         status=$(broadcast_peers_health "$reader")
         metric=$(silent_peers_metric "$reader")
@@ -2849,7 +2879,7 @@ test_broadcast_silent_peer_reported() {
         failed=1
     fi
     if [[ "$(broadcast_peers_health "$other")" != ok ]]; then
-        log "ERROR: $other, which still hears multicast, reports silent peers"
+        log "ERROR: $other, which still hears broadcast, reports silent peers"
         failed=1
     fi
 
@@ -3860,6 +3890,7 @@ run_test "Broadcast Directory Invalidation" test_broadcast_directory_invalidatio
 run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Broadcast Silent Peer Reported" test_broadcast_silent_peer_reported
+run_test "Broadcast Without Multicast" test_broadcast_without_multicast
 run_test "Staleness Under Packet Loss" test_staleness_packet_loss
 run_test "Staleness Under Duplication and Reordering" test_staleness_duplication_and_reordering
 run_test "Staleness Under Delay" test_staleness_delay

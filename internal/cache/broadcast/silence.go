@@ -2,6 +2,8 @@ package broadcast
 
 import (
 	"log"
+	"net"
+	"net/netip"
 	"sort"
 	"time"
 )
@@ -14,6 +16,8 @@ const silentAfter = 3
 type ExpectedPeer struct {
 	UUID [16]byte
 	Name string
+	// Addr is where the node takes unicast, from its registry slot; invalid when it advertises none.
+	Addr netip.AddrPort
 }
 
 // WatchPeers has the broadcaster check, every heartbeat interval, that it
@@ -23,6 +27,14 @@ type ExpectedPeer struct {
 // hears nothing from a peer finds no gap in its sequence numbers either.
 func (b *Broadcaster) WatchPeers(expected func() ([]ExpectedPeer, error)) {
 	b.expected.Store(&expected)
+	b.relistSoon()
+}
+
+func (b *Broadcaster) relistSoon() {
+	select {
+	case b.relist <- struct{}{}:
+	default:
+	}
 }
 
 // SilentPeers names the expected nodes not heard from for the returned time.
@@ -53,6 +65,8 @@ func (b *Broadcaster) watchLoop() {
 			return
 		case now := <-ticker.C:
 			b.checkPeers(now)
+		case <-b.relist:
+			b.checkPeers(time.Now())
 		}
 	}
 }
@@ -69,14 +83,24 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 	}
 
 	quiet := b.silenceThreshold()
+	local := localAddrs()
+	var ask []netip.AddrPort
+	defer func() { b.requestUnicast(ask) }()
 	b.silentMu.Lock()
 	defer b.silentMu.Unlock()
 	listed := make(map[[16]byte]time.Time, len(peers))
 	silent := map[[16]byte]ExpectedPeer{}
 	b.sendersMu.Lock()
+	addrs := make(map[[16]byte]netip.AddrPort, len(peers))
 	for _, p := range peers {
 		if p.UUID == b.localUUID {
 			continue
+		}
+		if addr, known := b.peerAddr(p, local); known {
+			addrs[p.UUID] = addr
+			if s, ok := b.senders[p.UUID]; !ok || now.Sub(s.multicast) > quiet {
+				ask = append(ask, addr)
+			}
 		}
 		first, ok := b.firstListed[p.UUID]
 		if !ok {
@@ -94,6 +118,8 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 			silent[p.UUID] = p
 		}
 	}
+	b.peerAddrs = addrs
+	b.applyRequestsLocked(now)
 	b.sendersMu.Unlock()
 
 	for id, p := range silent {
@@ -110,4 +136,74 @@ func (b *Broadcaster) checkPeers(now time.Time) {
 		}
 	}
 	b.silent, b.firstListed = silent, listed
+}
+
+// requestUnicast asks each peer at addrs, whose multicast this node misses, to
+// also send to this node's registry address.
+func (b *Broadcaster) requestUnicast(addrs []netip.AddrPort) {
+	for _, addr := range addrs {
+		if err := b.transport.SendTo(b.builder.UnicastRequest(), net.UDPAddrFromAddrPort(addr)); err != nil {
+			log.Printf("[broadcast] asking %s for unicast failed: %v", addr, err)
+		}
+	}
+}
+
+func (b *Broadcaster) handleUnicastRequest(sender [16]byte, now time.Time) {
+	b.sendersMu.Lock()
+	defer b.sendersMu.Unlock()
+	b.requests[sender] = now
+	if _, known := b.peerAddrs[sender]; !known {
+		b.relistSoon()
+		return
+	}
+	b.applyRequestsLocked(now)
+}
+
+// applyRequestsLocked sends unicast to the registry address of every peer that
+// asked within the silence threshold. The caller holds sendersMu.
+func (b *Broadcaster) applyRequestsLocked(now time.Time) {
+	var addrs []*net.UDPAddr
+	for id, at := range b.requests {
+		if now.Sub(at) > b.silenceThreshold() {
+			delete(b.requests, id)
+			continue
+		}
+		if addr, ok := b.peerAddrs[id]; ok {
+			addrs = append(addrs, net.UDPAddrFromAddrPort(addr))
+		}
+	}
+	b.transport.SetRequestedPeers(addrs)
+}
+
+// peerAddr is where a listed peer takes unicast: its slot's address or, while
+// its orphan list leaves no room for one, the last address read. The caller holds sendersMu.
+func (b *Broadcaster) peerAddr(p ExpectedPeer, local map[netip.Addr]bool) (netip.AddrPort, bool) {
+	if p.Addr.IsValid() {
+		return p.Addr, !b.isSelf(p.Addr, local)
+	}
+	addr, ok := b.peerAddrs[p.UUID]
+	return addr, ok
+}
+
+// isSelf says whether addr reaches this node: under QEMU user networking every
+// node has the same address, so a peer's advertised address can be this node's.
+func (b *Broadcaster) isSelf(addr netip.AddrPort, local map[netip.Addr]bool) bool {
+	ip := addr.Addr().Unmap()
+	return addr.Port() == b.localPort && (ip.IsLoopback() || ip.IsUnspecified() || local[ip])
+}
+
+func localAddrs() map[netip.Addr]bool {
+	local := map[netip.Addr]bool{}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return local
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok {
+				local[ip.Unmap()] = true
+			}
+		}
+	}
+	return local
 }

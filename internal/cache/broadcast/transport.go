@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,9 @@ type Transport struct {
 	// Unicast peers by address, so a remount on the same address replaces its entry.
 	peersMu sync.RWMutex
 	peers   map[string]*peer
+
+	// Registry addresses of peers that asked for unicast; they get every message even when multicast works.
+	requested atomic.Pointer[[]*net.UDPAddr]
 
 	// Statistics
 	multicastSent     uint64
@@ -165,7 +169,7 @@ func NewTransport(cfg Config) (*Transport, error) {
 }
 
 // Start begins listening for broadcast messages.
-func (t *Transport) Start(ctx context.Context, handler func(*Message, *net.UDPAddr)) error {
+func (t *Transport) Start(ctx context.Context, handler func(msg *Message, from *net.UDPAddr, multicast bool)) error {
 	if !t.config.Enabled {
 		return nil
 	}
@@ -263,7 +267,7 @@ func listen(cfg Config, group *net.UDPAddr) (multicastConn, unicastConn *net.UDP
 }
 
 // receiveLoop reads messages from a UDP connection.
-func (t *Transport) receiveLoop(conn *net.UDPConn, handler func(*Message, *net.UDPAddr), isMulticast bool) {
+func (t *Transport) receiveLoop(conn *net.UDPConn, handler func(*Message, *net.UDPAddr, bool), isMulticast bool) {
 	defer t.wg.Done()
 
 	buf := make([]byte, MaxMessageSize)
@@ -315,7 +319,7 @@ func (t *Transport) receiveLoop(conn *net.UDPConn, handler func(*Message, *net.U
 
 		// Handle message
 		if handler != nil {
-			handler(msg, addr)
+			handler(msg, addr, isMulticast)
 		}
 	}
 }
@@ -357,7 +361,7 @@ func (t *Transport) deliver(data []byte) error {
 			if t.multicast.succeeded(limit) {
 				log.Printf("[broadcast] multicast sends work again")
 			}
-			return nil
+			return t.sendTo(data, t.requestedPeers())
 		}
 		total := atomic.AddUint64(&t.multicastFailures, 1)
 		if t.multicast.failed(time.Now(), limit) {
@@ -377,13 +381,26 @@ func (t *Transport) sendUnicast(data []byte) error {
 		return fmt.Errorf("unicast connection not available")
 	}
 
+	requested := t.requestedPeers()
+	seen := make(map[string]bool, len(requested))
+	for _, addr := range requested {
+		seen[addr.String()] = true
+	}
 	t.peersMu.RLock()
-	peers := make([]*net.UDPAddr, 0, len(t.peers))
-	for _, p := range t.peers {
-		peers = append(peers, p.addr)
+	peers := requested
+	for key, p := range t.peers {
+		if !seen[key] {
+			peers = append(peers, p.addr)
+		}
 	}
 	t.peersMu.RUnlock()
+	return t.sendTo(data, peers)
+}
 
+func (t *Transport) sendTo(data []byte, peers []*net.UDPAddr) error {
+	if len(peers) == 0 {
+		return nil
+	}
 	var lastErr error
 	for _, addr := range peers {
 		if _, err := t.unicastConn.WriteToUDP(data, addr); err != nil {
@@ -412,6 +429,34 @@ func (t *Transport) AddPeer(addr *net.UDPAddr) {
 		delete(t.peers, oldest(t.peers, func(p *peer) time.Time { return p.heard }))
 	}
 	t.peers[key] = &peer{addr: addr, heard: time.Now()}
+}
+
+// SendTo sends msg to one peer only.
+func (t *Transport) SendTo(msg *Message, addr *net.UDPAddr) error {
+	if !t.config.Enabled || t.unicastConn == nil {
+		return nil
+	}
+	secret := []byte(t.config.Secret)
+	if len(secret) == 0 {
+		secret = nil
+	}
+	data, err := msg.Marshal(secret)
+	if err != nil {
+		return fmt.Errorf("marshal error: %w", err)
+	}
+	return t.sendTo(data, []*net.UDPAddr{addr})
+}
+
+// SetRequestedPeers replaces the addresses that get unicast even when multicast works.
+func (t *Transport) SetRequestedPeers(addrs []*net.UDPAddr) {
+	t.requested.Store(&addrs)
+}
+
+func (t *Transport) requestedPeers() []*net.UDPAddr {
+	if p := t.requested.Load(); p != nil {
+		return slices.Clone(*p)
+	}
+	return nil
 }
 
 // PeerCount returns the number of known peers.
@@ -485,7 +530,7 @@ func (t *Transport) Problem() string {
 		return "the last invalidation send failed: " + (*err).Error()
 	}
 	multicast := t.multicastConn != nil && t.multicast.usable(time.Now(), t.config.MaxMulticastFailures)
-	if !multicast && t.PeerCount() == 0 {
+	if !multicast && t.PeerCount() == 0 && len(t.requestedPeers()) == 0 {
 		return "multicast is unavailable and no unicast peers are known"
 	}
 	return ""

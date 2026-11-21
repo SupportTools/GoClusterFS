@@ -9,6 +9,7 @@ import (
 	"log"
 	"maps"
 	"math"
+	"net/netip"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -115,6 +116,7 @@ func main() {
 		unicastPort      = flag.Int("unicast-port", broadcast.DefaultConfig().UnicastPort, "UDP port for unicast messages; must differ from -mcast-port")
 		broadcastSecret  = flag.String("broadcast-secret", "", "Secret that signs broadcast messages, the same on every node; visible to local users in ps. Empty leaves them unauthenticated: any host that can reach the UDP ports can make this node drop its caches")
 		broadcastIface   = flag.String("broadcast-iface", "", "Network interface for multicast; empty lets the kernel choose")
+		advertiseAddr    = flag.String("advertise-addr", "", "IP or IP:port where peers that miss this node's multicast send it unicast, written to its registry slot; empty takes the address of -broadcast-iface or of the route to -mcast-group, and -unicast-port. Set it for NAT or a host with several addresses")
 		broadcastPeers   = flag.Int("broadcast-max-peers", broadcast.DefaultMaxPeers, "Most nodes the broadcast peer table and sequence tracking hold")
 		broadcastBeat    = flag.Duration("broadcast-heartbeat", 30*time.Second, "How often this node sends a broadcast heartbeat; a mounted node not heard for 3 of these is reported")
 
@@ -213,6 +215,18 @@ func main() {
 	}
 	if *broadcastPeers < 1 {
 		log.Fatalf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
+	}
+	var advertise netip.AddrPort
+	if *broadcastEnabled {
+		addr, err := broadcast.AdvertiseAddr(networkCfg, *advertiseAddr)
+		switch {
+		case err != nil && *advertiseAddr != "":
+			log.Fatalf("-advertise-addr: %v", err)
+		case err != nil:
+			log.Printf("[WARN] Broadcast: no unicast address to advertise (%v), so peers that miss this node's multicast cannot reach it. Set -advertise-addr", err)
+		default:
+			advertise = addr
+		}
 	}
 	cacheCfg := cache.DefaultConfig()
 	cacheCfg.StrictMode = *cacheStrict
@@ -313,6 +327,7 @@ func main() {
 		nodeReg.PreferSlot(*skipRecovery)
 	}
 	nodeReg.SetLockLayout(lock.LayoutID())
+	nodeReg.SetAdvertiseAddr(advertise)
 	slotIdx, err := nodeReg.Register(ctx, hostname)
 	if errors.Is(err, node.ErrLockLayout) {
 		failf("Cannot join the cluster: %v. Nodes of different GoClusterFS versions would not lock each other out: unmount that node, then mount every node with one version", err)
@@ -472,8 +487,8 @@ func main() {
 			broadcastFailed(err)
 		}
 		cacheMgr.WatchBroadcastPeers(expectedPeers(nodeReg))
-		log.Printf("Broadcast: enabled on %s:%d, unicast port %d (secret=%v)",
-			*multicastGroup, *multicastPort, *unicastPort, *broadcastSecret != "")
+		log.Printf("Broadcast: enabled on %s:%d, unicast port %d, advertising %v (secret=%v)",
+			*multicastGroup, *multicastPort, *unicastPort, advertise, *broadcastSecret != "")
 	} else {
 		log.Println("Broadcast: disabled (using storage-only cache validation)")
 	}
