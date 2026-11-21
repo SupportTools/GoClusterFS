@@ -41,6 +41,16 @@ func (t *Target) MayWrite(initiator string) bool {
 	return registered || !t.reserved
 }
 
+// Relogin moves initiator's key to a session the initiator no longer has, as an iSCSI logout and login does on LIO.
+func (t *Target) Relogin(initiator string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if key, ok := t.keys[initiator]; ok {
+		t.keys[initiator+"-old"] = key
+		delete(t.keys, initiator)
+	}
+}
+
 // Preempted returns the keys preempted so far, in order.
 func (t *Target) Preempted() []uint64 {
 	t.mu.Lock()

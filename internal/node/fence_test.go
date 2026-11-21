@@ -14,10 +14,17 @@ import (
 // fencedPair registers a survivor and a node that then stalls with a stale heartbeat, each with its key on target.
 func fencedPair(t *testing.T, target *fence.Target) (survivor *Registry, failing int, victimKey uint64) {
 	t.Helper()
+	survivor, victim, failing := fencedVictim(t, target)
+	return survivor, failing, fence.NodeKey(victim.LocalUUID())
+}
+
+// fencedVictim is fencedPair that also returns the stalled node's registry.
+func fencedVictim(t *testing.T, target *fence.Target) (survivor, victim *Registry, failing int) {
+	t.Helper()
 	dev, cleanup := createTestDevice(t, 1<<20)
 	t.Cleanup(cleanup)
 	ctx := context.Background()
-	survivor, victim := NewRegistry(dev, 0), NewRegistry(dev, 0)
+	survivor, victim = NewRegistry(dev, 0), NewRegistry(dev, 0)
 	if _, err := survivor.Register(ctx, "survivor"); err != nil {
 		t.Fatal(err)
 	}
@@ -47,32 +54,34 @@ func fencedPair(t *testing.T, target *fence.Target) (survivor *Registry, failing
 	}
 	silence(survivor, failing, stale, deadAfter+time.Second)
 	survivor.SetRecoveryHandler(func(*FailedNodeInfo) error { return nil })
-	return survivor, failing, dead.Key()
+	return survivor, victim, failing
 }
 
-// A survivor revokes the dead node's access before it marks the slot dead, so a write the dead node still has queued,
-// its heartbeat included, cannot land over the Dead mark or the replay.
+// A survivor marks its intent in the dead node's slot, then revokes the node's access, then marks the slot dead: a
+// write the dead node still has queued, its heartbeat included, cannot land over the Dead mark or the replay, and a
+// node that registers its key again after the revoke reads the intent.
 func TestRecoveryPreemptsBeforeMarkingDead(t *testing.T) {
 	target := fence.NewTarget()
 	survivor, failing, victimKey := fencedPair(t, target)
-	early := false
-	survivor.dev.SetWriteObserver(func(offset int64, _ int) {
-		if offset == int64(failing*SlotSize) && len(target.Preempted()) == 0 {
-			early = true
-		}
+	own := target.Node("survivor", fence.NodeKey(survivor.LocalUUID()))
+	var atPreempt *Slot
+	survivor.SetPreempter(func(owner [16]byte) error {
+		atPreempt, _ = survivor.readSlot(failing)
+		return own.Preempt(fence.NodeKey(owner))
 	})
 	if err := survivor.RecoverFailedNode(failing); err != nil {
 		t.Fatalf("recover: %v", err)
 	}
-	if early {
-		t.Error("the survivor wrote the dead node's slot before preempting its key")
+	if atPreempt == nil || atPreempt.State != NodeStateActive || atPreempt.RecoveryOwner != survivor.LocalUUID() {
+		t.Errorf("the slot at the preempt: %+v; want it Active with the survivor's intent", atPreempt)
 	}
 	if !slices.Equal(target.Preempted(), []uint64{victimKey}) || target.MayWrite("victim") {
 		t.Errorf("preempted %x, victim may write %v; want only the victim's key gone", target.Preempted(), target.MayWrite("victim"))
 	}
 }
 
-// A preempt that fails leaves the dead node's slot, journal and locks alone; the next scan tries again.
+// A preempt that fails leaves the dead node's slot Active with the survivor's intent, and its journal and locks alone;
+// the next scan tries again.
 func TestRecoveryStopsWhenPreemptFails(t *testing.T) {
 	survivor, failing, _ := fencedPair(t, fence.NewTarget())
 	offline := errors.New("array offline")
