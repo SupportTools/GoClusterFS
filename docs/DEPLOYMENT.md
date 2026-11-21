@@ -24,7 +24,7 @@ This guide covers deploying GoClusterFS in both single-node and multi-node clust
 |-----------|---------|-------------|
 | CPU | 2 cores | 4+ cores |
 | RAM | 512 MB | 2+ GB |
-| Storage | Any O_DIRECT-capable device | NVMe, SAN, or iSCSI LUN |
+| Storage | Any O_DIRECT-capable device; for more than one node, a shared disk with SCSI-3 or NVMe persistent reservations | NVMe, SAN, or iSCSI LUN with persistent reservations |
 
 ### Software Requirements
 
@@ -107,6 +107,8 @@ GoClusterFS can use any O_DIRECT-capable block device of at least 327 MB. The la
 
 ### Option 1: File-Backed Device (Development/Testing)
 
+A file has no persistent reservations, so its volume is not fenced, and a second node refuses to mount it while one has it mounted. Test rigs that share a file between nodes pass `-unsafe-allow-unfenced` on every node; see [Storage Fencing](OPERATIONS.md#storage-fencing) for the risk.
+
 ```bash
 # Create sparse file (fast, allocates on write)
 truncate -s 10G /path/to/goclusterfs.img
@@ -129,7 +131,7 @@ lvcreate -L 100G -n goclusterfs vg_data
 
 ### Option 3: iSCSI/FC LUN (Multi-Node)
 
-For multi-node deployments, use shared storage:
+For multi-node deployments, use shared storage with SCSI-3 persistent reservations, so `-format` turns on fencing. Without fencing, a VM its hypervisor paused past its takeover resumes and writes after a peer replayed its journal. In tests on QEMU it overwrote file data every time, and `goclusterfs-fsck` found nothing, so a node refuses to join an unfenced volume while another node has it mounted. Check new storage with `goclusterfs-fsck -test-reservations DEVICE` before you format it.
 
 ```bash
 # iSCSI example - discover and login

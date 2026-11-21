@@ -36,6 +36,7 @@ These are the `goclusterfs-mount` flags:
 | `-bytes-per-inode` | uint | `1048576` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes |
 | `-fencing` | string | `auto` | With `-format`: `pr` fences dead nodes with persistent reservations and fails if the device lacks them, `none` formats without fencing, and `auto` picks `pr` when the device supports it. See [Storage Fencing](OPERATIONS.md#storage-fencing) |
 | `-require-fencing` | bool | `false` | Refuse to mount a volume formatted without fencing |
+| `-unsafe-allow-unfenced` | bool | `false` | Mount a volume without storage fencing while other nodes have it mounted. Without it, such a mount refuses to start; a node alone needs no flag. UNSAFE: a node that pauses, as a VM its hypervisor paused, can resume and write after another node replayed its journal, corrupting file data that fsck cannot detect |
 | `-debug` | bool | `false` | Print `[DEBUG]` log lines |
 | `-fuse-debug` | bool | `false` | Log every FUSE request and reply |
 | `-allow-other` | bool | `false` | Let every user on the host, not only the one that mounted, use the filesystem, with the kernel checking each file's owner, group and mode bits (`allow_other` and `default_permissions`). See [Users Other Than Root](DEPLOYMENT.md#users-other-than-root) |

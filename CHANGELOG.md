@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- A node now refuses to mount a volume without storage fencing while another node has it mounted, and tells you which slots hold the other nodes. Under QEMU a paused VM's clocks do not count the pause, so on an unfenced volume a VM paused past its takeover resumed and overwrote file data after a peer replayed its journal, in 6 of 6 test runs, and `goclusterfs-fsck` found nothing. Format multi-node volumes on a device with SCSI-3 or NVMe persistent reservations. To keep running several nodes on an unfenced volume, as on files or virtio disks, pass `-unsafe-allow-unfenced` on every node that joins. A node mounted alone is unchanged.
 - The default broadcast ports moved from UDP 31337 and 31338 to UDP 24730 (`-mcast-port`) and 24731 (`-unicast-port`), out of Kubernetes' NodePort range 30000-32767, where kube-proxy can send their traffic to a service. Open the new ports in your firewall, or pass `-mcast-port 31337 -unicast-port 31338` on every node to keep the old ones.
 - The on-disk format is now version 3. Mount refuses devices formatted by earlier builds. Version 1 kept one journal for all nodes. Version 2 had room for 4096 inodes, and on devices over 128 GB its refcounts overwrote the snapshot registry and then data blocks. Copy the data off with the old build, reformat with `-format`, and copy it back.
 - Devices must be at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.

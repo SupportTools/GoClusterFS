@@ -692,7 +692,8 @@ setup_goclusterfs() {
         "${binaries[@]}" "${SSH_USER}@127.0.0.1:/usr/local/bin/"
 
     # Mount GoClusterFS
-    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device} -broadcast-iface ${BROADCAST_IFACE} ${extra_args}"
+    # Virtio volumes have no reservations, and tests run several nodes on them; on a fenced volume the flag does nothing.
+    local mount_args="-mount ${GOCLUSTERFS_MOUNT} -device ${device} -broadcast-iface ${BROADCAST_IFACE} -unsafe-allow-unfenced ${extra_args}"
     if [[ "$format_disk" == "true" ]]; then
         log_info "Formatting shared disk on VM $vm_id..."
         # One inode per 64 KB gives the 1 GB disk 16384 inodes, enough for test_more_than_4096_files

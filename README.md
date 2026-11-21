@@ -22,7 +22,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - Linux with FUSE support (`fusermount3`)
 - O_DIRECT-capable storage (tmpfs supports O_DIRECT only on Linux 6.6 and later)
 - Root or `fuse` group membership
-- For multi-node: Shared block device (SAN, iSCSI, NVMe-oF, etc.)
+- For multi-node: a shared block device with SCSI-3 or NVMe persistent reservations (SAN, iSCSI, NVMe-oF), so nodes can be fenced; see [Limits and Status](#limits-and-status)
 - A device of at least 327 MB: the layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records
 
 ## Limits and Status
@@ -37,6 +37,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Upgrade all nodes at once.** Unmount on every node, upgrade, then mount again. Mixing old and new binaries on one device can serve stale data or make files unreadable. See the upgrade notes in [CHANGELOG.md](CHANGELOG.md).
 - **Snapshots and clones are experimental.** Before you mount an image that has snapshots or clones with a newer build, read the upgrade notes in [CHANGELOG.md](CHANGELOG.md). They say whether to run `goclusterfs-fsck` first.
 - **fsck repairs little.** `-repair` rebuilds refcounts, frees leaked blocks and inodes no directory names, fixes the superblock checksum, rewrites snapshot registry sectors that fail their checksum, and points a wrong `.` or `..` at the right directory. It only reports other problems. See [Filesystem Check](#filesystem-check).
+- **Several nodes need storage fencing.** A node refuses to mount a volume without storage fencing while another node has it mounted. Without fencing, a VM its hypervisor paused past its takeover resumes and writes after a peer replayed its journal. In tests on QEMU it overwrote file data every time, and `goclusterfs-fsck` found nothing. Format a multi-node volume on a device with persistent reservations. `-unsafe-allow-unfenced` overrides the refusal, for test rigs on files or virtio disks. See [Storage Fencing](docs/OPERATIONS.md#storage-fencing).
 - **Cluster safety limits.** Node stalls and storage timeouts have hard limits. Read [Node Requirements](docs/OPERATIONS.md#node-requirements) and [Distributed Lock Limits](docs/OPERATIONS.md#distributed-lock-limits) before you run more than one node.
 
 ## Quick Start
@@ -196,12 +197,12 @@ Use `GFSCTL_TOKEN` or the config file for the token: other local users can read 
 
 For clustered deployments:
 
-1. **Shared Storage**: All nodes must access the same block device (SAN, iSCSI, NVMe-oF)
+1. **Shared Storage**: All nodes must access the same block device (SAN, iSCSI, NVMe-oF), with SCSI-3 or NVMe persistent reservations. A node refuses to join a volume without fencing while another node has it mounted, unless it passes `-unsafe-allow-unfenced`
 2. **Network**: Nodes should be on the same subnet for multicast invalidation
 3. **Mount Command**: Use identical mount options across all nodes
 4. **Limits**: At most 64 nodes mount a device at once; run NTP so file times agree
 5. **Format version**: This release uses on-disk format version 3, which gives each node its own journal and sizes the block bitmap, refcount table and inode table from the device. It refuses devices formatted by earlier builds; copy their data off and reformat
-6. **Stalled nodes**: Other nodes declare a node dead after about 20 seconds of silence, for example a paused VM, and replay its journal. The stalled node checks its registry slot before each write, so when it resumes it refuses new writes and exits. A write it started before the stall can still land, unless the volume is fenced: on a device with SCSI-3 or NVMe persistent reservations, `-format` turns on fencing, and the node that replays a dead node first revokes its access to the device. See [Storage Fencing](docs/OPERATIONS.md#storage-fencing)
+6. **Stalled nodes**: Other nodes declare a node dead after about 20 seconds of silence, for example a paused VM, and replay its journal. The stalled node checks its registry slot before each write, so when it resumes it refuses new writes and exits. A write it started before the stall can still land, and under QEMU a paused VM does not see the pause in its clocks, so it can write after its replay, unless the volume is fenced: on a device with SCSI-3 or NVMe persistent reservations, `-format` turns on fencing, and the node that replays a dead node first revokes its access to the device. See [Storage Fencing](docs/OPERATIONS.md#storage-fencing)
 7. **A dead node's damaged journal**: If peers cannot replay it, they retry every minute, and after 3 failures with the same error every 10 minutes, with `/health` degraded. List what it holds with `goclusterfs-fsck -inspect-slot N`, and free the slot with `-release-slot N` and `-salvage` or `-discard-journal`. While other nodes are mounted, the release refuses to drop a committed transaction. See [Damaged Journal Slot](docs/OPERATIONS.md#damaged-journal-slot)
 
 Format the device once, from one node, with `-format`. Then mount it on every node without `-format`:

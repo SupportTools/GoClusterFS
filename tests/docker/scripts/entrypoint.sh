@@ -71,7 +71,8 @@ fi
 log "Device $DEVICE_PATH is ready (size: $(stat -c%s "$DEVICE_PATH") bytes)"
 
 # Build mount command arguments
-MOUNT_ARGS="-device $DEVICE_PATH -mount $MOUNT_POINT"
+# The nodes share a file image, which has no reservations.
+MOUNT_ARGS="-device $DEVICE_PATH -mount $MOUNT_POINT -unsafe-allow-unfenced"
 if [ -n "$BROADCAST_HEARTBEAT" ]; then
     MOUNT_ARGS="$MOUNT_ARGS -broadcast-heartbeat $BROADCAST_HEARTBEAT"
 fi

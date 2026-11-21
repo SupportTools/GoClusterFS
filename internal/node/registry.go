@@ -1065,6 +1065,22 @@ func (r *Registry) Slots() ([]*Slot, error) {
 	return slots, errors.Join(errs...)
 }
 
+// MountedPeers returns the slots, other than this node's, whose node may still write: Active or Leaving, except
+// mount processes of this host that have exited. A paused node's slot stays among them: nothing tells it from a
+// crashed one.
+func (r *Registry) MountedPeers() (map[int]*Slot, error) {
+	slots, err := r.Slots()
+	self := r.LocalSlot()
+	peers := map[int]*Slot{}
+	for i, s := range slots {
+		if i == self || s == nil || (s.State != NodeStateActive && s.State != NodeStateLeaving) || r.deadLocalOwner(s) {
+			continue
+		}
+		peers[i] = s
+	}
+	return peers, err
+}
+
 // LocalUUID returns this node's UUID.
 func (r *Registry) LocalUUID() [16]byte {
 	return r.localUUID

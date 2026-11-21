@@ -5703,6 +5703,29 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fencing_paused_vm
 
+  - id: unfenced-join-refused
+    name: A second node refuses an unfenced volume
+    description: On a volume without storage fencing, a node refuses to mount while another node has it mounted, naming that node's slot; with -unsafe-allow-unfenced it mounts and logs UNSAFE
+    priority: critical
+    environments:
+      go: tests/integration/unfenced_test.go::TestUnfencedVolumeRefusesASecondNode
+      docker: run-tests.sh::test_unfenced_join_refused
+      vm: run-vm-tests.sh::test_unfenced_join_refused
+
+  - id: registry-mounted-peers
+    name: The registry lists every other node that may still write
+    description: Active and Leaving slots count, silent ones too, since a paused node looks like a crashed one; this node, Dead and empty slots, and this host's exited mounts do not
+    priority: go_only
+    environments:
+      go: internal/node/mounted_peers_test.go::TestMountedPeersListsEveryOtherNodeThatMayWrite
+
+  - id: unfenced-paused-vm-hazard
+    name: An unfenced paused VM lands writes after its replay
+    description: With -unsafe-allow-unfenced, a VM paused with QEMU stop past its takeover resumes and overwrites data a peer wrote after replaying it. Fails on purpose; runs only with VM_HAZARD_TESTS=1
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_unfenced_paused_vm
+
   - id: fencing-idle-node
     name: A fenced idle node stops soon after resume
     description: A node stopped with SIGSTOP and revoked while idle stops within 10 seconds of resuming

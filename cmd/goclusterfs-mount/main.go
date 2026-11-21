@@ -107,6 +107,7 @@ func main() {
 		journalEnabled = flag.Bool("journal", true, "Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only")
 		fencingMode    = flag.String("fencing", "auto", "With -format: pr fences dead nodes with persistent reservations and fails if the device lacks them, none formats without fencing, and auto picks pr when the device supports it")
 		requireFencing = flag.Bool("require-fencing", false, "Refuse to mount a volume formatted without fencing, on which a stalled node's last writes can land after another node takes over")
+		unsafeUnfenced = flag.Bool("unsafe-allow-unfenced", false, "Let this node mount a volume without storage fencing while other nodes have it mounted. UNSAFE: a node that pauses, as a VM its hypervisor paused, can resume and write after another node replayed its journal, corrupting file data that fsck cannot detect. Without it, such a mount refuses to start; a node mounted alone needs no flag")
 		skipRecovery   = flag.Int("skip-recovery", -1, "Emergency use only: discard the journal of registry slot N instead of replaying it, if this mount takes slot N, losing the writes it holds; -1 replays as normal")
 
 		// Network broadcast configuration
@@ -340,6 +341,9 @@ func main() {
 	}
 	if err != nil {
 		failf("Cannot join the cluster: %v; check the device, then mount again", err)
+	}
+	if fencer.Kind() == "none" {
+		joinUnfenced(ctx, nodeReg, *devicePath, *unsafeUnfenced)
 	}
 	nodeReg.SetSlotLostHandler(func(loss node.SlotLoss) {
 		storage.AwaitStoppedWrite()
