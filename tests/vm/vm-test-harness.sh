@@ -468,25 +468,19 @@ echo 1 > \$tpg/enable
 SCRIPT
 }
 
-# restart_iscsi_target tears the target down and serves the LUN again under its old serial, as a storage restart
-# would. With "keep" it first restores the reservations LIO saved for APTPL, as OPERATIONS.md says; without, they are
-# lost.
-restart_iscsi_target() {
-    local keep="${1:-}" serial
-    serial=$(ssh_run "$TARGET_VM_ID" "sh -s" <<SCRIPT
-set -e
-cd /sys/kernel/config/target
-serial=\$(sed 's/.*: //' core/iblock_0/lun0/wwn/vpd_unit_serial)
-cp /var/target/pr/aptpl_\$serial /root/aptpl.saved 2>/dev/null || rm -f /root/aptpl.saved
-tpg=iscsi/${ISCSI_TARGET_IQN}/tpgt_1
-echo 0 > \$tpg/enable
-for acl in \$tpg/acls/*; do rm \$acl/lun_0/lun; rmdir \$acl/lun_0 \$acl; done
-rm \$tpg/lun/lun_0/disk
-rmdir \$tpg/lun/lun_0 \$tpg/np/0.0.0.0:3260 \$tpg iscsi/${ISCSI_TARGET_IQN} core/iblock_0/lun0 core/iblock_0
-echo \$serial
-SCRIPT
-) || return 1
+# power_cycle_target kills the iSCSI target VM and boots it again, as a storage power loss would, and serves the LUN
+# under its old serial. With "keep" it first copies the file LIO saved the reservations in (APTPL) to the host, and
+# restores it before nodes reconnect, as OPERATIONS.md says; without, the reservations are lost.
+power_cycle_target() {
+    local keep="${1:-}" serial saved="${VM_RUN_DIR}/aptpl.saved"
+    serial=$(ssh_run_capped 30 "$TARGET_VM_ID" "sed 's/.*: //' /sys/kernel/config/target/core/iblock_0/lun0/wwn/vpd_unit_serial") || return 1
     if [[ "$keep" == keep ]]; then
+        ssh_run_capped 30 "$TARGET_VM_ID" "cat /var/target/pr/aptpl_$serial" > "$saved" || return 1
+    fi
+    kill_vm "$TARGET_VM_ID" || return 1
+    boot_vm "$TARGET_VM_ID" || return 1
+    if [[ "$keep" == keep ]]; then
+        ssh_run "$TARGET_VM_ID" "cat > /root/aptpl.saved" < "$saved" || return 1
         configure_iscsi_target "$serial" /root/aptpl.saved
     else
         configure_iscsi_target "$serial"
@@ -827,6 +821,13 @@ ssh_run() {
     local ssh_port=$(get_vm_ssh_port "$vm_id")
 
     ssh ${SSH_OPTIONS} -i "$(get_ssh_key)" -p "$ssh_port" "${SSH_USER}@127.0.0.1" "$@"
+}
+
+# ssh_run_capped is ssh_run that gives up after $1 seconds, for a command the guest's kernel may never finish.
+ssh_run_capped() {
+    local secs="$1" vm_id="$2"
+    shift 2
+    timeout -s KILL "$secs" ssh ${SSH_OPTIONS} -i "$(get_ssh_key)" -p "$(get_vm_ssh_port "$vm_id")" "${SSH_USER}@127.0.0.1" "$@"
 }
 
 # VMs accept only the run's SSH key; kept for existing callers

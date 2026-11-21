@@ -257,3 +257,57 @@ func TestKeysPrintAsSixteenDigits(t *testing.T) {
 		t.Errorf("hexKey = %s", got)
 	}
 }
+
+// stalledReserve never answers a reserve until release closes, as storage that queues I/O while its path is down.
+type stalledReserve struct {
+	*fakeDevice
+	release chan struct{}
+}
+
+func (d stalledReserve) reserve(uint64) error {
+	<-d.release
+	return nil
+}
+
+// A command without an answer fails the test, which sends nothing more and names the key left behind.
+func TestSelfTestStopsWhenTheDeviceStopsAnswering(t *testing.T) {
+	target := NewTarget()
+	dev := stalledReserve{&fakeDevice{t: target, initiator: "a"}, make(chan struct{})}
+	defer close(dev.release)
+	var r recorder
+	s := newSelfTest(dev, func() error { return nil }, r.report)
+	s.timeout = 50 * time.Millisecond
+	s.Run()
+	failed := r.with(Fail)
+	if len(failed) != 2 || !strings.Contains(failed[0], "no answer within 50ms") || !strings.Contains(failed[1], "not sent") {
+		t.Errorf("want the reserve and the clean up to fail:%s", &r)
+	}
+	if last := r.checks[len(r.checks)-1]; !strings.HasPrefix(last.Step, "clean up") {
+		t.Errorf("want nothing reported between the stalled step and the clean up:%s", &r)
+	}
+}
+
+// unitAttention answers the first register with a check condition, as LIO does to a host whose key was preempted.
+type unitAttention struct {
+	*fakeDevice
+	pending *bool
+}
+
+func (d unitAttention) register(old, new uint64, ignore bool) error {
+	if *d.pending {
+		*d.pending = false
+		return statusError(statusCheckCondition)
+	}
+	return d.fakeDevice.register(old, new, ignore)
+}
+
+// A check condition is retried once, and the step says so.
+func TestSelfTestRetriesACheckCondition(t *testing.T) {
+	pending := true
+	var r recorder
+	s := newSelfTest(unitAttention{&fakeDevice{t: NewTarget(), initiator: "a"}, &pending}, func() error { return nil }, r.report)
+	s.Run()
+	if s.Failed() || !strings.Contains(r.checks[1].Answer, "check condition") {
+		t.Errorf("want the first register to pass after a retry, and say so:%s", &r)
+	}
+}

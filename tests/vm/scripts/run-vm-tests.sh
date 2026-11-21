@@ -3800,7 +3800,7 @@ test_fencing_clear_reservations() {
 
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
-    ssh_run "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
+    ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
 }
 
 # A clean unmount removes the node's reservation key, after its last write.
@@ -3840,19 +3840,16 @@ kept_key() {
     grep -oE '(-preempt|-check-kept) 0x4746[0-9a-f]{12}' <<< "$1" | head -1 | cut -d' ' -f2
 }
 
-# reattach waits until VM $1 reads the cluster device again after the target restarted: an iSCSI node logs out and in
-# again, as detaching and attaching the disk would; with nvme, QEMU's initiator reconnects by itself.
-reattach() {
-    if [[ "$VM_STORAGE" == iscsi ]]; then
-        relogin_iscsi "$1"
-        return
-    fi
-    ssh_run "$1" "for t in \$(seq 30); do dd if=$(cluster_device) of=/dev/null bs=4096 count=1 iflag=direct 2>/dev/null && exit 0; sleep 1; done; exit 1"
+# reconnected waits until VM $1 reads the cluster device again after the target came back. Its initiator, open-iscsi
+# or QEMU's, reconnects in the same session, which LIO's restored registrations name.
+reconnected() {
+    ssh_run_capped 120 "$1" "for t in \$(seq 90); do dd if=$(cluster_device) of=/dev/null bs=4096 count=1 iflag=direct 2>/dev/null && exit 0; sleep 1; done; exit 1"
 }
 
 # fsck -test-reservations qualifies LIO, through SCSI or NVMe, for fencing: it refuses the mounted volume, passes alone
-# on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write. A key survives an iSCSI logout
-# and login, and a target restart that restores LIO's APTPL file, but not one that does not, which the check reports.
+# on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write. A key survives a target power
+# cycle that restores LIO's APTPL file, and -check-kept reports it lost after one that does not, and after an iSCSI
+# logout and login: the new session has a new session ID, and LIO ties a registration to the old one.
 test_fencing_reservation_self_test() {
     if ! fenced_storage || [[ $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi or nvme and 2 VMs"
@@ -3917,14 +3914,14 @@ test_fencing_reservation_self_test() {
         fi
         case "$how" in
             relogin) relogin_iscsi 1 ;;
-            restore) restart_iscsi_target keep && reattach 1 && reattach 2 ;;
-            lose) restart_iscsi_target && reattach 1 && reattach 2 ;;
+            restore) power_cycle_target keep && reconnected 1 && reconnected 2 ;;
+            lose) power_cycle_target && reconnected 1 && reconnected 2 ;;
         esac || { log_error "detaching the device ($how) failed"; result=1; break; }
         out=$(reservation_test 1 "-force -check-kept $key")
-        log_info "after $how:"$'\n'"$out"
-        if [[ "$how" == lose ]]; then
+        log_info "after $how:"$'\n'"$out"$'\n'"registrations on the target:"$'\n'"$(registered_initiators)"
+        if [[ "$how" != restore ]]; then
             if [[ "$out" != *"did not survive"*"rc=4" ]]; then
-                log_error "-check-kept did not report the key lost by a restart without the APTPL file"
+                log_error "-check-kept did not report the key lost after $how"
                 result=1
             fi
         elif [[ "$out" != *"rc=0" ]] || grep -q '^FAIL' <<< "$out"; then
@@ -3933,8 +3930,9 @@ test_fencing_reservation_self_test() {
         fi
     done
 
-    if registered_initiators | grep -q "goclusterfs:vm"; then
-        log_error "keys left after the self-test: $(registered_initiators | tr '\n' ' ')"
+    out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"rc=0" ]] || registered_initiators | grep -q "goclusterfs:vm"; then
+        log_error "keys left after the self-test: $out $(registered_initiators | tr '\n' ' ')"
         result=1
     fi
     setup_goclusterfs 1 false || result=1

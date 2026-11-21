@@ -28,17 +28,26 @@ type Check struct {
 	Answer  string
 }
 
+// StepTimeout is how long the self-test waits for any one command. Storage that queues I/O while a path is down may
+// never answer.
+const StepTimeout = 30 * time.Second
+
 // SelfTest qualifies a device for fencing. It sends the reservation commands this package sends, from temporary keys
-// with fsck's 0x4746 prefix, and checks every answer; a write step sends 4 KiB with O_DIRECT.
+// with fsck's 0x4746 prefix, and checks every answer; a write step sends 4 KiB with O_DIRECT. A command that gets no
+// answer within StepTimeout fails the test, which then sends nothing more.
 type SelfTest struct {
 	dev     device
 	write   func() error
-	report  func(Check)
+	sink    func(Check)
 	poll    time.Duration
+	timeout time.Duration
 	held    uint64
 	failed  bool
 	listing bool
 	reading bool
+	retried bool
+	hung    bool
+	stopped bool
 }
 
 // NewSelfTest tests the device f is open on. write writes 4 KiB to it with O_DIRECT.
@@ -47,7 +56,103 @@ func NewSelfTest(f *os.File, write func() error, report func(Check)) *SelfTest {
 }
 
 func newSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
-	return &SelfTest{dev: dev, write: write, report: report, poll: 200 * time.Millisecond, listing: true, reading: true}
+	s := &SelfTest{sink: report, poll: 200 * time.Millisecond, timeout: StepTimeout, listing: true, reading: true}
+	s.dev = guarded{dev: dev, s: s}
+	s.write = func() error {
+		_, err := timed(s, func() (struct{}, error) { return struct{}{}, write() })
+		return err
+	}
+	return s
+}
+
+var errNoAnswer = errors.New("no answer")
+
+// timed runs one command with the test's time limit, and once more after a check condition: the first command from a
+// host after another host preempted its key gets a unit attention, which a check condition reports.
+func timed[T any](s *SelfTest, command func() (T, error)) (T, error) {
+	type result struct {
+		v   T
+		err error
+	}
+	var zero T
+	if s.hung {
+		return zero, errNoAnswer
+	}
+	for try := 0; ; try++ {
+		done := make(chan result, 1)
+		go func() {
+			v, err := command()
+			done <- result{v, err}
+		}()
+		select {
+		case r := <-done:
+			if try == 0 && errors.Is(r.err, statusError(statusCheckCondition)) {
+				s.retried = true
+				continue
+			}
+			return r.v, r.err
+		case <-time.After(s.timeout):
+			s.hung = true
+			return zero, fmt.Errorf("%w within %v", errNoAnswer, s.timeout)
+		}
+	}
+}
+
+// guarded sends every command through timed.
+type guarded struct {
+	dev device
+	s   *SelfTest
+}
+
+func (g guarded) register(old, new uint64, ignore bool) error {
+	_, err := timed(g.s, func() (struct{}, error) { return struct{}{}, g.dev.register(old, new, ignore) })
+	return err
+}
+
+func (g guarded) reserve(key uint64) error {
+	_, err := timed(g.s, func() (struct{}, error) { return struct{}{}, g.dev.reserve(key) })
+	return err
+}
+
+func (g guarded) preemptAbort(own, victim uint64) error {
+	_, err := timed(g.s, func() (struct{}, error) { return struct{}{}, g.dev.preemptAbort(own, victim) })
+	return err
+}
+
+func (g guarded) clear(key uint64) error {
+	_, err := timed(g.s, func() (struct{}, error) { return struct{}{}, g.dev.clear(key) })
+	return err
+}
+
+func (g guarded) readKeys() ([]uint64, error) { return timed(g.s, g.dev.readKeys) }
+
+func (g guarded) readReservation() (uint64, uint32, error) {
+	type reservation struct {
+		key uint64
+		typ uint32
+	}
+	r, err := timed(g.s, func() (reservation, error) {
+		key, typ, err := g.dev.readReservation()
+		return reservation{key, typ}, err
+	})
+	return r.key, r.typ, err
+}
+
+// report passes c on, noting a retry after a check condition. Once a command got no answer, it passes on only the
+// step that waited for it.
+func (s *SelfTest) report(c Check) {
+	if s.retried {
+		c.Answer += "; the first try got status 0x2, a check condition such as a unit attention, and was retried"
+		s.retried = false
+	}
+	if s.hung {
+		if s.stopped {
+			return
+		}
+		s.stopped = true
+		c.Answer += "; the device or its path stopped answering, so the test sends nothing more"
+	}
+	s.sink(c)
 }
 
 // Failed reports whether any step failed.
@@ -250,18 +355,27 @@ func (s *SelfTest) unregister(step string) bool {
 	return s.expect(step, err, "an unmount would leave its key")
 }
 
-// release unregisters the key the test still holds.
+// release unregisters the key the test still holds. A conflict means the key is gone already.
 func (s *SelfTest) release() {
 	if s.held == 0 {
 		return
 	}
 	step := fmt.Sprintf("clean up: unregister %s", hexKey(s.held))
-	if err := s.dev.register(s.held, 0, false); err != nil {
-		s.fail(step, answer(err)+"; remove it with goclusterfs-fsck -clear-reservations")
+	if s.hung {
+		s.failed = true
+		s.sink(Check{Fail, step, "not sent; once the device answers, remove the key with goclusterfs-fsck -clear-reservations"})
 		return
 	}
+	err := s.dev.register(s.held, 0, false)
+	switch {
+	case err == nil:
+		s.report(Check{Pass, step, answer(nil)})
+	case errors.Is(err, ErrReservationConflict):
+		s.report(Check{Pass, step, answer(err) + ": the key was gone already"})
+	default:
+		s.fail(step, answer(err)+"; remove it with goclusterfs-fsck -clear-reservations")
+	}
 	s.held = 0
-	s.report(Check{Pass, step, answer(nil)})
 }
 
 func (s *SelfTest) expect(step string, err error, why string) bool {

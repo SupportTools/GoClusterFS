@@ -108,10 +108,21 @@ func ioctlResult(r uintptr, errno syscall.Errno) error {
 	case r == statusConflict || r == nvmeStatusConflict:
 		return fmt.Errorf("%w (status %#x)", ErrReservationConflict, r)
 	case r != 0:
-		return fmt.Errorf("persistent reservation command failed with status %#x", r)
+		return statusError(r)
 	}
 	return nil
 }
+
+// statusError is a device status other than success or a conflict.
+type statusError uintptr
+
+func (s statusError) Error() string {
+	return fmt.Sprintf("persistent reservation command failed with status %#x", uintptr(s))
+}
+
+// statusCheckCondition is SCSI CHECK CONDITION, which a unit attention also returns: the first command from a host
+// after another host preempted its key gets one.
+const statusCheckCondition = 0x02
 
 func (d blockDevice) register(old, new uint64, ignore bool) error {
 	r := registration{old: old, new: new}

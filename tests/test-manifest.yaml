@@ -5507,6 +5507,20 @@ scenarios:
     environments:
       go: internal/fence/selftest_test.go::TestKeysPrintAsSixteenDigits
 
+  - id: fence-self-test-no-answer
+    name: The reservation self-test stops when the device stops answering
+    description: A command without an answer within the step timeout fails, the test sends nothing more, and the clean up names the key left behind
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestStopsWhenTheDeviceStopsAnswering
+
+  - id: fence-self-test-check-condition
+    name: The reservation self-test retries a check condition once
+    description: A status 0x2 answer, which a unit attention gives after a preempt, is retried once and the step says so
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestRetriesACheckCondition
+
   - id: storage-quiesce
     name: Quiesce drains in-flight I/O and holds new I/O
     description: Quiesce runs its function only after a write in flight finishes, and a read started meanwhile waits until the function returns
