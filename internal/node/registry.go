@@ -8,6 +8,7 @@ package node
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -89,8 +90,8 @@ type Slot struct {
 	BootID        [16]byte       // Kernel boot ID of the node's host
 	PID           uint32         // Mount process ID
 	ProcStart     int64          // Mount process start time (Unix ns)
-	RecoveryOwner [16]byte       // Dead slots: node replaying the journal
-	RecoveryStart int64          // Dead slots: when that replay last renewed its lease (Unix s)
+	RecoveryOwner [16]byte       // Dead slots: node replaying the journal; live slots: node revoking this one
+	RecoveryStart int64          // when that node last renewed its lease or wrote its intent (Unix s)
 	PIDNamespace  uint64         // Inode of the mount process's PID namespace
 	Orphans       []Orphan       // Files this node unlinked that some node may still have open
 	LockLayout    uint32         // How the node's build maps locks to lock records; 0 before builds recorded it
@@ -182,7 +183,7 @@ var (
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
 	ErrOrphansFull        = errors.New("this node's registry slot has no room for another orphan")
-	ErrLockLayout         = errors.New("a live node maps locks to lock records differently from this build")
+	ErrLockLayout         = errors.New("a live node maps locks to lock records, or takes over nodes, differently from this build")
 	// ErrReplayContended marks a replay that failed waiting on other nodes, such as for a lock; it never counts toward a backoff.
 	ErrReplayContended = errors.New("the replay waited too long on other nodes")
 )
@@ -421,12 +422,16 @@ func (r *Registry) SetAdvertiseAddr(addr netip.AddrPort) {
 	r.advertise = addr
 }
 
+// takeoverProtocol is mixed into the lock layout a slot records, so builds that take over nodes in another order
+// refuse to run next to this one: a node that restores its key is safe only from peers that mark an intent first.
+const takeoverProtocol uint32 = 1
+
 // SetLockLayout sets the lock record layout Register writes in this node's
 // slot. Register refuses to join while a live node's slot holds another one.
 func (r *Registry) SetLockLayout(id uint32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lockLayout = id
+	r.lockLayout = id ^ takeoverProtocol
 }
 
 // checkLockLayouts returns ErrLockLayout naming a node whose slot holds another
@@ -754,7 +759,7 @@ func (r *Registry) beat(slotIdx int) error {
 	if afterBeatRead != nil {
 		afterBeatRead()
 	}
-	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
+	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead && slot.RecoveryOwner == [16]byte{}
 	takenOver := err == nil && !ours
 	paused := r.sinceLastBeat()
 	if ours && paused <= stallLimit {
@@ -903,6 +908,9 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		newSlot.Orphans = old.Orphans
 		// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
 		if old.State != NodeStateEmpty {
+			if expected, err = r.markIntent(slotIdx, expected); err != nil {
+				return err
+			}
 			if err := r.fenceOut(old.UUID); err != nil {
 				return err
 			}
@@ -1417,6 +1425,12 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 	if err != nil {
 		return nil, err
 	}
+	r.mu.Lock()
+	raw, err = r.markIntent(slotIdx, raw)
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	// Before the CAS, so the dead node's late heartbeat cannot land over the Dead mark, and outside r.mu, so a slow
 	// preempt cannot hold up this node's own heartbeat.
 	if err := r.fenceOut(slot.UUID); err != nil {
@@ -1447,6 +1461,26 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		Orphans:       slot.Orphans,
 		CheckLease:    r.leaseCheck(slotIdx, slot.UUID, time.Now()),
 	}, nil
+}
+
+// markIntent writes this node's UUID as the recovery owner of a live slot that raw holds, before this node revokes
+// the slot's node: a node that registers its key again after the revoke reads the intent and stops. It returns the
+// bytes the next CAS must find, raw itself for a slot that is not live. Called with r.mu held.
+func (r *Registry) markIntent(slotIdx int, raw []byte) ([]byte, error) {
+	slot, err := deserializeSlot(raw)
+	if err != nil {
+		return nil, err
+	}
+	if slot.State != NodeStateActive && slot.State != NodeStateLeaving {
+		return raw, nil
+	}
+	slot.RecoveryOwner = r.localUUID
+	slot.RecoveryStart = time.Now().Unix()
+	intent := serializeSlot(slot)
+	if ok, err := r.casSlot(slotIdx, raw, intent); err != nil || !ok {
+		return nil, cmp.Or(err, ErrSlotTaken)
+	}
+	return intent, nil
 }
 
 // confirmStale reads slot slotIdx again and returns its raw bytes if it still holds observed's node, stale for timeout.
@@ -1531,6 +1565,14 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func(renew fu
 	}
 	slot, err := deserializeSlot(expected)
 	if err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	expected, err = r.markIntent(slotIdx, expected)
+	r.mu.Unlock()
+	if errors.Is(err, ErrSlotTaken) {
+		return false, nil
+	} else if err != nil {
 		return false, err
 	}
 	if err := r.fenceOut(slot.UUID); err != nil {
@@ -1675,8 +1717,8 @@ func (r *Registry) HeartbeatAge() time.Duration {
 	return r.sinceLastBeat()
 }
 
-// SlotLive returns nil while registry slot slotIdx holds this node and is not Dead. It takes no registry lock, so a
-// write the heartbeat makes under them can call it.
+// SlotLive returns nil while registry slot slotIdx holds this node, is not Dead and names no peer revoking it. It takes
+// no registry lock, so a write the heartbeat makes under them can call it.
 func (r *Registry) SlotLive(slotIdx int) error {
 	slot, err := r.readSlot(slotIdx)
 	switch {
@@ -1686,6 +1728,9 @@ func (r *Registry) SlotLive(slotIdx int) error {
 		return fmt.Errorf("slot %d now belongs to node %x", slotIdx, slot.UUID[:8])
 	case slot.State == NodeStateDead:
 		return fmt.Errorf("slot %d is marked Dead: a peer is taking over this node's journal and locks", slotIdx)
+	case slot.RecoveryOwner != [16]byte{}:
+		return fmt.Errorf("slot %d names node %x, which is revoking this node's access to take over its journal and locks",
+			slotIdx, slot.RecoveryOwner[:8])
 	}
 	return nil
 }

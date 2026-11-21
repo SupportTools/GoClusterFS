@@ -16,6 +16,7 @@ type rekeyWorld struct {
 	target     *Target
 	node, peer *PR
 	age        atomic.Int64
+	intent     atomic.Bool
 	dead       atomic.Bool
 	takenOver  atomic.Bool
 	hold       sync.RWMutex
@@ -68,19 +69,24 @@ func newRekeyWorld(t *testing.T) *rekeyWorld {
 
 // loseSession drops n's key from its current session, as an iSCSI logout and login does; LIO keeps it under the old one.
 func (w *rekeyWorld) loseSession() {
-	w.target.mu.Lock()
-	defer w.target.mu.Unlock()
-	w.target.keys["n-old"] = w.target.keys["n"]
-	delete(w.target.keys, "n")
+	w.target.Relogin("n")
 }
 
-// takeOver is p proving n dead: n's heartbeat is 20s old by now, and p preempts n's key and marks n's slot Dead.
+// takeOver is p proving n dead: n's heartbeat is 20s old by now, and p marks its intent in n's slot, preempts n's key
+// and marks the slot Dead.
 func (w *rekeyWorld) takeOver(t *testing.T) {
 	w.age.Store(int64(20 * time.Second))
+	w.revoke(t)
+	w.dead.Store(true)
+}
+
+// revoke is the first two steps of a takeover: p marks its intent in n's slot, then preempts n's key. From the
+// preempt on, no write of n's may land.
+func (w *rekeyWorld) revoke(t *testing.T) {
+	w.intent.Store(true)
 	if err := w.peer.Preempt(w.node.Key()); err != nil {
 		t.Errorf("peer's preempt: %v", err)
 	}
-	w.dead.Store(true)
 	w.takenOver.Store(true)
 }
 
@@ -94,8 +100,11 @@ func (w *rekeyWorld) rekeyer() *Rekeyer {
 		},
 		HeartbeatAge: func() time.Duration { return time.Duration(w.age.Load()) },
 		SlotLive: func() error {
-			if w.dead.Load() {
+			switch {
+			case w.dead.Load():
 				return errors.New("slot is Dead")
+			case w.intent.Load():
+				return errors.New("slot names a peer revoking this node")
 			}
 			return nil
 		},
@@ -199,20 +208,45 @@ func TestRekeyRefusesWithoutRegistering(t *testing.T) {
 }
 
 // A hypervisor pause stops a KVM guest's CLOCK_BOOTTIME, so after one the heartbeat age reads about 1s whatever time
-// passed. The peer preempts before it marks the slot Dead; if this node resumes in between, every check passes, and
-// the peer's Dead mark then lands while this node writes. No write may land after the takeover.
+// passed, and only the slot can tell this node that a peer took it over. Each case pauses this node at another point
+// of the peer's takeover; a writer keeps writing through the hold, and no write may land after the peer's preempt.
 func TestRekeyAfterAPausedClockLandsNoWrite(t *testing.T) {
-	w := newRekeyWorld(t)
-	w.loseSession()
-	if err := w.peer.Preempt(w.node.Key()); err != nil {
-		t.Fatal(err)
-	}
-	w.age.Store(int64(time.Second))
-	_ = w.rekeyer().Rekey()
-	w.dead.Store(true)
-	w.takenOver.Store(true)
-	time.Sleep(20 * time.Millisecond)
-	if n := w.lateWrites.Load(); n != 0 {
-		t.Errorf("%d writes landed after the peer took this node over", n)
+	for _, tc := range []struct {
+		name  string
+		pause func(w *rekeyWorld, k *Rekeyer, t *testing.T)
+		// registers says whether the node's register reaches the device after the peer's preempt.
+		registers bool
+	}{
+		{"resumes between the preempt and the Dead mark", func(w *rekeyWorld, k *Rekeyer, t *testing.T) { w.revoke(t) }, false},
+		{"paused before the register", func(w *rekeyWorld, k *Rekeyer, t *testing.T) {
+			k.beforeRegister = func() { w.revoke(t) }
+		}, true},
+		{"paused between the register and the slot read", func(w *rekeyWorld, k *Rekeyer, t *testing.T) {
+			k.afterRegister = func() { w.revoke(t) }
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRekeyWorld(t)
+			w.loseSession()
+			w.age.Store(int64(time.Second))
+			k := w.rekeyer()
+			tc.pause(w, k, t)
+			registeredAfterPreempt := false
+			if k.afterRegister == nil {
+				k.afterRegister = func() { registeredAfterPreempt = w.nodeRegistered() }
+			}
+			err := k.Rekey()
+			w.dead.Store(true)
+			if err == nil || !strings.Contains(err.Error(), "revoking") {
+				t.Errorf("Rekey: %v, want it to read the peer's intent", err)
+			}
+			if registeredAfterPreempt != tc.registers {
+				t.Errorf("the register landed after the preempt: %v, want %v", registeredAfterPreempt, tc.registers)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if n := w.lateWrites.Load(); n != 0 || w.nodeRegistered() {
+				t.Errorf("%d writes landed after the peer's preempt, registered %v", n, w.nodeRegistered())
+			}
+		})
 	}
 }
