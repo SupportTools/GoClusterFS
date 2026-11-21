@@ -29,6 +29,10 @@ type Rekeyer struct {
 	Restored func(age time.Duration)
 	// Listed, if set, runs with what the device listed around each register attempt.
 	Listed func(KeyListing)
+	// NoKeyCheck and BeforeRegister exist only for the B key-check POC: one skips the storage proof to compare with
+	// the clock and slot checks alone, the other lets a test preempt between the listing and the register.
+	NoKeyCheck     bool
+	BeforeRegister func()
 
 	last time.Time
 	// Tests stall here, as a pause would.
@@ -71,7 +75,9 @@ func (k *Rekeyer) Rekey() error {
 			return fmt.Errorf("counting the device's paths: %w", err)
 		}
 		l.Paths = paths
-		if l.GenBefore, l.Before, err = k.PR.Registrations(); err != nil {
+		if k.NoKeyCheck {
+			l.Before = 1
+		} else if l.GenBefore, l.Before, err = k.PR.Registrations(); err != nil {
 			return fmt.Errorf("listing the device's keys, which proves no peer preempted this node: %w", err)
 		}
 		if l.Before == 0 {
@@ -83,6 +89,9 @@ func (k *Rekeyer) Rekey() error {
 		if k.beforeRegister != nil {
 			k.beforeRegister()
 		}
+		if k.BeforeRegister != nil {
+			k.BeforeRegister()
+		}
 		if err := k.PR.Register(); err != nil {
 			return fmt.Errorf("registering the key again: %w", err)
 		}
@@ -91,9 +100,11 @@ func (k *Rekeyer) Rekey() error {
 			k.afterRegister()
 		}
 		age := k.HeartbeatAge()
-		l.GenAfter, l.After, err = k.PR.Registrations()
-		l.AfterListed = err == nil
-		if err == nil && l.After <= paths {
+		if !k.NoKeyCheck {
+			l.GenAfter, l.After, err = k.PR.Registrations()
+			l.AfterListed = err == nil
+		}
+		if err == nil && !k.NoKeyCheck && l.After <= paths {
 			err = fmt.Errorf("after the register the device lists %d registrations of key %#x on %d paths, so the ones from before the loss are gone: a peer preempted this node",
 				l.After, key, paths)
 		}

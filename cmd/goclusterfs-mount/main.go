@@ -870,6 +870,10 @@ func restoreKey(pr *fence.PR, dev *storage.Device, reg *node.Registry, slotIdx i
 		HeartbeatAge: reg.HeartbeatAge,
 		SlotLive:     func() error { return reg.SlotLive(slotIdx) },
 		StallLimit:   node.StallLimit,
+		Listed: func(l fence.KeyListing) {
+			log.Printf("[WARN] Fencing: before a re-register the device listed %d registrations of key %#x at generation %d; after it %d at generation %d (listed: %v), on %d paths",
+				l.Before, pr.Key(), l.GenBefore, l.After, l.GenAfter, l.AfterListed, l.Paths)
+		},
 		Restored: func(age time.Duration) {
 			reg.NoteKeyRestore()
 			log.Printf("[WARN] Fencing: the device no longer knew this node's reservation key %#x, as after its storage path logged out and in again; "+
