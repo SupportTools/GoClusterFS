@@ -197,3 +197,22 @@ func TestRekeyRefusesWithoutRegistering(t *testing.T) {
 		})
 	}
 }
+
+// A hypervisor pause stops a KVM guest's CLOCK_BOOTTIME, so after one the heartbeat age reads about 1s whatever time
+// passed. The peer preempts before it marks the slot Dead; if this node resumes in between, every check passes, and
+// the peer's Dead mark then lands while this node writes. No write may land after the takeover.
+func TestRekeyAfterAPausedClockLandsNoWrite(t *testing.T) {
+	w := newRekeyWorld(t)
+	w.loseSession()
+	if err := w.peer.Preempt(w.node.Key()); err != nil {
+		t.Fatal(err)
+	}
+	w.age.Store(int64(time.Second))
+	_ = w.rekeyer().Rekey()
+	w.dead.Store(true)
+	w.takenOver.Store(true)
+	time.Sleep(20 * time.Millisecond)
+	if n := w.lateWrites.Load(); n != 0 {
+		t.Errorf("%d writes landed after the peer took this node over", n)
+	}
+}
