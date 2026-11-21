@@ -1995,6 +1995,24 @@ scenarios:
       docker: run-tests.sh::test_multinode_rename
       vm: run-vm-tests.sh::test_multinode_rename
 
+  - id: multinode-rename-moved-dir
+    name: A node renames a directory another node moved
+    description: Node 1 looks a directory up, node 2 moves it to another directory, and node 1 moves it again by its new name while its kernel still holds the old one, back into the old parent, into a third directory and within the new parent, and moves a subdirectory of a moved directory; no rename fails with ESTALE and fsck is clean
+    priority: high
+    environments:
+      go: rename_moved_dir_test.go::TestRenameOfDirAnotherNodeMoved
+      docker: run-tests.sh::test_multinode_rename_moved_dir
+      vm: run-vm-tests.sh::test_multinode_rename_moved_dir
+
+  - id: multinode-moved-dir-old-handle
+    name: A handle and a working directory in a moved directory keep working
+    description: Node 1 holds a directory open and a working directory in it while node 2 moves it and node 1 moves it again; reading the directory, creating in it through the handle and by a name relative to the working directory, and fchdir all still work
+    priority: high
+    environments:
+      go: rename_moved_dir_test.go::TestMovedDirOldHandleAndCwdKeepWorking
+      docker: run-tests.sh::test_multinode_rename_moved_dir
+      vm: run-vm-tests.sh::test_multinode_rename_moved_dir
+
   - id: mkdir-power-failure
     name: Power failure during mkdir
     description: Power fails at each write; the root counts a link for the new directory exactly when it names it, and fsck finds only leaks

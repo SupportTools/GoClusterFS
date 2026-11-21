@@ -2657,6 +2657,55 @@ test_multinode_rename() {
     return 0
 }
 
+# Runs cmd on a VM again while it fails with ENOENT, since a node can see another node's change only after -cache-ttl.
+until_found_on_vm() {
+    local vm_id=$1 cmd=$2 i out
+    for i in $(seq 1 75); do
+        out=$(ssh_run "$vm_id" "$cmd" 2>&1) && return 0
+        [[ "$out" == *"No such file"* ]] || { log_error "On VM $vm_id, $cmd: $out"; return 1; }
+        sleep 0.2
+    done
+    log_error "On VM $vm_id, still ENOENT after 15 s: $cmd"
+    return 1
+}
+
+# Test: VM 1 renames a directory VM 2 moved while VM 1's kernel holds the old name; a cwd in it keeps working.
+# Based on TestRenameOfDirAnotherNodeMoved and TestMovedDirOldHandleAndCwdKeepWorking. busybox mv calls rename(2) alone.
+test_multinode_rename_moved_dir() {
+    log_info "Testing renames of a directory another VM moved..."
+    ensure_cluster_healthy 2 || return 1
+    local n1=1 n2=2 m=/mnt/goclusterfs dst d want p
+    ssh_run "$n1" "mkdir $m/md_a $m/md_b $m/md_c" || return 1
+    for dst in md_a md_c md_b; do
+        d=md_d_${dst#md_}
+        ssh_run "$n1" "mkdir $m/md_a/$d && stat $m/md_a/$d >/dev/null" || return 1
+        until_found_on_vm "$n2" "mv $m/md_a/$d $m/md_b/$d-moved" || return 1
+        until_found_on_vm "$n1" "mv $m/md_b/$d-moved $m/$dst/$d-final" || return 1
+        want="test -d $dst/$d-final && test ! -e md_a/$d && test ! -e md_b/$d-moved"
+        settle_on_vm "$n1" "$want" && settle_on_vm "$n2" "$want" || return 1
+    done
+
+    ssh_run "$n1" "mkdir $m/md_a/md_cwd && touch $m/md_a/md_cwd/before && rm -f /tmp/md_ready /tmp/md_go" || return 1
+    ssh_run "$n1" "cd $m/md_a/md_cwd && touch /tmp/md_ready && while [ ! -e /tmp/md_go ]; do sleep 0.1; done; ls > /tmp/md_ls && touch via-cwd" & p=$!
+    settle_on_vm "$n1" "test -e /tmp/md_ready" || return 1
+    until_found_on_vm "$n2" "mv $m/md_a/md_cwd $m/md_b/md_cwd" || return 1
+    until_found_on_vm "$n1" "mv $m/md_b/md_cwd $m/md_a/md_cwd-final" || return 1
+    ssh_run "$n1" "touch /tmp/md_go" || return 1
+    if ! wait $p; then
+        log_error "Listing or creating in the working directory of the moved directory failed"
+        return 1
+    fi
+    if ! ssh_run "$n1" "grep -qx before /tmp/md_ls"; then
+        log_error "The working directory of the moved directory listed '$(ssh_run "$n1" "cat /tmp/md_ls")', want before"
+        return 1
+    fi
+    want="test -e md_a/md_cwd-final/before && test -e md_a/md_cwd-final/via-cwd"
+    settle_on_vm "$n1" "$want" && settle_on_vm "$n2" "$want" || return 1
+    ssh_run "$n1" "rm -f /tmp/md_ready /tmp/md_go /tmp/md_ls"
+    log_info "Moved-directory rename test passed"
+    return 0
+}
+
 # Test: Single-node stress test
 # Rapidly creates, reads, verifies, and deletes files to stress test the filesystem
 test_stress_single_node() {
@@ -4907,6 +4956,7 @@ main() {
     run_test "Stress Single Node" test_stress_single_node
     run_test "Concurrent Directory Ops" test_concurrent_directory_ops
     run_test "Multi-Node Rename" test_multinode_rename
+    run_test "Multi-Node Rename Of A Moved Directory" test_multinode_rename_moved_dir
     run_test "Long-Running Stability" test_stability
 
     # Run concurrent same-file write tests (using pre-extension pattern)

@@ -172,6 +172,8 @@ type FS struct {
 
 	orphanReg orphanRegistry
 	opens     openFiles
+
+	dirGen atomic.Uint64
 }
 
 // Verify interface compliance at compile time
@@ -827,11 +829,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 		out.Attr.Blocks = 1 * (BlockSize / 512)
 		out.Attr.Blksize = BlockSize
 
-		childDir := &Dir{fs: f, inodeNum: uint32(childInodeNum)}
-		ch := f.NewPersistentInode(ctx, childDir, fs.StableAttr{
-			Mode: fuse.S_IFDIR,
-			Ino:  childInodeNum,
-		})
+		ch := f.dirNode(ctx, &f.Inode, name, childInodeNum)
 		logging.Debugf("FS.Lookup: returning dir inode %d", childInodeNum)
 		return ch, 0
 	}
@@ -1344,9 +1342,21 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	ch := parent.NewPersistentInode(ctx, &Dir{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
 		Mode: fuse.S_IFDIR,
 		Ino:  uint64(childIno.InodeNum),
+		Gen:  f.dirGen.Add(1),
 	})
 	fillEntryOut(out, childIno)
 	return ch, 0
+}
+
+// A new node spares the kernel moving the old dentry of a directory another node moved, which fails inside a rename.
+func (f *FS) dirNode(ctx context.Context, parent *fs.Inode, name string, num uint64) *fs.Inode {
+	attr := fs.StableAttr{Mode: fuse.S_IFDIR, Ino: num}
+	if old := parent.GetChild(name); old != nil && old.IsDir() && old.StableAttr().Ino == num {
+		attr.Gen = old.StableAttr().Gen
+	} else {
+		attr.Gen = f.dirGen.Add(1)
+	}
+	return parent.NewPersistentInode(ctx, &Dir{fs: f, inodeNum: uint32(num)}, attr)
 }
 
 // Mkdir creates a new directory in the root directory.
@@ -1531,11 +1541,7 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 		out.Attr.Blocks = 1 * (BlockSize / 512)
 		out.Attr.Blksize = BlockSize
 
-		childDir := &Dir{fs: d.fs, inodeNum: uint32(childInodeNum)}
-		ch := d.NewPersistentInode(ctx, childDir, fs.StableAttr{
-			Mode: fuse.S_IFDIR,
-			Ino:  childInodeNum,
-		})
+		ch := d.fs.dirNode(ctx, &d.Inode, name, childInodeNum)
 		logging.Debugf("Lookup: returning dir inode %d", childInodeNum)
 		return ch, 0
 	}
