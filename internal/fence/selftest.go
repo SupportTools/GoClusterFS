@@ -45,14 +45,13 @@ type SelfTest struct {
 	failed  bool
 	listing bool
 	reading bool
-	retried bool
 	hung    bool
 	stopped bool
 }
 
 // NewSelfTest tests the device f is open on. write writes 4 KiB to it with O_DIRECT.
 func NewSelfTest(f *os.File, write func() error, report func(Check)) *SelfTest {
-	return newSelfTest(blockDevice{f: f, partition: isPartition(f)}, write, report)
+	return newSelfTest(retrying{blockDevice{f: f, partition: isPartition(f)}}, write, report)
 }
 
 func newSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
@@ -67,8 +66,7 @@ func newSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
 
 var errNoAnswer = errors.New("no answer")
 
-// timed runs one command with the test's time limit, and once more after status 0x2: the first command from a host
-// whose key another host preempted gets a unit attention, which the kernel reports as 0x2.
+// timed runs one command with the test's time limit.
 func timed[T any](s *SelfTest, command func() (T, error)) (T, error) {
 	type result struct {
 		v   T
@@ -78,23 +76,17 @@ func timed[T any](s *SelfTest, command func() (T, error)) (T, error) {
 	if s.hung {
 		return zero, errNoAnswer
 	}
-	for try := 0; ; try++ {
-		done := make(chan result, 1)
-		go func() {
-			v, err := command()
-			done <- result{v, err}
-		}()
-		select {
-		case r := <-done:
-			if try == 0 && errors.Is(r.err, statusError(statusIOError)) {
-				s.retried = true
-				continue
-			}
-			return r.v, r.err
-		case <-time.After(s.timeout):
-			s.hung = true
-			return zero, fmt.Errorf("%w within %v", errNoAnswer, s.timeout)
-		}
+	done := make(chan result, 1)
+	go func() {
+		v, err := command()
+		done <- result{v, err}
+	}()
+	select {
+	case r := <-done:
+		return r.v, r.err
+	case <-time.After(s.timeout):
+		s.hung = true
+		return zero, fmt.Errorf("%w within %v", errNoAnswer, s.timeout)
 	}
 }
 
@@ -138,13 +130,8 @@ func (g guarded) readReservation() (uint64, uint32, error) {
 	return r.key, r.typ, err
 }
 
-// report passes c on, noting a retry after status 0x2. Once a command got no answer, it passes on only the
-// step that waited for it.
+// report passes c on. Once a command got no answer, it passes on only the step that waited for it.
 func (s *SelfTest) report(c Check) {
-	if s.retried {
-		c.Answer += "; the first try got status 0x2, the kernel's code for any failure but a conflict, such as the unit attention a preempted host's first command gets, and was retried"
-		s.retried = false
-	}
 	if s.hung {
 		if s.stopped {
 			return

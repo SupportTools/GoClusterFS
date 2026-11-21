@@ -240,3 +240,45 @@ func TestPreemptStatusesFromBothTransports(t *testing.T) {
 		t.Errorf("status 0x02: %v, want an error that stops the takeover", err)
 	}
 }
+
+// scripted answers each command with the next raw status of its list, as the kernel returns them.
+type scripted struct{ registers, preempts []uintptr }
+
+func (d *scripted) next(statuses *[]uintptr) error {
+	r := (*statuses)[0]
+	*statuses = (*statuses)[1:]
+	return ioctlResult(r, 0)
+}
+
+func (d *scripted) register(uint64, uint64, bool) error      { return d.next(&d.registers) }
+func (d *scripted) reserve(uint64) error                     { return nil }
+func (d *scripted) preemptAbort(uint64, uint64) error        { return d.next(&d.preempts) }
+func (d *scripted) clear(uint64) error                       { return nil }
+func (d *scripted) readKeys() ([]uint64, error)              { return nil, nil }
+func (d *scripted) readReservation() (uint64, uint32, error) { return 0, 0, nil }
+
+// A preempted host's first reservation command gets a unit attention, which the kernel reports as status 0x2. Sent
+// again, the command meets the conflict behind it, so Unregister and Preempt report ErrFenced; 0x2 twice stays an
+// error that is not.
+func TestUnitAttentionAfterAPreemptReadsAsFenced(t *testing.T) {
+	unmounting := &PR{dev: retrying{&scripted{registers: []uintptr{0x02, 0x18}}}, key: 1}
+	if err := unmounting.Unregister(); !errors.Is(err, ErrFenced) {
+		t.Errorf("Unregister after a unit attention: %v, want ErrFenced", err)
+	}
+	preempting := &PR{dev: retrying{&scripted{preempts: []uintptr{0x02, 0x18}, registers: []uintptr{0x02, 0x18}}}, key: 1}
+	if err := preempting.Preempt(2); !errors.Is(err, ErrFenced) {
+		t.Errorf("Preempt after a unit attention: %v, want ErrFenced", err)
+	}
+	failing := &PR{dev: retrying{&scripted{registers: []uintptr{0x02, 0x02}}}, key: 1}
+	if err := failing.Unregister(); err == nil || errors.Is(err, ErrFenced) {
+		t.Errorf("Unregister answered 0x2 twice: %v, want an error that is not ErrFenced", err)
+	}
+	f, err := os.CreateTemp(t.TempDir(), "disk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, ok := Block(f, 1).dev.(retrying); !ok {
+		t.Error("Block does not send a command again after status 0x2")
+	}
+}
