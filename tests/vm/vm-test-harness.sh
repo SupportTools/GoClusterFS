@@ -819,6 +819,21 @@ ssh_run() {
     ssh ${SSH_OPTIONS} -i "$(get_ssh_key)" -p "$ssh_port" "${SSH_USER}@127.0.0.1" "$@"
 }
 
+# iscsi_disk prints the disk VM $1's iSCSI session attached, such as sdb; every login can name it anew.
+iscsi_disk() {
+    ssh_run "$1" "iscsiadm -m session -P 3 | sed -n 's/.*Attached scsi disk \\([a-z]*\\).*/\\1/p' | head -1"
+}
+
+# multipath_over sets VM $1's one-path dm-multipath map gcfs-mpath on disk $2, by default its current iSCSI disk. A map
+# that exists takes the disk without flushing the writes it queued while it had no path.
+multipath_over() {
+    local disk=${2:-}
+    if [[ -z "$disk" ]]; then
+        disk=$(iscsi_disk "$1") && [[ -n "$disk" ]] || return 1
+    fi
+    ssh_run "$1" "command -v dmsetup > /dev/null || apk add --no-cache device-mapper > /dev/null; modprobe dm-multipath && t=\"0 \$(blockdev --getsz /dev/$disk) multipath 1 queue_if_no_path 0 1 1 round-robin 0 1 1 /dev/$disk 1\" && if dmsetup info gcfs-mpath > /dev/null 2>&1; then dmsetup suspend --noflush gcfs-mpath && dmsetup load gcfs-mpath --table \"\$t\" && dmsetup resume gcfs-mpath; else dmsetup create gcfs-mpath --table \"\$t\"; fi"
+}
+
 # ssh_run_capped is ssh_run that gives up after $1 seconds, for a command the guest's kernel may never finish.
 ssh_run_capped() {
     local secs="$1" vm_id="$2"

@@ -51,6 +51,7 @@ func main() {
 		fs.IntVar(&cfg.diskMB, "disk-mb", 4096, "shared disk size")
 		fs.Int64Var(&cfg.budget, "budget", 1200, "data blocks the model may hold, counting each snapshot as a full copy")
 		fs.DurationVar(&cfg.stallAfter, "stall-capture", 20*time.Second, "when a call waits this long, save every node's stacks and lock wait totals; 0 turns it off")
+		fs.BoolVar(&cfg.relogin, "relogin", false, "also log a node's iSCSI session out and in under load, sometimes with its mount stopped first; nodes mount dm-multipath maps; needs VM_STORAGE=iscsi and -inflight")
 		fs.StringVar(&oplog, "log", "", "replay: op log to run again")
 		fs.Uint64Var(&upto, "upto", 0, "replay: stop after this op sequence number")
 		_ = fs.Parse(os.Args[2:])

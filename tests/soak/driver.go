@@ -43,6 +43,7 @@ type config struct {
 	diskMB       int
 	budget       int64
 	stallAfter   time.Duration
+	relogin      bool
 }
 
 type node struct {
@@ -91,6 +92,7 @@ type driver struct {
 	failure  string
 
 	ops, unexpected, faults, fscks, barriers, slow, stalls, resolved atomic.Int64
+	reloginSurvived, reloginStopped                                  atomic.Int64
 	slowestMs                                                        atomic.Int64
 	opsByKind                                                        sync.Map
 }
@@ -538,6 +540,10 @@ func (d *driver) injectFault(kind string, n *node) {
 	if kind == "stop" {
 		command = fmt.Sprintf("stop %d %d", n.id, int(d.cfg.stopFor.Seconds()))
 	}
+	if strings.HasPrefix(kind, "relogin") {
+		d.relogin(kind, n, start)
+		return
+	}
 	log.Printf("fault: %s", command)
 	if d.cfg.inflight {
 		// Operations keep starting on the node until the fault takes it down, so it cuts some of them short.
@@ -572,6 +578,65 @@ func (d *driver) injectFault(kind string, n *node) {
 	n.up.Store(false)
 	d.faults.Add(1)
 	d.logRecord(record{Type: "fault", Fault: kind, Victim: n.id, Op: Op{At: start.UnixMilli(), Ms: time.Since(start).Milliseconds()}})
+	if err := d.resolvePending(n); err != nil {
+		d.fail("after fault %s: %v", command, err)
+		return
+	}
+	if err := d.verifyAll(n, true); err != nil {
+		d.fail("after fault %s: node %d: %v", command, n.id, err)
+		return
+	}
+	n.hit.Store(false)
+	n.up.Store(true)
+}
+
+// relogin logs n's iSCSI session out and in while lanes keep running operations on it; "relogin-paused" stops its
+// mount for -stop-for around that, past the time peers take to fence it. The node either runs on, and then no
+// operation on it may have failed, or it stops and the controller mounts it again.
+func (d *driver) relogin(kind string, n *node, start time.Time) {
+	command := fmt.Sprintf("relogin %d", n.id)
+	if kind == "relogin-paused" {
+		command = fmt.Sprintf("relogin %d %d", n.id, int(d.cfg.stopFor.Seconds()))
+	}
+	log.Printf("fault: %s", command)
+	n.hit.Store(true)
+	outcome, _, err := d.ctl.run(command)
+	if err != nil {
+		d.fail("fault %s: %v", command, err)
+		return
+	}
+	n.up.Store(false)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	switch outcome {
+	case "survived":
+		d.reloginSurvived.Add(1)
+		d.pendingMu.Lock()
+		cut := d.pending[n.id]
+		delete(d.pending, n.id)
+		d.pendingMu.Unlock()
+		for _, u := range cut {
+			close(u.done)
+		}
+		if len(cut) > 0 {
+			op := cut[0].op
+			d.fail("op %d %s %s on node %d failed during a relogin the node ran through; ops.jsonl has its answer", op.Seq, op.Kind, op.Path, n.id)
+			return
+		}
+	case "stopped":
+		d.reloginStopped.Add(1)
+		n.agent.close()
+		if err := d.connect(n); err != nil {
+			d.fail("fault %s: reconnect: %v", command, err)
+			return
+		}
+		n.up.Store(false)
+	default:
+		d.fail("fault %s: controller answered %q", command, outcome)
+		return
+	}
+	d.faults.Add(1)
+	d.logRecord(record{Type: "fault", Fault: kind, Victim: n.id, Detail: outcome, Op: Op{At: start.UnixMilli(), Ms: time.Since(start).Milliseconds()}})
 	if err := d.resolvePending(n); err != nil {
 		d.fail("after fault %s: %v", command, err)
 		return
@@ -682,9 +747,9 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d files=%d snapshots=%d blocks=%d [%s]",
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d relogin_survived=%d relogin_stopped=%d files=%d snapshots=%d blocks=%d [%s]",
 		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
-		files, snaps, blocks, strings.Join(kinds, " "))
+		d.reloginSurvived.Load(), d.reloginStopped.Load(), files, snaps, blocks, strings.Join(kinds, " "))
 }
 
 func newDriver(cfg config) (*driver, func(), error) {
@@ -699,7 +764,8 @@ func newDriver(cfg config) (*driver, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	env := []string{"NODE_COUNT=3", fmt.Sprintf("VM_SSH_BASE_PORT=%d", cfg.sshBasePort), fmt.Sprintf("VM_CLUSTER_SIZE_MB=%d", cfg.diskMB)}
+	env := []string{"NODE_COUNT=3", fmt.Sprintf("VM_SSH_BASE_PORT=%d", cfg.sshBasePort), fmt.Sprintf("VM_CLUSTER_SIZE_MB=%d", cfg.diskMB),
+		fmt.Sprintf("MULTIPATH=%t", cfg.relogin)}
 	ctl, err := startController(filepath.Join(cfg.checkout, "tests/soak/cluster.sh"), env, clusterLog)
 	if err != nil {
 		return nil, nil, err
@@ -737,6 +803,9 @@ func every(ctx context.Context, interval time.Duration, f func()) {
 }
 
 func run(cfg config) error {
+	if cfg.relogin && (os.Getenv("VM_STORAGE") != "iscsi" || !cfg.inflight) {
+		return errors.New("-relogin needs VM_STORAGE=iscsi and -inflight")
+	}
 	d, cleanup, err := newDriver(cfg)
 	if err != nil {
 		return err
@@ -750,6 +819,10 @@ func run(cfg config) error {
 	ctx, stop := context.WithTimeout(d.ctx, cfg.duration)
 	defer stop()
 	faultRng := rand.New(rand.NewPCG(cfg.seed, 0xfa))
+	faultKinds := []string{"power", "sigkill", "stop"}
+	if cfg.relogin {
+		faultKinds = append(faultKinds, "relogin", "relogin-paused")
+	}
 	var wg sync.WaitGroup
 	for i := range cfg.lanes {
 		l := &lane{id: i, rng: rand.New(rand.NewPCG(cfg.seed, uint64(i))), budget: cfg.budget}
@@ -757,7 +830,7 @@ func run(cfg config) error {
 	}
 	wg.Go(func() {
 		every(ctx, cfg.faultEvery, func() {
-			kind, n := pick(faultRng, []string{"power", "sigkill", "stop"}), pick(faultRng, d.nodes)
+			kind, n := pick(faultRng, faultKinds), pick(faultRng, d.nodes)
 			if cfg.inflight {
 				n = d.victimMidOp(n)
 			}
