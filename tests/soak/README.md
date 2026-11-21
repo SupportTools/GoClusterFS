@@ -16,6 +16,11 @@
   - goclusterfs-mount is stopped past the 10s heartbeat timeout and resumed.
 
   The node comes back, mounts again and must show the model. The other nodes keep working through the fault.
+- **Relogins:** with `-relogin`, which needs `VM_STORAGE=iscsi` and `-inflight`, nodes mount a one-path dm-multipath map over their iSCSI disk, and two more faults join the draw:
+  - relogin: the node's iSCSI session logs out and in while operations run on it, and its map takes the new disk;
+  - relogin-paused: the same, with goclusterfs-mount stopped for `-stop-for` around it, so peers fence it.
+
+  If the same mount process still serves the mount point 30s later, the relogin counts as `relogin_survived`, and every operation on the node must have succeeded. Otherwise it counts as `relogin_stopped`: the node is mounted again, operations it cut short are judged as for an in-flight fault, and it must show the model.
 - **In-flight faults:** by default a fault waits for the operations running on its node. With `-inflight` it does not, so a fault can land in the middle of an operation.
   - An operation the fault cuts short may or may not have happened. Once the node is back, the soak reads what it shows and accepts the state from before the operation or after it.
   - A write may also be torn: each 4 KB sector shows the old data or the new.
