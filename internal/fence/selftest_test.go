@@ -301,13 +301,16 @@ func (d unitAttention) register(old, new uint64, ignore bool) error {
 	return d.fakeDevice.register(old, new, ignore)
 }
 
-// Status 0x2 is retried once, and the step says so.
-func TestSelfTestRetriesStatus0x2(t *testing.T) {
+// A command sent again after status 0x2 passes, and its step says so.
+func TestSelfTestNotesACommandSentAgain(t *testing.T) {
 	pending := true
 	var r recorder
-	s := newSelfTest(unitAttention{&fakeDevice{t: NewTarget(), initiator: "a"}, &pending}, func() error { return nil }, r.report)
+	s := newRetryingSelfTest(unitAttention{&fakeDevice{t: NewTarget(), initiator: "a"}, &pending}, func() error { return nil }, r.report)
 	s.Run()
-	if s.Failed() || !strings.Contains(r.checks[1].Answer, "status 0x2") {
-		t.Errorf("want the first register to pass after a retry, and say so:%s", &r)
+	if s.Failed() || !strings.Contains(r.checks[1].Answer, "was sent again") {
+		t.Errorf("want the first register to pass after a second try, and say so:%s", &r)
+	}
+	if strings.Contains(r.checks[2].Answer, "sent again") {
+		t.Errorf("the note carried over to the next step:%s", &r)
 	}
 }

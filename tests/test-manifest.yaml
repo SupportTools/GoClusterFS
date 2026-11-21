@@ -5573,12 +5573,19 @@ scenarios:
     environments:
       go: internal/fence/selftest_test.go::TestSelfTestStopsWhenTheDeviceStopsAnswering
 
-  - id: fence-self-test-status-retry
-    name: The reservation self-test retries status 0x2 once
-    description: A status 0x2 answer (PR_STS_IOERR), which LIO gives a preempted host's first command, is retried once and the step says so
+  - id: fence-unit-attention
+    name: A unit attention after a preempt reads as fenced
+    description: A preempted host's first reservation command gets status 0x2 (a unit attention); fence sends it once more, so Unregister and Preempt see the conflict and report ErrFenced, and 0x2 twice stays an error that is not ErrFenced
     priority: go_only
     environments:
-      go: internal/fence/selftest_test.go::TestSelfTestRetriesStatus0x2
+      go: internal/fence/fence_test.go::TestUnitAttentionAfterAPreemptReadsAsFenced
+
+  - id: fence-self-test-sent-again
+    name: The reservation self-test notes a command sent again after status 0x2
+    description: When fence sends a command once more after status 0x2, the self-test step passes and says so, and the note does not carry over to the next step
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestNotesACommandSentAgain
 
   - id: storage-quiesce
     name: Quiesce drains in-flight I/O and holds new I/O

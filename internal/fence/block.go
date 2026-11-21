@@ -14,7 +14,54 @@ import (
 
 // Block fences through the block layer's persistent reservation ioctls on f, which SCSI and NVMe disks implement.
 func Block(f *os.File, key uint64) *PR {
-	return &PR{dev: blockDevice{f: f, partition: isPartition(f)}, key: key}
+	return &PR{dev: retrying{device: blockDevice{f: f, partition: isPartition(f)}}, key: key}
+}
+
+// retrying sends a reservation command once more after status 0x2, and calls retried if set. A host whose key another
+// host preempted gets a unit attention on its first command, which the kernel reports as 0x2; sent again, the command
+// gets the device's real answer, such as a conflict. A clear is sent once: a repeat after one that worked would report
+// a conflict. An unregister whose first answer was lost reads its repeat's conflict as ErrFenced, which unmount only logs.
+type retrying struct {
+	device
+	retried func()
+}
+
+func (d retrying) register(old, new uint64, ignore bool) error {
+	return d.again(func() error { return d.device.register(old, new, ignore) })
+}
+
+func (d retrying) reserve(key uint64) error {
+	return d.again(func() error { return d.device.reserve(key) })
+}
+
+func (d retrying) preemptAbort(own, victim uint64) error {
+	return d.again(func() error { return d.device.preemptAbort(own, victim) })
+}
+
+func (d retrying) readKeys() (keys []uint64, err error) {
+	err = d.again(func() error {
+		keys, err = d.device.readKeys()
+		return err
+	})
+	return keys, err
+}
+
+func (d retrying) readReservation() (key uint64, typ uint32, err error) {
+	err = d.again(func() error {
+		key, typ, err = d.device.readReservation()
+		return err
+	})
+	return key, typ, err
+}
+
+func (d retrying) again(command func() error) error {
+	if err := command(); !errors.Is(err, statusError(statusIOError)) {
+		return err
+	}
+	if d.retried != nil {
+		d.retried()
+	}
+	return command()
 }
 
 type blockDevice struct {
