@@ -28,7 +28,7 @@ func TestNodeKey(t *testing.T) {
 func TestIoctlNumbers(t *testing.T) {
 	for got, want := range map[uintptr]uintptr{
 		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
-		iocReadKeys: 0xc01070ce,
+		iocReadKeys: 0xc01070ce, iocReadResv: 0x801070cf,
 	} {
 		if got != want {
 			t.Errorf("ioctl %#x, want %#x", got, want)
@@ -217,10 +217,11 @@ type statusDevice struct{ preemptStatus, registerStatus uintptr }
 func (d statusDevice) register(old, new uint64, ignore bool) error {
 	return ioctlResult(d.registerStatus, 0)
 }
-func (d statusDevice) reserve(uint64) error                  { return nil }
-func (d statusDevice) preemptAbort(own, victim uint64) error { return ioctlResult(d.preemptStatus, 0) }
-func (d statusDevice) clear(uint64) error                    { return nil }
-func (d statusDevice) readKeys() ([]uint64, error)           { return nil, nil }
+func (d statusDevice) reserve(uint64) error                     { return nil }
+func (d statusDevice) preemptAbort(own, victim uint64) error    { return ioctlResult(d.preemptStatus, 0) }
+func (d statusDevice) clear(uint64) error                       { return nil }
+func (d statusDevice) readKeys() ([]uint64, error)              { return nil, nil }
+func (d statusDevice) readReservation() (uint64, uint32, error) { return 0, 0, nil }
 
 // Preempt reads a conflict alike from SCSI and NVMe, and stops on any other status.
 func TestPreemptStatusesFromBothTransports(t *testing.T) {

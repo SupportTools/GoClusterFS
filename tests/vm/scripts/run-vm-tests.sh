@@ -3800,7 +3800,7 @@ test_fencing_clear_reservations() {
 
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
-    ssh_run "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
+    ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
 }
 
 # A clean unmount removes the node's reservation key, after its last write.
@@ -3827,6 +3827,115 @@ test_fencing_unmount_removes_key() {
         result=1
     fi
     setup_goclusterfs "$vm" false || result=1
+    return $result
+}
+
+# reservation_test runs fsck -test-reservations on VM $1 with the arguments $2 and prints its output and exit code.
+reservation_test() {
+    ssh_run "$1" "/usr/local/bin/goclusterfs-fsck -test-reservations $2 $(cluster_device) 2>&1; echo rc=\$?"
+}
+
+# kept_key prints the key a reservation test's output $1 tells the operator to pass on.
+kept_key() {
+    grep -oE '(-preempt|-check-kept) 0x4746[0-9a-f]{12}' <<< "$1" | head -1 | cut -d' ' -f2
+}
+
+# reconnected waits until VM $1 reads the cluster device again after the target came back. open-iscsi reconnects in
+# the same session, which LIO's restored registrations name.
+reconnected() {
+    ssh_run_capped 120 "$1" "for t in \$(seq 90); do dd if=$(cluster_device) of=/dev/null bs=4096 count=1 iflag=direct 2>/dev/null && exit 0; sleep 1; done; exit 1"
+}
+
+# fsck -test-reservations qualifies LIO for fencing: it refuses the mounted volume, passes alone on VM 1, and in the
+# two-host test VM 2's preempt makes the device refuse VM 1's write. A key survives a target power cycle that restores
+# LIO's APTPL file. -check-kept reports it lost after a power cycle that does not, and after an iSCSI logout and
+# login, whose new session does not hold the key LIO still lists for the old one.
+test_fencing_reservation_self_test() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 out key
+    fencing_restart pr || return 1
+    out=$(reservation_test 1 "")
+    if [[ "$out" != *"refused:"*"holds a GoClusterFS volume, mounted by"*"rc=8" ]]; then
+        log_error "fsck -test-reservations on the mounted volume did not refuse: $out"
+        result=1
+    fi
+    unmount_goclusterfs 1 || return 1
+    unmount_goclusterfs 2 || return 1
+
+    out=$(reservation_test 1 -force)
+    log_info "fsck -test-reservations on VM 1:"$'\n'"$out"
+    if [[ "$out" != *"rc=0" ]] || grep -q '^FAIL' <<< "$out"; then
+        log_error "fsck -test-reservations failed on LIO"
+        result=1
+    fi
+    if registered_initiators | grep -q "goclusterfs:vm"; then
+        log_error "fsck -test-reservations left a key: $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+
+    ssh_run 1 "rm -f /tmp/victim.out; (/usr/local/bin/goclusterfs-fsck -test-reservations -force -victim $(cluster_device) > /tmp/victim.out 2>&1; echo rc=\$? >> /tmp/victim.out) > /dev/null 2>&1 &"
+    for _ in $(seq 60); do
+        key=$(kept_key "$(ssh_run 1 "cat /tmp/victim.out")")
+        [[ -n "$key" ]] && break
+        sleep 1
+    done
+    if [[ -z "$key" ]]; then
+        log_error "host A printed no key: $(ssh_run 1 "cat /tmp/victim.out")"
+        return 1
+    fi
+    out=$(reservation_test 2 "-force -preempt $key")
+    log_info "host B, VM 2:"$'\n'"$out"
+    if [[ "$out" != *"rc=0" ]] || grep -q '^FAIL' <<< "$out"; then
+        log_error "host B's preempt failed"
+        result=1
+    fi
+    for _ in $(seq 60); do
+        out=$(ssh_run 1 "cat /tmp/victim.out")
+        [[ "$out" == *"rc="* ]] && break
+        sleep 1
+    done
+    log_info "host A, VM 1:"$'\n'"$out"
+    if [[ "$out" != *"after host B preempted this host: refused with EBADE"*"rc=0" ]] || grep -q '^FAIL' <<< "$out"; then
+        log_error "the device did not refuse host A's write after host B preempted it"
+        result=1
+    fi
+
+    local how
+    for how in relogin restore lose; do
+        key=$(kept_key "$(reservation_test 1 "-force -keep")")
+        if [[ -z "$key" ]]; then
+            log_error "fsck -test-reservations -keep left no key"
+            result=1
+            break
+        fi
+        case "$how" in
+            relogin) relogin_iscsi 1 ;;
+            restore) power_cycle_target keep && reconnected 1 && reconnected 2 ;;
+            lose) power_cycle_target && reconnected 1 && reconnected 2 ;;
+        esac || { log_error "detaching the device ($how) failed"; result=1; break; }
+        out=$(reservation_test 1 "-force -check-kept $key")
+        log_info "after $how:"$'\n'"$out"$'\n'"registrations on the target:"$'\n'"$(registered_initiators)"
+        if [[ "$how" != restore ]]; then
+            if [[ "$out" != *"did not survive"*"rc=4" ]]; then
+                log_error "-check-kept did not report the key lost after $how"
+                result=1
+            fi
+        elif [[ "$out" != *"rc=0" ]] || grep -q '^FAIL' <<< "$out"; then
+            log_error "the key did not survive $how"
+            result=1
+        fi
+    done
+
+    out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"rc=0" ]] || registered_initiators | grep -q "goclusterfs:vm"; then
+        log_error "keys left after the self-test: $out $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+    setup_goclusterfs 1 false || result=1
+    setup_goclusterfs 2 false || result=1
     return $result
 }
 
@@ -4981,6 +5090,7 @@ main() {
     run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
+    run_test "Fencing: Reservation Self-Test" test_fencing_reservation_self_test
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall

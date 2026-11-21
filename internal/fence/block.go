@@ -51,6 +51,7 @@ var (
 	iocPreemptAbort = ioc(1, 204, unsafe.Sizeof(preemption{}))
 	iocClear        = ioc(1, 205, unsafe.Sizeof(clearing{}))
 	iocReadKeys     = ioc(3, 206, unsafe.Sizeof(keyList{}))
+	iocReadResv     = ioc(2, 207, unsafe.Sizeof(reservationState{}))
 )
 
 func ioc(dir, nr, size uintptr) uintptr { return dir<<30 | size<<16 | 'p'<<8 | nr }
@@ -80,6 +81,11 @@ type keyList struct {
 	keys              uint64
 }
 
+type reservationState struct {
+	key             uint64
+	generation, typ uint32
+}
+
 // maxListedKeys bounds a key listing: a volume has at most 64 nodes, plus fsck's and format's keys.
 const maxListedKeys = 256
 
@@ -96,16 +102,27 @@ func (d blockDevice) ioctl(req uintptr, arg unsafe.Pointer) error {
 func ioctlResult(r uintptr, errno syscall.Errno) error {
 	switch {
 	case errno == syscall.ENOTTY || errno == syscall.EOPNOTSUPP:
-		return fmt.Errorf("%w (%v)", ErrUnsupported, errno)
+		return fmt.Errorf("%w (%w)", ErrUnsupported, errno)
 	case errno != 0:
 		return errno
 	case r == statusConflict || r == nvmeStatusConflict:
-		return ErrReservationConflict
+		return fmt.Errorf("%w (status %#x)", ErrReservationConflict, r)
 	case r != 0:
-		return fmt.Errorf("persistent reservation command failed with status %#x", r)
+		return statusError(r)
 	}
 	return nil
 }
+
+// statusError is a device status other than success or a conflict.
+type statusError uintptr
+
+func (s statusError) Error() string {
+	return fmt.Sprintf("persistent reservation command failed with status %#x", uintptr(s))
+}
+
+// statusIOError is PR_STS_IOERR, the kernel's status for any failure but a conflict. A SCSI unit attention, which the
+// first command from a host whose key another host preempted gets, is one.
+const statusIOError = 0x02
 
 func (d blockDevice) register(old, new uint64, ignore bool) error {
 	r := registration{old: old, new: new}
@@ -144,11 +161,19 @@ func (d blockDevice) readKeys() ([]uint64, error) {
 	return keys[:list.count], nil
 }
 
-// unlistable reports EINVAL from a key listing as ErrUnsupported: on kernels without IOC_PR_READ_KEYS, sd passes the
-// unknown command to scsi_ioctl, which answers EINVAL instead of ENOTTY.
+func (d blockDevice) readReservation() (key uint64, typ uint32, err error) {
+	var r reservationState
+	if err := unlistable(d.ioctl(iocReadResv, unsafe.Pointer(&r))); err != nil {
+		return 0, 0, err
+	}
+	return r.key, r.typ, nil
+}
+
+// unlistable reports EINVAL from a listing as ErrUnsupported: on kernels without IOC_PR_READ_KEYS or
+// IOC_PR_READ_RESERVATION, sd passes the unknown command to scsi_ioctl, which answers EINVAL instead of ENOTTY.
 func unlistable(err error) error {
 	if errors.Is(err, syscall.EINVAL) {
-		return fmt.Errorf("%w (%v)", ErrUnsupported, err)
+		return fmt.Errorf("%w (%w)", ErrUnsupported, err)
 	}
 	return err
 }

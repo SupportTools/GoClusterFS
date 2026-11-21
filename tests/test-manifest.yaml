@@ -5437,6 +5437,90 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestPartitionInSysfs
 
+  - id: fence-self-test-run
+    name: The reservation self-test passes on a device that fences and leaves no key
+    description: fsck -test-reservations' single-host run sends every reservation command fencing sends from temporary keys, clears when no other host holds a key, and unregisters its last key
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestPassesAndLeavesNoKey
+
+  - id: fence-self-test-foreign-keys
+    name: The reservation self-test leaves another host's key and reservation
+    description: With another host registered and reserved, the self-test passes, skips only the clear, and leaves that host's key and reservation
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestLeavesAnotherHostsKey
+
+  - id: fence-self-test-two-hosts
+    name: In the two-host self-test, host B's preempt makes the device refuse host A's write
+    description: Host A registers, reserves and waits; host B preempts and aborts A's key and holds its own; A's next 4 KiB write gets EBADE and its key reads as gone; no key is left
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestTwoHosts
+
+  - id: fence-self-test-writable
+    name: The two-host self-test fails storage that takes a preempted host's write
+    description: When the device accepts host A's write after host B preempted A, the self-test reports that it cannot fence
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestFailsWhenAPreemptedHostCanWrite
+
+  - id: fence-self-test-cleanup
+    name: The reservation self-test removes its key after a failed step
+    description: A reserve the device refuses stops the test, which still unregisters its key
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestRemovesItsKeyAfterAFailure
+
+  - id: fence-self-test-key-zero
+    name: The reservation self-test catches an unregister that leaves a key
+    description: A device that keeps an unregistered host registered under key 0 fails the listing after the unregister
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestCatchesAnUnregisterThatLeavesAKey
+
+  - id: fence-self-test-unlisted
+    name: The reservation self-test works without the listing ioctls
+    description: Without IOC_PR_READ_KEYS and IOC_PR_READ_RESERVATION the test warns once for each, skips the checks that need them and the clear, and passes
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestWithoutListings
+
+  - id: fence-self-test-kept
+    name: The persistence self-test finds a kept key or reports it lost
+    description: -keep leaves a key and the reservation; -check-kept passes and removes the key while the device kept them, and fails once they are gone
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestKeepAndCheckKept
+
+  - id: fence-conflict-status
+    name: A reservation conflict names the device status
+    description: Conflicts from SCSI (0x18) and NVMe (0x83) stay ErrReservationConflict and show the status, so the self-test reports what the device answered
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestReservationConflictShowsTheStatus
+
+  - id: fence-self-test-key-format
+    name: Self-test keys print as 16 hex digits
+    description: The keys the self-test prints are 0x and 16 digits, as -clear-reservations prints them and -preempt and -check-kept parse them
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestKeysPrintAsSixteenDigits
+
+  - id: fence-self-test-no-answer
+    name: The reservation self-test stops when the device stops answering
+    description: A command without an answer within the step timeout fails, the test sends nothing more, and the clean up names the key left behind
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestStopsWhenTheDeviceStopsAnswering
+
+  - id: fence-self-test-status-retry
+    name: The reservation self-test retries status 0x2 once
+    description: A status 0x2 answer (PR_STS_IOERR), which LIO gives a preempted host's first command, is retried once and the step says so
+    priority: go_only
+    environments:
+      go: internal/fence/selftest_test.go::TestSelfTestRetriesStatus0x2
+
   - id: storage-quiesce
     name: Quiesce drains in-flight I/O and holds new I/O
     description: Quiesce runs its function only after a write in flight finishes, and a read started meanwhile waits until the function returns
@@ -5580,6 +5664,13 @@ scenarios:
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_unmount_removes_key
+
+  - id: fencing-reservation-self-test
+    name: fsck -test-reservations qualifies an LIO target
+    description: The self-test refuses the mounted volume; once both nodes unmount it passes alone on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write; a kept key survives a target power cycle that restores LIO's APTPL file, and -check-kept reports it lost after a power cycle that does not and after an iSCSI logout and login
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_reservation_self_test
 
   - id: storage-last-error
     name: Device remembers its last I/O failure

@@ -432,8 +432,10 @@ attach_storage() {
 }
 
 # configure_iscsi_target exports the target VM's /dev/vda, the cluster image, as one LUN with LIO through configfs,
-# with an ACL per node VM. LIO saves the reservations in /var/target/pr.
+# with an ACL per node VM. LIO saves the reservations in /var/target/pr. A rebuild passes the LUN's old unit serial $1
+# and, to keep the reservations, the target VM's copy $2 of the file LIO saved them in.
 configure_iscsi_target() {
+    local serial="${1:-}" metadata="${2:-}"
     ssh_run "$TARGET_VM_ID" "sh -s" <<SCRIPT
 set -e
 for m in target_core_mod target_core_iblock iscsi_target_mod; do modprobe \$m; done
@@ -443,6 +445,8 @@ cd /sys/kernel/config/target
 mkdir -p core/iblock_0/lun0
 echo udev_path=/dev/vda > core/iblock_0/lun0/control
 echo 1 > core/iblock_0/lun0/enable
+[ -z "$serial" ] || echo "$serial" > core/iblock_0/lun0/wwn/vpd_unit_serial
+[ -z "$metadata" ] || cat "$metadata" > core/iblock_0/lun0/pr/res_aptpl_metadata
 tpg=iscsi/${ISCSI_TARGET_IQN}/tpgt_1
 mkdir -p \$tpg/lun/lun_0 \$tpg/np/0.0.0.0:3260
 ln -s /sys/kernel/config/target/core/iblock_0/lun0 \$tpg/lun/lun_0/disk
@@ -453,6 +457,31 @@ done
 echo 0 > \$tpg/attrib/authentication
 echo 1 > \$tpg/enable
 SCRIPT
+}
+
+# power_cycle_target kills the iSCSI target VM and boots it again, as a storage power loss would, and serves the LUN
+# under its old serial. With "keep" it first copies the file LIO saved the reservations in (APTPL) to the host, and
+# restores it before nodes reconnect, as OPERATIONS.md says; without, the reservations are lost.
+power_cycle_target() {
+    local keep="${1:-}" serial saved="${VM_RUN_DIR}/aptpl.saved"
+    serial=$(ssh_run_capped 30 "$TARGET_VM_ID" "sed 's/.*: //' /sys/kernel/config/target/core/iblock_0/lun0/wwn/vpd_unit_serial") || return 1
+    if [[ "$keep" == keep ]]; then
+        ssh_run_capped 30 "$TARGET_VM_ID" "cat /var/target/pr/aptpl_$serial" > "$saved" || return 1
+    fi
+    kill_vm "$TARGET_VM_ID" || return 1
+    boot_vm "$TARGET_VM_ID" || return 1
+    if [[ "$keep" == keep ]]; then
+        ssh_run "$TARGET_VM_ID" "cat > /root/aptpl.saved" < "$saved" || return 1
+        configure_iscsi_target "$serial" /root/aptpl.saved
+    else
+        configure_iscsi_target "$serial"
+    fi
+}
+
+# relogin_iscsi logs node VM $1 out of the target and in again, as detaching and attaching the disk would.
+relogin_iscsi() {
+    local portal="10.0.2.2:${ISCSI_PORT}"
+    ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null 2>&1; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null && for t in \$(seq 20); do dd if=/dev/sda of=/dev/null bs=4096 count=1 iflag=direct 2>/dev/null && exit 0; sleep 1; done; exit 1"
 }
 
 # login_iscsi logs node VM $1 in to the target as its own initiator, which fails I/O after 5 s instead of queuing it.
@@ -775,6 +804,13 @@ ssh_run() {
     local ssh_port=$(get_vm_ssh_port "$vm_id")
 
     ssh ${SSH_OPTIONS} -i "$(get_ssh_key)" -p "$ssh_port" "${SSH_USER}@127.0.0.1" "$@"
+}
+
+# ssh_run_capped is ssh_run that gives up after $1 seconds, for a command the guest's kernel may never finish.
+ssh_run_capped() {
+    local secs="$1" vm_id="$2"
+    shift 2
+    timeout -s KILL "$secs" ssh ${SSH_OPTIONS} -i "$(get_ssh_key)" -p "$(get_vm_ssh_port "$vm_id")" "${SSH_USER}@127.0.0.1" "$@"
 }
 
 # VMs accept only the run's SSH key; kept for existing callers
