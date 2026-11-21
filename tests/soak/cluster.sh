@@ -54,7 +54,7 @@ kill_mount() {
 node_device() {
     local disk
     if [[ "$MULTIPATH" == true ]]; then
-        multipath_over "$1"
+        multipath_over "$1" && echo /dev/mapper/gcfs-mpath
     elif [[ "$VM_STORAGE" == iscsi ]]; then
         disk=$(iscsi_disk "$1") && [[ -n "$disk" ]] && echo "/dev/$disk"
     else
@@ -91,7 +91,7 @@ relogin_node() {
         [[ -n "$disk" ]] && ssh_run "$vm_id" "test -b /dev/$disk" && break
         sleep 1
     done
-    multipath_over "$vm_id" > /dev/null || return 1
+    multipath_over "$vm_id" "$disk" || return 1
     if (( pause > 0 )); then
         sleep "$pause"
         ssh_run "$vm_id" "kill -CONT $pid" || true
