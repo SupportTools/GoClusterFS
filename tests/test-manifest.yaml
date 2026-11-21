@@ -5594,6 +5594,55 @@ scenarios:
     environments:
       go: internal/fence/selftest_test.go::TestSelfTestNotesACommandSentAgain
 
+  - id: fence-rekey-restores
+    name: A node whose session lost its key registers it again
+    description: With its heartbeat recent and its slot live, Rekey registers the key again with writes held, and the node's writes land again
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyRestoresALostKey
+
+  - id: fence-rekey-stall-before-register
+    name: A stall before the re-register lands no write after a takeover
+    description: A stall between the age check and the register lets a peer preempt and mark the slot Dead first; the register reaches the device, the checks after it fail, the key goes again, and no write lands after the takeover
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyStalledBeforeRegisterLandsNoWrite
+
+  - id: fence-rekey-stall-after-register
+    name: A stall after the re-register lands no write after a takeover
+    description: A peer's preempt between the register and the second check removes the new registration; the checks fail and no write lands after the takeover
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyStalledAfterRegisterLandsNoWrite
+
+  - id: fence-rekey-refusals
+    name: Rekey refuses without registering
+    description: No register is sent while the host still holds its key, when the slot is Dead, past the 15s stall limit, or for a second loss within 10 minutes
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyRefusesWithoutRegistering
+
+  - id: storage-rekeyed-write
+    name: A refused write runs again after its key is restored
+    description: Writes that failed with EBADE run again once rekey restores the key, which runs once for all of them, and the fenced handler stays quiet
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestRekeyedWriteRunsAgain
+
+  - id: storage-failed-rekey
+    name: A failed rekey fences the node
+    description: When rekey fails the write returns EBADE, the fenced handler runs once and rekey is not tried again
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestFailedRekeyFences
+
+  - id: storage-hold-writes
+    name: HoldWrites holds writes but not reads
+    description: While HoldWrites runs, reads go on and a new write waits until it returns
+    priority: go_only
+    environments:
+      go: internal/storage/device_test.go::TestHoldWritesLetsReadsThrough
+
   - id: storage-quiesce
     name: Quiesce drains in-flight I/O and holds new I/O
     description: Quiesce runs its function only after a write in flight finishes, and a read started meanwhile waits until the function returns
@@ -5819,6 +5868,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/storage/device_test.go::TestGoneHandlerSeesENXIO
+
+  - id: fencing-session-relogin
+    name: A node on dm-multipath survives its iSCSI path logging in again
+    description: VM 1 mounts on a one-path dm-multipath map; its path logs out and in again under write load on both nodes, the node registers its key again, keeps writing, shows the restore in /health and /metrics, and fsck finds the volume clean
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_session_relogin
 
   - id: storage-last-error
     name: Device remembers its last I/O failure

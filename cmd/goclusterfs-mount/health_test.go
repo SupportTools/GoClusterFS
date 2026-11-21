@@ -150,14 +150,19 @@ func fineSources() healthSources {
 		broadcastProblem: func() string { return "" },
 		silentPeers:      func() ([]string, time.Duration) { return nil, 90 * time.Second },
 		heartbeatAge:     func() time.Duration { return 800 * time.Millisecond },
+		keyRestores:      func() (uint64, time.Time) { return 0, time.Time{} },
 	}
 }
 
 func TestFencingHealthNamesAMissingFence(t *testing.T) {
-	if h := fencingHealth("none"); h.Status != api.HealthStatusOK || !strings.HasPrefix(h.Message, "none:") {
+	if h := fencingHealth("none", 0, time.Time{}); h.Status != api.HealthStatusOK || !strings.HasPrefix(h.Message, "none:") {
 		t.Errorf("unfenced: %+v, want healthy with a message that starts with none:", h)
 	}
-	if h := fencingHealth("pr"); h.Status != api.HealthStatusOK || strings.HasPrefix(h.Message, "none") {
+	if h := fencingHealth("pr", 0, time.Time{}); h.Status != api.HealthStatusOK || strings.HasPrefix(h.Message, "none") || strings.Contains(h.Message, "again") {
 		t.Errorf("fenced: %+v", h)
+	}
+	at := time.Date(2026, 11, 21, 18, 0, 0, 0, time.UTC)
+	if h := fencingHealth("pr", 2, at); h.Status != api.HealthStatusOK || !strings.Contains(h.Message, "registered its key again 2 times") || !strings.Contains(h.Message, "2026-11-21T18:00:00Z") {
+		t.Errorf("after two key restores: %+v", h)
 	}
 }

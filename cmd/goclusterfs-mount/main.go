@@ -351,6 +351,9 @@ func main() {
 			"Check that the device is reachable and that this node did not stall, then mount again", loss)
 	})
 	dev.SetFencedHandler(nodeReg.Fenced)
+	if pr, ok := fencer.(*fence.PR); ok {
+		dev.SetRekey(restoreKey(pr, dev, nodeReg, slotIdx))
+	}
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
 	}
@@ -675,6 +678,10 @@ func main() {
 				silentPeers:      cacheMgr.SilentBroadcastPeers,
 				heartbeatAge:     func() time.Duration { return nodeReg.Stats().HeartbeatAge },
 				fencing:          fencer.Kind(),
+				keyRestores: func() (uint64, time.Time) {
+					st := nodeReg.Stats()
+					return st.KeyRestores, st.LastKeyRestore
+				},
 			})
 			apiServer.SetFileService(fileops.New(gfs))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
@@ -861,6 +868,30 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 	})
 	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
 	return pr
+}
+
+// restoreKey lets this node register its reservation key again when its storage path lost it, as a dm-multipath path
+// that logged out and in again does, and logs why when the node stops instead.
+func restoreKey(pr *fence.PR, dev *storage.Device, reg *node.Registry, slotIdx int) func() error {
+	k := &fence.Rekeyer{
+		PR:           pr,
+		HoldWrites:   dev.HoldWrites,
+		HeartbeatAge: reg.HeartbeatAge,
+		SlotLive:     func() error { return reg.SlotLive(slotIdx) },
+		StallLimit:   node.StallLimit,
+		Restored: func(age time.Duration) {
+			reg.NoteKeyRestore()
+			log.Printf("[WARN] Fencing: the device no longer knew this node's reservation key %#x, as after its storage path logged out and in again; "+
+				"registered it again with every write held, %v after the last heartbeat. A second loss within %v stops the node", pr.Key(), age.Round(time.Millisecond), fence.RekeyWindow)
+		},
+	}
+	return func() error {
+		if err := k.Rekey(); err != nil {
+			log.Printf("[WARN] Fencing: a write met a reservation conflict, and this node does not register its key again: %v", err)
+			return err
+		}
+		return nil
+	}
 }
 
 // openForFencing opens the device again for its reservation ioctls and host lock, which must outlive the device's

@@ -164,6 +164,8 @@ type Registry struct {
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 	replays              atomic.Uint64
 	replayFailures       atomic.Uint64
+	keyRestores          atomic.Uint64
+	lastKeyRestore       atomic.Int64
 	failures             map[int]*replayFailure // the last run of identical replay failures per slot
 }
 
@@ -1644,15 +1646,48 @@ type Stats struct {
 	ReplayFailures uint64 // replays that failed and were left for a retry
 	Replaying      []int  // slots whose journal this node is replaying now
 	Failing        []FailingReplay
+	// KeyRestores counts the times this node registered its reservation key again, the last at LastKeyRestore.
+	KeyRestores    uint64
+	LastKeyRestore time.Time
 }
 
 // Stats returns this node's liveness and replay counts.
 func (r *Registry) Stats() Stats {
-	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays()}
+	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays(),
+		KeyRestores: r.keyRestores.Load()}
 	if r.lastBeat.Load() != 0 {
 		st.HeartbeatAge = r.sinceLastBeat()
 	}
+	if at := r.lastKeyRestore.Load(); at != 0 {
+		st.LastKeyRestore = time.Unix(0, at)
+	}
 	return st
+}
+
+// NoteKeyRestore counts a re-register of this node's reservation key, for Stats.
+func (r *Registry) NoteKeyRestore() {
+	r.lastKeyRestore.Store(time.Now().UnixNano())
+	r.keyRestores.Add(1)
+}
+
+// HeartbeatAge is how long ago, on CLOCK_BOOTTIME, this node issued its last heartbeat that landed within StallLimit.
+func (r *Registry) HeartbeatAge() time.Duration {
+	return r.sinceLastBeat()
+}
+
+// SlotLive returns nil while registry slot slotIdx holds this node and is not Dead. It takes no registry lock, so a
+// write the heartbeat makes under them can call it.
+func (r *Registry) SlotLive(slotIdx int) error {
+	slot, err := r.readSlot(slotIdx)
+	switch {
+	case err != nil:
+		return err
+	case slot.UUID != r.localUUID:
+		return fmt.Errorf("slot %d now belongs to node %x", slotIdx, slot.UUID[:8])
+	case slot.State == NodeStateDead:
+		return fmt.Errorf("slot %d is marked Dead: a peer is taking over this node's journal and locks", slotIdx)
+	}
+	return nil
 }
 
 // Replaying returns the slots whose journal this node is replaying now.

@@ -27,6 +27,9 @@ const deadAfter = 2 * HeartbeatTimeout
 // stallLimit is how long a node may go without a heartbeat and still write: one failure scan short of deadAfter.
 const stallLimit = deadAfter - FailureCheckInterval
 
+// StallLimit is stallLimit, for fencing, which may restore this node's key only while peers cannot have taken over.
+const StallLimit = stallLimit
+
 // sighting is what this node last read in a slot: the fields a live node keeps
 // changing, and since when this node's monotonic clock has seen them unchanged.
 type sighting struct {
