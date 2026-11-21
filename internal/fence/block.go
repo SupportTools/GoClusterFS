@@ -120,9 +120,9 @@ func (s statusError) Error() string {
 	return fmt.Sprintf("persistent reservation command failed with status %#x", uintptr(s))
 }
 
-// statusCheckCondition is SCSI CHECK CONDITION, which a unit attention also returns: the first command from a host
-// after another host preempted its key gets one.
-const statusCheckCondition = 0x02
+// statusIOError is PR_STS_IOERR, the kernel's status for any failure but a conflict. A SCSI unit attention, which the
+// first command from a host whose key another host preempted gets, is one.
+const statusIOError = 0x02
 
 func (d blockDevice) register(old, new uint64, ignore bool) error {
 	r := registration{old: old, new: new}

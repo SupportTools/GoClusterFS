@@ -67,8 +67,8 @@ func newSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
 
 var errNoAnswer = errors.New("no answer")
 
-// timed runs one command with the test's time limit, and once more after a check condition: the first command from a
-// host after another host preempted its key gets a unit attention, which a check condition reports.
+// timed runs one command with the test's time limit, and once more after status 0x2: the first command from a host
+// whose key another host preempted gets a unit attention, which the kernel reports as 0x2.
 func timed[T any](s *SelfTest, command func() (T, error)) (T, error) {
 	type result struct {
 		v   T
@@ -86,7 +86,7 @@ func timed[T any](s *SelfTest, command func() (T, error)) (T, error) {
 		}()
 		select {
 		case r := <-done:
-			if try == 0 && errors.Is(r.err, statusError(statusCheckCondition)) {
+			if try == 0 && errors.Is(r.err, statusError(statusIOError)) {
 				s.retried = true
 				continue
 			}
@@ -138,11 +138,11 @@ func (g guarded) readReservation() (uint64, uint32, error) {
 	return r.key, r.typ, err
 }
 
-// report passes c on, noting a retry after a check condition. Once a command got no answer, it passes on only the
+// report passes c on, noting a retry after status 0x2. Once a command got no answer, it passes on only the
 // step that waited for it.
 func (s *SelfTest) report(c Check) {
 	if s.retried {
-		c.Answer += "; the first try got status 0x2, a check condition such as a unit attention, and was retried"
+		c.Answer += "; the first try got status 0x2, the kernel's code for any failure but a conflict, such as the unit attention a preempted host's first command gets, and was retried"
 		s.retried = false
 	}
 	if s.hung {

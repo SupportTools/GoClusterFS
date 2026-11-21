@@ -287,7 +287,7 @@ func TestSelfTestStopsWhenTheDeviceStopsAnswering(t *testing.T) {
 	}
 }
 
-// unitAttention answers the first register with a check condition, as LIO does to a host whose key was preempted.
+// unitAttention answers the first register with status 0x2, as LIO's unit attention does to a host whose key was preempted.
 type unitAttention struct {
 	*fakeDevice
 	pending *bool
@@ -296,18 +296,18 @@ type unitAttention struct {
 func (d unitAttention) register(old, new uint64, ignore bool) error {
 	if *d.pending {
 		*d.pending = false
-		return statusError(statusCheckCondition)
+		return statusError(statusIOError)
 	}
 	return d.fakeDevice.register(old, new, ignore)
 }
 
-// A check condition is retried once, and the step says so.
-func TestSelfTestRetriesACheckCondition(t *testing.T) {
+// Status 0x2 is retried once, and the step says so.
+func TestSelfTestRetriesStatus0x2(t *testing.T) {
 	pending := true
 	var r recorder
 	s := newSelfTest(unitAttention{&fakeDevice{t: NewTarget(), initiator: "a"}, &pending}, func() error { return nil }, r.report)
 	s.Run()
-	if s.Failed() || !strings.Contains(r.checks[1].Answer, "check condition") {
+	if s.Failed() || !strings.Contains(r.checks[1].Answer, "status 0x2") {
 		t.Errorf("want the first register to pass after a retry, and say so:%s", &r)
 	}
 }
