@@ -263,6 +263,9 @@ func main() {
 	if err != nil {
 		failf("Failed to open device: %v; %s", err, cli.OpenHint(err))
 	}
+	dev.SetGoneHandler(func(err error) {
+		failf("Device %s went away: %v; remount after the device returns", *devicePath, err)
+	})
 
 	// Get device size (returns int64, no error)
 	devSize := dev.Size()
@@ -776,7 +779,10 @@ func main() {
 			cacheStats.InvalidationsSent, cacheStats.InvalidationsReceived, cacheStats.BroadcastDuplicates, cacheStats.BroadcastLost)
 	}
 
-	if err := fencer.Unregister(); err != nil {
+	switch err := fencer.Unregister(); {
+	case errors.Is(err, fence.ErrFenced):
+		log.Printf("[INFO] This host's session holds no reservation key to remove: a peer removed it, or the target keeps it under an earlier session, as after an iSCSI logout and login. Peers' preempts or goclusterfs-fsck -clear-reservations remove it")
+	case err != nil:
 		log.Printf("[WARN] Removing this node's reservation key failed: %v; the next node to mount into slot %d removes it", err, slotIdx)
 	}
 	log.Println("Filesystem unmounted.")

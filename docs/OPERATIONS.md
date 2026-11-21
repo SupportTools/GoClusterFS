@@ -218,6 +218,7 @@ On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead
   2. Create the backstore again, for example `core/iblock_0/lun0` under `/sys/kernel/config/target`.
   3. Before any node logs in, write the saved file into the backstore: `cat aptpl_<serial> > /sys/kernel/config/target/core/iblock_0/lun0/pr/res_aptpl_metadata`.
   4. Create the LUN, ACLs and portal, and enable the target. Each node's registration and the reservation come back when the node logs in again, and a node fenced before the rebuild stays fenced.
+- **iSCSI paths:** mount an iSCSI LUN through dm-multipath. An iSCSI logout deletes a plain disk the mount holds open, so the mount stops with `Device ... went away` and needs a remount once the disk returns; a dm-multipath map survives a path that fails over or logs in again. A target keeps a registration under the session ID of the session that made it, and every new login gets a new one. After a logout and login, LIO usually goes on taking the node's writes, but its unregister at unmount finds no key and logs that the key stays on the target until a peer's preempt or `goclusterfs-fsck -clear-reservations` removes it.
 - **One fenced mount per host:** a registration belongs to the host's storage initiator, not to a process, so two mounts of one fenced device on one host could not fence each other. A fenced mount locks the device on its host, and a second mount refuses while the first process exists, even stopped. Kill a stopped mount before mounting again.
 - **Permissions and multipath:** on Linux 6.5 and later, registering a key needs the device opened for writing; older kernels need root (`CAP_SYS_ADMIN`). With dm-multipath, the kernel registers the key on every path.
 - **fsck:** on a fenced volume, a run that writes uses the key of the node mounted on the same host, or registers a key of its own and removes it when done. Run `-repair` and `-release-slot` on a host where no node is mounted: when fsck revokes a dead node's key there, a Linux LIO target also drops the mounted node's writes in flight, and that node can stop.
@@ -244,6 +245,8 @@ On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead
    # Verify device is visible
    ls -la /dev/mapper/shared_lun
    ```
+
+   Mount an iSCSI LUN through dm-multipath, as `/dev/mapper/shared_lun` here, not through its `/dev/sdX`. A path that fails over or logs in again then keeps the mount running; on a plain disk the mount stops (see [Storage Fencing](#storage-fencing)). Set `no_path_retry` so that I/O fails within 10 seconds once every path is gone (see the limits below).
 
 3. **Mount with cluster settings**:
    ```bash

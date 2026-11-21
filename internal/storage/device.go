@@ -91,8 +91,9 @@ type Device struct {
 	// writeFresh, when set, says without I/O whether a write that passed the
 	// gate may still land once it holds its locks.
 	writeFresh atomic.Pointer[func(offset int64) bool]
-	// readFault, when a test sets it, runs before every read and can fail it.
-	readFault atomic.Pointer[func(offset int64) error]
+	// readFault and writeFault, when a test sets them, run before every read or write and can fail it.
+	readFault  atomic.Pointer[func(offset int64) error]
+	writeFault atomic.Pointer[func(offset int64) error]
 	// writeObserver and syncObserver let tests model a volatile write cache.
 	writeObserver atomic.Pointer[func(offset int64, n int)]
 	syncObserver  atomic.Pointer[func()]
@@ -102,6 +103,8 @@ type Device struct {
 	lastErr       atomic.Pointer[error]
 	fenced        atomic.Pointer[func(error)]
 	fencedOnce    sync.Once
+	gone          atomic.Pointer[func(error)]
+	goneOnce      sync.Once
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -316,6 +319,12 @@ func (d *Device) writeIfFresh(buf []byte, offset int64, sharded bool) (landed bo
 	if fresh := d.writeFresh.Load(); fresh != nil && !(*fresh)(offset) {
 		return false, 0, nil
 	}
+	if fault := d.writeFault.Load(); fault != nil {
+		if err := (*fault)(offset); err != nil {
+			d.record(err)
+			return true, 0, err
+		}
+	}
 	resume := func() {}
 	if sharded && stopBeforeWrite != "" {
 		resume = stopIfTriggered(buf)
@@ -343,6 +352,11 @@ func (d *Device) SetWriteFresh(fresh func(offset int64) bool) {
 // SetReadFault makes fault run before every read; a read it returns an error for fails with that error.
 func (d *Device) SetReadFault(fault func(offset int64) error) {
 	d.readFault.Store(&fault)
+}
+
+// SetWriteFault makes fault run before every write; a write it returns an error for fails with that error.
+func (d *Device) SetWriteFault(fault func(offset int64) error) {
+	d.writeFault.Store(&fault)
 }
 
 // SetWriteObserver makes every write call observe with its range before it writes; nil removes it.
@@ -398,6 +412,13 @@ func (d *Device) LastError() error {
 }
 
 func (d *Device) record(err error) {
+	if err != nil {
+		if why := d.wentAway(err); why != nil {
+			if gone := d.gone.Load(); gone != nil {
+				d.goneOnce.Do(func() { (*gone)(why) })
+			}
+		}
+	}
 	switch {
 	case err == nil:
 		if d.lastErr.Load() != nil {
@@ -411,6 +432,25 @@ func (d *Device) record(err error) {
 			}
 		}
 	}
+}
+
+// wentAway returns why the device itself is gone, or nil, as when the kernel removed a SCSI or iSCSI disk: the block
+// layer answers ENXIO or ENODEV, or the disk shrank to nothing, so writes fail with ENOSPC and reads end early.
+func (d *Device) wentAway(err error) error {
+	switch {
+	case errors.Is(err, syscall.ENXIO), errors.Is(err, syscall.ENODEV):
+		return err
+	case errors.Is(err, syscall.ENOSPC), errors.Is(err, io.EOF):
+		if size, serr := d.file.Seek(0, io.SeekEnd); serr == nil && size < d.size {
+			return fmt.Errorf("%w: it is now %d bytes, not %d", err, size, d.size)
+		}
+	}
+	return nil
+}
+
+// SetGoneHandler makes the first I/O that finds the device gone call gone.
+func (d *Device) SetGoneHandler(gone func(error)) {
+	d.gone.Store(&gone)
 }
 
 // SetFencedHandler makes the first I/O that fails with a reservation conflict (EBADE) call fenced: another node

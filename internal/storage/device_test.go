@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -617,5 +618,63 @@ func TestQuiesceWaitsForIOInFlightAndHoldsNewIO(t *testing.T) {
 	}
 	if err := <-read; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func openTwoSectorDevice(t *testing.T) *Device {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = dev.Close() })
+	return dev
+}
+
+// A device the kernel removed shrinks to nothing, so writes fail with ENOSPC; that calls the gone handler once, with
+// the new size. ENOSPC from a device that kept its size does not.
+func TestGoneHandlerSeesARemovedDevice(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.img")
+	if err := os.WriteFile(path, make([]byte, 2*SectorSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dev, err := Open(path)
+	if err != nil {
+		t.Skipf("O_DIRECT not supported: %v", err)
+	}
+	defer func() { _ = dev.Close() }()
+	var gone []error
+	dev.SetGoneHandler(func(err error) { gone = append(gone, err) })
+	fault := syscall.ENOSPC
+	dev.SetWriteFault(func(int64) error { return fault })
+	write := func() { _, _ = dev.WriteAt(NewAlignedBuffer(SectorSize).Bytes(), 0) }
+
+	write()
+	if len(gone) != 0 {
+		t.Fatalf("ENOSPC from a device that kept its size called the gone handler: %v", gone)
+	}
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	write()
+	fault = syscall.ENXIO
+	write()
+	if len(gone) != 1 || !errors.Is(gone[0], syscall.ENOSPC) || !strings.Contains(gone[0].Error(), "now 0 bytes, not 8192") {
+		t.Errorf("gone handler calls %v, want one with ENOSPC naming the new size once the device shrank", gone)
+	}
+}
+
+func TestGoneHandlerSeesENXIO(t *testing.T) {
+	dev := openTwoSectorDevice(t)
+	var gone []error
+	dev.SetGoneHandler(func(err error) { gone = append(gone, err) })
+	dev.SetWriteFault(func(int64) error { return syscall.ENXIO })
+	_, _ = dev.WriteAt(NewAlignedBuffer(SectorSize).Bytes(), 0)
+	if len(gone) != 1 || !errors.Is(gone[0], syscall.ENXIO) {
+		t.Errorf("gone handler calls %v, want one with ENXIO", gone)
 	}
 }
