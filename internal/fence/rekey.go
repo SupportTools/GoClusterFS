@@ -27,10 +27,21 @@ type Rekeyer struct {
 	StallLimit time.Duration
 	// Restored, if set, runs after a re-register with the heartbeat age the last check read.
 	Restored func(age time.Duration)
+	// Listed, if set, runs with what the device listed around each register attempt.
+	Listed func(KeyListing)
 
 	last time.Time
 	// Tests stall here, as a pause would.
 	beforeRegister, afterRegister func()
+}
+
+// KeyListing is what the device listed of this node's key around a re-register: its registrations and the
+// reservation generation before and after, and the paths the register went out on.
+type KeyListing struct {
+	Paths                   int
+	Before, After           int
+	GenBefore, GenAfter     uint32
+	Registered, AfterListed bool
 }
 
 // Rekey restores this node's key after a write met a reservation conflict. Unless every check passes, it leaves this
@@ -48,6 +59,24 @@ func (k *Rekeyer) Rekey() error {
 		case !errors.Is(err, ErrReservationConflict):
 			return fmt.Errorf("checking for this node's key: %w", err)
 		}
+		// A peer takes a node over with a preempt, which removes every registration of the node's key, the ones a lost
+		// session left on the target included. Only those prove that no preempt came: the clock may have missed a
+		// pause, and the slot is marked Dead only after the preempt.
+		var l KeyListing
+		if k.Listed != nil {
+			defer func() { k.Listed(l) }()
+		}
+		paths, err := k.PR.Paths()
+		if err != nil {
+			return fmt.Errorf("counting the device's paths: %w", err)
+		}
+		l.Paths = paths
+		if l.GenBefore, l.Before, err = k.PR.Registrations(); err != nil {
+			return fmt.Errorf("listing the device's keys, which proves no peer preempted this node: %w", err)
+		}
+		if l.Before == 0 {
+			return fmt.Errorf("the device lists no registration of key %#x, so a peer preempted this node", key)
+		}
 		if err := k.live(); err != nil {
 			return err
 		}
@@ -57,11 +86,20 @@ func (k *Rekeyer) Rekey() error {
 		if err := k.PR.Register(); err != nil {
 			return fmt.Errorf("registering the key again: %w", err)
 		}
+		l.Registered = true
 		if k.afterRegister != nil {
 			k.afterRegister()
 		}
 		age := k.HeartbeatAge()
-		err := k.live()
+		l.GenAfter, l.After, err = k.PR.Registrations()
+		l.AfterListed = err == nil
+		if err == nil && l.After <= paths {
+			err = fmt.Errorf("after the register the device lists %d registrations of key %#x on %d paths, so the ones from before the loss are gone: a peer preempted this node",
+				l.After, key, paths)
+		}
+		if err == nil {
+			err = k.live()
+		}
 		if err == nil {
 			err = k.PR.Reserve()
 		}

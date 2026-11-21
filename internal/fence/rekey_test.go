@@ -216,3 +216,109 @@ func TestRekeyAfterAPausedClockLandsNoWrite(t *testing.T) {
 		t.Errorf("%d writes landed after the peer took this node over", n)
 	}
 }
+
+// A paused clock and a live slot pass every other check; a preempt between the listing and the register leaves only
+// the new registration, so the check after the register refuses and no write lands.
+func TestRekeyPausedBetweenListingAndRegisterLandsNoWrite(t *testing.T) {
+	w := newRekeyWorld(t)
+	w.loseSession()
+	w.age.Store(int64(time.Second))
+	k := w.rekeyer()
+	k.beforeRegister = func() {
+		if err := w.peer.Preempt(w.node.Key()); err != nil {
+			t.Errorf("peer's preempt: %v", err)
+		}
+	}
+	err := k.Rekey()
+	if err == nil || !strings.Contains(err.Error(), "from before the loss are gone") {
+		t.Errorf("Rekey: %v, want the check after the register to refuse", err)
+	}
+	w.dead.Store(true)
+	w.takenOver.Store(true)
+	time.Sleep(20 * time.Millisecond)
+	if n := w.lateWrites.Load(); n != 0 {
+		t.Errorf("%d writes landed after the peer took this node over", n)
+	}
+	if w.nodeRegistered() {
+		t.Error("the node's key is registered again")
+	}
+}
+
+// Without a key listing, as on kernels before IOC_PR_READ_KEYS, nothing proves the key was not preempted, so Rekey
+// registers nothing.
+func TestRekeyWithoutAKeyListingRegistersNothing(t *testing.T) {
+	w := newRekeyWorld(t)
+	w.loseSession()
+	w.target.Unlistable = true
+	if err := w.rekeyer().Rekey(); err == nil || !errors.Is(err, ErrUnsupported) {
+		t.Errorf("Rekey: %v, want ErrUnsupported", err)
+	}
+	if w.nodeRegistered() {
+		t.Error("the node's key is registered again")
+	}
+}
+
+// On a two-path dm-multipath map a register goes out on both paths. After one path's session is lost, the re-register
+// lists three registrations, more than the two paths, so it goes through. After a preempt, before or between the
+// listing and the register, it does not, and neither path may write.
+func TestRekeyOnTwoPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		preempt, during bool
+	}{
+		{name: "session lost"},
+		{name: "preempted before", preempt: true},
+		{name: "preempted between listing and register", during: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := NewTarget()
+			node := target.MultipathNode("n", 2, NodeKey([16]byte{1}))
+			peer := target.Node("p", NodeKey([16]byte{2}))
+			for _, pr := range []*PR{node, peer} {
+				if err := pr.Register(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := peer.Reserve(); err != nil {
+				t.Fatal(err)
+			}
+			target.mu.Lock()
+			target.keys["n#1-old"] = target.keys["n#1"]
+			delete(target.keys, "n#1")
+			target.mu.Unlock()
+			if tc.preempt {
+				if err := peer.Preempt(node.Key()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var listed KeyListing
+			k := &Rekeyer{
+				PR:           node,
+				HoldWrites:   func(fn func() error) error { return fn() },
+				HeartbeatAge: func() time.Duration { return time.Second },
+				SlotLive:     func() error { return nil },
+				StallLimit:   15 * time.Second,
+				Listed:       func(l KeyListing) { listed = l },
+			}
+			if tc.during {
+				k.beforeRegister = func() {
+					if err := peer.Preempt(node.Key()); err != nil {
+						t.Errorf("peer's preempt: %v", err)
+					}
+				}
+			}
+			err := k.Rekey()
+			mayWrite := target.MayWrite("n#0") || target.MayWrite("n#1")
+			if tc.preempt || tc.during {
+				if err == nil || mayWrite {
+					t.Errorf("Rekey: %v, a path may write: %v; want a refusal and no path writing (listing %+v)", err, mayWrite, listed)
+				}
+				return
+			}
+			if err != nil || !target.MayWrite("n#0") || !target.MayWrite("n#1") || listed.After != 3 {
+				t.Errorf("Rekey: %v, paths write: %v %v, listing %+v; want both paths writing and 3 registrations",
+					err, target.MayWrite("n#0"), target.MayWrite("n#1"), listed)
+			}
+		})
+	}
+}
