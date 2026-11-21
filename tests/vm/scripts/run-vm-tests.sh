@@ -3840,19 +3840,19 @@ kept_key() {
     grep -oE '(-preempt|-check-kept) 0x4746[0-9a-f]{12}' <<< "$1" | head -1 | cut -d' ' -f2
 }
 
-# reconnected waits until VM $1 reads the cluster device again after the target came back. Its initiator, open-iscsi
-# or QEMU's, reconnects in the same session, which LIO's restored registrations name.
+# reconnected waits until VM $1 reads the cluster device again after the target came back. open-iscsi reconnects in
+# the same session, which LIO's restored registrations name.
 reconnected() {
     ssh_run_capped 120 "$1" "for t in \$(seq 90); do dd if=$(cluster_device) of=/dev/null bs=4096 count=1 iflag=direct 2>/dev/null && exit 0; sleep 1; done; exit 1"
 }
 
-# fsck -test-reservations qualifies LIO, through SCSI or NVMe, for fencing: it refuses the mounted volume, passes alone
-# on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write. A key survives a target power
-# cycle that restores LIO's APTPL file, and -check-kept reports it lost after one that does not, and after an iSCSI
-# logout and login: the new session has a new session ID, and LIO ties a registration to the old one.
+# fsck -test-reservations qualifies LIO for fencing: it refuses the mounted volume, passes alone on VM 1, and in the
+# two-host test VM 2's preempt makes the device refuse VM 1's write. A key survives a target power cycle that restores
+# LIO's APTPL file. -check-kept reports it lost after a power cycle that does not, and after an iSCSI logout and
+# login, whose new session does not hold the key LIO still lists for the old one.
 test_fencing_reservation_self_test() {
-    if ! fenced_storage || [[ $NODE_COUNT -lt 2 ]]; then
-        log_warn "Skipping: needs VM_STORAGE=iscsi or nvme and 2 VMs"
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
     local result=0 out key
@@ -3905,7 +3905,6 @@ test_fencing_reservation_self_test() {
 
     local how
     for how in relogin restore lose; do
-        [[ "$how" == relogin && "$VM_STORAGE" != iscsi ]] && continue
         key=$(kept_key "$(reservation_test 1 "-force -keep")")
         if [[ -z "$key" ]]; then
             log_error "fsck -test-reservations -keep left no key"

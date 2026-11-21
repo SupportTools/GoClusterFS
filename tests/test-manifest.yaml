@@ -5667,7 +5667,7 @@ scenarios:
 
   - id: fencing-reservation-self-test
     name: fsck -test-reservations qualifies an LIO target
-    description: The self-test refuses the mounted volume; once both nodes unmount it passes alone on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write; a kept key survives a logout and login and a target restart that restores LIO's APTPL file, and -check-kept reports it lost after a restart that does not
+    description: The self-test refuses the mounted volume; once both nodes unmount it passes alone on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write; a kept key survives a target power cycle that restores LIO's APTPL file, and -check-kept reports it lost after a power cycle that does not and after an iSCSI logout and login
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_reservation_self_test

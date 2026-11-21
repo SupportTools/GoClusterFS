@@ -44,9 +44,7 @@ SHARED_DISK_SIZE_MB=${VM_CLUSTER_SIZE_MB:-1024}
 SSH_BASE_PORT=${VM_SSH_BASE_PORT:-2222}
 
 # VM_STORAGE=iscsi serves the cluster image from VM ${TARGET_VM_ID} over iSCSI (Linux LIO, with SCSI-3 persistent
-# reservations), so nodes fence each other. nvme gives each node that LUN as an emulated NVMe namespace instead, through
-# QEMU's own iSCSI initiator, so nodes send NVMe reservation commands that QEMU passes on to LIO. virtio, the default,
-# shares the image as a virtio disk without reservations.
+# reservations), so nodes fence each other. virtio, the default, shares the image as a virtio disk without reservations.
 VM_STORAGE=${VM_STORAGE:-virtio}
 TARGET_VM_ID=9
 ISCSI_PORT=$((SSH_BASE_PORT + 100))
@@ -252,7 +250,7 @@ EOF
 # =============================================================================
 download_iso() {
     download_pinned "${ISO_PATH}" "${ISO_URL}" "${ISO_SHA256}" || return 1
-    if fenced_storage; then
+    if [[ "$VM_STORAGE" == iscsi ]]; then
         download_pinned "${STD_ISO_PATH}" "${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/x86_64/${STD_ISO_NAME}" "${STD_ISO_SHA256}"
     fi
 }
@@ -408,7 +406,7 @@ start_vm() {
 
     download_iso || return 1
     create_shared_disk || return 1
-    if fenced_storage && [[ "$vm_id" != "$TARGET_VM_ID" ]]; then
+    if [[ "$VM_STORAGE" == iscsi && "$vm_id" != "$TARGET_VM_ID" ]]; then
         start_vm "$TARGET_VM_ID" || return 1
     fi
 
@@ -423,20 +421,13 @@ start_vm() {
     return 1
 }
 
-# fenced_storage reports whether the nodes reach the cluster image through the target VM, with reservations.
-fenced_storage() {
-    [[ "$VM_STORAGE" == iscsi || "$VM_STORAGE" == nvme ]]
-}
-
 # attach_storage serves the cluster image when VM $1 is the iSCSI target, and logs in to it from a node VM.
 attach_storage() {
-    fenced_storage || return 0
+    [[ "$VM_STORAGE" == iscsi ]] || return 0
     if [[ "$1" == "$TARGET_VM_ID" ]]; then
         configure_iscsi_target
-    elif [[ "$VM_STORAGE" == iscsi ]]; then
-        login_iscsi "$1"
     else
-        ssh_run "$1" "for t in \$(seq 20); do [ -b $(cluster_device) ] && exit 0; sleep 1; done; exit 1"
+        login_iscsi "$1"
     fi
 }
 
@@ -512,11 +503,7 @@ SCRIPT
 
 # cluster_device is the cluster image's device on a node VM.
 cluster_device() {
-    case "$VM_STORAGE" in
-        iscsi) echo /dev/sda ;;
-        nvme) echo /dev/nvme0n1 ;;
-        *) echo /dev/vda ;;
-    esac
+    if [[ "$VM_STORAGE" == iscsi ]]; then echo /dev/sda; else echo /dev/vda; fi
 }
 
 # Boot the Alpine live ISO, log in on the serial console and run the setup disk
@@ -529,13 +516,10 @@ boot_vm() {
     local pid_file=$(get_vm_pid_file "$vm_id")
     local accelerator=$(get_accelerator)
     local cpu_type=$(get_cpu_type)
-    local iso="${ISO_PATH}" forwards="hostfwd=tcp:127.0.0.1:${ssh_port}-:22" nvme=()
+    local iso="${ISO_PATH}" forwards="hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
     if [[ "$vm_id" == "$TARGET_VM_ID" ]]; then
         iso="${STD_ISO_PATH}"
         forwards="${forwards},hostfwd=tcp:127.0.0.1:${ISCSI_PORT}-:3260"
-    elif [[ "$VM_STORAGE" == nvme ]]; then
-        nvme=(-drive "if=none,id=lun0,format=raw,file.driver=iscsi,file.transport=tcp,file.portal=127.0.0.1:${ISCSI_PORT},file.target=${ISCSI_TARGET_IQN},file.lun=0,file.initiator-name=iqn.2026-11.dev.goclusterfs:vm${vm_id}"
-            -device "nvme,serial=gcfs-vm${vm_id},drive=lun0")
     fi
 
     # Clean up old sockets before starting (avoids "Address already in use")
@@ -559,7 +543,6 @@ boot_vm() {
         -boot d \
         -drive "file=${SHARED_DISK_PATH},format=raw,if=virtio,cache=none,discard=unmap,file.locking=off" \
         -drive "file=${VM_RUN_DIR}/setup.img,format=raw,if=virtio,readonly=on" \
-        "${nvme[@]}" \
         -netdev "user,id=net0,${forwards}" \
         -device "virtio-net-pci,netdev=net0" \
         -device virtio-serial-pci \
