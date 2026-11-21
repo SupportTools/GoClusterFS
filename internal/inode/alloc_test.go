@@ -2,9 +2,12 @@ package inode
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sort"
 	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 func TestAllocationStartSpreadsNodes(t *testing.T) {
@@ -94,5 +97,115 @@ func TestFindFreeSlotFindsEveryFreeInode(t *testing.T) {
 	}
 	if _, err := table.FindFreeSlot(); !errors.Is(err, ErrInodeFull) {
 		t.Errorf("FindFreeSlot on a full table: err = %v, want ErrInodeFull", err)
+	}
+}
+
+// Each create used to reread every used inode from this node's start, so its
+// cost grew with the file count: 12 MB per create with 44k files.
+func TestFindFreeSlotReadsFromWhereItLeftOff(t *testing.T) {
+	const total, used = 65536, 40000
+	dev, cleanup := createTestDevice(t, total*InodeSize)
+	defer cleanup()
+	ctx := context.Background()
+
+	buf := storage.NewAlignedBuffer(used * InodeSize)
+	for num := InodeFirstUsable; num < used; num++ {
+		binary.LittleEndian.PutUint32(buf.Bytes()[num*InodeSize:], InodeMagic)
+	}
+	if _, err := dev.WriteAt(buf.Bytes(), 0); err != nil {
+		t.Fatal(err)
+	}
+	table := NewTable(dev, 0, total*InodeSize, nil, [16]byte{1})
+	if _, err := claimFree(ctx, table); err != nil {
+		t.Fatal(err)
+	}
+
+	counting, reads := false, 0
+	dev.SetReadFault(func(int64) error {
+		if counting {
+			reads++
+		}
+		return nil
+	})
+	for i := range 200 {
+		counting, reads = true, 0
+		num, err := table.FindFreeSlot()
+		counting = false
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := uint32(used + 1 + i); num != want {
+			t.Fatalf("create %d got inode %d, want %d", i, num, want)
+		}
+		if reads > 2 {
+			t.Fatalf("create %d read the inode table %d times, want at most 2: it rescanned the %d used inodes", i, reads, used)
+		}
+		if _, err := table.ClaimSlot(ctx, num); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Scans start at this node's start (inode 33 here) and resume after the last
+// free inode they found.
+func TestFindFreeSlotFindsInodesAnotherNodeFreed(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	a := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
+	b := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+	a.SetAllocationStart(1, 2)
+	for {
+		if _, err := claimFree(ctx, a); errors.Is(err, ErrInodeFull) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := b.Free(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+	if num, err := a.FindFreeSlot(); err != nil || num != 10 {
+		t.Fatalf("FindFreeSlot = %d, %v; want inode 10, which the other node freed behind this node's last find", num, err)
+	}
+	if _, err := a.ClaimSlot(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.Free(ctx, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Free(ctx, 50); err != nil {
+		t.Fatal(err)
+	}
+	if num, err := a.FindFreeSlot(); err != nil || num != 50 {
+		t.Errorf("FindFreeSlot = %d, %v; want inode 50, the first free inode from this node's start", num, err)
+	}
+}
+
+func TestFindFreeSlotStartsOverForInodesOtherNodesFreed(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	a := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
+	b := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+	for range 20 {
+		if _, err := claimFree(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := b.Free(ctx, 5); err != nil {
+		t.Fatal(err)
+	}
+	if num, err := a.FindFreeSlot(); err != nil || num != 23 {
+		t.Fatalf("FindFreeSlot = %d, %v; want inode 23 before its next start over", num, err)
+	}
+
+	a.restartEvery = 0
+	if num, err := a.FindFreeSlot(); err != nil || num != 5 {
+		t.Errorf("FindFreeSlot = %d, %v; want inode 5, which the other node freed", num, err)
 	}
 }

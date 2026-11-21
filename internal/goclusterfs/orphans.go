@@ -302,14 +302,21 @@ func (f *FS) ForgetSlot(ctx context.Context, k int, dead []node.Orphan) error {
 
 // pruneOwnOrphans drops freed orphans. An entry still linked may be an unlink between reserveOrphan and dropLink.
 func (f *FS) pruneOwnOrphans(dropLinked bool) (dropped int) {
+	var freed []uint32
 	err := f.orphanReg.DropOrphans(func(o node.Orphan) bool {
 		ino, err := f.inodeTbl.Read(o.Inode)
 		done := err == nil && (ino.Magic != inode.InodeMagic || orphanOf(ino) != o || ino.LinkCount != 0 && dropLinked)
 		if done {
 			dropped++
+			if ino.Magic != inode.InodeMagic {
+				freed = append(freed, o.Inode)
+			}
 		}
 		return done
 	})
+	for _, num := range freed {
+		f.inodeTbl.NoteFreed(num)
+	}
 	if err != nil && !errors.Is(err, node.ErrNotRegistered) {
 		log.Printf("[WARN] pruning this node's orphan list failed: %v", err)
 		return 0

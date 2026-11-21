@@ -17,7 +17,9 @@ import (
 	"log"
 	"math/bits"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -165,7 +167,11 @@ type Table struct {
 	nodeUUID    [16]byte      // This node's UUID
 	treeFlusher TreeFlusher
 	syncDevice  func() error
-	scanStart   uint64 // FindFreeSlot's first slot, as an offset from InodeFirstUsable
+	scanStart   uint64        // FindFreeSlot's first slot, as an offset from InodeFirstUsable
+	resume      atomic.Uint64 // where FindFreeSlot starts reading; the slots before it, from scanStart on, were in use
+	// restartEvery is how often FindFreeSlot reads from scanStart again, to reuse inodes other nodes freed.
+	restartEvery time.Duration
+	restarted    atomic.Int64
 }
 
 // SetTreeFlusher sets the writer for pending extent-tree changes.
@@ -185,6 +191,7 @@ func (t *Table) SetAllocationStart(slot, slots int) {
 	width := bits.Len(uint(slots - 1))
 	fraction := bits.Reverse64(uint64(slot)) >> (64 - width)
 	t.scanStart = (t.totalInodes - uint64(InodeFirstUsable)) * fraction >> width
+	t.resume.Store(uint64(InodeFirstUsable) + t.scanStart)
 }
 
 // NewTable creates a new inode table manager.
@@ -197,7 +204,7 @@ func (t *Table) SetAllocationStart(slot, slots int) {
 //   - nodeUUID: This node's UUID for modification tracking
 func NewTable(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager, nodeUUID [16]byte) *Table {
 	totalInodes := size / InodeSize
-	return &Table{
+	t := &Table{
 		dev:         dev,
 		offset:      offset,
 		size:        size,
@@ -205,7 +212,11 @@ func NewTable(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager, n
 		lockMgr:     lockMgr,
 		nodeUUID:    nodeUUID,
 		syncDevice:  dev.Sync,
+
+		restartEvery: time.Minute,
 	}
+	t.resume.Store(uint64(InodeFirstUsable))
+	return t
 }
 
 // Read reads an inode from disk.
@@ -413,7 +424,11 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	start := uint64(InodeFirstUsable) + t.scanStart
+	start := t.resume.Load()
+	if now := time.Now().UnixNano(); now-t.restarted.Load() >= int64(t.restartEvery) {
+		t.restarted.Store(now)
+		start = uint64(InodeFirstUsable) + t.scanStart
+	}
 	free := uint32(0)
 	isFree := func(num, magic uint32) bool {
 		if magic == 0 {
@@ -421,22 +436,46 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 		}
 		return magic != 0
 	}
-	if t.scanMagic(start, t.totalInodes, isFree); free != 0 {
-		return free, nil
+	if t.scanMagic(start, t.totalInodes, SectorSize, isFree); free == 0 {
+		t.scanMagic(uint64(InodeFirstUsable), start, SectorSize, isFree)
 	}
-	if t.scanMagic(uint64(InodeFirstUsable), start, isFree); free != 0 {
-		return free, nil
+	if free == 0 {
+		return 0, ErrInodeFull
 	}
-	return 0, ErrInodeFull
+	t.resume.Store(uint64(free))
+	return free, nil
 }
 
-// scanMagic reads the inode table 1 MB at a time and calls fn with each magic in [from, to) until fn returns false.
-func (t *Table) scanMagic(from, to uint64, fn func(num, magic uint32) bool) {
+// NoteFreed tells FindFreeSlot that another node freed inode num.
+func (t *Table) NoteFreed(num uint32) {
+	if num < InodeFirstUsable || uint64(num) >= t.totalInodes {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.freedBeforeResume(num)
+}
+
+// freedBeforeResume moves FindFreeSlot back to free inode num if its scan would
+// only reach num after wrapping. Called with t.mu held.
+func (t *Table) freedBeforeResume(num uint32) {
+	usable := t.totalInodes - uint64(InodeFirstUsable)
+	scanOrder := func(n uint64) uint64 {
+		return (n - uint64(InodeFirstUsable) + usable - t.scanStart) % usable
+	}
+	if scanOrder(uint64(num)) < scanOrder(t.resume.Load()) {
+		t.resume.Store(uint64(num))
+	}
+}
+
+// scanMagic reads the inode table from chunk bytes at a time, doubling up to 1 MB, and calls fn with each magic in
+// [from, to) until fn returns false.
+func (t *Table) scanMagic(from, to, chunk uint64, fn func(num, magic uint32) bool) {
 	buf := storage.GetBuffer(scanBytes)
 	defer storage.PutBuffer(buf)
 
-	for sector := from / InodesPerSector; sector*InodesPerSector < to; {
-		sectors := min(scanBytes/SectorSize, (to+InodesPerSector-1)/InodesPerSector-sector)
+	for sector := from / InodesPerSector; sector*InodesPerSector < to; chunk = min(2*chunk, scanBytes) {
+		sectors := min(chunk/SectorSize, (to+InodesPerSector-1)/InodesPerSector-sector)
 		data := buf.Bytes()[:sectors*SectorSize]
 		if _, err := t.dev.ReadAt(data, int64(t.offset+sector*SectorSize)); err == nil {
 			for num := max(from, sector*InodesPerSector); num < min(to, (sector+sectors)*InodesPerSector); num++ {
@@ -610,6 +649,7 @@ func (t *Table) freeIfOnce(ctx context.Context, inodeNum uint32, ok func(*Inode)
 	if err := t.writeInodeUnlocked(emptyInode); err != nil {
 		return false, err
 	}
+	t.freedBeforeResume(inodeNum)
 	return true, nil
 }
 
@@ -662,7 +702,7 @@ func (t *Table) TotalInodes() uint64 {
 // FreeCount estimates free inodes; it scans without t.mu, so a full-table scan never stalls inode writes.
 func (t *Table) FreeCount() uint64 {
 	freeCount := uint64(0)
-	t.scanMagic(uint64(InodeFirstUsable), t.totalInodes, func(_, magic uint32) bool {
+	t.scanMagic(uint64(InodeFirstUsable), t.totalInodes, scanBytes, func(_, magic uint32) bool {
 		if magic == 0 {
 			freeCount++
 		}
