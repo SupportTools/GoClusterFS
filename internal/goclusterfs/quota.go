@@ -27,11 +27,13 @@ var (
 	_ fs.NodeListxattrer   = (*Dir)(nil)
 )
 
-// SetQuotaTable names the inode that holds the volume's quota table; 0, the default, leaves quotas off.
-func (f *FS) SetQuotaTable(num uint32) { f.quotaInode = num }
+// SetQuotaTable names the inode that holds the volume's quota table and the volume's block size, in which usage and
+// limits count; num 0, the default, leaves quotas off.
+func (f *FS) SetQuotaTable(num uint32, blockSize uint64) {
+	f.quotaInode, f.quotaBlockSize = num, blockSize
+}
 
-// dataBlockSize is the volume's data block size, in which quota usage and limits count.
-func (f *FS) dataBlockSize() uint64 { return BlockSize }
+func (f *FS) dataBlockSize() uint64 { return f.quotaBlockSize }
 
 // childProject is the project a new inode in directory dir takes.
 func childProject(dir *inode.Inode) uint32 {
@@ -135,8 +137,11 @@ func (f *FS) projectRoot(num uint32, tbl quota.Table) (*inode.Inode, *quota.Reco
 // setQuota gives empty directory num a new project with the limits in value, or changes the limits of the project
 // whose root it is. The record goes in before the directory names it, so a crash leaves at worst an unused record.
 func (f *FS) setQuota(ctx context.Context, num uint32, value string) syscall.Errno {
-	if f.quotaInode == 0 {
+	switch {
+	case f.quotaInode == 0:
 		return syscall.ENOTSUP
+	case num == inode.InodeRoot:
+		return syscall.EPERM
 	}
 	setting, err := parseQuotaSetting(value)
 	if err != nil {

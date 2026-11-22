@@ -87,6 +87,9 @@ func TestQuotaXattrMakesAProject(t *testing.T) {
 	if errno := sub.Setxattr(ctx, quotaXattr, []byte("bytes=1"), 0); errno != syscall.EPERM {
 		t.Errorf("set the quota on a directory inside the project: %v, want EPERM", errno)
 	}
+	if errno := fsys.setQuota(ctx, inode.InodeRoot, "bytes=1"); errno != syscall.EPERM {
+		t.Errorf("set the quota on the volume root: %v, want EPERM", errno)
+	}
 	if errno := pvc.Setxattr(ctx, quotaXattr, []byte("bytes=5242880"), 0); errno != 0 {
 		t.Fatalf("change the project's limits: %v", errno)
 	}

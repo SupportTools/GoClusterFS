@@ -116,7 +116,7 @@ func openFormattedComponents(t *testing.T, path string) *FS {
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
 	fsys.SetSymlinks(sb.RequiredFlags&superblock.RequiredSymlinks != 0)
 	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
-		fsys.SetQuotaTable(sb.QuotaInode)
+		fsys.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize))
 	}
 	return fsys
 }

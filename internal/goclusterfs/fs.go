@@ -140,23 +140,24 @@ type FS struct {
 	releaseSlot func()
 
 	// Managers
-	lockMgr     *lock.Manager
-	bitmapMgr   *bitmap.Region
-	inodeTbl    *inode.Table
-	extentMgr   *extent.Manager
-	dirMgr      *dir.Manager
-	cacheMgr    *cache.Manager     // Inode cache for read optimization
-	journal     *journal.Journal   // Per-node journal for crash consistency (WAL)
-	reserve     *reserve.Manager   // this node's batch of data blocks; nil without a journal
-	symlinks    bool               // the volume was formatted with RequiredSymlinks
-	noSymlinks  sync.Once          // warns once that this volume cannot hold symlinks
-	trimMgr     *trim.Manager      // TRIM manager for batched block discards
-	sfbMgr      *sfb.Manager       // SFB manager for small file storage (optional)
-	refcountReg *refcount.Region   // Reference count table for CoW/snapshots (optional)
-	snapshotReg *snapshot.Registry // Snapshot registry for managing snapshot descriptors
-	snapshotWkr *snapshot.Worker   // Background worker for async refcount updates
-	snapshotsUp atomic.Bool        // snapshotReg and snapshotWkr are set, for the failure detector's goroutine
-	quotaInode  uint32             // holds the quota table; 0 when the volume has no quotas
+	lockMgr        *lock.Manager
+	bitmapMgr      *bitmap.Region
+	inodeTbl       *inode.Table
+	extentMgr      *extent.Manager
+	dirMgr         *dir.Manager
+	cacheMgr       *cache.Manager     // Inode cache for read optimization
+	journal        *journal.Journal   // Per-node journal for crash consistency (WAL)
+	reserve        *reserve.Manager   // this node's batch of data blocks; nil without a journal
+	symlinks       bool               // the volume was formatted with RequiredSymlinks
+	noSymlinks     sync.Once          // warns once that this volume cannot hold symlinks
+	trimMgr        *trim.Manager      // TRIM manager for batched block discards
+	sfbMgr         *sfb.Manager       // SFB manager for small file storage (optional)
+	refcountReg    *refcount.Region   // Reference count table for CoW/snapshots (optional)
+	snapshotReg    *snapshot.Registry // Snapshot registry for managing snapshot descriptors
+	snapshotWkr    *snapshot.Worker   // Background worker for async refcount updates
+	snapshotsUp    atomic.Bool        // snapshotReg and snapshotWkr are set, for the failure detector's goroutine
+	quotaInode     uint32             // holds the quota table; 0 when the volume has no quotas
+	quotaBlockSize uint64             // the volume's block size, in which quota usage counts
 
 	// Configuration
 	nodeUUID   [16]byte
