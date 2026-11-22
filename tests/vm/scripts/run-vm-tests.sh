@@ -4122,6 +4122,26 @@ test_fencing_reservation_self_test() {
     return $result
 }
 
+# relogin_last_path logs VM $1's last iSCSI path out and in again, as a session loss does, and points its map at the
+# new disk. The target keeps the key the old session registered.
+relogin_last_path() {
+    local portal="10.0.2.2:${ISCSI_PORT}" iface
+    iface=$(ssh_run "$1" "iscsiadm -m session -P 1 | awk '/Iface Name:/ {print \$3}' | sort | tail -1")
+    ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --logout > /dev/null; sleep 1; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --login > /dev/null; sleep 2" || return 1
+    multipath_over "$1"
+}
+
+# clear_write_flag registers and removes a spare key on VM $1's newest iSCSI path. LIO keeps one write flag per
+# initiator and clears it when any of the initiator's registrations goes, so VM $1's next write meets a reservation
+# conflict while its key stays listed, as a target that checks writes per session would refuse the relogged path.
+clear_write_flag() {
+    local disk
+    disk=$(ssh_run "$1" "iscsiadm -m session -P 3 | awk '/Iface Name:/ {i = \$3} /Attached scsi disk/ {print i, \$4}' | sort | tail -1 | cut -d' ' -f2")
+    ssh_run "$1" "command -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null
+        sg_persist --out --register --param-sark=0x47430000f1a90001 /dev/$disk > /dev/null &&
+            sg_persist --out --register --param-rk=0x47430000f1a90001 --param-sark=0 /dev/$disk > /dev/null"
+}
+
 # write_load writes small files with fsync on VM $1 and records ok or fail for each in /tmp/load.out.
 write_load() {
     ssh_run "$1" "rm -f /tmp/load.out; (i=0; while [ ! -e /tmp/load.stop ]; do i=\$((i+1)); if dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/load.vm$1.\$((i%16)) bs=64k count=4 conv=fsync 2>/dev/null; then echo ok; else echo fail; fi; sleep 0.1; done) >> /tmp/load.out 2>&1 &"
@@ -4145,9 +4165,11 @@ writes_go_on() {
 }
 
 # A node on a two-path dm-multipath map keeps writing when one path logs out and in again: LIO takes its writes while
-# the old session's registration stands, and lists the node's key under the old session and the other path. VM 2 then
-# preempts the key, as a takeover does. That is final: the device lists no registration of the key from before, so
-# VM 1 does not register it again and stops, and VM 2 writes on. Afterwards fsck finds the volume clean.
+# the old session's registration stands, and lists the node's key under the old session and the other path. A spare
+# key's removal then clears LIO's write flag for VM 1, as a target that checks writes per session would refuse the
+# relogged path: VM 1 registers its key again on that path only and writes on. VM 2 then preempts the key, as a
+# takeover does. That is final: VM 1 does not register it again and stops, and VM 2 writes on and replays it.
+# Afterwards fsck finds the volume clean.
 test_fencing_session_relogin() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
@@ -4163,8 +4185,10 @@ test_fencing_session_relogin() {
     iscsi_add_path 1 1 || return 1
     multipath_over 1 || return 1
     log_info "VM 1 mounts a map over $(iscsi_disks 1)"
-    setup_goclusterfs 1 true "" /dev/mapper/gcfs-mpath "-fencing=pr" || return 1
-    setup_goclusterfs 2 false || return 1
+    # VM 2 formats and holds the reservation: every session of the holder's host writes as the holder on LIO.
+    ssh_run 2 "$fsck -clear-reservations -confirm $(cluster_device) > /dev/null 2>&1; true"
+    setup_goclusterfs 2 true "" "" "-fencing=pr" || return 1
+    setup_goclusterfs 1 false "" /dev/mapper/gcfs-mpath || return 1
     write_load 1
     write_load 2
     sleep 5
@@ -4182,13 +4206,23 @@ test_fencing_session_relogin() {
         log_error "the device lists VM 1's key $keys times after the relogin, want it under the old session and the other path"
         result=1
     fi
+    clear_write_flag 1 || result=1
+    wait_log 1 "registered it again with every write held" 60 "$marker" || result=1
+    writes_go_on 1 "after it registered its key again" || result=1
+    keys=$(ssh_run 2 "sg_persist --in --read-keys $(cluster_device) | grep -c $(reservation_key 1 | sed 's/^0x//')")
+    if [[ "$keys" != 3 ]]; then
+        log_error "the device lists VM 1's key $keys times after the re-register, want 3: the old session, the other path and the relogged path"
+        result=1
+    fi
+    local restored
+    restored=$(sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -c "registered it again")
     ssh_run 2 "sg_persist --out --preempt-abort --param-rk=$(reservation_key 2) --param-sark=$(reservation_key 1) --prout-type=7 $(cluster_device) > /dev/null" || result=1
-    wait_log 1 "a peer preempted this node" 60 "$marker" || result=1
+    wait_log 1 "a peer preempted this node\|lost this node's key again" 60 "$marker" || result=1
     if ! wait_stopped 1 30; then
         log_error "VM 1 still runs 30s after its key was preempted"
         result=1
     fi
-    if sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -q "registered it again"; then
+    if (( $(sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -c "registered it again") > restored )); then
         log_error "VM 1 registered its key again after VM 2 preempted it"
         result=1
     fi
@@ -4232,9 +4266,10 @@ wait_log_now() {
 # slot can tell it that VM 2 is taking it over.
 #   gate:            VM 1 stops while it rewrites a file.
 #   held:            VM 1 stops between a heartbeat's slot read and its write.
-#   before-register: VM 2 preempts VM 1's key with sg_persist, so VM 1 starts to register again; VM 1 stops before
-#                    its register, and the register lands after VM 2's real takeover preempted. The stop comes 1.5s
-#                    into a 5s stall, once VM 1's heartbeat waits in a held write, so only the rekey reads the slot.
+#   before-register: VM 1's last path logs out and in, and a spare key's removal clears LIO's write flag for VM 1, so
+#                    VM 1 starts to register again with its key still listed; VM 1 stops before its register, and the
+#                    register lands after VM 2's real takeover preempted. The stop comes 1.5s into a 5s stall, once
+#                    VM 1's heartbeat waits in a held write, so only the rekey reads the slot.
 #   after-register:  as before-register, but VM 1 stops between its register and its slot read.
 rekey_pause_case() {
     local mode=$1 paths=$2 paused=1 peer=2 result=0 env1="" stop_at="" mon marker slot uuid stopped_at byte state mode_label
@@ -4244,13 +4279,15 @@ rekey_pause_case() {
     esac
     fencing_restart pr "$env1" || return 1
     unmount_goclusterfs "$paused" || return 1
+    unmount_goclusterfs "$peer" || return 1
+    # VM 2 mounts first and holds the reservation: every session of the holder's host writes as the holder on LIO.
+    ssh_run "$peer" "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm $(cluster_device) > /dev/null 2>&1; true"
+    setup_goclusterfs "$peer" false "GOCLUSTERFS_TEST_TAKEOVER_DELAY=10s" || return 1
     if [[ $paths -ge 2 ]]; then
         iscsi_add_path "$paused" 1 || return 1
     fi
     multipath_over "$paused" || return 1
     setup_goclusterfs "$paused" false "$env1" /dev/mapper/gcfs-mpath || return 1
-    unmount_goclusterfs "$peer" || return 1
-    setup_goclusterfs "$peer" false "GOCLUSTERFS_TEST_TAKEOVER_DELAY=10s" || return 1
     mon=$(get_vm_monitor_socket "$paused")
     slot=$(grep -o 'Registered as node [0-9]*' "$(get_vm_mount_log "$paused")" | tail -1 | grep -o '[0-9]*$')
     uuid=$(grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' "$(get_vm_mount_log "$paused")" | tail -1 | grep -o '[0-9a-f]*$')
@@ -4263,7 +4300,8 @@ rekey_pause_case() {
     ssh_run "$paused" "nohup sh -c 'while dd if=/tmp/fenced.A of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null; do :; done' < /dev/null > /dev/null 2>&1 &"
     sleep 3
     if [[ "$mode" == *register ]]; then
-        ssh_run "$peer" "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key "$peer") --param-sark=$(reservation_key "$paused") --prout-type=7 $(cluster_device) > /dev/null" || result=1
+        relogin_last_path "$paused" || result=1
+        clear_write_flag "$paused" || result=1
     fi
     local seen=""
     [[ "$mode" == *register ]] && seen=0

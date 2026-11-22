@@ -5871,7 +5871,7 @@ scenarios:
 
   - id: fencing-session-relogin
     name: A path relogin keeps a node writing, and a preempt of its key is final
-    description: VM 1 mounts on a two-path dm-multipath map; one path logs out and in again under write load and VM 1 keeps writing, with its key listed under the old session and the other path; VM 2 then preempts VM 1's key, VM 1 refuses to register it again and stops, VM 2 writes on and replays it, and fsck finds the volume clean
+    description: VM 1 mounts on a two-path dm-multipath map while VM 2 holds the reservation; one path logs out and in again under write load and VM 1 keeps writing, with its key listed under the old session and the other path; once LIO's write flag for VM 1 clears, VM 1 registers its key again on the relogged path only and writes on, with three registrations listed; VM 2 then preempts VM 1's key, VM 1 refuses to register it again and stops, VM 2 writes on and replays it, and fsck finds the volume clean
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_session_relogin
