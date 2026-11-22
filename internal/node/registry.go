@@ -957,17 +957,26 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		newSlot.Orphans = old.Orphans
 		if old.State != NodeStateEmpty {
 			owner = old.UUID
-			if marked, err = r.markIntent(slotIdx, expected); err != nil {
+			// The mark is this node's first write: LIO refuses it after a revoke of a key this host registered from an
+			// earlier session, until the key is registered anew.
+			marked, err = r.markIntent(slotIdx, expected)
+			if errors.Is(err, unix.EBADE) {
+				if err = r.rejoinOnce(err); err == nil {
+					marked, err = r.markIntent(slotIdx, expected)
+				}
+			}
+			if err != nil {
 				return err
 			}
 		}
 	}
-	// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up. LIO refuses a preempt from a host
-	// whose write flag a revoke of its earlier session's key cleared, as it refuses that host's first write: either
-	// one means registering the key anew, then revoking again.
+	// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up. LIO refuses a preempt from such a
+	// host too, and the device then still lists the owner's key.
 	err := r.fenceOut(owner)
 	if errors.Is(err, fence.ErrNotPreempted) {
-		err = r.registerAnew(err, owner)
+		if err = r.rejoinOnce(err); err == nil {
+			err = r.fenceOut(owner)
+		}
 	}
 	if err != nil {
 		r.undoIntent(slotIdx, expected, marked, owner, err)
@@ -976,8 +985,11 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 
 	success, err := r.casSlot(slotIdx, marked, serializeSlot(newSlot))
 	if errors.Is(err, unix.EBADE) {
-		if err = r.registerAnew(err, owner); err == nil {
-			success, err = r.casSlot(slotIdx, marked, serializeSlot(newSlot))
+		if err = r.rejoinOnce(err); err == nil {
+			// LIO refused the preempt before the rejoin too, and Preempt may have read that as the owner being gone.
+			if err = r.fenceOut(owner); err == nil {
+				success, err = r.casSlot(slotIdx, marked, serializeSlot(newSlot))
+			}
 		}
 	}
 	if err != nil {
@@ -1555,10 +1567,9 @@ func (r *Registry) undoIntent(slotIdx int, original, marked []byte, owner [16]by
 	log.Printf("[Recovery] Put slot %d back as node %x left it: the preempt did not take effect", slotIdx, owner[:8])
 }
 
-// registerAnew handles the first refusal claimSlot meets from a device that holds this node's key: it registers the
-// key anew, as LIO needs after a key this host registered from an earlier session was revoked, then revokes owner
-// again, since LIO also refused that preempt. It returns cause when it already tried once.
-func (r *Registry) registerAnew(cause error, owner [16]byte) error {
+// rejoinOnce registers this node's key anew the first time a device that holds it refuses this node, as LIO does after
+// a revoke of a key this host registered from an earlier session. It returns cause when it already tried once.
+func (r *Registry) rejoinOnce(cause error) error {
 	if r.rejoin == nil || r.rejoined {
 		return cause
 	}
@@ -1568,7 +1579,7 @@ func (r *Registry) registerAnew(cause error, owner [16]byte) error {
 	if err := r.rejoin(); err != nil {
 		return fmt.Errorf("%w; not registering anew: %v", cause, err)
 	}
-	return r.fenceOut(owner)
+	return nil
 }
 
 // markIntent writes this node's UUID as the recovery owner of a live slot that raw holds, before this node revokes
