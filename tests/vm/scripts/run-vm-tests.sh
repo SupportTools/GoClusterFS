@@ -3942,7 +3942,7 @@ test_fencing_clear_reservations() {
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
-    local result=0 out pr=/sys/kernel/config/target/core/iblock_0/lun0/pr
+    local result=0 out
     fencing_restart pr || return 1
     out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm -force $(cluster_device) 2>&1; echo rc=\$?")
     if [[ "$out" != *"clearing refused: the filesystem is mounted by"* ]]; then
@@ -3970,7 +3970,7 @@ test_fencing_clear_reservations() {
         log_error "keys left after fsck -clear-reservations: $(registered_initiators | tr '\n' ' ')"
         result=1
     fi
-    out=$(ssh_run "$TARGET_VM_ID" "tr -d '\\000' < $pr/res_pr_type")
+    out=$(reservation_holder)
     if [[ "$out" != *"No SPC-3 Reservation holder"* ]]; then
         log_error "the target still holds a reservation after fsck -clear-reservations: $out"
         result=1
@@ -3981,8 +3981,34 @@ test_fencing_clear_reservations() {
     return $result
 }
 
+# target_query runs the script on stdin on the first node VM that answers, with sg3_utils and $dev, that VM's iSCSI disk,
+# so it asks the target itself, whatever kind it is.
+target_query() {
+    local script vm disk
+    script=$(cat)
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        disk=$(iscsi_disk "$vm" 2> /dev/null) && [[ -n "$disk" ]] || continue
+        printf 'dev=/dev/%s\ncommand -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null\n%s\n' "$disk" "$script" |
+            ssh_run_capped 30 "$vm" "sh -s" && return 0
+    done
+    return 1
+}
+
+# skip_on_external_target logs SKIP with reason $1 and succeeds when the tests run against an external target.
+skip_on_external_target() {
+    [[ "$EXTERNAL_TARGET" == true ]] || return 1
+    log_info "SKIP: external target ${ISCSI_TARGET_IQN}: $1"
+}
+
 # reservation_holder prints the target's reservation holder, or "No SPC-3 Reservation holder".
 reservation_holder() {
+    if [[ "$EXTERNAL_TARGET" == true ]]; then
+        target_query <<'QUERY'
+out=$(sg_persist --in --read-reservation "$dev") || exit 1
+case "$out" in *"NO reservation"*) echo "No SPC-3 Reservation holder" ;; *) echo "$out" ;; esac
+QUERY
+        return
+    fi
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_holder"
 }
 
@@ -4048,6 +4074,12 @@ test_fencing_lost_reservation() {
 
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
+    if [[ "$EXTERNAL_TARGET" == true ]]; then
+        target_query <<'QUERY'
+sg_persist --in --read-full-status "$dev" | awk '/Key=/ { sub(/.*Key=/, ""); key = $1 } /iSCSI name/ { n = $NF; if (n !~ /,/) n = n ","; print "iSCSI Node: " n " Key: " key }'
+QUERY
+        return
+    fi
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
 }
 
@@ -4081,7 +4113,8 @@ test_fencing_unmount_removes_key() {
 # relogin_under_map logs VM $1's only iSCSI path out and in under its multipath map gcfs-mpath, which keeps its mount
 # running. The new session has a new ISID, and LIO keeps the old session's registration.
 relogin_under_map() {
-    local disk i portal="10.0.2.2:${ISCSI_PORT}"
+    local disk i portal
+    portal=$(iscsi_portal)
     ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; sleep 2; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null" || return 1
     for i in $(seq 1 20); do
         disk=$(iscsi_disk "$1")
@@ -4100,6 +4133,7 @@ test_fencing_relogin_remount() {
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
+    skip_on_external_target "this test models LIO's check of only part of the ISID, which another target need not share" && return 0
     local node=1 peer=2 result=0 marker vm byte
     for vm in $(seq 1 "$NODE_COUNT"); do
         unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
@@ -4383,8 +4417,11 @@ test_fencing_reservation_self_test() {
         result=1
     fi
 
-    local how
-    for how in relogin restore lose; do
+    local how hows="relogin restore lose"
+    if skip_on_external_target "the -keep and -check-kept steps log out or power cycle the LIO target VM"; then
+        hows=""
+    fi
+    for how in $hows; do
         key=$(kept_key "$(reservation_test 1 "-force -keep")")
         if [[ -z "$key" ]]; then
             log_error "fsck -test-reservations -keep left no key"
