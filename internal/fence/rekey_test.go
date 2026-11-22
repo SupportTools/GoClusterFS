@@ -414,3 +414,27 @@ func TestRekeyOnTwoPaths(t *testing.T) {
 		})
 	}
 }
+
+// A peer whose own key is gone cannot preempt: the device refuses it and still lists the victim's key, so the error
+// says the preempt did not take effect, and that the peer is fenced.
+func TestPreemptThatDidNotTakeEffectSaysSo(t *testing.T) {
+	target := NewTarget()
+	victim := target.Node("v", NodeKey([16]byte{1}))
+	peer := target.Node("p", NodeKey([16]byte{2}))
+	third := target.Node("t", NodeKey([16]byte{3}))
+	for _, pr := range []*PR{victim, peer, third} {
+		if err := pr.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := third.Preempt(peer.Key()); err != nil {
+		t.Fatal(err)
+	}
+	err := peer.Preempt(victim.Key())
+	if !errors.Is(err, ErrNotPreempted) || !errors.Is(err, ErrFenced) {
+		t.Errorf("Preempt by a fenced peer = %v, want ErrNotPreempted and ErrFenced", err)
+	}
+	if err := third.Preempt(victim.Key()); err != nil || errors.Is(err, ErrNotPreempted) {
+		t.Errorf("a preempt that took effect = %v, want nil", err)
+	}
+}

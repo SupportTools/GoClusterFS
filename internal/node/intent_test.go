@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -225,5 +226,39 @@ func TestRegisterRefusesNextToAnotherTakeoverProtocol(t *testing.T) {
 		}
 		_ = live.Unregister(ctx)
 		cleanup()
+	}
+}
+
+// A takeover whose preempt did not take effect, as the device shows by still listing the victim's key, puts the slot
+// back as the victim left it, so a live victim keeps it. A preempt whose outcome is unknown leaves the intent.
+func TestFailedPreemptPutsTheSlotBackOnlyWhenItDidNotTakeEffect(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		keepsIts bool
+	}{
+		{"did not take effect", fmt.Errorf("%w: path down", fence.ErrNotPreempted), true},
+		{"outcome unknown", errors.New("path down"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := fence.NewTarget()
+			survivor, victim, failing := fencedVictim(t, target)
+			survivor.SetPreempter(func([16]byte) error { return tc.err })
+			if err := survivor.RecoverFailedNode(failing); err == nil {
+				t.Fatal("RecoverFailedNode succeeded although its preempt failed")
+			}
+			slot, err := survivor.readSlot(failing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, marked := slot.Intent()
+			if tc.keepsIts && (marked || victim.SlotLive(failing) != nil) {
+				t.Errorf("slot still marked %v, victim's slot check %v; want the slot back and the victim keeping it",
+					marked, victim.SlotLive(failing))
+			}
+			if !tc.keepsIts && (!marked || slot.RecoveryOwner != survivor.LocalUUID()) {
+				t.Errorf("slot marked %v by %x; want the survivor's intent to stay", marked, slot.RecoveryOwner[:8])
+			}
+		})
 	}
 }

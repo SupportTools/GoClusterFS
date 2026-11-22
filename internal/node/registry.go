@@ -26,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/supporttools/GoClusterFS/internal/fence"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -916,12 +917,14 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		newSlot.Orphans = old.Orphans
 		// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
 		if old.State != NodeStateEmpty {
-			if expected, err = r.markIntent(slotIdx, expected); err != nil {
+			marked, err := r.markIntent(slotIdx, expected)
+			if err != nil {
 				return err
 			}
-			if err := r.fenceOut(old.UUID); err != nil {
+			if err := r.revoke(slotIdx, expected, marked, old.UUID, true); err != nil {
 				return err
 			}
+			expected = marked
 		}
 	}
 
@@ -1434,17 +1437,18 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		return nil, err
 	}
 	r.mu.Lock()
-	raw, err = r.markIntent(slotIdx, raw)
+	marked, err := r.markIntent(slotIdx, raw)
 	r.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	// Before the CAS, so the dead node's late heartbeat cannot land over the Dead mark, and outside r.mu, so a slow
 	// preempt cannot hold up this node's own heartbeat.
-	if err := r.fenceOut(slot.UUID); err != nil {
+	if err := r.revoke(slotIdx, raw, marked, slot.UUID, false); err != nil {
 		log.Printf("[Recovery] Not recovering slot %d: %v", slotIdx, err)
 		return nil, err
 	}
+	raw = marked
 	pocSleep(pocTakeoverDelay, "slot %d: intent written and node %x revoked; the Dead mark waits", slotIdx, slot.UUID[:8])
 
 	r.mu.Lock()
@@ -1475,6 +1479,28 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 // markIntent writes this node's UUID as the recovery owner of a live slot that raw holds, before this node revokes
 // the slot's node: a node that registers its key again after the revoke reads the intent and stops. It returns the
 // bytes the next CAS must find, raw itself for a slot that is not live. Called with r.mu held.
+// revoke preempts owner's key after this node marked its intent in slotIdx, replacing original with marked. A preempt
+// that fails while the device still lists owner's key did not take effect, so the slot gets original back and owner,
+// if it runs and has not read the intent yet, keeps running. After any other failure the intent stays: owner may have
+// lost its key, and another node takes the slot over once it stays unchanged for deadAfter.
+func (r *Registry) revoke(slotIdx int, original, marked []byte, owner [16]byte, holdsMu bool) error {
+	err := r.fenceOut(owner)
+	if err == nil || bytes.Equal(original, marked) || !errors.Is(err, fence.ErrNotPreempted) {
+		return err
+	}
+	if !holdsMu {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+	}
+	if ok, cerr := r.casSlot(slotIdx, marked, original); cerr != nil || !ok {
+		log.Printf("[Recovery] Slot %d keeps this node's intent: the preempt of node %x did not take effect, and putting the slot back failed (%v)",
+			slotIdx, owner[:8], cmp.Or(cerr, ErrSlotTaken))
+		return err
+	}
+	log.Printf("[Recovery] Put slot %d back as node %x left it: the preempt did not take effect", slotIdx, owner[:8])
+	return err
+}
+
 func (r *Registry) markIntent(slotIdx int, raw []byte) ([]byte, error) {
 	slot, err := deserializeSlot(raw)
 	if err != nil {
@@ -1577,16 +1603,17 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func(renew fu
 		return false, err
 	}
 	r.mu.Lock()
-	expected, err = r.markIntent(slotIdx, expected)
+	marked, err := r.markIntent(slotIdx, expected)
 	r.mu.Unlock()
 	if errors.Is(err, ErrSlotTaken) {
 		return false, nil
 	} else if err != nil {
 		return false, err
 	}
-	if err := r.fenceOut(slot.UUID); err != nil {
+	if err := r.revoke(slotIdx, expected, marked, slot.UUID, false); err != nil {
 		return false, err
 	}
+	expected = marked
 	slot.Magic = SlotMagic
 	slot.State = NodeStateDead
 	slot.RecoveryOwner = r.localUUID

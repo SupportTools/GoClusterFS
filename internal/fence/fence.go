@@ -3,6 +3,7 @@
 package fence
 
 import (
+	"slices"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -16,6 +17,9 @@ var (
 	ErrPartition = fmt.Errorf("%w on a partition, only on the whole disk", ErrUnsupported)
 	// ErrFenced means another node removed this node's key: the storage refuses its writes.
 	ErrFenced             = errors.New("this node's reservation key is gone: another node revoked its access to the device")
+	// ErrNotPreempted wraps a failed preempt after which the device still lists the victim's key: the preempt did not
+	// take effect, and the victim may still write.
+	ErrNotPreempted = errors.New("the preempt did not take effect: the device still lists the node's key")
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
@@ -113,15 +117,26 @@ func (p *PR) Preempt(victim uint64) error {
 	}
 	err := p.dev.preemptAbort(p.key, victim)
 	if !errors.Is(err, ErrReservationConflict) {
-		return err
+		return p.listedAfter(victim, err)
 	}
 	// A conflict means the victim is gone already or this node's key is: only a registered key can register itself again.
 	if err := p.dev.register(p.key, p.key, false); errors.Is(err, ErrReservationConflict) {
-		return ErrFenced
+		return p.listedAfter(victim, ErrFenced)
 	} else if err != nil {
-		return err
+		return p.listedAfter(victim, err)
 	}
 	return nil
+}
+
+// listedAfter wraps a failed preempt's err in ErrNotPreempted when the device still lists victim's key.
+func (p *PR) listedAfter(victim uint64, err error) error {
+	if err == nil {
+		return nil
+	}
+	if keys, lerr := p.dev.readKeys(); lerr == nil && slices.Contains(keys, victim) {
+		return fmt.Errorf("%w: %w", ErrNotPreempted, err)
+	}
+	return err
 }
 
 // Registrations returns how many registrations of this node's key the device lists, one per path that registered it,
