@@ -141,7 +141,10 @@ type Registry struct {
 	onOwnerDead func(owner [16]byte, slot int) (done func(replayed bool))
 	onOrphans   func(ctx context.Context, slot int, orphans []Orphan)
 	// preempt revokes a dead node's access to the device before this node acts on its death; nil when unfenced.
-	preempt       func(owner [16]byte) error
+	preempt func(owner [16]byte, ownHost bool) error
+	// join registers this node's reservation key before Register's first write; nil when unfenced.
+	join          func() error
+	joined        bool
 	orphanKick    chan struct{}
 	previousOwner *[16]byte
 	sightings     map[int]sighting
@@ -234,19 +237,26 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 }
 
 // SetPreempter makes this node revoke a node's access to the device, through preempt, before it marks that node's
-// slot dead, releases it or mounts into it. Call it before Register.
-func (r *Registry) SetPreempter(preempt func(owner [16]byte) error) {
+// slot dead, releases it or mounts into it. ownHost says the slot names this node's hostname: on LIO, revoking a key
+// this host registered from another session also stops this host's own writes. Call it before Register.
+func (r *Registry) SetPreempter(preempt func(owner [16]byte, ownHost bool) error) {
 	r.preempt = preempt
 }
 
-func (r *Registry) fenceOut(owner [16]byte) error {
-	if r.preempt == nil || owner == ([16]byte{}) {
+// SetJoin makes Register call join once, after it has watched out an earlier mount on this host and before its first
+// write. A mount registers its reservation key there, after any peer's revoke of that earlier mount's key.
+func (r *Registry) SetJoin(join func() error) {
+	r.join = join
+}
+
+func (r *Registry) fenceOut(owner *Slot) error {
+	if r.preempt == nil || owner.UUID == ([16]byte{}) {
 		return nil
 	}
-	if err := r.preempt(owner); err != nil {
-		return fmt.Errorf("revoking node %x's access to the device: %w", owner[:8], err)
+	if err := r.preempt(owner.UUID, r.hostname != "" && owner.Host() == r.hostname); err != nil {
+		return fmt.Errorf("revoking node %x's access to the device: %w", owner.UUID[:8], err)
 	}
-	log.Printf("[Recovery] Revoked node %x's access to the device", owner[:8])
+	log.Printf("[Recovery] Revoked node %x's access to the device", owner.UUID[:8])
 	return nil
 }
 
@@ -395,9 +405,14 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	}
 	// A slot under this hostname is likely this host's mount before a crash, a container restart or a reboot; taking
 	// it back replays its journal before this mount serves. Its mount may still run, or another host may share the
-	// name, so it is watched first.
-	if i, err := r.claimWatched(r.awaitSilentSlots(r.ownHostSlots(), silentSlotWatch)); i >= 0 || err != nil {
-		return i, err
+	// name, so it is watched first. A peer that takes it over during the watch revokes its key first, and the join
+	// after the watch registers this node's key after that revoke.
+	if own := r.ownHostSlots(); len(own) > 0 {
+		log.Printf("Registry slots %v hold an earlier mount on this host; waiting up to %v for a peer to take them over, or to take them over itself, before joining",
+			own, silentSlotWatch)
+		if i, err := r.claimWatched(r.awaitSilentSlots(own, silentSlotWatch)); i >= 0 || err != nil {
+			return i, err
+		}
 	}
 	if i, err := r.claimFirst(allSlots(), empty); i >= 0 || err != nil {
 		return i, err
@@ -479,7 +494,8 @@ var silentSlotWatch = deadAfter
 
 // ownHostSlots returns the slots under this node's hostname whose mount it
 // cannot prove exited: one in another PID namespace on this boot, which a
-// restarted container left, or one whose heartbeat looks old by this node's clock.
+// restarted container left, one from another boot, or one whose heartbeat looks
+// old by this node's clock.
 func (r *Registry) ownHostSlots() []int {
 	var slots []int
 	for i := 0; i < MaxNodes; i++ {
@@ -487,7 +503,7 @@ func (r *Registry) ownHostSlots() []int {
 		if err != nil || (slot.State != NodeStateActive && slot.State != NodeStateLeaving) || slot.Host() != r.hostname {
 			continue
 		}
-		if r.sameHost(slot) && slot.PIDNamespace != r.pidNS || heartbeatOlderThan(slot, HeartbeatTimeout) {
+		if r.sameHost(slot) && slot.PIDNamespace != r.pidNS || slot.BootID != r.bootID || heartbeatOlderThan(slot, HeartbeatTimeout) {
 			slots = append(slots, i)
 		}
 	}
@@ -880,6 +896,12 @@ func bootClock() time.Duration {
 // claimSlot replaces the slot bytes Register judged claimable with this node's
 // registration, then re-reads the slot to catch a racing node.
 func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
+	if r.join != nil && !r.joined {
+		if err := r.join(); err != nil {
+			return err
+		}
+		r.joined = true
+	}
 	newSlot := &Slot{
 		Magic:         SlotMagic,
 		State:         NodeStateActive,
@@ -901,7 +923,7 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		newSlot.Orphans = old.Orphans
 		// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
 		if old.State != NodeStateEmpty {
-			if err := r.fenceOut(old.UUID); err != nil {
+			if err := r.fenceOut(old); err != nil {
 				return err
 			}
 		}
@@ -1417,7 +1439,7 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 	}
 	// Before the CAS, so the dead node's late heartbeat cannot land over the Dead mark, and outside r.mu, so a slow
 	// preempt cannot hold up this node's own heartbeat.
-	if err := r.fenceOut(slot.UUID); err != nil {
+	if err := r.fenceOut(slot); err != nil {
 		log.Printf("[Recovery] Not recovering slot %d: %v", slotIdx, err)
 		return nil, err
 	}
@@ -1531,7 +1553,7 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func(renew fu
 	if err != nil {
 		return false, err
 	}
-	if err := r.fenceOut(slot.UUID); err != nil {
+	if err := r.fenceOut(slot); err != nil {
 		return false, err
 	}
 	slot.Magic = SlotMagic

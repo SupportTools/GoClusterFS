@@ -832,8 +832,8 @@ func formatFencer(devicePath, mode string) fence.Fencer {
 	return pr
 }
 
-// joinFencing registers this node's reservation key before its first write on a fenced volume, and makes the
-// registry revoke dead nodes' keys. On an unfenced volume it warns, or with require refuses to mount.
+// joinFencing makes the registry register this node's reservation key before its first write on a fenced volume, and
+// revoke dead nodes' keys. On an unfenced volume it warns, or with require refuses to mount.
 func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblock, reg *node.Registry, require bool) fence.Fencer {
 	if sb.RequiredFlags&superblock.RequiredReservations == 0 {
 		if require {
@@ -849,17 +849,27 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 			"A host has one reservation key per device, so stop that process first", devicePath, err)
 	}
 	pr := fence.Block(f, fence.NodeKey(reg.LocalUUID()))
-	if err := pr.Register(); err != nil {
-		failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
-	}
-	if err := pr.Reserve(); err != nil {
-		failf("%s is fenced, and reserving it failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s", devicePath, err, devicePath)
-	}
-	// LIO tags every command with the holder's key, so PREEMPT AND ABORT also drops this node's in-flight I/O without a status.
-	reg.SetPreempter(func(owner [16]byte) error {
-		return dev.Quiesce(func() error { return pr.Preempt(fence.NodeKey(owner)) })
+	reg.SetJoin(func() error {
+		switch err := pr.RegisterFresh(); {
+		case errors.Is(err, fence.ErrForeignReservation):
+			failf("%s is fenced, and reserving it failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s", devicePath, err, devicePath)
+		case err != nil:
+			failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
+		}
+		log.Printf("Fencing: persistent reservation key %#x", pr.Key())
+		return nil
 	})
-	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
+	// LIO tags every command with the holder's key, so PREEMPT AND ABORT also drops this node's in-flight I/O without a
+	// status. Revoking a key this host registered from another session also clears LIO's write permission for this
+	// host's initiator, so this node then registers its own key anew before any write.
+	reg.SetPreempter(func(owner [16]byte, ownHost bool) error {
+		return dev.Quiesce(func() error {
+			if err := pr.Preempt(fence.NodeKey(owner)); err != nil || !ownHost {
+				return err
+			}
+			return pr.RegisterFresh()
+		})
+	})
 	return pr
 }
 

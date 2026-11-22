@@ -174,7 +174,7 @@ func TestSameHostMountLeavesLiveSlotAfterClockJump(t *testing.T) {
 			}
 			defer keepWriting(t, reg, 0, live, jump)()
 			var revoked [][16]byte
-			reg.SetPreempter(func(owner [16]byte) error {
+			reg.SetPreempter(func(owner [16]byte, _ bool) error {
 				revoked = append(revoked, owner)
 				return nil
 			})

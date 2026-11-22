@@ -2,6 +2,7 @@ package fence
 
 import (
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -12,9 +13,32 @@ type Target struct {
 	keys      map[string]uint64
 	reserved  bool
 	preempted []uint64
+	// lio decides writes per initiator, as LIO does; writable holds the flag it keeps for each.
+	lio      bool
+	writable map[string]bool
 }
 
-func NewTarget() *Target { return &Target{keys: map[string]uint64{}} }
+func NewTarget() *Target { return &Target{keys: map[string]uint64{}, writable: map[string]bool{}} }
+
+// NewLIOTarget is a Target that decides writes as LIO does. Name each session "initiator/session": registrations
+// belong to sessions, but whether a session may write is one flag per initiator, which a new registration of the
+// initiator sets and removing any of its registrations clears.
+func NewLIOTarget() *Target {
+	t := NewTarget()
+	t.lio = true
+	return t
+}
+
+func initiatorOf(session string) string {
+	initiator, _, _ := strings.Cut(session, "/")
+	return initiator
+}
+
+// drop removes session's registration. Called with t.mu held.
+func (t *Target) drop(session string) {
+	delete(t.keys, session)
+	t.writable[initiatorOf(session)] = false
+}
 
 // Node returns the Fencer of initiator, whose registration is separate from every other initiator's.
 func (t *Target) Node(initiator string, key uint64) *PR {
@@ -38,6 +62,9 @@ func (t *Target) MayWrite(initiator string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	_, registered := t.keys[initiator]
+	if t.lio {
+		registered = t.writable[initiatorOf(initiator)]
+	}
 	return registered || !t.reserved
 }
 
@@ -63,9 +90,14 @@ func (d *fakeDevice) register(old, new uint64, ignore bool) error {
 	}
 	if new != 0 {
 		t.keys[d.initiator] = new
+		if !registered {
+			t.writable[initiatorOf(d.initiator)] = true
+		}
 		return nil
 	}
-	delete(t.keys, d.initiator)
+	if registered {
+		t.drop(d.initiator)
+	}
 	if len(t.keys) == 0 {
 		t.reserved = false
 	}
@@ -93,7 +125,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	found := false
 	for initiator, key := range t.keys {
 		if key == victim {
-			delete(t.keys, initiator)
+			t.drop(initiator)
 			found = true
 		}
 	}
@@ -112,6 +144,7 @@ func (d *fakeDevice) clear(key uint64) error {
 		return ErrReservationConflict
 	}
 	t.keys = map[string]uint64{}
+	t.writable = map[string]bool{}
 	t.reserved = false
 	return nil
 }
