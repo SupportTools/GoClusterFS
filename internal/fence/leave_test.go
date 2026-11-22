@@ -6,9 +6,15 @@ import (
 )
 
 // After an iSCSI logout and login, the node's key stays registered under its earlier session, and this session holds
-// none. Leave removes the key from the earlier session too, and keeps the peer's registration.
+// none. Leave removes the key from the earlier session too, and keeps the peer's registration. On LIO the reservation
+// the earlier session held passes to the peer.
 func TestLeaveRemovesTheKeyAnEarlierSessionKept(t *testing.T) {
-	target := NewTarget()
+	for name, target := range map[string]*Target{"spec": NewTarget(), "LIO": NewLIOTarget()} {
+		t.Run(name, func(t *testing.T) { leaveRemovesTheKeyAnEarlierSessionKept(t, target) })
+	}
+}
+
+func leaveRemovesTheKeyAnEarlierSessionKept(t *testing.T, target *Target) {
 	peer := target.Node("vm2/1", NodeKey([16]byte{2}))
 	key := NodeKey([16]byte{1})
 	earlier, current := target.Node("vm1/1", key), target.Node("vm1/2", key)
