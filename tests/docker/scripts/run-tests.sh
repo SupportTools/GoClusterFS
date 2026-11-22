@@ -3846,6 +3846,47 @@ test_snapshot_during_writes() {
     return 0
 }
 
+# A directory gets a project quota through trusted.goclusterfs.quota, as the CSI driver will set it. Every node sees
+# the same project, files made under the directory join it, and a hard link out of it fails with EXDEV. A container
+# root without CAP_SYS_ADMIN cannot change the limit, which is what stops a tenant from raising its own PVC's quota.
+test_quota_project() {
+    log "Testing project quotas through the trusted.goclusterfs.quota attribute..."
+
+    local setter="${NODE_ARRAY[0]}"
+    local other="${NODE_ARRAY[1]:-${NODE_ARRAY[0]}}"
+    local dir=/mnt/goclusterfs/quota_pvc_$$
+    local got
+
+    exec_on_node "$setter" mkdir "$dir" || return 1
+    exec_on_node "$setter" setfattr -n trusted.goclusterfs.quota -v "bytes=4194304 inodes=100" "$dir" || {
+        log "ERROR: setting the quota as root failed"
+        return 1
+    }
+    got=$(exec_on_node "$other" getfattr --only-values -n trusted.goclusterfs.quota "$dir")
+    if [[ "$got" != project=*" bytes=4194304 inodes=100 "* ]]; then
+        log "ERROR: node $other reads the quota as '$got'"
+        return 1
+    fi
+    exec_on_node "$other" sh -c "echo data > $dir/file" || return 1
+    if exec_on_node "$other" ln "$dir/file" "/mnt/goclusterfs/quota_link_$$" 2>/dev/null; then
+        log "ERROR: a hard link out of the project succeeded"
+        return 1
+    fi
+    if exec_on_node "$setter" setpriv --bounding-set=-sys_admin --inh-caps=-sys_admin \
+        setfattr -n trusted.goclusterfs.quota -v "bytes=1099511627776" "$dir" 2>/dev/null; then
+        log "ERROR: root without CAP_SYS_ADMIN changed the quota"
+        return 1
+    fi
+    got=$(exec_on_node "$setter" getfattr --only-values -n trusted.goclusterfs.quota "$dir")
+    if [[ "$got" != project=*" bytes=4194304 "* ]]; then
+        log "ERROR: after the refused change the quota reads '$got'"
+        return 1
+    fi
+    exec_on_node "$setter" rm -rf "$dir"
+    log "Project quota test passed"
+    return 0
+}
+
 run_test "Create and Read File" test_create_read_file
 run_test "Create Directory" test_create_directory
 run_test "File in Directory" test_file_in_directory
@@ -3871,6 +3912,7 @@ run_test "Clone In-Place Write" test_clone_in_place_write
 run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 run_test "Snapshot During Writes" test_snapshot_during_writes
+run_test "Quota Project" test_quota_project
 run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 run_test "Multi-Node Rename" test_multinode_rename
 run_test "Multi-Node Rename Of A Moved Directory" test_multinode_rename_moved_dir
