@@ -14,6 +14,9 @@ import (
 // DefaultFlushMs is how often a node flushes its usage deltas into the table.
 const DefaultFlushMs = 1000
 
+// extentAllocated is extent.FlagAllocated, which package extent cannot give without an import cycle once it counts usage.
+const extentAllocated = 1 << 0
+
 // ErrEnabled means the volume has a quota table already.
 var ErrEnabled = errors.New("the volume has project quotas already")
 
@@ -52,7 +55,7 @@ func Enable(ctx context.Context, dev *storage.Device, sb *superblock.Superblock,
 		return fmt.Errorf("writing the quota table: %w", err)
 	}
 
-	ino.InlineExtents[0] = inode.InlineExtent{LogicalBlock: 0, PhysicalBlock: block, Length: 1}
+	ino.InlineExtents[0] = inode.InlineExtent{LogicalBlock: 0, PhysicalBlock: block, Length: 1, Flags: extentAllocated}
 	ino.ExtentCount, ino.AllocatedBlocks, ino.WrittenBlocks, ino.Size = 1, 1, 1, blockSize
 	if err := inodes.Write(ctx, ino); err != nil {
 		return fmt.Errorf("writing quota table inode %d: %w", num, err)
