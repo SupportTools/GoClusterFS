@@ -351,6 +351,10 @@ func main() {
 			"Check that the device is reachable and that this node did not stall, then mount again", loss)
 	})
 	dev.SetFencedHandler(nodeReg.Fenced)
+	stopReservationCheck := make(chan struct{})
+	if pr, ok := fencer.(*fence.PR); ok {
+		go keepReserved(pr, stopReservationCheck)
+	}
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
 	}
@@ -739,6 +743,7 @@ func main() {
 
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
 	server.Wait()
+	close(stopReservationCheck)
 	unmounted.Store(true)
 	watch.Start()
 	goclusterfs.ShutdownStep("API server stop", stopAPI)
@@ -871,6 +876,42 @@ func openForFencing(devicePath string) *os.File {
 		failf("Opening %s for its persistent reservations failed: %v", devicePath, err)
 	}
 	return f
+}
+
+// keepReserved checks the device's reservation on every failure scan until stop closes. A device without a reservation
+// takes writes from any host, so a node it revoked would go on writing: keepReserved reserves again while this node's
+// key stays registered, and stops the node if the key is gone too.
+func keepReserved(pr *fence.PR, stop <-chan struct{}) {
+	tick := time.NewTicker(node.FailureCheckInterval)
+	defer tick.Stop()
+	failing := false
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+		}
+		reserved, err := pr.KeepReserved()
+		switch {
+		case errors.Is(err, fence.ErrFenced):
+			failf("Fencing: the device holds no reservation and no longer lists this node's key %#x, as after a storage reset "+
+				"or a revoke while it was unreserved; stopping so two nodes never share a journal. Mount again", pr.Key())
+		case errors.Is(err, fence.ErrUnsupported):
+			log.Printf("[WARN] Fencing: cannot check that the device keeps its reservation: %v", err)
+			return
+		case err != nil:
+			if !failing {
+				log.Printf("[WARN] Fencing: checking the device's reservation failed: %v", err)
+			}
+			failing = true
+		default:
+			failing = false
+			if reserved {
+				log.Printf("[WARN] Fencing: the device had lost its reservation while this node's key %#x stayed registered, "+
+					"so a revoked node could have gone on writing; reserved it again", pr.Key())
+			}
+		}
+	}
 }
 
 // failf logs why the mount cannot go on and exits with cli.ExitFailure.

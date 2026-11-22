@@ -3981,6 +3981,59 @@ test_fencing_clear_reservations() {
     return $result
 }
 
+# reservation_holder prints the target's reservation holder, or "No SPC-3 Reservation holder".
+reservation_holder() {
+    ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_holder"
+}
+
+# mount_key prints the reservation key VM $1's mount logged.
+mount_key() {
+    sed -n 's/.*Fencing: persistent reservation key \(0x[0-9a-f]*\).*/\1/p' "$(get_vm_mount_log "$1")" | tail -1
+}
+
+# A device without a reservation takes writes from any host, so a node a peer revoked there would go on writing.
+# When the device loses its reservation while the nodes' keys stay, a node reserves it again within two failure
+# scans. When it also loses a node's key, that node stops, and the other reserves again.
+test_fencing_lost_reservation() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 k1 k2 marker t dev
+    fencing_restart pr || return 1
+    k1=$(mount_key 1) k2=$(mount_key 2) dev=$(cluster_device)
+    ssh_run 2 "apk add --no-cache sg3_utils > /dev/null" || return 1
+    marker="lost reservation $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run 2 "sg_persist --out --release --param-rk=$k2 --prout-type=7 $dev > /dev/null" || result=1
+    for t in $(seq 15); do
+        [[ "$(reservation_holder)" != *"No SPC-3 Reservation holder"* ]] && break
+        sleep 1
+    done
+    if [[ "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
+        log_error "15s after the reservation was released, no node had reserved again"
+        result=1
+    elif ! cat "$(get_vm_mount_log 1)" "$(get_vm_mount_log 2)" | grep -q "had lost its reservation"; then
+        log_error "a node reserved again without logging it"
+        result=1
+    else
+        log_info "a node reserved again ${t}s after the release"
+    fi
+
+    ssh_run 2 "sg_persist --out --release --param-rk=$k2 --prout-type=7 $dev > /dev/null && sg_persist --out --preempt-abort --param-rk=$k2 --param-sark=$k1 --prout-type=7 $dev > /dev/null" || result=1
+    if ! wait_stopped 1 20; then
+        log_error "VM 1 still runs 20s after the device lost its reservation and VM 1's key"
+        result=1
+    fi
+    if [[ -z "$(mount_pids 2)" || "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
+        log_error "VM 2 stopped, or did not reserve the device again"
+        result=1
+    fi
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E "Fencing|stopping" | tail -2
+    fencing_restart pr || result=1
+    return $result
+}
+
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
@@ -5300,6 +5353,7 @@ main() {
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Fencing: Reservation Self-Test" test_fencing_reservation_self_test
+    run_test "Fencing: Lost Reservation" test_fencing_lost_reservation
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall
