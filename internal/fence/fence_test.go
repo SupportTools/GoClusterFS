@@ -27,7 +27,7 @@ func TestNodeKey(t *testing.T) {
 // The ioctl numbers are the kernel's, from linux/pr.h.
 func TestIoctlNumbers(t *testing.T) {
 	for got, want := range map[uintptr]uintptr{
-		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
+		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreempt: 0x401870cb, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
 		iocReadKeys: 0xc01070ce, iocReadResv: 0x801070cf,
 	} {
 		if got != want {
@@ -219,6 +219,7 @@ func (d statusDevice) register(old, new uint64, ignore bool) error {
 }
 func (d statusDevice) reserve(uint64) error                     { return nil }
 func (d statusDevice) preemptAbort(own, victim uint64) error    { return ioctlResult(d.preemptStatus, 0) }
+func (d statusDevice) preempt(uint64, uint64) error             { return nil }
 func (d statusDevice) clear(uint64) error                       { return nil }
 func (d statusDevice) readKeys() ([]uint64, error)              { return nil, nil }
 func (d statusDevice) readReservation() (uint64, uint32, error) { return 0, 0, nil }
@@ -253,6 +254,7 @@ func (d *scripted) next(statuses *[]uintptr) error {
 func (d *scripted) register(uint64, uint64, bool) error      { return d.next(&d.registers) }
 func (d *scripted) reserve(uint64) error                     { return nil }
 func (d *scripted) preemptAbort(uint64, uint64) error        { return d.next(&d.preempts) }
+func (d *scripted) preempt(uint64, uint64) error             { return nil }
 func (d *scripted) clear(uint64) error                       { return nil }
 func (d *scripted) readKeys() ([]uint64, error)              { return nil, nil }
 func (d *scripted) readReservation() (uint64, uint32, error) { return 0, 0, nil }
