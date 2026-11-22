@@ -24,6 +24,9 @@ func (c *Checker) crossValidate() error {
 
 	phantomBlocks := 0
 
+	c.logf("  Checking the quota table...\n")
+	c.checkQuotaTable()
+
 	c.logf("  Checking for inodes no directory names...\n")
 	if err := c.checkUnnamed(); err != nil {
 		return err

@@ -5454,6 +5454,27 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestIoctlResultMapsBothTransports
 
+  - id: quota-table-encoding
+    name: The quota table's header and records round-trip and carry checksums
+    description: The header keeps NextProjectID and every slot's FoldedThroughSeq, neighbouring records share a sector without overwriting each other, and a flipped bit or a wrong magic is refused
+    priority: go_only
+    environments:
+      go: internal/quota/table_test.go::TestHeaderRoundTrip
+
+  - id: quota-enable
+    name: Enabling quotas creates the table inode and sets the superblock last
+    description: With no node mounted, as fsck -enable-quotas runs it, Enable allocates the table inode and its first block, writes the header and empty records, names the inode in the superblock and sets RequiredProjectQuotas; a second Enable changes nothing
+    priority: go_only
+    environments:
+      go: internal/quota/enable_test.go::TestEnableCreatesTheTable
+
+  - id: fsck-quota-table
+    name: fsck checks the quota table and keeps its unnamed inode
+    description: A fresh image with a quota table checks clean, the hidden quota inode is not reported as unnamed, and a record sector failing its checksum is an error
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckChecksTheQuotaTable
+
   - id: fence-preempt-statuses
     name: Preempt reads SCSI and NVMe conflicts alike
     description: A conflict from either transport is a victim already gone while this node's own key holds, ErrFenced once it is gone, and any other status stops the takeover

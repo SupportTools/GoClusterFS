@@ -37,6 +37,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/stats"
@@ -603,7 +604,10 @@ func main() {
 		if err := gfs.InitRoot(ctx); err != nil {
 			failf("Failed to create the root directory: %v; check the device, then format again", err)
 		}
-		log.Println("Filesystem formatted successfully")
+		if err := quota.Enable(ctx, dev, sb, inodeTbl, bm); err != nil {
+			failf("Failed to create the quota table: %v; check the device, then format again", err)
+		}
+		log.Printf("Filesystem formatted successfully, with project quotas in inode %d", sb.QuotaInode)
 	}
 
 	// Verify root exists

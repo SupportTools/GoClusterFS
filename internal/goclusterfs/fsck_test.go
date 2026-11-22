@@ -17,6 +17,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -48,6 +49,13 @@ func newFormattedImageOfSize(t *testing.T, size int64) string {
 	fsys := openFormattedFS(t, path)
 	if err := fsys.InitRoot(context.Background()); err != nil {
 		t.Fatalf("InitRoot: %v", err)
+	}
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := quota.Enable(context.Background(), fsys.dev, sb, fsys.inodeTbl, fsys.bitmapMgr); err != nil {
+		t.Fatalf("quota.Enable: %v", err)
 	}
 	fsys.snapshotWkr.Stop()
 	return path
@@ -444,5 +452,42 @@ func TestFsckRebuildsCorruptRefcountSector(t *testing.T) {
 		if got := refcountOf(t, fsys, b); got != 2 {
 			t.Fatalf("block %d shared by a file and its clone: refcount %d after repair, want 2", b, got)
 		}
+	}
+}
+
+// A record sector of the quota table that fails its checksum is an error, and the quota inode, which no directory
+// names, is not reported as unnamed.
+func TestFsckChecksTheQuotaTable(t *testing.T) {
+	t.Parallel()
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
+		t.Fatalf("fsck on a fresh image with a quota table:%s", problemList(r))
+	}
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil || sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 || sb.QuotaInode == 0 {
+		t.Fatalf("superblock after the format: flags %#x, quota inode %d, %v; want quotas on", sb.RequiredFlags, sb.QuotaInode, err)
+	}
+	qi, err := fsys.inodeTbl.Read(sb.QuotaInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := int64(sb.DataRegionOffset+qi.InlineExtents[0].PhysicalBlock*uint64(sb.BlockSize)) + 2*storage.SectorSize
+	sector := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := fsys.dev.ReadAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+	sector.Bytes()[10] ^= 1
+	if _, err := fsys.dev.WriteAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+	r := runFsck(t, fsys, fsck.DefaultOptions())
+	found := false
+	for _, p := range r.Problems {
+		if strings.Contains(p.String(), "quota inode") && strings.Contains(p.String(), "checksum") {
+			found = true
+		}
+	}
+	if !found || r.ExitCode() == fsck.ExitClean {
+		t.Errorf("fsck exit %d after a quota table sector was damaged; want an error naming it:%s", r.ExitCode(), problemList(r))
 	}
 }
