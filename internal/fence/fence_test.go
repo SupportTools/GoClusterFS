@@ -27,7 +27,7 @@ func TestNodeKey(t *testing.T) {
 // The ioctl numbers are the kernel's, from linux/pr.h.
 func TestIoctlNumbers(t *testing.T) {
 	for got, want := range map[uintptr]uintptr{
-		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
+		iocRegister: 0x401870c8, iocReserve: 0x401070c9, iocPreempt: 0x401870cb, iocPreemptAbort: 0x401870cc, iocClear: 0x401070cd,
 		iocReadKeys: 0xc01070ce, iocReadResv: 0x801070cf,
 	} {
 		if got != want {
@@ -69,6 +69,39 @@ func TestClearRemovesEveryKeyAndTheReservation(t *testing.T) {
 	}
 	if err := a.Unregister(); !errors.Is(err, ErrFenced) {
 		t.Errorf("a's key after Clear: Unregister = %v, want ErrFenced", err)
+	}
+}
+
+// After an iSCSI logout and login, the node's key stays registered under its earlier session, and this session holds
+// none. Leave removes the key from the earlier session too, and keeps the peer's registration.
+func TestLeaveRemovesTheKeyAnEarlierSessionKept(t *testing.T) {
+	target := NewTarget()
+	peer := target.Node("vm2/1", NodeKey([16]byte{2}))
+	key := NodeKey([16]byte{1})
+	earlier, current := target.Node("vm1/1", key), target.Node("vm1/2", key)
+	for _, n := range []*PR{earlier, peer} {
+		if err := n.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := earlier.Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	if gotEarlier, err := current.Leave(); err != nil || !gotEarlier {
+		t.Fatalf("Leave from a session without the key = %v, %v; want true, nil", gotEarlier, err)
+	}
+	if keys, err := peer.Keys(); err != nil || !slices.Equal(keys, []uint64{peer.Key()}) {
+		t.Errorf("Keys after Leave = %x, %v; want only the peer's", keys, err)
+	}
+	if target.MayWrite("vm1/1") || target.MayWrite("vm1/2") || !target.MayWrite("vm2/1") {
+		t.Error("after Leave, a session of the host that left may write, or the peer may not")
+	}
+
+	if gotEarlier, err := peer.Leave(); err != nil || gotEarlier {
+		t.Errorf("Leave from the session that holds the key = %v, %v; want false, nil", gotEarlier, err)
+	}
+	if keys, err := peer.Keys(); err != nil || len(keys) != 0 {
+		t.Errorf("Keys after the peer left = %x, %v; want none", keys, err)
 	}
 }
 
@@ -219,6 +252,7 @@ func (d statusDevice) register(old, new uint64, ignore bool) error {
 }
 func (d statusDevice) reserve(uint64) error                     { return nil }
 func (d statusDevice) preemptAbort(own, victim uint64) error    { return ioctlResult(d.preemptStatus, 0) }
+func (d statusDevice) preempt(uint64, uint64) error             { return nil }
 func (d statusDevice) clear(uint64) error                       { return nil }
 func (d statusDevice) readKeys() ([]uint64, error)              { return nil, nil }
 func (d statusDevice) readReservation() (uint64, uint32, error) { return 0, 0, nil }
@@ -253,6 +287,7 @@ func (d *scripted) next(statuses *[]uintptr) error {
 func (d *scripted) register(uint64, uint64, bool) error      { return d.next(&d.registers) }
 func (d *scripted) reserve(uint64) error                     { return nil }
 func (d *scripted) preemptAbort(uint64, uint64) error        { return d.next(&d.preempts) }
+func (d *scripted) preempt(uint64, uint64) error             { return nil }
 func (d *scripted) clear(uint64) error                       { return nil }
 func (d *scripted) readKeys() ([]uint64, error)              { return nil, nil }
 func (d *scripted) readReservation() (uint64, uint32, error) { return 0, 0, nil }

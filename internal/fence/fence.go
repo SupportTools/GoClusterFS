@@ -34,6 +34,9 @@ type Fencer interface {
 	Preempt(victim uint64) error
 	// Unregister removes this node's key; once no key is left, the reservation goes too.
 	Unregister() error
+	// Leave is Unregister for a node that gave up its slot, which also removes the key an earlier iSCSI session of this
+	// host keeps; earlier reports that this session held no key.
+	Leave() (earlier bool, err error)
 }
 
 const (
@@ -68,11 +71,13 @@ func (None) Register() error      { return nil }
 func (None) Reserve() error       { return nil }
 func (None) Preempt(uint64) error { return nil }
 func (None) Unregister() error    { return nil }
+func (None) Leave() (bool, error) { return false, nil }
 
 type device interface {
 	register(old, new uint64, ignore bool) error
 	reserve(key uint64) error
 	preemptAbort(own, victim uint64) error
+	preempt(own, victim uint64) error
 	clear(key uint64) error
 	readKeys() ([]uint64, error)
 	readReservation() (key uint64, typ uint32, err error)
@@ -137,4 +142,24 @@ func (p *PR) Unregister() error {
 		return err
 	}
 	return nil
+}
+
+// Leave unregisters this node's key, also where an earlier iSCSI session of this host keeps it. On LIO no peer revokes
+// such a registration, and while it holds the reservation every session of this host writes past a revoke of a later key.
+func (p *PR) Leave() (earlier bool, err error) {
+	if err := p.Unregister(); !errors.Is(err, ErrFenced) {
+		return false, err
+	}
+	if err := p.Register(); err != nil {
+		return true, err
+	}
+	// Preempting its own key without abort removes the earlier registration and takes the reservation if that one held it.
+	if err := p.dev.preempt(p.key, p.key); err != nil {
+		return true, err
+	}
+	// Over dm-multipath the preempt also removed the key from the other paths, which then answer a conflict.
+	if err := p.Unregister(); err != nil && !errors.Is(err, ErrFenced) {
+		return true, err
+	}
+	return true, nil
 }

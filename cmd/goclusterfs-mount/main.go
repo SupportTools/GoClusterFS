@@ -750,10 +750,13 @@ func main() {
 		}
 	})
 	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
+	leftSlot := false
 	gfs.SetSlotRelease(func() {
 		if err := nodeReg.Release(); err != nil {
 			log.Printf("[INFO] Leaving registry slot %d for a running node to clear: %v", slotIdx, err)
+			return
 		}
+		leftSlot = true
 	})
 	if err := gfs.Close(); err != nil {
 		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)
@@ -788,11 +791,19 @@ func main() {
 			cacheStats.InvalidationsSent, cacheStats.InvalidationsReceived, cacheStats.BroadcastDuplicates, cacheStats.BroadcastLost)
 	}
 
-	switch err := fencer.Unregister(); {
+	unregister := func() (bool, error) { return false, fencer.Unregister() }
+	if leftSlot {
+		unregister = fencer.Leave
+	}
+	switch earlier, err := unregister(); {
+	case earlier && err == nil:
+		log.Printf("[INFO] This host's session held no reservation key, as after an iSCSI logout and login: registered the key on it, removed the key from the earlier session and unregistered it")
 	case errors.Is(err, fence.ErrFenced):
-		log.Printf("[INFO] This host's session holds no reservation key to remove: a peer removed it, or the target keeps it under an earlier session, as after an iSCSI logout and login. Peers' preempts or goclusterfs-fsck -clear-reservations remove it")
+		log.Printf("[INFO] This host's session holds no reservation key to remove: a peer removed it, or the target keeps it under an earlier session, as after an iSCSI logout and login. The node that replays slot %d removes it", slotIdx)
+	case err != nil && leftSlot:
+		log.Printf("[WARN] Removing this node's reservation key failed: %v; no peer removes it, so remove it with goclusterfs-fsck -clear-reservations once no node runs", err)
 	case err != nil:
-		log.Printf("[WARN] Removing this node's reservation key failed: %v; the next node to mount into slot %d removes it", err, slotIdx)
+		log.Printf("[WARN] Removing this node's reservation key failed: %v; the node that replays slot %d removes it", err, slotIdx)
 	}
 	log.Println("Filesystem unmounted.")
 	_ = dev.Close()

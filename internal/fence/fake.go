@@ -136,3 +136,26 @@ func (d *fakeDevice) readKeys() ([]uint64, error) {
 	slices.Sort(keys)
 	return keys, nil
 }
+
+// preempt is a PREEMPT without abort: it removes every registration of victim but the caller's, even of its own key.
+func (d *fakeDevice) preempt(own, victim uint64) error {
+	t := d.t
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if cur, registered := t.keys[d.initiator]; !registered || cur != own {
+		return ErrReservationConflict
+	}
+	found := false
+	for initiator, key := range t.keys {
+		if key == victim {
+			found = true
+			if initiator != d.initiator {
+				delete(t.keys, initiator)
+			}
+		}
+	}
+	if !found {
+		return ErrReservationConflict
+	}
+	return nil
+}
