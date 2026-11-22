@@ -25,13 +25,19 @@ func TestUnownedKeys(t *testing.T) {
 }
 
 // A joining node registers its key before its slot claim lands, so only a key without an owner in both checks is
-// stale. A mount that stops before the second check reports nothing.
+// stale: not one whose node claimed its slot by the second check, nor one registered between the checks. A mount that
+// stops before the second check reports nothing.
 func TestStaleKeyCheckNeedsBothChecks(t *testing.T) {
-	stale, joining := fence.NodeKey([16]byte{7}), fence.NodeKey([16]byte{8})
-	keys := func() ([]uint64, error) { return []uint64{stale, joining}, nil }
+	stale, claimed, newcomer := fence.NodeKey([16]byte{7}), fence.NodeKey([16]byte{8}), fence.NodeKey([16]byte{9})
 	checks := 0
-	slots := func() ([]*node.Slot, error) {
+	keys := func() ([]uint64, error) {
 		checks++
+		if checks == 1 {
+			return []uint64{stale, claimed}, nil
+		}
+		return []uint64{stale, claimed, newcomer}, nil
+	}
+	slots := func() ([]*node.Slot, error) {
 		if checks == 1 {
 			return nil, nil
 		}
@@ -41,7 +47,8 @@ func TestStaleKeyCheckNeedsBothChecks(t *testing.T) {
 	if err != nil || !slices.Equal(got, []uint64{stale}) {
 		t.Errorf("run = %x, %v; want only the key no slot owned in either check", got, err)
 	}
-	if got, err := (staleKeyCheck{keys: keys, slots: func() ([]*node.Slot, error) { return nil, nil }, wait: func() bool { return false }}).run(); err != nil || len(got) != 0 {
+	checks = 0
+	if got, err := (staleKeyCheck{keys: keys, slots: slots, wait: func() bool { return false }}).run(); err != nil || len(got) != 0 {
 		t.Errorf("run with the mount stopping before the second check = %x, %v; want none", got, err)
 	}
 }

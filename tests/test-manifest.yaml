@@ -5829,7 +5829,7 @@ scenarios:
 
   - id: fencing-stale-keys-two-checks
     name: A stale key needs no owner in both checks
-    description: A joining node registers before its slot claim lands, so only keys without an owner in both checks a minute apart are reported, and a mount that stops first reports none
+    description: A joining node registers before its slot claim lands, so only keys without an owner in both checks a minute apart are reported, neither one whose node claimed its slot by the second check nor one registered between the checks, and a mount that stops first reports none
     priority: go_only
     environments:
       go: cmd/goclusterfs-mount/stalekeys_test.go::TestStaleKeyCheckNeedsBothChecks
