@@ -141,9 +141,11 @@ func (m twoPaths) readKeys() ([]uint64, error)              { return m.paths[0].
 func (m twoPaths) readReservation() (uint64, uint32, error) { return m.paths[0].readReservation() }
 
 // takeOverOverTwoPaths has node H, on two paths, preempt the stalled holder P, which makes H's first path the holder,
-// so LIO refuses H's writes on its second path. It returns H and whether P could write after any command since.
+// so LIO refuses H's writes on its second path. That needs an initiator whose sessions differ in ISID bytes 0-3;
+// open-iscsi's don't. It returns H and whether P could write after any command since.
 func takeOverOverTwoPaths(t *testing.T, target *Target) (h *PR, pWrote func() bool) {
 	t.Helper()
+	target.holderBySession = true
 	stalled := target.Node("vm1/1", 0x4743000000000001)
 	if err := stalled.Register(); err != nil {
 		t.Fatal(err)

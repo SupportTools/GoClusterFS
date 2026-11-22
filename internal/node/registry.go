@@ -933,15 +933,17 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
+	var owner [16]byte
 	// Peers may still hold orphans an earlier owner of this slot listed.
 	if old, err := deserializeSlot(expected); err == nil {
 		newSlot.Orphans = old.Orphans
-		// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
 		if old.State != NodeStateEmpty {
-			if err := r.fenceOut(old.UUID); err != nil {
-				return err
-			}
+			owner = old.UUID
 		}
+	}
+	// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
+	if err := r.fenceOut(owner); err != nil {
+		return err
 	}
 
 	success, err := r.casSlot(slotIdx, expected, serializeSlot(newSlot))
@@ -949,9 +951,10 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		r.rejoined = true
 		log.Printf("[WARN] Fencing: the device refused this node's first write although it registered its key, as LIO does "+
 			"after a key this host registered from an earlier iSCSI session is revoked; trying to register the key anew (%v)", err)
+		// LIO refuses a preempt from such a host too, and Preempt reads that as the owner being gone, so revoke it again.
 		if rerr := r.rejoin(); rerr != nil {
 			err = fmt.Errorf("%w; not registering anew: %v", err, rerr)
-		} else {
+		} else if err = r.fenceOut(owner); err == nil {
 			success, err = r.casSlot(slotIdx, expected, serializeSlot(newSlot))
 		}
 	}

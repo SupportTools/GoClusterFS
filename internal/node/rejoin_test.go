@@ -233,3 +233,69 @@ func TestLiveNodesSharingAHostnameJoinWithoutWaiting(t *testing.T) {
 		t.Error("the second node did not warn that a live node shares its hostname")
 	}
 }
+
+// Probe 4: after this node joined, a peer revokes a key this host registered from another session, which on LIO
+// clears the host's write permission. The node's revoke of the stalled owner P of the slot it claims is then refused,
+// and Preempt reads that as P being gone. The claim is refused too; the node registers anew, and must revoke P again
+// before it claims, or P's writes go on landing while the node replays P.
+func TestRejoinRevokesTheOwnerAgain(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	dev, cleanup := createTestDevice(t, 1<<20)
+	t.Cleanup(cleanup)
+	target := fence.NewLIOTarget()
+	q := target.Node("vm1/1", 0x4743000000000001)
+	other := target.Node("vm2/2", 0x4743000000000002)
+	p := target.Node("vm3/1", 0x4743000000000003)
+	for _, pr := range []*fence.PR{q, other, p} {
+		if err := pr.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	stalled := NewRegistry(dev, 0)
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: stalled.LocalUUID(), HeartbeatSeq: 3,
+		HeartbeatTime: time.Now().Add(-30 * time.Second).Unix(), JournalOffset: 5 << 20, JournalSize: 4 << 20}
+	copy(slot.Hostname[:], "vm3")
+	stalled.mu.Lock()
+	err := stalled.writeSlot(1, slot)
+	stalled.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p = target.Node("vm3/1", fence.NodeKey(stalled.LocalUUID()))
+	if err := p.Register(); err != nil {
+		t.Fatal(err)
+	}
+
+	nDev, err := storage.Open(dev.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = nDev.Close() })
+	nDev.SetWriteFault(func(int64) error {
+		if !target.MayWrite("vm2/1") {
+			return syscall.EBADE
+		}
+		return nil
+	})
+	reg := NewRegistry(nDev, 0)
+	pr := target.Node("vm2/1", fence.NodeKey(reg.LocalUUID()))
+	reg.SetJoin(func() error {
+		if _, err := pr.Join(); err != nil {
+			return err
+		}
+		return q.Preempt(other.Key())
+	}, pr.RegisterFresh)
+	reg.SetPreempter(func(owner [16]byte) error { return pr.Preempt(fence.NodeKey(owner)) })
+	reg.PreferSlot(1)
+	got, err := reg.Register(context.Background(), "vm2")
+	if err != nil || got != 1 {
+		t.Fatalf("Register: slot %d, %v; want the stalled node's slot 1", got, err)
+	}
+	keys, _ := q.Keys()
+	if target.MayWrite("vm3/1") || slices.Contains(keys, p.Key()) {
+		t.Errorf("the stalled node may write: %v, its key registered: %v; want it revoked before the claim", target.MayWrite("vm3/1"), slices.Contains(keys, p.Key()))
+	}
+}

@@ -21,14 +21,17 @@ type Target struct {
 	order    []string
 	// unlistable makes the target answer key listings as kernels without IOC_PR_READ_KEYS do.
 	unlistable bool
+	// holderBySession refuses the holder's initiator's other sessions, as LIO does for an initiator whose sessions
+	// differ in ISID bytes 0-3. open-iscsi's differ only in the qualifier, so LIO takes all of them for the holder.
+	holderBySession bool
 }
 
 func NewTarget() *Target { return &Target{keys: map[string]uint64{}, writable: map[string]bool{}} }
 
-// NewLIOTarget is a Target that decides writes as LIO does. Name each session "initiator/session". Registrations
-// belong to sessions. The session holding the reservation may write; another session of its initiator may not; any
-// other session may while its initiator's flag is set, which a new registration of the initiator sets and removing
-// any of its registrations clears. Removing the holder's registration hands the reservation to the oldest
+// NewLIOTarget is a Target that decides writes as LIO does for open-iscsi initiators. Name each session
+// "initiator/session". Registrations belong to sessions. Every session of the initiator holding the reservation may
+// write; any other session may while its initiator's flag is set, which a new registration of the initiator sets and
+// removing any of its registrations clears. A session that may not write may not reserve or preempt either. Removing the holder's registration hands the reservation to the oldest
 // registration, and preempting the holder's key hands it to the preempting session.
 func NewLIOTarget() *Target {
 	t := NewTarget()
@@ -92,7 +95,7 @@ func (t *Target) mayWrite(initiator string) bool {
 		case t.holder == initiator:
 			return true
 		case initiatorOf(t.holder) == initiatorOf(initiator):
-			return false
+			return !t.holderBySession
 		}
 		registered = t.writable[initiatorOf(initiator)]
 	}
@@ -154,7 +157,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if cur, registered := t.keys[d.initiator]; !registered || cur != own {
+	if cur, registered := t.keys[d.initiator]; !registered || cur != own || t.lio && !t.mayWrite(d.initiator) {
 		return ErrReservationConflict
 	}
 	found, holderKey := false, t.keys[t.holder]
