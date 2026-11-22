@@ -4096,7 +4096,7 @@ registered_initiators() {
     if [[ "$EXTERNAL_TARGET" == true ]]; then
         target_query <<'QUERY'
 out=$(pr --in --read-full-status "$dev") || exit 1
-echo "$out" | awk '/Key=/ { sub(/.*Key=/, ""); key = $1 } /iSCSI name/ { n = $NF; if (n !~ /,/) n = n ","; print "iSCSI Node: " n " Key: " key }'
+echo "$out" | awk '/Key=/ { sub(/.*Key=/, ""); key = $1 } /iSCSI (name|world wide unique port id)/ { n = $NF; if (n !~ /,/) n = n ","; print "iSCSI Node: " n " Key: " key }'
 QUERY
         # A failed query must fail a test that looks for no keys as well as one that looks for a key.
         [[ $? -eq 0 ]] || echo "the target query failed: goclusterfs:vm?"
