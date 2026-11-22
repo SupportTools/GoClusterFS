@@ -36,7 +36,7 @@ func TestMetricsForOperators(t *testing.T) {
 		lock: &LockStatsResponse{Types: []LockTypeStats{{Type: "inode", Acquires: 9, Blocked: 4, WaitSeconds: 2, Failed: 3}}},
 		all: &AllStatsResponse{Node: &NodeStatsResponse{
 			HeartbeatAgeSeconds: 1.5, PeerReplays: 2, PeerReplayFailures: 1, ReplayingSlots: []int{5},
-			MountReplayedTransactions: 4, MountDiscardedJournal: true,
+			MountReplayedTransactions: 4, MountDiscardedJournal: true, StaleReservationKeys: 2,
 		}},
 		cluster: &ClusterInfoResponse{State: "active", ClusterSize: 4, HealthyNodes: 2, Peers: []ClusterPeerInfo{
 			{State: "active"}, {State: "stale"}, {State: "dead"},
@@ -45,6 +45,7 @@ func TestMetricsForOperators(t *testing.T) {
 	requireMetrics(t, scrape(t, srv),
 		`goclusterfs_lock_failures_total{type="inode"} 3`,
 		`goclusterfs_node_heartbeat_age_seconds 1.5`,
+		`goclusterfs_fencing_stale_keys 2`,
 		`goclusterfs_journal_peer_replays_total{result="ok"} 2`,
 		`goclusterfs_journal_peer_replays_total{result="failed"} 1`,
 		`goclusterfs_journal_peer_replays_running 1`,

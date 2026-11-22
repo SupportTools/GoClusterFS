@@ -164,6 +164,7 @@ type Registry struct {
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 	replays              atomic.Uint64
 	replayFailures       atomic.Uint64
+	staleKeys            atomic.Int64
 	failures             map[int]*replayFailure // the last run of identical replay failures per slot
 }
 
@@ -1644,16 +1645,21 @@ type Stats struct {
 	ReplayFailures uint64 // replays that failed and were left for a retry
 	Replaying      []int  // slots whose journal this node is replaying now
 	Failing        []FailingReplay
+	StaleKeys      int // reservation keys no registry slot owned in this node's check after it joined
 }
 
 // Stats returns this node's liveness and replay counts.
 func (r *Registry) Stats() Stats {
-	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays()}
+	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays(),
+		StaleKeys: int(r.staleKeys.Load())}
 	if r.lastBeat.Load() != 0 {
 		st.HeartbeatAge = r.sinceLastBeat()
 	}
 	return st
 }
+
+// NoteStaleKeys records how many reservation keys no registry slot owned in this node's last check, for Stats.
+func (r *Registry) NoteStaleKeys(n int) { r.staleKeys.Store(int64(n)) }
 
 // Replaying returns the slots whose journal this node is replaying now.
 func (r *Registry) Replaying() []int {

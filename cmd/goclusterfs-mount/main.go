@@ -354,6 +354,7 @@ func main() {
 	stopReservationCheck := make(chan struct{})
 	if pr, ok := fencer.(*fence.PR); ok {
 		go keepReserved(pr, stopReservationCheck)
+		go warnStaleKeys(pr, nodeReg, *devicePath, stopReservationCheck)
 	}
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
