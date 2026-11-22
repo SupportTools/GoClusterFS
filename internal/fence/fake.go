@@ -19,6 +19,8 @@ type Target struct {
 	writable map[string]bool
 	holder   string
 	order    []string
+	// unlistable makes the target answer key listings as kernels without IOC_PR_READ_KEYS do.
+	unlistable bool
 }
 
 func NewTarget() *Target { return &Target{keys: map[string]uint64{}, writable: map[string]bool{}} }
@@ -199,6 +201,9 @@ func (d *fakeDevice) readKeys() ([]uint64, error) {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.unlistable {
+		return nil, ErrUnsupported
+	}
 	keys := make([]uint64, 0, len(t.keys))
 	for _, key := range t.keys {
 		keys = append(keys, key)

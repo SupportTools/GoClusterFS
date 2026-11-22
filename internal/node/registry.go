@@ -948,8 +948,10 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 	if errors.Is(err, unix.EBADE) && r.rejoin != nil && !r.rejoined {
 		r.rejoined = true
 		log.Printf("[WARN] Fencing: the device refused this node's first write although it registered its key, as LIO does "+
-			"after a key this host registered from an earlier iSCSI session is revoked; registering the key anew (%v)", err)
-		if err = r.rejoin(); err == nil {
+			"after a key this host registered from an earlier iSCSI session is revoked; trying to register the key anew (%v)", err)
+		if rerr := r.rejoin(); rerr != nil {
+			err = fmt.Errorf("%w; not registering anew: %v", err, rerr)
+		} else {
 			success, err = r.casSlot(slotIdx, expected, serializeSlot(newSlot))
 		}
 	}
