@@ -3,6 +3,8 @@ package integration
 import (
 	"syscall"
 	"testing"
+
+	"github.com/supporttools/GoClusterFS/internal/extent"
 )
 
 // TestTreeReservationsDoNotLeakBlocks appends to a file whose two inline extents
@@ -21,12 +23,13 @@ func TestTreeReservationsDoNotLeakBlocks(t *testing.T) {
 	}
 	fresh := st.Bfree
 
-	// 128KB at block 0 keeps the file off the SFB path; block 2 makes the second extent.
-	if err := mfs.WriteFileAt("append.bin", chunk(1, 128*1024), 0); err != nil {
+	// Block 0 makes the first extent and block 2 the second.
+	bs := blockSizeOf(t, mfs)
+	if err := mfs.WriteFileAt("append.bin", chunk(1, min(128*1024, bs)), 0); err != nil {
 		t.Fatalf("write at block 0 failed: %v", err)
 	}
 	for blk := 2; blk <= 7; blk++ {
-		if err := mfs.WriteFileAt("append.bin", chunk(byte(blk), 64*1024), int64(blk*mb)); err != nil {
+		if err := mfs.WriteFileAt("append.bin", chunk(byte(blk), min(64*1024, bs)), int64(blk*bs)); err != nil {
 			t.Fatalf("write at block %d failed: %v", blk, err)
 		}
 	}
@@ -35,10 +38,12 @@ func TestTreeReservationsDoNotLeakBlocks(t *testing.T) {
 		t.Fatalf("Remove failed: %v", err)
 	}
 
-	// Every block that was free right after the format, so a block a reservation leaked makes the write fail.
-	fill := int(fresh) * mb
+	// Every block that was free right after the format, so a block a reservation leaked makes the write fail, less
+	// room for the fill file's own tree node, which below 64 KB blocks is an aligned run of several blocks.
+	treeBlocks := int(extent.NodeBlocks(uint64(bs)))
+	fill := (int(fresh) - 2*(treeBlocks-1)) * bs
 	if err := mfs.WriteFile("fill.bin", make([]byte, fill)); err != nil {
-		t.Fatalf("writing %d MB, all a fresh volume had free, after the file was removed failed: %v", fill/mb, err)
+		t.Fatalf("writing %d blocks, all a fresh volume had free, after the file was removed failed: %v", fill/bs, err)
 	}
 }
 

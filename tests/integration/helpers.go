@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -682,4 +683,14 @@ func withTestBlockSize(args []string) []string {
 		return args
 	}
 	return append(args, "-block-size", bs)
+}
+
+// blockSizeOf returns the data block size of the volume mounted at mfs.
+func blockSizeOf(t *testing.T, mfs *MountedFS) int {
+	t.Helper()
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mfs.MountPoint, &st); err != nil {
+		t.Fatalf("Statfs failed: %v", err)
+	}
+	return int(st.Bsize)
 }

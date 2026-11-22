@@ -2066,7 +2066,7 @@ func TestMultiNodeStatfsFreeBlocks(t *testing.T) {
 	const fileBlocks = 5
 	writer, remover := cluster.Node(0), cluster.Node(1)
 	start := statfs(t, remover).Bfree
-	if err := writer.WriteFile("five-blocks.bin", make([]byte, fileBlocks*1024*1024)); err != nil {
+	if err := writer.WriteFile("five-blocks.bin", make([]byte, fileBlocks*blockSizeOf(t, writer))); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 	for i := range cluster.NodeCount() {
