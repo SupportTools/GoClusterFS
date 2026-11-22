@@ -4419,7 +4419,7 @@ test_clock_ahead_mount() {
         log_error "VM 2 took VM 1's registry slot"
         result=1
     fi
-    ssh_run 2 "hostname localhost; date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null"
+    ssh_run 2 "hostname \$(cat /etc/hostname); date -u -s '$(date -u '+%Y-%m-%d %H:%M:%S')' > /dev/null"
     if [[ -z "$(mount_pids 1)" ]]; then
         ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT}" || true
         setup_goclusterfs 1 false || result=1
