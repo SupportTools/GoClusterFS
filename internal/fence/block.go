@@ -17,14 +17,20 @@ func Block(f *os.File, key uint64) *PR {
 	return &PR{dev: retrying{device: blockDevice{f: f, partition: isPartition(f)}}, key: key}
 }
 
-// retrying sends a reservation command once more after status 0x2, and calls retried if set. A host whose key another
-// host preempted gets a unit attention on its first command, which the kernel reports as 0x2; sent again, the command
-// gets the device's real answer, such as a conflict. A clear is sent once: a repeat after one that worked would report
-// a conflict. An unregister whose first answer was lost reads its repeat's conflict as ErrFenced, which unmount only logs.
+// retrying sends a reservation command again while it gets status 0x2, at most maxResends times, and calls retried with
+// each such answer if set. A host whose key another host preempted gets a unit attention on its next command, and some
+// targets queue one for each event, such as the preempt and the commands it aborted; sent again, the command gets the
+// device's real answer, such as a conflict. The ioctls report every failure but a conflict as 0x2, so a resend there
+// assumes a unit attention, which the device answers without running the command; the SG_IO listings read the sense
+// data and return 0x2 only for a unit attention. A clear is sent once: a repeat after one that worked would report a
+// conflict. An unregister whose first answer was lost reads its repeat's conflict as ErrFenced, which unmount only logs.
 type retrying struct {
 	device
-	retried func()
+	retried func(error)
 }
+
+// maxResends bounds the resends after status 0x2, as Linux's SCSI disk driver retries ordinary I/O up to 5 times.
+const maxResends = 5
 
 func (d retrying) register(old, new uint64, ignore bool) error {
 	return d.again(func() error { return d.device.register(old, new, ignore) })
@@ -59,13 +65,17 @@ func (d retrying) readReservation() (key uint64, typ uint32, err error) {
 }
 
 func (d retrying) again(command func() error) error {
-	if err := command(); !errors.Is(err, statusError(statusIOError)) {
-		return err
+	err := command()
+	for range maxResends {
+		if !errors.Is(err, statusError(statusIOError)) {
+			break
+		}
+		if d.retried != nil {
+			d.retried(err)
+		}
+		err = command()
 	}
-	if d.retried != nil {
-		d.retried()
-	}
-	return command()
+	return err
 }
 
 type blockDevice struct {
