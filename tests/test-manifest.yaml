@@ -5733,6 +5733,13 @@ scenarios:
     environments:
       go: internal/node/zombie_test.go::TestZombieMountCountsAsExited
 
+  - id: registry-zombie-stuck-thread
+    name: A zombie leader with a stuck thread counts as running
+    description: A mount killed while a thread sits in an uninterruptible write shows a zombie leader, but the write can still land; it counts as gone only once every thread is Z or X
+    priority: go_only
+    environments:
+      go: internal/node/zombie_test.go::TestZombieLeaderWithAStuckThreadCountsAsRunning
+
   - id: registry-release-clean-slot
     name: A clean unmount empties its registry slot
     description: Release empties a clean, Active slot of this node, so other hosts stop counting it; a slot listing orphans or marked Dead by a peer stays as it is
