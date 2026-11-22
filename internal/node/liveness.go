@@ -159,12 +159,7 @@ func heartbeatOlderThan(slot *Slot, d time.Duration) bool {
 func (s *Slot) LeaseExpiry() time.Time {
 	switch s.State {
 	case NodeStateActive, NodeStateLeaving:
-		expiry := time.Unix(s.HeartbeatTime, 0).Add(HeartbeatTimeout)
-		// A node taking the slot over may still finish; peers wait deadAfter from its intent before they do.
-		if _, marked, ok := s.Intent(); ok && marked.Add(deadAfter).After(expiry) {
-			expiry = marked.Add(deadAfter)
-		}
-		return expiry
+		return time.Unix(s.HeartbeatTime, 0).Add(HeartbeatTimeout)
 	case NodeStateDead:
 		return time.Unix(s.RecoveryStart, 0).Add(recoveryLease)
 	}

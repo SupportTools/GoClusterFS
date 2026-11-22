@@ -277,15 +277,13 @@ func TestFailedPreemptPutsTheSlotBackOnlyWhenItDidNotTakeEffect(t *testing.T) {
 	}
 }
 
-// A live slot with an intent counts as failing for lock waiters, though the intent changed its bytes, and fsck's
-// offline release waits deadAfter from the intent, however old the node's last heartbeat.
-func TestAnIntentSlotIsFailingAndHoldsItsLease(t *testing.T) {
+// A live slot with an intent counts as failing for lock waiters, though the intent changed its bytes.
+func TestAnIntentSlotIsFailing(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1<<20)
 	t.Cleanup(cleanup)
 	reg := NewRegistry(dev, 0)
-	marked := time.Now()
 	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{1}, HeartbeatSeq: 1,
-		HeartbeatTime: marked.Add(-time.Hour).Unix(), RecoveryOwner: [16]byte{2}, RecoveryStart: marked.Unix()}
+		HeartbeatTime: time.Now().Unix(), RecoveryOwner: [16]byte{2}, RecoveryStart: time.Now().Unix()}
 	reg.mu.Lock()
 	err := reg.writeSlot(3, slot)
 	reg.mu.Unlock()
@@ -294,8 +292,5 @@ func TestAnIntentSlotIsFailingAndHoldsItsLease(t *testing.T) {
 	}
 	if _, occ := reg.Occupant(3, true); occ != OccupiedFailing {
 		t.Errorf("Occupant = %v, want OccupiedFailing", occ)
-	}
-	if got, want := slot.LeaseExpiry(), time.Unix(marked.Unix(), 0).Add(deadAfter); !got.Equal(want) {
-		t.Errorf("LeaseExpiry = %v, want %v, deadAfter after the intent", got, want)
 	}
 }
