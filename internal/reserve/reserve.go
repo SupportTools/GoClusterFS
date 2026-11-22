@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	DefaultSize = 64
-	DefaultIdle = 10 * time.Second
-	tick        = time.Second
+	DefaultBytes = 64 << 20
+	DefaultIdle  = 10 * time.Second
+	tick         = time.Second
 	// MaxPeerWait covers a peer's idle return, so a lost broadcast cannot cause ENOSPC.
 	MaxPeerWait = DefaultIdle + 2*tick
 )

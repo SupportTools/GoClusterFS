@@ -127,7 +127,7 @@ func main() {
 		// TRIM configuration
 		trimEnabled   = flag.Bool("trim", true, "Discard freed blocks on the device (BLKDISCARD) in batches; does nothing on image files")
 		trimBatchSize = flag.Int("trim-batch", 256, "Freed blocks to collect before a discard")
-		blockReserve  = flag.Int("block-reserve", reserve.DefaultSize, "Data blocks each node takes from the bitmap at once and hands out without the cluster-wide bitmap lock; 0 turns reserves off. Needs the journal")
+		blockReserve  = flag.Int("block-reserve", -1, "Data blocks each node takes from the bitmap at once and hands out without the cluster-wide bitmap lock; 0 turns reserves off, and -1 takes 64 MB of blocks: 64 at 1 MB, 8192 at 8 KB. Needs the journal")
 		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Longest a freed block waits for its discard")
 
 		// SFB configuration (Sub-File Block containers for small files)
@@ -548,6 +548,9 @@ func main() {
 		failf("[ERROR] Stopping this node and keeping its locks: %v. A peer replays this node's journal and finishes the rename, or the next mount here does", err)
 	})
 	var res *reserve.Manager
+	if *blockReserve < 0 {
+		*blockReserve = int(reserve.DefaultBytes / sb.BlockSize)
+	}
 	if j != nil && *blockReserve > 0 {
 		res = reserve.New(reserve.Config{Size: *blockReserve}, bm, j, extentMgr.ReleaseBlocks, func() int {
 			active, _ := nodeReg.GetActiveNodes()
