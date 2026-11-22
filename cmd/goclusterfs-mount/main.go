@@ -609,6 +609,9 @@ func main() {
 		}
 		log.Printf("Filesystem formatted successfully, with project quotas in inode %d", sb.QuotaInode)
 	}
+	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
+		gfs.SetQuotaTable(sb.QuotaInode)
+	}
 
 	// Verify root exists
 	rootIno, err := inodeTbl.Read(inode.InodeRoot)

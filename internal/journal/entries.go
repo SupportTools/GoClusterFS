@@ -141,7 +141,7 @@ type InodeCreatePayload struct {
 	GID            uint32
 	ParentInodeNum uint64
 	NameHash       uint64 // Hash of filename (for verification)
-	Reserved       uint32
+	ProjectID      uint32 // Quota project the new inode takes from a PROJINHERIT parent; 0 for none
 	MetaGeneration uint64
 }
 
@@ -154,6 +154,7 @@ func (p *InodeCreatePayload) Serialize() []byte {
 	binary.LittleEndian.PutUint32(buf[16:20], p.GID)
 	binary.LittleEndian.PutUint64(buf[20:28], p.ParentInodeNum)
 	binary.LittleEndian.PutUint64(buf[28:36], p.NameHash)
+	binary.LittleEndian.PutUint32(buf[36:40], p.ProjectID)
 	binary.LittleEndian.PutUint64(buf[40:48], p.MetaGeneration)
 	return buf
 }
@@ -170,6 +171,7 @@ func DeserializeInodeCreate(buf []byte) (*InodeCreatePayload, error) {
 		GID:            binary.LittleEndian.Uint32(buf[16:20]),
 		ParentInodeNum: binary.LittleEndian.Uint64(buf[20:28]),
 		NameHash:       binary.LittleEndian.Uint64(buf[28:36]),
+		ProjectID:      binary.LittleEndian.Uint32(buf[36:40]),
 		MetaGeneration: trailingUint64(buf, 40),
 	}, nil
 }

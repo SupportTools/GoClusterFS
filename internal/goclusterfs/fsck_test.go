@@ -115,6 +115,9 @@ func openFormattedComponents(t *testing.T, path string) *FS {
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
 	fsys := NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, nil, nil, nil, nil, refs, locks, nodeUUID, sb.DataRegionOffset)
 	fsys.SetSymlinks(sb.RequiredFlags&superblock.RequiredSymlinks != 0)
+	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
+		fsys.SetQuotaTable(sb.QuotaInode)
+	}
 	return fsys
 }
 

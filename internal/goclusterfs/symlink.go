@@ -107,9 +107,10 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		return nil, syscall.EIO
 	}
 	uid, gid, _ := f.newOwner(ctx, dirIno)
+	project := childProject(dirIno)
 
 	if f.journal != nil {
-		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, target, block, reserved)
+		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, project, target, block, reserved)
 		if err != nil {
 			logging.Debugf("Symlink %q: journal commit failed: %v", name, err)
 			// A full journal wrote nothing and Logged put a reserved block back; other failures may leave the record on disk.
@@ -146,6 +147,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	childIno.Mode = inode.S_IFLNK | 0o777
 	childIno.UID = uid
 	childIno.GID = gid
+	joinProject(childIno, project)
 	childIno.LinkCount = 1
 	childIno.Atime = now
 	childIno.Mtime = now
@@ -213,9 +215,9 @@ func (f *FS) symlinkBlock(ctx context.Context, target []byte) (uint64, bool, sys
 	return b, reserved, 0
 }
 
-func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid uint32, target []byte, block uint64, reserved bool) (uint64, error) {
+func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid, project uint32, target []byte, block uint64, reserved bool) (uint64, error) {
 	link := &journal.SymlinkTargetPayload{InodeNum: uint64(num), DiskBlock: block, Target: target}
-	txn, err := f.createTxn(num, parentNum, name, uint32(inode.S_IFLNK|0o777), uid, gid, journal.DirEntrySymlink, link)
+	txn, err := f.createTxn(num, parentNum, name, uint32(inode.S_IFLNK|0o777), uid, gid, project, journal.DirEntrySymlink, link)
 	if err != nil {
 		return 0, err
 	}

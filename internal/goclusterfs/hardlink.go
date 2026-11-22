@@ -78,6 +78,8 @@ func (f *FS) addLink(ctx context.Context, parentNum uint32, file *File, name str
 		return nil, syscall.ENOENT
 	case ino.LinkCount >= maxLinks:
 		return nil, syscall.EMLINK
+	case f.crossesProject(ino, dirIno):
+		return nil, syscall.EXDEV
 	}
 
 	if f.journal != nil {
