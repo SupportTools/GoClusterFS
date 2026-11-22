@@ -35,7 +35,7 @@ func fencedPair(t *testing.T, target *fence.Target) (survivor *Registry, failing
 			t.Fatal(err)
 		}
 	}
-	survivor.SetPreempter(func(owner [16]byte, _ bool) error { return own.Preempt(fence.NodeKey(owner)) })
+	survivor.SetPreempter(func(owner [16]byte) error { return own.Preempt(fence.NodeKey(owner)) })
 
 	stale := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: victim.LocalUUID(), HeartbeatSeq: 1,
 		HeartbeatTime: time.Now().Add(-2 * HeartbeatTimeout).Unix(), JournalOffset: 1 << 20, JournalSize: 4 << 20}
@@ -76,7 +76,7 @@ func TestRecoveryPreemptsBeforeMarkingDead(t *testing.T) {
 func TestRecoveryStopsWhenPreemptFails(t *testing.T) {
 	survivor, failing, _ := fencedPair(t, fence.NewTarget())
 	offline := errors.New("array offline")
-	survivor.SetPreempter(func([16]byte, bool) error { return offline })
+	survivor.SetPreempter(func([16]byte) error { return offline })
 	replayed := false
 	survivor.SetRecoveryHandler(func(*FailedNodeInfo) error { replayed = true; return nil })
 	if err := survivor.RecoverFailedNode(failing); !errors.Is(err, offline) {
@@ -138,7 +138,7 @@ func TestMountingIntoADeadSlotPreempts(t *testing.T) {
 	if err := own.Register(); err != nil {
 		t.Fatal(err)
 	}
-	mounting.SetPreempter(func(owner [16]byte, _ bool) error { return own.Preempt(fence.NodeKey(owner)) })
+	mounting.SetPreempter(func(owner [16]byte) error { return own.Preempt(fence.NodeKey(owner)) })
 	slot, err := mounting.Register(context.Background(), "host")
 	if err != nil || slot != 0 {
 		t.Fatalf("register: slot %d, %v; want the dead node's slot 0", slot, err)
@@ -194,7 +194,7 @@ func TestMountPreemptsOnlyAfterTheSilenceWatch(t *testing.T) {
 		}
 		start := time.Now()
 		var preemptedAfter time.Duration
-		mounting.SetPreempter(func(owner [16]byte, _ bool) error {
+		mounting.SetPreempter(func(owner [16]byte) error {
 			preemptedAfter = time.Since(start)
 			return own.Preempt(fence.NodeKey(owner))
 		})

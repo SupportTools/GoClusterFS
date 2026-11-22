@@ -5,7 +5,8 @@ import "testing"
 // After a relogin a host holds keys under two sessions: an orphan from before it, whose unregister failed, and its
 // mount's after it. The host crashes and reboots onto its first session, whose REGISTER changes the orphan's key in
 // place. A peer then revokes the crashed mount's key, which on LIO stops writes from every session of the host, though
-// the new key stays registered. RegisterFresh registers the key as a new registration, which lets the host write.
+// the new key stays registered. RegisterFresh registers the key as a new registration, which lets the host write,
+// and keeps the peer's reservation.
 func TestRegisterFreshRestoresWritesAfterAnotherSessionsKeyIsRevoked(t *testing.T) {
 	target := NewLIOTarget()
 	peer := target.Node("vm1/1", 0x4743000000000001)
@@ -32,21 +33,28 @@ func TestRegisterFreshRestoresWritesAfterAnotherSessionsKeyIsRevoked(t *testing.
 	if err := rebooted.RegisterFresh(); err != nil {
 		t.Fatalf("RegisterFresh: %v", err)
 	}
-	keys, _ := rebooted.Keys()
-	if !target.MayWrite("vm2/1") || len(keys) != 2 {
-		t.Errorf("after RegisterFresh the host may write: %v, keys %x; want it writing with the peer's key and its own", target.MayWrite("vm2/1"), keys)
+	if !target.MayWrite("vm2/1") || target.MayWrite("vm9/1") || target.holder != "vm1/1" {
+		t.Errorf("after RegisterFresh the host may write: %v, an unregistered host may: %v, holder %q; want the host writing under the peer's reservation",
+			target.MayWrite("vm2/1"), target.MayWrite("vm9/1"), target.holder)
 	}
 }
 
-// A session that holds no key registers once and reserves.
-func TestRegisterFreshOnANewSession(t *testing.T) {
+// A host that preempts its own key under another session, after it registered on this one, keeps writing when it holds
+// the reservation: LIO does not check the holder's own session against the initiator's flag.
+func TestTheHolderWritesAfterRevokingItsOwnOtherSession(t *testing.T) {
 	target := NewLIOTarget()
-	pr := target.Node("vm1/1", 0x4743000000000001)
-	if err := pr.RegisterFresh(); err != nil {
+	old := target.Node("vm2/1", 0x4743000000000001)
+	if err := old.RegisterFresh(); err != nil {
 		t.Fatal(err)
 	}
-	other := target.Node("vm9/1", 0)
-	if !target.MayWrite("vm1/1") || target.MayWrite(other.dev.(*fakeDevice).initiator) {
-		t.Error("RegisterFresh did not leave the host registered with the device reserved")
+	current := target.Node("vm2/2", 0x4743000000000002)
+	if err := current.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := current.Preempt(old.Key()); err != nil {
+		t.Fatal(err)
+	}
+	if !target.MayWrite("vm2/2") || target.holder != "vm2/2" {
+		t.Errorf("after revoking the holder's key the session may write: %v, holder %q; want it holding the reservation", target.MayWrite("vm2/2"), target.holder)
 	}
 }

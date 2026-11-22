@@ -13,16 +13,21 @@ type Target struct {
 	keys      map[string]uint64
 	reserved  bool
 	preempted []uint64
-	// lio decides writes per initiator, as LIO does; writable holds the flag it keeps for each.
+	// lio decides writes as LIO does: writable holds its flag per initiator, holder the session holding the
+	// reservation, and order the sessions in the order they registered.
 	lio      bool
 	writable map[string]bool
+	holder   string
+	order    []string
 }
 
 func NewTarget() *Target { return &Target{keys: map[string]uint64{}, writable: map[string]bool{}} }
 
-// NewLIOTarget is a Target that decides writes as LIO does. Name each session "initiator/session": registrations
-// belong to sessions, but whether a session may write is one flag per initiator, which a new registration of the
-// initiator sets and removing any of its registrations clears.
+// NewLIOTarget is a Target that decides writes as LIO does. Name each session "initiator/session". Registrations
+// belong to sessions. The session holding the reservation may write; another session of its initiator may not; any
+// other session may while its initiator's flag is set, which a new registration of the initiator sets and removing
+// any of its registrations clears. Removing the holder's registration hands the reservation to the oldest
+// registration, and preempting the holder's key hands it to the preempting session.
 func NewLIOTarget() *Target {
 	t := NewTarget()
 	t.lio = true
@@ -34,10 +39,24 @@ func initiatorOf(session string) string {
 	return initiator
 }
 
+// add records session's new registration. Called with t.mu held.
+func (t *Target) add(session string, key uint64) {
+	t.keys[session] = key
+	t.order = append(t.order, session)
+	t.writable[initiatorOf(session)] = true
+}
+
 // drop removes session's registration. Called with t.mu held.
 func (t *Target) drop(session string) {
 	delete(t.keys, session)
+	t.order = slices.DeleteFunc(t.order, func(s string) bool { return s == session })
 	t.writable[initiatorOf(session)] = false
+	if t.holder == session {
+		t.holder = ""
+		if len(t.order) > 0 {
+			t.holder = t.order[0]
+		}
+	}
 }
 
 // Node returns the Fencer of initiator, whose registration is separate from every other initiator's.
@@ -62,7 +81,13 @@ func (t *Target) MayWrite(initiator string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	_, registered := t.keys[initiator]
-	if t.lio {
+	if t.lio && t.reserved {
+		switch {
+		case t.holder == initiator:
+			return true
+		case initiatorOf(t.holder) == initiatorOf(initiator):
+			return false
+		}
 		registered = t.writable[initiatorOf(initiator)]
 	}
 	return registered || !t.reserved
@@ -89,9 +114,10 @@ func (d *fakeDevice) register(old, new uint64, ignore bool) error {
 		return ErrReservationConflict
 	}
 	if new != 0 {
-		t.keys[d.initiator] = new
-		if !registered {
-			t.writable[initiatorOf(d.initiator)] = true
+		if registered {
+			t.keys[d.initiator] = new
+		} else {
+			t.add(d.initiator, new)
 		}
 		return nil
 	}
@@ -111,6 +137,9 @@ func (d *fakeDevice) reserve(key uint64) error {
 	if t.keys[d.initiator] != key || key == 0 {
 		return ErrReservationConflict
 	}
+	if !t.reserved {
+		t.holder = d.initiator
+	}
 	t.reserved = true
 	return nil
 }
@@ -122,7 +151,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	if cur, registered := t.keys[d.initiator]; !registered || cur != own {
 		return ErrReservationConflict
 	}
-	found := false
+	found, holderKey := false, t.keys[t.holder]
 	for initiator, key := range t.keys {
 		if key == victim {
 			t.drop(initiator)
@@ -131,6 +160,9 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	}
 	if !found {
 		return ErrReservationConflict
+	}
+	if t.holder != "" && holderKey == victim {
+		t.holder = d.initiator
 	}
 	t.preempted = append(t.preempted, victim)
 	return nil
@@ -145,6 +177,7 @@ func (d *fakeDevice) clear(key uint64) error {
 	}
 	t.keys = map[string]uint64{}
 	t.writable = map[string]bool{}
+	t.holder, t.order = "", nil
 	t.reserved = false
 	return nil
 }

@@ -92,30 +92,22 @@ func (p *PR) Key() uint64 { return p.key }
 
 func (p *PR) Register() error { return p.dev.register(0, p.key, true) }
 
-// RegisterFresh registers this node's key as a new registration of this session, then reserves. LIO lets an initiator
+// RegisterFresh drops this session's registration and registers the key anew, then reserves. LIO lets an initiator
 // write only while a per-initiator flag is set: each new registration sets it, and removing any registration of the
-// initiator clears it, also one an earlier session of this host made. Changing a registration's key in place leaves
-// the flag as it was.
+// initiator clears it, also one an earlier session of this host made. Call it only after the device refused a write of
+// this session while it held its key: the session is then not the reservation holder, so dropping its registration
+// does not release the reservation.
 func (p *PR) RegisterFresh() error {
-	err := p.dev.register(0, p.key, false)
-	if errors.Is(err, ErrReservationConflict) {
-		err = p.reregister()
-	}
-	if err != nil {
-		return err
-	}
-	return p.Reserve()
-}
-
-// reregister replaces whatever key this session holds with this node's, removes it, and registers it anew.
-func (p *PR) reregister() error {
 	if err := p.Register(); err != nil {
 		return err
 	}
 	if err := p.dev.register(p.key, 0, false); err != nil {
 		return err
 	}
-	return p.dev.register(0, p.key, false)
+	if err := p.dev.register(0, p.key, false); err != nil {
+		return err
+	}
+	return p.Reserve()
 }
 
 func (p *PR) Reserve() error {

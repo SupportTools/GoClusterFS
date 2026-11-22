@@ -246,9 +246,7 @@ func (c *Checker) Release(plan *ReleasePlan, salvage bool) (*Salvage, error) {
 		return c.dev.Sync()
 	}
 	reg := node.NewRegistry(c.dev, c.sbData.NodeRegistryOffset)
-	if preempt := c.opts.Preempt; preempt != nil {
-		reg.SetPreempter(func(owner [16]byte, _ bool) error { return preempt(owner) })
-	}
+	reg.SetPreempter(c.opts.Preempt)
 	released, err := reg.ReleaseSlot(i, plan.Slot.raw, resetJournal)
 	switch {
 	case err != nil && reset:
