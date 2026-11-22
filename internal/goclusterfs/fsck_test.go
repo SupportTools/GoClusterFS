@@ -31,6 +31,12 @@ func newFormattedImage(t *testing.T) string {
 
 func newFormattedImageOfSize(t *testing.T, size int64) string {
 	t.Helper()
+	return formatImage(t, size, true)
+}
+
+// formatImage formats an image and creates its root directory, and with quotas its quota table, as -format does.
+func formatImage(t *testing.T, size int64, quotas bool) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "fs.img")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -50,12 +56,14 @@ func newFormattedImageOfSize(t *testing.T, size int64) string {
 	if err := fsys.InitRoot(context.Background()); err != nil {
 		t.Fatalf("InitRoot: %v", err)
 	}
-	sb, err := superblock.Read(fsys.dev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := quota.Enable(context.Background(), fsys.dev, sb, fsys.inodeTbl, fsys.bitmapMgr); err != nil {
-		t.Fatalf("quota.Enable: %v", err)
+	if quotas {
+		sb, err := superblock.Read(fsys.dev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := quota.Enable(context.Background(), fsys.dev, sb, fsys.inodeTbl, fsys.bitmapMgr); err != nil {
+			t.Fatalf("quota.Enable: %v", err)
+		}
 	}
 	fsys.snapshotWkr.Stop()
 	return path
@@ -489,5 +497,43 @@ func TestFsckChecksTheQuotaTable(t *testing.T) {
 	}
 	if !found || r.ExitCode() == fsck.ExitClean {
 		t.Errorf("fsck exit %d after a quota table sector was damaged; want an error naming it:%s", r.ExitCode(), problemList(r))
+	}
+}
+
+// An enable that fails before it names the table in the superblock leaves the superblock without quotas, so builds
+// without them still mount the volume, and fsck -repair frees the inode and block it had taken.
+func TestInterruptedQuotaEnableLeavesNoFlag(t *testing.T) {
+	t.Parallel()
+	path := formatImage(t, superblock.MinDeviceSize+64<<20, false)
+	fsys := openFormattedFS(t, path)
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsys.dev.SetWriteFault(func(off int64) error {
+		if off >= int64(sb.DataRegionOffset) {
+			return syscall.EIO
+		}
+		return nil
+	})
+	if err := quota.Enable(context.Background(), fsys.dev, sb, fsys.inodeTbl, fsys.bitmapMgr); err == nil {
+		t.Fatal("Enable succeeded though the table could not be written")
+	}
+	fsys.dev.SetWriteFault(func(int64) error { return nil })
+	onDisk, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.RequiredFlags&superblock.RequiredProjectQuotas != 0 || onDisk.QuotaInode != 0 {
+		t.Fatalf("after a failed enable the superblock has flags %#x and quota inode %d; want no quotas", onDisk.RequiredFlags, onDisk.QuotaInode)
+	}
+
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitCorrected {
+		t.Fatalf("repair after a failed enable: exit %d, want %d:%s", r.ExitCode(), fsck.ExitCorrected, problemList(r))
+	}
+	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
+		t.Fatalf("problems left after repair:%s", problemList(r))
 	}
 }
