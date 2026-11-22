@@ -77,7 +77,7 @@ func (k *Rekeyer) rekey() error {
 	if k.beforeRegister != nil {
 		k.beforeRegister()
 	}
-	pocStall("before-register")
+	failpointStall("before-register")
 	var added []*PR
 	for _, path := range lost {
 		if err := path.Register(); err != nil {
@@ -88,7 +88,7 @@ func (k *Rekeyer) rekey() error {
 	if k.afterRegister != nil {
 		k.afterRegister()
 	}
-	pocStall("after-register")
+	failpointStall("after-register")
 	age := k.HeartbeatAge()
 	err = errors.Join(k.listedAfter(len(added)), k.live())
 	if err == nil {

@@ -5870,11 +5870,137 @@ scenarios:
       go: internal/storage/device_test.go::TestGoneHandlerSeesENXIO
 
   - id: fencing-session-relogin
-    name: A node on dm-multipath survives its iSCSI path logging in again
-    description: VM 1 mounts on a one-path dm-multipath map; its path logs out and in again under write load on both nodes and it keeps writing; VM 2 then preempts VM 1's old-session registration, VM 1 registers its key again, keeps writing, shows the restore in /health and /metrics, and fsck finds the volume clean
+    name: A path relogin keeps a node writing, and a preempt of its key is final
+    description: VM 1 mounts on a two-path dm-multipath map; one path logs out and in again under write load and VM 1 keeps writing, with its key listed under the old session and the other path; VM 2 then preempts VM 1's key, VM 1 refuses to register it again and stops, VM 2 writes on and replays it, and fsck finds the volume clean
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_session_relogin
+
+  - id: fencing-paused-rekey
+    name: A paused node resuming inside a takeover lands no write, on one or two paths
+    description: VM 2 holds its takeover between its preempt and its Dead mark; VM 1, on a one- and a two-path dm-multipath map and paused with QEMU stop while writing, between a heartbeat's read and write, or before or after a re-register, resumes inside that window, stops on both the intent and the key listing, and lands no write; fsck is clean
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_paused_rekey
+
+  - id: fence-rekey-paused-clock
+    name: A paused clock cannot let a re-register land a write after a takeover
+    description: With the heartbeat age frozen at 1s, a node that resumes between the peer's preempt and its Dead mark, or registers just before or after the preempt, is refused by both the slot's intent and the key listing, and no write lands
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyAfterAPausedClockLandsNoWrite
+
+  - id: fence-rekey-unregister-fails
+    name: A failed rekey that cannot remove its key stops the node with writes held
+    description: A re-register that lands after the preempt and cannot be removed again leaves a registration; Refused runs while writes are still held, so none lands through it
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyThatCannotUnregisterStopsWithWritesHeld
+
+  - id: fence-rekey-preempt-without-intent
+    name: The key listing refuses a preempt that left no intent
+    description: An older fsck or peer preempts without marking an intent, before the rekey or between its listing and its register; the key listing refuses and no write lands
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyRefusesAPreemptWithoutAnIntent
+
+  - id: fence-rekey-intent-before-preempt
+    name: The slot refuses an intent the peer has not acted on yet
+    description: A peer marked its intent but has not preempted, so every registration stands; the slot check refuses before any register
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyRefusesAnIntentBeforeThePreempt
+
+  - id: fence-rekey-unlistable
+    name: Without a key listing a rekey registers nothing
+    description: A device that cannot list keys gives no proof that the key was not preempted, so Rekey returns ErrUnsupported without a register
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyWithoutAKeyListingRegistersNothing
+
+  - id: fence-rekey-two-paths
+    name: A rekey on two paths re-registers only the lost path
+    description: On a two-path dm-multipath map whose second path lost its session, Rekey registers that path only and the first keeps its key throughout; a preempt before or between the listing and the register is refused and neither path writes
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyOnTwoPaths
+
+  - id: fence-preempt-not-taken
+    name: A preempt that did not take effect says so
+    description: A peer whose own key is gone cannot preempt; the device still lists the victim's key, so Preempt returns ErrNotPreempted along with ErrFenced
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestPreemptThatDidNotTakeEffectSaysSo
+
+  - id: node-rekey-reads-intent
+    name: A victim's rekey during a takeover reads the intent
+    description: With real registries, the victim's re-register lands after the survivor's preempt or before its slot read; it reads the survivor's intent, removes its key and cannot write during the replay
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestRekeyDuringATakeoverReadsTheIntent
+
+  - id: node-beat-stops-on-intent
+    name: A heartbeat stops on an intent in its slot
+    description: A node whose slot names a peer revoking it loses the slot at its next heartbeat and does not write it
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestBeatStopsOnAnIntent
+
+  - id: node-intent-after-beat
+    name: A takeover intent fails after the victim's heartbeat
+    description: A victim's heartbeat that lands before the intent makes the intent's CAS fail
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestIntentFailsAfterTheVictimBeats
+
+  - id: node-intent-erased-by-beat
+    name: A takeover stops when a heartbeat erases its intent
+    description: A victim heartbeat between the intent and the Dead mark makes the Dead CAS fail; the peer replays nothing
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestTakeoverAbortsWhenABeatErasesTheIntent
+
+  - id: node-orphaned-intent
+    name: An orphaned intent is taken over after deadAfter
+    description: A peer that marked its intent and stopped, before or after its preempt, leaves the slot Active with the intent; another node takes it over once it stays unchanged for deadAfter
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestOrphanedIntentIsTakenOverLater
+
+  - id: node-takeover-protocol-gate
+    name: Builds that take nodes over differently refuse to join each other
+    description: A node of the intent build and one of an older build refuse to register while the other runs; this build's refusal names the takeover protocol
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestRegisterRefusesNextToAnotherTakeoverProtocol
+
+  - id: node-failed-preempt-undo
+    name: A failed preempt gives the slot back only when it did not take effect
+    description: When the device still lists the victim's key after a failed preempt, the slot gets its old bytes back and the victim keeps it; after a failure of unknown outcome the intent stays
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestFailedPreemptPutsTheSlotBackOnlyWhenItDidNotTakeEffect
+
+  - id: node-intent-slot-failing
+    name: A slot with an intent counts as failing for lock waiters
+    description: Occupant reports a live slot with an intent as failing although the intent changed its bytes
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestAnIntentSlotIsFailing
+
+  - id: superblock-takeover-intent-flag
+    name: Builds without takeover intents refuse a new volume
+    description: A new volume carries RequiredTakeoverIntent; a build that does not know it, whose fsck would revoke without an intent, refuses to mount or check it
+    priority: go_only
+    environments:
+      go: internal/superblock/superblock_test.go::TestBuildsWithoutTakeoverIntentsRefuseANewVolume
+
+  - id: fsck-slots-show-intent
+    name: fsck shows a takeover intent
+    description: -list-slots shows a live slot as being taken over by the marking node, and -inspect-slot shows who marked it and when, not a replay lease
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-fsck/slots_test.go::TestSlotsShowATakeoverIntent
 
   - id: storage-last-error
     name: Device remembers its last I/O failure
