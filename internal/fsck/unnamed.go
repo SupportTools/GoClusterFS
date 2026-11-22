@@ -59,7 +59,7 @@ func (c *Checker) checkUnnamed() error {
 	var problems []int
 	kept := 0
 	for _, num := range c.unnamed {
-		if c.snapshotData[num] && (c.snapshotRefs[num] || !c.finished[PhaseSnapshots]) {
+		if c.snapshotData[num] && (c.snapshotRefs[num] || !c.finished[PhaseSnapshots]) || c.isQuotaInode(num) {
 			continue
 		}
 		loc := fmt.Sprintf("inode %d", num)

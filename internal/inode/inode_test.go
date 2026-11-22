@@ -126,7 +126,9 @@ func TestSerializeDeserialize(t *testing.T) {
 		ExtentTreeRoot:  1000,
 		ExtentCount:     3,
 		ExtentDepth:     1,
+		ProjectID:       0x01020304,
 	}
+	inode.Flags |= FlagProjInherit
 	copy(inode.LastModifierUUID[:], "0123456789abcdef")
 
 	inode.InlineExtents[0] = InlineExtent{
@@ -176,6 +178,9 @@ func TestSerializeDeserialize(t *testing.T) {
 	}
 	if restored.LinkCount != inode.LinkCount {
 		t.Errorf("LinkCount = %d, want %d", restored.LinkCount, inode.LinkCount)
+	}
+	if restored.ProjectID != inode.ProjectID || binary.LittleEndian.Uint32(data[212:216]) != inode.ProjectID {
+		t.Errorf("ProjectID = %#x, bytes 212-215 %#x; want %#x", restored.ProjectID, binary.LittleEndian.Uint32(data[212:216]), inode.ProjectID)
 	}
 	if restored.Size != inode.Size {
 		t.Errorf("Size = %d, want %d", restored.Size, inode.Size)

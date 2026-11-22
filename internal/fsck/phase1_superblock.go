@@ -192,6 +192,10 @@ func (c *Checker) parseSuperblock(buf []byte) *SuperblockData {
 
 	sb.LockSlotSize = binary.LittleEndian.Uint32(buf[264:268])
 
+	sb.QuotaInode = binary.LittleEndian.Uint32(buf[268:272])
+	sb.QuotaFlushMs = binary.LittleEndian.Uint32(buf[272:276])
+	sb.QuotaTableBlocks = binary.LittleEndian.Uint32(buf[276:280])
+
 	return sb
 }
 
