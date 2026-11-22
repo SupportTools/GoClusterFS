@@ -2,8 +2,10 @@ package node
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -64,5 +66,34 @@ func TestZombieMountCountsAsExited(t *testing.T) {
 	slot.PID = uint32(running.Process.Pid)
 	if reg.deadLocalOwner(slot) {
 		t.Errorf("a slot of this host whose mount runs counts as exited")
+	}
+}
+
+// A mount killed while one of its threads sits in an uninterruptible O_DIRECT
+// write shows its leader as a zombie, but the stuck write can still land. Only
+// a process whose every thread exited is gone.
+func TestZombieLeaderWithAStuckThreadCountsAsRunning(t *testing.T) {
+	root := t.TempDir()
+	task := func(pid, tid int, state string) {
+		t.Helper()
+		dir := filepath.Join(root, strconv.Itoa(pid), "task", strconv.Itoa(tid))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		stat := fmt.Sprintf("%d (goclusterfs (mount)) %s 1 %d %d 0", tid, state, pid, pid)
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(stat), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	task(100, 100, "Z")
+	task(100, 101, "D")
+	task(200, 200, "Z")
+	task(300, 300, "Z")
+	task(300, 301, "X")
+
+	for pid, exited := range map[int]bool{100: false, 200: true, 300: true, 400: false} {
+		if got := threadsExited(root, pid); got != exited {
+			t.Errorf("threadsExited(%d) = %v, want %v", pid, got, exited)
+		}
 	}
 }

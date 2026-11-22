@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"os"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -92,19 +93,36 @@ func (r *Registry) deadLocalOwner(slot *Slot) bool {
 	return processGone(int(slot.PID))
 }
 
-// processGone reports whether process pid has exited: it no longer exists, or it is a zombie its parent has not
-// reaped, which in a container whose init does not reap can last for good. A /proc it cannot read counts as running.
+// processGone reports whether process pid has exited: it no longer exists, or every one of its threads has exited
+// and only its parent has yet to reap it. In a container whose init does not reap, that can last for good.
 func processGone(pid int) bool {
-	if syscall.Kill(pid, 0) == syscall.ESRCH {
-		return true
-	}
-	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
+	return syscall.Kill(pid, 0) == syscall.ESRCH || threadsExited(procRoot, pid)
+}
+
+// procRoot is the /proc processGone reads; tests point it at a fake tree.
+var procRoot = "/proc"
+
+// threadsExited reports whether every thread of process pid is a zombie or dead. A leader that exited stays a zombie
+// while another thread runs, and a thread stuck in an uninterruptible write still has that write to land. A /proc it
+// cannot read counts as running.
+func threadsExited(root string, pid int) bool {
+	dir := filepath.Join(root, strconv.Itoa(pid), "task")
+	tasks, err := os.ReadDir(dir)
+	if err != nil || len(tasks) == 0 {
 		return false
 	}
-	// The state follows the command name, which is in parentheses and may itself hold spaces and parentheses.
-	end := bytes.LastIndexByte(stat, ')')
-	return end >= 0 && end+2 < len(stat) && stat[end+2] == 'Z'
+	for _, task := range tasks {
+		stat, err := os.ReadFile(filepath.Join(dir, task.Name(), "stat"))
+		if err != nil {
+			return false
+		}
+		// The state follows the command name, which is in parentheses and may itself hold spaces and parentheses.
+		end := bytes.LastIndexByte(stat, ')')
+		if end < 0 || end+2 >= len(stat) || (stat[end+2] != 'Z' && stat[end+2] != 'X') {
+			return false
+		}
+	}
+	return true
 }
 
 // stale reports whether a slot's node is gone: it is a mount process on this
