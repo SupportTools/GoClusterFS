@@ -102,7 +102,7 @@ func TestBatchThreshold(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{BlockSize: BlockSize, 
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  10,
 		MaxAge:     time.Hour, // Long enough not to trigger
 		DataOffset: 0,
@@ -146,7 +146,7 @@ func TestAgeThreshold(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{BlockSize: BlockSize, 
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  1000, // High enough not to trigger
 		MaxAge:     100 * time.Millisecond,
 		DataOffset: 0,
@@ -204,7 +204,7 @@ func TestGracefulShutdown(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{BlockSize: BlockSize, 
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  1000, // Won't trigger during test
 		MaxAge:     time.Hour,
 		DataOffset: 0,
@@ -243,7 +243,7 @@ func TestCoalesceRatio(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{BlockSize: BlockSize, 
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  10,
 		MaxAge:     time.Hour,
 		DataOffset: 0,
@@ -289,7 +289,7 @@ func TestStatsAreThreadSafe(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{BlockSize: BlockSize, 
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  1000,
 		MaxAge:     time.Hour,
 		DataOffset: 0,

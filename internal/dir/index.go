@@ -14,7 +14,6 @@ import (
 // DefaultIndexEntries is how many names a mount keeps in directory indexes by default.
 const DefaultIndexEntries = 1 << 20
 
-
 // slot is where a name lives; chunk counts 4 KB chunks from the directory's first block.
 type slot struct {
 	child uint64
