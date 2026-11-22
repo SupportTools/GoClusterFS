@@ -46,6 +46,21 @@ func (d retrying) readKeys() (keys []uint64, err error) {
 	return keys, err
 }
 
+func (d retrying) pathDevices() ([]device, func(), error) {
+	l, ok := d.device.(pathLister)
+	if !ok {
+		return []device{d}, func() {}, nil
+	}
+	devs, closeAll, err := l.pathDevices()
+	if err != nil {
+		return nil, nil, err
+	}
+	for i, dev := range devs {
+		devs[i] = retrying{device: dev, retried: d.retried}
+	}
+	return devs, closeAll, nil
+}
+
 func (d retrying) readReservation() (key uint64, typ uint32, err error) {
 	err = d.again(func() error {
 		key, typ, err = d.device.readReservation()
@@ -67,6 +82,54 @@ func (d retrying) again(command func() error) error {
 type blockDevice struct {
 	f         *os.File
 	partition bool
+}
+
+// pathDevices opens each disk under a device-mapper map; a plain disk is its own only path.
+func (d blockDevice) pathDevices() ([]device, func(), error) {
+	names, err := slaves("/sys/dev/block", d.f)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(names) == 0 {
+		return []device{d}, func() {}, nil
+	}
+	var files []*os.File
+	closeAll := func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}
+	devs := make([]device, 0, len(names))
+	for _, name := range names {
+		f, err := os.OpenFile(filepath.Join("/dev", name), os.O_RDWR, 0)
+		if err != nil {
+			closeAll()
+			return nil, nil, fmt.Errorf("opening path %s: %w", name, err)
+		}
+		files = append(files, f)
+		devs = append(devs, blockDevice{f: f, partition: isPartition(f)})
+	}
+	return devs, closeAll, nil
+}
+
+// slaves names the disks sysfs lists under f's block device, none for a disk that is not a map.
+func slaves(sysDevBlock string, f *os.File) ([]string, error) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(filepath.Join(sysDevBlock, fmt.Sprintf("%d:%d", unix.Major(st.Rdev), unix.Minor(st.Rdev)), "slaves"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	return names, nil
 }
 
 // isPartition reports whether f is a block device that sysfs lists as a partition.

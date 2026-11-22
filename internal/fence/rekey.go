@@ -12,9 +12,14 @@ const RekeyWindow = 10 * time.Minute
 
 // Rekeyer registers this node's key again after the device stopped knowing it, as when an iSCSI path under
 // dm-multipath logged out and in again with a new session ID, but only when no peer can have taken this node over.
-// Peers preempt a node only after its heartbeat stayed unchanged for longer than StallLimit, and every check below
-// runs with the device's writes held, after the register returned. So a register that passes its checks happened
-// before any peer's preempt, which removes it with every other registration of the key.
+// Two checks must pass, before and after the register, with the device's writes held:
+//   - the storage: a peer takes a node over with a preempt, which removes every registration of the node's key,
+//     those of lost sessions included. After the register, the device must list more registrations than this rekey
+//     made, so one from before survived and no preempt came, whatever this node's clock says;
+//   - the slot: a peer marks its intent in the node's slot before it preempts, so the slot read after the register
+//     must name no peer, no Dead mark and no other owner.
+//
+// The heartbeat age is checked too, but a hypervisor pause can hide time from it.
 type Rekeyer struct {
 	PR *PR
 	// HoldWrites runs fn while no write is in flight and none can start; fn may read the device.
@@ -54,40 +59,101 @@ func (k *Rekeyer) Rekey() error {
 
 func (k *Rekeyer) rekey() error {
 	key := k.PR.Key()
-	switch err := k.PR.dev.register(key, key, false); {
-	case err == nil:
-		return errors.New("this host still holds its key, so the conflict has another cause")
-	case !errors.Is(err, ErrReservationConflict):
-		return fmt.Errorf("checking for this node's key: %w", err)
+	paths, closePaths, err := k.PR.Paths()
+	if err != nil {
+		return fmt.Errorf("finding the device's paths: %w", err)
 	}
-	if err := k.live(); err != nil {
+	defer closePaths()
+	lost, err := lostPaths(paths, key)
+	if err != nil {
+		return err
+	}
+	if len(lost) == 0 {
+		return errors.New("every path still holds this node's key, so the conflict has another cause")
+	}
+	if err := errors.Join(k.listedBefore(), k.live()); err != nil {
 		return err
 	}
 	if k.beforeRegister != nil {
 		k.beforeRegister()
 	}
 	pocStall("before-register")
-	if err := k.PR.Register(); err != nil {
-		return fmt.Errorf("registering the key again: %w", err)
+	var added []*PR
+	for _, path := range lost {
+		if err := path.Register(); err != nil {
+			return unregister(fmt.Errorf("registering the key again: %w", err), added)
+		}
+		added = append(added, path)
 	}
 	if k.afterRegister != nil {
 		k.afterRegister()
 	}
 	pocStall("after-register")
 	age := k.HeartbeatAge()
-	err := k.live()
+	err = errors.Join(k.listedAfter(len(added)), k.live())
 	if err == nil {
 		err = k.PR.Reserve()
 	}
 	if err != nil {
-		if uerr := k.PR.Unregister(); uerr != nil && !errors.Is(uerr, ErrFenced) {
-			err = fmt.Errorf("%w; removing the key again failed: %v", err, uerr)
-		}
-		return err
+		return unregister(err, added)
 	}
 	k.last = time.Now()
 	if k.Restored != nil {
 		k.Restored(age)
+	}
+	return nil
+}
+
+// lostPaths probes each path for key and returns the ones that no longer hold it. A path that holds the key takes the
+// probe as a register of the same key and changes nothing; a dm map would instead drop the key from every path if one
+// refused.
+func lostPaths(paths []*PR, key uint64) ([]*PR, error) {
+	var lost []*PR
+	for _, path := range paths {
+		switch err := path.dev.register(key, key, false); {
+		case errors.Is(err, ErrReservationConflict):
+			lost = append(lost, path)
+		case err != nil:
+			return nil, fmt.Errorf("checking a path for this node's key: %w", err)
+		}
+	}
+	return lost, nil
+}
+
+// unregister removes the key from the paths a failed rekey registered, and adds what went wrong doing it to err.
+func unregister(err error, added []*PR) error {
+	for _, path := range added {
+		if uerr := path.Unregister(); uerr != nil && !errors.Is(uerr, ErrFenced) {
+			err = fmt.Errorf("%w; removing the key again failed: %v", err, uerr)
+		}
+	}
+	return err
+}
+
+// listedBefore checks that the device still lists a registration of this node's key from before the loss. A peer
+// takes a node over with a preempt, which removes every registration of its key, the ones of sessions that are gone
+// included.
+func (k *Rekeyer) listedBefore() error {
+	n, err := k.PR.Registrations()
+	switch {
+	case err != nil:
+		return fmt.Errorf("listing the device's keys, which shows whether a peer preempted this node: %w", err)
+	case n == 0:
+		return fmt.Errorf("the device lists no registration of key %#x, so a peer preempted this node", k.PR.Key())
+	}
+	return nil
+}
+
+// listedAfter checks that the device lists more registrations of this node's key than the added ones this rekey
+// made: one from before survived, so no preempt came between the listings, whatever this node's clock says.
+func (k *Rekeyer) listedAfter(added int) error {
+	n, err := k.PR.Registrations()
+	switch {
+	case err != nil:
+		return fmt.Errorf("listing the device's keys after the register: %w", err)
+	case n <= added:
+		return fmt.Errorf("after registering %d paths the device lists %d registrations of key %#x, so the ones from before are gone: a peer preempted this node",
+			added, n, k.PR.Key())
 	}
 	return nil
 }

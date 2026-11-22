@@ -91,6 +91,14 @@ func (w *rekeyWorld) revoke(t *testing.T) {
 	w.takenOver.Store(true)
 }
 
+// preemptOnly is a preempt of n's key without an intent in n's slot, as an older fsck or peer would send.
+func (w *rekeyWorld) preemptOnly(t *testing.T) {
+	if err := w.peer.Preempt(w.node.Key()); err != nil {
+		t.Errorf("peer's preempt: %v", err)
+	}
+	w.takenOver.Store(true)
+}
+
 func (w *rekeyWorld) rekeyer() *Rekeyer {
 	return &Rekeyer{
 		PR: w.node,
@@ -189,7 +197,7 @@ func TestRekeyRefusesWithoutRegistering(t *testing.T) {
 		setup func(w *rekeyWorld, k *Rekeyer)
 		want  string
 	}{
-		{"key still held", func(w *rekeyWorld, k *Rekeyer) {}, "still holds its key"},
+		{"key still held", func(w *rekeyWorld, k *Rekeyer) {}, "still holds this node's key"},
 		{"slot Dead", func(w *rekeyWorld, k *Rekeyer) { w.loseSession(); w.dead.Store(true) }, "slot is Dead"},
 		{"heartbeat too old", func(w *rekeyWorld, k *Rekeyer) { w.loseSession(); w.age.Store(int64(16 * time.Second)) }, "past the 15s"},
 		{"second loss", func(w *rekeyWorld, k *Rekeyer) { w.loseSession(); k.last = time.Now().Add(-time.Minute) }, "lost this node's key again"},
@@ -238,8 +246,8 @@ func TestRekeyAfterAPausedClockLandsNoWrite(t *testing.T) {
 			}
 			err := k.Rekey()
 			w.dead.Store(true)
-			if err == nil || !strings.Contains(err.Error(), "revoking") {
-				t.Errorf("Rekey: %v, want it to read the peer's intent", err)
+			if err == nil || !strings.Contains(err.Error(), "revoking") || !strings.Contains(err.Error(), "a peer preempted this node") {
+				t.Errorf("Rekey: %v, want both the intent and the key listing to refuse", err)
 			}
 			if registeredAfterPreempt != tc.registers {
 				t.Errorf("the register landed after the preempt: %v, want %v", registeredAfterPreempt, tc.registers)
@@ -281,5 +289,128 @@ func TestRekeyThatCannotUnregisterStopsWithWritesHeld(t *testing.T) {
 	}
 	if !heldAtRefusal || w.lateWrites.Load() != 0 {
 		t.Errorf("Refused ran with writes held: %v; %d writes landed after the preempt", heldAtRefusal, w.lateWrites.Load())
+	}
+}
+
+// An older fsck or peer preempts without marking an intent, so the slot shows nothing; the key listing still refuses.
+func TestRekeyRefusesAPreemptWithoutAnIntent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pause func(w *rekeyWorld, k *Rekeyer, t *testing.T)
+	}{
+		{"preempted before the rekey", func(w *rekeyWorld, k *Rekeyer, t *testing.T) { w.preemptOnly(t) }},
+		{"preempted between the listing and the register", func(w *rekeyWorld, k *Rekeyer, t *testing.T) {
+			k.beforeRegister = func() { w.preemptOnly(t) }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRekeyWorld(t)
+			w.loseSession()
+			w.age.Store(int64(time.Second))
+			k := w.rekeyer()
+			tc.pause(w, k, t)
+			err := k.Rekey()
+			w.dead.Store(true)
+			if err == nil || !strings.Contains(err.Error(), "a peer preempted this node") {
+				t.Errorf("Rekey: %v, want the key listing to refuse", err)
+			}
+			time.Sleep(20 * time.Millisecond)
+			if n := w.lateWrites.Load(); n != 0 || w.nodeRegistered() {
+				t.Errorf("%d writes landed after the preempt, registered %v", n, w.nodeRegistered())
+			}
+		})
+	}
+}
+
+// A peer that marked its intent but has not preempted yet leaves every registration in place; the slot refuses.
+func TestRekeyRefusesAnIntentBeforeThePreempt(t *testing.T) {
+	w := newRekeyWorld(t)
+	w.loseSession()
+	w.age.Store(int64(time.Second))
+	w.intent.Store(true)
+	k := w.rekeyer()
+	registers := 0
+	k.beforeRegister = func() { registers++ }
+	err := k.Rekey()
+	if err == nil || !strings.Contains(err.Error(), "revoking") || strings.Contains(err.Error(), "preempted") || registers != 0 {
+		t.Errorf("Rekey: %v after %d registers; want only the slot to refuse, before any register", err, registers)
+	}
+}
+
+// Without a key listing nothing shows whether a peer preempted this node, so Rekey registers nothing.
+func TestRekeyWithoutAKeyListingRegistersNothing(t *testing.T) {
+	w := newRekeyWorld(t)
+	w.loseSession()
+	w.target.Unlistable = true
+	k := w.rekeyer()
+	registers := 0
+	k.beforeRegister = func() { registers++ }
+	if err := k.Rekey(); !errors.Is(err, ErrUnsupported) || registers != 0 {
+		t.Errorf("Rekey: %v after %d registers; want ErrUnsupported and no register", err, registers)
+	}
+}
+
+// On a two-path dm-multipath map whose second path lost its session, Rekey re-registers that path only: the first
+// path keeps its registration throughout, where a probe through the map would make dm remove it. A preempt before
+// or during the rekey is refused, and neither path may write.
+func TestRekeyOnTwoPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		preempt, during bool
+	}{
+		{name: "second path lost its session"},
+		{name: "preempted before", preempt: true},
+		{name: "preempted between the listing and the register", during: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := NewTarget()
+			node := target.MultipathNode("n", 2, NodeKey([16]byte{1}))
+			peer := target.Node("p", NodeKey([16]byte{2}))
+			for _, pr := range []*PR{node, peer} {
+				if err := pr.Register(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := peer.Reserve(); err != nil {
+				t.Fatal(err)
+			}
+			target.Relogin("n#1")
+			if tc.preempt {
+				if err := peer.Preempt(node.Key()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			firstPathKept := !tc.preempt
+			k := &Rekeyer{
+				PR:           node,
+				HoldWrites:   func(fn func() error) error { return fn() },
+				HeartbeatAge: func() time.Duration { return time.Second },
+				SlotLive:     func() error { return nil },
+				StallLimit:   15 * time.Second,
+			}
+			k.beforeRegister = func() {
+				if !tc.preempt {
+					firstPathKept = target.MayWrite("n#0")
+				}
+				if tc.during {
+					if err := peer.Preempt(node.Key()); err != nil {
+						t.Errorf("peer's preempt: %v", err)
+					}
+				}
+			}
+			err := k.Rekey()
+			if tc.preempt || tc.during {
+				if err == nil || !strings.Contains(err.Error(), "a peer preempted this node") || target.MayWrite("n#0") || target.MayWrite("n#1") {
+					t.Errorf("Rekey: %v, paths write: %v %v; want the key listing to refuse and neither path writing",
+						err, target.MayWrite("n#0"), target.MayWrite("n#1"))
+				}
+				return
+			}
+			n, _ := node.Registrations()
+			if err != nil || !firstPathKept || !target.MayWrite("n#0") || !target.MayWrite("n#1") || n != 3 {
+				t.Errorf("Rekey: %v; first path kept its key during the rekey: %v; paths write: %v %v; %d registrations, want 3",
+					err, firstPathKept, target.MayWrite("n#0"), target.MayWrite("n#1"), n)
+			}
+		})
 	}
 }

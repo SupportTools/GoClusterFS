@@ -78,6 +78,12 @@ type device interface {
 	readReservation() (key uint64, typ uint32, err error)
 }
 
+// pathLister lists the devices a register reaches, each of which holds a registration of its own: the paths under a
+// device-mapper map, or the device itself.
+type pathLister interface {
+	pathDevices() ([]device, func(), error)
+}
+
 // PR fences with a Write Exclusive, All Registrants reservation: every registered node may write, and no other
 // initiator may, while any node stays registered.
 type PR struct {
@@ -116,6 +122,41 @@ func (p *PR) Preempt(victim uint64) error {
 		return err
 	}
 	return nil
+}
+
+// Registrations returns how many registrations of this node's key the device lists, one per path that registered it,
+// including paths whose session is gone. ErrUnsupported means the device cannot list keys.
+func (p *PR) Registrations() (int, error) {
+	keys, err := p.dev.readKeys()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, key := range keys {
+		if key == p.key {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// Paths returns a PR for each path of the device, each registered on its own, and a function that closes them. A
+// device-mapper map registers through every path at once and, if one path refuses, removes the key from all of them;
+// a PR per path registers only where the key is missing.
+func (p *PR) Paths() ([]*PR, func(), error) {
+	l, ok := p.dev.(pathLister)
+	if !ok {
+		return []*PR{p}, func() {}, nil
+	}
+	devs, closeAll, err := l.pathDevices()
+	if err != nil {
+		return nil, nil, err
+	}
+	paths := make([]*PR, len(devs))
+	for i, dev := range devs {
+		paths[i] = &PR{dev: dev, key: p.key}
+	}
+	return paths, closeAll, nil
 }
 
 // Keys lists the keys registered on the device. ErrUnsupported means the kernel or the device cannot list them.
