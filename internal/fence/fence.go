@@ -38,6 +38,9 @@ type Fencer interface {
 	Preempt(victim uint64) error
 	// Unregister removes this node's key; once no key is left, the reservation goes too.
 	Unregister() error
+	// Leave is Unregister for a node that gave up its slot, which also removes the key an earlier iSCSI session of this
+	// host keeps; earlier reports that this session held no key.
+	Leave() (earlier bool, err error)
 }
 
 const (
@@ -72,11 +75,13 @@ func (None) Register() error      { return nil }
 func (None) Reserve() error       { return nil }
 func (None) Preempt(uint64) error { return nil }
 func (None) Unregister() error    { return nil }
+func (None) Leave() (bool, error) { return false, nil }
 
 type device interface {
 	register(old, new uint64, ignore bool) error
 	reserve(key uint64) error
 	preemptAbort(own, victim uint64) error
+	preempt(own, victim uint64) error
 	clear(key uint64) error
 	readKeys() ([]uint64, error)
 	readReservation() (key uint64, typ uint32, err error)
@@ -151,9 +156,17 @@ func (p *PR) Reserve() error {
 	return nil
 }
 
+// Preempt removes victim's registration and aborts its commands. A device without a reservation takes writes from any
+// host, so a preempt there would leave the victim writing: Preempt reserves first when the device holds none.
 func (p *PR) Preempt(victim uint64) error {
 	if victim == 0 || victim == p.key {
 		return fmt.Errorf("refusing to preempt key %#x: key 0 would remove every other node, and %#x is this node's", victim, p.key)
+	}
+	if err := p.reserveIfNone(); err != nil {
+		if errors.Is(err, ErrForeignReservation) && errors.Is(p.dev.register(p.key, p.key, false), ErrReservationConflict) {
+			return ErrFenced
+		}
+		return fmt.Errorf("reserving the device before revoking key %#x: %w", victim, err)
 	}
 	err := p.dev.preemptAbort(p.key, victim)
 	if !errors.Is(err, ErrReservationConflict) {
@@ -166,6 +179,33 @@ func (p *PR) Preempt(victim uint64) error {
 		return err
 	}
 	return nil
+}
+
+// reserveIfNone reserves the device unless it holds a reservation, or reserves anyway where the reservation cannot be read.
+func (p *PR) reserveIfNone() error {
+	if _, typ, err := p.dev.readReservation(); err == nil && typ != 0 {
+		return nil
+	} else if err != nil && !errors.Is(err, ErrUnsupported) {
+		return err
+	}
+	return p.Reserve()
+}
+
+// KeepReserved reserves the device again if it holds no reservation while this node's key is registered, and reports
+// whether it did. It returns ErrFenced if this node's key is gone too: the node cannot tell a storage reset from its
+// own fencing.
+func (p *PR) KeepReserved() (bool, error) {
+	if _, typ, err := p.dev.readReservation(); err != nil || typ != 0 {
+		return false, err
+	}
+	keys, err := p.Keys()
+	if err != nil {
+		return false, err
+	}
+	if !slices.Contains(keys, p.key) {
+		return false, ErrFenced
+	}
+	return true, p.Reserve()
 }
 
 // Keys lists the keys registered on the device. ErrUnsupported means the kernel or the device cannot list them.
@@ -187,4 +227,28 @@ func (p *PR) Unregister() error {
 		return err
 	}
 	return nil
+}
+
+// Leave unregisters this node's key, also where an earlier iSCSI session of this host keeps it. On LIO no peer revokes
+// such a registration, and while it holds the reservation every session of this host writes past a revoke of a later key.
+func (p *PR) Leave() (earlier bool, err error) {
+	if err := p.Unregister(); !errors.Is(err, ErrFenced) {
+		return false, err
+	}
+	if err := p.Register(); err != nil {
+		return true, err
+	}
+	// Preempting its own key without abort removes the earlier registration and takes the reservation if that one held it.
+	if err := p.dev.preempt(p.key, p.key); err != nil {
+		return true, err
+	}
+	// Over dm-multipath the preempt also removed the key from this host's other paths, and dm stops an unregister at the
+	// first path without the key, so the key goes back on every path first.
+	if err := p.Register(); err != nil {
+		return true, err
+	}
+	if err := p.dev.register(p.key, 0, false); err != nil {
+		return true, fmt.Errorf("unregistering the key after removing it from the earlier session: %v", err)
+	}
+	return true, nil
 }

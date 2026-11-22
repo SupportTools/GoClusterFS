@@ -136,6 +136,10 @@ func (m twoPaths) preemptAbort(own, victim uint64) error {
 	return m.first(func(p *fakeDevice) error { return p.preemptAbort(own, victim) })
 }
 
+func (m twoPaths) preempt(own, victim uint64) error {
+	return m.first(func(p *fakeDevice) error { return p.preempt(own, victim) })
+}
+
 func (m twoPaths) clear(key uint64) error                   { return m.paths[0].clear(key) }
 func (m twoPaths) readKeys() ([]uint64, error)              { return m.paths[0].readKeys() }
 func (m twoPaths) readReservation() (uint64, uint32, error) { return m.paths[0].readReservation() }

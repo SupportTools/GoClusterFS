@@ -49,7 +49,7 @@ func (d *driver) resolve(n *node, op *Op) (string, error) {
 		return "before", nil
 	}
 	var outcome string
-	err := d.converge(fmt.Sprintf("node %d resolving op %d", n.id, op.Seq), func() error {
+	err := d.converge(n, fmt.Sprintf("node %d resolving op %d", n.id, op.Seq), func() error {
 		var err error
 		outcome, err = d.observe(n, op)
 		return err

@@ -3981,6 +3981,59 @@ test_fencing_clear_reservations() {
     return $result
 }
 
+# reservation_holder prints the target's reservation holder, or "No SPC-3 Reservation holder".
+reservation_holder() {
+    ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_holder"
+}
+
+# mount_key prints the reservation key VM $1's mount logged.
+mount_key() {
+    sed -n 's/.*Fencing: persistent reservation key \(0x[0-9a-f]*\).*/\1/p' "$(get_vm_mount_log "$1")" | tail -1
+}
+
+# A device without a reservation takes writes from any host, so a node a peer revoked there would go on writing.
+# When the device loses its reservation while the nodes' keys stay, a node reserves it again within two failure
+# scans. When it also loses a node's key, that node stops, and the other reserves again.
+test_fencing_lost_reservation() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 k1 k2 marker t dev
+    fencing_restart pr || return 1
+    k1=$(mount_key 1) k2=$(mount_key 2) dev=$(cluster_device)
+    ssh_run 2 "apk add --no-cache sg3_utils > /dev/null" || return 1
+    marker="lost reservation $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run 2 "sg_persist --out --release --param-rk=$k2 --prout-type=7 $dev > /dev/null" || result=1
+    for t in $(seq 15); do
+        [[ "$(reservation_holder)" != *"No SPC-3 Reservation holder"* ]] && break
+        sleep 1
+    done
+    if [[ "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
+        log_error "15s after the reservation was released, no node had reserved again"
+        result=1
+    elif ! cat "$(get_vm_mount_log 1)" "$(get_vm_mount_log 2)" | grep -q "had lost its reservation"; then
+        log_error "a node reserved again without logging it"
+        result=1
+    else
+        log_info "a node reserved again ${t}s after the release"
+    fi
+
+    ssh_run 2 "sg_persist --out --release --param-rk=$k2 --prout-type=7 $dev > /dev/null && sg_persist --out --preempt-abort --param-rk=$k2 --param-sark=$k1 --prout-type=7 $dev > /dev/null" || result=1
+    if ! wait_stopped 1 20; then
+        log_error "VM 1 still runs 20s after the device lost its reservation and VM 1's key"
+        result=1
+    fi
+    if [[ -z "$(mount_pids 2)" || "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
+        log_error "VM 2 stopped, or did not reserve the device again"
+        result=1
+    fi
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E "Fencing|stopping" | tail -2
+    fencing_restart pr || result=1
+    return $result
+}
+
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
@@ -4010,6 +4063,89 @@ test_fencing_unmount_removes_key() {
         result=1
     fi
     setup_goclusterfs "$vm" false || result=1
+    return $result
+}
+
+# relogin_under_map logs VM $1's only iSCSI path out and in under its multipath map gcfs-mpath, which keeps its mount
+# running. The new session has a new ISID, and LIO keeps the old session's registration.
+relogin_under_map() {
+    local disk i portal="10.0.2.2:${ISCSI_PORT}"
+    ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; sleep 2; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null" || return 1
+    for i in $(seq 1 20); do
+        disk=$(iscsi_disk "$1")
+        [[ -n "$disk" ]] && ssh_run "$1" "test -b /dev/$disk" && break
+        sleep 1
+    done
+    multipath_over "$1" "$disk"
+}
+
+# VM 1 holds the reservation, then logs out and in again under its multipath map, so LIO keeps its key under the old
+# session. LIO lets every session of a host write while one of its registrations holds the reservation, since it
+# compares only the first 4 bytes of the ISID, and open-iscsi numbers sessions in the last 2. Unless VM 1's clean unmount
+# removes the old registration, VM 2's later revoke of VM 1's new key does not fence VM 1.
+test_fencing_relogin_remount() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local node=1 peer=2 result=0 marker vm byte
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
+    done
+    multipath_over "$node" || return 1
+    setup_goclusterfs "$node" true "" /dev/mapper/gcfs-mpath -fencing=pr || return 1
+    for vm in $(seq 2 "$NODE_COUNT"); do
+        setup_goclusterfs "$vm" false || return 1
+    done
+    relogin_under_map "$node" || return 1
+    if ! ssh_run "$node" "echo after-relogin > ${GOCLUSTERFS_MOUNT}/relogin && sync"; then
+        log_error "VM $node could not write after its relogin"
+        result=1
+    fi
+    log_info "registrations after VM $node's relogin: $(registered_initiators | tr '\n' ' ')"
+    marker="fencing relogin remount $(date +%s)"
+    mark_vm_logs "$marker"
+    unmount_goclusterfs "$node" || return 1
+    if ! sed -n "/$marker/,\$p" "$(get_vm_mount_log "$node")" | grep -q "removed the key from the earlier session"; then
+        log_error "VM $node's unmount did not remove its key from the earlier session"
+        result=1
+    fi
+    if registered_initiators | grep -q "goclusterfs:vm$node,"; then
+        log_error "VM $node left a registration at its unmount: $(registered_initiators | tr '\n' ' ')"
+        result=1
+    fi
+    setup_goclusterfs "$node" false "" /dev/mapper/gcfs-mpath || return 1
+
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/fenced && sync"
+    ssh_run "$node" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/fenced.A"
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/fenced.B"
+    marker="fencing relogin revoke $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$node" "nohup sh -c 'while dd if=/tmp/fenced.A of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null; do :; done' < /dev/null > /dev/null 2>&1 &"
+    sleep 2
+    echo stop | nc -U -q1 "$(get_vm_monitor_socket "$node")" > /dev/null
+    if ! wait_log "$peer" "Revoked node" 120 "$marker"; then
+        echo cont | nc -U -q1 "$(get_vm_monitor_socket "$node")" > /dev/null
+        return 1
+    fi
+    sleep 3
+    ssh_run "$peer" "dd if=/tmp/fenced.B of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null" || result=1
+    echo cont | nc -U -q1 "$(get_vm_monitor_socket "$node")" > /dev/null
+    if ! wait_stopped "$node" 30; then
+        log_error "VM $node still runs 30s after it resumed, with its key revoked"
+        result=1
+    fi
+    byte=$(fenced_file_byte "$peer")
+    if [[ "$byte" != B ]]; then
+        log_error "the file starts with '$byte' after VM $node resumed, want VM $peer's B: a revoke of VM $node's key did not fence it"
+        result=1
+    fi
+    ssh_run "$node" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fence[d]'; true"
+    crash_goclusterfs "$node" 2>/dev/null
+    ssh_run "$node" "dmsetup remove gcfs-mpath" || result=1
+    relogin_iscsi "$node" || result=1
+    fencing_restart pr || result=1
+    [[ $result -eq 0 ]] && log_info "VM $node's unmount removed its earlier session's key, and revoking its new key fenced it"
     return $result
 }
 
@@ -5299,7 +5435,9 @@ main() {
     run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
+    run_test "Fencing: Relogin Then Remount" test_fencing_relogin_remount
     run_test "Fencing: Reservation Self-Test" test_fencing_reservation_self_test
+    run_test "Fencing: Lost Reservation" test_fencing_lost_reservation
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall
