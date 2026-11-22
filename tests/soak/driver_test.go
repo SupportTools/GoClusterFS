@@ -63,7 +63,7 @@ func TestSlowCheckLogsItsLastStaleAnswer(t *testing.T) {
 	var out bytes.Buffer
 	d := &driver{cfg: config{window: time.Minute}, logw: &out, ctx: context.Background()}
 	answers := []error{errors.New("first"), errors.New("/f: read errno 0 size 1 sum a, want size 2 sum b"), nil}
-	if err := d.converge("node 1 /f", func() error {
+	if err := d.converge(&node{id: 1}, "node 1 /f", func() error {
 		a := answers[0]
 		answers = answers[1:]
 		return a
@@ -123,5 +123,66 @@ func TestFailureReleasesAnOperationAFaultCutShort(t *testing.T) {
 	case <-released:
 	case <-time.After(5 * time.Second):
 		t.Fatal("an operation a failed fault cut short still waits after the run failed, so the soak never ends")
+	}
+}
+
+// A check of a node a fault hit counts as slow but is marked, and a down node's answers do not count as stale.
+func TestSlowCheckDuringAFaultIsMarkedAndNotCountedStale(t *testing.T) {
+	var out bytes.Buffer
+	d := &driver{cfg: config{window: time.Minute}, logw: &out, ctx: context.Background()}
+	n := &node{id: 3}
+	n.hit.Store(true)
+	answers := []error{errors.New("/f: read errno 2 size 0 sum , want size 1 sum a"), nil}
+	if err := d.converge(n, "node 3 /f", func() error {
+		a := answers[0]
+		answers = answers[1:]
+		return a
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"during_fault":true`) || !strings.Contains(out.String(), "during a fault on node 3: node 3 /f took") {
+		t.Errorf("slow record %q is not marked as during a fault", out.String())
+	}
+	if d.slow.Load() != 1 || d.slowDuringFault.Load() != 1 || d.slowStale.Load() != 0 {
+		t.Errorf("slow %d, during faults %d, with stale answers %d; want 1, 1, 0", d.slow.Load(), d.slowDuringFault.Load(), d.slowStale.Load())
+	}
+}
+
+// Outside a fault, a slow check records what its node waited on while it was slow.
+func TestSlowCheckRecordsWhatItsNodeWaitedOn(t *testing.T) {
+	var out bytes.Buffer
+	d := &driver{cfg: config{window: time.Minute}, logw: &out, ctx: context.Background()}
+	snaps := []waits{
+		{seconds: map[string]float64{"lock inode": 1, "lock file_io": 0.5, "reserve": 0}, reads: 100, readMs: 200, writes: 10, wMs: 50, device: true},
+		{seconds: map[string]float64{"lock inode": 4.25, "lock file_io": 0.52, "reserve": 0}, reads: 140, readMs: 600, writes: 10, wMs: 50, device: true},
+	}
+	d.waitsOf = func(*node) waits {
+		w := snaps[0]
+		snaps = snaps[1:]
+		return w
+	}
+	if err := d.converge(&node{id: 2}, "node 2 /f", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	want := "waited on lock inode 3.2s, device 40 at 10.0ms reads, 0 writes"
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("slow record %q lacks %q", out.String(), want)
+	}
+	if d.slowStale.Load() != 0 || d.slowDuringFault.Load() != 0 {
+		t.Errorf("a slow check with no stale answers outside a fault counted as stale %d, during a fault %d", d.slowStale.Load(), d.slowDuringFault.Load())
+	}
+}
+
+func TestParseWaitsReadsMetricsAndDiskstats(t *testing.T) {
+	w := parseWaits([]byte(`goclusterfs_lock_wait_seconds_total{type="inode"} 7.637581863
+goclusterfs_lock_wait_seconds_total{type="file_io"} 5.022810437
+goclusterfs_reserve_peer_wait_seconds_total 0.5
+device 1200 3400 560 7800
+`))
+	if w.seconds["lock inode"] != 7.637581863 || w.seconds["lock file_io"] != 5.022810437 || w.seconds["reserve"] != 0.5 {
+		t.Errorf("wait seconds %v", w.seconds)
+	}
+	if !w.device || w.reads != 1200 || w.readMs != 3400 || w.writes != 560 || w.wMs != 7800 {
+		t.Errorf("device totals %+v", w)
 	}
 }

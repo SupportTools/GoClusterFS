@@ -63,6 +63,8 @@ type record struct {
 	Fault  string `json:"fault,omitempty"`
 	Victim int    `json:"victim,omitempty"`
 	Detail string `json:"detail,omitempty"`
+	// DuringFault marks a slow check of a node that a fault hit while it ran.
+	DuringFault bool `json:"during_fault,omitempty"`
 }
 
 type driver struct {
@@ -93,8 +95,11 @@ type driver struct {
 
 	ops, unexpected, faults, fscks, barriers, slow, stalls, resolved atomic.Int64
 	reloginSurvived, reloginStopped                                  atomic.Int64
-	slowestMs                                                        atomic.Int64
-	opsByKind                                                        sync.Map
+	slowDuringFault, slowStale                                       atomic.Int64
+	// waitsOf reads a node's wait totals for slow-check records; nil leaves them out.
+	waitsOf   func(*node) waits
+	slowestMs atomic.Int64
+	opsByKind sync.Map
 }
 
 func (d *driver) logRecord(r record) {
@@ -178,9 +183,15 @@ func (d *driver) upNodes() []*node {
 
 // converge retries check until it passes or the window ends. The caller holds the node. A check that passes only
 // after the documented coherence window is logged for review: during a fault, reads can wait out the failure detection.
-func (d *driver) converge(what string, check func() error) error {
+func (d *driver) converge(n *node, what string, check func() error) error {
 	start := time.Now()
 	stale, longestCall := 0, time.Duration(0)
+	duringFault := n.hit.Load()
+	before := make(chan waits, 1)
+	if d.waitsOf != nil {
+		timer := time.AfterFunc(d.cfg.coherence, func() { before <- d.waitsOf(n) })
+		defer timer.Stop()
+	}
 	var last error
 	for {
 		callStart := time.Now()
@@ -192,13 +203,7 @@ func (d *driver) converge(what string, check func() error) error {
 				d.slowestMs.Store(ms)
 			}
 			if took > d.cfg.coherence {
-				d.slow.Add(1)
-				detail := fmt.Sprintf("%s took %s: %d stale answers, longest call %s",
-					what, took.Round(time.Millisecond), stale, longestCall.Round(time.Millisecond))
-				if last != nil {
-					detail += fmt.Sprintf("; last stale answer: %v", last)
-				}
-				d.logRecord(record{Type: "slow", Detail: detail})
+				d.logSlow(n, what, took, stale, longestCall, last, duringFault || n.hit.Load(), before)
 			}
 			return nil
 		}
@@ -209,6 +214,33 @@ func (d *driver) converge(what string, check func() error) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// logSlow records a check that passed only after -coherence. Outside a fault on n it adds what n waited on from
+// -coherence into the check until it passed; a check during a fault is marked, and its stale answers, which a node
+// that is down gives, are not counted.
+func (d *driver) logSlow(n *node, what string, took time.Duration, stale int, longestCall time.Duration, last error, duringFault bool, before <-chan waits) {
+	d.slow.Add(1)
+	detail := fmt.Sprintf("%s took %s: %d stale answers, longest call %s", what, took.Round(time.Millisecond), stale, longestCall.Round(time.Millisecond))
+	if duringFault {
+		d.slowDuringFault.Add(1)
+		detail = fmt.Sprintf("during a fault on node %d: %s", n.id, detail)
+	} else {
+		if stale > 0 {
+			d.slowStale.Add(1)
+		}
+		if d.waitsOf != nil {
+			select {
+			case b := <-before:
+				detail += "; waited on " + waitsBetween(b, d.waitsOf(n))
+			case <-time.After(10 * time.Second):
+			}
+		}
+	}
+	if last != nil {
+		detail += fmt.Sprintf("; last stale answer: %v", last)
+	}
+	d.logRecord(record{Type: "slow", Detail: detail, DuringFault: duringFault})
 }
 
 func (d *driver) call(n *node, req request) (response, error) {
@@ -362,7 +394,7 @@ func (d *driver) verifyAll(n *node, content bool) error {
 	sort.Strings(dirs)
 	sort.Strings(files)
 	for _, dir := range dirs {
-		if err := d.converge(fmt.Sprintf("node %d dir %s", n.id, dir), func() error { return d.compareDir(n, dir) }); err != nil {
+		if err := d.converge(n, fmt.Sprintf("node %d dir %s", n.id, dir), func() error { return d.compareDir(n, dir) }); err != nil {
 			return err
 		}
 	}
@@ -370,10 +402,10 @@ func (d *driver) verifyAll(n *node, content bool) error {
 		return nil
 	}
 	for _, p := range files {
-		if err := d.converge(fmt.Sprintf("node %d %s", n.id, p), func() error { return d.comparePath(n, p) }); err != nil {
+		if err := d.converge(n, fmt.Sprintf("node %d %s", n.id, p), func() error { return d.comparePath(n, p) }); err != nil {
 			return err
 		}
-		if err := d.converge(fmt.Sprintf("node %d snapshots of %s", n.id, p), func() error { return d.compareSnaps(n, p) }); err != nil {
+		if err := d.converge(n, fmt.Sprintf("node %d snapshots of %s", n.id, p), func() error { return d.compareSnaps(n, p) }); err != nil {
 			return err
 		}
 	}
@@ -502,12 +534,12 @@ func (d *driver) check(op *Op) {
 
 func (d *driver) checkOp(m *node, op *Op, paths []string) error {
 	for _, p := range paths {
-		if err := d.converge(fmt.Sprintf("node %d %s after op %d", m.id, p, op.Seq), func() error { return d.comparePath(m, p) }); err != nil {
+		if err := d.converge(m, fmt.Sprintf("node %d %s after op %d", m.id, p, op.Seq), func() error { return d.comparePath(m, p) }); err != nil {
 			return err
 		}
 	}
 	if slices.Contains([]string{"snapshot", "snapdelete", "snapclone"}, op.Kind) {
-		return d.converge(fmt.Sprintf("node %d snapshots of %s after op %d", m.id, op.Path, op.Seq), func() error { return d.compareSnaps(m, op.Path) })
+		return d.converge(m, fmt.Sprintf("node %d snapshots of %s after op %d", m.id, op.Path, op.Seq), func() error { return d.compareSnaps(m, op.Path) })
 	}
 	return nil
 }
@@ -756,8 +788,8 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slowest_converge_ms=%d stalls=%d relogin_survived=%d relogin_stopped=%d files=%d snapshots=%d blocks=%d [%s]",
-		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowestMs.Load(), d.stalls.Load(),
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slow_during_faults=%d slow_with_stale=%d slowest_converge_ms=%d stalls=%d relogin_survived=%d relogin_stopped=%d files=%d snapshots=%d blocks=%d [%s]",
+		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowDuringFault.Load(), d.slowStale.Load(), d.slowestMs.Load(), d.stalls.Load(),
 		d.reloginSurvived.Load(), d.reloginStopped.Load(), files, snaps, blocks, strings.Join(kinds, " "))
 }
 
@@ -781,6 +813,7 @@ func newDriver(cfg config) (*driver, func(), error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, running: map[*Op]*File{}, victims: make(chan *node)}
+	d.waitsOf = d.nodeWaits
 	cleanup := func() {
 		cancel()
 		for _, n := range d.nodes {
