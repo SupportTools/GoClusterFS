@@ -308,7 +308,7 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 		d.writeMu.RLock()
 		landed, n, err := d.writeIfFresh(buf, offset, sharded)
 		d.writeMu.RUnlock()
-		if landed && !(errors.Is(err, syscall.EBADE) && d.restored(gen, err)) {
+		if landed && (!errors.Is(err, syscall.EBADE) || !d.restored(gen, err)) {
 			return n, err
 		}
 		if err := d.CheckWrite(offset); err != nil {

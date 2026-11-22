@@ -64,7 +64,7 @@ func formatted(t *testing.T) (*storage.Device, *superblock.Superblock) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "test.img")
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ func formatted(t *testing.T) (*storage.Device, *superblock.Superblock) {
 	if err != nil {
 		t.Skipf("O_DIRECT not supported here: %v", err)
 	}
-	t.Cleanup(func() { dev.Close() })
+	t.Cleanup(func() { _ = dev.Close() })
 	sb, err := superblock.Format(dev, 0)
 	if err != nil {
 		t.Fatal(err)

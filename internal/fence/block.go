@@ -96,7 +96,7 @@ func (d blockDevice) pathDevices() ([]device, func(), error) {
 	var files []*os.File
 	closeAll := func() {
 		for _, f := range files {
-			f.Close()
+			_ = f.Close()
 		}
 	}
 	devs := make([]device, 0, len(names))
