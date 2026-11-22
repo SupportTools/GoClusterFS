@@ -220,6 +220,8 @@ write_setup_disk() {
         echo "mountpoint='${GOCLUSTERFS_MOUNT}'"
         cat <<'EOF'
 set -x
+# QEMU passes each VM its own name, nodeN, so mounts see one hostname per VM, as on real hosts.
+name=$(cat /sys/class/dmi/id/product_serial) && [ -n "$name" ] && hostname "$name" && echo "$name" > /etc/hostname || exit 1
 # setup-interfaces -a leaves eth0 out once a VM has a second NIC.
 printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
 ifup eth0
@@ -455,7 +457,9 @@ mkdir -p core/iblock_0/lun0
 echo udev_path=/dev/vda > core/iblock_0/lun0/control
 echo 1 > core/iblock_0/lun0/enable
 [ -z "$serial" ] || echo "$serial" > core/iblock_0/lun0/wwn/vpd_unit_serial
-[ -z "$metadata" ] || cat "$metadata" > core/iblock_0/lun0/pr/res_aptpl_metadata
+# LIO takes one registration per write, so each PR_REG block goes in its own write, as rtslib restores them
+[ -z "$metadata" ] || awk '/^PR_REG_START/ { r = ""; next } /^PR_REG_END/ { print r; next } { r = r (r == "" ? "" : ",") \$0 }' "$metadata" |
+    while read -r reg; do echo "\$reg" > core/iblock_0/lun0/pr/res_aptpl_metadata; done
 tpg=iscsi/${ISCSI_TARGET_IQN}/tpgt_1
 mkdir -p \$tpg/lun/lun_0 \$tpg/np/0.0.0.0:3260
 ln -s /sys/kernel/config/target/core/iblock_0/lun0 \$tpg/lun/lun_0/disk
@@ -550,6 +554,7 @@ boot_vm() {
         -machine q35,accel=${accelerator} \
         -cpu ${cpu_type} \
         -m "${VM_MEMORY}" \
+        -smbios "type=1,serial=node${vm_id}" \
         -smp ${VM_CPUS} \
         -cdrom "${iso}" \
         -boot d \

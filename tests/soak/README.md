@@ -10,6 +10,7 @@
   - It also covers waiting out a failed node's 10s detection.
   - A read that overlaps a write or truncate of the same file, through any of its names, may show the file before or after it.
   - A check that needs longer than `-coherence` (6s) is logged as a `slow` record for review, with its last stale answer and what the model expected.
+  - A slow check of a node that a fault hit while the check ran is marked `during_fault`. Its stale answers come from a node that is down, so `slow_with_stale` in the summary counts only slow checks outside faults. Those also record what their node waited on from `-coherence` into the check until it passed: lock and reserve wait seconds, and the reads and writes its disk finished with their average time.
 - **Faults:** every `-fault-every`, one node is hit, picked at random from these:
   - power is cut (QEMU is killed);
   - goclusterfs-mount gets SIGKILL;

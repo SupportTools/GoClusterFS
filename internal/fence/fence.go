@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 var (
@@ -106,9 +107,17 @@ func (p *PR) Reserve() error {
 	return nil
 }
 
+// Preempt removes victim's registration and aborts its commands. A device without a reservation takes writes from any
+// host, so a preempt there would leave the victim writing: Preempt reserves first when the device holds none.
 func (p *PR) Preempt(victim uint64) error {
 	if victim == 0 || victim == p.key {
 		return fmt.Errorf("refusing to preempt key %#x: key 0 would remove every other node, and %#x is this node's", victim, p.key)
+	}
+	if err := p.reserveIfNone(); err != nil {
+		if errors.Is(err, ErrForeignReservation) && errors.Is(p.dev.register(p.key, p.key, false), ErrReservationConflict) {
+			return ErrFenced
+		}
+		return fmt.Errorf("reserving the device before revoking key %#x: %w", victim, err)
 	}
 	err := p.dev.preemptAbort(p.key, victim)
 	if !errors.Is(err, ErrReservationConflict) {
@@ -121,6 +130,33 @@ func (p *PR) Preempt(victim uint64) error {
 		return err
 	}
 	return nil
+}
+
+// reserveIfNone reserves the device unless it holds a reservation, or reserves anyway where the reservation cannot be read.
+func (p *PR) reserveIfNone() error {
+	if _, typ, err := p.dev.readReservation(); err == nil && typ != 0 {
+		return nil
+	} else if err != nil && !errors.Is(err, ErrUnsupported) {
+		return err
+	}
+	return p.Reserve()
+}
+
+// KeepReserved reserves the device again if it holds no reservation while this node's key is registered, and reports
+// whether it did. It returns ErrFenced if this node's key is gone too: the node cannot tell a storage reset from its
+// own fencing.
+func (p *PR) KeepReserved() (bool, error) {
+	if _, typ, err := p.dev.readReservation(); err != nil || typ != 0 {
+		return false, err
+	}
+	keys, err := p.Keys()
+	if err != nil {
+		return false, err
+	}
+	if !slices.Contains(keys, p.key) {
+		return false, ErrFenced
+	}
+	return true, p.Reserve()
 }
 
 // Keys lists the keys registered on the device. ErrUnsupported means the kernel or the device cannot list them.
