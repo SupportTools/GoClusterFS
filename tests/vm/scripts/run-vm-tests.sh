@@ -3658,8 +3658,9 @@ test_fencing_stalled_writer() {
         log_error "fenced: the file starts with '$FENCED_BYTE', want VM 2's B"
         result=1
     fi
-    if ! sed -n '/fencing stalled writer pr/,$p' "$(get_vm_mount_log 1)" | grep -q "The device refused a write"; then
-        log_error "VM 1 did not report the refused write"
+    # While the refused write lists keys before it stops the node, another write's stall check may stop it first.
+    if ! sed -n '/fencing stalled writer pr/,$p' "$(get_vm_mount_log 1)" | grep -q "The device refused a write\|without a heartbeat, so a peer may have replayed it"; then
+        log_error "VM 1 reported neither the refused write nor its stall"
         result=1
     fi
     if ! sed -n '/fencing stalled writer pr/,$p' "$(get_vm_mount_log 2)" | grep -q "Revoked node"; then
@@ -4014,7 +4015,7 @@ test_fencing_lost_reservation() {
         log_error "15s after the reservation was released, no node had reserved again"
         result=1
     elif ! cat "$(get_vm_mount_log 1)" "$(get_vm_mount_log 2)" | grep -q "had lost its reservation"; then
-        log_error "a node reserved again without logging it"
+        log_error "a node reserved again without logging it; holder: $(reservation_holder | tr -s '\n' ' '); registrations: $(registered_initiators | tr -s '\n' ' ')"
         result=1
     else
         log_info "a node reserved again ${t}s after the release"
@@ -4530,7 +4531,8 @@ test_fencing_session_relogin() {
     fi
 
     ssh_run 2 "$fsck -clear-reservations -confirm $(cluster_device) > /dev/null 2>&1" || result=1
-    ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p1 --logout > /dev/null 2>&1; true"
+    ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath; true"
+    iscsi_drop_path 1 1 || result=1
     fencing_restart pr || result=1
     return $result
 }
@@ -4653,9 +4655,9 @@ rekey_pause_cleanup() {
         wait_vm_healthy "$1" 120 || return 1
         return 0
     fi
-    ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath 2>/dev/null
-        iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I p1 --logout > /dev/null 2>&1
-        if [ ! -b $(cluster_device) ]; then
+    ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath 2>/dev/null; true"
+    iscsi_drop_path "$1" 1
+    ssh_run "$1" "if [ ! -b $(cluster_device) ]; then
             iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I default --logout > /dev/null 2>&1
             iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I default --login > /dev/null 2>&1
             for t in \$(seq 20); do [ -b $(cluster_device) ] && break; sleep 1; done

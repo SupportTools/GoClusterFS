@@ -844,6 +844,16 @@ iscsi_add_path() {
         iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p$2 --login > /dev/null && sleep 2"
 }
 
+# iscsi_drop_path logs VM $1's path p$2 out and deletes it. Its node record replaced the default one, without which a
+# login through iface default finds no record, so it creates that again.
+iscsi_drop_path() {
+    local node="-T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT}"
+    ssh_run "$1" "iscsiadm -m node $node -I p$2 --logout > /dev/null 2>&1
+        iscsiadm -m node $node -I p$2 -o delete > /dev/null 2>&1; iscsiadm -m iface -I p$2 -o delete > /dev/null 2>&1
+        iscsiadm -m node $node -I default > /dev/null 2>&1 && exit 0
+        iscsiadm -m node $node -o new > /dev/null && iscsiadm -m node $node -o update -n node.session.timeo.replacement_timeout -v 5"
+}
+
 # multipath_over sets VM $1's dm-multipath map gcfs-mpath on the disks after $1, by default every iSCSI disk of VM $1,
 # one path each. A map that exists takes the disks without flushing the writes it queued while it had no path.
 multipath_over() {
