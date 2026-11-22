@@ -136,6 +136,8 @@ type FS struct {
 	// Storage layer
 	dev *storage.Device
 	sb  *superblock.Superblock
+	// releaseSlot empties this node's registry slot at a clean close.
+	releaseSlot func()
 
 	// Managers
 	lockMgr     *lock.Manager
@@ -412,9 +414,11 @@ func (f *FS) Close() error {
 	}
 
 	// Stop journal to ensure clean shutdown
+	journalClean := true
 	if f.journal != nil {
 		ShutdownStep("journal stop", func() {
 			if err := f.journal.Stop(); err != nil {
+				journalClean = false
 				log.Printf("Warning: failed to stop journal cleanly: %v", err)
 			}
 		})
@@ -427,9 +431,17 @@ func (f *FS) Close() error {
 		})
 		f.lockMgr.LogStats()
 	}
+	if f.releaseSlot != nil && journalClean {
+		ShutdownStep("registry slot release", f.releaseSlot)
+	}
 	var err error
 	ShutdownStep("device close", func() { err = f.dev.Close() })
 	return err
+}
+
+// SetSlotRelease makes Close run release after the journal stopped cleanly and before the device closes.
+func (f *FS) SetSlotRelease(release func()) {
+	f.releaseSlot = release
 }
 
 // getInode retrieves an inode, using the cache when available.

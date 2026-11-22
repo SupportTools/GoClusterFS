@@ -3850,7 +3850,34 @@ test_unfenced_join_refused() {
     return $result
 }
 
-# A fenced node that writes nothing still stops soon after it resumes: its next heartbeat write fails.
+# A clean unmount empties its registry slot. So after every node of an unfenced cluster unmounted cleanly, the first
+# node to mount again joins without -unsafe-allow-unfenced: no stale slot counts as a mounted node.
+test_unfenced_remount_after_clean_stop() {
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs 2 VMs"
+        return 0
+    fi
+    local result=0 vm out
+    fencing_restart none || return 1
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        unmount_goclusterfs "$vm" || return 1
+    done
+    out=$(ssh_run 2 "mkdir -p ${GOCLUSTERFS_MOUNT}; nohup /usr/local/bin/goclusterfs-mount -mount ${GOCLUSTERFS_MOUNT} -device $(cluster_device) -broadcast=false -api=false > /tmp/unfenced-remount.log 2>&1 < /dev/null & for i in \$(seq 1 60); do mountpoint -q ${GOCLUSTERFS_MOUNT} && break; sleep 0.5; done; mountpoint -q ${GOCLUSTERFS_MOUNT} && echo MOUNTED; grep -E 'Cannot join|UNSAFE|Leaving registry slot' /tmp/unfenced-remount.log")
+    if [[ "$out" != *MOUNTED* ]]; then
+        log_error "VM 2 did not mount alone without -unsafe-allow-unfenced after every node unmounted cleanly: $out"
+        result=1
+    else
+        log_info "VM 2 mounted alone after a clean stop of the cluster"
+    fi
+    unmount_goclusterfs 2 || crash_goclusterfs 2
+    ssh_run 2 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        setup_goclusterfs "$vm" false || return 1
+    done
+    return $result
+}
+
+# A fenced node that writes nothing still stops soon after it resumes: its next heartbeat write fails.# A fenced node that writes nothing still stops soon after it resumes: its next heartbeat write fails.
 test_fencing_idle_node() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
@@ -5267,6 +5294,7 @@ main() {
     run_test "Fencing: Paused VM" test_fencing_paused_vm
     run_test "Pause: Unfenced Paused VM" test_unfenced_paused_vm
     run_test "Unfenced Join Refused" test_unfenced_join_refused
+    run_test "Unfenced Remount After Clean Stop" test_unfenced_remount_after_clean_stop
     run_test "Fencing: Idle Node" test_fencing_idle_node
     run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations

@@ -647,6 +647,35 @@ func (r *Registry) Unregister(ctx context.Context) error {
 	return nil
 }
 
+// Release empties this node's slot after a clean unmount, so no node has to recover it and an unfenced volume does
+// not count it as a mounted node. It writes only over the slot exactly as it reads it, Active and this node's with no
+// takeover mark, so a peer's mark stays, and a slot that still lists files unlinked while open stays for a peer.
+func (r *Registry) Release() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.localSlot < 0 {
+		return ErrNotRegistered
+	}
+	raw, slot, err := r.readSlotRaw(r.localSlot)
+	switch {
+	case err != nil:
+		return err
+	case slot.UUID != r.localUUID || slot.State != NodeStateActive || slot.RecoveryOwner != [16]byte{}:
+		return fmt.Errorf("%w: slot %d", ErrSlotLost, r.localSlot)
+	case len(slot.Orphans) > 0:
+		return fmt.Errorf("slot %d lists %d files unlinked while open, which a peer takes over", r.localSlot, len(slot.Orphans))
+	}
+	released, err := r.casSlot(r.localSlot, raw, serializeSlot(&Slot{Magic: SlotMagic, State: NodeStateEmpty}))
+	if err != nil {
+		return err
+	}
+	if !released {
+		return fmt.Errorf("slot %d changed while this node released it", r.localSlot)
+	}
+	r.localSlot = -1
+	return nil
+}
+
 // Stop ends the heartbeat and failure detection. It waits for a journal
 // replay in progress, so call it before closing the device.
 func (r *Registry) Stop() {
