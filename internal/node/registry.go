@@ -993,6 +993,7 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 		}
 	}
 	if err != nil {
+		r.undoIntent(slotIdx, expected, marked, owner, err)
 		return err
 	}
 	if !success {
