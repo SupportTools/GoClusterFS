@@ -3834,15 +3834,13 @@ test_unfenced_join_refused() {
     fencing_restart none || return 1
     unmount_goclusterfs 2 || return 1
     out=$(ssh_run 2 "mkdir -p ${GOCLUSTERFS_MOUNT}; timeout 60 /usr/local/bin/goclusterfs-mount -mount ${GOCLUSTERFS_MOUNT} -device $(cluster_device) -broadcast=false -api=false 2>&1; echo rc=\$?")
+    # The refusal may also name VM 2's own last slot: an unmount leaves its slot Active for a peer or a remount on its
+    # host to clear, and for about a second the exited mount is a zombie, which passes the kill(pid, 0) liveness test.
     if [[ "$out" != *"has no storage fencing, and the node"* || "$out" == *rc=0* ]]; then
         log_error "VM 2 was not refused on an unfenced volume VM 1 has mounted, without -unsafe-allow-unfenced: $out"
         result=1
     else
         log_info "VM 2 refused: $(grep -o 'has no storage fencing, and the node[^.]*' <<< "$out" | head -1)"
-    fi
-    if [[ "$out" == *"the nodes in slots"* ]]; then
-        log_warn "VM 2 saw more than VM 1's node; the registry:"
-        ssh_run 2 "/usr/local/bin/goclusterfs-fsck -list-slots $(cluster_device) 2>&1" | head -8
     fi
     marker="unfenced join $(date +%s)"
     mark_vm_logs "$marker"
