@@ -3,6 +3,7 @@ package fence
 import (
 	"encoding/binary"
 	"errors"
+	"os"
 	"slices"
 	"syscall"
 	"testing"
@@ -194,4 +195,43 @@ func TestPassthroughRefusesMoreKeysThanAVolumeHolds(t *testing.T) {
 	if _, _, err := parseNVMeReport(report, true); err == nil {
 		t.Error("parseNVMeReport took more registrants than a volume can hold")
 	}
+}
+
+// On the disk GOCLUSTERFS_TEST_PR_DEVICE names, on a kernel with IOC_PR_READ_KEYS, the passthrough listing matches the
+// kernel's: the test registers a key and reserves, compares both listings, and removes the key.
+func TestPassthroughMatchesTheKernel(t *testing.T) {
+	path := os.Getenv("GOCLUSTERFS_TEST_PR_DEVICE")
+	if path == "" {
+		t.Skip("set GOCLUSTERFS_TEST_PR_DEVICE to a whole disk with persistent reservations and no other keys")
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	d := blockDevice{f: f}
+	key := ToolKey()
+	if err := d.register(0, key, true); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	defer func() { _ = d.register(key, 0, false) }()
+	if err := d.reserve(key); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	kernelKeys, err := d.listKeys()
+	if err != nil {
+		t.Fatalf("the kernel's listing: %v; this test needs Linux 6.19 or later", err)
+	}
+	rawKeys, err := d.passthrough().readKeys()
+	slices.Sort(kernelKeys)
+	slices.Sort(rawKeys)
+	if err != nil || !slices.Equal(rawKeys, kernelKeys) || !slices.Contains(rawKeys, key) {
+		t.Errorf("passthrough keys %x, %v; the kernel lists %x", rawKeys, err, kernelKeys)
+	}
+	kernelKey, kernelType, kerr := d.readHeldReservation()
+	rawKey, rawType, err := d.passthrough().readReservation()
+	if kerr != nil || err != nil || rawKey != kernelKey || rawType != kernelType || rawType != typeWriteExclusiveAllRegs {
+		t.Errorf("passthrough reservation key %#x type %d (%v); the kernel's key %#x type %d (%v)", rawKey, rawType, err, kernelKey, kernelType, kerr)
+	}
+	t.Logf("%s: keys %x, reservation key %#x type %d, from both", path, rawKeys, rawKey, rawType)
 }
