@@ -40,9 +40,6 @@ const (
 	// MaxNameLen is the maximum length of a filename.
 	MaxNameLen = 255
 
-	// BlockSize is the size of data blocks used by directories.
-	BlockSize = extent.BlockSize
-
 	// DirChunkSize is the size of directory chunks within a block.
 	// Directories are organized in 4KB chunks to keep RecLen within uint16 range.
 	DirChunkSize = 4096
@@ -101,6 +98,7 @@ type Manager struct {
 	extentMgr  *extent.Manager
 	lockMgr    *lock.Manager
 	dataOffset uint64 // Starting disk offset for data blocks
+	blockSize  uint64
 	indexes    *indexCache
 	// dirMu serializes this node's changes to a directory: its cluster lock admits every goroutine on the node at once.
 	dirMu [dirStripes]sync.RWMutex
@@ -130,6 +128,7 @@ func NewManager(dev *storage.Device, inodeTbl *inode.Table, extentMgr *extent.Ma
 		extentMgr:  extentMgr,
 		lockMgr:    lockMgr,
 		dataOffset: dataOffset,
+		blockSize:  extentMgr.BlockSize(),
 		indexes:    newIndexCache(DefaultIndexEntries),
 	}
 }
@@ -300,7 +299,7 @@ func (m *Manager) addToExistingChunk(num uint32, entry *DirEntry, blocks uint64,
 	if _, exists, _ := x.find(freshIno.MetaGeneration, entry.Name); exists {
 		return nil, false, ErrExists
 	}
-	if extent.BlocksForSize(freshIno.Size) <= blocks {
+	if m.extentMgr.BlocksForSize(freshIno.Size) <= blocks {
 		return freshIno, false, nil
 	}
 	at, ok := x.chunkWithRoom(entrySize(entry))
@@ -489,7 +488,7 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	dotdotEntry.RecLen = uint16(DirChunkSize - int(dotEntry.RecLen))
 
 	// Build the block
-	data := make([]byte, BlockSize)
+	data := make([]byte, m.blockSize)
 	offset := 0
 
 	// Write "."
@@ -503,7 +502,7 @@ func (m *Manager) InitDirectory(ctx context.Context, dirIno *inode.Inode, parent
 	if err := m.writeBlock(ext.PhysicalBlock, data); err != nil {
 		return err
 	}
-	dirIno.Size = BlockSize
+	dirIno.Size = m.blockSize
 	dirIno.AllocatedBlocks = 1
 
 	// Later operations re-read the inode from disk, so write it now.
@@ -610,7 +609,7 @@ func (m *Manager) addToNewBlock(ctx context.Context, dirIno *inode.Inode, entry 
 // may report that another goroutine or node made the block unneeded.
 func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled func(nextBlock uint64) (*inode.Inode, bool, error), fill func(data []byte), parent func(*inode.Inode)) error {
 	// Calculate next block number based on current (possibly stale) size
-	nextBlock := extent.BlocksForSize(dirIno.Size)
+	nextBlock := m.extentMgr.BlocksForSize(dirIno.Size)
 
 	// Allocate a new block (this acquires bitmap lock - level 6)
 	physBlock, err := m.extentMgr.AllocatePhysicalBlock(ctx)
@@ -666,7 +665,7 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 		dirIno.Size = freshIno.Size
 		return nil
 	}
-	nextBlock = max(nextBlock, extent.BlocksForSize(freshIno.Size))
+	nextBlock = max(nextBlock, m.extentMgr.BlocksForSize(freshIno.Size))
 
 	// CONFLICT DETECTION 2: Check if our target logical block is already occupied.
 	// Another node may have inserted an extent at this position while we were waiting.
@@ -683,7 +682,7 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 		return fmt.Errorf("failed to check extent: %w", extErr)
 	}
 
-	data := make([]byte, BlockSize)
+	data := make([]byte, m.blockSize)
 	fill(data)
 
 	if err := m.writeBlock(physBlock, data); err != nil {
@@ -710,7 +709,7 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 	pending = freshIno
 
 	// Update directory size and allocated blocks
-	freshIno.Size = uint64(nextBlock+1) * BlockSize
+	freshIno.Size = (nextBlock + 1) * m.blockSize
 	freshIno.AllocatedBlocks++
 	freshIno.MetaGeneration++
 	if parent != nil {
@@ -739,23 +738,23 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 }
 
 func (m *Manager) blockOffset(physBlock uint64) int64 {
-	return int64(m.dataOffset + physBlock*BlockSize)
+	return int64(m.dataOffset + physBlock*m.blockSize)
 }
 
 func (m *Manager) readBlock(physBlock uint64) ([]byte, error) {
-	buf := storage.GetBuffer(BlockSize)
+	buf := storage.GetBuffer(int(m.blockSize))
 	defer storage.PutBuffer(buf)
-	if _, err := m.dev.ReadAt(buf.Bytes()[:BlockSize], m.blockOffset(physBlock)); err != nil {
+	if _, err := m.dev.ReadAt(buf.Bytes()[:m.blockSize], m.blockOffset(physBlock)); err != nil {
 		return nil, fmt.Errorf("read block %d: %w", physBlock, err)
 	}
-	return append([]byte(nil), buf.Bytes()[:BlockSize]...), nil
+	return append([]byte(nil), buf.Bytes()[:m.blockSize]...), nil
 }
 
 func (m *Manager) writeBlock(physBlock uint64, data []byte) error {
-	buf := storage.GetBuffer(BlockSize)
+	buf := storage.GetBuffer(int(m.blockSize))
 	defer storage.PutBuffer(buf)
 	copy(buf.Bytes(), data)
-	if _, err := m.dev.WriteAt(buf.Bytes()[:BlockSize], m.blockOffset(physBlock)); err != nil {
+	if _, err := m.dev.WriteAt(buf.Bytes()[:m.blockSize], m.blockOffset(physBlock)); err != nil {
 		return fmt.Errorf("write block %d: %w", physBlock, err)
 	}
 	return nil

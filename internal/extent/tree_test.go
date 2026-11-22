@@ -49,7 +49,7 @@ func newTreeEnv(t *testing.T, nodeCap int) *treeEnv {
 
 // remount replaces the manager, dropping the node cache as a new mount would.
 func (env *treeEnv) remount(nodeCap int) {
-	env.mgr = NewManager(env.dev, env.bm, nil, treeTestDataOffset)
+	env.mgr = NewManager(env.dev, env.bm, nil, treeTestDataOffset, BlockSize)
 	if nodeCap > 0 {
 		env.mgr.leafCap, env.mgr.indexCap = nodeCap, nodeCap
 	}
@@ -399,7 +399,7 @@ func TestCorruptNodeIsDetected(t *testing.T) {
 	env.insertScattered(ino, 3)
 	env.write(ino)
 
-	off := TreeNodeOffset(treeTestDataOffset, ino.ExtentTreeRoot, ino.ExtentTreeGen)
+	off := TreeNodeOffset(treeTestDataOffset, BlockSize, ino.ExtentTreeRoot, ino.ExtentTreeGen)
 	buf := storage.NewAlignedBuffer(storage.SectorSize)
 	if _, err := env.dev.ReadAt(buf.Bytes(), off); err != nil {
 		t.Fatal(err)
@@ -476,20 +476,20 @@ func TestParseRejectsBadNodes(t *testing.T) {
 	n := &TreeNode{Level: LevelLeaf, Inode: 7, Gen: 3, Extents: []Extent{{0, 10, 2, FlagAllocated}, {5, 20, 1, FlagAllocated}}}
 	buf := make([]byte, treeNodeSize(2))
 	encodeTreeNode(buf, n)
-	got, err := parseTreeNode(buf)
+	got, err := parseTreeNode(buf, BlockSize)
 	if err != nil || len(got.Extents) != 2 || got.Extents[1] != n.Extents[1] || got.Gen != 3 || got.Inode != 7 {
 		t.Fatalf("round trip: %+v, %v", got, err)
 	}
 
 	overlap := &TreeNode{Level: LevelLeaf, Extents: []Extent{{0, 10, 5, 0}, {3, 20, 1, 0}}}
 	encodeTreeNode(buf, overlap)
-	if _, err := parseTreeNode(buf); !errors.Is(err, ErrCorruptTree) {
+	if _, err := parseTreeNode(buf, BlockSize); !errors.Is(err, ErrCorruptTree) {
 		t.Fatalf("overlapping extents: got %v", err)
 	}
 
 	index := &TreeNode{Level: LevelIndex, Children: []TreeChild{{First: 5, Block: 1, Gen: 1, Count: 1}}}
 	encodeTreeNode(buf, index)
-	if _, err := parseTreeNode(buf); !errors.Is(err, ErrCorruptTree) {
+	if _, err := parseTreeNode(buf, BlockSize); !errors.Is(err, ErrCorruptTree) {
 		t.Fatalf("index not starting at 0: got %v", err)
 	}
 }
@@ -566,7 +566,7 @@ func TestTreeMatchesModel(t *testing.T) {
 						t.Fatalf("op %d: truncate: %v", op, err)
 					}
 					for b := range model {
-						if b >= BlocksForSize(size) {
+						if b >= env.mgr.BlocksForSize(size) {
 							delete(model, b)
 						}
 					}

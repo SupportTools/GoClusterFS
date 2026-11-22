@@ -81,10 +81,10 @@ func journalResponse(j journal.JournalStats) *api.JournalStatsResponse {
 	}
 }
 
-func trimResponse(t trim.Stats) *api.TrimStatsResponse {
+func trimResponse(t trim.Stats, blockSize uint64) *api.TrimStatsResponse {
 	return &api.TrimStatsResponse{
 		TrimOperations:    t.DiscardCalls,
-		TrimBytes:         t.BlocksDiscarded * trim.BlockSize,
+		TrimBytes:         t.BlocksDiscarded * blockSize,
 		TrimBlocks:        t.BlocksDiscarded,
 		PendingTrimBlocks: t.PendingBlocks,
 		LastTrimAt:        timestamp(t.LastDiscard),

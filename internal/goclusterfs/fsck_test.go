@@ -109,7 +109,7 @@ func openFormattedComponents(t *testing.T, path string) *FS {
 	locks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, nodeUUID, slot)
 	bm := bitmap.NewRegion(dev, sb.BlockBitmapOffset, sb.TotalBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, sb.InodeTableOffset, sb.InodeCount*inode.InodeSize, locks, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset)
+	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
@@ -211,7 +211,7 @@ func shareTreeLikeOlderVersions(t *testing.T, fsys *FS, ino *inode.Inode) {
 	if !ino.HasExtentTree() || ino.ExtentDepth != 1 {
 		t.Fatalf("inode %d: want a depth-1 extent tree", ino.InodeNum)
 	}
-	off := extent.TreeNodeOffset(fsys.dataOffset, ino.ExtentTreeRoot, ino.ExtentTreeGen)
+	off := extent.TreeNodeOffset(fsys.dataOffset, storage.DefaultBlockSize, ino.ExtentTreeRoot, ino.ExtentTreeGen)
 	buf := storage.NewAlignedBuffer(64 << 10).Bytes()
 	if _, err := fsys.dev.ReadAt(buf, off); err != nil {
 		t.Fatal(err)

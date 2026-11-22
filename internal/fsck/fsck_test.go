@@ -492,7 +492,7 @@ func TestFsckExtentTree(t *testing.T) {
 	ctx := context.Background()
 	bm := bitmap.NewRegion(dev, testLayout.BlockBitmapOffset, totalBlocks, nil, uuid)
 	tbl := inode.NewTable(dev, testLayout.InodeTableOffset, testLayout.InodeTableSize, nil, uuid)
-	mgr := extent.NewManager(dev, bm, nil, dataOffset)
+	mgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	tbl.SetTreeFlusher(mgr)
 
 	newFile := func() *inode.Inode {
@@ -518,7 +518,7 @@ func TestFsckExtentTree(t *testing.T) {
 		}
 	}
 	for _, ino := range []*inode.Inode{a, b} {
-		ino.Size = 6 * extent.BlockSize
+		ino.Size = 6 * storage.DefaultBlockSize
 		if err := tbl.Write(ctx, ino); err != nil {
 			t.Fatalf("write inode: %v", err)
 		}
@@ -531,7 +531,7 @@ func TestFsckExtentTree(t *testing.T) {
 		t.Fatalf("valid extent trees reported as broken: %v", problems)
 	}
 
-	off := extent.TreeNodeOffset(dataOffset, a.ExtentTreeRoot, a.ExtentTreeGen)
+	off := extent.TreeNodeOffset(dataOffset, storage.DefaultBlockSize, a.ExtentTreeRoot, a.ExtentTreeGen)
 	buf := storage.NewAlignedBuffer(storage.SectorSize)
 	if _, err := dev.ReadAt(buf.Bytes(), off); err != nil {
 		t.Fatal(err)

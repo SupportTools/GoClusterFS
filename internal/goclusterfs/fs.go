@@ -104,9 +104,6 @@ func conflictBackoff(attempt int) {
 	time.Sleep(time.Duration(1+rand.Intn(5<<attempt)) * time.Millisecond)
 }
 
-// BlockSize is the size of data blocks (1MB).
-const BlockSize = 1 << 20
-
 const inodeMuStripes = 256
 
 // SFB (Sub-File Block) constants for small file storage.
@@ -160,6 +157,7 @@ type FS struct {
 	// Configuration
 	nodeUUID   [16]byte
 	dataOffset uint64 // Offset where data blocks start on disk
+	blockSize  uint64
 	failStop   func(error)
 
 	// Runtime state
@@ -205,6 +203,7 @@ type Config struct {
 	InodeOffset   uint64
 	DataOffset    uint64
 	JournalOffset uint64 // Journal region start offset (0 = no journal)
+	BlockSize     uint64 // Data block size
 
 	// Region sizes
 	TotalBlocks uint64 // Number of data blocks
@@ -231,7 +230,10 @@ func New(cfg *Config) (*FS, error) {
 	inodeTbl := inode.NewTable(dev, cfg.InodeOffset, cfg.InodeCount*inode.InodeSize, lockMgr, cfg.NodeUUID)
 
 	// Create extent manager
-	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr, cfg.DataOffset)
+	if cfg.BlockSize == 0 {
+		cfg.BlockSize = storage.DefaultBlockSize
+	}
+	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr, cfg.DataOffset, cfg.BlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 
 	// Create directory manager
@@ -246,6 +248,7 @@ func New(cfg *Config) (*FS, error) {
 		dirMgr:     dirMgr,
 		nodeUUID:   cfg.NodeUUID,
 		dataOffset: cfg.DataOffset,
+		blockSize:  cfg.BlockSize,
 		uid:        uint32(os.Getuid()),
 		gid:        uint32(os.Getgid()),
 	}, nil
@@ -286,9 +289,15 @@ func NewWithComponents(
 		refcountReg: refcountReg,
 		nodeUUID:    nodeUUID,
 		dataOffset:  dataOffset,
+		blockSize:   extentMgr.BlockSize(),
 		uid:         uint32(os.Getuid()),
 		gid:         uint32(os.Getgid()),
 	}
+}
+
+// BlockSize returns the volume's data block size in bytes.
+func (f *FS) BlockSize() uint64 {
+	return f.blockSize
 }
 
 // InitSnapshots initializes the snapshot subsystem.
@@ -748,9 +757,9 @@ func (f *FS) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	out.Bavail = freeBlocks
 	out.Files = f.inodeTbl.TotalInodes()
 	out.Ffree = f.inodeTbl.FreeCount()
-	out.Bsize = BlockSize
+	out.Bsize = uint32(f.blockSize)
 	out.NameLen = 255
-	out.Frsize = BlockSize
+	out.Frsize = uint32(f.blockSize)
 
 	return 0
 }
@@ -777,8 +786,8 @@ func (f *FS) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) s
 	out.Mtimensec = uint32(ino.Mtime % 1e9)
 	out.Ctime = uint64(ino.Ctime / 1e9)
 	out.Ctimensec = uint32(ino.Ctime % 1e9)
-	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
-	out.Blksize = BlockSize
+	out.Blocks = ino.AllocatedBlocks * (f.blockSize / 512)
+	out.Blksize = uint32(f.blockSize)
 
 	return 0
 }
@@ -837,9 +846,9 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 	}
 	if fileType == dir.DT_DIR {
 		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0o7777))
-		out.Attr.Size = BlockSize
-		out.Attr.Blocks = 1 * (BlockSize / 512)
-		out.Attr.Blksize = BlockSize
+		out.Attr.Size = f.blockSize
+		out.Attr.Blocks = 1 * (f.blockSize / 512)
+		out.Attr.Blksize = uint32(f.blockSize)
 
 		ch := f.dirNode(ctx, &f.Inode, name, childInodeNum)
 		logging.Debugf("FS.Lookup: returning dir inode %d", childInodeNum)
@@ -848,8 +857,8 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 
 	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0o7777))
 	out.Attr.Size = childIno.Size
-	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
-	out.Attr.Blksize = BlockSize
+	out.Attr.Blocks = childIno.AllocatedBlocks * (f.blockSize / 512)
+	out.Attr.Blksize = uint32(f.blockSize)
 
 	ch := f.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
@@ -1125,7 +1134,7 @@ func (f *FS) announceDir(num uint32) {
 	f.cacheInode(dirIno)
 }
 
-func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode) {
+func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode, blockSize uint64) {
 	out.EntryValid = 0
 	out.AttrValid = 0
 	out.Ino = uint64(ino.InodeNum)
@@ -1137,7 +1146,7 @@ func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode) {
 	out.Atime, out.Atimensec = uint64(ino.Atime/1e9), uint32(ino.Atime%1e9)
 	out.Mtime, out.Mtimensec = uint64(ino.Mtime/1e9), uint32(ino.Mtime%1e9)
 	out.Ctime, out.Ctimensec = uint64(ino.Ctime/1e9), uint32(ino.Ctime%1e9)
-	out.Blksize = BlockSize
+	out.Blksize = uint32(blockSize)
 }
 
 // createFile creates a file called name in directory parentNum, whose go-fuse node is parent.
@@ -1265,7 +1274,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		Ino:  uint64(childIno.InodeNum),
 		Gen:  childIno.BirthGeneration,
 	})
-	fillEntryOut(out, childIno)
+	fillEntryOut(out, childIno, f.blockSize)
 	return ch, 0
 }
 
@@ -1356,7 +1365,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		Ino:  uint64(childIno.InodeNum),
 		Gen:  f.dirGen.Add(1),
 	})
-	fillEntryOut(out, childIno)
+	fillEntryOut(out, childIno, f.blockSize)
 	return ch, 0
 }
 
@@ -1431,8 +1440,8 @@ func (d *Dir) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) 
 	out.Mtimensec = uint32(ino.Mtime % 1e9)
 	out.Ctime = uint64(ino.Ctime / 1e9)
 	out.Ctimensec = uint32(ino.Ctime % 1e9)
-	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
-	out.Blksize = BlockSize
+	out.Blocks = ino.AllocatedBlocks * (d.fs.blockSize / 512)
+	out.Blksize = uint32(d.fs.blockSize)
 
 	return 0
 }
@@ -1549,9 +1558,9 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	}
 	if fileType == dir.DT_DIR {
 		out.Attr.Mode = uint32(fuse.S_IFDIR | (childIno.Mode & 0o7777))
-		out.Attr.Size = BlockSize // Directories have fixed size
-		out.Attr.Blocks = 1 * (BlockSize / 512)
-		out.Attr.Blksize = BlockSize
+		out.Attr.Size = d.fs.blockSize // Directories have fixed size
+		out.Attr.Blocks = 1 * (d.fs.blockSize / 512)
+		out.Attr.Blksize = uint32(d.fs.blockSize)
 
 		ch := d.fs.dirNode(ctx, &d.Inode, name, childInodeNum)
 		logging.Debugf("Lookup: returning dir inode %d", childInodeNum)
@@ -1560,8 +1569,8 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 
 	out.Attr.Mode = uint32(fuse.S_IFREG | (childIno.Mode & 0o7777))
 	out.Attr.Size = childIno.Size
-	out.Attr.Blocks = childIno.AllocatedBlocks * (BlockSize / 512)
-	out.Attr.Blksize = BlockSize
+	out.Attr.Blocks = childIno.AllocatedBlocks * (d.fs.blockSize / 512)
+	out.Attr.Blksize = uint32(d.fs.blockSize)
 
 	ch := d.NewPersistentInode(ctx, newFile(d.fs, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
@@ -2051,8 +2060,8 @@ func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 	out.Mtimensec = uint32(ino.Mtime % 1e9)
 	out.Ctime = uint64(ino.Ctime / 1e9)
 	out.Ctimensec = uint32(ino.Ctime % 1e9)
-	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
-	out.Blksize = BlockSize
+	out.Blocks = ino.AllocatedBlocks * (f.fs.blockSize / 512)
+	out.Blksize = uint32(f.fs.blockSize)
 
 	return 0
 }
@@ -2113,8 +2122,8 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 		return err
 	}
 	for bytesRead := 0; bytesRead < readSize; {
-		blockNum, blockOffset := offset/BlockSize, offset%BlockSize
-		toRead := min(int(BlockSize-blockOffset), readSize-bytesRead)
+		blockNum, blockOffset := offset/f.fs.blockSize, offset%f.fs.blockSize
+		toRead := min(int(f.fs.blockSize-blockOffset), readSize-bytesRead)
 		physBlock, err := f.fs.lookupPhysical(ino, blockNum)
 		if err != nil {
 			return nil, syscall.EIO
@@ -2124,7 +2133,7 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 				return nil, syscall.EIO
 			}
 		} else {
-			diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
+			diskOffset := int64(f.fs.dataOffset + physBlock*f.fs.blockSize + blockOffset)
 			if runLen > 0 && runDisk+int64(runLen) != diskOffset && flush() != nil {
 				return nil, syscall.EIO
 			}
@@ -2267,7 +2276,7 @@ func (f *FS) zeroRange(physBlock, from, to uint64) error {
 	buf := storage.GetBuffer(int(to - from))
 	defer storage.PutBuffer(buf)
 	clear(buf.Bytes())
-	_, err := f.dev.WriteAt(buf.Bytes()[:to-from], int64(f.dataOffset+physBlock*BlockSize+from))
+	_, err := f.dev.WriteAt(buf.Bytes()[:to-from], int64(f.dataOffset+physBlock*f.blockSize+from))
 	return err
 }
 
@@ -2521,8 +2530,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		// Once the lock drops, another node's growth may zero the rest of the block the file ended in. Cover what
 		// this write put there; a write that started at a block boundary stays invisible until it completes.
-		if oldEnd%BlockSize != 0 && writtenEnd > ino.Size {
-			ino.Size = min(writtenEnd, (oldEnd/BlockSize+1)*BlockSize)
+		if oldEnd%f.fs.blockSize != 0 && writtenEnd > ino.Size {
+			ino.Size = min(writtenEnd, (oldEnd/f.fs.blockSize+1)*f.fs.blockSize)
 			inoDirty = true
 		}
 		if inoDirty {
@@ -2611,8 +2620,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			offset, data, bytesWritten = segments[0].off, segments[0].data, 0
 			continue
 		}
-		blockNum := offset / BlockSize
-		blockOffset := offset % BlockSize
+		blockNum := offset / f.fs.blockSize
+		blockOffset := offset % f.fs.blockSize
 		zeroFirst := false
 
 		// Try to find existing extent first (without lock for read-only check)
@@ -2834,14 +2843,14 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Calculate physical location
 		physBlock := ext.PhysicalBlock + extOffset
-		diskOffset := int64(f.fs.dataOffset + physBlock*BlockSize + blockOffset)
+		diskOffset := int64(f.fs.dataOffset + physBlock*f.fs.blockSize + blockOffset)
 
 		// Write to disk
-		toWrite := int(BlockSize - blockOffset)
+		toWrite := int(f.fs.blockSize - blockOffset)
 		if toWrite > len(data)-bytesWritten {
 			toWrite = len(data) - bytesWritten
 		}
-		zeroFirst = zeroFirst && toWrite < BlockSize
+		zeroFirst = zeroFirst && uint64(toWrite) < f.fs.blockSize
 
 		if beforeInPlaceWrite != nil {
 			beforeInPlaceWrite()
@@ -2907,8 +2916,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		// A block first written here keeps its old disk contents outside the write. Zero what lies below the end of
 		// the file; growing the file later zeroes the rest.
 		if zeroFirst {
-			blockStart := blockNum * BlockSize
-			below := min(BlockSize, max(ino.Size, blockStart)-blockStart)
+			blockStart := blockNum * f.fs.blockSize
+			below := min(f.fs.blockSize, max(ino.Size, blockStart)-blockStart)
 			err := f.fs.zeroRange(physBlock, 0, alignSector(blockOffset, true))
 			if from := alignSector(blockOffset+uint64(toWrite), false); err == nil && below > from {
 				err = f.fs.zeroRange(physBlock, from, alignSector(below, true))
@@ -3111,7 +3120,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	}
 
 	// A peer resized the file after growthSegments chose what to zero; the retry zeroes from the new size.
-	if onDisk < writeStart && onDisk != oldEnd && onDisk%BlockSize != 0 {
+	if onDisk < writeStart && onDisk != oldEnd && onDisk%f.fs.blockSize != 0 {
 		return 0, writeFailed(fmt.Errorf("%w: inode %d is %d bytes, not %d as the write planned", extent.ErrTreeConflict, f.inodeNum, onDisk, oldEnd))
 	}
 
@@ -3171,10 +3180,10 @@ type writeSegment struct {
 // first, through the same path, so a block shared with a snapshot or clone is copied rather than changed.
 func (f *File) growthSegments(ino *inode.Inode, data []byte, offset uint64) ([]writeSegment, error) {
 	end := ino.Size
-	if offset <= end || end%BlockSize == 0 || ino.IsSFBBacked() {
+	if offset <= end || end%f.fs.blockSize == 0 || ino.IsSFBBacked() {
 		return []writeSegment{{offset, data}}, nil
 	}
-	ext, _, err := f.fs.extentMgr.Lookup(ino, end/BlockSize)
+	ext, _, err := f.fs.extentMgr.Lookup(ino, end/f.fs.blockSize)
 	switch {
 	case errors.Is(err, extent.ErrStaleTree):
 		return nil, errRetryWrite
@@ -3183,7 +3192,7 @@ func (f *File) growthSegments(ino *inode.Inode, data []byte, offset uint64) ([]w
 	case err != nil:
 		return nil, syscall.EIO
 	}
-	gapEnd := min(offset, (end/BlockSize+1)*BlockSize)
+	gapEnd := min(offset, (end/f.fs.blockSize+1)*f.fs.blockSize)
 	zeros := make([]byte, gapEnd-end)
 	if gapEnd == offset {
 		return []writeSegment{{end, append(zeros, data...)}}, nil
@@ -3200,7 +3209,7 @@ func (f *FS) sfbSlotOffset(ino *inode.Inode) (int64, error) {
 	if ino.Size > uint64(slotSize) {
 		return 0, fmt.Errorf("SFB inode %d: size %d exceeds its %d-byte slot", ino.InodeNum, ino.Size, slotSize)
 	}
-	return int64(f.dataOffset + container*BlockSize + SFBHeaderSize + uint64(slot)*uint64(slotSize)), nil
+	return int64(f.dataOffset + container*sfb.BlockSize + SFBHeaderSize + uint64(slot)*uint64(slotSize)), nil
 }
 
 // readSFB reads n bytes at off from an SFB-backed inode's slot. Slots are not
@@ -3244,7 +3253,7 @@ func FreeSFBSlot(ctx context.Context, dev *storage.Device, lockMgr *lock.Manager
 	buf := storage.GetBuffer(storage.SectorSize)
 	defer storage.PutBuffer(buf)
 	sector := buf.Bytes()[:storage.SectorSize]
-	off := int64(dataOffset + container*BlockSize)
+	off := int64(dataOffset + container*sfb.BlockSize)
 	if _, err := dev.ReadAt(sector, off); err != nil {
 		log.Printf("[WARN] Free SFB slot %d:%d: reading container header failed: %v", container, slot, err)
 		return
@@ -3287,9 +3296,9 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 	}
 	newBlock := newBlocks[0]
 
-	buf := storage.GetBuffer(BlockSize)
+	buf := storage.GetBuffer(int(f.fs.blockSize))
 	copy(buf.Bytes(), data)
-	_, err = f.fs.dev.WriteAt(buf.Bytes()[:BlockSize], int64(f.fs.dataOffset+newBlock*BlockSize))
+	_, err = f.fs.dev.WriteAt(buf.Bytes()[:f.fs.blockSize], int64(f.fs.dataOffset+newBlock*f.fs.blockSize))
 	storage.PutBuffer(buf)
 	if err != nil {
 		f.fs.freeUnused(ctx, f.inodeNum, newBlock)
@@ -3447,8 +3456,8 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		if sz < ino.Size {
 			truncating = true
 			// Calculate blocks being freed
-			oldBlocks := (ino.Size + BlockSize - 1) / BlockSize
-			newBlocks := (sz + BlockSize - 1) / BlockSize
+			oldBlocks := (ino.Size + f.fs.blockSize - 1) / f.fs.blockSize
+			newBlocks := (sz + f.fs.blockSize - 1) / f.fs.blockSize
 			if oldBlocks > newBlocks {
 				blocksToFree = uint32(oldBlocks - newBlocks)
 			}
@@ -3668,9 +3677,9 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 	// We acquire the inode lock only at the end to update metadata atomically.
 
 	// Calculate block range
-	startBlock := off / BlockSize
+	startBlock := off / f.fs.blockSize
 	endOffset := off + size
-	endBlock := (endOffset + BlockSize - 1) / BlockSize // Round up
+	endBlock := (endOffset + f.fs.blockSize - 1) / f.fs.blockSize // Round up
 	totalBlocks := endBlock - startBlock
 
 	logging.Debugf("Allocate inode %d: offset=%d length=%d blocks=%d-%d (total=%d)",

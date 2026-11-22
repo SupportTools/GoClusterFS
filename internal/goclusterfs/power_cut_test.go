@@ -146,6 +146,7 @@ func attachHolePunchingTrim(t *testing.T, fsys *FS, path string) {
 	}
 	const keepSize, punchHole = 0x01, 0x02
 	tm := trim.NewManager(fsys.dev, trim.Config{
+		BlockSize:  uint64(sb.BlockSize),
 		BatchSize:  1 << 16,
 		MaxAge:     time.Hour,
 		DataOffset: sb.DataRegionOffset,

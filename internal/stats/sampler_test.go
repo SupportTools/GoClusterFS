@@ -11,6 +11,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
@@ -108,7 +109,7 @@ func TestLockAndJournalResponses(t *testing.T) {
 
 func TestTrimResponseCountsBytesAndLastDiscard(t *testing.T) {
 	last := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
-	got := trimResponse(trim.Stats{BlocksDiscarded: 3, DiscardCalls: 2, DiscardErrors: 1, PendingBlocks: 4, BatchSize: 256, LastDiscard: last})
+	got := trimResponse(trim.Stats{BlocksDiscarded: 3, DiscardCalls: 2, DiscardErrors: 1, PendingBlocks: 4, BatchSize: 256, LastDiscard: last}, storage.DefaultBlockSize)
 	want := api.TrimStatsResponse{
 		TrimOperations: 2, TrimBytes: 3 << 20, TrimBlocks: 3, PendingTrimBlocks: 4,
 		LastTrimAt: "2026-11-10T12:00:00Z", TrimErrors: 1, TrimEnabled: true, BatchSize: 256,
@@ -116,10 +117,10 @@ func TestTrimResponseCountsBytesAndLastDiscard(t *testing.T) {
 	if *got != want {
 		t.Errorf("trimResponse = %+v, want %+v", *got, want)
 	}
-	if never := trimResponse(trim.Stats{}); never.LastTrimAt != "" {
+	if never := trimResponse(trim.Stats{}, storage.DefaultBlockSize); never.LastTrimAt != "" {
 		t.Errorf("LastTrimAt before any discard = %q, want empty", never.LastTrimAt)
 	}
-	if unsupported := trimResponse(trim.Stats{Unsupported: true}); unsupported.TrimEnabled {
+	if unsupported := trimResponse(trim.Stats{Unsupported: true}, storage.DefaultBlockSize); unsupported.TrimEnabled {
 		t.Error("a device that cannot discard should report TRIM as disabled")
 	}
 }

@@ -81,7 +81,7 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 	}
 	bm := bitmap.NewRegion(dev, fuzzBitmap, fuzzBlocks, nil, uuid)
 	tbl := inode.NewTable(dev, fuzzInodes, testLayout.InodeTableSize, nil, uuid)
-	mgr := extent.NewManager(dev, bm, nil, fuzzDataOffset)
+	mgr := extent.NewManager(dev, bm, nil, fuzzDataOffset, storage.DefaultBlockSize)
 	tbl.SetTreeFlusher(mgr)
 	refs := refcount.NewRegion(dev, fuzzRefcounts, refcount.SizeForBlocks(fuzzBlocks), fuzzBlocks, nil)
 	mgr.SetRefcounts(refs)
@@ -114,7 +114,7 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 		}
 	}
 	for _, ino := range []*inode.Inode{plain, a, b} {
-		ino.Size = 2 * extent.BlockSize
+		ino.Size = 2 * storage.DefaultBlockSize
 		must(tbl.Write(ctx, ino))
 	}
 	if !a.HasExtentTree() {
@@ -147,8 +147,8 @@ func fuzzImage(tb testing.TB) (*storage.Device, []fuzzTarget) {
 		{"node registry", int64(fuzzRegistry), sectorCRC},
 		{"refcounts", int64(fuzzRefcounts), sectorCRC},
 		{"snapshots", int64(fuzzSnapshots), snapshotCRCs},
-		{"extent tree", extent.TreeNodeOffset(fuzzDataOffset, a.ExtentTreeRoot, a.ExtentTreeGen), treeNodeCRC},
-		{"root directory", int64(fuzzDataOffset + rootBlock*extent.BlockSize), func([]byte) {}},
+		{"extent tree", extent.TreeNodeOffset(fuzzDataOffset, storage.DefaultBlockSize, a.ExtentTreeRoot, a.ExtentTreeGen), treeNodeCRC},
+		{"root directory", int64(fuzzDataOffset + rootBlock*storage.DefaultBlockSize), func([]byte) {}},
 	}
 	return dev, targets
 }

@@ -97,7 +97,7 @@ func (c *Checker) markSharingCounted() error {
 	var uuid [16]byte
 	bm := bitmap.NewRegion(c.dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, uuid)
 	tbl := inode.NewTable(c.dev, sb.InodeTableOffset, sb.InodeTableSize, nil, uuid)
-	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset)
+	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset, uint64(sb.BlockSize))
 	tbl.SetTreeFlusher(mgr)
 
 	if !c.opts.DryRun {
