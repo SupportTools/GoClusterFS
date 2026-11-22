@@ -220,6 +220,8 @@ write_setup_disk() {
         echo "mountpoint='${GOCLUSTERFS_MOUNT}'"
         cat <<'EOF'
 set -x
+# QEMU passes each VM its own name, nodeN, so mounts see one hostname per VM, as on real hosts.
+name=$(cat /sys/class/dmi/id/product_serial) && [ -n "$name" ] && hostname "$name" && echo "$name" > /etc/hostname || exit 1
 # setup-interfaces -a leaves eth0 out once a VM has a second NIC.
 printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > /etc/network/interfaces
 ifup eth0
@@ -552,6 +554,7 @@ boot_vm() {
         -machine q35,accel=${accelerator} \
         -cpu ${cpu_type} \
         -m "${VM_MEMORY}" \
+        -smbios "type=1,serial=node${vm_id}" \
         -smp ${VM_CPUS} \
         -cdrom "${iso}" \
         -boot d \
