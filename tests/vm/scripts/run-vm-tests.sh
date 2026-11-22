@@ -3981,18 +3981,37 @@ test_fencing_clear_reservations() {
     return $result
 }
 
-# target_query runs the script on stdin on the first node VM that answers, with sg3_utils and $dev, that VM's iSCSI disk,
-# so it asks the target itself, whatever kind it is.
+# target_query runs the script on stdin, with $dev, an iSCSI disk, and pr, sg_persist sent again after a unit attention,
+# so it asks the target itself, whatever kind it is. With 2 nodes it asks from VM 3, which no test mounts, so it never
+# takes a unit attention a node under test should get; with more it asks from the first node that answers.
 target_query() {
-    local script vm disk
+    local script vm disk vms
     script=$(cat)
-    for vm in $(seq 1 "$NODE_COUNT"); do
+    if [[ $NODE_COUNT -lt 3 ]]; then
+        start_vm 3 false > /dev/null 2>&1 || { log_error "target_query: VM 3, which asks the target, did not start"; return 1; }
+        vms=3
+    else
+        vms=$(seq 1 "$NODE_COUNT")
+    fi
+    for vm in $vms; do
         disk=$(iscsi_disk "$vm" 2> /dev/null) && [[ -n "$disk" ]] || continue
-        printf 'dev=/dev/%s\ncommand -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null\n%s\n' "$disk" "$script" |
-            ssh_run_capped 30 "$vm" "sh -s" && return 0
+        printf '%s\ndev=/dev/%s\n%s\n' "$TARGET_QUERY_PRELUDE" "$disk" "$script" | ssh_run_capped 60 "$vm" "sh -s" && return 0
     done
+    log_error "target_query: no VM could ask the target"
     return 1
 }
+
+TARGET_QUERY_PRELUDE='command -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null
+pr() {
+    i=0
+    while :; do
+        out=$(sg_persist "$@" 2>&1) && { echo "$out"; return 0; }
+        i=$((i + 1))
+        case "$out" in *"nit attention"*) [ $i -lt 5 ] && continue ;; esac
+        echo "$out" >&2
+        return 1
+    done
+}'
 
 # skip_on_external_target logs SKIP with reason $1 and succeeds when the tests run against an external target.
 skip_on_external_target() {
@@ -4004,7 +4023,7 @@ skip_on_external_target() {
 reservation_holder() {
     if [[ "$EXTERNAL_TARGET" == true ]]; then
         target_query <<'QUERY'
-out=$(sg_persist --in --read-reservation "$dev") || exit 1
+out=$(pr --in --read-reservation "$dev") || exit 1
 case "$out" in *"NO reservation"*) echo "No SPC-3 Reservation holder" ;; *) echo "$out" ;; esac
 QUERY
         return
@@ -4076,8 +4095,11 @@ test_fencing_lost_reservation() {
 registered_initiators() {
     if [[ "$EXTERNAL_TARGET" == true ]]; then
         target_query <<'QUERY'
-sg_persist --in --read-full-status "$dev" | awk '/Key=/ { sub(/.*Key=/, ""); key = $1 } /iSCSI name/ { n = $NF; if (n !~ /,/) n = n ","; print "iSCSI Node: " n " Key: " key }'
+out=$(pr --in --read-full-status "$dev") || exit 1
+echo "$out" | awk '/Key=/ { sub(/.*Key=/, ""); key = $1 } /iSCSI name/ { n = $NF; if (n !~ /,/) n = n ","; print "iSCSI Node: " n " Key: " key }'
 QUERY
+        # A failed query must fail a test that looks for no keys as well as one that looks for a key.
+        [[ $? -eq 0 ]] || echo "the target query failed: goclusterfs:vm?"
         return
     fi
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
