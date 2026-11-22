@@ -4263,7 +4263,10 @@ test_fencing_reservation_self_test() {
 relogin_last_path() {
     local portal="10.0.2.2:${ISCSI_PORT}" iface
     iface=$(ssh_run "$1" "iscsiadm -m session -P 1 | awk '/Iface Name:/ {print \$3}' | sort | tail -1")
-    ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --logout > /dev/null; sleep 1; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --login > /dev/null; sleep 2" || return 1
+    # The new disk attaches a moment after the login; a map reloaded before it would be left with no path.
+    ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --logout > /dev/null; sleep 1; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --login > /dev/null
+        n=\$(iscsiadm -m session | wc -l)
+        for t in \$(seq 30); do [ \$(iscsiadm -m session -P 3 | grep -c 'Attached scsi disk') -ge \$n ] && exit 0; sleep 1; done; exit 1" || return 1
     multipath_over "$1"
 }
 
@@ -4494,8 +4497,12 @@ rekey_pause_case() {
 # the old one, so it logs that session in again until the disk has the name the harness expects.
 rekey_pause_cleanup() {
     ssh_run "$1" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fence[d]'; true"
-    if [[ -n "$(mount_pids "$1")" ]]; then
-        crash_goclusterfs "$1"
+    if [[ -n "$(mount_pids "$1")" ]] && ! crash_goclusterfs "$1"; then
+        log_warn "VM $1: restarting it, since its mount could not be stopped"
+        kill_vm "$1"
+        start_vm "$1" || return 1
+        wait_vm_healthy "$1" 120 || return 1
+        return 0
     fi
     ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath 2>/dev/null
         iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I p1 --logout > /dev/null 2>&1
