@@ -4226,13 +4226,14 @@ test_fencing_session_relogin() {
         log_error "VM 1 registered its key again after VM 2 preempted it"
         result=1
     fi
-    writes_go_on 2 "after it preempted VM 1" || result=1
+    # VM 2's writes may wait on locks VM 1 held until VM 2 replays it.
+    wait_log 2 "\[Recovery\] Completed\|Journal is clean" 90 "$marker" || result=1
+    writes_go_on 2 "after it replayed VM 1" || result=1
 
     ssh_run 1 "touch /tmp/load.stop"
     ssh_run 2 "touch /tmp/load.stop"
     sleep 1
     log_info "writes on VM 1: $(ssh_run 1 'sort /tmp/load.out | uniq -c | tr "\n" " "'), VM 2: $(ssh_run 2 'sort /tmp/load.out | uniq -c | tr "\n" " "')"
-    wait_log 2 "\[Recovery\] Completed\|Journal is clean" 90 "$marker" || result=1
     unmount_goclusterfs 2 || result=1
     out=$(ssh_run 2 "$fsck $(cluster_device) 2>&1; echo rc=\$?")
     if [[ "$out" != *"rc=0" ]]; then
