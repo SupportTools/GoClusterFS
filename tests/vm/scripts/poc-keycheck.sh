@@ -154,8 +154,10 @@ pause_case() {
     on "$P" "prpoc $pd $KP clear > /dev/null; prpoc $pd $KP unregister > /dev/null; true"
     for vm in $N $P; do
         ssh_run "$vm" "pkill -f goclusterfs-moun[t]; sleep 1; fusermount3 -uz $MNT 2> /dev/null; mkdir -p $MNT; rm -f /var/log/goclusterfs.log; true"
-        ssh_run "$vm" "cp /usr/local/bin/$bin /usr/local/bin/goclusterfs-mount"
     done
+    # Only node N runs the build under test; the peer always runs the POC build, which alone has the takeover hold.
+    ssh_run "$N" "cp /usr/local/bin/$bin /usr/local/bin/goclusterfs-mount"
+    ssh_run "$P" "cp /usr/local/bin/goclusterfs-mount.poc /usr/local/bin/goclusterfs-mount"
     ssh_run "$N" "nohup /usr/local/bin/goclusterfs-mount -device $MAP -mount $MNT -format -fencing=pr > /var/log/goclusterfs.log 2>&1 < /dev/null &"
     ssh_run "$N" "for t in \$(seq 1 60); do mountpoint -q $MNT && exit 0; sleep 1; done; tail -5 /var/log/goclusterfs.log; exit 1" || return 1
     ssh_run "$P" "nohup env $peer_env /usr/local/bin/goclusterfs-mount -device $pd -mount $MNT > /var/log/goclusterfs.log 2>&1 < /dev/null &"
