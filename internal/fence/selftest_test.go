@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -118,6 +119,44 @@ func TestSelfTestTwoHosts(t *testing.T) {
 	}
 	if keys := keysOf(t, target); len(keys) != 0 {
 		t.Errorf("the test left keys %x", keys)
+	}
+}
+
+// A target that queues 2 or 3 unit attentions for a preempted host, as TrueNAS SCALE's does: host A's commands after
+// the preempt reach the device's answers, and its step says how many tries got status 0x2.
+func TestSelfTestTwoHostsWithQueuedUnitAttentions(t *testing.T) {
+	for _, queued := range []int{2, 3} {
+		target := NewTarget()
+		target.unitAttentions = queued
+		var ra, rb recorder
+		host := func(initiator string, report func(Check)) *SelfTest {
+			write := func() error {
+				if target.MayWrite(initiator) {
+					return nil
+				}
+				return syscall.EBADE
+			}
+			return newRetryingSelfTest(&fakeDevice{t: target, initiator: initiator}, write, report)
+		}
+		a, b := host("a", ra.report), host("b", rb.report)
+		a.poll = time.Millisecond
+		keys := make(chan uint64, 1)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			a.Victim(10*time.Second, func(key uint64) { keys <- key })
+		}()
+		b.Preempt(<-keys, 200*time.Millisecond)
+		<-done
+		if a.Failed() || b.Failed() {
+			t.Errorf("%d queued: want both hosts to pass\nhost A:%s\nhost B:%s", queued, &ra, &rb)
+		}
+		want := fmt.Sprintf("the first %d tries got status 0x2", queued)
+		if !slices.ContainsFunc(ra.checks, func(c Check) bool {
+			return strings.HasPrefix(c.Step, "wait up to") && strings.Contains(c.Answer, want)
+		}) {
+			t.Errorf("%d queued: host A's wait for the preempt does not say %q:%s", queued, want, &ra)
+		}
 	}
 }
 
