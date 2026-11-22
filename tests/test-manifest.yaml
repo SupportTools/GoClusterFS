@@ -5899,6 +5899,40 @@ scenarios:
       docker: TODO - the Docker suite's shared disk has no persistent reservations
       vm: run-vm-tests.sh::test_fencing_lost_reservation
 
+  - id: fencing-rejoin-relogin-kill
+    name: A mount killed after a relogin rejoins on the same boot
+    description: After an iSCSI relogin, VM 2's mount is killed and mounts again on its new session; taking its own slot back revokes its first session's key, which on LIO stops writes from every session of the host, so the mount registers its key anew, joins, stays up 25 s and writes a file VM 1 reads
+    priority: high
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinRegistersAnewAfterRevokingItsOwnOtherSession
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_rejoin_relogin_kill
+
+  - id: fencing-rejoin-relogin-power-cut
+    name: A node power cut after a relogin rejoins on its first session
+    description: VM 2 relogs in, remounts on its new session and is power cut; it boots on its first session again, joins, stays up 25 s and writes a file VM 1 reads
+    priority: high
+    environments:
+      go: internal/fence/rejoin_test.go::TestJoinRegistersAnewWhenLIORefusesTheReserve
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_rejoin_relogin_power_cut
+
+  - id: fencing-rejoin-takeover-power-cut
+    name: A node rejoins after a relogin, a takeover and a power cut
+    description: The bug hunt's sequence; VM 2 relogs in, its mount is killed and VM 1 takes it over, VM 2 remounts on its new session and is power cut, then boots, joins, stays up 25 s and writes a file VM 1 reads
+    priority: high
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinRegistersAfterAPeerRevokesTheEarlierMount
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_rejoin_takeover_power_cut
+
+  - id: fencing-rejoin-power-cut
+    name: A power-cut node rejoins on a plain disk and a multipath map
+    description: VM 2 is power cut and mounts at once or 3 s after it boots, racing VM 1's takeover, on its iSCSI disk and on a multipath map; each time it joins, stays up 25 s and writes a file VM 1 reads
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_rejoin_power_cut
+
   - id: storage-gone-device
     name: A removed device calls the gone handler
     description: ENOSPC from a device that shrank to nothing, as a removed disk does, calls the gone handler once with the new size; ENOSPC from a device that kept its size does not
