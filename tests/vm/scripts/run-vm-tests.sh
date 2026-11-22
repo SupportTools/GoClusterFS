@@ -4133,7 +4133,6 @@ test_fencing_relogin_remount() {
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
-    skip_on_external_target "this test models LIO's check of only part of the ISID, which another target need not share" && return 0
     local node=1 peer=2 result=0 marker vm byte
     for vm in $(seq 1 "$NODE_COUNT"); do
         unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
