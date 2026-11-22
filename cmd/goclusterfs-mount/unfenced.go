@@ -25,8 +25,9 @@ func joinUnfenced(reg *node.Registry, devicePath string, allow bool) {
 	case !allow:
 		failf("Cannot join the cluster: %s has no storage fencing, and %s. %s "+
 			"Format the volume on a device with persistent reservations (-fencing=pr) so nodes can be fenced, or mount every node "+
-			"with -unsafe-allow-unfenced to accept the risk. A node that unmounted cleanly also keeps its slot until a running node clears it, "+
-			"so the slots may belong to nodes that are gone: check them with goclusterfs-fsck -list-slots %s, "+
+			"with -unsafe-allow-unfenced to accept the risk. A node whose unmount kept its slot, because files it unlinked were still open "+
+			"or its journal did not stop cleanly, counts until a running node clears it, so the slots may belong to nodes that are gone: "+
+			"check them with goclusterfs-fsck -list-slots %s, "+
 			"and free the slot of a node that is gone or unmounted with goclusterfs-fsck -release-slot N %s",
 			devicePath, describePeers(peers), unfencedRisk, devicePath, devicePath)
 	}
