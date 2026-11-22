@@ -141,10 +141,14 @@ type Registry struct {
 	onOwnerDead func(owner [16]byte, slot int) (done func(replayed bool))
 	onOrphans   func(ctx context.Context, slot int, orphans []Orphan)
 	// preempt revokes a dead node's access to the device before this node acts on its death; nil when unfenced.
-	preempt       func(owner [16]byte) error
-	orphanKick    chan struct{}
-	previousOwner *[16]byte
-	sightings     map[int]sighting
+	preempt func(owner [16]byte) error
+	// join registers this node's reservation key before Register's first write, and rejoin registers it anew once
+	// that write is refused; both nil when unfenced.
+	join, rejoin     func() error
+	joined, rejoined bool
+	orphanKick       chan struct{}
+	previousOwner    *[16]byte
+	sightings        map[int]sighting
 
 	// seen holds the last read of each slot, for Occupant.
 	seenMu sync.Mutex
@@ -237,6 +241,14 @@ func NewRegistry(dev *storage.Device, registryOffset uint64) *Registry {
 // slot dead, releases it or mounts into it. Call it before Register.
 func (r *Registry) SetPreempter(preempt func(owner [16]byte) error) {
 	r.preempt = preempt
+}
+
+// SetJoin makes Register call join once, after it has watched out an earlier mount on this host and before its first
+// write, so a mount registers its reservation key after any peer's revoke of that earlier mount's key. If the device
+// then refuses Register's slot claim, Register calls rejoin once and claims again: on LIO, revoking a key this host
+// registered from another iSCSI session stops writes from all its sessions until the host registers anew.
+func (r *Registry) SetJoin(join, rejoin func() error) {
+	r.join, r.rejoin = join, rejoin
 }
 
 func (r *Registry) fenceOut(owner [16]byte) error {
@@ -395,9 +407,15 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	}
 	// A slot under this hostname is likely this host's mount before a crash, a container restart or a reboot; taking
 	// it back replays its journal before this mount serves. Its mount may still run, or another host may share the
-	// name, so it is watched first.
-	if i, err := r.claimWatched(r.awaitSilentSlots(r.ownHostSlots(), silentSlotWatch)); i >= 0 || err != nil {
-		return i, err
+	// name, so it is watched first. A peer that takes it over during the watch revokes its key first, and the join
+	// after the watch registers this node's key after that revoke.
+	r.warnSharedHostname()
+	if own := r.ownHostSlots(); len(own) > 0 {
+		log.Printf("Registry slots %v hold an earlier mount on this host; waiting up to %v for a peer to take them over, or to take them over itself, before joining",
+			own, silentSlotWatch)
+		if i, err := r.claimWatched(r.awaitSilentSlots(own, silentSlotWatch)); i >= 0 || err != nil {
+			return i, err
+		}
 	}
 	if i, err := r.claimFirst(allSlots(), empty); i >= 0 || err != nil {
 		return i, err
@@ -492,6 +510,19 @@ func (r *Registry) ownHostSlots() []int {
 		}
 	}
 	return slots
+}
+
+// warnSharedHostname logs each other node whose slot carries this node's hostname and a recent heartbeat. Register
+// counts a slot under its hostname whose heartbeat stopped as this host's earlier mount, so hosts need unique names.
+func (r *Registry) warnSharedHostname() {
+	for i := 0; i < MaxNodes; i++ {
+		_, slot, err := r.readSlotRaw(i)
+		if err == nil && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) && slot.Host() == r.hostname &&
+			!heartbeatOlderThan(slot, HeartbeatTimeout) && !r.deadLocalOwner(slot) {
+			log.Printf("[WARN] Node %x in registry slot %d is live under this host's name %q: give every host its own hostname, "+
+				"as a mount takes a slot under its hostname whose heartbeat stopped for its own earlier mount", slot.UUID[:8], i, r.hostname)
+		}
+	}
 }
 
 // otherHostSlots returns the slots of other hosts' nodes whose heartbeat looks old by this node's clock.
@@ -880,6 +911,12 @@ func bootClock() time.Duration {
 // claimSlot replaces the slot bytes Register judged claimable with this node's
 // registration, then re-reads the slot to catch a racing node.
 func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
+	if r.join != nil && !r.joined {
+		if err := r.join(); err != nil {
+			return err
+		}
+		r.joined = true
+	}
 	newSlot := &Slot{
 		Magic:         SlotMagic,
 		State:         NodeStateActive,
@@ -896,18 +933,31 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 	}
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
+	var owner [16]byte
 	// Peers may still hold orphans an earlier owner of this slot listed.
 	if old, err := deserializeSlot(expected); err == nil {
 		newSlot.Orphans = old.Orphans
-		// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
 		if old.State != NodeStateEmpty {
-			if err := r.fenceOut(old.UUID); err != nil {
-				return err
-			}
+			owner = old.UUID
 		}
+	}
+	// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
+	if err := r.fenceOut(owner); err != nil {
+		return err
 	}
 
 	success, err := r.casSlot(slotIdx, expected, serializeSlot(newSlot))
+	if errors.Is(err, unix.EBADE) && r.rejoin != nil && !r.rejoined {
+		r.rejoined = true
+		log.Printf("[WARN] Fencing: the device refused this node's first write although it registered its key, as LIO does "+
+			"after a key this host registered from an earlier iSCSI session is revoked; trying to register the key anew (%v)", err)
+		// LIO refuses a preempt from such a host too, and Preempt reads that as the owner being gone, so revoke it again.
+		if rerr := r.rejoin(); rerr != nil {
+			err = fmt.Errorf("%w; not registering anew: %v", err, rerr)
+		} else if err = r.fenceOut(owner); err == nil {
+			success, err = r.casSlot(slotIdx, expected, serializeSlot(newSlot))
+		}
+	}
 	if err != nil {
 		return err
 	}

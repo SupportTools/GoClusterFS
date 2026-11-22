@@ -20,6 +20,9 @@ var (
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
+	errKeysUnlisted        = errors.New("this kernel or device cannot list the registered keys")
+	// ErrNoOtherRegistrant means no other node's key is registered, so dropping this node's could release the reservation.
+	ErrNoOtherRegistrant = errors.New("no other node's key is registered, so dropping this node's could release the reservation")
 )
 
 // Fencer registers this node's key on the device and revokes the keys of nodes proven dead.
@@ -97,6 +100,52 @@ func (p *PR) Kind() string { return "pr" }
 func (p *PR) Key() uint64 { return p.key }
 
 func (p *PR) Register() error { return p.dev.register(0, p.key, true) }
+
+// RegisterFresh drops this session's registration and registers the key anew, then reserves. LIO lets an initiator
+// write only while a per-initiator flag is set: each new registration sets it, and removing any registration of the
+// initiator clears it, also one an earlier session of this host made. Call it only after the device refused a write
+// or reserve of this node. It drops the registration only while another node's key is registered, so LIO hands the
+// reservation to that node: over dm-multipath with several paths into one LIO target portal group, the refusal can
+// come from this node's own other path holding the reservation, and dropping every path's registration with no other
+// registrant would release the reservation. Otherwise it returns ErrNoOtherRegistrant, or why it cannot list keys.
+func (p *PR) RegisterFresh() error {
+	keys, err := p.Keys()
+	if errors.Is(err, ErrUnsupported) {
+		return fmt.Errorf("%w (%s), so it cannot check that another node stays registered", errKeysUnlisted, cause(err))
+	} else if err != nil {
+		return fmt.Errorf("listing the registered keys: %w", err)
+	}
+	if !slices.ContainsFunc(keys, func(k uint64) bool { return k != p.key }) {
+		return ErrNoOtherRegistrant
+	}
+	if err := p.Register(); err != nil {
+		return err
+	}
+	if err := p.dev.register(p.key, 0, false); err != nil {
+		return err
+	}
+	if err := p.dev.register(0, p.key, false); err != nil {
+		return err
+	}
+	return p.Reserve()
+}
+
+// Join registers this node's key and reserves, and reports whether it registered the key anew. LIO refuses a reserve,
+// as it refuses a write, from a host whose write permission a revoke of its key under an earlier iSCSI session
+// cleared, so after such a refusal Join tries RegisterFresh once.
+func (p *PR) Join() (anew bool, err error) {
+	if err := p.Register(); err != nil {
+		return false, err
+	}
+	err = p.Reserve()
+	if !errors.Is(err, ErrForeignReservation) {
+		return false, err
+	}
+	if ferr := p.RegisterFresh(); ferr != nil {
+		return false, fmt.Errorf("%w; not registering anew: %v", err, ferr)
+	}
+	return true, nil
+}
 
 func (p *PR) Reserve() error {
 	if err := p.dev.reserve(p.key); errors.Is(err, ErrReservationConflict) {

@@ -144,6 +144,8 @@ multipath -ll
 # Use /dev/mapper/mpathX
 ```
 
+Give every host its own iSCSI initiator name in `/etc/iscsi/initiatorname.iscsi`. Hosts cloned from one image share it; generate a new name with `iscsi-iname` before the first login. Storage fencing does not hold between two hosts with one initiator name (see [Storage Fencing](OPERATIONS.md#storage-fencing)).
+
 ### Option 4: NVMe-oF (High Performance Multi-Node)
 
 ```bash
@@ -352,6 +354,8 @@ ExecStop=/usr/bin/fusermount3 -u /mnt/cluster
 Restart=on-failure
 RestartSec=10
 EnvironmentFile=-/etc/default/goclusterfs
+# A mount after a crash or reboot of this host can wait about 30s for a peer to take over the earlier mount
+TimeoutStartSec=120
 
 [Install]
 WantedBy=multi-user.target
