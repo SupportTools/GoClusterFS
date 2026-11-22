@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -20,14 +21,14 @@ func TestPassthroughStructsMatchTheKernel(t *testing.T) {
 }
 
 // scsiDisk answers SG_IO as a SCSI disk holding keys and a reservation of SCSI type resvType, or with the SCSI status
-// and sense key it is given.
+// and sense key it is given: to its first failures commands, or to all of them if failures is 0.
 type scsiDisk struct {
-	keys      []uint64
-	resvType  byte
-	status    byte
-	senseKey  byte
-	commands  int
-	failFirst bool
+	keys     []uint64
+	resvType byte
+	status   byte
+	senseKey byte
+	commands int
+	failures int
 }
 
 func (d *scsiDisk) ioctl(req uintptr, arg unsafe.Pointer) (uintptr, syscall.Errno) {
@@ -42,10 +43,10 @@ func (d *scsiDisk) ioctl(req uintptr, arg unsafe.Pointer) (uintptr, syscall.Errn
 		h.status = scsiCheckCondition
 		return 0, 0
 	}
-	if d.status != 0 && (!d.failFirst || d.commands == 1) {
+	if d.status != 0 && (d.failures == 0 || d.commands <= d.failures) {
 		h.status = d.status
 		sense := unsafe.Slice((*byte)(h.sbp), h.mxSbLen)
-		sense[0], sense[2], sense[12] = 0x70, d.senseKey, 0x29
+		sense[0], sense[2], sense[12], sense[13] = 0x70, d.senseKey, 0x2a, 0x03
 		h.sbLenWr = 18
 		return 0, 0
 	}
@@ -81,17 +82,28 @@ func TestSCSIPassthroughListsKeysAndTheReservation(t *testing.T) {
 	}
 }
 
-// A device that refuses PERSISTENT RESERVE IN cannot list keys; a unit attention is retried once, as the retrying
-// wrapper does for the reservation ioctls.
+// A device that refuses PERSISTENT RESERVE IN cannot list keys. Unit attentions are sent again, as the retrying wrapper
+// does for the reservation ioctls, up to maxResends times, and the last one's sense data stays in the error.
 func TestSCSIPassthroughErrors(t *testing.T) {
 	refusing := &scsiDisk{status: scsiCheckCondition, senseKey: senseIllegalRequest}
 	if _, err := (passthrough{ioctl: refusing.ioctl}).readKeys(); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("ILLEGAL REQUEST: %v, want ErrUnsupported", err)
 	}
-	attention := &scsiDisk{keys: []uint64{0x4743000000000001}, status: scsiCheckCondition, senseKey: senseUnitAttention, failFirst: true}
-	keys, err := retrying{device: passthroughDevice{passthrough{ioctl: attention.ioctl}}}.readKeys()
-	if err != nil || len(keys) != 1 || attention.commands != 2 {
-		t.Errorf("after a unit attention: %x, %v in %d commands; want the key after one retry", keys, err, attention.commands)
+	for _, queued := range []int{1, 3, maxResends} {
+		attention := &scsiDisk{keys: []uint64{0x4743000000000001}, status: scsiCheckCondition, senseKey: senseUnitAttention, failures: queued}
+		keys, err := retrying{device: passthroughDevice{passthrough{ioctl: attention.ioctl}}}.readKeys()
+		if err != nil || len(keys) != 1 || attention.commands != queued+1 {
+			t.Errorf("after %d unit attentions: %x, %v in %d commands; want the key on the next command", queued, keys, err, attention.commands)
+		}
+	}
+	endless := &scsiDisk{status: scsiCheckCondition, senseKey: senseUnitAttention}
+	_, err := retrying{device: passthroughDevice{passthrough{ioctl: endless.ioctl}}}.readKeys()
+	var ua unitAttentionError
+	if !errors.Is(err, statusError(statusIOError)) || !errors.As(err, &ua) || !strings.Contains(err.Error(), "ASC 0x2a, ASCQ 0x03 (reservations preempted)") {
+		t.Errorf("past %d unit attentions: %v; want status 0x2 with the sense data", maxResends, err)
+	}
+	if endless.commands != maxResends+1 {
+		t.Errorf("sent %d commands to a device that keeps answering unit attentions, want %d", endless.commands, maxResends+1)
 	}
 }
 

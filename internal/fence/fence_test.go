@@ -243,7 +243,7 @@ func TestPreemptStatusesFromBothTransports(t *testing.T) {
 }
 
 // scripted answers each command with the next raw status of its list, as the kernel returns them.
-type scripted struct{ registers, preempts []uintptr }
+type scripted struct{ registers, preempts, clears []uintptr }
 
 func (d *scripted) next(statuses *[]uintptr) error {
 	r := (*statuses)[0]
@@ -255,13 +255,13 @@ func (d *scripted) register(uint64, uint64, bool) error      { return d.next(&d.
 func (d *scripted) reserve(uint64) error                     { return nil }
 func (d *scripted) preemptAbort(uint64, uint64) error        { return d.next(&d.preempts) }
 func (d *scripted) preempt(uint64, uint64) error             { return nil }
-func (d *scripted) clear(uint64) error                       { return nil }
+func (d *scripted) clear(uint64) error                       { return d.next(&d.clears) }
 func (d *scripted) readKeys() ([]uint64, error)              { return nil, nil }
 func (d *scripted) readReservation() (uint64, uint32, error) { return 0, 0, nil }
 
-// A preempted host's first reservation command gets a unit attention, which the kernel reports as status 0x2. Sent
-// again, the command meets the conflict behind it, so Unregister and Preempt report ErrFenced; 0x2 twice stays an
-// error that is not.
+// A preempted host's next reservation commands get unit attentions, which the kernel reports as status 0x2. Sent again,
+// the command meets the conflict behind them, so Unregister and Preempt report ErrFenced; 0x2 past maxResends resends
+// stays an error that is not.
 func TestUnitAttentionAfterAPreemptReadsAsFenced(t *testing.T) {
 	unmounting := &PR{dev: retrying{device: &scripted{registers: []uintptr{0x02, 0x18}}}, key: 1}
 	if err := unmounting.Unregister(); !errors.Is(err, ErrFenced) {
@@ -271,9 +271,13 @@ func TestUnitAttentionAfterAPreemptReadsAsFenced(t *testing.T) {
 	if err := preempting.Preempt(2); !errors.Is(err, ErrFenced) {
 		t.Errorf("Preempt after a unit attention: %v, want ErrFenced", err)
 	}
-	failing := &PR{dev: retrying{device: &scripted{registers: []uintptr{0x02, 0x02}}}, key: 1}
+	lastResend := &PR{dev: retrying{device: &scripted{registers: []uintptr{0x02, 0x02, 0x02, 0x02, 0x02, 0x18}}}, key: 1}
+	if err := lastResend.Unregister(); !errors.Is(err, ErrFenced) {
+		t.Errorf("Unregister after 5 unit attentions: %v, want ErrFenced", err)
+	}
+	failing := &PR{dev: retrying{device: &scripted{registers: []uintptr{0x02, 0x02, 0x02, 0x02, 0x02, 0x02}}}, key: 1}
 	if err := failing.Unregister(); err == nil || errors.Is(err, ErrFenced) {
-		t.Errorf("Unregister answered 0x2 twice: %v, want an error that is not ErrFenced", err)
+		t.Errorf("Unregister answered 0x2 six times: %v, want an error that is not ErrFenced", err)
 	}
 	f, err := os.CreateTemp(t.TempDir(), "disk")
 	if err != nil {
@@ -282,5 +286,68 @@ func TestUnitAttentionAfterAPreemptReadsAsFenced(t *testing.T) {
 	defer func() { _ = f.Close() }()
 	if _, ok := Block(f, 1).dev.(retrying); !ok {
 		t.Error("Block does not send a command again after status 0x2")
+	}
+}
+
+// A clear that gets status 0x2 is not sent again: a repeat after a clear that worked would meet a conflict.
+func TestClearIsSentOnce(t *testing.T) {
+	dev := &scripted{registers: []uintptr{0}, clears: []uintptr{0x02, 0}}
+	if err := (&PR{dev: retrying{device: dev}, key: 1}).Clear(); !errors.Is(err, statusError(statusIOError)) {
+		t.Errorf("Clear answered 0x2: %v, want status 0x2", err)
+	}
+	if len(dev.clears) != 1 {
+		t.Errorf("sent %d clears, want 1", 2-len(dev.clears))
+	}
+}
+
+// Some targets queue a unit attention for each event that touched a preempted host, and answer each of its next
+// commands with one. Every command a fenced node sends still reaches the device's real answer.
+func TestQueuedUnitAttentionsAfterAPreempt(t *testing.T) {
+	for _, queued := range []int{1, 2, 3, maxResends} {
+		target := NewTarget()
+		target.unitAttentions = queued
+		a := &PR{dev: retrying{device: &fakeDevice{t: target, initiator: "a"}}, key: 1}
+		b := &PR{dev: retrying{device: &fakeDevice{t: target, initiator: "b"}}, key: 2}
+		for _, err := range []error{a.Register(), a.Reserve(), b.Register(), b.Preempt(a.Key())} {
+			if err != nil {
+				t.Fatalf("%d queued: setting up: %v", queued, err)
+			}
+		}
+		requeue := func() {
+			target.mu.Lock()
+			defer target.mu.Unlock()
+			target.attentions["a"] = queued
+		}
+		if err := a.Unregister(); !errors.Is(err, ErrFenced) {
+			t.Errorf("%d queued: Unregister: %v, want ErrFenced", queued, err)
+		}
+		requeue()
+		if err := a.Preempt(b.Key()); !errors.Is(err, ErrFenced) {
+			t.Errorf("%d queued: Preempt: %v, want ErrFenced", queued, err)
+		}
+		requeue()
+		if err := a.Reserve(); !errors.Is(err, ErrForeignReservation) {
+			t.Errorf("%d queued: Reserve: %v, want ErrForeignReservation", queued, err)
+		}
+		requeue()
+		if keys, err := a.Keys(); err != nil || !slices.Equal(keys, []uint64{b.Key()}) {
+			t.Errorf("%d queued: Keys: %x, %v; want only host B's key", queued, keys, err)
+		}
+		requeue()
+		if reserved, err := a.KeepReserved(); err != nil || reserved {
+			t.Errorf("%d queued: KeepReserved: %v, %v; want the reservation host B holds", queued, reserved, err)
+		}
+	}
+	target := NewTarget()
+	target.unitAttentions = maxResends + 1
+	a := &PR{dev: retrying{device: &fakeDevice{t: target, initiator: "a"}}, key: 1}
+	b := &PR{dev: retrying{device: &fakeDevice{t: target, initiator: "b"}}, key: 2}
+	for _, err := range []error{a.Register(), a.Reserve(), b.Register(), b.Preempt(a.Key())} {
+		if err != nil {
+			t.Fatalf("setting up: %v", err)
+		}
+	}
+	if err := a.Unregister(); !errors.Is(err, statusError(statusIOError)) || errors.Is(err, ErrFenced) {
+		t.Errorf("Unregister past %d unit attentions: %v, want status 0x2", maxResends, err)
 	}
 }

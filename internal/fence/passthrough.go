@@ -130,9 +130,35 @@ func (p passthrough) scsiPRIn(action byte, buf []byte) error {
 	case senseIllegalRequest:
 		return fmt.Errorf("%w (sense key %#x, ASC %#x, ASCQ %#x)", ErrUnsupported, key, asc, ascq)
 	case senseUnitAttention:
-		return statusError(statusIOError)
+		return unitAttentionError{asc, ascq}
 	}
 	return fmt.Errorf("PERSISTENT RESERVE IN failed: sense key %#x, ASC %#x, ASCQ %#x", key, asc, ascq)
+}
+
+// unitAttentionError is a unit attention that SG_IO reported with its sense data. It is status 0x2, as the reservation
+// ioctls report a unit attention.
+type unitAttentionError struct{ asc, ascq byte }
+
+func (u unitAttentionError) Error() string {
+	return fmt.Sprintf("%v: unit attention, %s", statusError(statusIOError), u.sense())
+}
+
+func (u unitAttentionError) Is(target error) bool { return target == statusError(statusIOError) }
+
+func (u unitAttentionError) sense() string {
+	s := fmt.Sprintf("ASC 0x%02x, ASCQ 0x%02x", u.asc, u.ascq)
+	if name, ok := unitAttentionNames[[2]byte{u.asc, u.ascq}]; ok {
+		s += " (" + name + ")"
+	}
+	return s
+}
+
+var unitAttentionNames = map[[2]byte]string{
+	{0x29, 0x00}: "power on or reset",
+	{0x2a, 0x03}: "reservations preempted",
+	{0x2a, 0x04}: "reservations released",
+	{0x2a, 0x05}: "registrations preempted",
+	{0x2f, 0x00}: "commands cleared by another initiator",
 }
 
 // senseKey reads the sense key and additional sense code of fixed or descriptor format sense data.

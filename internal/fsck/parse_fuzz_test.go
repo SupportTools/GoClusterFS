@@ -34,7 +34,7 @@ func TestParseDirBlockChunkBoundary(t *testing.T) {
 		"second chunk fills":       {append(slices.Clone(fullChunk), dirEntry(6, DirChunkSize, "b.txt")...), 4, ""},
 		"second chunk stops short": {append(slices.Clone(fullChunk), dirEntry(6, 32, "b.txt")...), 4, "entries end at offset 4128"},
 	} {
-		buf := make([]byte, DirBlockSize)
+		buf := make([]byte, storage.DefaultBlockSize)
 		copy(buf, tc.block)
 		entries, errs := parseDirBlock(buf)
 		got := strings.Join(errs, "; ")

@@ -165,7 +165,7 @@ func (s *Sampler) sampleCounters() {
 	}
 	s.current.Trim = &api.TrimStatsResponse{}
 	if s.src.Trim != nil {
-		s.current.Trim = trimResponse(s.src.Trim.Stats())
+		s.current.Trim = trimResponse(s.src.Trim.Stats(), s.src.BlockSize)
 	}
 	if s.src.Nodes != nil {
 		n := s.src.Nodes.Stats()

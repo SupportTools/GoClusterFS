@@ -84,7 +84,7 @@ func (c *Checker) readTreeNode(inodeNum uint32, block, gen uint64) (*extent.Tree
 	if block >= c.sbData.TotalBlocks {
 		return nil, fmt.Errorf("block out of range (max %d)", c.sbData.TotalBlocks-1)
 	}
-	n, err := extent.ReadTreeNode(c.dev, c.sbData.DataRegionOffset, block, gen)
+	n, err := extent.ReadTreeNode(c.dev, c.sbData.DataRegionOffset, uint64(c.sbData.BlockSize), block, gen)
 	if err != nil {
 		return nil, err
 	}

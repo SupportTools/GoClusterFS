@@ -5,7 +5,7 @@
 //
 // Storage modes:
 //   - Inline: Up to 2 extents stored directly in the inode (64 bytes)
-//   - Tree: More extents stored in an overflow tree of 1MB nodes (see tree.go)
+//   - Tree: More extents stored in an overflow tree of one-block nodes (see tree.go)
 //
 // Extent flags support:
 //   - Allocated: Physical blocks are allocated
@@ -33,9 +33,6 @@ import (
 const (
 	// ExtentSize is the size of each extent record in bytes.
 	ExtentSize = 32
-
-	// BlockSize is the size of each data block (1MB).
-	BlockSize = 1 << 20 // 1MB
 
 	// MaxInlineExtents is the number of extents that fit in an inode.
 	MaxInlineExtents = 2
@@ -91,6 +88,7 @@ type Manager struct {
 	bitmap     *bitmap.Region
 	lockMgr    *lock.Manager
 	dataOffset uint64
+	blockSize  uint64
 	nodes      *nodeCache
 	leafCap    int // extents per leaf before it splits
 	indexCap   int // leaves per tree
@@ -111,17 +109,24 @@ func (m *Manager) SetRefcounts(refs *refcount.Region) {
 }
 
 // NewManager creates a new extent manager. dataOffset is the device offset of
-// data block 0; extent tree nodes are stored in data blocks.
-func NewManager(dev *storage.Device, bm *bitmap.Region, lockMgr *lock.Manager, dataOffset uint64) *Manager {
+// data block 0, and blockSize the volume's data block size; extent tree nodes
+// are stored in data blocks.
+func NewManager(dev *storage.Device, bm *bitmap.Region, lockMgr *lock.Manager, dataOffset, blockSize uint64) *Manager {
 	return &Manager{
 		dev:        dev,
 		bitmap:     bm,
 		lockMgr:    lockMgr,
 		dataOffset: dataOffset,
+		blockSize:  blockSize,
 		nodes:      newNodeCache(nodeCacheEntries),
-		leafCap:    defaultLeafCap,
-		indexCap:   MaxNodeEntries,
+		leafCap:    min(defaultLeafCap, MaxNodeEntries(blockSize)),
+		indexCap:   MaxNodeEntries(blockSize),
 	}
+}
+
+// BlockSize returns the volume's data block size in bytes.
+func (m *Manager) BlockSize() uint64 {
+	return m.blockSize
 }
 
 // TotalBlocks returns the number of blocks in the data region, or 0 for a manager without a bitmap.
@@ -342,7 +347,7 @@ func (m *Manager) FreePhysicalBlock(ctx context.Context, physBlock uint64) error
 // Truncate removes all extents beyond the given size.
 func (m *Manager) Truncate(ctx context.Context, ino *inode.Inode, newSize uint64) error {
 	logging.Debugf("extent.Truncate: inode %d, newSize=%d, extentCount=%d", ino.InodeNum, newSize, ino.ExtentCount)
-	if err := m.unmap(ctx, ino, BlocksForSize(newSize), math.MaxUint64); err != nil {
+	if err := m.unmap(ctx, ino, m.BlocksForSize(newSize), math.MaxUint64); err != nil {
 		return err
 	}
 	ino.Size = newSize
@@ -562,22 +567,9 @@ func (e *Extent) SetSFBLocation(containerBlock uint64, slotIndex uint16) {
 	e.Flags |= FlagSFB | FlagAllocated
 }
 
-// BlocksForSize calculates the number of blocks needed for a given byte size.
-func BlocksForSize(size uint64) uint64 {
-	if size == 0 {
-		return 0
-	}
-	return (size + BlockSize - 1) / BlockSize
-}
-
-// OffsetToBlock converts a byte offset to a block number.
-func OffsetToBlock(offset uint64) uint64 {
-	return offset / BlockSize
-}
-
-// BlockToOffset converts a block number to the starting byte offset.
-func BlockToOffset(block uint64) uint64 {
-	return block * BlockSize
+// BlocksForSize returns how many blocks hold size bytes.
+func (m *Manager) BlocksForSize(size uint64) uint64 {
+	return (size + m.blockSize - 1) / m.blockSize
 }
 
 // AddExtentForRecovery adds an extent during recovery.
@@ -644,12 +636,13 @@ func (m *Manager) MapCopy(ctx context.Context, ino *inode.Inode, logicalBlock ui
 // file is the caller's alone, the caller holds the inode lock exclusively, so
 // no in-place write lands in the old block during the copy.
 func (m *Manager) CopyBlockData(c *CoWResult, dataOffset uint64) error {
-	buf := storage.GetBuffer(BlockSize)
+	buf := storage.GetBuffer(int(m.blockSize))
 	defer storage.PutBuffer(buf)
-	if _, err := m.dev.ReadAt(buf.Bytes(), int64(dataOffset+c.OldPhysBlock*BlockSize)); err != nil {
+	block := buf.Bytes()[:m.blockSize]
+	if _, err := m.dev.ReadAt(block, int64(dataOffset+c.OldPhysBlock*m.blockSize)); err != nil {
 		return fmt.Errorf("CoW read failed: %w", err)
 	}
-	if _, err := m.dev.WriteAt(buf.Bytes(), int64(dataOffset+c.NewPhysBlock*BlockSize)); err != nil {
+	if _, err := m.dev.WriteAt(block, int64(dataOffset+c.NewPhysBlock*m.blockSize)); err != nil {
 		return fmt.Errorf("CoW write failed: %w", err)
 	}
 	log.Printf("[CoW] Copied block %d -> %d", c.OldPhysBlock, c.NewPhysBlock)

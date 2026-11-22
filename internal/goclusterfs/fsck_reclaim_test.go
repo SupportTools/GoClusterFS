@@ -239,7 +239,7 @@ func TestFsckRepairKeepsLeaksItCannotPlace(t *testing.T) {
 			if err != nil || !ino.HasExtentTree() {
 				t.Fatalf("sparse.bin should use an extent tree (err=%v)", err)
 			}
-			flipByte(t, fsys, extent.TreeNodeOffset(fsys.dataOffset, ino.ExtentTreeRoot, ino.ExtentTreeGen)+100)
+			flipByte(t, fsys, extent.TreeNodeOffset(fsys.dataOffset, storage.DefaultBlockSize, ino.ExtentTreeRoot, ino.ExtentTreeGen)+100)
 			return repair
 		}, "extent tree"},
 		{"SkippedInodePhase", func(t *testing.T, fsys *FS, sb *superblock.Superblock) fsck.Options {

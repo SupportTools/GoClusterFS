@@ -6,7 +6,7 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -37,18 +37,19 @@ const StepTimeout = 30 * time.Second
 // with fsck's 0x4746 prefix, and checks every answer; a write step sends 4 KiB with O_DIRECT. A command that gets no
 // answer within StepTimeout fails the test, which then sends nothing more.
 type SelfTest struct {
-	dev     device
-	write   func() error
-	sink    func(Check)
-	poll    time.Duration
-	timeout time.Duration
-	held    uint64
-	failed  bool
-	listing bool
-	reading bool
-	retried atomic.Bool
-	hung    bool
-	stopped bool
+	dev      device
+	write    func() error
+	sink     func(Check)
+	poll     time.Duration
+	timeout  time.Duration
+	held     uint64
+	failed   bool
+	listing  bool
+	reading  bool
+	resendMu sync.Mutex
+	resends  []error
+	hung     bool
+	stopped  bool
 }
 
 // NewSelfTest tests the device f is open on. write writes 4 KiB to it with O_DIRECT.
@@ -59,7 +60,11 @@ func NewSelfTest(f *os.File, write func() error, report func(Check)) *SelfTest {
 // newRetryingSelfTest sends commands to dev as Block does, and notes each command it sent again after status 0x2.
 func newRetryingSelfTest(dev device, write func() error, report func(Check)) *SelfTest {
 	var s *SelfTest
-	s = newSelfTest(retrying{device: dev, retried: func() { s.retried.Store(true) }}, write, report)
+	s = newSelfTest(retrying{device: dev, retried: func(err error) {
+		s.resendMu.Lock()
+		defer s.resendMu.Unlock()
+		s.resends = append(s.resends, err)
+	}}, write, report)
 	return s
 }
 
@@ -147,9 +152,7 @@ func (g guarded) readReservation() (uint64, uint32, error) {
 // report passes c on, noting a command sent again after status 0x2. Once a command got no answer, it passes on only
 // the step that waited for it.
 func (s *SelfTest) report(c Check) {
-	if s.retried.Swap(false) {
-		c.Answer += "; the first try got status 0x2, the kernel's code for any failure but a conflict, such as the unit attention a preempted host's first command gets, and was sent again"
-	}
+	c.Answer += s.resendNote()
 	if s.hung {
 		if s.stopped {
 			return
@@ -233,6 +236,34 @@ func (s *SelfTest) clear(before []uint64) {
 		s.keys("list the keys: none are left", having().only())
 		s.reservation("read the reservation: it is gone", 0)
 	}
+}
+
+// resendNote says how many tries of the last command got status 0x2 and were sent again, with the sense data of each
+// unit attention SG_IO saw, and forgets them.
+func (s *SelfTest) resendNote() string {
+	s.resendMu.Lock()
+	resends := s.resends
+	s.resends = nil
+	s.resendMu.Unlock()
+	if len(resends) == 0 {
+		return ""
+	}
+	tries := "the first try"
+	if len(resends) > 1 {
+		tries = fmt.Sprintf("the first %d tries", len(resends))
+	}
+	note := fmt.Sprintf("; %s got status 0x2, the kernel's code for any failure but a conflict, such as the unit attentions a preempted host's next commands get, and the command was sent again", tries)
+	var attentions []string
+	for _, err := range resends {
+		var ua unitAttentionError
+		if errors.As(err, &ua) {
+			attentions = append(attentions, ua.sense())
+		}
+	}
+	if len(attentions) > 0 {
+		note += "; unit attentions: " + strings.Join(attentions, "; ")
+	}
+	return note
 }
 
 // Victim is host A of the two-host test. It registers and reserves, waits up to wait for host B to preempt its key,

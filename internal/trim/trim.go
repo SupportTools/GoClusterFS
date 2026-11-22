@@ -28,9 +28,6 @@ const (
 
 	// DefaultMaxAge is the maximum age before flushing pending TRIMs.
 	DefaultMaxAge = 5 * time.Second
-
-	// BlockSize is the size of each data block (1MB).
-	BlockSize = 1 << 20
 )
 
 // Config holds TRIM manager configuration.
@@ -43,6 +40,9 @@ type Config struct {
 
 	// DataOffset is the byte offset where data blocks start on the device.
 	DataOffset uint64
+
+	// BlockSize is the volume's data block size in bytes.
+	BlockSize uint64
 
 	// Enabled controls whether TRIM operations are actually issued.
 	// When false, blocks are still tracked but no ioctl is issued.
@@ -360,8 +360,8 @@ func (m *Manager) issueDiscard(r blockRange) error {
 
 	// Calculate byte offset and length
 	// startBlock is relative to data region, add DataOffset
-	byteOffset := m.config.DataOffset + r.startBlock*BlockSize
-	byteLength := r.count * BlockSize
+	byteOffset := m.config.DataOffset + r.startBlock*m.config.BlockSize
+	byteLength := r.count * m.config.BlockSize
 	if err := m.dev.CheckWrite(int64(byteOffset)); err != nil {
 		return err
 	}

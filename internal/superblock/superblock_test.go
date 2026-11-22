@@ -31,6 +31,10 @@ func TestSerializeDeserialize(t *testing.T) {
 		LastMountTime: 1700001000,
 		LastWriteTime: 1700002000,
 		LockSlotSize:  4096,
+
+		QuotaInode:       7,
+		QuotaFlushMs:     1000,
+		QuotaTableBlocks: 2,
 	}
 	copy(sb.Magic[:], Magic)
 	copy(sb.UUID[:], []byte("0123456789abcdef"))
@@ -96,6 +100,17 @@ func TestSerializeDeserialize(t *testing.T) {
 	}
 	if restored.LockSlotSize != sb.LockSlotSize {
 		t.Errorf("LockSlotSize = %d, want %d", restored.LockSlotSize, sb.LockSlotSize)
+	}
+	if restored.QuotaInode != sb.QuotaInode || restored.QuotaFlushMs != sb.QuotaFlushMs || restored.QuotaTableBlocks != sb.QuotaTableBlocks {
+		t.Errorf("quota fields = %d, %d, %d; want %d, %d, %d", restored.QuotaInode, restored.QuotaFlushMs, restored.QuotaTableBlocks,
+			sb.QuotaInode, sb.QuotaFlushMs, sb.QuotaTableBlocks)
+	}
+}
+
+// This build mounts volumes with project quotas.
+func TestCanMountWithProjectQuotas(t *testing.T) {
+	if err := CheckRequiredFlags(RequiredLockLayout | RequiredProjectQuotas); err != nil {
+		t.Errorf("CheckRequiredFlags with RequiredProjectQuotas: %v", err)
 	}
 }
 

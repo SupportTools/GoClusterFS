@@ -37,6 +37,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/stats"
@@ -387,7 +388,7 @@ func main() {
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, lockMgr, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, lockMgr, nodeUUID)
 	inodeTbl.SetAllocationStart(slotIdx, node.MaxNodes)
-	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset, uint64(sb.BlockSize))
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 	dirMgr.SetIndexLimit(*dirIndex)
@@ -516,6 +517,7 @@ func main() {
 			BatchSize:  *trimBatchSize,
 			MaxAge:     *trimMaxAge,
 			DataOffset: dataOffset,
+			BlockSize:  uint64(sb.BlockSize),
 			Enabled:    true,
 		}
 		trimMgr = trim.NewManager(dev, trimCfg)
@@ -607,7 +609,10 @@ func main() {
 		if err := gfs.InitRoot(ctx); err != nil {
 			failf("Failed to create the root directory: %v; check the device, then format again", err)
 		}
-		log.Println("Filesystem formatted successfully")
+		if err := quota.Enable(ctx, dev, sb, inodeTbl, bm); err != nil {
+			failf("Failed to create the quota table: %v; check the device, then format again", err)
+		}
+		log.Printf("Filesystem formatted successfully, with project quotas in inode %d", sb.QuotaInode)
 	}
 
 	// Verify root exists
@@ -667,7 +672,7 @@ func main() {
 		if err != nil {
 			log.Printf("Warning: Failed to create the API server: %v; the mount continues without it", err)
 		} else {
-			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res, mountReplay))
+			sampler = stats.StartSampler(statsSources(cacheMgr, lockMgr, dirMgr, j, trimMgr, bm, nodeReg, res, mountReplay, gfs.BlockSize()))
 			apiServer.SetStatusProvider(&fsStatusProvider{
 				mountPath:  *mountPoint,
 				devicePath: *devicePath,
@@ -1002,8 +1007,8 @@ func usageFailf(format string, args ...any) {
 	os.Exit(cli.ExitUsage)
 }
 
-func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager, mountReplay stats.MountReplay) stats.Sources {
-	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: goclusterfs.BlockSize, MountReplay: mountReplay}
+func statsSources(cacheMgr *cache.Manager, lockMgr *lock.Manager, dirMgr *dir.Manager, j *journal.Journal, trimMgr *trim.Manager, bm *bitmap.Region, nodeReg *node.Registry, res *reserve.Manager, mountReplay stats.MountReplay, blockSize uint64) stats.Sources {
+	src := stats.Sources{Cache: cacheMgr, Locks: lockMgr, Dirs: dirMgr, Blocks: bm, Nodes: nodeReg, BlockSize: blockSize, MountReplay: mountReplay}
 	if res != nil {
 		src.Reserve = res
 	}

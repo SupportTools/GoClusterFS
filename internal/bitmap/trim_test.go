@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/trim"
 )
 
@@ -18,7 +19,7 @@ type discardRecorder struct {
 func (d *discardRecorder) discard(offset, length uint64) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for b := offset / trim.BlockSize; b < (offset+length)/trim.BlockSize; b++ {
+	for b := offset / storage.DefaultBlockSize; b < (offset+length)/storage.DefaultBlockSize; b++ {
 		d.discarded[b] = true
 	}
 	return nil
@@ -34,7 +35,7 @@ func newTrimmedRegion(t *testing.T, batch int, maxAge time.Duration) (*Region, *
 	t.Helper()
 	dev, cleanup := createTestDevice(t, 10<<20)
 	rec := &discardRecorder{discarded: make(map[uint64]bool)}
-	tm := trim.NewManager(dev, trim.Config{BatchSize: batch, MaxAge: maxAge, Enabled: true, Discard: rec.discard})
+	tm := trim.NewManager(dev, trim.Config{BlockSize: storage.DefaultBlockSize, BatchSize: batch, MaxAge: maxAge, Enabled: true, Discard: rec.discard})
 	region := NewRegion(dev, 0, 1000, nil, [16]byte{1})
 	region.SetTrimManager(tm)
 	tm.Start()
@@ -178,7 +179,7 @@ func TestTrimDiscardHoldsNoBitmapLock(t *testing.T) {
 	started := make(chan struct{})
 	finish := make(chan struct{})
 	var once sync.Once
-	tm := trim.NewManager(dev, trim.Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+	tm := trim.NewManager(dev, trim.Config{BlockSize: storage.DefaultBlockSize, BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
 		once.Do(func() { close(started) })
 		<-finish
 		return nil

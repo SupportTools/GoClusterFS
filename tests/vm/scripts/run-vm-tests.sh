@@ -3992,6 +3992,18 @@ mount_key() {
     sed -n 's/.*Fencing: persistent reservation key \(0x[0-9a-f]*\).*/\1/p' "$(get_vm_mount_log "$1")" | tail -1
 }
 
+# reserved_again_logged waits up to 5s for a mount log to show a node reserved again after marker $1; logs lag the target.
+reserved_again_logged() {
+    local marker="$1" i vm
+    for i in $(seq 10); do
+        for vm in 1 2; do
+            sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -q "had lost its reservation" && return 0
+        done
+        sleep 0.5
+    done
+    return 1
+}
+
 # A device without a reservation takes writes from any host, so a node a peer revoked there would go on writing.
 # When the device loses its reservation while the nodes' keys stay, a node reserves it again within two failure
 # scans. When it also loses a node's key, that node stops, and the other reserves again.
@@ -4014,7 +4026,7 @@ test_fencing_lost_reservation() {
     if [[ "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
         log_error "15s after the reservation was released, no node had reserved again"
         result=1
-    elif ! cat "$(get_vm_mount_log 1)" "$(get_vm_mount_log 2)" | grep -q "had lost its reservation"; then
+    elif ! reserved_again_logged "$marker"; then
         log_error "a node reserved again without logging it; holder: $(reservation_holder | tr -s '\n' ' '); registrations: $(registered_initiators | tr -s '\n' ' ')"
         result=1
     else

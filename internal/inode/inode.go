@@ -80,6 +80,7 @@ const (
 	FlagAppend        uint16 = 1 << 5 // Append-only
 	FlagSnapshotData  uint16 = 1 << 6 // Holds a snapshot's frozen extents; in no directory
 	FlagInlineTarget  uint16 = 1 << 7 // Symlink whose target fills the extent area instead of extents
+	FlagProjInherit   uint16 = 1 << 8 // Directory whose new entries take its ProjectID
 )
 
 // Errors
@@ -137,7 +138,8 @@ type Inode struct {
 	ExtentTreeGen    uint64          // Commit generation of the tree root; its low bit picks the root's active half
 	BirthGeneration  uint64          // MetaGeneration when this file took the slot; 0 in inodes older versions wrote
 	Holders          uint64          // with LinkCount 0: one bit per registry slot that may still have the file open
-	Reserved         [40]byte        // Bytes 212-251, unused here; written back as read so newer versions' fields survive
+	ProjectID        uint32          // Bytes 212-215: the quota project this inode counts against; 0 for none
+	Reserved         [36]byte        // Bytes 216-251, unused here; written back as read so newer versions' fields survive
 	Checksum         uint32          // CRC32C checksum
 
 	// Target is a FlagInlineTarget symlink's target, decoded from where the extent fields go.
@@ -949,7 +951,8 @@ func serializeInode(inode *Inode) []byte {
 	}
 	binary.LittleEndian.PutUint64(buf[196:204], inode.BirthGeneration)
 	binary.LittleEndian.PutUint64(buf[204:212], inode.Holders)
-	copy(buf[212:252], inode.Reserved[:])
+	binary.LittleEndian.PutUint32(buf[212:216], inode.ProjectID)
+	copy(buf[216:252], inode.Reserved[:])
 
 	// Compute checksum (bytes 0-251)
 	checksum := storage.CRC32C(buf[:InodeSize-4])
@@ -1002,7 +1005,8 @@ func deserializeInode(buf []byte) (*Inode, error) {
 
 	// Copy UUID
 	copy(inode.LastModifierUUID[:], buf[88:104])
-	copy(inode.Reserved[:], buf[212:252])
+	inode.ProjectID = binary.LittleEndian.Uint32(buf[212:216])
+	copy(inode.Reserved[:], buf[216:252])
 
 	if inode.HasInlineTarget() {
 		copy(inode.Target[:], buf[104:196])

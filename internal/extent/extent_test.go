@@ -59,7 +59,7 @@ func createTestSetup(tb testing.TB) (*Manager, *inode.Inode, func()) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 1000, nil, uuid) // 1000 blocks
-	mgr := NewManager(dev, bm, nil, 1<<20)
+	mgr := NewManager(dev, bm, nil, 1<<20, BlockSize)
 
 	ino := &inode.Inode{
 		Magic:    inode.InodeMagic,
@@ -157,11 +157,9 @@ func TestExtentFlags(t *testing.T) {
 	}
 }
 
-func TestBlockHelpers(t *testing.T) {
-	testCases := []struct {
-		size   uint64
-		blocks uint64
-	}{
+func TestBlocksForSize(t *testing.T) {
+	m := &Manager{blockSize: BlockSize}
+	for _, tc := range []struct{ size, blocks uint64 }{
 		{0, 0},
 		{1, 1},
 		{BlockSize - 1, 1},
@@ -169,40 +167,9 @@ func TestBlockHelpers(t *testing.T) {
 		{BlockSize + 1, 2},
 		{BlockSize * 5, 5},
 		{BlockSize*5 + 1, 6},
-	}
-
-	for _, tc := range testCases {
-		result := BlocksForSize(tc.size)
-		if result != tc.blocks {
-			t.Errorf("BlocksForSize(%d) = %d, want %d", tc.size, result, tc.blocks)
-		}
-	}
-}
-
-func TestOffsetBlockConversion(t *testing.T) {
-	testCases := []struct {
-		offset uint64
-		block  uint64
-	}{
-		{0, 0},
-		{BlockSize - 1, 0},
-		{BlockSize, 1},
-		{BlockSize + 1, 1},
-		{BlockSize * 100, 100},
-	}
-
-	for _, tc := range testCases {
-		result := OffsetToBlock(tc.offset)
-		if result != tc.block {
-			t.Errorf("OffsetToBlock(%d) = %d, want %d", tc.offset, result, tc.block)
-		}
-
-		// Verify BlockToOffset for whole blocks
-		if tc.offset%BlockSize == 0 {
-			back := BlockToOffset(tc.block)
-			if back != tc.offset {
-				t.Errorf("BlockToOffset(%d) = %d, want %d", tc.block, back, tc.offset)
-			}
+	} {
+		if got := m.BlocksForSize(tc.size); got != tc.blocks {
+			t.Errorf("BlocksForSize(%d) = %d, want %d", tc.size, got, tc.blocks)
 		}
 	}
 }
@@ -897,7 +864,7 @@ func TestAllocateUnwritten_CreatesUnwrittenExtent(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -936,7 +903,7 @@ func TestAllocateUnwritten_DoesNotIncrementWrittenBlocks(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -971,7 +938,7 @@ func TestClearUnwritten_ClearsOnlyThatBlock(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{Magic: inode.InodeMagic, InodeNum: 100}
@@ -1018,7 +985,7 @@ func TestClearUnwritten_NoOpIfAlreadyWritten(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1065,7 +1032,7 @@ func TestLookupPhysical_ReturnsHoleForUnwritten(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1123,7 +1090,7 @@ func TestAllocateUnwritten_IdempotentForExisting(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1166,7 +1133,7 @@ func TestFreeExtent_HandlesUnwrittenCorrectly(t *testing.T) {
 
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, 0, 100, nil, uuid)
-	mgr := NewManager(dev, bm, nil, 0)
+	mgr := NewManager(dev, bm, nil, 0, BlockSize)
 	ctx := context.Background()
 
 	ino := &inode.Inode{
@@ -1221,7 +1188,7 @@ func createTestSetupWithRefcount(tb testing.TB) (*Manager, *refcount.Region, *in
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, 1000, nil, uuid) // 1000 blocks
 	refcountReg := refcount.NewRegion(dev, refcountOffset, refcountSize, 1000, nil)
-	mgr := NewManager(dev, bm, nil, 2<<20)
+	mgr := NewManager(dev, bm, nil, 2<<20, BlockSize)
 
 	ino := &inode.Inode{
 		Magic:    inode.InodeMagic,

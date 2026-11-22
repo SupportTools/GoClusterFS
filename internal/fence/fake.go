@@ -30,9 +30,24 @@ type Target struct {
 	// refusePreempt makes every preempt conflict, as LIO does for a host whose write flag another freed registration
 	// cleared.
 	refusePreempt bool
+	// unitAttentions is how many unit attentions a preempt queues for each session it removes; each of the session's
+	// next commands gets one as status 0x2 until none is left.
+	unitAttentions int
+	attentions     map[string]int
 }
 
-func NewTarget() *Target { return &Target{keys: map[string]uint64{}, writable: map[string]bool{}} }
+func NewTarget() *Target {
+	return &Target{keys: map[string]uint64{}, writable: map[string]bool{}, attentions: map[string]int{}}
+}
+
+// attention answers status 0x2 for one of session's queued unit attentions. Called with t.mu held.
+func (t *Target) attention(session string) error {
+	if t.attentions[session] == 0 {
+		return nil
+	}
+	t.attentions[session]--
+	return statusError(statusIOError)
+}
 
 // NewLIOTarget is a Target that decides writes as LIO does for open-iscsi initiators. Name each session
 // "initiator/session". Registrations belong to sessions. Every session of the initiator holding the reservation may
@@ -189,7 +204,11 @@ func (d *fakeDevice) register(old, new uint64, ignore bool) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, nexus := range d.nexuses() {
-		if err := t.registerNexus(nexus, old, new, ignore); err != nil {
+		err := t.attention(nexus)
+		if err == nil {
+			err = t.registerNexus(nexus, old, new, ignore)
+		}
+		if err != nil {
 			if new != 0 {
 				for _, nexus := range d.nexuses() {
 					_ = t.registerNexus(nexus, new, 0, false)
@@ -232,6 +251,9 @@ func (d *fakeDevice) reserve(key uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
+		return err
+	}
 	if t.keys[first] != key || key == 0 || t.lio && !t.mayWrite(first) {
 		return ErrReservationConflict
 	}
@@ -247,6 +269,9 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
+		return err
+	}
 	if cur, registered := t.keys[first]; !registered || cur != own || t.lio && !t.mayWrite(first) || t.refusePreempt {
 		return ErrReservationConflict
 	}
@@ -254,6 +279,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	for initiator, key := range t.keys {
 		if key == victim {
 			t.drop(initiator)
+			t.attentions[initiator] += t.unitAttentions
 			found = true
 		}
 	}
@@ -271,7 +297,11 @@ func (d *fakeDevice) clear(key uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if cur, registered := t.keys[d.nexuses()[0]]; !registered || cur != key {
+	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
+		return err
+	}
+	if cur, registered := t.keys[first]; !registered || cur != key {
 		return ErrReservationConflict
 	}
 	t.keys = map[string]uint64{}
@@ -284,6 +314,9 @@ func (d *fakeDevice) clear(key uint64) error {
 func (d *fakeDevice) readReservation() (uint64, uint32, error) {
 	d.t.mu.Lock()
 	defer d.t.mu.Unlock()
+	if err := d.t.attention(d.nexuses()[0]); err != nil {
+		return 0, 0, err
+	}
 	if !d.t.reserved {
 		return 0, 0, nil
 	}
@@ -294,6 +327,9 @@ func (d *fakeDevice) readKeys() ([]uint64, error) {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err := t.attention(d.nexuses()[0]); err != nil {
+		return nil, err
+	}
 	if t.unlistable {
 		return nil, ErrUnsupported
 	}
@@ -311,6 +347,9 @@ func (d *fakeDevice) preempt(own, victim uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
+		return err
+	}
 	if cur, registered := t.keys[first]; !registered || cur != own || t.lio && !t.mayWrite(first) {
 		return ErrReservationConflict
 	}
@@ -320,6 +359,7 @@ func (d *fakeDevice) preempt(own, victim uint64) error {
 			found = true
 			if initiator != first {
 				t.drop(initiator)
+				t.attentions[initiator] += t.unitAttentions
 			}
 		}
 	}

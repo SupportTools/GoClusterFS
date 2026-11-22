@@ -17,6 +17,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -29,6 +30,12 @@ func newFormattedImage(t *testing.T) string {
 }
 
 func newFormattedImageOfSize(t *testing.T, size int64) string {
+	t.Helper()
+	return formatImage(t, size, true)
+}
+
+// formatImage formats an image and creates its root directory, and with quotas its quota table, as -format does.
+func formatImage(t *testing.T, size int64, quotas bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fs.img")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
@@ -48,6 +55,15 @@ func newFormattedImageOfSize(t *testing.T, size int64) string {
 	fsys := openFormattedFS(t, path)
 	if err := fsys.InitRoot(context.Background()); err != nil {
 		t.Fatalf("InitRoot: %v", err)
+	}
+	if quotas {
+		sb, err := superblock.Read(fsys.dev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := quota.Enable(context.Background(), fsys.dev, sb, fsys.inodeTbl, fsys.bitmapMgr); err != nil {
+			t.Fatalf("quota.Enable: %v", err)
+		}
 	}
 	fsys.snapshotWkr.Stop()
 	return path
@@ -93,7 +109,7 @@ func openFormattedComponents(t *testing.T, path string) *FS {
 	locks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, nodeUUID, slot)
 	bm := bitmap.NewRegion(dev, sb.BlockBitmapOffset, sb.TotalBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, sb.InodeTableOffset, sb.InodeCount*inode.InodeSize, locks, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset)
+	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
@@ -195,7 +211,7 @@ func shareTreeLikeOlderVersions(t *testing.T, fsys *FS, ino *inode.Inode) {
 	if !ino.HasExtentTree() || ino.ExtentDepth != 1 {
 		t.Fatalf("inode %d: want a depth-1 extent tree", ino.InodeNum)
 	}
-	off := extent.TreeNodeOffset(fsys.dataOffset, ino.ExtentTreeRoot, ino.ExtentTreeGen)
+	off := extent.TreeNodeOffset(fsys.dataOffset, storage.DefaultBlockSize, ino.ExtentTreeRoot, ino.ExtentTreeGen)
 	buf := storage.NewAlignedBuffer(64 << 10).Bytes()
 	if _, err := fsys.dev.ReadAt(buf, off); err != nil {
 		t.Fatal(err)
@@ -444,5 +460,80 @@ func TestFsckRebuildsCorruptRefcountSector(t *testing.T) {
 		if got := refcountOf(t, fsys, b); got != 2 {
 			t.Fatalf("block %d shared by a file and its clone: refcount %d after repair, want 2", b, got)
 		}
+	}
+}
+
+// A record sector of the quota table that fails its checksum is an error, and the quota inode, which no directory
+// names, is not reported as unnamed.
+func TestFsckChecksTheQuotaTable(t *testing.T) {
+	t.Parallel()
+	fsys := openFormattedFS(t, newFormattedImage(t))
+	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
+		t.Fatalf("fsck on a fresh image with a quota table:%s", problemList(r))
+	}
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil || sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 || sb.QuotaInode == 0 {
+		t.Fatalf("superblock after the format: flags %#x, quota inode %d, %v; want quotas on", sb.RequiredFlags, sb.QuotaInode, err)
+	}
+	qi, err := fsys.inodeTbl.Read(sb.QuotaInode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := int64(sb.DataRegionOffset+qi.InlineExtents[0].PhysicalBlock*uint64(sb.BlockSize)) + 2*storage.SectorSize
+	sector := storage.NewAlignedBuffer(storage.SectorSize)
+	if _, err := fsys.dev.ReadAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+	sector.Bytes()[10] ^= 1
+	if _, err := fsys.dev.WriteAt(sector.Bytes(), at); err != nil {
+		t.Fatal(err)
+	}
+	r := runFsck(t, fsys, fsck.DefaultOptions())
+	found := false
+	for _, p := range r.Problems {
+		if strings.Contains(p.String(), "quota inode") && strings.Contains(p.String(), "checksum") {
+			found = true
+		}
+	}
+	if !found || r.ExitCode() == fsck.ExitClean {
+		t.Errorf("fsck exit %d after a quota table sector was damaged; want an error naming it:%s", r.ExitCode(), problemList(r))
+	}
+}
+
+// An enable that fails before it names the table in the superblock leaves the superblock without quotas, so builds
+// without them still mount the volume, and fsck -repair frees the inode and block it had taken.
+func TestInterruptedQuotaEnableLeavesNoFlag(t *testing.T) {
+	t.Parallel()
+	path := formatImage(t, superblock.MinDeviceSize+64<<20, false)
+	fsys := openFormattedFS(t, path)
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsys.dev.SetWriteFault(func(off int64) error {
+		if off >= int64(sb.DataRegionOffset) {
+			return syscall.EIO
+		}
+		return nil
+	})
+	if err := quota.Enable(context.Background(), fsys.dev, sb, fsys.inodeTbl, fsys.bitmapMgr); err == nil {
+		t.Fatal("Enable succeeded though the table could not be written")
+	}
+	fsys.dev.SetWriteFault(func(int64) error { return nil })
+	onDisk, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.RequiredFlags&superblock.RequiredProjectQuotas != 0 || onDisk.QuotaInode != 0 {
+		t.Fatalf("after a failed enable the superblock has flags %#x and quota inode %d; want no quotas", onDisk.RequiredFlags, onDisk.QuotaInode)
+	}
+
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	if r := runFsck(t, fsys, repair); r.ExitCode() != fsck.ExitCorrected {
+		t.Fatalf("repair after a failed enable: exit %d, want %d:%s", r.ExitCode(), fsck.ExitCorrected, problemList(r))
+	}
+	if r := runFsck(t, fsys, fsck.DefaultOptions()); len(r.Problems) > 0 {
+		t.Fatalf("problems left after repair:%s", problemList(r))
 	}
 }
