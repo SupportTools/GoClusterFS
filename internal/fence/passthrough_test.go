@@ -210,12 +210,13 @@ func TestPassthroughMatchesTheKernel(t *testing.T) {
 	}
 	defer func() { _ = f.Close() }()
 	d := blockDevice{f: f}
+	pr := retrying{device: d}
 	key := ToolKey()
-	if err := d.register(0, key, true); err != nil {
+	if err := pr.register(0, key, true); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	defer func() { _ = d.register(key, 0, false) }()
-	if err := d.reserve(key); err != nil {
+	defer func() { _ = pr.register(key, 0, false) }()
+	if err := pr.reserve(key); err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
 	kernelKeys, err := d.listKeys()
