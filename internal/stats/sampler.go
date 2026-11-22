@@ -176,6 +176,7 @@ func (s *Sampler) sampleCounters() {
 			ReplayingSlots:            n.Replaying,
 			MountReplayedTransactions: s.src.MountReplay.Transactions,
 			MountDiscardedJournal:     s.src.MountReplay.Discarded,
+			StaleReservationKeys:      n.StaleKeys,
 		}
 	}
 	s.current.CollectedAt = time.Now().UTC().Format(time.RFC3339Nano)

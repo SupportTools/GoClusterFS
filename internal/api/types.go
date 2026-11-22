@@ -244,6 +244,7 @@ type NodeStatsResponse struct {
 	ReplayingSlots            []int   `json:"replaying_slots,omitempty"`
 	MountReplayedTransactions int     `json:"mount_replayed_transactions"`
 	MountDiscardedJournal     bool    `json:"mount_discarded_journal"`
+	StaleReservationKeys      int     `json:"stale_reservation_keys"`
 }
 
 // ReserveStatsResponse counts this node's block reserve since it mounted.

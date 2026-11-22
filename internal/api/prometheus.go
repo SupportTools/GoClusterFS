@@ -124,6 +124,7 @@ type fsCollector struct {
 
 	lockFailuresDesc        *prometheus.Desc
 	nodeHeartbeatAgeDesc    *prometheus.Desc
+	fencingStaleKeysDesc    *prometheus.Desc
 	peerReplaysDesc         *prometheus.Desc
 	peerReplaysRunningDesc  *prometheus.Desc
 	mountReplayedTxnsDesc   *prometheus.Desc
@@ -520,6 +521,11 @@ func newFSCollector(s *Server) *fsCollector {
 			"How long ago this node's last heartbeat reached its registry slot; past 5 seconds the node stops",
 			nil, nil,
 		),
+		fencingStaleKeysDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, "fencing", "stale_keys"),
+			"Reservation keys the device lists that no registry slot owned in two checks a minute apart after this node joined; on LIO one can keep its host writing past a revoke",
+			nil, nil,
+		),
 		peerReplaysDesc: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "journal", "peer_replays_total"),
 			"Journals of crashed nodes this node replayed, by result: ok, or failed and left for a retry",
@@ -641,6 +647,7 @@ func (c *fsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.clusterNodesDesc
 	ch <- c.lockFailuresDesc
 	ch <- c.nodeHeartbeatAgeDesc
+	ch <- c.fencingStaleKeysDesc
 	ch <- c.peerReplaysDesc
 	ch <- c.peerReplaysRunningDesc
 	ch <- c.mountReplayedTxnsDesc
@@ -802,6 +809,7 @@ func (c *fsCollector) collectLockStats(ch chan<- prometheus.Metric, stats *LockS
 
 func (c *fsCollector) collectNodeStats(ch chan<- prometheus.Metric, n *NodeStatsResponse) {
 	ch <- prometheus.MustNewConstMetric(c.nodeHeartbeatAgeDesc, prometheus.GaugeValue, n.HeartbeatAgeSeconds)
+	ch <- prometheus.MustNewConstMetric(c.fencingStaleKeysDesc, prometheus.GaugeValue, float64(n.StaleReservationKeys))
 	ch <- prometheus.MustNewConstMetric(c.peerReplaysDesc, prometheus.CounterValue, float64(n.PeerReplays), "ok")
 	ch <- prometheus.MustNewConstMetric(c.peerReplaysDesc, prometheus.CounterValue, float64(n.PeerReplayFailures), "failed")
 	ch <- prometheus.MustNewConstMetric(c.peerReplaysRunningDesc, prometheus.GaugeValue, float64(len(n.ReplayingSlots)))

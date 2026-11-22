@@ -5820,6 +5820,20 @@ scenarios:
     environments:
       go: internal/fence/leave_test.go::TestLeaveOverTwoPathsWhenTheFirstPathMissesThePreempt
 
+  - id: fencing-unowned-keys
+    name: Keys no registry slot owns count as unowned
+    description: A key is owned while its node is in a slot, live or dead and waiting for a replay; an emptied slot's old node, a node in no slot and a tool key own nothing, and a key on two paths is listed once
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/stalekeys_test.go::TestUnownedKeys
+
+  - id: fencing-stale-keys-two-checks
+    name: A stale key needs no owner in both checks
+    description: A joining node registers before its slot claim lands, so only keys without an owner in both checks a minute apart are reported, neither one whose node claimed its slot by the second check nor one registered between the checks, and a mount that stops first reports none
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/stalekeys_test.go::TestStaleKeyCheckNeedsBothChecks
+
   - id: fencing-reservation-self-test
     name: fsck -test-reservations qualifies an LIO target
     description: The self-test refuses the mounted volume; once both nodes unmount it passes alone on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write; a kept key survives a target power cycle that restores LIO's APTPL file, and -check-kept reports it lost after a power cycle that does not and after an iSCSI logout and login
