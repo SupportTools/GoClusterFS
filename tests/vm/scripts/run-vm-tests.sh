@@ -3456,17 +3456,17 @@ crash_goclusterfs() {
 }
 
 # Unmount GoClusterFS on VM $1 and wait for the mount process to exit, which
-# marks its journal clean.
+# marks its journal clean, and to be reaped: a zombie keeps its /proc entry.
 unmount_goclusterfs() {
-    local vm_id=$1
+    local vm_id=$1 pids start
+    pids=$(mount_pids "$vm_id" | xargs)
     ssh_run "$vm_id" "fusermount3 -u ${GOCLUSTERFS_MOUNT}" || return 1
-    local waited=0
-    while [[ -n "$(mount_pids "$vm_id")" ]]; do
-        if [[ $waited -ge 30 ]]; then
+    start=$(date +%s%3N)
+    while [[ -n "$pids" ]] && ssh_run "$vm_id" "for p in $pids; do [ -e /proc/\$p ] && exit 0; done; exit 1"; do
+        if (( $(date +%s%3N) - start >= 30000 )); then
             return 1
         fi
-        sleep 1
-        waited=$((waited + 1))
+        sleep 0.2
     done
 }
 
@@ -3834,13 +3834,11 @@ test_unfenced_join_refused() {
     fencing_restart none || return 1
     unmount_goclusterfs 2 || return 1
     out=$(ssh_run 2 "mkdir -p ${GOCLUSTERFS_MOUNT}; timeout 60 /usr/local/bin/goclusterfs-mount -mount ${GOCLUSTERFS_MOUNT} -device $(cluster_device) -broadcast=false -api=false 2>&1; echo rc=\$?")
-    # The refusal may also name VM 2's own last slot: an unmount leaves its slot Active for a peer or a remount on its
-    # host to clear, and for about a second the exited mount is a zombie, which passes the kill(pid, 0) liveness test.
-    if [[ "$out" != *"has no storage fencing, and the node"* || "$out" == *rc=0* ]]; then
+    if [[ "$out" != *"has no storage fencing, and the node in slot 0 "* || "$out" == *rc=0* ]]; then
         log_error "VM 2 was not refused on an unfenced volume VM 1 has mounted, without -unsafe-allow-unfenced: $out"
         result=1
     else
-        log_info "VM 2 refused: $(grep -o 'has no storage fencing, and the node[^.]*' <<< "$out" | head -1)"
+        log_info "VM 2 refused: $(grep -o 'has no storage fencing, and the node in slot 0 [^.]*' <<< "$out" | head -1)"
     fi
     marker="unfenced join $(date +%s)"
     mark_vm_logs "$marker"

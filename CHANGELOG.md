@@ -109,6 +109,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A mount whose host's earlier mount in the same slot had exited, but was still a zombie its parent had not reaped, took that slot for a running node. A remount then took another slot and left its own journal for a peer to replay, and on a volume without fencing it refused to mount next to itself. In a container whose init does not reap, the zombie lasts for good. A zombie now counts as exited.
 - Create, mkdir and chmod dropped the setuid, setgid and sticky bits, and stat never showed them. A new file in a setgid directory took its creator's group instead of the directory's.
 - A new mount on the same host judged another mount's heartbeat by the wall clock, so a forward clock step of 20 seconds or more made a live mount look dead: the new mount took its registry slot and, on a fenced volume, revoked its access. A mount now takes a slot whose process it cannot prove exited only after watching the heartbeat stay unchanged for about 20 seconds, as for other hosts' slots. A restarted container whose peers keep running may now see a peer replay its old slot first, and then takes another slot.
 - A write that hit a read error when it re-read its inode, after taking the inode lock or after moving a small file out of its SFB slot, crashed the mount with a nil pointer panic. It now fails with EIO.

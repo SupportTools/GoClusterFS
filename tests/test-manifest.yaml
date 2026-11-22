@@ -5726,6 +5726,13 @@ scenarios:
     environments:
       go: internal/node/mounted_peers_test.go::TestMountedPeersListsEveryOtherNodeThatMayWrite
 
+  - id: registry-zombie-mount-exited
+    name: A zombie mount counts as exited
+    description: A same-host mount that exited but was never reaped, as in a container whose init does not reap, counts as its host's exited mount, so a remount takes its slot back; a running process does not
+    priority: go_only
+    environments:
+      go: internal/node/zombie_test.go::TestZombieMountCountsAsExited
+
   - id: unfenced-refused-remount-keeps-journal
     name: A refused remount leaves the crashed journal to a peer
     description: A crashed node's remount without -unsafe-allow-unfenced takes back its slot and is refused; the slot stays, so a peer still replays the crashed journal and its files survive
