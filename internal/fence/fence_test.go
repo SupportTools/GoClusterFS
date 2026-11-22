@@ -72,39 +72,6 @@ func TestClearRemovesEveryKeyAndTheReservation(t *testing.T) {
 	}
 }
 
-// After an iSCSI logout and login, the node's key stays registered under its earlier session, and this session holds
-// none. Leave removes the key from the earlier session too, and keeps the peer's registration.
-func TestLeaveRemovesTheKeyAnEarlierSessionKept(t *testing.T) {
-	target := NewTarget()
-	peer := target.Node("vm2/1", NodeKey([16]byte{2}))
-	key := NodeKey([16]byte{1})
-	earlier, current := target.Node("vm1/1", key), target.Node("vm1/2", key)
-	for _, n := range []*PR{earlier, peer} {
-		if err := n.Register(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := earlier.Reserve(); err != nil {
-		t.Fatal(err)
-	}
-	if gotEarlier, err := current.Leave(); err != nil || !gotEarlier {
-		t.Fatalf("Leave from a session without the key = %v, %v; want true, nil", gotEarlier, err)
-	}
-	if keys, err := peer.Keys(); err != nil || !slices.Equal(keys, []uint64{peer.Key()}) {
-		t.Errorf("Keys after Leave = %x, %v; want only the peer's", keys, err)
-	}
-	if target.MayWrite("vm1/1") || target.MayWrite("vm1/2") || !target.MayWrite("vm2/1") {
-		t.Error("after Leave, a session of the host that left may write, or the peer may not")
-	}
-
-	if gotEarlier, err := peer.Leave(); err != nil || gotEarlier {
-		t.Errorf("Leave from the session that holds the key = %v, %v; want false, nil", gotEarlier, err)
-	}
-	if keys, err := peer.Keys(); err != nil || len(keys) != 0 {
-		t.Errorf("Keys after the peer left = %x, %v; want none", keys, err)
-	}
-}
-
 // A survivor's preempt shuts the dead node out: its writes stop, it cannot preempt back, and a second preempt of
 // the same key is harmless.
 func TestPreemptRevokesTheVictim(t *testing.T) {

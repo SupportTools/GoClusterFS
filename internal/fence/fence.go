@@ -157,9 +157,13 @@ func (p *PR) Leave() (earlier bool, err error) {
 	if err := p.dev.preempt(p.key, p.key); err != nil {
 		return true, err
 	}
-	// Over dm-multipath the preempt also removed the key from the other paths, which then answer a conflict.
-	if err := p.Unregister(); err != nil && !errors.Is(err, ErrFenced) {
+	// Over dm-multipath the preempt also removed the key from this host's other paths, and dm stops an unregister at the
+	// first path without the key, so the key goes back on every path first.
+	if err := p.Register(); err != nil {
 		return true, err
+	}
+	if err := p.dev.register(p.key, 0, false); err != nil {
+		return true, fmt.Errorf("unregistering the key after removing it from the earlier session: %v", err)
 	}
 	return true, nil
 }

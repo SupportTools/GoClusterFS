@@ -5811,7 +5811,14 @@ scenarios:
     description: When this session holds no key, Leave registers it, preempts it without abort to remove the earlier session's registration, and unregisters, keeping the peer's key
     priority: go_only
     environments:
-      go: internal/fence/fence_test.go::TestLeaveRemovesTheKeyAnEarlierSessionKept
+      go: internal/fence/leave_test.go::TestLeaveRemovesTheKeyAnEarlierSessionKept
+
+  - id: fence-leave-two-paths
+    name: Leave removes the key from every dm-multipath path
+    description: With dm's routing, the first path misses the preempt and the second issues it; Leave registers the key on every path again before it unregisters, since dm stops an unregister at the first path without the key
+    priority: go_only
+    environments:
+      go: internal/fence/leave_test.go::TestLeaveOverTwoPathsWhenTheFirstPathMissesThePreempt
 
   - id: fencing-reservation-self-test
     name: fsck -test-reservations qualifies an LIO target
