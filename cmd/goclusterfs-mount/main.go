@@ -750,6 +750,11 @@ func main() {
 		}
 	})
 	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
+	gfs.SetSlotRelease(func() {
+		if err := nodeReg.Release(); err != nil {
+			log.Printf("[INFO] Leaving registry slot %d for a running node to clear: %v", slotIdx, err)
+		}
+	})
 	if err := gfs.Close(); err != nil {
 		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)
 		exit = cli.ExitFailure

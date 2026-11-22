@@ -5726,6 +5726,37 @@ scenarios:
     environments:
       go: internal/node/mounted_peers_test.go::TestMountedPeersListsEveryOtherNodeThatMayWrite
 
+  - id: registry-zombie-mount-exited
+    name: A zombie mount counts as exited
+    description: A same-host mount that exited but was never reaped, as in a container whose init does not reap, counts as its host's exited mount, so a remount takes its slot back; a running process does not
+    priority: go_only
+    environments:
+      go: internal/node/zombie_test.go::TestZombieMountCountsAsExited
+
+  - id: registry-zombie-stuck-thread
+    name: A zombie leader with a stuck thread counts as running
+    description: A mount killed while a thread sits in an uninterruptible write shows a zombie leader, but the write can still land; it counts as gone only once every thread is Z or X
+    priority: go_only
+    environments:
+      go: internal/node/zombie_test.go::TestZombieLeaderWithAStuckThreadCountsAsRunning
+
+  - id: registry-release-clean-slot
+    name: A clean unmount empties its registry slot
+    description: Release empties a clean, Active slot of this node, so other hosts stop counting it; a slot listing orphans or marked Dead by a peer stays as it is
+    priority: go_only
+    environments:
+      go: internal/node/release_test.go::TestReleaseEmptiesOnlyACleanSlot
+
+  - id: unfenced-remount-after-clean-stop
+    name: An unfenced cluster mounts again after a clean stop
+    description: After every node unmounted cleanly, the first node to mount an unfenced volume again joins without -unsafe-allow-unfenced
+    priority: high
+    environments:
+      go: internal/node/release_test.go::TestReleaseEmptiesOnlyACleanSlot
+      # Each Docker node's mount is its container's main process, started with -unsafe-allow-unfenced by the entrypoint.
+      docker: TODO
+      vm: run-vm-tests.sh::test_unfenced_remount_after_clean_stop
+
   - id: unfenced-refused-remount-keeps-journal
     name: A refused remount leaves the crashed journal to a peer
     description: A crashed node's remount without -unsafe-allow-unfenced takes back its slot and is refused; the slot stays, so a peer still replays the crashed journal and its files survive
