@@ -5806,6 +5806,15 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fencing_reservation_self_test
 
+  - id: fencing-lost-reservation
+    name: A node reserves again a device that lost its reservation
+    description: A device without a reservation takes writes from any host; a preempt reserves first when the device holds none, a node reserves again within two failure scans when the reservation is lost while its key stays, and stops when its key is gone too
+    priority: high
+    environments:
+      go: internal/fence/reserve_test.go::TestPreemptReservesWhenTheDeviceHasNone
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_lost_reservation
+
   - id: storage-gone-device
     name: A removed device calls the gone handler
     description: ENOSPC from a device that shrank to nothing, as a removed disk does, calls the gone handler once with the new size; ENOSPC from a device that kept its size does not
