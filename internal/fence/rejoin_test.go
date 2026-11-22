@@ -58,3 +58,35 @@ func TestTheHolderWritesAfterRevokingItsOwnOtherSession(t *testing.T) {
 		t.Errorf("after revoking the holder's key the session may write: %v, holder %q; want it holding the reservation", target.MayWrite("vm2/2"), target.holder)
 	}
 }
+
+// LIO refuses a reserve, as it refuses a write, from a host whose write permission a revoke of its key under another
+// session cleared. Join then registers anew once, which lets the host reserve and write under the peer's reservation.
+func TestJoinRegistersAnewWhenLIORefusesTheReserve(t *testing.T) {
+	target := NewLIOTarget()
+	peer := target.Node("vm1/1", 0x4743000000000001)
+	orphan := target.Node("vm2/1", 0x4743000000000002)
+	crashed := target.Node("vm2/2", 0x4743000000000003)
+	for _, pr := range []*PR{peer, orphan, crashed} {
+		if err := pr.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Preempt(crashed.Key()); err != nil {
+		t.Fatal(err)
+	}
+	rebooted := target.Node("vm2/1", 0x4743000000000004)
+	if err := rebooted.Register(); err != nil {
+		t.Fatal(err)
+	}
+	if err := rebooted.Reserve(); err == nil {
+		t.Fatal("the LIO fake let the host reserve after the revoke, so the test proves nothing")
+	}
+	anew, err := rebooted.Join()
+	if err != nil || !anew || !target.MayWrite("vm2/1") || target.holder != "vm1/1" {
+		t.Errorf("Join: registered anew %v, %v; the host may write: %v, holder %q; want it registered anew under the peer's reservation",
+			anew, err, target.MayWrite("vm2/1"), target.holder)
+	}
+}

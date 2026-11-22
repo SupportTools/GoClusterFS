@@ -850,11 +850,15 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 	}
 	pr := fence.Block(f, fence.NodeKey(reg.LocalUUID()))
 	reg.SetJoin(func() error {
-		if err := pr.Register(); err != nil {
-			failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
-		}
-		if err := pr.Reserve(); err != nil {
+		anew, err := pr.Join()
+		switch {
+		case errors.Is(err, fence.ErrForeignReservation):
 			failf("%s is fenced, and reserving it failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s", devicePath, err, devicePath)
+		case err != nil:
+			failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
+		case anew:
+			log.Printf("[WARN] Fencing: the device refused this node's reserve although it registered its key, as LIO does after a key this host " +
+				"registered from an earlier iSCSI session is revoked; registered the key anew")
 		}
 		log.Printf("Fencing: persistent reservation key %#x", pr.Key())
 		return nil

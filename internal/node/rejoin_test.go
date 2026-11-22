@@ -92,7 +92,7 @@ func (w *rejoinWorld) peer(t *testing.T) (reg *Registry, revoked func() time.Tim
 
 // rebooted is vm2's new mount on its first session, wired as goclusterfs-mount wires it. Its own device refuses its
 // writes whenever the target refuses vm2's first session.
-func (w *rejoinWorld) rebooted(t *testing.T) (reg *Registry, joined *time.Time, rejoins *int) {
+func (w *rejoinWorld) rebooted(t *testing.T) (reg *Registry, joined *time.Time, anew *bool, rejoins *int) {
 	t.Helper()
 	dev, err := storage.Open(w.dev.Path())
 	if err != nil {
@@ -107,19 +107,18 @@ func (w *rejoinWorld) rebooted(t *testing.T) (reg *Registry, joined *time.Time, 
 	})
 	reg = NewRegistry(dev, 0)
 	pr := w.target.Node("vm2/1", fence.NodeKey(reg.LocalUUID()))
-	joined, rejoins = new(time.Time), new(int)
+	joined, anew, rejoins = new(time.Time), new(bool), new(int)
 	reg.SetJoin(func() error {
 		*joined = time.Now()
-		if err := pr.Register(); err != nil {
-			return err
-		}
-		return pr.Reserve()
+		var err error
+		*anew, err = pr.Join()
+		return err
 	}, func() error {
 		*rejoins++
 		return pr.RegisterFresh()
 	})
 	reg.SetPreempter(func(owner [16]byte) error { return pr.Preempt(fence.NodeKey(owner)) })
-	return reg, joined, rejoins
+	return reg, joined, anew, rejoins
 }
 
 // The bug this guards against: vm2 registered its new key at once, and the peer's revoke of the earlier mount's key
@@ -140,14 +139,14 @@ func TestRegisteringBeforeThePeersRevokeLosesWritesOnLIO(t *testing.T) {
 }
 
 // vm2's mount watches its earlier mount's slot, which a peer takes over during the watch. vm2 registers its key only
-// after the peer's revoke. Its register changed the orphan's key in place, so the device refuses its slot claim; it
-// registers anew, which keeps the peer's reservation, and claims again.
+// after the peer's revoke. Its register changed the orphan's key in place, so the device refuses its reserve; it
+// registers anew, which keeps the peer's reservation.
 func TestJoinRegistersAfterAPeerRevokesTheEarlierMount(t *testing.T) {
 	shortenSilentSlotWatch(t)
 	w := newRejoinWorld(t)
 	w.writeEarlier(t)
 	peer, revoked := w.peer(t)
-	reg, joined, rejoins := w.rebooted(t)
+	reg, joined, anew, rejoins := w.rebooted(t)
 	recovered := make(chan error, 1)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
@@ -162,23 +161,23 @@ func TestJoinRegistersAfterAPeerRevokesTheEarlierMount(t *testing.T) {
 	if at := revoked(); at.IsZero() || !joined.After(at) {
 		t.Errorf("vm2 joined at %v, the peer revoked at %v; want the join after the revoke", joined.Format(time.StampMilli), at.Format(time.StampMilli))
 	}
-	if *rejoins != 1 || !w.target.MayWrite("vm2/1") || w.target.MayWrite("vm9/1") {
-		t.Errorf("vm2 registered anew %d times, may write: %v, an unregistered host may write: %v; want one rejoin under the peer's reservation",
-			*rejoins, w.target.MayWrite("vm2/1"), w.target.MayWrite("vm9/1"))
+	if !*anew || *rejoins != 0 || !w.target.MayWrite("vm2/1") || w.target.MayWrite("vm9/1") {
+		t.Errorf("vm2's join registered anew: %v, its claim %d times; may write: %v, an unregistered host may write: %v; want the join to register anew under the peer's reservation",
+			*anew, *rejoins, w.target.MayWrite("vm2/1"), w.target.MayWrite("vm9/1"))
 	}
 }
 
-// With no peer to take it over, vm2's mount watches its earlier mount's slot silent and takes it over itself. The
-// earlier mount held the reservation, so vm2's revoke of its key hands the reservation to vm2, which writes as its
-// holder without registering anew.
+// With no peer to take it over, vm2's mount watches its earlier mount's slot silent and takes it over itself. vm2's
+// first session reserved before the relogin, so its new key there holds the reservation, and vm2 writes as the holder
+// after revoking the earlier mount's key, without registering anew.
 func TestJoinTakesOverTheEarlierMountWithoutPeers(t *testing.T) {
 	shortenSilentSlotWatch(t)
 	w := newRejoinWorld(t)
 	w.writeEarlier(t)
-	if err := w.target.Node("vm2/2", w.key).Reserve(); err != nil {
+	if err := w.target.Node("vm2/1", 0x47430000000000ff).Reserve(); err != nil {
 		t.Fatal(err)
 	}
-	reg, _, rejoins := w.rebooted(t)
+	reg, _, _, rejoins := w.rebooted(t)
 	slot, err := reg.Register(context.Background(), "vm2")
 	if err != nil || slot != earlierSlot {
 		t.Fatalf("vm2's Register: slot %d, %v; want the earlier mount's slot %d", slot, err, earlierSlot)
@@ -197,7 +196,7 @@ func TestJoinRegistersAnewAfterRevokingItsOwnOtherSession(t *testing.T) {
 	w.earlier.BootID, w.earlier.PIDNamespace, w.earlier.PID = readBootID(), readPIDNamespace(), 0x3ffffff0
 	w.writeEarlier(t)
 	w.peer(t)
-	reg, _, rejoins := w.rebooted(t)
+	reg, _, _, rejoins := w.rebooted(t)
 	slot, err := reg.Register(context.Background(), "vm2")
 	if err != nil || slot != earlierSlot {
 		t.Fatalf("vm2's Register: slot %d, %v; want its own crashed slot %d", slot, err, earlierSlot)

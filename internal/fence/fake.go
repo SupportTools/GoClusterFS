@@ -80,6 +80,10 @@ func (t *Target) SelfTest(initiator string, report func(Check)) *SelfTest {
 func (t *Target) MayWrite(initiator string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.mayWrite(initiator)
+}
+
+func (t *Target) mayWrite(initiator string) bool {
 	_, registered := t.keys[initiator]
 	if t.lio && t.reserved {
 		switch {
@@ -134,7 +138,7 @@ func (d *fakeDevice) reserve(key uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.keys[d.initiator] != key || key == 0 {
+	if t.keys[d.initiator] != key || key == 0 || t.lio && !t.mayWrite(d.initiator) {
 		return ErrReservationConflict
 	}
 	if !t.reserved {

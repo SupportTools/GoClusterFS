@@ -110,6 +110,21 @@ func (p *PR) RegisterFresh() error {
 	return p.Reserve()
 }
 
+// Join registers this node's key and reserves, and reports whether it registered the key anew. LIO refuses a reserve,
+// as it refuses a write, from a host whose write permission a revoke of its key under an earlier iSCSI session
+// cleared, so after such a refusal Join registers anew once: the refusal proves this session is not the reservation
+// holder, so dropping its registration does not release the reservation.
+func (p *PR) Join() (anew bool, err error) {
+	if err := p.Register(); err != nil {
+		return false, err
+	}
+	err = p.Reserve()
+	if errors.Is(err, ErrForeignReservation) {
+		return true, p.RegisterFresh()
+	}
+	return false, err
+}
+
 func (p *PR) Reserve() error {
 	if err := p.dev.reserve(p.key); errors.Is(err, ErrReservationConflict) {
 		return ErrForeignReservation
