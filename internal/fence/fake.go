@@ -17,6 +17,9 @@ type Target struct {
 	failUnregister error
 	// Unlistable makes key listings fail, as on a device that cannot list keys.
 	Unlistable bool
+	// refusePreempt makes every preempt conflict, as LIO does for a host whose write flag another freed registration
+	// cleared.
+	refusePreempt bool
 }
 
 func NewTarget() *Target { return &Target{keys: map[string]uint64{}} }
@@ -162,7 +165,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if cur, registered := t.keys[d.nexuses()[0]]; !registered || cur != own {
+	if cur, registered := t.keys[d.nexuses()[0]]; !registered || cur != own || t.refusePreempt {
 		return ErrReservationConflict
 	}
 	found := false

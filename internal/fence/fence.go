@@ -3,11 +3,11 @@
 package fence
 
 import (
-	"slices"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 var (
@@ -16,10 +16,10 @@ var (
 	// it on a partition.
 	ErrPartition = fmt.Errorf("%w on a partition, only on the whole disk", ErrUnsupported)
 	// ErrFenced means another node removed this node's key: the storage refuses its writes.
-	ErrFenced             = errors.New("this node's reservation key is gone: another node revoked its access to the device")
+	ErrFenced = errors.New("this node's reservation key is gone: another node revoked its access to the device")
 	// ErrNotPreempted wraps a failed preempt after which the device still lists the victim's key: the preempt did not
 	// take effect, and the victim may still write.
-	ErrNotPreempted = errors.New("the preempt did not take effect: the device still lists the node's key")
+	ErrNotPreempted       = errors.New("the preempt did not take effect: the device still lists the node's key")
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
@@ -124,6 +124,12 @@ func (p *PR) Preempt(victim uint64) error {
 		return p.listedAfter(victim, ErrFenced)
 	} else if err != nil {
 		return p.listedAfter(victim, err)
+	}
+	// A device may refuse a preempt from a host it no longer lets write, though this node's key is still listed, as LIO
+	// does once another registration of the host was freed. The victim's key, still listed, tells that apart from a
+	// victim that is gone.
+	if keys, lerr := p.dev.readKeys(); lerr == nil && slices.Contains(keys, victim) {
+		return fmt.Errorf("%w: the device refused the preempt", ErrNotPreempted)
 	}
 	return nil
 }

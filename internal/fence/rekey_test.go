@@ -481,3 +481,22 @@ func TestRekeyOnNVMeRefuses(t *testing.T) {
 		})
 	}
 }
+
+// A device that refuses a preempt although the preempting node's key still registers, as LIO does once another
+// registration of that host was freed, leaves the victim's key listed: Preempt says the preempt did not take effect.
+func TestRefusedPreemptWithTheVictimListedSaysSo(t *testing.T) {
+	target := NewTarget()
+	victim := target.Node("v", NodeKey([16]byte{1}))
+	peer := target.Node("p", NodeKey([16]byte{2}))
+	for _, pr := range []*PR{victim, peer} {
+		if err := pr.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target.mu.Lock()
+	target.refusePreempt = true
+	target.mu.Unlock()
+	if err := peer.Preempt(victim.Key()); !errors.Is(err, ErrNotPreempted) || errors.Is(err, ErrFenced) {
+		t.Errorf("Preempt refused by the device = %v, want ErrNotPreempted without ErrFenced", err)
+	}
+}
