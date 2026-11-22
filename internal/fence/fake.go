@@ -32,6 +32,12 @@ func (t *Target) MultipathNode(initiator string, paths int, key uint64) *PR {
 	return &PR{dev: &fakeDevice{t: t, initiator: initiator, paths: paths}, key: key}
 }
 
+// NVMeNode returns the Fencer of host on an NVMe namespace reached over paths controllers. NVMe registers a host, not
+// a path: every path shares one registration, which a reconnect keeps.
+func (t *Target) NVMeNode(host string, paths int, key uint64) *PR {
+	return &PR{dev: &fakeDevice{t: t, initiator: host, paths: paths, perHost: true}, key: key}
+}
+
 // SelfTest returns a self-test that runs as initiator, whose 4 KiB writes the target refuses with EBADE, as Linux does,
 // once a reservation shuts initiator out.
 func (t *Target) SelfTest(initiator string, report func(Check)) *SelfTest {
@@ -74,11 +80,13 @@ type fakeDevice struct {
 	initiator string
 	// paths is the number of paths of a dm-multipath map, named initiator#0 and up; 0 is a plain disk.
 	paths int
+	// perHost makes every path share the initiator's one registration, as NVMe does.
+	perHost bool
 }
 
 // nexuses names the initiator-target nexuses a command from d reaches: one per map path, or the initiator itself.
 func (d *fakeDevice) nexuses() []string {
-	if d.paths == 0 {
+	if d.paths == 0 || d.perHost {
 		return []string{d.initiator}
 	}
 	names := make([]string, d.paths)
@@ -93,7 +101,11 @@ func (d *fakeDevice) pathDevices() ([]device, func(), error) {
 		return []device{d}, func() {}, nil
 	}
 	devs := make([]device, d.paths)
-	for i, name := range d.nexuses() {
+	for i := range devs {
+		name := d.initiator
+		if !d.perHost {
+			name = fmt.Sprintf("%s#%d", d.initiator, i)
+		}
 		devs[i] = &fakeDevice{t: d.t, initiator: name}
 	}
 	return devs, func() {}, nil

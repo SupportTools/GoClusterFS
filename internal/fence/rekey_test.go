@@ -2,6 +2,7 @@ package fence
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -436,5 +437,47 @@ func TestPreemptThatDidNotTakeEffectSaysSo(t *testing.T) {
 	}
 	if err := third.Preempt(victim.Key()); err != nil || errors.Is(err, ErrNotPreempted) {
 		t.Errorf("a preempt that took effect = %v, want nil", err)
+	}
+}
+
+// NVMe registers a host, not a path, so a reconnect loses no key and leaves no registration from before behind. A
+// rekey there refuses either way: every path still holds the key, or a preempt removed it.
+func TestRekeyOnNVMeRefuses(t *testing.T) {
+	for _, preempted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("preempted %v", preempted), func(t *testing.T) {
+			target := NewTarget()
+			node := target.NVMeNode("host", 2, NodeKey([16]byte{1}))
+			peer := target.Node("p", NodeKey([16]byte{2}))
+			for _, pr := range []*PR{node, peer} {
+				if err := pr.Register(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := peer.Reserve(); err != nil {
+				t.Fatal(err)
+			}
+			want := "still holds this node's key"
+			if preempted {
+				if err := peer.Preempt(node.Key()); err != nil {
+					t.Fatal(err)
+				}
+				want = "a peer preempted this node"
+			}
+			registers := 0
+			k := &Rekeyer{
+				PR:             node,
+				HoldWrites:     func(fn func() error) error { return fn() },
+				HeartbeatAge:   func() time.Duration { return time.Second },
+				SlotLive:       func() error { return nil },
+				StallLimit:     15 * time.Second,
+				beforeRegister: func() { registers++ },
+			}
+			if err := k.Rekey(); err == nil || !strings.Contains(err.Error(), want) || registers != 0 {
+				t.Errorf("Rekey: %v after %d registers; want an error naming %q and no register", err, registers, want)
+			}
+			if target.MayWrite("host") == preempted {
+				t.Errorf("host may write: %v, want %v", target.MayWrite("host"), !preempted)
+			}
+		})
 	}
 }

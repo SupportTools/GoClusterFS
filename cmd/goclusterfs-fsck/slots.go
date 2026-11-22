@@ -211,6 +211,11 @@ func inspectSlot(out io.Writer, checker *fsck.Checker, i int) error {
 		return err
 	}
 	p := &printer{w: out}
+	if in.TakeoverIntents {
+		p.printf("Volume: takeover intents required; builds without them, their goclusterfs-fsck included, refuse it\n")
+	} else {
+		p.printf("Volume: formatted before takeover intents; the first node of a build with them to mount it sets the flag\n")
+	}
 	s := in.Status
 	if s.Slot == nil {
 		p.printf("Slot %d: unreadable: %v\n", s.Index, s.Err)

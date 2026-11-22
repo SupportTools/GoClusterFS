@@ -5997,10 +5997,24 @@ scenarios:
 
   - id: fsck-slots-show-intent
     name: fsck shows a takeover intent
-    description: -list-slots shows a live slot as being taken over by the marking node, and -inspect-slot shows who marked it and when, not a replay lease
+    description: -list-slots shows a live slot as being taken over by the marking node, and -inspect-slot shows who marked it and when, not a replay lease, and that the volume requires takeover intents
     priority: go_only
     environments:
       go: cmd/goclusterfs-fsck/slots_test.go::TestSlotsShowATakeoverIntent
+
+  - id: mount-sets-takeover-intent-flag
+    name: The first node of this build sets RequiredTakeoverIntent once
+    description: Joining a volume formatted before takeover intents sets the flag on disk and in memory; joining a volume that has it writes nothing
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/takeover_intent_test.go::TestJoinSetsRequiredTakeoverIntentOnce
+
+  - id: fence-rekey-nvme-refuses
+    name: A rekey on NVMe refuses
+    description: NVMe registers a host, so every path shares one registration; a rekey refuses without a register whether the key is still held or was preempted
+    priority: go_only
+    environments:
+      go: internal/fence/rekey_test.go::TestRekeyOnNVMeRefuses
 
   - id: storage-last-error
     name: Device remembers its last I/O failure

@@ -345,6 +345,9 @@ func main() {
 	if fencer.Kind() == "none" {
 		joinUnfenced(nodeReg, *devicePath, *unsafeUnfenced)
 	}
+	if err := requireTakeoverIntent(dev, sb); err != nil {
+		failf("Cannot mark %s for takeover intents: %v; check the device, then mount again", *devicePath, err)
+	}
 	nodeReg.SetSlotLostHandler(func(loss node.SlotLoss) {
 		storage.AwaitStoppedWrite()
 		failf("%s; stopping so two nodes never share a journal. "+
@@ -868,6 +871,26 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 	})
 	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
 	return pr
+}
+
+// requireTakeoverIntent sets RequiredTakeoverIntent on a volume formatted before it, once this node joined: the join
+// refused any live node of an older build, and from now on older builds, fsck included, refuse the volume, since they
+// revoke a node without marking an intent first. sb takes the flag too.
+func requireTakeoverIntent(dev *storage.Device, sb *superblock.Superblock) error {
+	current, err := superblock.Read(dev)
+	if err != nil {
+		return err
+	}
+	if current.RequiredFlags&superblock.RequiredTakeoverIntent == 0 {
+		current.RequiredFlags |= superblock.RequiredTakeoverIntent
+		if err := superblock.Write(dev, current); err != nil {
+			return err
+		}
+		log.Printf("Set required flag %#x, takeover intents, on the volume: builds without them, their goclusterfs-fsck included, can no longer mount or check it",
+			superblock.RequiredTakeoverIntent)
+	}
+	sb.RequiredFlags |= superblock.RequiredTakeoverIntent
+	return nil
 }
 
 // restoreKey lets this node register its reservation key again when its storage path lost it, as a dm-multipath path

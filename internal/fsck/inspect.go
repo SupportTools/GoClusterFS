@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"slices"
 	"time"
 
@@ -12,9 +13,11 @@ import (
 
 // SlotInspection is what -inspect-slot reports about one node registry slot. Gathering it writes nothing.
 type SlotInspection struct {
-	Status        SlotStatus
-	JournalOffset uint64
-	JournalSize   uint64
+	Status SlotStatus
+	// TakeoverIntents says the volume carries RequiredTakeoverIntent, so builds without takeover intents refuse it.
+	TakeoverIntents bool
+	JournalOffset   uint64
+	JournalSize     uint64
 	// Header is nil when the journal was never initialized or HeaderErr says why it cannot be read.
 	Header    *journal.JournalSuperblock
 	HeaderErr error
@@ -43,7 +46,9 @@ func (c *Checker) InspectSlot(i int) (*SlotInspection, error) {
 	if i < 0 || i >= len(slots) {
 		return nil, fmt.Errorf("%w: slot %d; slots are 0 to %d", ErrNoSuchSlot, i, len(slots)-1)
 	}
-	return c.inspect(slots[i]), nil
+	in := c.inspect(slots[i])
+	in.TakeoverIntents = c.sbData.RequiredFlags&superblock.RequiredTakeoverIntent != 0
+	return in, nil
 }
 
 // inspect reads the journal of slot s and what replaying it would change.

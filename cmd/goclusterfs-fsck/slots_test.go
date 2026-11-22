@@ -46,6 +46,9 @@ func TestSlotsShowATakeoverIntent(t *testing.T) {
 	if err := inspectSlot(&inspect, checker, slot); err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(inspect.String(), "Volume: takeover intents required") {
+		t.Errorf("-inspect-slot does not show the volume's takeover intent flag:\n%s", inspect.String())
+	}
 	if !strings.Contains(list.String(), "being taken over by abcdef0123456789") {
 		t.Errorf("-list-slots does not show the intent:\n%s", list.String())
 	}
