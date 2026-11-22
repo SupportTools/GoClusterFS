@@ -82,6 +82,7 @@ func openLockedTreeFSNodeWithRegion(t *testing.T, path, lockPath string, slot in
 		dirMgr:     dir.NewManager(dev, inodeTbl, extentMgr, lm, treeFSDataOffset),
 		nodeUUID:   nodeUUID,
 		dataOffset: treeFSDataOffset,
+		blockSize:  BlockSize,
 	}
 }
 

@@ -230,6 +230,9 @@ func New(cfg *Config) (*FS, error) {
 	inodeTbl := inode.NewTable(dev, cfg.InodeOffset, cfg.InodeCount*inode.InodeSize, lockMgr, cfg.NodeUUID)
 
 	// Create extent manager
+	if cfg.BlockSize == 0 {
+		cfg.BlockSize = storage.DefaultBlockSize
+	}
 	extentMgr := extent.NewManager(dev, bitmapMgr, lockMgr, cfg.DataOffset, cfg.BlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 

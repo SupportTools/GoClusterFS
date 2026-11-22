@@ -44,6 +44,7 @@ func openTreeFS(t *testing.T, path string) *FS {
 		dirMgr:     dir.NewManager(dev, inodeTbl, extentMgr, nil, treeFSDataOffset),
 		nodeUUID:   nodeUUID,
 		dataOffset: treeFSDataOffset,
+		blockSize:  BlockSize,
 	}
 }
 

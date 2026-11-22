@@ -66,6 +66,7 @@ func createTestFS(t *testing.T) (*FS, func()) {
 		dirMgr:     dirMgr,
 		nodeUUID:   nodeUUID,
 		dataOffset: dataOffset,
+		blockSize:  BlockSize,
 		uid:        uint32(os.Getuid()),
 		gid:        uint32(os.Getgid()),
 	}
