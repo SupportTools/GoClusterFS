@@ -7,13 +7,14 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
-// AdoptOwner keeps the write claims of owner, a node proven dead whose
-// registry slot is ownerSlot, in place while owner's journal is replayed, and
-// returns their records. It writes each of owner's write slots, and any torn
-// slot in ownerSlot, again with the current time, so peers stay off those
-// records until ReleaseAdopted while this node's own acquires ignore them.
-// owner's read slots are cleared at once. Call it before the replay and pass
-// the result to ReleaseAdopted after it.
+// AdoptOwner keeps the write claims in ownerSlot, the registry slot of owner, a
+// node proven dead, in place while the slot's journal is replayed, and returns
+// their records. It writes each write slot there, and any torn one, again with
+// the current time, so peers stay off those records until ReleaseAdopted while
+// this node's own acquires ignore them. Read slots there are cleared at once.
+// That covers claims an earlier node of the slot left, such as a node killed
+// before a mount that registered in its slot stopped before its replay. Call it
+// before the replay and pass the result to ReleaseAdopted after it.
 func (m *Manager) AdoptOwner(owner [16]byte, ownerSlot int) ([]uint64, error) {
 	var adopted []uint64
 	for recordID := uint64(0); recordID < m.size/RowSize; recordID++ {
@@ -46,7 +47,7 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (b
 	}
 	dead, err := decodeSlot(buf.Bytes())
 	switch {
-	case err == nil && (dead == nil || dead.owner != owner):
+	case err == nil && (dead == nil || dead.owner == m.nodeUUID):
 		return false, nil
 	case err == nil && dead.mode != LockModeExclusive:
 		return false, m.writeSlot(recordID, ownerSlot, nil)
@@ -59,7 +60,7 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (b
 		return false, err
 	}
 	m.mu.Lock()
-	m.adopted[recordID] = adoptedSlot{slot: ownerSlot, owner: owner}
+	m.adopted[recordID] = adoptedSlot{slot: ownerSlot, owner: dead.owner}
 	m.mu.Unlock()
 	return true, nil
 }
