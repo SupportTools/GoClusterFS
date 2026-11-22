@@ -4353,14 +4353,20 @@ rekey_pause_case() {
 }
 
 # rekey_pause_cleanup stops VM $1's writer and mount, removes its map and logs out its second path, so the next case
-# mounts it afresh on its one plain session.
+# mounts it afresh on its one plain session. A relogged only path came back under another disk name while the map held
+# the old one, so it logs that session in again until the disk has the name the harness expects.
 rekey_pause_cleanup() {
     ssh_run "$1" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fence[d]'; true"
     if [[ -n "$(mount_pids "$1")" ]]; then
         crash_goclusterfs "$1"
     fi
     ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath 2>/dev/null
-        iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I p1 --logout > /dev/null 2>&1; true"
+        iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I p1 --logout > /dev/null 2>&1
+        if [ ! -b $(cluster_device) ]; then
+            iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I default --logout > /dev/null 2>&1
+            iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I default --login > /dev/null 2>&1
+            for t in \$(seq 20); do [ -b $(cluster_device) ] && break; sleep 1; done
+        fi; true"
 }
 
 # A fenced node on a one- or two-path dm-multipath map, paused with QEMU stop, resumes inside a peer's takeover, between
