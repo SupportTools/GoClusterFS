@@ -1,8 +1,13 @@
 package node
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"log"
+	"os"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -31,7 +36,7 @@ func newRejoinWorld(t *testing.T) *rejoinWorld {
 	w := &rejoinWorld{target: fence.NewLIOTarget(), dev: dev}
 	gone := NewRegistry(dev, 0)
 	w.earlier = &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: gone.LocalUUID(), HeartbeatSeq: 7,
-		HeartbeatTime: time.Now().Add(-2 * time.Second).Unix(), BootID: [16]byte{0xee}, JournalOffset: 5 << 20, JournalSize: 4 << 20}
+		HeartbeatTime: time.Now().Add(-30 * time.Second).Unix(), BootID: [16]byte{0xee}, JournalOffset: 5 << 20, JournalSize: 4 << 20}
 	copy(w.earlier.Hostname[:], "vm2")
 	w.key = fence.NodeKey(gone.LocalUUID())
 	for _, pr := range []*fence.PR{w.target.Node("vm2/2", w.key), w.target.Node("vm2/1", 0x47430000000000ff)} {
@@ -200,5 +205,32 @@ func TestJoinRegistersAnewAfterRevokingItsOwnOtherSession(t *testing.T) {
 	if *rejoins != 1 || !w.target.MayWrite("vm2/1") || w.target.MayWrite("vm9/1") {
 		t.Errorf("vm2 registered anew %d times, may write: %v, an unregistered host may write: %v; want one rejoin under the peer's reservation",
 			*rejoins, w.target.MayWrite("vm2/1"), w.target.MayWrite("vm9/1"))
+	}
+}
+
+// Two live nodes on different hosts that share a hostname: the second joins at once, since a slot under its hostname
+// whose heartbeat is recent is never taken for its own earlier mount, and it warns about the shared name.
+func TestLiveNodesSharingAHostnameJoinWithoutWaiting(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	t.Cleanup(cleanup)
+	first := NewRegistry(dev, 0)
+	if _, err := first.Register(context.Background(), "node"); err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	log.SetOutput(io.MultiWriter(os.Stderr, &logged))
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	second := NewRegistry(dev, 0)
+	second.bootID = [16]byte{0xbb}
+	start := time.Now()
+	slot, err := second.Register(context.Background(), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(start); took > time.Second || slot == first.localSlot {
+		t.Errorf("the second node joined slot %d after %v; want another slot than the first node's %d, at once", slot, took.Round(time.Millisecond), first.localSlot)
+	}
+	if !strings.Contains(logged.String(), "is live under this host's name") {
+		t.Error("the second node did not warn that a live node shares its hostname")
 	}
 }

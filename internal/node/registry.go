@@ -409,6 +409,7 @@ func (r *Registry) Register(ctx context.Context, hostname string) (int, error) {
 	// it back replays its journal before this mount serves. Its mount may still run, or another host may share the
 	// name, so it is watched first. A peer that takes it over during the watch revokes its key first, and the join
 	// after the watch registers this node's key after that revoke.
+	r.warnSharedHostname()
 	if own := r.ownHostSlots(); len(own) > 0 {
 		log.Printf("Registry slots %v hold an earlier mount on this host; waiting up to %v for a peer to take them over, or to take them over itself, before joining",
 			own, silentSlotWatch)
@@ -496,8 +497,7 @@ var silentSlotWatch = deadAfter
 
 // ownHostSlots returns the slots under this node's hostname whose mount it
 // cannot prove exited: one in another PID namespace on this boot, which a
-// restarted container left, one from another boot, or one whose heartbeat looks
-// old by this node's clock.
+// restarted container left, or one whose heartbeat looks old by this node's clock.
 func (r *Registry) ownHostSlots() []int {
 	var slots []int
 	for i := 0; i < MaxNodes; i++ {
@@ -505,11 +505,24 @@ func (r *Registry) ownHostSlots() []int {
 		if err != nil || (slot.State != NodeStateActive && slot.State != NodeStateLeaving) || slot.Host() != r.hostname {
 			continue
 		}
-		if r.sameHost(slot) && slot.PIDNamespace != r.pidNS || slot.BootID != r.bootID || heartbeatOlderThan(slot, HeartbeatTimeout) {
+		if r.sameHost(slot) && slot.PIDNamespace != r.pidNS || heartbeatOlderThan(slot, HeartbeatTimeout) {
 			slots = append(slots, i)
 		}
 	}
 	return slots
+}
+
+// warnSharedHostname logs each other node whose slot carries this node's hostname and a recent heartbeat. Register
+// counts a slot under its hostname whose heartbeat stopped as this host's earlier mount, so hosts need unique names.
+func (r *Registry) warnSharedHostname() {
+	for i := 0; i < MaxNodes; i++ {
+		_, slot, err := r.readSlotRaw(i)
+		if err == nil && (slot.State == NodeStateActive || slot.State == NodeStateLeaving) && slot.Host() == r.hostname &&
+			!heartbeatOlderThan(slot, HeartbeatTimeout) && !r.deadLocalOwner(slot) {
+			log.Printf("[WARN] Node %x in registry slot %d is live under this host's name %q: give every host its own hostname, "+
+				"as a mount takes a slot under its hostname whose heartbeat stopped for its own earlier mount", slot.UUID[:8], i, r.hostname)
+		}
+	}
 }
 
 // otherHostSlots returns the slots of other hosts' nodes whose heartbeat looks old by this node's clock.
