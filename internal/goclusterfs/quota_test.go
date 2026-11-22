@@ -54,7 +54,7 @@ func projectOf(t *testing.T, fsys *FS, num uint32) (uint32, bool) {
 // lifts the limits but keeps the project.
 func TestQuotaXattrMakesAProject(t *testing.T) {
 	t.Parallel()
-	fsys := openFormattedFS(t, newFormattedImage(t))
+	fsys := withBridge(openFormattedFS(t, newFormattedImage(t)))
 	ctx := context.Background()
 
 	pvc := mkdirIn(t, fsys, "pvc")
@@ -125,7 +125,7 @@ func TestQuotaXattrMakesAProject(t *testing.T) {
 // A snapshot's data counts against the project of the file it was taken of.
 func TestQuotaProjectsKeepTheirFiles(t *testing.T) {
 	t.Parallel()
-	fsys := openFormattedFS(t, newFormattedImage(t))
+	fsys := withBridge(openFormattedFS(t, newFormattedImage(t)))
 	ctx := context.Background()
 	a, b, plain := mkdirIn(t, fsys, "a"), mkdirIn(t, fsys, "b"), mkdirIn(t, fsys, "plain")
 	for _, d := range []*Dir{a, b} {
