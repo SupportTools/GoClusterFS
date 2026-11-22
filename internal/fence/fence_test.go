@@ -243,7 +243,7 @@ func TestPreemptStatusesFromBothTransports(t *testing.T) {
 }
 
 // scripted answers each command with the next raw status of its list, as the kernel returns them.
-type scripted struct{ registers, preempts []uintptr }
+type scripted struct{ registers, preempts, clears []uintptr }
 
 func (d *scripted) next(statuses *[]uintptr) error {
 	r := (*statuses)[0]
@@ -255,7 +255,7 @@ func (d *scripted) register(uint64, uint64, bool) error      { return d.next(&d.
 func (d *scripted) reserve(uint64) error                     { return nil }
 func (d *scripted) preemptAbort(uint64, uint64) error        { return d.next(&d.preempts) }
 func (d *scripted) preempt(uint64, uint64) error             { return nil }
-func (d *scripted) clear(uint64) error                       { return nil }
+func (d *scripted) clear(uint64) error                       { return d.next(&d.clears) }
 func (d *scripted) readKeys() ([]uint64, error)              { return nil, nil }
 func (d *scripted) readReservation() (uint64, uint32, error) { return 0, 0, nil }
 
@@ -286,6 +286,17 @@ func TestUnitAttentionAfterAPreemptReadsAsFenced(t *testing.T) {
 	defer func() { _ = f.Close() }()
 	if _, ok := Block(f, 1).dev.(retrying); !ok {
 		t.Error("Block does not send a command again after status 0x2")
+	}
+}
+
+// A clear that gets status 0x2 is not sent again: a repeat after a clear that worked would meet a conflict.
+func TestClearIsSentOnce(t *testing.T) {
+	dev := &scripted{registers: []uintptr{0}, clears: []uintptr{0x02, 0}}
+	if err := (&PR{dev: retrying{device: dev}, key: 1}).Clear(); !errors.Is(err, statusError(statusIOError)) {
+		t.Errorf("Clear answered 0x2: %v, want status 0x2", err)
+	}
+	if len(dev.clears) != 1 {
+		t.Errorf("sent %d clears, want 1", 2-len(dev.clears))
 	}
 }
 
