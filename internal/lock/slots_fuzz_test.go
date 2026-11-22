@@ -168,14 +168,18 @@ func checkRowWrites(t *testing.T, dir string, row []byte, self, ownerSlot int) {
 			t.Fatalf("AdoptOwner for slot %d changed slot %d", ownerSlot, slot)
 		}
 	}
+	writer := fuzzDeadOwner
+	if before, err := decodeSlot(rowSlot(row, ownerSlot)); err == nil && before != nil {
+		writer = before.owner
+	}
 	s, err := decodeSlot(rowSlot(after, ownerSlot))
 	switch {
 	case err != nil:
 		t.Fatalf("AdoptOwner left slot %d torn: %v", ownerSlot, err)
-	case len(adopted) == 1 && (s == nil || !s.adopted || s.mode != LockModeExclusive || s.owner != fuzzDeadOwner):
+	case len(adopted) == 1 && (s == nil || !s.adopted || s.mode != LockModeExclusive || s.owner != writer || s.owner == m.nodeUUID):
 		t.Fatalf("AdoptOwner kept record 0 but slot %d holds %+v", ownerSlot, s)
-	case len(adopted) == 0 && s != nil && s.owner == fuzzDeadOwner:
-		t.Fatalf("AdoptOwner left the dead node's claim in slot %d without keeping it: %+v", ownerSlot, s)
+	case len(adopted) == 0 && s != nil && s.owner != m.nodeUUID:
+		t.Fatalf("AdoptOwner left another node's claim in slot %d without keeping it: %+v", ownerSlot, s)
 	}
 	if err := m.ReleaseAdopted(adopted); err != nil {
 		t.Fatalf("ReleaseAdopted: %v", err)
