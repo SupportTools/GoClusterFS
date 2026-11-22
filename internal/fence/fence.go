@@ -20,7 +20,7 @@ var (
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
-	errKeysUnlisted = errors.New("this kernel or device cannot list the registered keys")
+	errKeysUnlisted        = errors.New("this kernel or device cannot list the registered keys")
 	// ErrNoOtherRegistrant means no other node's key is registered, so dropping this node's could release the reservation.
 	ErrNoOtherRegistrant = errors.New("no other node's key is registered, so dropping this node's could release the reservation")
 )
