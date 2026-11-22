@@ -137,12 +137,14 @@ scenarios() {
     on "$P" "prpoc $pd $KP clear"
 }
 
-# pause_case BINARY runs the QEMU-stop pause with -fencing=pr: node N on a two-path map writes A, is stopped until the
-# peer replays it and writes B, and is resumed. The file must keep B.
+# pause_case BINARY [window] runs the QEMU-stop pause with -fencing=pr: node N on a two-path map writes A, is stopped
+# until the peer replays it and writes B, and is resumed. The file must keep B. With window, the peer holds its takeover
+# 15s between the preempt and the Dead mark, and N resumes as soon as the peer revoked it, inside that window.
 pause_case() {
-    local bin=$1 pd uuid stopped mon byte
+    local bin=$1 window=${2:-} pd uuid stopped mon byte peer_env=""
+    [[ -n "$window" ]] && peer_env="GOCLUSTERFS_POC_TAKEOVER_DELAY=15s"
     mon=$(get_vm_monitor_socket "$N")
-    say "QEMU-stop pause with -fencing=pr, $bin"
+    say "QEMU-stop pause with -fencing=pr, $bin${window:+, resumed inside the takeover window}"
     logout_all "$N"
     logout_all "$P"
     login "$N" 2 > /dev/null
@@ -151,11 +153,12 @@ pause_case() {
     pd=$(peer_disk)
     on "$P" "prpoc $pd $KP clear > /dev/null; prpoc $pd $KP unregister > /dev/null; true"
     for vm in $N $P; do
-        ssh_run "$vm" "pkill -f goclusterfs-moun[t]; sleep 1; fusermount3 -uz $MNT 2> /dev/null; mkdir -p $MNT; rm -f /var/log/goclusterfs.log; cp /usr/local/bin/$bin /usr/local/bin/goclusterfs-mount"
+        ssh_run "$vm" "pkill -f goclusterfs-moun[t]; sleep 1; fusermount3 -uz $MNT 2> /dev/null; mkdir -p $MNT; rm -f /var/log/goclusterfs.log; true"
+        ssh_run "$vm" "cp /usr/local/bin/$bin /usr/local/bin/goclusterfs-mount"
     done
     ssh_run "$N" "nohup /usr/local/bin/goclusterfs-mount -device $MAP -mount $MNT -format -fencing=pr > /var/log/goclusterfs.log 2>&1 < /dev/null &"
     ssh_run "$N" "for t in \$(seq 1 60); do mountpoint -q $MNT && exit 0; sleep 1; done; tail -5 /var/log/goclusterfs.log; exit 1" || return 1
-    ssh_run "$P" "nohup /usr/local/bin/goclusterfs-mount -device $pd -mount $MNT > /var/log/goclusterfs.log 2>&1 < /dev/null &"
+    ssh_run "$P" "nohup env $peer_env /usr/local/bin/goclusterfs-mount -device $pd -mount $MNT > /var/log/goclusterfs.log 2>&1 < /dev/null &"
     ssh_run "$P" "for t in \$(seq 1 60); do mountpoint -q $MNT && exit 0; sleep 1; done; tail -5 /var/log/goclusterfs.log; exit 1" || return 1
     uuid=$(ssh_run "$N" "grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' /var/log/goclusterfs.log | tail -1" | grep -o '[0-9a-f]*$')
     ssh_run "$P" "head -c 4096 /dev/zero | tr '\\000' 0 > $MNT/paused && sync"
@@ -165,10 +168,25 @@ pause_case() {
     echo stop | nc -U -q1 "$mon" > /dev/null
     stopped=$(date +%s)
     local waited=0
+    if [[ -n "$window" ]]; then
+        until ssh_run "$P" "grep -q 'Revoked node ${uuid:0:8}' /var/log/goclusterfs.log"; do
+            if [[ $waited -ge 120 ]]; then
+                say "no revoke of ${uuid:0:8} within 120s"
+                echo cont | nc -U -q1 "$mon" > /dev/null
+                return 1
+            fi
+            sleep 0.5
+            waited=$((waited + 1))
+        done
+        echo cont | nc -U -q1 "$mon" > /dev/null
+        say "peer revoked node ${uuid:0:8}; resumed it $(( $(date +%s) - stopped ))s after the stop, inside the takeover window"
+        waited=0
+    fi
     until ssh_run "$P" "grep -q 'Starting journal replay for node ${uuid:0:8}' /var/log/goclusterfs.log && grep -q 'Recovery\] Completed\|Journal is clean' /var/log/goclusterfs.log"; do
         if [[ $waited -ge 120 ]]; then
             say "no replay of ${uuid:0:8} within 120s"
             echo cont | nc -U -q1 "$mon" > /dev/null
+            pause_end
             return 1
         fi
         sleep 2
@@ -177,12 +195,19 @@ pause_case() {
     say "peer replayed node ${uuid:0:8} $(( $(date +%s) - stopped ))s after the stop"
     sleep 3
     on "$P" "dd if=/tmp/paused.B of=$MNT/paused bs=4096 count=1 conv=notrunc,fsync 2>/dev/null; echo 3 > /proc/sys/vm/drop_caches; dd if=$MNT/paused iflag=direct bs=4096 count=1 2>/dev/null | head -c 1; echo ' (peer reads after its write)'"
-    echo cont | nc -U -q1 "$mon" > /dev/null
-    say "resumed $(( $(date +%s) - stopped ))s after the stop"
+    [[ -z "$window" ]] && echo cont | nc -U -q1 "$mon" > /dev/null
+    say "resumed or running $(( $(date +%s) - stopped ))s after the stop"
     sleep 15
     byte=$(ssh_run "$P" "echo 3 > /proc/sys/vm/drop_caches; dd if=$MNT/paused iflag=direct bs=4096 count=1 2>/dev/null | head -c 1")
-    say "15s after the resume the file starts with '$byte'; node mount $(ssh_run "$N" "pgrep -f goclusterfs-moun[t] > /dev/null && echo running || echo stopped")"
+    say "15s after the resume the file starts with '$byte'"
+    pause_end
+}
+
+# pause_end logs both nodes' fencing and recovery lines and stops both mounts.
+pause_end() {
+    say "node mount $(ssh_run "$N" "pgrep -f goclusterfs-moun[t] > /dev/null && echo running || echo stopped")"
     on "$N" "grep -E 'Fencing|registry slot|refused|re-register' /var/log/goclusterfs.log | tail -8"
+    on "$P" "grep -E 'Recovery|POC|Revoked' /var/log/goclusterfs.log | tail -8"
     ssh_run "$N" "pkill -f 'of=$MNT/pause[d]'; pkill -9 -f goclusterfs-moun[t]; sleep 1; fusermount3 -uz $MNT 2> /dev/null; true"
     ssh_run "$P" "fusermount3 -u $MNT; sleep 3; pkill -9 -f goclusterfs-moun[t]; true"
 }
@@ -202,4 +227,6 @@ scenarios 1
 scenarios 2
 pause_case goclusterfs-mount.poc
 pause_case goclusterfs-mount.rekey
+pause_case goclusterfs-mount.poc window
+pause_case goclusterfs-mount.rekey window
 say "done"

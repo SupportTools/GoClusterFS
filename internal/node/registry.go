@@ -1378,6 +1378,10 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		log.Printf("[Recovery] Not recovering slot %d: %v", slotIdx, err)
 		return nil, err
 	}
+	if d, err := time.ParseDuration(os.Getenv("GOCLUSTERFS_POC_TAKEOVER_DELAY")); err == nil {
+		log.Printf("[WARN] POC: holding the takeover of slot %d for %v between the preempt and the Dead mark", slotIdx, d)
+		time.Sleep(d)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
