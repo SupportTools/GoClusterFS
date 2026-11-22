@@ -215,8 +215,13 @@ func TestRegisterRefusesNextToAnotherTakeoverProtocol(t *testing.T) {
 		if err := live.StartHeartbeat(); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := joining.Register(ctx, "joining"); !errors.Is(err, ErrLockLayout) {
+		_, err := joining.Register(ctx, "joining")
+		if !errors.Is(err, ErrLockLayout) {
 			t.Errorf("newer build live %v: Register = %v, want ErrLockLayout", newerLive, err)
+		}
+		// Joining next to an older live node, this build names the takeover protocol.
+		if !newerLive && err != nil && !strings.Contains(err.Error(), "without marking an intent") {
+			t.Errorf("Register = %v, want it to name the takeover protocol", err)
 		}
 		_ = live.Unregister(ctx)
 		cleanup()

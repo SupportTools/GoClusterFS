@@ -24,6 +24,9 @@ func SetRecoveryLease(d time.Duration) (restore func()) {
 // it counts the slot's node as dead rather than slow, and replays it.
 const deadAfter = 2 * HeartbeatTimeout
 
+// DeadAfter is how long peers watch a slot unchanged before they take it over.
+const DeadAfter = deadAfter
+
 // stallLimit is how long a node may go without a heartbeat and still write: one failure scan short of deadAfter.
 const stallLimit = deadAfter - FailureCheckInterval
 

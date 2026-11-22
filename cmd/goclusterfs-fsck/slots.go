@@ -61,8 +61,8 @@ func printSlots(out io.Writer, checker *fsck.Checker) error {
 		state, host, uuid := "unreadable: "+fmt.Sprint(s.Err), "-", "-"
 		if s.Slot != nil {
 			state = s.Slot.State.String()
-			if s.Slot.State != node.NodeStateDead && s.Slot.RecoveryOwner != [16]byte{} {
-				state += fmt.Sprintf(", revoked by %x", s.Slot.RecoveryOwner[:8])
+			if owner, _, ok := s.Slot.Intent(); ok {
+				state += fmt.Sprintf(", being taken over by %x", owner[:8])
 			}
 			host = strings.TrimRight(string(s.Slot.Hostname[:]), "\x00")
 			uuid = fmt.Sprintf("%x", s.Slot.UUID[:8])
@@ -220,13 +220,12 @@ func inspectSlot(out io.Writer, checker *fsck.Checker, i int) error {
 		if sl.State != node.NodeStateEmpty {
 			p.printf("  mounted %s, last heartbeat %s, boot %x, pid %d\n", unixTime(sl.MountTime), unixTime(sl.HeartbeatTime), sl.BootID[:8], sl.PID)
 		}
-		switch {
-		case sl.RecoveryOwner == [16]byte{}:
-		case sl.State == node.NodeStateDead:
+		if owner, marked, ok := sl.Intent(); ok {
+			p.printf("  node %x began taking it over %s: it marked the slot, then revokes the node's key and marks it Dead; "+
+				"if it stopped, another node takes the slot over once it stays unchanged for %v\n",
+				owner[:8], unixTime(marked.Unix()), node.DeadAfter)
+		} else if sl.RecoveryOwner != ([16]byte{}) {
 			p.printf("  journal replay lease held by node %x, last renewed %s\n", sl.RecoveryOwner[:8], unixTime(sl.RecoveryStart))
-		default:
-			p.printf("  node %x began taking it over %s: it marked the slot, then revokes the node's key and marks it Dead\n",
-				sl.RecoveryOwner[:8], unixTime(sl.RecoveryStart))
 		}
 		if len(sl.Orphans) > 0 {
 			p.printf("  %d unlinked files it may still have open, inodes %s\n", len(sl.Orphans), orphanInodes(sl.Orphans))

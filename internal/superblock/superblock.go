@@ -52,13 +52,19 @@ const (
 	// without fencing, which could neither write nor be fenced, must not mount the volume.
 	RequiredReservations uint64 = 1 << 7
 
+	// RequiredTakeoverIntent means a node marks its intent in a node's slot before it revokes that node's key, and a
+	// node re-registers a lost key only when its slot shows no intent. Builds without it, fsck included, revoke
+	// without an intent, so they must not mount or repair the volume.
+	RequiredTakeoverIntent uint64 = 1 << 8
+
 	// RequiredLockLayout is the lock record layout of this build.
 	RequiredLockLayout = RequiredTypedLockRecords | RequiredFileIOLocks
 )
 
 // FlagsWeSupport defines which required flags this version understands.
 // Update this as new features are implemented.
-var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks | RequiredReservations
+var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks | RequiredReservations |
+	RequiredTakeoverIntent
 
 // Errors
 var (

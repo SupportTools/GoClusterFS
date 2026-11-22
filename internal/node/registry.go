@@ -461,6 +461,11 @@ func (r *Registry) checkLockLayouts() error {
 	}
 	for _, i := range other {
 		if _, s, err := r.readSlotRaw(i); err == nil && !silent[i] && differs(s) {
+			if s.LockLayout^r.lockLayout == takeoverProtocol {
+				return fmt.Errorf("%w: node %s in slot %d (%x) takes nodes over without marking an intent in their slot first, "+
+					"as builds before takeover intents do; unmount every node of that build before mounting this one",
+					ErrLockLayout, s.Host(), i, s.UUID[:8])
+			}
 			return fmt.Errorf("%w: node %s in slot %d (%x) has lock layout %08x, this build %08x",
 				ErrLockLayout, s.Host(), i, s.UUID[:8], s.LockLayout, r.lockLayout)
 		}
@@ -1722,6 +1727,15 @@ func (r *Registry) HeartbeatAge() time.Duration {
 }
 
 // TakenOver reports whether a peer marked the slot Dead or wrote its intent to take the slot's node over.
+// Intent returns the node that marked this live slot to take it over and when it marked it; ok is false for a slot
+// no node marked. The marking node preempts the slot's node next, then marks the slot Dead.
+func (s *Slot) Intent() (owner [16]byte, marked time.Time, ok bool) {
+	if (s.State != NodeStateActive && s.State != NodeStateLeaving) || s.RecoveryOwner == ([16]byte{}) {
+		return owner, marked, false
+	}
+	return s.RecoveryOwner, time.Unix(s.RecoveryStart, 0), true
+}
+
 func (s *Slot) TakenOver() bool {
 	return s.State == NodeStateDead || s.RecoveryOwner != [16]byte{}
 }

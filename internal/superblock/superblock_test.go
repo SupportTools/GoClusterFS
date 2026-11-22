@@ -473,3 +473,21 @@ func TestReservationsFlagIsOptionalButKnown(t *testing.T) {
 		t.Errorf("a build without fencing mounting a fenced volume: %v, want ErrUnknownRequired", err)
 	}
 }
+
+// A volume formatted now carries RequiredTakeoverIntent, so a build from before takeover intents, whose fsck would
+// revoke a node without marking an intent first, refuses to mount or check it.
+func TestBuildsWithoutTakeoverIntentsRefuseANewVolume(t *testing.T) {
+	sb := New(1<<30, 0)
+	if sb.RequiredFlags&RequiredTakeoverIntent == 0 {
+		t.Fatal("a new volume lacks RequiredTakeoverIntent")
+	}
+	if err := sb.CanMount(); err != nil {
+		t.Fatalf("this build refuses its own volume: %v", err)
+	}
+	saved := FlagsWeSupport
+	t.Cleanup(func() { FlagsWeSupport = saved })
+	FlagsWeSupport &^= RequiredTakeoverIntent
+	if err := sb.CanMount(); !errors.Is(err, ErrUnknownRequired) {
+		t.Errorf("a build without takeover intents: CanMount = %v, want ErrUnknownRequired", err)
+	}
+}
