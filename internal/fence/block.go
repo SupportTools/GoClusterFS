@@ -195,6 +195,29 @@ func (d blockDevice) clear(key uint64) error {
 }
 
 func (d blockDevice) readKeys() ([]uint64, error) {
+	keys, err := d.listKeys()
+	if errors.Is(err, ErrUnsupported) && !d.partition {
+		return d.passthrough().readKeys()
+	}
+	return keys, err
+}
+
+func (d blockDevice) readReservation() (key uint64, typ uint32, err error) {
+	key, typ, err = d.readHeldReservation()
+	if errors.Is(err, ErrUnsupported) && !d.partition {
+		return d.passthrough().readReservation()
+	}
+	return key, typ, err
+}
+
+func (d blockDevice) passthrough() passthrough {
+	return passthrough{ioctl: func(req uintptr, arg unsafe.Pointer) (uintptr, syscall.Errno) {
+		r, _, errno := syscall.Syscall(syscall.SYS_IOCTL, d.f.Fd(), req, uintptr(arg))
+		return r, errno
+	}}
+}
+
+func (d blockDevice) listKeys() ([]uint64, error) {
 	keys := make([]uint64, maxListedKeys)
 	list := keyList{count: maxListedKeys, keys: uint64(uintptr(unsafe.Pointer(&keys[0])))}
 	err := unlistable(d.ioctl(iocReadKeys, unsafe.Pointer(&list)))
@@ -208,7 +231,7 @@ func (d blockDevice) readKeys() ([]uint64, error) {
 	return keys[:list.count], nil
 }
 
-func (d blockDevice) readReservation() (key uint64, typ uint32, err error) {
+func (d blockDevice) readHeldReservation() (key uint64, typ uint32, err error) {
 	var r reservationState
 	if err := unlistable(d.ioctl(iocReadResv, unsafe.Pointer(&r))); err != nil {
 		return 0, 0, err
