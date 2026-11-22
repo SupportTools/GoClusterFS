@@ -54,7 +54,7 @@ func createTestFS(t *testing.T) (*FS, func()) {
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 

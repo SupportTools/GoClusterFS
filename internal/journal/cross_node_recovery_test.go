@@ -54,7 +54,7 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
@@ -590,7 +590,7 @@ func TestApplyExtentAddIntoTree(t *testing.T) {
 	}
 
 	// Read back through a fresh extent manager, as after a remount.
-	mgr := extent.NewManager(rctx.Dev, rctx.BitmapMgr, nil, 3<<20)
+	mgr := extent.NewManager(rctx.Dev, rctx.BitmapMgr, nil, 3<<20, storage.DefaultBlockSize)
 	ino, err = rctx.InodeTbl.Read(51)
 	if err != nil {
 		t.Fatal(err)

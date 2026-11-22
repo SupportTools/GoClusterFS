@@ -99,7 +99,7 @@ func newWorkerEnv(t *testing.T) *workerEnv {
 	if err := env.reg.Initialize(env.ctx); err != nil {
 		t.Fatalf("initialize registry: %v", err)
 	}
-	env.ext = extent.NewManager(dev, env.bm, nil, 0)
+	env.ext = extent.NewManager(dev, env.bm, nil, 0, storage.DefaultBlockSize)
 	env.ext.SetRefcounts(env.refs)
 	env.tbl.SetTreeFlusher(env.ext)
 
@@ -268,7 +268,7 @@ func TestWorkerQueueDeleteJob(t *testing.T) {
 	snap := env.snapshot(file, "test-snap", StateActive)
 
 	// The file lets go of its last two blocks; only the snapshot holds them now.
-	if err := env.ext.Truncate(env.ctx, file, extent.BlockSize); err != nil {
+	if err := env.ext.Truncate(env.ctx, file, storage.DefaultBlockSize); err != nil {
 		t.Fatal(err)
 	}
 	env.write(file)

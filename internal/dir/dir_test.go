@@ -67,7 +67,7 @@ func testSetup(t *testing.T) (context.Context, *Manager, *inode.Table, func()) {
 	dataOffset := uint64(10 * 1024 * 1024)
 
 	// Create extent manager (nil lockMgr for unit tests)
-	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 
 	// Create directory manager (nil lockMgr for unit tests)
@@ -92,10 +92,6 @@ func TestConstants(t *testing.T) {
 
 	if MaxNameLen != 255 {
 		t.Errorf("MaxNameLen = %d, want 255", MaxNameLen)
-	}
-
-	if BlockSize != extent.BlockSize {
-		t.Errorf("BlockSize = %d, want %d", BlockSize, extent.BlockSize)
 	}
 }
 
@@ -685,7 +681,7 @@ func BenchmarkLookup(b *testing.B) {
 	bm := bitmap.NewRegion(dev, 2*1024*1024, 100, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, 3*1024*1024, 100*inode.InodeSize, nil, nodeUUID)
 	dataOffset := uint64(10 * 1024 * 1024)
-	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
@@ -742,7 +738,7 @@ func BenchmarkAdd(b *testing.B) {
 	bm := bitmap.NewRegion(dev, 2*1024*1024, 1000, nil, nodeUUID) // More blocks for benchmark
 	inodeTbl := inode.NewTable(dev, 3*1024*1024, 100*inode.InodeSize, nil, nodeUUID)
 	dataOffset := uint64(10 * 1024 * 1024)
-	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
@@ -788,7 +784,7 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 	bm := bitmap.NewRegion(dev, 2<<20, 100, lockMgr, nodeUUID)
 	inodeTbl := inode.NewTable(dev, 3<<20, 100*inode.InodeSize, lockMgr, nodeUUID)
 	dataOffset := uint64(10 << 20)
-	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 
@@ -836,7 +832,7 @@ func TestDirectoryGrowsPastInlineExtentsUnderLocks(t *testing.T) {
 	}
 	// A copy read before the last commits points at rewritten tree nodes; a
 	// manager with an empty cache has to fall back to the current inode.
-	remounted := NewManager(dev, inodeTbl, extent.NewManager(dev, bm, lockMgr, dataOffset), lockMgr, dataOffset)
+	remounted := NewManager(dev, inodeTbl, extent.NewManager(dev, bm, lockMgr, dataOffset, storage.DefaultBlockSize), lockMgr, dataOffset)
 	if num, _, err := remounted.Lookup(ctx, stale, "entry-5"); err != nil || num != 55 {
 		t.Fatalf("lookup through a stale directory inode: inode %d, %v", num, err)
 	}

@@ -14,7 +14,6 @@ import (
 // DefaultIndexEntries is how many names a mount keeps in directory indexes by default.
 const DefaultIndexEntries = 1 << 20
 
-const chunksPerBlock = BlockSize / DirChunkSize
 
 // slot is where a name lives; chunk counts 4 KB chunks from the directory's first block.
 type slot struct {
@@ -202,6 +201,10 @@ func (m *Manager) cachedLookup(num uint32, name string) (s slot, found, ok bool)
 	return s, found, ok
 }
 
+func (m *Manager) chunksPerBlock() uint64 {
+	return m.blockSize / DirChunkSize
+}
+
 // indexOf returns the index of dirIno, read under the directory lock, rebuilding it unless the cached one is current.
 func (m *Manager) indexOf(dirIno *inode.Inode) (*index, error) {
 	if x := m.indexes.get(dirIno.InodeNum); x != nil && x.validAt(dirIno.MetaGeneration) {
@@ -218,7 +221,7 @@ func (m *Manager) indexOf(dirIno *inode.Inode) (*index, error) {
 // scan reads every block of dirIno, read under the directory lock, into an index and a list in disk order.
 func (m *Manager) scan(dirIno *inode.Inode) (*index, []DirEntry, error) {
 	m.indexes.rebuilds.Add(1)
-	blocks := extent.BlocksForSize(dirIno.Size)
+	blocks := m.extentMgr.BlocksForSize(dirIno.Size)
 	if total := m.extentMgr.TotalBlocks(); total > 0 && blocks > total {
 		return nil, nil, fmt.Errorf("%w: directory %d is %d bytes, more than the data region holds", extent.ErrBlockOutOfRange, dirIno.InodeNum, dirIno.Size)
 	}
@@ -226,7 +229,7 @@ func (m *Manager) scan(dirIno *inode.Inode) (*index, []DirEntry, error) {
 		num:   dirIno.InodeNum,
 		gen:   dirIno.MetaGeneration,
 		names: map[string]slot{},
-		room:  make([]uint16, blocks*chunksPerBlock),
+		room:  make([]uint16, blocks*m.chunksPerBlock()),
 	}
 	var entries []DirEntry
 	for block := uint64(0); block < blocks; block++ {
@@ -241,9 +244,9 @@ func (m *Manager) scan(dirIno *inode.Inode) (*index, []DirEntry, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		for c := range uint64(chunksPerBlock) {
+		for c := range m.chunksPerBlock() {
 			chunk := data[c*DirChunkSize : (c+1)*DirChunkSize]
-			at := uint32(block*chunksPerBlock + c)
+			at := uint32(block*m.chunksPerBlock() + c)
 			x.room[at] = chunkRoom(chunk)
 			walkChunk(chunk, func(_ int, e *DirEntry) bool {
 				if e.InodeNum != 0 {
@@ -289,11 +292,11 @@ func (m *Manager) rewriteChunk(dirIno *inode.Inode, x *index, at uint32, edit fu
 }
 
 func (m *Manager) changeChunk(dirIno *inode.Inode, x *index, at uint32, edit func(chunk []byte) bool, update func(names map[string]slot), writeInode func() error) (changed bool, err error) {
-	physBlock, err := m.physicalBlock(dirIno, uint64(at/chunksPerBlock))
+	physBlock, err := m.physicalBlock(dirIno, uint64(at)/m.chunksPerBlock())
 	if err != nil {
 		return false, err
 	}
-	start := int(at%chunksPerBlock) * DirChunkSize
+	start := int(uint64(at)%m.chunksPerBlock()) * DirChunkSize
 	chunk, err := m.readChunk(physBlock, start)
 	if err != nil {
 		return false, err

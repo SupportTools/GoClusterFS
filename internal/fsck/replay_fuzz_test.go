@@ -91,7 +91,7 @@ func newReplayContext(dev *storage.Device) *journal.RecoveryContext {
 	var uuid [16]byte
 	bm := bitmap.NewRegion(dev, fuzzBitmap, fuzzBlocks, nil, uuid)
 	tbl := inode.NewTable(dev, fuzzInodes, testLayout.InodeTableSize, nil, uuid)
-	mgr := extent.NewManager(dev, bm, nil, fuzzDataOffset)
+	mgr := extent.NewManager(dev, bm, nil, fuzzDataOffset, storage.DefaultBlockSize)
 	tbl.SetTreeFlusher(mgr)
 	mgr.SetRefcounts(refcount.NewRegion(dev, fuzzRefcounts, refcount.SizeForBlocks(fuzzBlocks), fuzzBlocks, nil))
 	return &journal.RecoveryContext{Dev: dev, InodeTbl: tbl, BitmapMgr: bm, DirMgr: dir.NewManager(dev, tbl, mgr, nil, fuzzDataOffset), ExtentMgr: mgr}

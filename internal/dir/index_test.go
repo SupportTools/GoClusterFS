@@ -45,7 +45,7 @@ func newNodes(t *testing.T, n int) ([]*Manager, *inode.Inode) {
 		t.Cleanup(lockMgr.ReleaseCached)
 		bm := bitmap.NewRegion(dev, 2<<20, 100, lockMgr, nodeUUID)
 		inodeTbl := inode.NewTable(dev, testInodeOffset, 100*inode.InodeSize, lockMgr, nodeUUID)
-		extentMgr := extent.NewManager(dev, bm, lockMgr, testDataOffset)
+		extentMgr := extent.NewManager(dev, bm, lockMgr, testDataOffset, storage.DefaultBlockSize)
 		inodeTbl.SetTreeFlusher(extentMgr)
 		managers = append(managers, NewManager(dev, inodeTbl, extentMgr, lockMgr, testDataOffset))
 	}

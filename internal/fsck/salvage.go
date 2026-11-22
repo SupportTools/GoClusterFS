@@ -84,7 +84,7 @@ func (c *Checker) replayContext() *journal.RecoveryContext {
 	var uuid [16]byte
 	bm := bitmap.NewRegion(c.dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, uuid)
 	tbl := inode.NewTable(c.dev, sb.InodeTableOffset, sb.InodeTableSize, nil, uuid)
-	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset)
+	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset, uint64(sb.BlockSize))
 	mgr.SetRefcounts(refcount.NewRegion(c.dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, nil))
 	tbl.SetTreeFlusher(mgr)
 	return &journal.RecoveryContext{Dev: c.dev, InodeTbl: tbl, BitmapMgr: bm, DirMgr: dir.NewManager(c.dev, tbl, mgr, nil, sb.DataRegionOffset), ExtentMgr: mgr}

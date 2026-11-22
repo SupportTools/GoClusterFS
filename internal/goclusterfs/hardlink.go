@@ -53,7 +53,7 @@ func (f *FS) link(ctx context.Context, parent *fs.Inode, parentNum uint32, targe
 		Ino:  uint64(file.inodeNum),
 		Gen:  ino.BirthGeneration,
 	})
-	fillEntryOut(out, ino)
+	fillEntryOut(out, ino, f.blockSize)
 	return ch, 0
 }
 

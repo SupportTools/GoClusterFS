@@ -10,7 +10,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 )
@@ -555,7 +554,7 @@ func (m *Manager) grow(ctx context.Context, num uint32, need uint16) error {
 		err = m.appendBlock(ctx, fresh,
 			func(next uint64) (*inode.Inode, bool, error) {
 				cur, err := m.liveDirLocked(num)
-				if err != nil || extent.BlocksForSize(cur.Size) <= next {
+				if err != nil || m.extentMgr.BlocksForSize(cur.Size) <= next {
 					return cur, false, err
 				}
 				x, err := m.indexOf(cur)

@@ -34,7 +34,7 @@ func openTreeFS(t *testing.T, path string) *FS {
 	copy(nodeUUID[:], "testnode12345678")
 	bm := bitmap.NewRegion(dev, treeFSBitmapOffset, treeFSDataBlocks, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, treeFSInodeOffset, 4096*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil, treeFSDataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, treeFSDataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	return &FS{
 		dev:        dev,

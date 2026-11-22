@@ -3,11 +3,11 @@ package extent
 // Overflow extent tree.
 //
 // An inode that needs more than MaxInlineExtents extents keeps all of them in a
-// tree of 1MB nodes taken from the block bitmap. At depth 1 the root is a leaf;
+// tree of nodes, one data block each, taken from the block bitmap. At depth 1 the root is a leaf;
 // at depth 2 the root is an index whose children are leaves. Each extent lies
 // inside the key range of exactly one leaf.
 //
-// A node block has two 512KB halves. Generation g of a node lives in half g&1,
+// A node block has two halves. Generation g of a node lives in half g&1,
 // so writing a new generation never touches the committed copy. The inode
 // records the root block and generation; index entries record each leaf's
 // generation. Edits stay in inode.PendingTree until inode.Table writes the
@@ -33,12 +33,8 @@ const (
 	LevelLeaf  uint16 = 0
 	LevelIndex uint16 = 1
 
-	nodeHalfSize   = BlockSize / 2
 	nodeHeaderSize = 64
 	nodeEntrySize  = 32
-
-	// MaxNodeEntries is the number of extents (leaf) or children (index) a node holds.
-	MaxNodeEntries = (nodeHalfSize - nodeHeaderSize) / nodeEntrySize
 
 	// Every commit rewrites each changed leaf, so leaves split well below
 	// MaxNodeEntries to keep that write at 64KB.
@@ -81,9 +77,19 @@ func (n *TreeNode) count() int {
 	return len(n.Children)
 }
 
+// nodeHalfSize is the size of each of a tree node's two halves: a node is one data block.
+func nodeHalfSize(blockSize uint64) uint64 {
+	return blockSize / 2
+}
+
+// MaxNodeEntries is the number of extents (leaf) or children (index) a node holds at this block size.
+func MaxNodeEntries(blockSize uint64) int {
+	return int((nodeHalfSize(blockSize) - nodeHeaderSize) / nodeEntrySize)
+}
+
 // TreeNodeOffset returns the device offset of the half that holds generation gen.
-func TreeNodeOffset(dataOffset, block, gen uint64) int64 {
-	return int64(dataOffset + block*BlockSize + (gen&1)*nodeHalfSize)
+func TreeNodeOffset(dataOffset, blockSize, block, gen uint64) int64 {
+	return int64(dataOffset + block*blockSize + (gen&1)*nodeHalfSize(blockSize))
 }
 
 func treeNodeSize(count int) int {
@@ -91,7 +97,7 @@ func treeNodeSize(count int) int {
 	return (n + storage.SectorSize - 1) &^ (storage.SectorSize - 1)
 }
 
-func treeNodeHeader(buf []byte) (level uint16, inodeNum uint32, count int, gen uint64, err error) {
+func treeNodeHeader(buf []byte, maxEntries int) (level uint16, inodeNum uint32, count int, gen uint64, err error) {
 	if len(buf) < nodeHeaderSize {
 		return 0, 0, 0, 0, fmt.Errorf("%w: short header", ErrCorruptTree)
 	}
@@ -106,15 +112,15 @@ func treeNodeHeader(buf []byte) (level uint16, inodeNum uint32, count int, gen u
 		return 0, 0, 0, 0, fmt.Errorf("%w: bad level %d", ErrCorruptTree, level)
 	}
 	count = int(binary.LittleEndian.Uint32(buf[12:16]))
-	if count > MaxNodeEntries {
+	if count > maxEntries {
 		return 0, 0, 0, 0, fmt.Errorf("%w: %d entries", ErrCorruptTree, count)
 	}
 	return level, binary.LittleEndian.Uint32(buf[8:12]), count, binary.LittleEndian.Uint64(buf[16:24]), nil
 }
 
-// parseTreeNode decodes and validates one node half.
-func parseTreeNode(buf []byte) (*TreeNode, error) {
-	level, inodeNum, count, gen, err := treeNodeHeader(buf)
+// parseTreeNode decodes and validates one node half of a volume with this block size.
+func parseTreeNode(buf []byte, blockSize uint64) (*TreeNode, error) {
+	level, inodeNum, count, gen, err := treeNodeHeader(buf, MaxNodeEntries(blockSize))
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +306,7 @@ func (m *Manager) readNode(inodeNum uint32, block, gen uint64) (*TreeNode, error
 	if err := m.CheckRange(block, 1); err != nil {
 		return nil, err
 	}
-	n, err := ReadTreeNode(m.dev, m.dataOffset, block, gen)
+	n, err := ReadTreeNode(m.dev, m.dataOffset, m.blockSize, block, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -312,15 +318,15 @@ func (m *Manager) readNode(inodeNum uint32, block, gen uint64) (*TreeNode, error
 
 // ReadTreeNode reads and decodes the half of a node block that holds
 // generation gen. Callers must check the returned Inode and Gen.
-func ReadTreeNode(dev *storage.Device, dataOffset, block, gen uint64) (*TreeNode, error) {
-	off := TreeNodeOffset(dataOffset, block, gen)
+func ReadTreeNode(dev *storage.Device, dataOffset, blockSize, block, gen uint64) (*TreeNode, error) {
+	off := TreeNodeOffset(dataOffset, blockSize, block, gen)
 	head := storage.GetBuffer(storage.SectorSize)
 	defer storage.PutBuffer(head)
 	buf := head.Bytes()[:storage.SectorSize]
 	if _, err := dev.ReadAt(buf, off); err != nil {
 		return nil, err
 	}
-	_, _, count, _, err := treeNodeHeader(buf)
+	_, _, count, _, err := treeNodeHeader(buf, MaxNodeEntries(blockSize))
 	if err != nil {
 		return nil, err
 	}
@@ -334,7 +340,7 @@ func ReadTreeNode(dev *storage.Device, dataOffset, block, gen uint64) (*TreeNode
 		}
 		buf = big
 	}
-	return parseTreeNode(buf)
+	return parseTreeNode(buf, blockSize)
 }
 
 func (m *Manager) writeNode(block uint64, n *TreeNode) error {
@@ -346,6 +352,6 @@ func (m *Manager) writeNode(block uint64, n *TreeNode) error {
 	defer storage.PutBuffer(ab)
 	buf := ab.Bytes()[:size]
 	encodeTreeNode(buf, n)
-	_, err := m.dev.WriteAt(buf, TreeNodeOffset(m.dataOffset, block, n.Gen))
+	_, err := m.dev.WriteAt(buf, TreeNodeOffset(m.dataOffset, m.blockSize, block, n.Gen))
 	return err
 }
