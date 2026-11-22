@@ -36,6 +36,10 @@ const (
 	nodeHeaderSize = 64
 	nodeEntrySize  = 32
 
+	// minNodeSize keeps a node's halves at 32 KB or more at small block sizes, so
+	// a fully fragmented file still holds about a million extents.
+	minNodeSize = 64 << 10
+
 	// Every commit rewrites each changed leaf, so leaves split well below
 	// MaxNodeEntries to keep that write at 64KB.
 	defaultLeafCap = 2048
@@ -77,9 +81,15 @@ func (n *TreeNode) count() int {
 	return len(n.Children)
 }
 
-// nodeHalfSize is the size of each of a tree node's two halves: a node is one data block.
+// NodeBlocks is how many contiguous data blocks one tree node takes: a node is
+// one block, or one aligned run of blocks for blocks smaller than minNodeSize.
+func NodeBlocks(blockSize uint64) uint64 {
+	return max(blockSize, minNodeSize) / blockSize
+}
+
+// nodeHalfSize is the size of each of a tree node's two halves.
 func nodeHalfSize(blockSize uint64) uint64 {
-	return blockSize / 2
+	return NodeBlocks(blockSize) * blockSize / 2
 }
 
 // MaxNodeEntries is the number of extents (leaf) or children (index) a node holds at this block size.
@@ -303,7 +313,7 @@ func (m *Manager) loadNode(inodeNum uint32, block, gen uint64, level uint16) (*T
 }
 
 func (m *Manager) readNode(inodeNum uint32, block, gen uint64) (*TreeNode, error) {
-	if err := m.CheckRange(block, 1); err != nil {
+	if err := m.CheckRange(block, NodeBlocks(m.blockSize)); err != nil {
 		return nil, err
 	}
 	n, err := ReadTreeNode(m.dev, m.dataOffset, m.blockSize, block, gen)
@@ -344,7 +354,7 @@ func ReadTreeNode(dev *storage.Device, dataOffset, blockSize, block, gen uint64)
 }
 
 func (m *Manager) writeNode(block uint64, n *TreeNode) error {
-	if err := m.CheckRange(block, 1); err != nil {
+	if err := m.CheckRange(block, NodeBlocks(m.blockSize)); err != nil {
 		return err
 	}
 	size := treeNodeSize(n.count())

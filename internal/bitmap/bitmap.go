@@ -101,9 +101,18 @@ func NewRegion(dev *storage.Device, offset, totalBlocks uint64, lockMgr *lock.Ma
 // Alloc allocates the requested number of blocks.
 // Returns the allocated block numbers, or an error if not enough free blocks.
 func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
+	return r.AllocRuns(ctx, count, 1)
+}
+
+// AllocRuns allocates count runs of runLen contiguous blocks, each starting at a
+// multiple of runLen, and returns each run's first block. runLen is 1, 2, 4 or 8.
+func (r *Region) AllocRuns(ctx context.Context, count, runLen int) ([]uint64, error) {
+	if runLen < 1 || runLen > 8 || 8%runLen != 0 {
+		return nil, fmt.Errorf("bitmap: run length %d is not 1, 2, 4 or 8", runLen)
+	}
 	var start time.Time
 	for {
-		blocks, err := r.allocOnce(ctx, count)
+		blocks, err := r.allocOnce(ctx, count, runLen)
 		if !errors.Is(err, ErrNoFreeBlocks) || r.noSpace == nil {
 			if err == nil && !start.IsZero() {
 				r.noSpace.Waited(time.Since(start))
@@ -122,7 +131,7 @@ func (r *Region) Alloc(ctx context.Context, count int) ([]uint64, error) {
 	}
 }
 
-func (r *Region) allocOnce(ctx context.Context, count int) ([]uint64, error) {
+func (r *Region) allocOnce(ctx context.Context, count, runLen int) ([]uint64, error) {
 	if count <= 0 {
 		return nil, nil
 	}
@@ -138,12 +147,13 @@ func (r *Region) allocOnce(ctx context.Context, count int) ([]uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	allocated := make([]uint64, 0, count)
+	starts := make([]uint64, 0, count)
+	allocated := make([]uint64, 0, count*runLen)
 
 	// Scan through sectors looking for free blocks
 	numSectors := (r.totalBlocks + BitsPerSector - 1) / BitsPerSector
 
-	for sectorIdx := uint64(0); sectorIdx < numSectors && len(allocated) < count; sectorIdx++ {
+	for sectorIdx := uint64(0); sectorIdx < numSectors && len(starts) < count; sectorIdx++ {
 		sectorData, err := r.readSector(sectorIdx)
 		if err != nil {
 			return nil, r.rollback(allocated, fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err))
@@ -153,22 +163,23 @@ func (r *Region) allocOnce(ctx context.Context, count int) ([]uint64, error) {
 		baseBlock := sectorIdx * BitsPerSector
 
 		// Scan bits in this sector
-		for byteIdx := 0; byteIdx < BytesPerSector && len(allocated) < count; byteIdx++ {
-			b := sectorData[byteIdx]
-			if b == 0xFF {
+		for byteIdx := 0; byteIdx < BytesPerSector && len(starts) < count; byteIdx++ {
+			if sectorData[byteIdx] == 0xFF {
 				continue // All bits set, no free blocks in this byte
 			}
 
-			for bitIdx := 0; bitIdx < 8 && len(allocated) < count; bitIdx++ {
-				blockNum := baseBlock + uint64(byteIdx*8+bitIdx)
-				if blockNum >= r.totalBlocks {
+			for shift := 0; shift < 8 && len(starts) < count; shift += runLen {
+				first := baseBlock + uint64(byteIdx*8+shift)
+				if first+uint64(runLen) > r.totalBlocks {
 					break // Past the last valid block
 				}
-
-				if (b & (1 << bitIdx)) == 0 {
-					// Bit is 0, block is free - allocate it
-					sectorData[byteIdx] |= (1 << bitIdx)
-					allocated = append(allocated, blockNum)
+				mask := byte(1<<runLen-1) << shift
+				if sectorData[byteIdx]&mask == 0 {
+					sectorData[byteIdx] |= mask
+					starts = append(starts, first)
+					for i := range uint64(runLen) {
+						allocated = append(allocated, first+i)
+					}
 					modified = true
 				}
 			}
@@ -181,12 +192,12 @@ func (r *Region) allocOnce(ctx context.Context, count int) ([]uint64, error) {
 		}
 	}
 
-	if len(allocated) < count {
+	if len(starts) < count {
 		return nil, r.rollback(allocated, ErrNoFreeBlocks)
 	}
 
 	logging.Debugf("bitmap.Alloc: allocated blocks %v", allocated)
-	return allocated, nil
+	return starts, nil
 }
 
 // rollback frees the blocks a failed Alloc had marked and returns cause, joined
