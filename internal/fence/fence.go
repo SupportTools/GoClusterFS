@@ -20,6 +20,7 @@ var (
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
+	errKeysUnlisted = errors.New("this kernel or device cannot list the registered keys")
 	// ErrNoOtherRegistrant means no other node's key is registered, so dropping this node's could release the reservation.
 	ErrNoOtherRegistrant = errors.New("no other node's key is registered, so dropping this node's could release the reservation")
 )
@@ -104,7 +105,9 @@ func (p *PR) Register() error { return p.dev.register(0, p.key, true) }
 // registrant would release the reservation. Otherwise it returns ErrNoOtherRegistrant, or why it cannot list keys.
 func (p *PR) RegisterFresh() error {
 	keys, err := p.Keys()
-	if err != nil {
+	if errors.Is(err, ErrUnsupported) {
+		return fmt.Errorf("%w (%s), so it cannot check that another node stays registered", errKeysUnlisted, cause(err))
+	} else if err != nil {
 		return fmt.Errorf("listing the registered keys: %w", err)
 	}
 	if !slices.ContainsFunc(keys, func(k uint64) bool { return k != p.key }) {

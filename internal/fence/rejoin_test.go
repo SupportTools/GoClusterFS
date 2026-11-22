@@ -208,8 +208,8 @@ func TestRegisterFreshRefusesWithoutAKeyListing(t *testing.T) {
 		t.Fatal(err)
 	}
 	target.unlistable = true
-	if err := pr.RegisterFresh(); !errors.Is(err, ErrUnsupported) {
-		t.Errorf("RegisterFresh without a key listing: %v, want ErrUnsupported", err)
+	if err := pr.RegisterFresh(); !errors.Is(err, errKeysUnlisted) {
+		t.Errorf("RegisterFresh without a key listing: %v, want errKeysUnlisted", err)
 	}
 	if target.keys["vm2/1"] != pr.Key() {
 		t.Error("RegisterFresh changed the registration although it could not list keys")
