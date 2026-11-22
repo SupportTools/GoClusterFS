@@ -772,3 +772,37 @@ func TestReserveRestoresSectorsWhenAWriteFails(t *testing.T) {
 		cleanup()
 	}
 }
+
+// A count reads the bitmap 1 MB at a time, and on a failed read rereads that
+// chunk sector by sector, so only the sector that fails counts as allocated.
+func TestCountReadsOneMBAtATime(t *testing.T) {
+	const sectors = 300
+	dev, cleanup := createTestDevice(t, 2<<20)
+	defer cleanup()
+	region := NewRegion(dev, 0, sectors*BitsPerSector, nil, [16]byte{})
+	ctx := context.Background()
+	for _, sector := range []uint64{0, 255, 257, 299} {
+		if err := region.MarkAllocated(ctx, sector*BitsPerSector+5); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	reads := 0
+	dev.SetReadFault(func(int64) error { reads++; return nil })
+	if free, allocated, err := region.Scan(ctx); err != nil || allocated != 4 || free != sectors*BitsPerSector-4 {
+		t.Fatalf("Scan = %d free, %d allocated, %v; want 4 allocated", free, allocated, err)
+	}
+	if reads != 2 {
+		t.Errorf("Scan read %d times, want 2 reads of up to 1 MB", reads)
+	}
+
+	dev.SetReadFault(func(offset int64) error {
+		if offset == 256*SectorSize {
+			return errors.New("injected read error")
+		}
+		return nil
+	})
+	if allocated, err := region.countAllocated(); err == nil || allocated != 4+BitsPerSector {
+		t.Errorf("count with sector 256 unreadable = %d allocated, %v; want %d and an error", allocated, err, 4+BitsPerSector)
+	}
+}
