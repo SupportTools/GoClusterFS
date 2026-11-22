@@ -1476,9 +1476,6 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 	}, nil
 }
 
-// markIntent writes this node's UUID as the recovery owner of a live slot that raw holds, before this node revokes
-// the slot's node: a node that registers its key again after the revoke reads the intent and stops. It returns the
-// bytes the next CAS must find, raw itself for a slot that is not live. Called with r.mu held.
 // revoke preempts owner's key after this node marked its intent in slotIdx, replacing original with marked. A preempt
 // that fails while the device still lists owner's key did not take effect, so the slot gets original back and owner,
 // if it runs and has not read the intent yet, keeps running. After any other failure the intent stays: owner may have
@@ -1501,6 +1498,12 @@ func (r *Registry) revoke(slotIdx int, original, marked []byte, owner [16]byte, 
 	return err
 }
 
+// markIntent writes this node's UUID as the recovery owner of a live slot that raw holds, before this node revokes
+// the slot's node: a node that registers its key again after the revoke reads the intent and stops. It returns the
+// bytes the next CAS must find, raw itself for a slot that is not live. Called with r.mu held.
+//
+// An intent whose node stops before it marks the slot Dead is a change like any heartbeat: peers take the slot over
+// once it stays unchanged for deadAfter on their own clock, and its node, if it runs, stops at its next heartbeat.
 func (r *Registry) markIntent(slotIdx int, raw []byte) ([]byte, error) {
 	slot, err := deserializeSlot(raw)
 	if err != nil {

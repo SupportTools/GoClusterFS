@@ -159,7 +159,12 @@ func heartbeatOlderThan(slot *Slot, d time.Duration) bool {
 func (s *Slot) LeaseExpiry() time.Time {
 	switch s.State {
 	case NodeStateActive, NodeStateLeaving:
-		return time.Unix(s.HeartbeatTime, 0).Add(HeartbeatTimeout)
+		expiry := time.Unix(s.HeartbeatTime, 0).Add(HeartbeatTimeout)
+		// A node taking the slot over may still finish; peers wait deadAfter from its intent before they do.
+		if _, marked, ok := s.Intent(); ok && marked.Add(deadAfter).After(expiry) {
+			expiry = marked.Add(deadAfter)
+		}
+		return expiry
 	case NodeStateDead:
 		return time.Unix(s.RecoveryStart, 0).Add(recoveryLease)
 	}
@@ -233,7 +238,8 @@ func (r *Registry) Occupant(slotIdx int, fresh bool) ([16]byte, Occupancy) {
 		return slot.UUID, OccupiedLapsed
 	case slot.State == NodeStateDead:
 		return slot.UUID, OccupiedReplaying
-	case r.stale(slotIdx, slot, HeartbeatTimeout):
+	case slot.TakenOver(), r.stale(slotIdx, slot, HeartbeatTimeout):
+		// A peer that marked its intent is revoking the node; the mark is a change but no heartbeat.
 		return slot.UUID, OccupiedFailing
 	}
 	return slot.UUID, OccupiedLive

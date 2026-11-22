@@ -159,38 +159,52 @@ func TestTakeoverAbortsWhenABeatErasesTheIntent(t *testing.T) {
 	}
 }
 
-// A peer that wrote its intent and died leaves the slot Active with the intent. Peers watch it unchanged for deadAfter
-// like any silent slot, then take it over from the intent.
+// A peer that wrote its intent and died leaves the slot Active with the intent, before or after its preempt. Peers
+// watch the slot unchanged for deadAfter like any silent slot, then take it over from the intent; a preempt of a key
+// the dead peer already removed finds nothing to remove and lets the takeover go on.
 func TestOrphanedIntentIsTakenOverLater(t *testing.T) {
-	target := fence.NewTarget()
-	survivor, victim, failing := fencedVictim(t, target)
-	orphan := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: victim.LocalUUID(), HeartbeatSeq: 1,
-		HeartbeatTime: time.Now().Add(-time.Minute).Unix(), JournalOffset: 1 << 20, JournalSize: 4 << 20,
-		RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Add(-time.Minute).Unix()}
-	victim.mu.Lock()
-	err := victim.writeSlot(failing, orphan)
-	victim.mu.Unlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-	survivor.mu.Lock()
-	survivor.observe(failing, orphan)
-	survivor.mu.Unlock()
-	if err := survivor.RecoverFailedNode(failing); err == nil {
-		t.Fatal("recovered an intent the survivor saw only just now")
-	}
-	silence(survivor, failing, orphan, deadAfter+time.Second)
-	var owner [16]byte
-	survivor.SetRecoveryHandler(func(*FailedNodeInfo) error {
-		slot, _ := survivor.readSlot(failing)
-		owner = slot.RecoveryOwner
-		return nil
-	})
-	if err := survivor.RecoverFailedNode(failing); err != nil || owner != survivor.LocalUUID() {
-		t.Errorf("recover the orphaned intent: %v, recovery owner %x; want the survivor", err, owner[:8])
-	}
-	if target.MayWrite("victim") {
-		t.Error("the victim may still write")
+	for _, preempted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("died after its preempt %v", preempted), func(t *testing.T) {
+			target := fence.NewTarget()
+			survivor, victim, failing := fencedVictim(t, target)
+			if preempted {
+				dead := target.Node("dead-peer", fence.NodeKey([16]byte{9}))
+				if err := dead.Register(); err != nil {
+					t.Fatal(err)
+				}
+				if err := dead.Preempt(fence.NodeKey(victim.LocalUUID())); err != nil {
+					t.Fatal(err)
+				}
+			}
+			orphan := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: victim.LocalUUID(), HeartbeatSeq: 1,
+				HeartbeatTime: time.Now().Add(-time.Minute).Unix(), JournalOffset: 1 << 20, JournalSize: 4 << 20,
+				RecoveryOwner: [16]byte{9}, RecoveryStart: time.Now().Add(-time.Minute).Unix()}
+			victim.mu.Lock()
+			err := victim.writeSlot(failing, orphan)
+			victim.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			survivor.mu.Lock()
+			survivor.observe(failing, orphan)
+			survivor.mu.Unlock()
+			if err := survivor.RecoverFailedNode(failing); err == nil {
+				t.Fatal("recovered an intent the survivor saw only just now")
+			}
+			silence(survivor, failing, orphan, deadAfter+time.Second)
+			var owner [16]byte
+			survivor.SetRecoveryHandler(func(*FailedNodeInfo) error {
+				slot, _ := survivor.readSlot(failing)
+				owner = slot.RecoveryOwner
+				return nil
+			})
+			if err := survivor.RecoverFailedNode(failing); err != nil || owner != survivor.LocalUUID() {
+				t.Errorf("recover the orphaned intent: %v, recovery owner %x; want the survivor", err, owner[:8])
+			}
+			if target.MayWrite("victim") {
+				t.Error("the victim may still write")
+			}
+		})
 	}
 }
 
@@ -260,5 +274,28 @@ func TestFailedPreemptPutsTheSlotBackOnlyWhenItDidNotTakeEffect(t *testing.T) {
 				t.Errorf("slot marked %v by %x; want the survivor's intent to stay", marked, slot.RecoveryOwner[:8])
 			}
 		})
+	}
+}
+
+// A live slot with an intent counts as failing for lock waiters, though the intent changed its bytes, and fsck's
+// offline release waits deadAfter from the intent, however old the node's last heartbeat.
+func TestAnIntentSlotIsFailingAndHoldsItsLease(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	t.Cleanup(cleanup)
+	reg := NewRegistry(dev, 0)
+	marked := time.Now()
+	slot := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{1}, HeartbeatSeq: 1,
+		HeartbeatTime: marked.Add(-time.Hour).Unix(), RecoveryOwner: [16]byte{2}, RecoveryStart: marked.Unix()}
+	reg.mu.Lock()
+	err := reg.writeSlot(3, slot)
+	reg.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, occ := reg.Occupant(3, true); occ != OccupiedFailing {
+		t.Errorf("Occupant = %v, want OccupiedFailing", occ)
+	}
+	if got, want := slot.LeaseExpiry(), time.Unix(marked.Unix(), 0).Add(deadAfter); !got.Equal(want) {
+		t.Errorf("LeaseExpiry = %v, want %v, deadAfter after the intent", got, want)
 	}
 }
