@@ -107,3 +107,21 @@ func localAgent(t *testing.T, root string) *agentConn {
 	t.Cleanup(func() { _ = reqw.Close() })
 	return a
 }
+
+func TestFailureReleasesAnOperationAFaultCutShort(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := &driver{logw: io.Discard, ctx: ctx, cancel: cancel}
+	u := &uncertain{op: &Op{}, done: make(chan struct{})}
+	released := make(chan struct{})
+	go func() {
+		d.awaitResolved(u)
+		close(released)
+	}()
+	d.fail("fault power 2: restore: controller: err restore power 2 failed")
+	select {
+	case <-released:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an operation a failed fault cut short still waits after the run failed, so the soak never ends")
+	}
+}

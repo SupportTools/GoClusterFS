@@ -434,10 +434,19 @@ func (d *driver) runOpLocked(op *Op, n *node) {
 		op.Ms = time.Now().UnixMilli() - op.At
 		op.Got, op.Err = resp.Errno, fmt.Sprint(err, resp.Err)
 		d.logRecord(record{Type: "uncertain", Op: *op})
-		<-u.done
+		d.awaitResolved(u)
 		return
 	}
 	d.finishOp(op, resp, err)
+}
+
+// awaitResolved waits until the fault that cut u's operation short resolves it, or the run fails, as when that fault's
+// own recovery fails and nothing will resolve it.
+func (d *driver) awaitResolved(u *uncertain) {
+	select {
+	case <-u.done:
+	case <-d.ctx.Done():
+	}
 }
 
 func (d *driver) finishOp(op *Op, resp response, err error) {
