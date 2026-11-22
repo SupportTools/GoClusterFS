@@ -4208,61 +4208,53 @@ rejoin_reset() {
     relogin_iscsi "$1" && fencing_restart pr
 }
 
-# A mount killed after a relogin mounts again on the same boot and keeps writing (#267's register-anew path on LIO).
-test_fencing_rejoin_relogin_kill() {
+# rejoin_test runs rejoin case $1 for VM 2 next to VM 1, then resets VM 2 however the case ended, so failures don't cascade.
+rejoin_test() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
-    local vm=2 peer=1 marker result=0
+    local result=0
     fencing_restart pr || return 1
+    "$1" 2 1 || result=1
+    rejoin_reset 2 || result=1
+    return $result
+}
+
+# A mount killed after a relogin mounts again on the same boot and keeps writing (#267's register-anew path on LIO).
+rejoin_relogin_kill() {
+    local vm="$1" peer="$2" marker
     rejoin_on_map "$vm" || return 1
     crash_goclusterfs "$vm" || return 1
     ssh_run "$vm" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
     marker="fencing rejoin relogin kill $(date +%s)"
     mark_vm_logs "$marker"
-    if rejoin_mount "$vm" mpath; then
-        rejoin_holds "$vm" "$marker" "$peer" || result=1
-    else
+    if ! rejoin_mount "$vm" mpath; then
         log_error "VM $vm did not join after a relogin and a kill: $(sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -E 'Cannot join|failed' | tail -2)"
-        result=1
+        return 1
     fi
-    rejoin_reset "$vm" || result=1
-    return $result
+    rejoin_holds "$vm" "$marker" "$peer"
 }
 
 # A node that relogged in and remounted is power cut, boots on its first session again and rejoins.
-test_fencing_rejoin_relogin_power_cut() {
-    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
-        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
-        return 0
-    fi
-    local vm=2 peer=1 marker result=0
-    fencing_restart pr || return 1
+rejoin_relogin_power_cut() {
+    local vm="$1" peer="$2" marker
     rejoin_on_map "$vm" || return 1
     unmount_goclusterfs "$vm" || return 1
     setup_goclusterfs "$vm" false "" /dev/mapper/gcfs-mpath || return 1
     rejoin_power_cut "$vm" 0 || return 1
     marker="fencing rejoin relogin power cut $(date +%s)"
     mark_vm_logs "$marker"
-    if rejoin_mount "$vm" disk; then
-        rejoin_holds "$vm" "$marker" "$peer" || result=1
-    else
+    if ! rejoin_mount "$vm" disk; then
         log_error "VM $vm did not join after a relogin and a power cut"
-        result=1
+        return 1
     fi
-    fencing_restart pr || result=1
-    return $result
+    rejoin_holds "$vm" "$marker" "$peer"
 }
 
 # The bug hunt's sequence: relogin, kill, the peer takes over, remount on the new session, power cut, rejoin.
-test_fencing_rejoin_takeover_power_cut() {
-    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
-        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
-        return 0
-    fi
-    local vm=2 peer=1 marker result=0
-    fencing_restart pr || return 1
+rejoin_takeover_power_cut() {
+    local vm="$1" peer="$2" marker
     rejoin_on_map "$vm" || return 1
     marker="fencing rejoin takeover $(date +%s)"
     mark_vm_logs "$marker"
@@ -4273,25 +4265,17 @@ test_fencing_rejoin_takeover_power_cut() {
     rejoin_power_cut "$vm" 0 || return 1
     marker="fencing rejoin takeover power cut $(date +%s)"
     mark_vm_logs "$marker"
-    if rejoin_mount "$vm" disk; then
-        rejoin_holds "$vm" "$marker" "$peer" || result=1
-    else
+    if ! rejoin_mount "$vm" disk; then
         log_error "VM $vm did not join after a relogin, a takeover and a power cut"
-        result=1
+        return 1
     fi
-    fencing_restart pr || result=1
-    return $result
+    rejoin_holds "$vm" "$marker" "$peer"
 }
 
 # A power-cut node rejoins on a plain disk and on a multipath map, its mount racing the peer's takeover.
-test_fencing_rejoin_power_cut() {
-    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
-        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
-        return 0
-    fi
-    local vm=2 peer=1 marker result=0 kind delay
+rejoin_power_cuts() {
+    local vm="$1" peer="$2" marker result=0 kind delay
     for kind in disk mpath; do
-        fencing_restart pr || return 1
         unmount_goclusterfs "$vm" || return 1
         rejoin_mount "$vm" "$kind" || return 1
         for delay in 0 3; do
@@ -4302,13 +4286,17 @@ test_fencing_rejoin_power_cut() {
                 rejoin_holds "$vm" "$marker" "$peer" || result=1
             else
                 log_error "VM $vm did not join on its $kind after a power cut, mounting ${delay}s after boot"
-                result=1
+                return 1
             fi
         done
     done
-    fencing_restart pr || result=1
     return $result
 }
+
+test_fencing_rejoin_relogin_kill() { rejoin_test rejoin_relogin_kill; }
+test_fencing_rejoin_relogin_power_cut() { rejoin_test rejoin_relogin_power_cut; }
+test_fencing_rejoin_takeover_power_cut() { rejoin_test rejoin_takeover_power_cut; }
+test_fencing_rejoin_power_cut() { rejoin_test rejoin_power_cuts; }
 
 # reservation_test runs fsck -test-reservations on VM $1 with the arguments $2 and prints its output and exit code.
 reservation_test() {
