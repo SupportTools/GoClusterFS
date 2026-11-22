@@ -1,15 +1,18 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/fence"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 // A node whose clock missed a pause restores its key while a survivor takes it over: the survivor's preempt comes
@@ -292,5 +295,102 @@ func TestAnIntentSlotIsFailing(t *testing.T) {
 	}
 	if _, occ := reg.Occupant(3, true); occ != OccupiedFailing {
 		t.Errorf("Occupant = %v, want OccupiedFailing", occ)
+	}
+}
+
+// joinOverEarlierBoot writes slot 0 as this hostname's mount from an earlier boot, whose heartbeat stopped, and returns
+// its bytes and a registry on its own handle to the device, which takes the slot over when it registers as "node".
+func joinOverEarlierBoot(t *testing.T) (joiner *Registry, joinerDev *storage.Device, original []byte, peek *Registry) {
+	t.Helper()
+	shortenSilentSlotWatch(t)
+	dev, cleanup := createTestDevice(t, 10<<20)
+	t.Cleanup(cleanup)
+	peek = NewRegistry(dev, 0)
+	earlier := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{7}, HeartbeatSeq: 3,
+		HeartbeatTime: time.Now().Add(-3 * HeartbeatTimeout).Unix(), BootID: [16]byte{0xEE}}
+	copy(earlier.Hostname[:], "node")
+	if err := peek.writeSlot(0, earlier); err != nil {
+		t.Fatal(err)
+	}
+	original, _, err := peek.readSlotRaw(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinerDev, err = storage.Open(dev.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = joinerDev.Close() })
+	return NewRegistry(joinerDev, 0), joinerDev, original, peek
+}
+
+// A join that takes over a silent slot is a takeover: the slot names the joiner as its recovery owner before the
+// joiner revokes the slot's node, so that node, if it registers its key again, reads the intent and stops.
+func TestJoinMarksItsIntentBeforeItRevokes(t *testing.T) {
+	joiner, _, _, peek := joinOverEarlierBoot(t)
+	var owner [16]byte
+	joiner.SetPreempter(func([16]byte) error {
+		slot, err := peek.readSlot(0)
+		if err != nil {
+			return err
+		}
+		owner = slot.RecoveryOwner
+		return nil
+	})
+	if slot, err := joiner.Register(context.Background(), "node"); err != nil || slot != 0 {
+		t.Fatalf("Register = %d, %v; want the earlier boot's slot 0", slot, err)
+	}
+	if want := joiner.LocalUUID(); owner != want {
+		t.Errorf("recovery owner during the revoke %x, want the joiner %x", owner[:8], want[:8])
+	}
+}
+
+// A join whose revoke did not take effect, as the device shows by still listing the slot's key, puts the slot back as
+// its node left it: first try, or after the device refused the claim and the joiner registered anew.
+func TestJoinPutsTheSlotBackWhenItsRevokeDidNotTakeEffect(t *testing.T) {
+	notPreempted := fmt.Errorf("%w: the device refused the preempt", fence.ErrNotPreempted)
+	for _, tc := range []struct {
+		name          string
+		refuseClaim   bool
+		firstPreempts bool
+	}{
+		{"first revoke", false, false},
+		{"revoke after registering anew", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			joiner, dev, original, peek := joinOverEarlierBoot(t)
+			writes := 0
+			dev.SetWriteFault(func(offset int64) error {
+				if offset != 0 {
+					return nil
+				}
+				writes++
+				if tc.refuseClaim && writes == 2 {
+					return syscall.EBADE
+				}
+				return nil
+			})
+			rejoins, preempts := 0, 0
+			joiner.SetJoin(func() error { return nil }, func() error { rejoins++; return nil })
+			joiner.SetPreempter(func([16]byte) error {
+				preempts++
+				if tc.firstPreempts && preempts == 1 {
+					return nil
+				}
+				return notPreempted
+			})
+			if _, err := joiner.Register(context.Background(), "node"); !errors.Is(err, fence.ErrNotPreempted) {
+				t.Fatalf("Register = %v, want ErrNotPreempted", err)
+			}
+			after, _, err := peek.readSlotRaw(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, original) || rejoins != 1 {
+				slot, _ := deserializeSlot(after)
+				t.Errorf("slot after the failed join: recovery owner %x, state %v; registered anew %d times; want the slot as its node left it, after one rejoin",
+					slot.RecoveryOwner[:8], slot.State, rejoins)
+			}
+		})
 	}
 }

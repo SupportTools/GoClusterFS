@@ -6066,6 +6066,20 @@ scenarios:
     environments:
       go: internal/node/intent_test.go::TestAnIntentSlotIsFailing
 
+  - id: node-join-marks-intent
+    name: A join that takes over a silent slot marks its intent before it revokes
+    description: While the joiner revokes a silent slot's node, the slot names the joiner as its recovery owner
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestJoinMarksItsIntentBeforeItRevokes
+
+  - id: node-join-gives-intent-back
+    name: A join whose revoke did not take effect puts the slot back
+    description: After a revoke that left the slot's key listed, first try or after registering anew, the slot holds its node's bytes again
+    priority: go_only
+    environments:
+      go: internal/node/intent_test.go::TestJoinPutsTheSlotBackWhenItsRevokeDidNotTakeEffect
+
   - id: superblock-takeover-intent-flag
     name: Builds without takeover intents refuse a new volume
     description: A new volume carries RequiredTakeoverIntent; a build that does not know it, whose fsck would revoke without an intent, refuses to mount or check it

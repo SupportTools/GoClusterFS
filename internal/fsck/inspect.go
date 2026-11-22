@@ -4,11 +4,11 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
-	"github.com/supporttools/GoClusterFS/internal/superblock"
 	"slices"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // SlotInspection is what -inspect-slot reports about one node registry slot. Gathering it writes nothing.

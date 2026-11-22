@@ -1842,7 +1842,6 @@ func (r *Registry) HeartbeatAge() time.Duration {
 	return r.sinceLastBeat()
 }
 
-// TakenOver reports whether a peer marked the slot Dead or wrote its intent to take the slot's node over.
 // Intent returns the node that marked this live slot to take it over and when it marked it; ok is false for a slot
 // no node marked. The marking node preempts the slot's node next, then marks the slot Dead.
 func (s *Slot) Intent() (owner [16]byte, marked time.Time, ok bool) {
@@ -1852,6 +1851,7 @@ func (s *Slot) Intent() (owner [16]byte, marked time.Time, ok bool) {
 	return s.RecoveryOwner, time.Unix(s.RecoveryStart, 0), true
 }
 
+// TakenOver reports whether a peer marked the slot Dead or wrote its intent to take the slot's node over.
 func (s *Slot) TakenOver() bool {
 	return s.State == NodeStateDead || s.RecoveryOwner != [16]byte{}
 }
