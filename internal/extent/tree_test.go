@@ -975,3 +975,43 @@ func TestTreeRootPastTheDataRegionFailsLookups(t *testing.T) {
 		t.Errorf("lookup through a tree root past the data region: %v, want ErrBlockOutOfRange", err)
 	}
 }
+
+// Fallocate maps only the holes of the range, in a tree too, and returns the
+// blocks it allocated.
+func TestFallocateMapsOnlyHoles(t *testing.T) {
+	env := newTreeEnv(t, 4)
+	ino := env.newInode()
+	for _, blk := range []uint64{2, 3, 10, 14, 16, 18} {
+		if _, err := env.mgr.AllocateBlocks(env.ctx, ino, blk, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fresh, err := env.mgr.Fallocate(env.ctx, ino, 0, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fresh) != 9 || ino.AllocatedBlocks != 15 {
+		t.Fatalf("Fallocate returned %d blocks, AllocatedBlocks %d; want 9 new blocks and 15 allocated", len(fresh), ino.AllocatedBlocks)
+	}
+	for _, b := range fresh {
+		if allocated, err := env.bm.IsAllocated(b); err != nil || !allocated {
+			t.Errorf("returned block %d allocated = %v, %v", b, allocated, err)
+		}
+	}
+	for blk := uint64(0); blk < 12; blk++ {
+		ext, _, err := env.mgr.Lookup(ino, blk)
+		if err != nil {
+			t.Fatalf("block %d: %v", blk, err)
+		}
+		if unwritten := ext.Flags&FlagUnwritten != 0; unwritten == (blk == 2 || blk == 3 || blk == 10) {
+			t.Errorf("block %d unwritten = %v", blk, unwritten)
+		}
+	}
+	if fresh, err := env.mgr.Fallocate(env.ctx, ino, 0, 12); err != nil || len(fresh) != 0 {
+		t.Errorf("second Fallocate = %d blocks, %v; want none", len(fresh), err)
+	}
+	if _, _, err := env.mgr.Lookup(ino, 12); err != ErrExtentNotFound {
+		t.Errorf("block 12 past the range: %v, want unmapped", err)
+	}
+}

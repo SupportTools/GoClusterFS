@@ -3688,7 +3688,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 
 	// Note: We don't hold the inode lock during block allocation to respect lock ordering.
 	// Lock order: bitmap (6) must be acquired before inode (8).
-	// AllocateUnwritten acquires bitmap lock internally.
+	// Fallocate acquires the bitmap lock internally.
 	// We acquire the inode lock only at the end to update metadata atomically.
 
 	// Calculate block range
@@ -3700,54 +3700,14 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 	logging.Debugf("Allocate inode %d: offset=%d length=%d blocks=%d-%d (total=%d)",
 		f.inodeNum, off, size, startBlock, endBlock-1, totalBlocks)
 
-	// Find contiguous ranges of unallocated blocks and allocate each as a single extent.
-	// This minimizes extent count and avoids hitting inline extent limits.
-	blockNum := startBlock
-	for blockNum < endBlock {
-		// Check if already allocated
-		_, _, lookupErr := f.fs.extentMgr.Lookup(ino, blockNum)
-		if lookupErr == nil {
-			// Already allocated, skip to next block
-			blockNum++
-			continue
+	var allocErr error
+	newBlocks, allocErr = f.fs.extentMgr.Fallocate(ctx, ino, startBlock, endBlock)
+	if allocErr != nil {
+		logging.Debugf("Allocate inode %d: blocks %d-%d: %v", f.inodeNum, startBlock, endBlock-1, allocErr)
+		if errors.Is(allocErr, extent.ErrExtentTreeFull) {
+			return syscall.EFBIG, nil
 		}
-		if lookupErr != extent.ErrExtentNotFound {
-			logging.Debugf("Allocate inode %d: extent lookup at block %d failed: %v", f.inodeNum, blockNum, lookupErr)
-			return syscall.EIO, nil
-		}
-
-		// Find how many contiguous blocks starting from blockNum are unallocated
-		rangeStart := blockNum
-		rangeEnd := blockNum + 1
-		for rangeEnd < endBlock {
-			_, _, lookupErr := f.fs.extentMgr.Lookup(ino, rangeEnd)
-			if lookupErr != extent.ErrExtentNotFound {
-				break // Allocated (or unreadable), stop the range
-			}
-			rangeEnd++
-		}
-
-		rangeCount := rangeEnd - rangeStart
-		logging.Debugf("Allocate inode %d: allocating contiguous range blocks=%d-%d (count=%d)",
-			f.inodeNum, rangeStart, rangeEnd-1, rangeCount)
-
-		// Allocate the entire contiguous range as a single unwritten extent
-		_, allocErr := f.fs.extentMgr.AllocateUnwritten(ctx, ino, rangeStart, rangeCount)
-		if allocErr != nil {
-			logging.Debugf("Allocate inode %d: AllocateUnwritten blocks %d-%d failed: %v",
-				f.inodeNum, rangeStart, rangeEnd-1, allocErr)
-			if errors.Is(allocErr, extent.ErrExtentTreeFull) {
-				return syscall.EFBIG, nil
-			}
-			return allocErrno(allocErr), nil
-		}
-		for b := rangeStart; b < rangeEnd; b++ {
-			if ext, inExt, err := f.fs.extentMgr.Lookup(ino, b); err == nil {
-				newBlocks = append(newBlocks, ext.PhysicalBlock+inExt)
-			}
-		}
-
-		blockNum = rangeEnd
+		return allocErrno(allocErr), nil
 	}
 
 	// Acquire inode lock for metadata update
