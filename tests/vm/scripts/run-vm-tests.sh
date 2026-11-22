@@ -3961,6 +3961,232 @@ test_fencing_reservation_self_test() {
     return $result
 }
 
+# iscsi_disk prints the disk VM $1's iSCSI session attached, which a new login can give another name.
+iscsi_disk() {
+    ssh_run "$1" "iscsiadm -m session -P 3 | sed -n 's/.*Attached scsi disk \([a-z]*\).*/\1/p' | head -1"
+}
+
+# multipath_over sets VM $1's one-path dm-multipath map gcfs-mpath on disk $2, which queues I/O while the path is gone.
+multipath_over() {
+    ssh_run "$1" "table=\"0 \$(blockdev --getsz /dev/$2) multipath 1 queue_if_no_path 0 1 1 round-robin 0 1 1 /dev/$2 1\"
+        if dmsetup info gcfs-mpath > /dev/null 2>&1; then
+            dmsetup suspend --noflush gcfs-mpath && dmsetup load gcfs-mpath --table \"\$table\" && dmsetup resume gcfs-mpath
+        else
+            dmsetup create gcfs-mpath --table \"\$table\"
+        fi"
+}
+
+# write_load writes small files with fsync on VM $1 and records ok or fail for each in /tmp/load.out.
+write_load() {
+    ssh_run "$1" "rm -f /tmp/load.out; (i=0; while [ ! -e /tmp/load.stop ]; do i=\$((i+1)); if dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/load.vm$1.\$((i%16)) bs=64k count=4 conv=fsync 2>/dev/null; then echo ok; else echo fail; fi; sleep 0.1; done) >> /tmp/load.out 2>&1 &"
+}
+
+# reservation_key prints the reservation key VM $1's mount logged.
+reservation_key() {
+    sed -n 's/.*Fencing: persistent reservation key \(0x[0-9a-f]*\).*/\1/p' "$(get_vm_mount_log "$1")" | tail -1
+}
+
+# writes_go_on fails unless VM $1's mount runs and its write load made progress over 5 seconds.
+writes_go_on() {
+    local before after
+    before=$(ssh_run "$1" "grep -c ok /tmp/load.out")
+    sleep 5
+    after=$(ssh_run "$1" "grep -c ok /tmp/load.out")
+    if [[ -z "$(mount_pids "$1")" ]] || (( after <= before )); then
+        log_error "VM $1 stopped or stopped writing $2 ($before, then $after writes)"
+        return 1
+    fi
+}
+
+# A node mounted on a dm-multipath map keeps running when its iSCSI path logs out and in again. LIO goes on taking
+# its writes while the old session's registration stands, so VM 2 then preempts that registration, as a target that
+# checks writes per session would refuse them. VM 1's next write meets a reservation conflict, VM 1 registers its key
+# again with every write held, and both nodes keep writing. Afterwards fsck finds the volume clean.
+test_fencing_session_relogin() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 out disk vm portal="10.0.2.2:${ISCSI_PORT}" fsck=/usr/local/bin/goclusterfs-fsck
+    for vm in 1 2; do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
+        fi
+        ssh_run "$vm" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; rm -f /tmp/load.stop; true"
+    done
+    ssh_run 1 "apk add --no-cache device-mapper > /dev/null && modprobe dm-multipath" || return 1
+    disk=$(iscsi_disk 1)
+    multipath_over 1 "$disk" || return 1
+    setup_goclusterfs 1 true "" /dev/mapper/gcfs-mpath "-fencing=pr" || return 1
+    setup_goclusterfs 2 false || return 1
+    write_load 1
+    write_load 2
+    sleep 5
+
+    local marker
+    marker="fencing relogin $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run 1 "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; sleep 2; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null" || result=1
+    disk=$(iscsi_disk 1)
+    log_info "VM 1's path logged in again as /dev/$disk"
+    multipath_over 1 "$disk" || result=1
+    writes_go_on 1 "after its path logged in again" || result=1
+    ssh_run 2 "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key 2) --param-sark=$(reservation_key 1) --prout-type=7 $(cluster_device) > /dev/null" || result=1
+    wait_log 1 "registered it again with every write held" 60 "$marker" || result=1
+    writes_go_on 1 "after it registered its key again" || result=1
+    out=$(ssh_run 1 "wget -qO- http://127.0.0.1:8080/health; echo; wget -qO- http://127.0.0.1:8080/metrics | grep '^goclusterfs_fencing_key_restores_total'")
+    if [[ "$out" != *"registered its key again 1 times"* || "$out" != *"goclusterfs_fencing_key_restores_total 1"* ]]; then
+        log_error "VM 1's /health and /metrics do not show the key restore: $out"
+        result=1
+    fi
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log 2)" | grep -q "failing or being recovered"; then
+        log_error "VM 2 treated VM 1 as failing while its path logged in again"
+        result=1
+    fi
+
+    ssh_run 1 "touch /tmp/load.stop"
+    ssh_run 2 "touch /tmp/load.stop"
+    sleep 1
+    log_info "writes on VM 1: $(ssh_run 1 'sort /tmp/load.out | uniq -c | tr "\n" " "'), VM 2: $(ssh_run 2 'sort /tmp/load.out | uniq -c | tr "\n" " "')"
+    unmount_goclusterfs 1 || result=1
+    unmount_goclusterfs 2 || result=1
+    out=$(ssh_run 2 "$fsck $(cluster_device) 2>&1; echo rc=\$?")
+    if [[ "$out" != *"rc=0" ]]; then
+        log_error "fsck after the relogin is not clean: $out"
+        result=1
+    fi
+
+    ssh_run 2 "$fsck -clear-reservations -confirm $(cluster_device) > /dev/null 2>&1" || result=1
+    ssh_run 1 "dmsetup remove gcfs-mpath; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null; for t in \$(seq 20); do [ -b $(cluster_device) ] && exit 0; sleep 1; done; exit 1" || result=1
+    fencing_restart pr || result=1
+    return $result
+}
+
+# wait_log_now waits up to $3 seconds, polling every 0.1s, for VM $1's mount log to show more than $5 lines with $2
+# after marker $4; without $5, more than when it started.
+wait_log_now() {
+    local vm="$1" pattern="$2" limit=$(( $3 * 10 )) marker="$4" waited=0 seen="${5:-}"
+    [[ -n "$seen" ]] || seen=$(sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -c "$pattern")
+    until (( $(sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")" | grep -c "$pattern") > seen )); do
+        if [[ $waited -ge $limit ]]; then
+            log_error "VM $vm: no '$pattern' in its mount log within $3s"
+            return 1
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+}
+
+# rekey_pause_case runs one case of test_fencing_paused_rekey. VM 2 holds every takeover 10s between its preempt and
+# its Dead mark, and VM 1, paused with QEMU stop, resumes inside that window. Its guest clock barely moved, so only its
+# slot can tell it that VM 2 is taking it over.
+#   gate:            VM 1 stops while it rewrites a file.
+#   held:            VM 1 stops between a heartbeat's slot read and its write.
+#   before-register: VM 2 preempts VM 1's key with sg_persist, so VM 1 starts to register again; VM 1 stops before
+#                    its register, and the register lands after VM 2's real takeover preempted. The stop comes 1.5s
+#                    into a 5s stall, once VM 1's heartbeat waits in a held write, so only the rekey reads the slot.
+#   after-register:  as before-register, but VM 1 stops between its register and its slot read.
+rekey_pause_case() {
+    local mode=$1 paused=1 peer=2 result=0 env1="" stop_at="" mon marker slot uuid stopped_at byte state
+    case "$mode" in
+        held) env1="GOCLUSTERFS_POC_BEAT_STALL=2s" stop_at="\[POC\] heartbeat read slot" ;;
+        before-register | after-register) env1="GOCLUSTERFS_POC_REKEY_STALL=$mode:5s" stop_at="\[POC\] rekey: stalling .* $mode" ;;
+    esac
+    fencing_restart pr "$env1" || return 1
+    unmount_goclusterfs "$peer" || return 1
+    setup_goclusterfs "$peer" false "GOCLUSTERFS_POC_TAKEOVER_DELAY=10s" || return 1
+    mon=$(get_vm_monitor_socket "$paused")
+    slot=$(grep -o 'Registered as node [0-9]*' "$(get_vm_mount_log "$paused")" | tail -1 | grep -o '[0-9]*$')
+    uuid=$(grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' "$(get_vm_mount_log "$paused")" | tail -1 | grep -o '[0-9a-f]*$')
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/fenced && sync"
+    ssh_run "$paused" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/fenced.A"
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/fenced.B"
+    marker="paused rekey $mode $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$paused" "nohup sh -c 'while dd if=/tmp/fenced.A of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null; do :; done' < /dev/null > /dev/null 2>&1 &"
+    sleep 3
+    if [[ "$mode" == *register ]]; then
+        ssh_run "$peer" "apk add --no-cache sg3_utils > /dev/null && sg_persist --out --preempt-abort --param-rk=$(reservation_key "$peer") --param-sark=$(reservation_key "$paused") --prout-type=7 $(cluster_device) > /dev/null" || result=1
+    fi
+    local seen=""
+    [[ "$mode" == *register ]] && seen=0
+    if [[ -n "$stop_at" ]] && ! wait_log_now "$paused" "$stop_at" 30 "$marker" "$seen"; then
+        rekey_pause_cleanup "$paused"
+        return 1
+    fi
+    [[ "$mode" == *register ]] && sleep 1.5
+    echo stop | nc -U -q1 "$mon" > /dev/null
+    stopped_at=$(date +%s)
+    log_info "$mode: VM $paused (slot $slot, $uuid) stopped with QEMU stop"
+    if ! wait_log_now "$peer" "\[POC\] slot $slot: intent written" 120 "$marker"; then
+        echo cont | nc -U -q1 "$mon" > /dev/null
+        rekey_pause_cleanup "$paused"
+        return 1
+    fi
+    echo cont | nc -U -q1 "$mon" > /dev/null
+    log_info "$mode: VM $paused resumed $(( $(date +%s) - stopped_at ))s after the stop, after VM $peer's intent and preempt, before its Dead mark"
+    wait_log "$peer" "\[Recovery\] Completed\|Journal is clean" 90 "$marker" || result=1
+    if ! wait_stopped "$paused" 30; then
+        log_error "$mode: VM $paused still runs 30s after it resumed"
+        result=1
+    fi
+    ssh_run "$peer" "dd if=/tmp/fenced.B of=${GOCLUSTERFS_MOUNT}/fenced bs=4096 count=1 conv=notrunc,fsync 2>/dev/null" || result=1
+    sleep 15
+    byte=$(fenced_file_byte "$peer")
+    state=$(ssh_run "$peer" "dd if=$(cluster_device) bs=4096 skip=$((256 + slot)) count=1 iflag=direct 2>/dev/null | od -An -tx1 -j4 -N20 | tr -d '\n'")
+    log_info "$mode: file starts with '$byte'; slot $slot reads (state, UUID)$state; VM $paused's log:"
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log "$paused")" | grep -E "POC|registered it again|revoking|refused|no longer this node|declared|ERROR|WARN" | head -12
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log "$peer")" | grep -E "POC|Revoked|Recovery\]" | head -6
+    if [[ "$byte" != B ]]; then
+        log_error "$mode: the file starts with '$byte', want VM $peer's B: VM $paused landed a write after VM $peer's takeover"
+        result=1
+    fi
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log "$paused")" | grep -q "registered it again"; then
+        log_error "$mode: VM $paused registered its key again inside VM $peer's takeover"
+        result=1
+    fi
+    if [[ "$mode" == *register ]] && ! sed -n "/$marker/,\$p" "$(get_vm_mount_log "$paused")" | grep -q "which is revoking"; then
+        log_error "$mode: VM $paused's re-register did not stop on VM $peer's intent"
+        result=1
+    fi
+    rekey_pause_cleanup "$paused"
+    return $result
+}
+
+# rekey_pause_cleanup stops VM $1's writer and mount, so the next case mounts it afresh.
+rekey_pause_cleanup() {
+    ssh_run "$1" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/fence[d]'; true"
+    if [[ -n "$(mount_pids "$1")" ]]; then
+        crash_goclusterfs "$1"
+    fi
+    ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
+}
+
+# Proof of concept for marking a takeover intent: a fenced node paused with QEMU stop resumes inside a peer's takeover,
+# between the peer's preempt and its Dead mark, and lands no write after the preempt, also when it registers its key
+# again after that preempt. Afterwards fsck finds the volume clean.
+test_fencing_paused_rekey() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local result=0 mode vm out GOCLUSTERFS_MOUNT_TIMEOUT=120
+    for mode in ${REKEY_PAUSE_CASES:-gate held before-register after-register}; do
+        rekey_pause_case "$mode" || result=1
+    done
+    for vm in 1 2; do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || crash_goclusterfs "$vm"
+        fi
+    done
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck $(cluster_device) 2>&1; echo rc=\$?")
+    log_info "fsck after every case: ${out##*rc=}"
+    echo "$out" | grep '^\[' | head -10
+    [[ "${out##*rc=}" == 0 ]] || result=1
+    fencing_restart pr || result=1
+    return $result
+}
+
 # =============================================================================
 # Hostile storage and clocks
 # =============================================================================
@@ -5136,6 +5362,8 @@ main() {
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations
     run_test "Fencing: Unmount Removes Key" test_fencing_unmount_removes_key
     run_test "Fencing: Reservation Self-Test" test_fencing_reservation_self_test
+    run_test "Fencing: Session Relogin" test_fencing_session_relogin
+    run_test "Fencing: Paused Rekey" test_fencing_paused_rekey
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall
