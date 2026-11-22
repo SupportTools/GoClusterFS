@@ -878,7 +878,6 @@ func openForFencing(devicePath string) *os.File {
 	return f
 }
 
-// failf logs why the mount cannot go on and exits with cli.ExitFailure.
 // keepReserved checks the device's reservation on every failure scan until stop closes. A device without a reservation
 // takes writes from any host, so a node it revoked would go on writing: keepReserved reserves again while this node's
 // key stays registered, and stops the node if the key is gone too.
@@ -915,6 +914,7 @@ func keepReserved(pr *fence.PR, stop <-chan struct{}) {
 	}
 }
 
+// failf logs why the mount cannot go on and exits with cli.ExitFailure.
 func failf(format string, args ...any) {
 	log.Printf(format, args...)
 	os.Exit(cli.ExitFailure)
