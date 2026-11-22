@@ -3716,6 +3716,142 @@ test_fencing_paused_vm() {
     return $result
 }
 
+# paused_file_byte prints the first byte of the pause test file as VM $1 reads it from the device, past every cache.
+paused_file_byte() {
+    ssh_run "$1" "sync; echo 3 > /proc/sys/vm/drop_caches; dd if=${GOCLUSTERFS_MOUNT}/paused iflag=direct bs=4096 count=1 2>/dev/null | head -c 1"
+}
+
+# pause_unfenced_case pauses VM 1 with QEMU stop while it rewrites a file, on a volume without storage fencing, until
+# VM 2 has replayed it and written the file itself, then resumes it. The guest's clocks barely move while it is
+# stopped. With $1 "held", VM 1's registry writes wait 2s in the guest, as a slow path or a guest-side queue would hold
+# them, so the pause likely falls between a heartbeat's slot read and its write.
+pause_unfenced_case() {
+    local mode=$1 paused=1 peer=2 result=0 dev mon marker slot uuid
+    dev=$(cluster_device)
+    mon=$(get_vm_monitor_socket "$paused")
+    ensure_cluster_healthy 2 || return 1
+    if [[ "$mode" == held ]]; then
+        unmount_goclusterfs "$paused" || return 1
+        ssh_run "$paused" "apk add --no-cache device-mapper > /dev/null && modprobe dm-delay && { dmsetup remove gcfs-pause 2>/dev/null; sz=\$(blockdev --getsz $dev); printf '0 2048 linear $dev 0\n2048 2048 delay $dev 2048 0 $dev 2048 2000\n4096 %s linear $dev 4096\n' \$((sz - 4096)) | dmsetup create gcfs-pause; }" || return 1
+        setup_goclusterfs "$paused" false "" /dev/mapper/gcfs-pause || return 1
+    fi
+    slot=$(ssh_run "$paused" "grep -o 'Registered as node [0-9]*' /var/log/goclusterfs.log | tail -1" | grep -o '[0-9]*$')
+    uuid=$(ssh_run "$paused" "grep -o 'Registered as node [0-9]* (UUID: [0-9a-f]*' /var/log/goclusterfs.log | tail -1" | grep -o '[0-9a-f]*$')
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' 0 > ${GOCLUSTERFS_MOUNT}/paused && sync"
+    ssh_run "$paused" "head -c 4096 /dev/zero | tr '\\000' A > /tmp/paused.A"
+    ssh_run "$peer" "head -c 4096 /dev/zero | tr '\\000' B > /tmp/paused.B"
+    marker="unfenced paused vm $mode $(date +%s)"
+    mark_vm_logs "$marker"
+    ssh_run "$paused" "nohup sh -c 'while :; do dd if=/tmp/paused.A of=${GOCLUSTERFS_MOUNT}/paused bs=4096 count=1 conv=notrunc,fsync 2>/dev/null; done' < /dev/null > /dev/null 2>&1 &"
+    sleep 3
+    local h0 g0 w0 h1 g1 w1 stopped_at
+    h0=$(date +%s.%N)
+    read -r g0 w0 < <(ssh_run "$paused" "echo \$(cut -d' ' -f1 /proc/uptime) \$(date +%s)")
+    echo stop | nc -U -q1 "$mon" > /dev/null
+    stopped_at=$(date +%s)
+    log_info "$mode: VM $paused (slot $slot, ${uuid:0:8}) stopped with QEMU stop"
+    if ! wait_log "$peer" "Starting journal replay for node ${uuid:0:8}" 120 "$marker" ||
+        ! wait_log "$peer" "\[Recovery\] Completed\|Journal is clean" 60 "$marker"; then
+        echo cont | nc -U -q1 "$mon" > /dev/null
+        pause_cleanup "$paused"
+        return 1
+    fi
+    log_info "$mode: VM $peer replayed VM $paused $(( $(date +%s) - stopped_at ))s after the stop"
+    sleep 3
+    ssh_run "$peer" "dd if=/tmp/paused.B of=${GOCLUSTERFS_MOUNT}/paused bs=4096 count=1 conv=notrunc,fsync 2>/dev/null" || result=1
+    log_info "$mode: VM $peer wrote B; the file starts with '$(paused_file_byte "$peer")'; slot $slot reads $(ssh_run "$peer" "dd if=$dev bs=4096 skip=$((256 + slot)) count=1 iflag=direct 2>/dev/null | od -An -tx1 -j4 -N20 | tr -d '\n'")"
+    echo cont | nc -U -q1 "$mon" > /dev/null
+    log_info "$mode: VM $paused resumed $(( $(date +%s) - stopped_at ))s after the stop"
+    sleep 1
+    read -r g1 w1 < <(ssh_run "$paused" "echo \$(cut -d' ' -f1 /proc/uptime) \$(date +%s)")
+    h1=$(date +%s.%N)
+    log_info "$mode: across the stop the host clock moved $(echo "$h0 $h1" | awk '{printf "%.1f", $2 - $1}')s, VM $paused's CLOCK_BOOTTIME $(echo "$g0 $g1" | awk '{printf "%.1f", $2 - $1}')s and its wall clock $((w1 - w0))s"
+    sleep 15
+    local byte state
+    byte=$(paused_file_byte "$peer")
+    state=$(ssh_run "$peer" "dd if=$dev bs=4096 skip=$((256 + slot)) count=1 iflag=direct 2>/dev/null | od -An -tx1 -j4 -N20 | tr -d '\n'")
+    log_info "$mode: 15s after the resume, slot $slot reads (state, UUID)$state; VM $paused's mount is $([[ -n "$(mount_pids "$paused")" ]] && echo running || echo stopped)"
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log "$paused")" | grep -E "registry slot|refused|ERROR" | head -5
+    if [[ "$byte" != B ]]; then
+        log_error "$mode: the file starts with '$byte', want VM $peer's B: VM $paused landed a write after VM $peer replayed it"
+        result=1
+    fi
+    if [[ "$state" == " 01 00 00 00 ${uuid:0:2}"* && -n "$(mount_pids "$paused")" ]]; then
+        log_error "$mode: VM $paused wrote its slot back as its own over VM $peer's replay and keeps running"
+        result=1
+    fi
+    pause_cleanup "$paused"
+    return $result
+}
+
+# pause_cleanup stops VM $1's writer and mount, so the next case mounts it afresh.
+pause_cleanup() {
+    ssh_run "$1" "pkill -f 'of=${GOCLUSTERFS_MOUNT}/pause[d]'; true"
+    if [[ -n "$(mount_pids "$1")" ]]; then
+        crash_goclusterfs "$1"
+    fi
+    ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-pause 2>/dev/null; true"
+}
+
+# A node VM paused with QEMU stop past deadAfter, on a volume without storage fencing, must not land a write after a
+# peer replayed it. Its guest clocks stand still while it is stopped, so the stall guards on CLOCK_BOOTTIME do not see
+# the pause, and it does land one: this is why an unfenced volume refuses a second node. The nodes here mount with
+# -unsafe-allow-unfenced, so the test fails on purpose and runs only with VM_HAZARD_TESTS=1.
+# Afterwards fsck reports what the late writes did to the volume.
+test_unfenced_paused_vm() {
+    if [[ "${VM_HAZARD_TESTS:-}" != 1 ]]; then
+        log_info "Skipping: it shows the late writes -unsafe-allow-unfenced risks and fails on purpose; run with VM_HAZARD_TESTS=1"
+        return 0
+    fi
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs 2 VMs"
+        return 0
+    fi
+    local result=0 vm out GOCLUSTERFS_MOUNT_TIMEOUT=120
+    fencing_restart none || return 1
+    pause_unfenced_case gate || result=1
+    pause_unfenced_case held || result=1
+    for vm in 1 2; do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || crash_goclusterfs "$vm"
+        fi
+    done
+    out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck $(cluster_device) 2>&1; echo rc=\$?")
+    log_info "fsck after both cases: ${out##*rc=}, $(echo "$out" | grep -c '^\[') problem lines"
+    echo "$out" | grep '^\[' | head -10
+    fencing_restart none || result=1
+    return $result
+}
+
+# On a volume without storage fencing, a node refuses to mount while another node has it mounted, unless it passes
+# -unsafe-allow-unfenced; with the flag it mounts and warns. Pause: Unfenced Paused VM shows what the refusal prevents.
+test_unfenced_join_refused() {
+    if [[ $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs 2 VMs"
+        return 0
+    fi
+    local result=0 out marker
+    fencing_restart none || return 1
+    unmount_goclusterfs 2 || return 1
+    out=$(ssh_run 2 "mkdir -p ${GOCLUSTERFS_MOUNT}; timeout 60 /usr/local/bin/goclusterfs-mount -mount ${GOCLUSTERFS_MOUNT} -device $(cluster_device) -broadcast=false -api=false 2>&1; echo rc=\$?")
+    # The refusal may also name VM 2's own last slot: an unmount leaves its slot Active for a peer or a remount on its
+    # host to clear, and for about a second the exited mount is a zombie, which passes the kill(pid, 0) liveness test.
+    if [[ "$out" != *"has no storage fencing, and the node"* || "$out" == *rc=0* ]]; then
+        log_error "VM 2 was not refused on an unfenced volume VM 1 has mounted, without -unsafe-allow-unfenced: $out"
+        result=1
+    else
+        log_info "VM 2 refused: $(grep -o 'has no storage fencing, and the node[^.]*' <<< "$out" | head -1)"
+    fi
+    marker="unfenced join $(date +%s)"
+    mark_vm_logs "$marker"
+    setup_goclusterfs 2 false || return 1
+    if ! wait_log 2 "\[WARN\] UNSAFE" 30 "$marker"; then
+        log_error "VM 2 joined with -unsafe-allow-unfenced but logged no UNSAFE warning"
+        result=1
+    fi
+    return $result
+}
+
 # A fenced node that writes nothing still stops soon after it resumes: its next heartbeat write fails.
 test_fencing_idle_node() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
@@ -5131,6 +5267,8 @@ main() {
     run_test "Stalled Node Writes Stop At Write Gate" test_stalled_node_writes_stop_at_write_gate
     run_test "Fencing: Stalled Writer" test_fencing_stalled_writer
     run_test "Fencing: Paused VM" test_fencing_paused_vm
+    run_test "Pause: Unfenced Paused VM" test_unfenced_paused_vm
+    run_test "Unfenced Join Refused" test_unfenced_join_refused
     run_test "Fencing: Idle Node" test_fencing_idle_node
     run_test "Fencing: Busy Survivor" test_fencing_busy_survivor
     run_test "Fencing: Clear Reservations" test_fencing_clear_reservations

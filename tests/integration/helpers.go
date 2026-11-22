@@ -32,7 +32,7 @@ type MountedFS struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 
-	// portArgs give the node its own broadcast and API ports; ExtraArgs come after and win.
+	// portArgs give the node its own broadcast and API ports, and cluster nodes the unfenced override; ExtraArgs come after and win.
 	portArgs []string
 	tail     *logTail
 	watchdog *watchdog

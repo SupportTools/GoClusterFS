@@ -60,7 +60,8 @@ func NewMultiNodeCluster(t *testing.T, nodeCount, sizeMB int) *MultiNodeCluster 
 	ports := freeUDPPorts(t, nodeCount+1)
 	for i := 0; i < nodeCount; i++ {
 		cluster.Nodes[i] = NewMountedFSWithImage(t, imagePath)
-		cluster.Nodes[i].portArgs = portArgs(t, ports[0], ports[i+1])
+		// The nodes share a file image, which has no reservations.
+		cluster.Nodes[i].portArgs = append(portArgs(t, ports[0], ports[i+1]), "-unsafe-allow-unfenced")
 	}
 
 	// Register cleanup

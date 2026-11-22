@@ -2392,6 +2392,21 @@ test_broadcast_without_multicast() {
     return $failed
 }
 
+# Test: the cluster's nodes share a file image, which has no storage fencing,
+# and run with -unsafe-allow-unfenced. A mount without the flag must refuse to
+# join while they have the volume mounted.
+test_unfenced_join_refused() {
+    local node="${NODE_ARRAY[0]}" out
+    exec_on_node "$node" mkdir -p /tmp/unfenced-join
+    out=$(exec_on_node "$node" timeout 60 goclusterfs-mount -device /data/cluster.img -mount /tmp/unfenced-join -broadcast=false -api=false 2>&1)
+    if ! grep -q "Cannot join the cluster: /data/cluster.img has no storage fencing, and the node" <<< "$out"; then
+        log "ERROR: a mount without -unsafe-allow-unfenced did not refuse to join an unfenced volume:"
+        log "$out"
+        return 1
+    fi
+    log "Refused as expected: $(grep -o 'has no storage fencing, and the node[^.]*' <<< "$out" | head -1)"
+}
+
 # Test: Broadcast directory invalidation
 # Verifies that new file creation is broadcast between nodes.
 test_broadcast_directory_invalidation() {
@@ -3891,6 +3906,7 @@ run_test "Broadcast Multiple Updates" test_broadcast_multiple_updates
 run_test "Broadcast Bidirectional" test_broadcast_bidirectional
 run_test "Broadcast Silent Peer Reported" test_broadcast_silent_peer_reported
 run_test "Broadcast Without Multicast" test_broadcast_without_multicast
+run_test "Unfenced Join Refused" test_unfenced_join_refused
 run_test "Staleness Under Packet Loss" test_staleness_packet_loss
 run_test "Staleness Under Duplication and Reordering" test_staleness_duplication_and_reordering
 run_test "Staleness Under Delay" test_staleness_delay
