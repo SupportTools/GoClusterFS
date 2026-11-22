@@ -255,3 +255,53 @@ jobs:
             integration-${{ matrix.group }}.log
             hangs/
           retention-days: 7
+
+  integration-tests-8k:
+    name: Integration Tests at 8 KB blocks
+    runs-on: ubuntu-latest
+    needs: [build, unit-tests]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          sudo modprobe fuse
+          # TestNonRootUsersAcrossNodes mounts with -allow-other as the runner user
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          which fusermount || which fusermount3
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: make build
+
+      - name: Integration Tests
+        shell: bash
+        env:
+          GOCLUSTERFS_HANG_DIR: ${{ github.workspace }}/hangs
+          GOCLUSTERFS_TEST_BLOCK_SIZE: "8192"
+        run: |
+          # The data paths the block size changes; the nightly runs the whole suite at 8 KB
+          go test -v -timeout 8m -short -run 'Extent|Tree|Truncate|Sparse|Large|Snapshot|Clone|Fsck|Hardlink|Symlink|Rename|Dir' ./tests/integration/... 2>&1 | tee integration-8k.log
+        timeout-minutes: 10
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-log-8k
+          path: |
+            integration-8k.log
+            hangs/
+          retention-days: 7

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -172,7 +173,7 @@ func (m *MountedFS) Format() error {
 	}
 	args = append(args, m.portArgs...)
 
-	cmd := exec.Command(m.BinaryPath, args...)
+	cmd := exec.Command(m.BinaryPath, withTestBlockSize(args)...)
 
 	// Capture output to detect when formatting is done
 	stdout, err := cmd.StdoutPipe()
@@ -251,7 +252,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	// Create a fresh context for this mount operation
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
+	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -285,7 +286,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	args = append(args, m.portArgs...)
 	args = append(args, m.ExtraArgs...)
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
+	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -609,7 +610,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	}
 	args = append(args, m.portArgs...)
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
+	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -644,7 +645,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	// Create a fresh context for this mount operation
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, args...)
+	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -671,4 +672,14 @@ func mustClose(tb testing.TB, c io.Closer) {
 	if err := c.Close(); err != nil {
 		tb.Errorf("close: %v", err)
 	}
+}
+
+// withTestBlockSize adds -block-size from GOCLUSTERFS_TEST_BLOCK_SIZE to a mount
+// command that formats, so the suite can run at another block size.
+func withTestBlockSize(args []string) []string {
+	bs := os.Getenv("GOCLUSTERFS_TEST_BLOCK_SIZE")
+	if bs == "" || !slices.Contains(args, "-format") || slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "-block-size") }) {
+		return args
+	}
+	return append(args, "-block-size", bs)
 }

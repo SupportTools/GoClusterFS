@@ -37,7 +37,7 @@ func imagePath(t *testing.T, size int64, format bool) string {
 	}
 	defer func() { _ = dev.Close() }()
 	if format {
-		if _, err := superblock.Format(dev, superblock.DefaultBytesPerInode); err != nil {
+		if _, err := superblock.Format(dev, 0, superblock.DefaultBytesPerInode); err != nil {
 			t.Fatal(err)
 		}
 	}

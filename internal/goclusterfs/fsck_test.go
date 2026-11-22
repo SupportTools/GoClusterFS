@@ -31,11 +31,18 @@ func newFormattedImage(t *testing.T) string {
 
 func newFormattedImageOfSize(t *testing.T, size int64) string {
 	t.Helper()
-	return formatImage(t, size, true)
+	return formatImage(t, size, 0, true)
 }
 
-// formatImage formats an image and creates its root directory, and with quotas its quota table, as -format does.
-func formatImage(t *testing.T, size int64, quotas bool) string {
+// newFormattedImageAt formats an image with blockSize-byte data blocks; 0 means 1 MB.
+func newFormattedImageAt(t *testing.T, size int64, blockSize uint64) string {
+	t.Helper()
+	return formatImage(t, size, blockSize, true)
+}
+
+// formatImage formats an image with blockSize-byte data blocks (0 means 1 MB) and creates its root directory, and with
+// quotas its quota table, as -format does.
+func formatImage(t *testing.T, size int64, blockSize uint64, quotas bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fs.img")
 	if err := os.WriteFile(path, nil, 0o600); err != nil {
@@ -49,7 +56,7 @@ func formatImage(t *testing.T, size int64, quotas bool) string {
 		t.Fatal(err)
 	}
 	defer func() { _ = dev.Close() }()
-	if _, err := superblock.Format(dev, 0); err != nil {
+	if _, err := superblock.Format(dev, blockSize, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	fsys := openFormattedFS(t, path)
@@ -109,7 +116,7 @@ func openFormattedComponents(t *testing.T, path string) *FS {
 	locks := lock.NewManager(dev, sb.LockBitmapOffset, sb.LockBitmapSize, nodeUUID, slot)
 	bm := bitmap.NewRegion(dev, sb.BlockBitmapOffset, sb.TotalBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, sb.InodeTableOffset, sb.InodeCount*inode.InodeSize, locks, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset, storage.DefaultBlockSize)
+	extentMgr := extent.NewManager(dev, bm, locks, sb.DataRegionOffset, uint64(sb.BlockSize))
 	inodeTbl.SetTreeFlusher(extentMgr)
 	refs := refcount.NewRegion(dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, sb.DataRegionOffset)
@@ -165,25 +172,35 @@ func problemList(r *fsck.Result) string {
 // write and extent trees, must pass fsck without a single problem.
 func TestFsckAcceptsRuntimeImage(t *testing.T) {
 	t.Parallel()
-	fsys := openFormattedFS(t, newFormattedImage(t))
+	for _, bs := range []uint64{storage.DefaultBlockSize, 64 << 10, 8 << 10} {
+		t.Run(fmt.Sprintf("%dK blocks", bs>>10), func(t *testing.T) {
+			t.Parallel()
+			fsckAcceptsRuntimeImage(t, bs)
+		})
+	}
+}
+
+func fsckAcceptsRuntimeImage(t *testing.T, blockSize uint64) {
+	fsys := openFormattedFS(t, newFormattedImageAt(t, superblock.MinDeviceSize+64<<20, blockSize))
 	ctx := context.Background()
+	bs := int64(fsys.BlockSize())
 
 	small := createFile(t, fsys, "small.txt")
 	writeAt(t, small, pattern(1, 100), 0)
 	big := createFile(t, fsys, "big.bin")
-	writeAt(t, big, pattern(2, 3*BlockSize), 0)
+	writeAt(t, big, pattern(2, int(3*bs)), 0)
 	sparse := createFile(t, fsys, "sparse.bin")
 	for i := int64(0); i < 5; i++ {
-		writeAt(t, sparse, pattern(byte(10+i), 4096), 2*i*BlockSize)
+		writeAt(t, sparse, pattern(byte(10+i), 4096), 2*i*bs)
 	}
 
 	setxattr(t, big, "user.snapshot", "s1")
 	writeAt(t, big, pattern(3, 100), 10)
 	setxattr(t, big, "user.clone", "/big-clone.bin")
-	writeAt(t, lookupFile(t, fsys, "big-clone.bin"), pattern(4, 100), BlockSize+10)
+	writeAt(t, lookupFile(t, fsys, "big-clone.bin"), pattern(4, 100), bs+10)
 	setxattr(t, big, "user.snapshot.clone", "s1:/from-s1.bin")
 	setxattr(t, sparse, "user.snapshot", "s2")
-	writeAt(t, sparse, pattern(5, 4096), 4*BlockSize)
+	writeAt(t, sparse, pattern(5, 4096), 4*bs)
 	if errno := sparse.Removexattr(ctx, "user.snapshot.s2"); errno != 0 {
 		t.Fatalf("delete snapshot: %v", errno)
 	}
@@ -507,7 +524,7 @@ func TestFsckChecksTheQuotaTable(t *testing.T) {
 // without them still mount the volume, and fsck -repair frees the inode and block it had taken.
 func TestInterruptedQuotaEnableLeavesNoFlag(t *testing.T) {
 	t.Parallel()
-	path := formatImage(t, superblock.MinDeviceSize+64<<20, false)
+	path := formatImage(t, superblock.MinDeviceSize+64<<20, 0, false)
 	fsys := openFormattedFS(t, path)
 	sb, err := superblock.Read(fsys.dev)
 	if err != nil {

@@ -85,8 +85,10 @@ func main() {
 		devicePath = flag.String("device", "", "Block device, or image file on a filesystem that supports O_DIRECT, to mount; required")
 		mountPoint = flag.String("mount", "", "Directory to mount the filesystem on; required")
 		format     = flag.Bool("format", false, "Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first")
-		inodeRatio = flag.Uint64("bytes-per-inode", superblock.DefaultBytesPerInode,
-			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes); fixed until the next format", superblock.MinInodes, superblock.MaxInodes))
+		blockSize  = flag.Uint64("block-size", superblock.MaxBlockSize,
+			fmt.Sprintf("With -format: data block size in bytes, a power of two from %d to %d; fixed until the next format. 8192 or 16384 for volumes of small files, 65536 for mixed ones, 1048576 for VM disks and large files", superblock.MinBlockSize, superblock.MaxBlockSize))
+		inodeRatio = flag.Uint64("bytes-per-inode", 0,
+			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes); fixed until the next format. 0 picks one per block at 1 MB blocks, and max(2 × block size, 16 KB) below", superblock.MinInodes, superblock.MaxInodes))
 		debug      = flag.Bool("debug", false, "Print [DEBUG] log lines")
 		fuseDebug  = flag.Bool("fuse-debug", false, "Print every FUSE request and reply")
 		showVer    = flag.Bool("version", false, "Print version and exit")
@@ -169,6 +171,11 @@ func main() {
 	if *devicePath == "" || *mountPoint == "" {
 		usageFailf("-device and -mount are required")
 	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "block-size" && !*format {
+			usageFailf("-block-size applies only with -format: a volume keeps the block size it was formatted with")
+		}
+	})
 	if flag.NArg() > 0 {
 		usageFailf("unexpected argument %q; give the device with -device and the mount point with -mount", flag.Arg(0))
 	}
@@ -279,8 +286,11 @@ func main() {
 		if *fencingMode != "auto" && *fencingMode != "pr" && *fencingMode != "none" {
 			usageFailf("-fencing=%s: use auto, pr or none", *fencingMode)
 		}
+		if !superblock.ValidBlockSize(*blockSize) {
+			usageFailf("-block-size=%d: %v", *blockSize, superblock.ErrInvalidBlockSize)
+		}
 		formatFence := formatFencer(*devicePath, *fencingMode)
-		sb, err = superblock.Format(dev, *inodeRatio)
+		sb, err = superblock.Format(dev, *blockSize, *inodeRatio)
 		if err == nil && formatFence.Kind() == "pr" {
 			sb.RequiredFlags |= superblock.RequiredReservations
 			err = superblock.Write(dev, sb)
@@ -294,6 +304,7 @@ func main() {
 	if err != nil {
 		failf("Cannot use %s: %v", *devicePath, err)
 	}
+	log.Printf("Block size: %d KB, %d inodes", sb.BlockSize>>10, sb.InodeCount)
 
 	bitmapOffset := sb.BlockBitmapOffset
 	inodeOffset := sb.InodeTableOffset
