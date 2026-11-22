@@ -38,6 +38,10 @@ func (d retrying) preemptAbort(own, victim uint64) error {
 	return d.again(func() error { return d.device.preemptAbort(own, victim) })
 }
 
+func (d retrying) preempt(own, victim uint64) error {
+	return d.again(func() error { return d.device.preempt(own, victim) })
+}
+
 func (d retrying) readKeys() (keys []uint64, err error) {
 	err = d.again(func() error {
 		keys, err = d.device.readKeys()
@@ -158,6 +162,7 @@ const (
 var (
 	iocRegister     = ioc(1, 200, unsafe.Sizeof(registration{}))
 	iocReserve      = ioc(1, 201, unsafe.Sizeof(reservation{}))
+	iocPreempt      = ioc(1, 203, unsafe.Sizeof(preemption{}))
 	iocPreemptAbort = ioc(1, 204, unsafe.Sizeof(preemption{}))
 	iocClear        = ioc(1, 205, unsafe.Sizeof(clearing{}))
 	iocReadKeys     = ioc(3, 206, unsafe.Sizeof(keyList{}))
@@ -250,6 +255,11 @@ func (d blockDevice) reserve(key uint64) error {
 func (d blockDevice) preemptAbort(own, victim uint64) error {
 	p := preemption{own: own, victim: victim, typ: typeWriteExclusiveAllRegs}
 	return d.ioctl(iocPreemptAbort, unsafe.Pointer(&p))
+}
+
+func (d blockDevice) preempt(own, victim uint64) error {
+	p := preemption{own: own, victim: victim, typ: typeWriteExclusiveAllRegs}
+	return d.ioctl(iocPreempt, unsafe.Pointer(&p))
 }
 
 func (d blockDevice) clear(key uint64) error {

@@ -101,6 +101,7 @@ type passthroughDevice struct{ passthrough }
 func (passthroughDevice) register(uint64, uint64, bool) error { return ErrUnsupported }
 func (passthroughDevice) reserve(uint64) error                { return ErrUnsupported }
 func (passthroughDevice) preemptAbort(uint64, uint64) error   { return ErrUnsupported }
+func (passthroughDevice) preempt(uint64, uint64) error        { return ErrUnsupported }
 func (passthroughDevice) clear(uint64) error                  { return ErrUnsupported }
 
 // nvmeNamespace answers the NVMe passthrough ioctls as namespace 1 with registrants, holding a reservation of NVMe

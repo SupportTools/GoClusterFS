@@ -354,8 +354,11 @@ func main() {
 			"Check that the device is reachable and that this node did not stall, then mount again", loss)
 	})
 	dev.SetFencedHandler(nodeReg.Fenced)
+	stopReservationCheck := make(chan struct{})
 	if pr, ok := fencer.(*fence.PR); ok {
 		dev.SetRekey(restoreKey(pr, dev, nodeReg, slotIdx))
+		go keepReserved(pr, stopReservationCheck)
+		go warnStaleKeys(pr, nodeReg, *devicePath, stopReservationCheck)
 	}
 	if err := nodeReg.StartHeartbeat(); err != nil {
 		failf("Failed to start node heartbeat: %v", err)
@@ -749,6 +752,7 @@ func main() {
 
 	log.Println("Filesystem mounted. Press Ctrl+C to unmount.")
 	server.Wait()
+	close(stopReservationCheck)
 	unmounted.Store(true)
 	watch.Start()
 	goclusterfs.ShutdownStep("API server stop", stopAPI)
@@ -760,10 +764,13 @@ func main() {
 		}
 	})
 	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
+	leftSlot := false
 	gfs.SetSlotRelease(func() {
 		if err := nodeReg.Release(); err != nil {
 			log.Printf("[INFO] Leaving registry slot %d for a running node to clear: %v", slotIdx, err)
+			return
 		}
+		leftSlot = true
 	})
 	if err := gfs.Close(); err != nil {
 		log.Printf("Closing the filesystem failed: %v; run goclusterfs-fsck %s before the next mount", err, *devicePath)
@@ -798,11 +805,19 @@ func main() {
 			cacheStats.InvalidationsSent, cacheStats.InvalidationsReceived, cacheStats.BroadcastDuplicates, cacheStats.BroadcastLost)
 	}
 
-	switch err := fencer.Unregister(); {
+	unregister := func() (bool, error) { return false, fencer.Unregister() }
+	if leftSlot {
+		unregister = fencer.Leave
+	}
+	switch earlier, err := unregister(); {
+	case earlier && err == nil:
+		log.Printf("[INFO] This host's session held no reservation key, as after an iSCSI logout and login: registered the key on it, removed the key from the earlier session and unregistered it")
 	case errors.Is(err, fence.ErrFenced):
-		log.Printf("[INFO] This host's session holds no reservation key to remove: a peer removed it, or the target keeps it under an earlier session, as after an iSCSI logout and login. Peers' preempts or goclusterfs-fsck -clear-reservations remove it")
+		log.Printf("[INFO] This host's session holds no reservation key to remove: a peer removed it, or the target keeps it under an earlier session, as after an iSCSI logout and login. The node that replays slot %d removes it", slotIdx)
+	case err != nil && leftSlot:
+		log.Printf("[WARN] Removing this node's reservation key failed: %v; no peer removes it, so remove it with goclusterfs-fsck -clear-reservations once no node runs", err)
 	case err != nil:
-		log.Printf("[WARN] Removing this node's reservation key failed: %v; the next node to mount into slot %d removes it", err, slotIdx)
+		log.Printf("[WARN] Removing this node's reservation key failed: %v; the node that replays slot %d removes it", err, slotIdx)
 	}
 	log.Println("Filesystem unmounted.")
 	_ = dev.Close()
@@ -842,8 +857,8 @@ func formatFencer(devicePath, mode string) fence.Fencer {
 	return pr
 }
 
-// joinFencing registers this node's reservation key before its first write on a fenced volume, and makes the
-// registry revoke dead nodes' keys. On an unfenced volume it warns, or with require refuses to mount.
+// joinFencing makes the registry register this node's reservation key before its first write on a fenced volume, and
+// revoke dead nodes' keys. On an unfenced volume it warns, or with require refuses to mount.
 func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblock, reg *node.Registry, require bool) fence.Fencer {
 	if sb.RequiredFlags&superblock.RequiredReservations == 0 {
 		if require {
@@ -859,17 +874,24 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 			"A host has one reservation key per device, so stop that process first", devicePath, err)
 	}
 	pr := fence.Block(f, fence.NodeKey(reg.LocalUUID()))
-	if err := pr.Register(); err != nil {
-		failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
-	}
-	if err := pr.Reserve(); err != nil {
-		failf("%s is fenced, and reserving it failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s", devicePath, err, devicePath)
-	}
+	reg.SetJoin(func() error {
+		anew, err := pr.Join()
+		switch {
+		case errors.Is(err, fence.ErrForeignReservation):
+			failf("%s is fenced, and reserving it failed: %v; once no node runs, clear it with goclusterfs-fsck -clear-reservations %s", devicePath, err, devicePath)
+		case err != nil:
+			failf("%s is fenced, and registering this node's reservation key failed: %v; mount as root on a host that reaches the device's persistent reservations", devicePath, err)
+		case anew:
+			log.Printf("[WARN] Fencing: the device refused this node's reserve although it registered its key, as LIO does after a key this host " +
+				"registered from an earlier iSCSI session is revoked; registered the key anew")
+		}
+		log.Printf("Fencing: persistent reservation key %#x", pr.Key())
+		return nil
+	}, pr.RegisterFresh)
 	// LIO tags every command with the holder's key, so PREEMPT AND ABORT also drops this node's in-flight I/O without a status.
 	reg.SetPreempter(func(owner [16]byte) error {
 		return dev.Quiesce(func() error { return pr.Preempt(fence.NodeKey(owner)) })
 	})
-	log.Printf("Fencing: persistent reservation key %#x", pr.Key())
 	return pr
 }
 
@@ -929,6 +951,42 @@ func openForFencing(devicePath string) *os.File {
 		failf("Opening %s for its persistent reservations failed: %v", devicePath, err)
 	}
 	return f
+}
+
+// keepReserved checks the device's reservation on every failure scan until stop closes. A device without a reservation
+// takes writes from any host, so a node it revoked would go on writing: keepReserved reserves again while this node's
+// key stays registered, and stops the node if the key is gone too.
+func keepReserved(pr *fence.PR, stop <-chan struct{}) {
+	tick := time.NewTicker(node.FailureCheckInterval)
+	defer tick.Stop()
+	failing := false
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+		}
+		reserved, err := pr.KeepReserved()
+		switch {
+		case errors.Is(err, fence.ErrFenced):
+			failf("Fencing: the device holds no reservation and no longer lists this node's key %#x, as after a storage reset "+
+				"or a revoke while it was unreserved; stopping so two nodes never share a journal. Mount again", pr.Key())
+		case errors.Is(err, fence.ErrUnsupported):
+			log.Printf("[WARN] Fencing: cannot check that the device keeps its reservation: %v", err)
+			return
+		case err != nil:
+			if !failing {
+				log.Printf("[WARN] Fencing: checking the device's reservation failed: %v", err)
+			}
+			failing = true
+		default:
+			failing = false
+			if reserved {
+				log.Printf("[WARN] Fencing: the device had lost its reservation while this node's key %#x stayed registered, "+
+					"so a revoked node could have gone on writing; reserved it again", pr.Key())
+			}
+		}
+	}
 }
 
 // failf logs why the mount cannot go on and exits with cli.ExitFailure.

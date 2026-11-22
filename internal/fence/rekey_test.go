@@ -342,7 +342,7 @@ func TestRekeyRefusesAnIntentBeforeThePreempt(t *testing.T) {
 func TestRekeyWithoutAKeyListingRegistersNothing(t *testing.T) {
 	w := newRekeyWorld(t)
 	w.loseSession()
-	w.target.Unlistable = true
+	w.target.unlistable = true
 	k := w.rekeyer()
 	registers := 0
 	k.beforeRegister = func() { registers++ }
@@ -498,5 +498,43 @@ func TestRefusedPreemptWithTheVictimListedSaysSo(t *testing.T) {
 	target.mu.Unlock()
 	if err := peer.Preempt(victim.Key()); !errors.Is(err, ErrNotPreempted) || errors.Is(err, ErrFenced) {
 		t.Errorf("Preempt refused by the device = %v, want ErrNotPreempted without ErrFenced", err)
+	}
+}
+
+// A rekey leaves the earlier session's registration in place, and every path holds the key again, so each path's
+// unregister at unmount would succeed and leave that registration behind with no slot. Leave sees more registrations
+// than paths and removes them all.
+func TestLeaveAfterARekeyOverTwoPathsLeavesNoKey(t *testing.T) {
+	target := NewTarget()
+	node := target.MultipathNode("n", 2, NodeKey([16]byte{1}))
+	peer := target.Node("p", NodeKey([16]byte{2}))
+	for _, pr := range []*PR{node, peer} {
+		if err := pr.Register(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := peer.Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	target.Relogin("n#1")
+	k := &Rekeyer{
+		PR:           node,
+		HoldWrites:   func(fn func() error) error { return fn() },
+		HeartbeatAge: func() time.Duration { return time.Second },
+		SlotLive:     func() error { return nil },
+		StallLimit:   15 * time.Second,
+	}
+	if err := k.Rekey(); err != nil {
+		t.Fatalf("Rekey: %v", err)
+	}
+	if n, _ := node.Registrations(); n != 3 {
+		t.Fatalf("%d registrations after the rekey, want 3: both paths and the earlier session", n)
+	}
+	earlier, err := node.Leave()
+	if err != nil || !earlier {
+		t.Errorf("Leave = %v, %v; want the earlier session's registration removed", earlier, err)
+	}
+	if n, _ := node.Registrations(); n != 0 {
+		t.Errorf("%d registrations of the key left after Leave, want none", n)
 	}
 }

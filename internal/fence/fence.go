@@ -23,6 +23,9 @@ var (
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
+	errKeysUnlisted        = errors.New("this kernel or device cannot list the registered keys")
+	// ErrNoOtherRegistrant means no other node's key is registered, so dropping this node's could release the reservation.
+	ErrNoOtherRegistrant = errors.New("no other node's key is registered, so dropping this node's could release the reservation")
 )
 
 // Fencer registers this node's key on the device and revokes the keys of nodes proven dead.
@@ -38,6 +41,9 @@ type Fencer interface {
 	Preempt(victim uint64) error
 	// Unregister removes this node's key; once no key is left, the reservation goes too.
 	Unregister() error
+	// Leave is Unregister for a node that gave up its slot, which also removes the key an earlier iSCSI session of this
+	// host keeps; earlier reports that this session held no key.
+	Leave() (earlier bool, err error)
 }
 
 const (
@@ -72,11 +78,13 @@ func (None) Register() error      { return nil }
 func (None) Reserve() error       { return nil }
 func (None) Preempt(uint64) error { return nil }
 func (None) Unregister() error    { return nil }
+func (None) Leave() (bool, error) { return false, nil }
 
 type device interface {
 	register(old, new uint64, ignore bool) error
 	reserve(key uint64) error
 	preemptAbort(own, victim uint64) error
+	preempt(own, victim uint64) error
 	clear(key uint64) error
 	readKeys() ([]uint64, error)
 	readReservation() (key uint64, typ uint32, err error)
@@ -102,6 +110,52 @@ func (p *PR) Key() uint64 { return p.key }
 
 func (p *PR) Register() error { return p.dev.register(0, p.key, true) }
 
+// RegisterFresh drops this session's registration and registers the key anew, then reserves. LIO lets an initiator
+// write only while a per-initiator flag is set: each new registration sets it, and removing any registration of the
+// initiator clears it, also one an earlier session of this host made. Call it only after the device refused a write
+// or reserve of this node. It drops the registration only while another node's key is registered, so LIO hands the
+// reservation to that node: over dm-multipath with several paths into one LIO target portal group, the refusal can
+// come from this node's own other path holding the reservation, and dropping every path's registration with no other
+// registrant would release the reservation. Otherwise it returns ErrNoOtherRegistrant, or why it cannot list keys.
+func (p *PR) RegisterFresh() error {
+	keys, err := p.Keys()
+	if errors.Is(err, ErrUnsupported) {
+		return fmt.Errorf("%w (%s), so it cannot check that another node stays registered", errKeysUnlisted, cause(err))
+	} else if err != nil {
+		return fmt.Errorf("listing the registered keys: %w", err)
+	}
+	if !slices.ContainsFunc(keys, func(k uint64) bool { return k != p.key }) {
+		return ErrNoOtherRegistrant
+	}
+	if err := p.Register(); err != nil {
+		return err
+	}
+	if err := p.dev.register(p.key, 0, false); err != nil {
+		return err
+	}
+	if err := p.dev.register(0, p.key, false); err != nil {
+		return err
+	}
+	return p.Reserve()
+}
+
+// Join registers this node's key and reserves, and reports whether it registered the key anew. LIO refuses a reserve,
+// as it refuses a write, from a host whose write permission a revoke of its key under an earlier iSCSI session
+// cleared, so after such a refusal Join tries RegisterFresh once.
+func (p *PR) Join() (anew bool, err error) {
+	if err := p.Register(); err != nil {
+		return false, err
+	}
+	err = p.Reserve()
+	if !errors.Is(err, ErrForeignReservation) {
+		return false, err
+	}
+	if ferr := p.RegisterFresh(); ferr != nil {
+		return false, fmt.Errorf("%w; not registering anew: %v", err, ferr)
+	}
+	return true, nil
+}
+
 func (p *PR) Reserve() error {
 	if err := p.dev.reserve(p.key); errors.Is(err, ErrReservationConflict) {
 		return ErrForeignReservation
@@ -111,9 +165,17 @@ func (p *PR) Reserve() error {
 	return nil
 }
 
+// Preempt removes victim's registration and aborts its commands. A device without a reservation takes writes from any
+// host, so a preempt there would leave the victim writing: Preempt reserves first when the device holds none.
 func (p *PR) Preempt(victim uint64) error {
 	if victim == 0 || victim == p.key {
 		return fmt.Errorf("refusing to preempt key %#x: key 0 would remove every other node, and %#x is this node's", victim, p.key)
+	}
+	if err := p.reserveIfNone(); err != nil {
+		if errors.Is(err, ErrForeignReservation) && errors.Is(p.dev.register(p.key, p.key, false), ErrReservationConflict) {
+			return p.listedAfter(victim, ErrFenced)
+		}
+		return p.listedAfter(victim, fmt.Errorf("reserving the device before revoking key %#x: %w", victim, err))
 	}
 	err := p.dev.preemptAbort(p.key, victim)
 	if !errors.Is(err, ErrReservationConflict) {
@@ -180,6 +242,33 @@ func (p *PR) Paths() ([]*PR, func(), error) {
 	return paths, closeAll, nil
 }
 
+// reserveIfNone reserves the device unless it holds a reservation, or reserves anyway where the reservation cannot be read.
+func (p *PR) reserveIfNone() error {
+	if _, typ, err := p.dev.readReservation(); err == nil && typ != 0 {
+		return nil
+	} else if err != nil && !errors.Is(err, ErrUnsupported) {
+		return err
+	}
+	return p.Reserve()
+}
+
+// KeepReserved reserves the device again if it holds no reservation while this node's key is registered, and reports
+// whether it did. It returns ErrFenced if this node's key is gone too: the node cannot tell a storage reset from its
+// own fencing.
+func (p *PR) KeepReserved() (bool, error) {
+	if _, typ, err := p.dev.readReservation(); err != nil || typ != 0 {
+		return false, err
+	}
+	keys, err := p.Keys()
+	if err != nil {
+		return false, err
+	}
+	if !slices.Contains(keys, p.key) {
+		return false, ErrFenced
+	}
+	return true, p.Reserve()
+}
+
 // Keys lists the keys registered on the device. ErrUnsupported means the kernel or the device cannot list them.
 func (p *PR) Keys() ([]uint64, error) { return p.dev.readKeys() }
 
@@ -199,4 +288,46 @@ func (p *PR) Unregister() error {
 		return err
 	}
 	return nil
+}
+
+// registeredBeyondPaths reports whether the device lists more registrations of this node's key than its paths hold, as
+// after a rekey that left the earlier session's registration in place: then every path's unregister succeeds and
+// would leave that one behind. A listing that fails says nothing.
+func (p *PR) registeredBeyondPaths() bool {
+	n, err := p.Registrations()
+	if err != nil {
+		return false
+	}
+	paths, closeAll, err := p.Paths()
+	if err != nil {
+		return false
+	}
+	defer closeAll()
+	return n > len(paths)
+}
+
+// Leave unregisters this node's key, also where an earlier iSCSI session of this host keeps it. On LIO no peer revokes
+// such a registration, and while it holds the reservation every session of this host writes past a revoke of a later key.
+func (p *PR) Leave() (earlier bool, err error) {
+	if !p.registeredBeyondPaths() {
+		if err := p.Unregister(); !errors.Is(err, ErrFenced) {
+			return false, err
+		}
+	}
+	if err := p.Register(); err != nil {
+		return true, err
+	}
+	// Preempting its own key without abort removes the earlier registration and takes the reservation if that one held it.
+	if err := p.dev.preempt(p.key, p.key); err != nil {
+		return true, err
+	}
+	// Over dm-multipath the preempt also removed the key from this host's other paths, and dm stops an unregister at the
+	// first path without the key, so the key goes back on every path first.
+	if err := p.Register(); err != nil {
+		return true, err
+	}
+	if err := p.dev.register(p.key, 0, false); err != nil {
+		return true, fmt.Errorf("unregistering the key after removing it from the earlier session: %v", err)
+	}
+	return true, nil
 }

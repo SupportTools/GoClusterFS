@@ -120,6 +120,11 @@ func (g guarded) preemptAbort(own, victim uint64) error {
 	return err
 }
 
+func (g guarded) preempt(own, victim uint64) error {
+	_, err := timed(g.s, func() (struct{}, error) { return struct{}{}, g.dev.preempt(own, victim) })
+	return err
+}
+
 func (g guarded) clear(key uint64) error {
 	_, err := timed(g.s, func() (struct{}, error) { return struct{}{}, g.dev.clear(key) })
 	return err

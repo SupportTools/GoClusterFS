@@ -5848,12 +5848,56 @@ scenarios:
     environments:
       vm: run-vm-tests.sh::test_fencing_unmount_removes_key
 
+  - id: fencing-relogin-remount
+    name: A clean unmount after a relogin removes the key the earlier session kept
+    description: VM 1 holds the reservation, logs out and in under its multipath map, unmounts and mounts again; its unmount removes the earlier session's registration, so VM 2's revoke of VM 1's new key alone fences it and the file keeps VM 2's data
+    priority: vm_only
+    environments:
+      vm: run-vm-tests.sh::test_fencing_relogin_remount
+
+  - id: fence-leave-earlier-session
+    name: Leave removes this node's key from an earlier session
+    description: When this session holds no key, Leave registers it, preempts it without abort to remove the earlier session's registration, and unregisters, keeping the peer's key
+    priority: go_only
+    environments:
+      go: internal/fence/leave_test.go::TestLeaveRemovesTheKeyAnEarlierSessionKept
+
+  - id: fence-leave-two-paths
+    name: Leave removes the key from every dm-multipath path
+    description: With dm's routing, the first path misses the preempt and the second issues it; Leave registers the key on every path again before it unregisters, since dm stops an unregister at the first path without the key
+    priority: go_only
+    environments:
+      go: internal/fence/leave_test.go::TestLeaveOverTwoPathsWhenTheFirstPathMissesThePreempt
+
+  - id: fencing-unowned-keys
+    name: Keys no registry slot owns count as unowned
+    description: A key is owned while its node is in a slot, live or dead and waiting for a replay; an emptied slot's old node, a node in no slot and a tool key own nothing, and a key on two paths is listed once
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/stalekeys_test.go::TestUnownedKeys
+
+  - id: fencing-stale-keys-two-checks
+    name: A stale key needs no owner in both checks
+    description: A joining node registers before its slot claim lands, so only keys without an owner in both checks a minute apart are reported, neither one whose node claimed its slot by the second check nor one registered between the checks, and a mount that stops first reports none
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/stalekeys_test.go::TestStaleKeyCheckNeedsBothChecks
+
   - id: fencing-reservation-self-test
     name: fsck -test-reservations qualifies an LIO target
     description: The self-test refuses the mounted volume; once both nodes unmount it passes alone on VM 1, and in the two-host test VM 2's preempt makes the device refuse VM 1's write; a kept key survives a target power cycle that restores LIO's APTPL file, and -check-kept reports it lost after a power cycle that does not and after an iSCSI logout and login
     priority: vm_only
     environments:
       vm: run-vm-tests.sh::test_fencing_reservation_self_test
+
+  - id: fencing-lost-reservation
+    name: A node reserves again a device that lost its reservation
+    description: A device without a reservation takes writes from any host; a preempt reserves first when the device holds none, a node reserves again within two failure scans when the reservation is lost while its key stays, and stops when its key is gone too
+    priority: high
+    environments:
+      go: internal/fence/reserve_test.go::TestPreemptReservesWhenTheDeviceHasNone
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_lost_reservation
 
   - id: storage-gone-device
     name: A removed device calls the gone handler
