@@ -65,7 +65,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 
 ## On-Disk Layout
 
-`internal/superblock` (`calculateLayout`) defines this layout, format version 3. `-format` writes it into the 4 KB superblock at offset 0, and mount takes every offset from there. Data blocks are 1 MB. Metadata I/O uses 4 KB sectors.
+`internal/superblock` (`calculateLayout`) defines this layout, format version 3. `-format` writes it into the 4 KB superblock at offset 0, and mount takes every offset from there. Data blocks are 1 MB unless `-format -block-size` picks a power of two from 8 KB; extent tree nodes are max(block size, 64 KB). Metadata I/O uses 4 KB sectors.
 
 | Offset | Size | Region |
 |--------|------|--------|
@@ -74,9 +74,9 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | 2 MB | 64 MB | Lock records: 256 records of 64 claim slots of 4 KB, one slot per registry slot |
 | 66 MB | 1 MB | Snapshot registry |
 | 67 MB | 256 MB | Journals: 64 × 4 MB, one per registry slot |
-| 323 MB | 1 MB per 8 TB of device | Block bitmap |
-| next | about 8 MB per TB of device | Block refcounts |
-| next | 256 bytes per inode | Inode table: one inode per `-bytes-per-inode` bytes of device (default 1 MB), 4096 to 16M inodes; root is inode 2 |
+| 323 MB | 1 bit per data block: 1 MB per 8 TB at 1 MB blocks | Block bitmap |
+| next | 8 bytes per data block: about 8 MB per TB at 1 MB blocks | Block refcounts |
+| next | 256 bytes per inode | Inode table: one inode per `-bytes-per-inode` bytes of device (default 1 MB at 1 MB blocks, max(2 × block size, 16 KB) below), 4096 to 16M inodes; root is inode 2 |
 | next | rest | Data blocks |
 
 The last three metadata regions are sized at format time, each at least 1 MB and rounded up to whole MB. On devices up to 4 GB the data blocks start at 326 MB. The smallest device is 327 MB. Registry slot `i` owns the journal at `67 MB + i × 4 MB`, and `Register` records that region in the slot. On mount a node replays only its own slot's journal, which may hold a dirty journal from the slot's previous owner. A crashed peer's journal is replayed by a surviving node through the peer's registry slot. Mount refuses version 1 images (one journal shared by all nodes) and version 2 images (1 MB bitmap, refcount and inode regions: 4096 inodes, refcounts overflow past 128 GB). It also refuses version 3 images formatted before per-node lock slots, which have no lock slot size in the superblock and a 1 MB lock region, version 3 images formatted before each lock type had its own records, which lack the `RequiredTypedLockRecords` flag, and version 3 images formatted before file I/O locks, which lack `RequiredFileIOLocks` (0x40). Copy the data off with the old build and reformat. Builds from before those flags refuse newer images with `unknown required flags 0x10` or `0x40`. Each registry slot also records its node's lock layout (`lock.LayoutID`), and `Register` refuses to join while a live node shows another one. `-format` also sets `RequiredSymlinks`, because a symlink of up to 92 bytes keeps its target in the inode where the extents go; builds from before it refuse such images with `unknown required flags 0x20`, and on older version 3 images `symlink(2)` returns EOPNOTSUPP. `-format` also sets `RequiredProjectQuotas` (0x200) and puts the project quota table in the data blocks of a hidden inode, which the superblock names (`QuotaInode`, bytes 268–279); an inode's project ID is in its bytes 212–215, and flag bit 8 is PROJINHERIT. `goclusterfs-fsck -enable-quotas` adds the table to an older volume with every node stopped. Builds without quotas refuse such images with `unknown required flags 0x200`.
@@ -99,7 +99,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - At most 64 nodes mount a volume at once, one per registry slot. A node judges another by whether its heartbeat changes, timed on its own clock, so failover does not need clocks to agree.
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, a directory's wrong `.` or `..`, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. `statfs` (`df`) counts free inodes with a background scan of the whole inode table, so other nodes' creates and removes show up after up to 30 times the scan time, at least a second.
-- SFB is disabled: writes never allocate SFB slots, so every file uses full 1 MB blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
+- SFB is disabled: writes never allocate SFB slots, so every file uses full blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
 - Rename supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`. Symlinks need a volume formatted by a build with symlink support.
 
 ## Testing
