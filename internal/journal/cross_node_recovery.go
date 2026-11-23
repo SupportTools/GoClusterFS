@@ -34,6 +34,9 @@ type RecoveryContext struct {
 	OrphanHolders func(num uint32) (uint64, error)
 	AddOrphan     func(num uint32, birth uint64) error
 	FreeSFBSlot   func(ctx context.Context, packed uint64)
+	// FoldQuota, when set, folds what the dirty journal in region, of registry slot slot and its node owner, owes the
+	// quota table, before replay begins.
+	FoldQuota func(ctx context.Context, slot int, owner [16]byte, region *Region) error
 }
 
 // ReleaseReserved returns a crashed node's unused reserved blocks. They have no
@@ -108,6 +111,11 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 		log.Printf("[Recovery] Journal is clean, no recovery needed")
 		result.Duration = time.Since(start)
 		return result, nil
+	}
+	if rctx.FoldQuota != nil {
+		if err := rctx.FoldQuota(ctx, info.SlotIndex, info.UUID, region); err != nil {
+			return result, fmt.Errorf("folding the journal's quota usage: %w", err)
+		}
 	}
 
 	// Create handler that applies transactions idempotently

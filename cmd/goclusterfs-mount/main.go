@@ -396,6 +396,17 @@ func main() {
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, lockMgr, nodeUUID)
 	inodeTbl.SetAllocationStart(slotIdx, node.MaxNodes)
 	extentMgr := extent.NewManager(dev, bm, lockMgr, dataOffset, uint64(sb.BlockSize))
+	quotaGuard := quota.NewGuard(lockMgr)
+	// The superblock gets quotas at -format only after peers may already replay, so each fold checks again.
+	foldQuota := func(ctx context.Context, slot int, owner [16]byte, region *journal.Region) error {
+		if sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 {
+			return nil
+		}
+		open := func() (quota.Table, error) {
+			return quota.Open(dev, inodeTbl, sb.QuotaInode, dataOffset, uint64(sb.BlockSize))
+		}
+		return quotaGuard.Fold(ctx, open, slot, slotIdx, owner, region)
+	}
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
 	dirMgr.SetIndexLimit(*dirIndex)
@@ -441,7 +452,10 @@ func main() {
 		releaseReserved := recoveryCtx.ReleaseReserved(lock.ForReplay(context.Background()))
 
 		// Replay a dirty journal left in this slot's region by its previous owner
-		result, err := recoverOwnJournal(dev, journalOffset, journalSize, recoveryHandler, releaseReserved, slotIdx)
+		fold := func(region *journal.Region) error {
+			return foldQuota(lock.ForReplay(context.Background()), slotIdx, nodeUUID, region)
+		}
+		result, err := recoverOwnJournal(dev, journalOffset, journalSize, fold, recoveryHandler, releaseReserved, slotIdx)
 		if err != nil {
 			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}
@@ -585,6 +599,7 @@ func main() {
 		FreeSFBSlot: func(ctx context.Context, packed uint64) {
 			goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
 		},
+		FoldQuota: foldQuota,
 	}
 	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)
 	nodeReg.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
@@ -625,7 +640,8 @@ func main() {
 		log.Printf("Filesystem formatted successfully, with project quotas in inode %d", sb.QuotaInode)
 	}
 	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
-		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize))
+		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
+		gfs.StartQuotaFlush(quota.DefaultFlushMs * time.Millisecond)
 	}
 
 	// Verify root exists
@@ -1036,10 +1052,10 @@ func resetJournalHeader(dev *storage.Device, offset uint64) error {
 // previous owner. A replay that gave up waiting for another node's lock is
 // retried with backoff. Any other failure, such as a record that does not
 // decode or an I/O error, cannot get better by waiting, so it stops the mount.
-func recoverOwnJournal(dev *storage.Device, offset, size uint64, handler journal.RecoveryHandler, release func([]uint64) error, slot int) (*journal.ScanRecoveryResult, error) {
+func recoverOwnJournal(dev *storage.Device, offset, size uint64, fold func(*journal.Region) error, handler journal.RecoveryHandler, release func([]uint64) error, slot int) (*journal.ScanRecoveryResult, error) {
 	delay := ownReplayRetry
 	for {
-		result, err := journal.ScanAndRecover(dev, offset, size, handler, release)
+		result, err := journal.ScanFoldAndRecover(dev, offset, size, fold, handler, release)
 		if err == nil {
 			return result, nil
 		}

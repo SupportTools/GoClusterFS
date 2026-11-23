@@ -12,7 +12,7 @@
 //	Level 2: Snapshot (by ID)
 //	Level 3: Journal (per-node)
 //	Level 4: RefCount Region
-//	Level 5: LockRegion
+//	Level 5: Quota, the quota table's usage
 //	Level 6: BlockBitmap
 //	Level 7: SFBContainer
 //	Level 8: Inode (by number)
@@ -105,7 +105,7 @@ const (
 	LockTypeSnapshot     LockType = 2
 	LockTypeJournal      LockType = 3
 	LockTypeRefCount     LockType = 4
-	LockTypeLockRegion   LockType = 5
+	LockTypeQuota        LockType = 5
 	LockTypeBlockBitmap  LockType = 6
 	LockTypeSFBContainer LockType = 7
 	LockTypeInode        LockType = 8
@@ -215,7 +215,7 @@ var typeNames = [numLockTypes]string{
 	LockTypeSnapshot:     "snapshot",
 	LockTypeJournal:      "journal",
 	LockTypeRefCount:     "refcount",
-	LockTypeLockRegion:   "lock_region",
+	LockTypeQuota:        "quota",
 	LockTypeBlockBitmap:  "bitmap",
 	LockTypeSFBContainer: "sfb_container",
 	LockTypeInode:        "inode",
@@ -388,7 +388,7 @@ var typeRows = [numLockTypes]uint64{
 	LockTypeSnapshot:     1,
 	LockTypeJournal:      1,
 	LockTypeRefCount:     1,
-	LockTypeLockRegion:   1,
+	LockTypeQuota:        1,
 	LockTypeBlockBitmap:  1,
 	LockTypeSFBContainer: 1,
 	LockTypeInode:        128,

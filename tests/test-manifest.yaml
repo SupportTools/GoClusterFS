@@ -5654,12 +5654,68 @@ scenarios:
     environments:
       go: internal/journal/quota_test.go::TestQuotaFoldInTheJournalStandsForTheRecordsBefore
 
-  - id: quota-peer-replay-skips
-    name: A peer's replay applies no quota record
-    description: Replaying a dead journal with quota records succeeds and skips them
+  - id: quota-peer-replay-folds
+    name: A peer's replay folds quota usage before it begins
+    description: Replaying a dead journal passes it to the fold hook with the slot and its node while it is still Dirty, then applies no quota record
     priority: go_only
     environments:
-      go: internal/journal/quota_test.go::TestPeerReplaySkipsQuotaRecords
+      go: internal/journal/quota_test.go::TestPeerReplayFoldsQuotaRecordsFirst
+
+  - id: quota-stop-keeps-unflushed
+    name: Stop keeps a journal with unflushed quota usage dirty
+    description: Stop returns an error and leaves the deltas for a replay to fold
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestStopLeavesUnflushedQuotaForReplay
+
+  - id: quota-pressure-hook
+    name: Quota holds press for a flush before they fill the journal
+    description: The pressure hook runs once the oldest unflushed delta is half a ring behind, and not while no delta waits
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaPressureHookRunsBeforeHoldsFillTheRing
+
+  - id: lock-keep-for-dead-slot
+    name: A fold keeps the quota lock in the dead slot
+    description: KeepFor holds peers off until cleared, a later replay of the slot adopts the claim, and a claim the dead node held stays until its replay releases it
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestKeepForHoldsTheLockInADeadSlot
+
+  - id: quota-flush
+    name: A flush moves the ledger into the quota table
+    description: The table gets the ledger's usage, the quota xattr counts unflushed usage, and a checkpoint passes every delta afterwards
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestQuotaFlushMovesTheLedgerIntoTheTable
+
+  - id: quota-flush-at-unmount
+    name: The last flush empties the ledger
+    description: Stopping the flush loop flushes what is left, and the journal stops clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestStoppingTheQuotaFlushEmptiesTheLedger
+
+  - id: quota-fold-after-crash
+    name: Unflushed quota usage is folded after a crash
+    description: The replaying node adds the crashed node's deltas no flush covered to what its flushes wrote
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestUnflushedQuotaUsageIsFoldedAfterACrash
+
+  - id: quota-fold-cut-short
+    name: A fold cut short is redone once
+    description: A fold appended before its writes is written by the next replay, twice-run folds count once, and a completed fold leaves later usage alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAQuotaFoldCutShortIsRedoneOnce
+
+  - id: quota-flush-waits-replay
+    name: A flush waits out an adopted quota lock
+    description: While this node keeps a dead node's quota lock for a replay, flushes write nothing; afterwards they do
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestQuotaFlushWaitsOutAdoptedQuotaLock
 
   - id: fence-preempt-statuses
     name: Preempt reads SCSI and NVMe conflicts alike

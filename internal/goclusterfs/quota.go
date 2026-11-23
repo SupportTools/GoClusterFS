@@ -12,9 +12,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
-	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/quota"
-	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
 // quotaXattr sets and reads a directory's project quota. The kernel lets only CAP_SYS_ADMIN change trusted.* names.
@@ -27,10 +25,10 @@ var (
 	_ fs.NodeListxattrer   = (*Dir)(nil)
 )
 
-// SetQuotaTable names the inode that holds the volume's quota table and the volume's block size, in which usage and
-// limits count; num 0, the default, leaves quotas off.
-func (f *FS) SetQuotaTable(num uint32, blockSize uint64) {
-	f.quotaInode, f.quotaBlockSize = num, blockSize
+// SetQuotaTable names the inode that holds the volume's quota table, the volume's block size, in which usage and
+// limits count, and the quota lock this node's replays share; num 0, the default, leaves quotas off.
+func (f *FS) SetQuotaTable(num uint32, blockSize uint64, guard *quota.Guard) {
+	f.quotaInode, f.quotaBlockSize, f.quotaGuard = num, blockSize, guard
 }
 
 func (f *FS) dataBlockSize() uint64 { return f.quotaBlockSize }
@@ -51,34 +49,8 @@ func joinProject(ino *inode.Inode, p uint32) {
 	}
 }
 
-// quotaTable maps the quota inode's blocks for table I/O.
 func (f *FS) quotaTable() (quota.Table, error) {
-	qi, err := f.inodeTbl.Read(f.quotaInode)
-	if err != nil {
-		return quota.Table{}, err
-	}
-	if qi.HasExtentTree() {
-		return quota.Table{}, fmt.Errorf("quota inode %d maps its table through an extent tree, which this build does not read", f.quotaInode)
-	}
-	blockSize := f.dataBlockSize()
-	perBlock := blockSize / storage.SectorSize
-	physical := map[uint64]uint64{}
-	for _, x := range qi.InlineExtents {
-		for i := uint64(0); i < x.Length; i++ {
-			physical[x.LogicalBlock+i] = x.PhysicalBlock + i
-		}
-	}
-	return quota.Table{
-		Dev:     f.dev,
-		Sectors: uint64(len(physical)) * perBlock,
-		At: func(sector uint64) (int64, error) {
-			block, ok := physical[sector/perBlock]
-			if !ok {
-				return 0, fmt.Errorf("quota table sector %d is past the table's blocks", sector)
-			}
-			return int64(f.dataOffset + block*blockSize + sector%perBlock*storage.SectorSize), nil
-		},
-	}, nil
+	return quota.Open(f.dev, f.inodeTbl, f.quotaInode, f.dataOffset, f.dataBlockSize())
 }
 
 // quotaSetting is the value of quotaXattr: limits in bytes and inodes, 0 for none.
@@ -153,7 +125,7 @@ func (f *FS) setQuota(ctx context.Context, num uint32, value string) syscall.Err
 	if setting.bytes%blockSize != 0 {
 		limitBlocks++
 	}
-	unlock, err := f.lockFileIO(ctx, f.quotaInode, lock.LockModeExclusive)
+	unlock, err := f.quotaGuard.Lock(ctx)
 	if err != nil {
 		return errToErrno(err)
 	}
@@ -230,7 +202,7 @@ func (f *FS) clearQuota(ctx context.Context, num uint32) syscall.Errno {
 	if f.quotaInode == 0 {
 		return syscall.ENOTSUP
 	}
-	unlock, err := f.lockFileIO(ctx, f.quotaInode, lock.LockModeExclusive)
+	unlock, err := f.quotaGuard.Lock(ctx)
 	if err != nil {
 		return errToErrno(err)
 	}
@@ -273,9 +245,14 @@ func (f *FS) quotaValue(num uint32) (string, syscall.Errno) {
 	if err != nil {
 		return "", syscall.EIO
 	}
+	usedBlocks, usedInodes := rec.UsedBlocks, rec.UsedInodes
+	if f.journal != nil {
+		d := f.journal.QuotaPending()[ino.ProjectID]
+		usedBlocks, usedInodes = uint64(max(int64(usedBlocks)+d.Blocks, 0)), uint64(max(int64(usedInodes)+d.Inodes, 0))
+	}
 	blockSize := f.dataBlockSize()
 	return fmt.Sprintf("project=%d bytes=%d inodes=%d used_bytes=%d used_inodes=%d",
-		ino.ProjectID, rec.LimitBlocks*blockSize, rec.LimitInodes, rec.UsedBlocks*blockSize, rec.UsedInodes), 0
+		ino.ProjectID, rec.LimitBlocks*blockSize, rec.LimitInodes, usedBlocks*blockSize, usedInodes), 0
 }
 
 func (d *Dir) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {

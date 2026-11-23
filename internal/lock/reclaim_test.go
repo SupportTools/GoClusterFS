@@ -353,3 +353,62 @@ func TestClearForeignClaimsKeepsOwnHolds(t *testing.T) {
 	}
 	requireBlocked(t, peer, LockTypeInode, 4, LockModeExclusive)
 }
+
+// KeepFor holds a lock in a dead node's slot while a fold of its journal is half written: peers stay off it until the
+// release clears it, and a replay of the slot that starts meanwhile adopts it. A claim the dead node held stays until
+// that node's replay releases it.
+func TestKeepForHoldsTheLockInADeadSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	next := NewManager(dev, 0, reclaimRegion, [16]byte{5}, 5)
+	reg := newFakeRegistry()
+	reg.set(1, OwnerRecovering)
+	for _, slot := range []int{3, 4, 5} {
+		reg.set(slot, OwnerAlive)
+	}
+	for _, m := range []*Manager{replayer, peer, next} {
+		m.SetOwnerView(reg.view)
+	}
+
+	requireAcquired(t, replayer, LockTypeQuota, 0, LockModeExclusive)
+	clearKept, err := replayer.KeepFor(LockTypeQuota, 0, [16]byte{1}, 1)
+	if err != nil {
+		t.Fatalf("KeepFor: %v", err)
+	}
+	release(t, replayer, LockTypeQuota, 0)
+	replayer.ReleaseCached()
+	requireBlocked(t, peer, LockTypeQuota, 0, LockModeExclusive)
+	adopted, err := next.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(adopted) != 1 || !next.Adopted(LockTypeQuota, 0) || replayer.Adopted(LockTypeQuota, 0) {
+		t.Fatalf("a later replay adopted %v, %v; Adopted %v there and %v at the first replayer; want the kept claim adopted by the later replay only",
+			adopted, err, next.Adopted(LockTypeQuota, 0), replayer.Adopted(LockTypeQuota, 0))
+	}
+	next.ForgetAdopted(adopted)
+	if err := clearKept(); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, peer, LockTypeQuota, 0, LockModeExclusive)
+	release(t, peer, LockTypeQuota, 0)
+	peer.ReleaseCached()
+
+	requireAcquired(t, dead, LockTypeQuota, 0, LockModeExclusive)
+	held, err := replayer.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(held) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v", held, err)
+	}
+	clearKept, err = replayer.KeepFor(LockTypeQuota, 0, [16]byte{1}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clearKept(); err != nil {
+		t.Fatal(err)
+	}
+	requireBlocked(t, peer, LockTypeQuota, 0, LockModeExclusive)
+	if err := replayer.ReleaseAdopted(held); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, peer, LockTypeQuota, 0, LockModeExclusive)
+}

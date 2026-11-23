@@ -79,6 +79,45 @@ func (m *Manager) ownSlotUse(recordID uint64) (LockMode, bool) {
 	return 0, false
 }
 
+// KeepFor writes an exclusive claim on the record of lockType and resourceID into the slot ownerSlot of owner, a node
+// proven dead, as AdoptOwner keeps one the node held. Peers then stay off the lock until the returned func clears the
+// claim, or, if this node dies first, until the slot's next replay, which adopts the claim and releases it at its
+// end. A claim the node held already stays as it is. The caller holds the lock.
+func (m *Manager) KeepFor(lockType LockType, resourceID uint64, owner [16]byte, ownerSlot int) (func() error, error) {
+	recordID := m.hashToRecord(lockType, resourceID)
+	gate := m.recordGate(recordID)
+	gate.Lock()
+	defer gate.Unlock()
+
+	buf := storage.GetBuffer(SlotSize)
+	defer storage.PutBuffer(buf)
+	if _, err := m.dev.ReadAtUnsharded(buf.Bytes(), m.slotOffset(recordID, ownerSlot)); err != nil {
+		return nil, err
+	}
+	if s, err := decodeSlot(buf.Bytes()); err == nil && s != nil && s.owner == owner && s.mode == LockModeExclusive {
+		return func() error { return nil }, nil
+	}
+	kept := &claimSlot{mode: LockModeExclusive, lockType: lockType, resourceID: resourceID, adopted: true, owner: owner,
+		acquireTime: time.Now().UnixNano()}
+	if err := m.writeSlot(recordID, ownerSlot, kept); err != nil {
+		return nil, err
+	}
+	return func() error {
+		gate.Lock()
+		defer gate.Unlock()
+		return m.writeSlot(recordID, ownerSlot, nil)
+	}, nil
+}
+
+// Adopted reports whether this node keeps a dead node's claim on the record of lockType and resourceID for a replay.
+// This node's own acquires pass over such a claim.
+func (m *Manager) Adopted(lockType LockType, resourceID uint64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.adopted[m.hashToRecord(lockType, resourceID)]
+	return ok
+}
+
 // ReleaseAdopted clears the dead node's slots that AdoptOwner kept. A slot
 // that is this node's own and in use again is left to its own release, and a
 // slot a new node has written since is left alone.

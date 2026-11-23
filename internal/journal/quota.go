@@ -185,9 +185,10 @@ func (j *Journal) QuotaPending() map[uint32]QuotaDeltaPayload {
 
 // QuotaReplay is what a dirty journal's quota records still owe the quota table. The replaying node folds it in
 // through the journal itself before replay begins: it appends one transaction of QuotaFold records with
-// AppendQuotaFold, then writes the usage. A fold in the journal stands for every quota record before it, so a fold
-// that stopped part way is redone from the fold alone, and only its writes that did not land change. Applying the
-// records one by one instead could not tell a usage value that came back to an old one from one never written.
+// AppendQuotaFold, writes the usage, and completes the fold with CompleteQuotaFold. A fold in the journal stands for
+// every quota record before it, so a fold that stopped part way is redone from the fold alone, and only its writes
+// that did not land change. Applying the records one by one instead could not tell a usage value that came back to an
+// old one from one never written.
 type QuotaReplay struct {
 	// Running is, per project, the sum of the deltas logged after its last flush.
 	Running map[uint32]QuotaDeltaPayload
@@ -197,6 +198,8 @@ type QuotaReplay struct {
 	// Folded is set when the journal holds a fold already, so its changes need no new one, or replay began, which it
 	// does only after the fold.
 	Folded bool
+	// FoldSeq is the sequence of the journal's fold while it has not completed.
+	FoldSeq uint64
 }
 
 // ReadQuotaReplay reads the quota records of the journal in region, completed or not. Records of transactions whose
@@ -217,7 +220,10 @@ func ReadQuotaReplay(region *Region) (*QuotaReplay, error) {
 		}
 		if slices.ContainsFunc(txn.Entries, func(e *RecoveredEntry) bool { return e.Entry.OpType == TxnOpQuotaFold }) {
 			clear(q.Running)
-			q.Updates, q.Folded = nil, true
+			q.Updates, q.Folded, q.FoldSeq = nil, true, 0
+			if !txn.Completed {
+				q.FoldSeq = txn.Header.Seq
+			}
 		}
 		for _, e := range txn.Entries {
 			if err := q.add(e, txn.Completed); err != nil {
@@ -260,6 +266,11 @@ func (q *QuotaReplay) add(e *RecoveredEntry, completed bool) error {
 	return nil
 }
 
+// Owes reports whether the journal owes the table anything.
+func (q *QuotaReplay) Owes() bool {
+	return len(q.Running) > 0 || len(q.Updates) > 0
+}
+
 // Fold returns the usage changes that bring the table up to date with the journal, with Old set to what used reads
 // now. Each unfinished update is written again: the quota lock kept every other writer off the record since, so it
 // holds the update's Old or its New. The running deltas add on, and usage that would go below zero stops at zero.
@@ -287,8 +298,8 @@ func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, err
 			f.NewBlocks, f.NewInodes = u.NewBlocks, u.NewInodes
 		}
 		r := q.Running[project]
-		f.NewBlocks = addClamped(f.NewBlocks, r.Blocks, project, "blocks")
-		f.NewInodes = addClamped(f.NewInodes, r.Inodes, project, "inodes")
+		f.NewBlocks = AddUsage(f.NewBlocks, r.Blocks, project, "blocks")
+		f.NewInodes = AddUsage(f.NewInodes, r.Inodes, project, "inodes")
 		if f.NewBlocks != f.OldBlocks || f.NewInodes != f.OldInodes {
 			folds = append(folds, f)
 		}
@@ -300,7 +311,8 @@ func (f *QuotaUpdatePayload) holds(blocks, inodes uint64) bool {
 	return f.NewBlocks == blocks && f.NewInodes == inodes
 }
 
-func addClamped(used uint64, delta int64, project uint32, what string) uint64 {
+// AddUsage adds delta to project's used blocks or inodes, stopping at zero with a warning.
+func AddUsage(used uint64, delta int64, project uint32, what string) uint64 {
 	if delta < 0 && uint64(-delta) > used {
 		log.Printf("[WARN] quota: project %d would use %d %s less than its %d; counting 0 until goclusterfs-fsck -repair", project, -delta, what, used)
 		return 0
@@ -310,19 +322,25 @@ func addClamped(used uint64, delta int64, project uint32, what string) uint64 {
 
 // AppendQuotaFold appends folds as one transaction to the dirty journal in region, which no node has open, and makes
 // it durable before the usage is written.
-func AppendQuotaFold(region *Region, folds []QuotaUpdatePayload) error {
+func AppendQuotaFold(region *Region, folds []QuotaUpdatePayload) (uint64, error) {
 	sb := region.Superblock()
 	txn := NewTransaction(0, sb.NodeUUID, sb.NodeGeneration)
 	for i := range folds {
 		if err := txn.LogQuotaFold(&folds[i]); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	if _, _, _, err := region.Append(func(seq uint64) ([]byte, error) {
+	seq, _, _, err := region.Append(func(seq uint64) ([]byte, error) {
 		txn.setSeq(seq)
 		return txn.Serialize()
-	}); err != nil {
-		return fmt.Errorf("appending the quota fold: %w", err)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("appending the quota fold: %w", err)
 	}
-	return syncAppended(region)
+	return seq, syncAppended(region)
+}
+
+// CompleteQuotaFold marks the fold at seq written, so the journal owes the table nothing more.
+func CompleteQuotaFold(region *Region, seq uint64) error {
+	return CompleteReserves(region, []uint64{seq})
 }
