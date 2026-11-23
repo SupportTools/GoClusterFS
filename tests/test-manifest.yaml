@@ -352,6 +352,27 @@ scenarios:
     environments:
       go: internal/goclusterfs/extent_lock_region_test.go::TestOverwriteOfARunIsOneDeviceWrite
 
+  - id: new-blocks-one-write
+    name: New blocks that follow each other on the device are one write
+    description: At 8 KB blocks a 128 KB write into an empty file maps 16 contiguous blocks and reaches the device as one data write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestNewBlocksThatFollowEachOtherAreOneDeviceWrite
+
+  - id: fallocated-write-one-run
+    name: A write into fallocated blocks clears them as one run
+    description: At 8 KB blocks an unaligned write over 16 fallocated blocks makes 3 data writes, the zeroed head, the zeroed tail and the data, and the bytes it does not cover read as zeros
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestWriteIntoFallocatedBlocksIsOneRun
+
+  - id: clear-unwritten-range
+    name: ClearUnwrittenRange stops at the end of the unwritten extent
+    description: Clearing 3 blocks inside an 8-block unwritten extent marks 3, clearing 10 near its end marks 2, and clearing written blocks marks none
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestClearUnwrittenRangeStopsAtTheExtentEnd
+
   - id: tree-nodes-at-small-blocks
     name: Extent tree nodes stay at least 64 KB at small block sizes
     description: At 8 KB blocks a file holds 20,000 scattered extents, past the 15,876 that half-block nodes allowed; each node is an aligned run of 8 blocks, and truncating to 0 frees every one of them
