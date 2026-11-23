@@ -2,6 +2,7 @@ package fence
 
 import (
 	"errors"
+	"syscall"
 	"testing"
 )
 
@@ -63,5 +64,45 @@ func TestKeepReserved(t *testing.T) {
 				t.Errorf("an unregistered host's writes refused: %v, want %v", refused, tc.wantOthersRefused)
 			}
 		})
+	}
+}
+
+// busy answers its first busyReads reservation reads with EAGAIN, as a suspended device-mapper map does.
+type busy struct {
+	device
+	busyReads *int
+}
+
+func (d busy) readReservation() (uint64, uint32, error) {
+	if *d.busyReads > 0 {
+		*d.busyReads--
+		return 0, 0, syscall.EAGAIN
+	}
+	return d.device.readReservation()
+}
+
+// A device that answers EAGAIN once, then the truth, gets its lost reservation back; one that stays busy returns EAGAIN.
+func TestKeepReservedWaitsOutABusyDevice(t *testing.T) {
+	for _, tc := range []struct {
+		busyReads    int
+		wantReserved bool
+		wantErr      error
+	}{
+		{1, true, nil},
+		{busyTries, false, syscall.EAGAIN},
+	} {
+		target := NewTarget()
+		reads := tc.busyReads
+		node := &PR{dev: busy{&fakeDevice{t: target, initiator: "a"}, &reads}, key: 0x4743000000000001}
+		if err := node.Register(); err != nil {
+			t.Fatal(err)
+		}
+		reserved, err := node.KeepReserved()
+		if reserved != tc.wantReserved || !errors.Is(err, tc.wantErr) || (tc.wantErr == nil && err != nil) {
+			t.Errorf("%d busy reads: KeepReserved %v, %v; want %v, %v", tc.busyReads, reserved, err, tc.wantReserved, tc.wantErr)
+		}
+		if reads != 0 {
+			t.Errorf("%d busy reads: %d left unread", tc.busyReads, reads)
+		}
 	}
 }
