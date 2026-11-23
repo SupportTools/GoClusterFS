@@ -4064,11 +4064,20 @@ test_fencing_lost_reservation() {
         log_error "VM 1 still runs 20s after the device lost its reservation and VM 1's key"
         result=1
     fi
-    if [[ -z "$(mount_pids 2)" || "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
-        log_error "VM 2 stopped, or did not reserve the device again"
+    # VM 2 reserves on its next failure scan, which can come up to 5s after the one that stopped VM 1.
+    for t in $(seq 12); do
+        [[ "$(reservation_holder)" != *"No SPC-3 Reservation holder"* ]] && break
+        sleep 1
+    done
+    if [[ "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
+        log_error "12s after VM 1 stopped, VM 2 had not reserved the device again"
         result=1
     fi
-    sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E "Fencing|stopping" | tail -2
+    if [[ -z "$(mount_pids 2)" ]]; then
+        log_error "VM 2 stopped after the device lost VM 1's key"
+        result=1
+    fi
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E "Fencing|stopping" | tail -2 | sed 's/^/VM 1: /'
     fencing_restart pr || result=1
     return $result
 }
