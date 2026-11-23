@@ -234,10 +234,19 @@ func (m *Manager) allocate(ctx context.Context, ino *inode.Inode, logicalBlock, 
 	if err != ErrExtentNotFound {
 		return nil, err
 	}
+	runs, _, err := m.mapNew(ctx, ino, logicalBlock, count, flags)
+	if err != nil {
+		return nil, err
+	}
+	return &runs[0], nil
+}
 
+// mapNew maps count new blocks at logicalBlock, which must be unmapped, and
+// returns their extents and blocks.
+func (m *Manager) mapNew(ctx context.Context, ino *inode.Inode, logicalBlock, count uint64, flags uint32) ([]Extent, []uint64, error) {
 	blocks, err := m.bitmap.Alloc(ctx, int(count))
 	if err != nil {
-		return nil, fmt.Errorf("failed to allocate blocks: %w", err)
+		return nil, nil, fmt.Errorf("failed to allocate blocks: %w", err)
 	}
 
 	runs := contiguousRuns(logicalBlock, blocks, flags)
@@ -249,29 +258,61 @@ func (m *Manager) allocate(ctx context.Context, ino *inode.Inode, logicalBlock, 
 		err = e.commit()
 	}
 	if err != nil {
-		return nil, m.freeUnmapped(ctx, blocks, err)
+		return nil, nil, m.freeUnmapped(ctx, blocks, err)
 	}
 
 	ino.AllocatedBlocks += count
 	if flags&FlagUnwritten == 0 {
 		ino.WrittenBlocks += count
 	}
-	return &runs[0], nil
+	return runs, blocks, nil
 }
 
-// freeUnmapped frees blocks no inode maps and returns cause, joined with an
-// error naming each block it could not free, which stays allocated.
-func (m *Manager) freeUnmapped(ctx context.Context, blocks []uint64, cause error) error {
-	errs := []error{cause}
-	for _, b := range blocks {
-		if err := m.bitmap.Free(ctx, b); err != nil {
-			errs = append(errs, fmt.Errorf("freeing unmapped block %d: %w", b, err))
+// Fallocate maps every hole in logical blocks [from, to) to new unwritten
+// blocks and returns the blocks it allocated, also on error. They belong to
+// nobody until the inode write commits.
+func (m *Manager) Fallocate(ctx context.Context, ino *inode.Inode, from, to uint64) ([]uint64, error) {
+	holes, err := m.holes(ino, from, to)
+	if err != nil {
+		return nil, err
+	}
+	var fresh []uint64
+	for _, h := range holes {
+		_, blocks, err := m.mapNew(ctx, ino, h.LogicalBlock, h.Length, FlagAllocated|FlagUnwritten)
+		if err != nil {
+			return fresh, err
 		}
+		fresh = append(fresh, blocks...)
 	}
-	if len(errs) == 1 {
-		return cause
+	return fresh, nil
+}
+
+// holes returns the unmapped ranges of logical blocks [from, to), in order.
+func (m *Manager) holes(ino *inode.Inode, from, to uint64) ([]Extent, error) {
+	var holes []Extent
+	next := from
+	err := m.forEach(ino, func(x Extent) {
+		if x.LogicalBlock > next && next < to {
+			holes = append(holes, Extent{LogicalBlock: next, Length: min(x.LogicalBlock, to) - next})
+		}
+		next = max(next, x.LogicalBlock+x.Length)
+	})
+	if err != nil {
+		return nil, err
 	}
-	return errors.Join(errs...)
+	if next < to {
+		holes = append(holes, Extent{LogicalBlock: next, Length: to - next})
+	}
+	return holes, nil
+}
+
+// freeUnmapped frees blocks no inode maps and returns cause, joined with the
+// error of a free that left some of them allocated.
+func (m *Manager) freeUnmapped(ctx context.Context, blocks []uint64, cause error) error {
+	if err := m.bitmap.FreeBatch(ctx, blocks); err != nil {
+		return errors.Join(cause, fmt.Errorf("freeing %d unmapped blocks, some stay allocated: %w", len(blocks), err))
+	}
+	return cause
 }
 
 // contiguousRuns maps blocks onto consecutive logical blocks starting at
@@ -376,34 +417,27 @@ func (m *Manager) unmap(ctx context.Context, ino *inode.Inode, from, to uint64) 
 // conflict, the inode on disk still maps them. SFB extents point into
 // containers rather than at bitmap blocks.
 func (m *Manager) release(ctx context.Context, ino *inode.Inode, removed []Extent) {
-	var blocks []uint64
+	var runs []blockRun
 	for _, x := range removed {
 		ino.AllocatedBlocks -= min(ino.AllocatedBlocks, x.Length)
 		if x.Flags&FlagUnwritten == 0 {
 			ino.WrittenBlocks -= min(ino.WrittenBlocks, x.Length)
 		}
-		if x.Flags&FlagSFB == 0 {
-			blocks = append(blocks, m.ownedBlocks(x)...)
+		if x.Flags&FlagSFB == 0 && m.owns(x) {
+			runs = append(runs, blockRun{x.PhysicalBlock, x.Length})
 		}
 	}
-	if len(blocks) == 0 {
+	if len(runs) == 0 {
 		return
 	}
 	p := ensurePending(ino)
-	p.release = append(p.release, blocks...)
+	p.release = append(p.release, runs...)
 }
 
-// ownedBlocks returns the blocks of x that frees may give back. Nobody knows
-// how many inodes share an uncounted block, so it stays allocated.
-func (m *Manager) ownedBlocks(x Extent) []uint64 {
-	if x.Flags&FlagShared != 0 && (x.Flags&FlagCounted == 0 || m.refs == nil) {
-		return nil
-	}
-	blocks := make([]uint64, x.Length)
-	for j := range blocks {
-		blocks[j] = x.PhysicalBlock + uint64(j)
-	}
-	return blocks
+// owns reports whether frees may give x's blocks back. Nobody knows how many
+// inodes share an uncounted block, so it stays allocated.
+func (m *Manager) owns(x Extent) bool {
+	return x.Flags&FlagShared == 0 || x.Flags&FlagCounted != 0 && m.refs != nil
 }
 
 // HasUncountedSharing reports whether ino shares blocks the way older versions
@@ -446,7 +480,7 @@ func (m *Manager) Delete(ctx context.Context, ino *inode.Inode) error {
 		return err
 	}
 	if p := pendingOf(ino); p != nil {
-		m.freeBlocks(ctx, p.release)
+		m.freeRuns(ctx, p.release)
 		m.freeBlocks(ctx, m.nodeRuns(p.fresh))
 		ino.PendingTree = nil
 	}

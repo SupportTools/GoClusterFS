@@ -54,8 +54,8 @@ type pendingTree struct {
 	index    uint64
 	hasIndex bool
 	leaves   []*leafRef
-	fresh    []uint64 // first blocks of the tree nodes allocated since base
-	release  []uint64 // blocks to free after the commit
+	fresh    []uint64   // first blocks of the tree nodes allocated since base
+	release  []blockRun // blocks to free after the commit
 }
 
 func pendingOf(ino *inode.Inode) *pendingTree {
@@ -234,7 +234,7 @@ type editor struct {
 	hasIndex bool
 	leaves   []*leafRef
 	fresh    []uint64
-	release  []uint64
+	release  []blockRun
 	changed  bool
 }
 
@@ -244,7 +244,7 @@ func (m *Manager) edit(ctx context.Context, ino *inode.Inode) (*editor, error) {
 	if p := pendingOf(ino); p != nil {
 		e.base, e.index, e.hasIndex = p.base, p.index, p.hasIndex
 		e.fresh = append([]uint64(nil), p.fresh...)
-		e.release = append([]uint64(nil), p.release...)
+		e.release = append([]blockRun(nil), p.release...)
 		leaves = p.leaves
 	} else {
 		e.base = committedTree(ino)
@@ -438,7 +438,7 @@ func (e *editor) drop(blocks []uint64) {
 			e.m.freeBlocks(e.ctx, e.m.nodeRuns([]uint64{b}))
 			continue
 		}
-		e.release = append(e.release, e.m.nodeRuns([]uint64{b})...)
+		e.release = append(e.release, blockRun{b, NodeBlocks(e.m.blockSize)})
 	}
 }
 
@@ -539,7 +539,7 @@ func (m *Manager) FlushTree(ino, onDisk *inode.Inode) (func(), error) {
 	if committedTree(onDisk) != p.base || !p.base.present && onDisk.InlineExtents != ino.CommittedInlineExtents() {
 		return nil, fmt.Errorf("%w: inode %d", ErrTreeConflict, ino.InodeNum)
 	}
-	release := func() { m.freeBlocks(context.Background(), p.release) }
+	release := func() { m.freeRuns(context.Background(), p.release) }
 	if len(p.leaves) == 0 {
 		ino.ExtentTreeGen = 0
 		return release, nil
@@ -734,6 +734,27 @@ func ensurePending(ino *inode.Inode) *pendingTree {
 // owner holds any more, such as a block a write just copied away from.
 func (m *Manager) ReleaseBlocks(ctx context.Context, blocks []uint64) {
 	m.freeBlocks(ctx, blocks)
+}
+
+// blockRun is count consecutive blocks from start.
+type blockRun struct{ start, count uint64 }
+
+// freeBatch bounds how many blocks one free lists in memory and frees in one
+// hold of the bitmap lock.
+const freeBatch = 1 << 20
+
+// freeRuns frees runs freeBatch blocks at a time.
+func (m *Manager) freeRuns(ctx context.Context, runs []blockRun) {
+	var batch []uint64
+	for _, r := range runs {
+		for b := r.start; b < r.start+r.count; b++ {
+			if batch = append(batch, b); len(batch) == freeBatch {
+				m.freeBlocks(ctx, batch)
+				batch = nil
+			}
+		}
+	}
+	m.freeBlocks(ctx, batch)
 }
 
 // freeBlocks drops one owner from each block and returns the blocks no owner

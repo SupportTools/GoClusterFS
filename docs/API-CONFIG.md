@@ -70,7 +70,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 |------|------|---------|-------------|
 | `-journal` | bool | `true` | Write-ahead journal for crash consistency. Off, a crash of this node can leave the filesystem inconsistent: testing only. The mount still replays the journal its registry slot holds from an earlier crash, and `-skip-recovery` still discards it |
 | `-skip-recovery` | int | `-1` (off) | Discard the journal of registry slot N instead of replaying it, if the mount takes slot N (dangerous, may lose data). Refuses while other nodes run if the journal holds a committed transaction or cannot be read |
-| `-block-reserve` | int | `64` | Data blocks each node takes from the bitmap at once and hands out to writes without the cluster-wide bitmap lock; `0` turns reserves off. Needs `-journal`. See [Block Reserves](OPERATIONS.md#block-reserves) |
+| `-block-reserve` | int | `-1` | Data blocks each node takes from the bitmap at once and hands out to writes without the cluster-wide bitmap lock; `0` turns reserves off, and `-1` takes 64 MB of blocks: 64 at 1 MB, 8192 at 8 KB. Needs `-journal`. See [Block Reserves](OPERATIONS.md#block-reserves) |
 
 ### Network Broadcast Flags
 

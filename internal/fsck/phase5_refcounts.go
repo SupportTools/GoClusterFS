@@ -3,7 +3,6 @@ package fsck
 import (
 	"encoding/binary"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -164,16 +163,15 @@ func (c *Checker) refcountCoverage() uint64 {
 // with counts, which the first delete frees. Only-uncounted sharing is never freed.
 func (c *Checker) checkSharingPastTable(covered uint64) {
 	var blocks []uint64
-	for block, refs := range c.inodeBlocks {
+	for block, refs := range c.inodeBlocks.all() {
 		if block >= covered && refs > 1 && c.uncountedRefs[block] < refs {
 			blocks = append(blocks, block)
 		}
 	}
-	slices.Sort(blocks)
 	for _, block := range blocks[:min(len(blocks), 10)] {
 		c.addProblem(PhaseRefcounts, Critical, fmt.Sprintf("block %d", block),
 			fmt.Sprintf("mapped by %d inodes but past the refcount table, which has no count for it: deleting one of them frees a block the others still map",
-				c.inodeBlocks[block]), false)
+				c.inodeBlocks.get(block)), false)
 	}
 	if len(blocks) > 10 {
 		c.addProblem(PhaseRefcounts, Critical, "blocks",
@@ -200,7 +198,7 @@ func (c *Checker) reportLeakCounts(leaks []refcountFix, counts []uint32) []refco
 // checkRefcount compares one block's count with the inodes that map it. It
 // reports a problem and returns the count repair should set, if any.
 func (c *Checker) checkRefcount(block uint64, count uint32) (uint32, bool) {
-	refs := uint32(c.inodeBlocks[block])
+	refs := uint32(c.inodeBlocks.get(block))
 	loc := fmt.Sprintf("block %d", block)
 	switch {
 	case count == 0xFFFFFFFF:
@@ -214,7 +212,7 @@ func (c *Checker) checkRefcount(block uint64, count uint32) (uint32, bool) {
 		c.addProblem(PhaseRefcounts, Warning, loc,
 			fmt.Sprintf("mapped by %d inode(s) but refcount is %d: the block will never be freed", refs, count), true)
 		return refs, true
-	case refs == 0 && count != 0 && !c.bitmapAllocated[block]:
+	case refs == 0 && count != 0 && !c.bitmapAllocated.has(block):
 		c.addProblem(PhaseRefcounts, Error, loc,
 			fmt.Sprintf("free in the bitmap but refcount is %d", count), true)
 		return 0, true
@@ -261,7 +259,7 @@ func (c *Checker) rebuildRefcountSector(buf []byte, sector uint64) {
 		if block >= c.sbData.TotalBlocks {
 			break
 		}
-		if refs := c.inodeBlocks[block]; refs > 1 {
+		if refs := c.inodeBlocks.get(block); refs > 1 {
 			binary.LittleEndian.PutUint32(buf[i*RefcountEntrySize:], uint32(refs))
 		}
 	}

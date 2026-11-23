@@ -86,6 +86,8 @@ func (c *Checker) checkSuperblock() error {
 	if err := c.validateRegions(sb, devSize); err != nil {
 		return err
 	}
+	c.bitmapAllocated = newBlockSet(sb.TotalBlocks)
+	c.inodeBlocks = newBlockRefs(sb.TotalBlocks)
 	c.checkJournalSlots(sb)
 	if err := sb.layout().CheckLayout(int64(devSize)); err != nil {
 		c.layoutErr = err

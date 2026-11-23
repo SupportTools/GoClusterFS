@@ -174,6 +174,12 @@ type Table struct {
 	// restartEvery is how often FindFreeSlot reads from scanStart again, to reuse inodes other nodes freed.
 	restartEvery time.Duration
 	restarted    atomic.Int64
+
+	freeInodes   atomic.Int64 // FreeCount's estimate, which local claims and frees adjust
+	counted      atomic.Bool
+	countedAt    atomic.Int64
+	recountAfter atomic.Int64 // how old the estimate may get before a scan refreshes it
+	counting     atomic.Bool
 }
 
 // SetTreeFlusher sets the writer for pending extent-tree changes.
@@ -571,6 +577,7 @@ func (t *Table) claimSlotOnce(ctx context.Context, num uint32, ok func(free *Ino
 	if err := t.writeInodeUnlocked(newInode); err != nil {
 		return nil, fmt.Errorf("failed to write new inode: %w", err)
 	}
+	t.freeInodes.Add(-1)
 
 	return newInode, nil
 }
@@ -651,6 +658,7 @@ func (t *Table) freeIfOnce(ctx context.Context, inodeNum uint32, ok func(*Inode)
 	if err := t.writeInodeUnlocked(emptyInode); err != nil {
 		return false, err
 	}
+	t.freeInodes.Add(1)
 	t.freedBeforeResume(inodeNum)
 	return true, nil
 }
@@ -701,16 +709,36 @@ func (t *Table) TotalInodes() uint64 {
 	return t.totalInodes
 }
 
-// FreeCount estimates free inodes; it scans without t.mu, so a full-table scan never stalls inode writes.
+// FreeCount estimates free inodes. The first call scans the table. Later calls
+// return the estimate at once and refresh it in the background once it is older
+// than 30 times the last scan took, at least a second, so a large table is not
+// read on every statfs. Local claims and frees adjust it in between; other
+// nodes' show up at the next refresh.
 func (t *Table) FreeCount() uint64 {
-	freeCount := uint64(0)
+	if !t.counted.Load() {
+		t.recount()
+	} else if time.Now().UnixNano()-t.countedAt.Load() > t.recountAfter.Load() && t.counting.CompareAndSwap(false, true) {
+		go func() {
+			defer t.counting.Store(false)
+			t.recount()
+		}()
+	}
+	return uint64(max(0, t.freeInodes.Load()))
+}
+
+func (t *Table) recount() {
+	started := time.Now()
+	var free int64
 	t.scanMagic(uint64(InodeFirstUsable), t.totalInodes, scanBytes, func(_, magic uint32) bool {
 		if magic == 0 {
-			freeCount++
+			free++
 		}
 		return true
 	})
-	return freeCount
+	t.freeInodes.Store(free)
+	t.recountAfter.Store(int64(max(time.Second, 30*time.Since(started))))
+	t.countedAt.Store(time.Now().UnixNano())
+	t.counted.Store(true)
 }
 
 // readInodeUnlocked reads an inode without acquiring the mutex.

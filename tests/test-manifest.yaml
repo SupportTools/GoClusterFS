@@ -366,6 +366,55 @@ scenarios:
     environments:
       go: internal/bitmap/alloc_runs_test.go::TestAllocRunsStaysInsideTheBitmap
 
+  - id: fsck-dense-block-sets
+    name: fsck tracks blocks in a bitset and a byte per block
+    description: The allocated set matches a map for add, remove, membership and sorted iteration; reference counts past 254 move to a map and back
+    priority: go_only
+    environments:
+      go: internal/fsck/blocks_test.go::TestBlockSetMatchesAMap
+
+  - id: fsck-block-refs-overflow
+    name: fsck reference counts past one byte
+    description: A block mapped 300 times counts 300, dropping to 200 keeps it in a byte, and iteration yields only referenced blocks
+    priority: go_only
+    environments:
+      go: internal/fsck/blocks_test.go::TestBlockRefsCountsPastOneByte
+
+  - id: bitmap-count-1mb-reads
+    name: Bitmap counts read 1 MB at a time
+    description: A count of a 300-sector bitmap makes 2 reads; when a 1 MB read fails it rereads sector by sector, so only the unreadable sector counts as allocated
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestCountReadsOneMBAtATime
+
+  - id: inode-free-count-cached
+    name: statfs free inodes come from a cached count
+    description: Local claims and frees change the count at once, a peer's claim shows up after the next background refresh
+    priority: go_only
+    environments:
+      go: internal/inode/alloc_test.go::TestFreeCountIsCachedAndAdjusted
+
+  - id: fallocate-maps-holes
+    name: fallocate maps only the holes of its range
+    description: In a file with an extent tree, fallocate allocates unwritten blocks for each hole in one pass, including the hole after the last extent, keeps written blocks, returns the new blocks, and a second call allocates nothing
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestFallocateMapsOnlyHoles
+
+  - id: fsck-cross-linked-blocks
+    name: fsck reports a block two inodes map without FlagShared
+    description: A block a second inode maps without FlagShared is a Critical problem naming the first inode, and a block both inodes map with FlagShared is not reported
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckReportsCrossLinkedBlocks
+
+  - id: reserve-default-64mb
+    name: The default block reserve is 64 MB of blocks
+    description: DefaultBlocks gives 64 blocks at 1 MB, 256 at 256 KB and 8192 at 8 KB
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestDefaultReserveIs64MB
+
   - id: inode-allocation-start
     name: Inode search starts at the node's part of the table
     description: FindFreeSlot starts at a bit-reversed fraction of the table per node slot, wraps around, and still finds every free inode

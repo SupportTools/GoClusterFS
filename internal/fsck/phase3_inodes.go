@@ -313,7 +313,7 @@ func (c *Checker) recordInodeExtents(inodeNum uint32, inode *InodeData) {
 		}
 	}
 	for _, block := range c.mappedBlocks(inodeNum, inode) {
-		c.inodeBlocks[block]++
+		c.inodeBlocks.add(block, 1)
 	}
 
 	for _, ext := range c.inodeExtents(inodeNum, inode) {

@@ -2,8 +2,6 @@ package fsck
 
 import (
 	"fmt"
-	"maps"
-	"slices"
 	"strings"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
@@ -18,12 +16,12 @@ const reportedLeaks = 10
 // it as data or extent-tree nodes and no SFB extent points into it. SFB
 // allocation is disabled, so a container nothing points into is leaked too.
 func (c *Checker) isLeaked(block uint64) bool {
-	return c.bitmapAllocated[block] && c.inodeBlocks[block] == 0 && !c.sfbContainers[block]
+	return c.bitmapAllocated.has(block) && c.inodeBlocks.get(block) == 0 && !c.sfbContainers[block]
 }
 
 func (c *Checker) leakedBlocks() []uint64 {
 	var leaked []uint64
-	for _, block := range slices.Sorted(maps.Keys(c.bitmapAllocated)) {
+	for block := range c.bitmapAllocated.all() {
 		if c.isLeaked(block) {
 			leaked = append(leaked, block)
 		}
