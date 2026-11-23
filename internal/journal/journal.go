@@ -119,6 +119,8 @@ type Journal struct {
 	commitCount  uint64
 	bytesWritten uint64
 	batchSyncs   uint64 // Number of batch syncs performed
+
+	quota quotaLedger
 }
 
 // ActiveTxn tracks a transaction between Begin and Commit or Abort.
@@ -140,6 +142,7 @@ func Open(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		config:            config,
 		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
+		quota:             newQuotaLedger(),
 		unsyncedEnds:      make(map[uint64]bool),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: region.Superblock().LastCheckpointSeq,
@@ -163,6 +166,7 @@ func Init(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		config:            config,
 		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
+		quota:             newQuotaLedger(),
 		unsyncedEnds:      make(map[uint64]bool),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: 0,
@@ -301,6 +305,9 @@ func (j *Journal) advanceHead() (bool, error) {
 	for blockSeq, pos := range j.pendingIntents {
 		block(blockSeq, pos)
 	}
+	for _, h := range j.quota.holds {
+		block(h.seq, h.start)
+	}
 	if target == head {
 		return false, nil
 	}
@@ -338,11 +345,27 @@ func (j *Journal) Begin() *Transaction {
 //
 // Returns the transaction sequence number for use with CompleteIntent().
 func (j *Journal) Commit(txn *Transaction) (uint64, error) {
+	return j.commit(txn, nil)
+}
+
+// CommitQuota commits txn after build adds records that read this node's quota ledger, such as a flush. No other
+// commit changes the ledger between build and txn's commit.
+func (j *Journal) CommitQuota(txn *Transaction, build func(pending func(project uint32) QuotaDeltaPayload) error) (uint64, error) {
+	return j.commit(txn, build)
+}
+
+func (j *Journal) commit(txn *Transaction, build func(pending func(project uint32) QuotaDeltaPayload) error) (uint64, error) {
 	j.mu.Lock()
 
 	if _, ok := j.activeTxns[txn]; !ok {
 		j.mu.Unlock()
 		return 0, errors.New("transaction not found in active set")
+	}
+	if build != nil {
+		if err := build(j.quota.pendingFor); err != nil {
+			j.mu.Unlock()
+			return 0, err
+		}
 	}
 
 	// Check space for the sector-aligned record WriteAt writes
@@ -382,7 +405,7 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// This is CRITICAL for crash consistency - the tail offset must be
 	// persisted so recovery can find the transaction data.
 	if err := j.region.FlushSuperblock(); err != nil {
-		j.abandonLocked(seq)
+		j.abandonLocked(seq, txn)
 		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to flush superblock: %w", err)
 	}
@@ -395,6 +418,7 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	// The operation runs after Commit, so the head must not pass this transaction until CompleteIntent.
 	delete(j.activeTxns, txn)
 	j.pendingIntents[seq] = start
+	j.quota.apply(seq, start, txn.quota, 1)
 	pressed := j.oldestIntentLagLocked() > j.region.DataAreaSize()/2
 
 	// Release lock BEFORE sync operations to avoid deadlock
@@ -411,18 +435,23 @@ func (j *Journal) Commit(txn *Transaction) (uint64, error) {
 	case CommitSync:
 		// Sync immediately for maximum durability
 		if err := j.region.Sync(); err != nil {
-			j.dropIntent(seq)
+			j.dropIntent(seq, txn)
 			return 0, fmt.Errorf("failed to sync journal: %w", err)
 		}
 	case CommitBatch:
 		// Batch mode: wait for periodic sync, reducing fsync frequency
 		// This amortizes fsync cost across multiple commits
 		if err := j.waitForBatchSync(); err != nil {
-			j.dropIntent(seq)
+			j.dropIntent(seq, txn)
 			return 0, fmt.Errorf("failed batch sync: %w", err)
 		}
 	case CommitAsync:
 		// No sync - fastest but no durability guarantee
+	}
+	if len(txn.quota) > 0 {
+		j.mu.Lock()
+		j.quota.settle(txn.quota)
+		j.mu.Unlock()
 	}
 
 	return seq, nil
@@ -432,19 +461,28 @@ func sectorAligned(n uint32) uint32 {
 	return (n + storage.SectorSize - 1) / storage.SectorSize * storage.SectorSize
 }
 
-// dropIntent forgets an intent whose Commit failed, since its caller never runs the operation.
-func (j *Journal) dropIntent(seq uint64) {
+// dropIntent forgets an intent whose Commit failed, since its caller never runs the operation, and takes back its
+// quota changes.
+func (j *Journal) dropIntent(seq uint64, txn *Transaction) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	delete(j.pendingIntents, seq)
-	j.abandonLocked(seq)
+	if len(txn.quota) > 0 {
+		j.quota.apply(seq, 0, txn.quota, -1)
+		log.Printf("[WARN] journal: record %d with quota changes failed to commit; if a flush counted them first, usage stays off until goclusterfs-fsck -repair", seq)
+	}
+	j.abandonLocked(seq, txn)
 }
 
 // abandonLocked ends a record whose Commit failed after it reached the ring: the next commit's tail would otherwise
 // cover it, and replay would run an operation its caller never ran, on an inode slot this node may have reused since.
 // Must hold j.mu.
-func (j *Journal) abandonLocked(seq uint64) {
-	if err := j.appendCompletionLocked(seq); err != nil {
+func (j *Journal) abandonLocked(seq uint64, txn *Transaction) {
+	record := completionRecord
+	if len(txn.quota) > 0 {
+		record = abandonRecord
+	}
+	if err := j.appendRecordLocked(seq, record); err != nil {
 		log.Printf("[WARN] journal: record %d failed to commit and could not be ended, so replay may run it: %v", seq, err)
 	}
 }
@@ -636,7 +674,11 @@ func (j *Journal) oldestIntentLocked(intentSeq uint64) bool {
 }
 
 func (j *Journal) appendCompletionLocked(intentSeq uint64) error {
-	need := sectorAligned(completionLength)
+	return j.appendRecordLocked(intentSeq, completionRecord)
+}
+
+func (j *Journal) appendRecordLocked(intentSeq uint64, record func(seq uint64, nodeUUID [16]byte, generation, intentSeq uint64) ([]byte, error)) error {
+	need := sectorAligned(abandonLength)
 	if need > j.region.AvailableSpace() {
 		if err := j.forceCheckpoint(); err != nil || need > j.region.AvailableSpace() {
 			return ErrJournalFull
@@ -649,7 +691,7 @@ func (j *Journal) appendCompletionLocked(intentSeq uint64) error {
 	}
 
 	_, _, written, err := j.region.Append(func(seq uint64) ([]byte, error) {
-		return completionRecord(seq, j.nodeUUID, j.generation, intentSeq)
+		return record(seq, j.nodeUUID, j.generation, intentSeq)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to write intent completion: %w", err)

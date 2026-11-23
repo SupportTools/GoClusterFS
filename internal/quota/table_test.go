@@ -9,7 +9,6 @@ import (
 
 func TestHeaderRoundTrip(t *testing.T) {
 	h := &Header{NextProjectID: 17}
-	h.FoldedThroughSeq[0], h.FoldedThroughSeq[MaxSlots-1] = 5, 1<<40
 	sector := make([]byte, storage.SectorSize)
 	EncodeHeader(h, sector)
 	got, err := DecodeHeader(sector)

@@ -24,6 +24,8 @@ type RecoveredTxn struct {
 	RawData []byte
 	// Completed is set when an IntentCompletion follows it; only scans that ask for completed transactions see them.
 	Completed bool
+	// Abandoned is set when its completion says its commit failed, so its operation never ran.
+	Abandoned bool
 }
 
 // RecoveredEntry represents an entry from a recovered transaction.
@@ -132,7 +134,7 @@ func RecoverReleasing(region *Region, handler RecoveryHandler, check func() erro
 // scanForCompletions scans the journal for IntentCompletion records.
 // This is Phase 1 of the two-phase recovery protocol.
 // Records are identified by IntentCompletionMagic (0x43544E49 "INTC").
-func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, completed map[uint64]bool, stats *RecoveryStats) error {
+func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, completed, abandoned map[uint64]bool, stats *RecoveryStats) error {
 	span := ringSpan(head, tail, dataAreaSize)
 	pos := head
 	for scanned := uint32(0); scanned < span; {
@@ -168,8 +170,12 @@ func scanForCompletions(region *Region, head, tail, dataAreaSize uint32, complet
 			if err != nil || header.TotalLength < TxnHeaderSize || header.TotalLength > remaining {
 				break
 			}
-			if header.Type == TxnTypeIntentComplete && header.TotalLength == completionLength {
-				completed[binary.LittleEndian.Uint64(sectorBuf[TxnHeaderSize:completionLength])] = true
+			if header.Type == TxnTypeIntentComplete && (header.TotalLength == completionLength || header.TotalLength == abandonLength) {
+				seq := binary.LittleEndian.Uint64(sectorBuf[TxnHeaderSize:completionLength])
+				completed[seq] = true
+				if header.TotalLength == abandonLength && binary.LittleEndian.Uint64(sectorBuf[completionLength:abandonLength]) == completionAbandoned {
+					abandoned[seq] = true
+				}
 				stats.IntentCompletions++
 			}
 			// Advance by aligned transaction length
@@ -218,8 +224,8 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 	}
 
 	// Phase 1: Scan for intent completion records
-	completedIntents := make(map[uint64]bool)
-	if err := scanForCompletions(region, head, tail, dataAreaSize, completedIntents, stats); err != nil {
+	completedIntents, abandonedIntents := make(map[uint64]bool), make(map[uint64]bool)
+	if err := scanForCompletions(region, head, tail, dataAreaSize, completedIntents, abandonedIntents, stats); err != nil {
 		return fmt.Errorf("phase 1 completion scan failed: %w", err)
 	}
 
@@ -324,6 +330,7 @@ func scanJournal(region *Region, handler RecoveryHandler, stats *RecoveryStats,
 				return fmt.Errorf("failed to parse txn entries: %w", err)
 			}
 			recoveredTxn.Completed = completedIntents[txnHeader.Seq]
+			recoveredTxn.Abandoned = abandonedIntents[txnHeader.Seq]
 
 			if check != nil {
 				if err := check(); err != nil {
@@ -594,6 +601,11 @@ func CompleteReserves(region *Region, seqs []uint64) error {
 			return fmt.Errorf("complete reserve %d: %w", seq, err)
 		}
 	}
+	return syncAppended(region)
+}
+
+// syncAppended makes records appended to a journal no node has open durable, and the tail that covers them.
+func syncAppended(region *Region) error {
 	if err := region.Sync(); err != nil {
 		return err
 	}

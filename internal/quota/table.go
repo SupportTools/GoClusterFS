@@ -21,9 +21,6 @@ const (
 	// RecordsPerSector is how many records fit in a sector before its checksum.
 	RecordsPerSector = (storage.SectorSize - 4) / RecordSize
 
-	// MaxSlots is the registry's node slot count, one FoldedThroughSeq each.
-	MaxSlots = 64
-
 	crcOffset = storage.SectorSize - 4
 )
 
@@ -36,9 +33,6 @@ var (
 // Header is the table's first sector.
 type Header struct {
 	NextProjectID uint32
-	// FoldedThroughSeq is, per registry slot, the journal sequence through which a dead node's unflushed deltas were
-	// folded into the table, so a second replay of that journal does not count them twice.
-	FoldedThroughSeq [MaxSlots]uint64
 }
 
 // Record is one project's limits and usage. Usage counts blocks of the volume's block size and inodes.
@@ -67,9 +61,6 @@ func EncodeHeader(h *Header, sector []byte) {
 	binary.LittleEndian.PutUint32(sector[0:4], HeaderMagic)
 	binary.LittleEndian.PutUint32(sector[4:8], Version)
 	binary.LittleEndian.PutUint32(sector[8:12], h.NextProjectID)
-	for i, seq := range h.FoldedThroughSeq {
-		binary.LittleEndian.PutUint64(sector[16+8*i:24+8*i], seq)
-	}
 	seal(sector)
 }
 
@@ -84,11 +75,7 @@ func DecodeHeader(sector []byte) (*Header, error) {
 	if v := binary.LittleEndian.Uint32(sector[4:8]); v != Version {
 		return nil, fmt.Errorf("%w: %d", ErrVersion, v)
 	}
-	h := &Header{NextProjectID: binary.LittleEndian.Uint32(sector[8:12])}
-	for i := range h.FoldedThroughSeq {
-		h.FoldedThroughSeq[i] = binary.LittleEndian.Uint64(sector[16+8*i : 24+8*i])
-	}
-	return h, nil
+	return &Header{NextProjectID: binary.LittleEndian.Uint32(sector[8:12])}, nil
 }
 
 // PutRecord writes r at offset in a record sector and seals the sector again.
