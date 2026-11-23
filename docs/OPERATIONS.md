@@ -611,10 +611,9 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 
 `-format -block-size` sets the data block size, a power of two from 8 KB to 1 MB, for the life of the volume. Every file with data takes whole blocks, so small blocks save space on volumes of many small files: a 155 MB node_modules tree took 1.5 times its size at 8 KB, 5.9 times at 64 KB and 83 times at 1 MB.
 
-Sizes below 1 MB are experimental until two fixes land:
+Sizes below 1 MB are experimental until overwrites get faster. An overwrite checks, locks and writes each block on its own: a 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
 
-- **fsck memory.** fsck keeps a map entry for every allocated block, about 1.6 GB of memory per 100 GB at 8 KB.
-- **Overwrites.** An overwrite checks, locks and writes each block on its own. A 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
+fsck needs about 3 MB of memory per 10 GB at 8 KB blocks: one bit and one byte per block. A check of a full 1 TB volume at 8 KB took 24 s and 302 MB.
 
 ### Cache Tuning
 
