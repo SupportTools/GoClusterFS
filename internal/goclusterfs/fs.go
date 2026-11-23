@@ -35,6 +35,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/logging"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
 	"github.com/supporttools/GoClusterFS/internal/reserve"
 	"github.com/supporttools/GoClusterFS/internal/sfb"
@@ -156,6 +157,12 @@ type FS struct {
 	snapshotsUp    atomic.Bool        // snapshotReg and snapshotWkr are set, for the failure detector's goroutine
 	quotaInode     uint32             // holds the quota table; 0 when the volume has no quotas
 	quotaBlockSize uint64             // the volume's block size, in which quota usage counts
+	quotaGuard     *quota.Guard
+	quotaStop      chan struct{}
+	quotaDone      chan struct{}
+	quotaStuck     atomic.Bool // a flush failed after its commit; the journal keeps it for a replay
+	openQuota      func() (quota.Table, error)
+	stopNode       func(reason string)
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -424,6 +431,8 @@ func (f *FS) Close() error {
 			}
 		})
 	}
+
+	ShutdownStep("quota flush", f.stopQuotaFlush)
 
 	// Stop journal to ensure clean shutdown
 	journalClean := true

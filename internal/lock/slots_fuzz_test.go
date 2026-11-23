@@ -3,6 +3,7 @@ package lock
 import (
 	"bytes"
 	"encoding/binary"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"testing"
@@ -100,10 +101,16 @@ func FuzzLockRow(f *testing.F) {
 		row, kinds := fuzzRow(desc)
 
 		m := NewManager(nil, 0, RowSize, [16]byte{0xee}, self)
-		conflict, lower, by := m.rowConflicts(0, row, mode, ign)
+		var ignored uint64
+		for _, slot := range []int{ign, int(views/5)%(SlotsPerRecord+1) - 1} {
+			if slot >= 0 {
+				ignored |= 1 << slot
+			}
+		}
+		conflict, lower, by := m.rowConflicts(0, row, mode, ignored)
 		mustConflict, mayConflict := false, false
 		for slot, kind := range kinds {
-			if slot == self || slot == ign {
+			if slot == self || ignored&(1<<slot) != 0 {
 				continue
 			}
 			s, err := decodeSlot(rowSlot(row, slot))
@@ -127,19 +134,63 @@ func FuzzLockRow(f *testing.F) {
 			t.Fatalf("slot %d conflicts with a mode %d claim from slot %d, but no slot holds a claim", by.slot, mode, self)
 		case lower && !conflict:
 			t.Fatal("rowConflicts reported a lower slot without a conflict")
-		case conflict && (by.slot == self || by.slot == ign || by.slot < 0 || by.slot >= SlotsPerRecord):
-			t.Fatalf("conflict blamed on slot %d (own slot %d, ignored %d)", by.slot, self, ign)
+		case conflict && (by.slot == self || by.slot < 0 || by.slot >= SlotsPerRecord || ignored&(1<<by.slot) != 0):
+			t.Fatalf("conflict blamed on slot %d (own slot %d, ignored %#x)", by.slot, self, ignored)
 		}
 		m.othersWaiting(row)
 
 		state := func(slot int) OwnerState { return OwnerState((int(views) + slot) % 5) }
 		m.SetOwnerView(func(slot int, _ bool) ([16]byte, OwnerState) { return [16]byte{byte(slot)}, state(slot) })
-		if conflict, _, by := m.rowConflicts(0, row, mode, ign); conflict && state(by.slot) == OwnerReleased {
+		if conflict, _, by := m.rowConflicts(0, row, mode, ignored); conflict && state(by.slot) == OwnerReleased {
 			t.Fatalf("slot %d conflicts although its registry slot is empty", by.slot)
 		}
 		m.othersWaiting(row)
 
 		checkRowWrites(t, dir, row, self, adoptedSlot%SlotsPerRecord)
+	})
+}
+
+// FuzzAdoptedTurns checks two nodes replaying dead nodes that hold one record: whatever dead slots each adopted, the
+// one whose lowest adopted slot is lower goes first, the other waits, and they never wait on each other at once.
+func FuzzAdoptedTurns(f *testing.F) {
+	f.Add(uint64(1<<1|1<<6), uint64(1<<3), uint8(10), uint8(11), true)
+	f.Add(uint64(1<<4|1<<6), uint64(1<<3), uint8(10), uint8(11), true)
+	f.Add(uint64(1<<20|1<<2), uint64(1<<5|1<<40), uint8(0), uint8(63), false)
+	f.Fuzz(func(t *testing.T, xs, ys uint64, xSlot, ySlot uint8, view bool) {
+		sx, sy := int(xSlot)%SlotsPerRecord, int(ySlot)%SlotsPerRecord
+		live := uint64(1)<<sx | uint64(1)<<sy
+		xs &^= live
+		ys &^= live | xs
+		if sx == sy || xs == 0 || ys == 0 {
+			return
+		}
+		row := make([]byte, RowSize)
+		now := time.Now().UnixNano()
+		for slot := range SlotsPerRecord {
+			if (xs|ys)&(1<<slot) != 0 {
+				claim := &claimSlot{mode: LockModeExclusive, adopted: true, owner: [16]byte{byte(slot)}, acquireTime: now}
+				copy(rowSlot(row, slot), encodeSlot(claim))
+			}
+		}
+		x := NewManager(nil, 0, RowSize, [16]byte{0xa1}, sx)
+		y := NewManager(nil, 0, RowSize, [16]byte{0xb2}, sy)
+		if view {
+			states := func(slot int, _ bool) ([16]byte, OwnerState) {
+				if (xs|ys)&(1<<slot) != 0 {
+					return [16]byte{byte(slot)}, OwnerRecovering
+				}
+				return [16]byte{byte(slot)}, OwnerAlive
+			}
+			x.SetOwnerView(states)
+			y.SetOwnerView(states)
+		}
+		xWaits, _, _ := x.rowConflicts(0, row, LockModeExclusive, xs)
+		yWaits, _, _ := y.rowConflicts(0, row, LockModeExclusive, ys)
+		xFirst := bits.TrailingZeros64(xs) < bits.TrailingZeros64(ys)
+		if xWaits == xFirst || yWaits != xFirst {
+			t.Fatalf("X in slot %d adopted %#x, Y in slot %d adopted %#x: X waits %v, Y waits %v; want the lower lowest slot first",
+				sx, xs, sy, ys, xWaits, yWaits)
+		}
 	})
 }
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -51,6 +52,35 @@ func (t Table) write(sector uint64, data []byte) error {
 	return nil
 }
 
+// Open maps the table in the data blocks of quota inode num. The table's blocks are inline extents.
+func Open(dev *storage.Device, inodes *inode.Table, num uint32, dataOffset, blockSize uint64) (Table, error) {
+	qi, err := inodes.Read(num)
+	if err != nil {
+		return Table{}, err
+	}
+	if qi.HasExtentTree() {
+		return Table{}, fmt.Errorf("quota inode %d maps its table through an extent tree, which this build does not read", num)
+	}
+	perBlock := blockSize / storage.SectorSize
+	physical := map[uint64]uint64{}
+	for _, x := range qi.InlineExtents {
+		for i := uint64(0); i < x.Length; i++ {
+			physical[x.LogicalBlock+i] = x.PhysicalBlock + i
+		}
+	}
+	return Table{
+		Dev:     dev,
+		Sectors: uint64(len(physical)) * perBlock,
+		At: func(sector uint64) (int64, error) {
+			block, ok := physical[sector/perBlock]
+			if !ok {
+				return 0, fmt.Errorf("quota table sector %d is past the table's blocks", sector)
+			}
+			return int64(dataOffset + block*blockSize + sector%perBlock*storage.SectorSize), nil
+		},
+	}, nil
+}
+
 func (t Table) Header() (*Header, error) {
 	sector, err := t.read(0)
 	if err != nil {
@@ -93,6 +123,16 @@ func (t Table) PutRecord(id uint32, r *Record) error {
 	}
 	PutRecord(sector, offset, r)
 	return t.write(sectorNum, sector)
+}
+
+// SetUsage writes project id's usage and leaves the rest of its record as it is.
+func (t Table) SetUsage(id uint32, blocks, inodes uint64) error {
+	r, err := t.Record(id)
+	if err != nil {
+		return err
+	}
+	r.UsedBlocks, r.UsedInodes = blocks, inodes
+	return t.PutRecord(id, r)
 }
 
 // FreeID returns the first project ID from from on, wrapping to 1, whose record is not in use.

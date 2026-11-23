@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"reflect"
 	"testing"
@@ -197,8 +198,7 @@ func TestQuotaReplayFold(t *testing.T) {
 }
 
 // A fold appended to the journal stands for every quota record before it: a replay that stopped after appending it
-// redoes only its writes that did not land. Replay itself applies no quota record, and once it began the journal
-// counts as folded.
+// redoes only its writes that did not land. Once the fold completes, or replay began, the journal owes nothing.
 func TestQuotaFoldInTheJournalStandsForTheRecordsBefore(t *testing.T) {
 	j := newTestJournal(t)
 	delta(t, j, true, 1, 5, 0)
@@ -210,14 +210,15 @@ func TestQuotaFoldInTheJournalStandsForTheRecordsBefore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := AppendQuotaFold(region, folds); err != nil {
+	seq, err := AppendQuotaFold(region, folds)
+	if err != nil {
 		t.Fatal(err)
 	}
 	table[1] = [2]uint64{15, 0}
 
 	region, q = quotaAfterCrash(t, j)
-	if len(q.Running) != 0 || !reflect.DeepEqual(q.Updates, folds) || !q.Folded {
-		t.Fatalf("after the fold: running %+v, updates %+v, folded %v; want only the fold %+v", q.Running, q.Updates, q.Folded, folds)
+	if len(q.Running) != 0 || !reflect.DeepEqual(q.Updates, folds) || !q.Folded || q.FoldSeq != seq {
+		t.Fatalf("after the fold: running %+v, updates %+v, folded %v at %d; want only the fold %+v at %d", q.Running, q.Updates, q.Folded, q.FoldSeq, folds, seq)
 	}
 	redo, err := q.Fold(used)
 	if err != nil {
@@ -227,29 +228,95 @@ func TestQuotaFoldInTheJournalStandsForTheRecordsBefore(t *testing.T) {
 		t.Errorf("the redo writes %+v, want only project 2's change, which did not land: %+v", redo, want)
 	}
 
+	if err := CompleteQuotaFold(region, q.FoldSeq); err != nil {
+		t.Fatal(err)
+	}
+	if _, q = quotaAfterCrash(t, j); !q.Folded || q.Owes() {
+		t.Errorf("after the fold completed the journal reads as %+v; want folded with nothing owed", q)
+	}
+
 	if err := region.MarkRecovering(); err != nil {
 		t.Fatal(err)
 	}
-	if q, err := ReadQuotaReplay(region); err != nil || !q.Folded || len(q.Updates) != 0 || len(q.Running) != 0 {
+	if q, err := ReadQuotaReplay(region); err != nil || !q.Folded || q.Owes() {
 		t.Errorf("a journal whose replay began reads as %+v, %v; want folded with nothing owed", q, err)
 	}
-	stats, err := Recover(region, CreateTxnRecoveryHandler(&RecoveryContext{Dev: j.region.dev}))
-	if err != nil || stats.EntriesReplayed != len(folds) {
-		t.Errorf("replaying the fold: %+v, %v; want its %d records passed over without error", stats, err, len(folds))
+	if _, err := Recover(region, CreateTxnRecoveryHandler(&RecoveryContext{Dev: j.region.dev})); err != nil {
+		t.Errorf("replaying the folded journal: %v", err)
 	}
 }
 
-// A peer's replay of a dead journal with quota records applies none of them and succeeds.
-func TestPeerReplaySkipsQuotaRecords(t *testing.T) {
+// A peer's replay of a dead journal passes it to FoldQuota, with the slot and its node, before replay begins, and then
+// applies none of its quota records.
+func TestPeerReplayFoldsQuotaRecordsFirst(t *testing.T) {
 	j := newTestJournal(t)
 	delta(t, j, true, 1, 5, 0)
 	flush(t, j, false, 1, 0, 0)
-	info := &node.FailedNodeInfo{JournalOffset: j.region.regionOffset, JournalSize: j.region.regionSize}
-	result, err := ReplayJournal(context.Background(), &RecoveryContext{Dev: j.region.dev}, info)
+	info := &node.FailedNodeInfo{SlotIndex: 7, UUID: [16]byte{9}, JournalOffset: j.region.regionOffset, JournalSize: j.region.regionSize}
+	var folded []string
+	fold := func(_ context.Context, slot int, owner [16]byte, region *Region) error {
+		folded = append(folded, fmt.Sprintf("slot %d node %x %s", slot, owner[0], region.State()))
+		return nil
+	}
+	result, err := ReplayJournal(context.Background(), &RecoveryContext{Dev: j.region.dev, FoldQuota: fold}, info)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if want := []string{"slot 7 node 9 Dirty"}; !reflect.DeepEqual(folded, want) {
+		t.Errorf("FoldQuota saw %v, want %v", folded, want)
+	}
 	if result.EntriesReplayed != 0 || result.EntriesSkipped != 1 {
 		t.Errorf("replay applied %d and skipped %d entries; want the unfinished flush skipped", result.EntriesReplayed, result.EntriesSkipped)
+	}
+}
+
+// Stop leaves a journal dirty while a project has usage no flush moved into the table, so a replay folds it.
+func TestStopLeavesUnflushedQuotaForReplay(t *testing.T) {
+	j := newTestJournal(t)
+	delta(t, j, true, 4, 2, 1)
+	if err := j.Stop(); err == nil {
+		t.Error("Stop with unflushed quota usage returned nil")
+	}
+	if _, q := quotaAfterCrash(t, j); q.Running[4] != (QuotaDeltaPayload{Project: 4, Blocks: 2, Inodes: 1}) {
+		t.Errorf("after the stop the replay finds %+v, want project 4's 2 blocks and 1 inode", q.Running)
+	}
+}
+
+// The pressure hook runs once the oldest delta no flush covered is half a ring behind, and not while no delta waits.
+func TestQuotaPressureHookRunsBeforeHoldsFillTheRing(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	t.Cleanup(cleanup)
+	j, err := Init(dev, 0, 256*1024, [16]byte{1}, 1, DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	j.SetQuotaPressureHook(func() { calls++ })
+	create := func() {
+		commitQuota(t, j, true, func(txn *Transaction) error { return txn.LogInodeCreate(testInodePayload(100)) })
+	}
+	delta(t, j, true, 1, 1, 0)
+	for range 64 {
+		if calls > 0 {
+			break
+		}
+		create()
+	}
+	if calls == 0 {
+		t.Fatal("the hook never ran while a delta held the head")
+	}
+	flush(t, j, true, 1, 0, 0)
+	if _, err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	calls = 0
+	for range 64 {
+		create()
+		if _, err := j.Checkpoint(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("the hook ran %d times with no delta waiting", calls)
 	}
 }

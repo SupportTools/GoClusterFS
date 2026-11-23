@@ -19,7 +19,7 @@ func TestLockTypes(t *testing.T) {
 		LockTypeSnapshot,
 		LockTypeJournal,
 		LockTypeRefCount,
-		LockTypeLockRegion,
+		LockTypeQuota,
 		LockTypeBlockBitmap,
 		LockTypeSFBContainer,
 		LockTypeInode,

@@ -11,9 +11,11 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/fsck"
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -533,4 +535,49 @@ func readSector(t *testing.T, dev *storage.Device, offset int64) []byte {
 		t.Fatal(err)
 	}
 	return buf
+}
+
+// A salvaging release folds the usage the slot's journal owes the quota table before it replays the journal.
+func TestReleaseSlotSalvageFoldsQuotaUsage(t *testing.T) {
+	t.Cleanup(fsck.SetHeartbeatWatch(2*node.HeartbeatInterval, 2*node.HeartbeatInterval))
+	var sb *superblock.Superblock
+	dev := formattedDevice(t, func(s *superblock.Superblock) { sb = s })
+	inodes := inode.NewTable(dev, sb.InodeTableOffset, sb.InodeCount*inode.InodeSize, nil, [16]byte{})
+	blocks := bitmap.NewRegion(dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, [16]byte{})
+	if err := quota.Enable(context.Background(), dev, sb, inodes, blocks); err != nil {
+		t.Fatal(err)
+	}
+	slot := goneNode(t, dev, sb)
+	journalAt := sb.JournalRegionOffset + uint64(slot)*sb.JournalSlotSize()
+	j, err := journal.Init(dev, journalAt, sb.JournalSlotSize(), [16]byte{1}, 1, journal.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	txn := j.Begin()
+	if err := txn.LogQuotaDelta(&journal.QuotaDeltaPayload{Project: 1, Blocks: 5, Inodes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	seq, err := j.Commit(txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.CompleteIntent(seq); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newChecker(dev)
+	plan, err := c.PlanRelease(slot, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if salvaged, err := c.Release(plan, true); err != nil || salvaged.Err != nil {
+		t.Fatalf("Release with salvage: %+v, %v", salvaged, err)
+	}
+	tbl, err := quota.Open(dev, inodes, sb.QuotaInode, sb.DataRegionOffset, uint64(sb.BlockSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, err := tbl.Record(1); err != nil || r.UsedBlocks != 5 || r.UsedInodes != 1 {
+		t.Errorf("after the salvage project 1 uses %+v, %v; want 5 blocks and 1 inode", r, err)
+	}
 }
