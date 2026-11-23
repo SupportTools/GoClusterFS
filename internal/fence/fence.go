@@ -18,7 +18,10 @@ var (
 	// it on a partition.
 	ErrPartition = fmt.Errorf("%w on a partition, only on the whole disk", ErrUnsupported)
 	// ErrFenced means another node removed this node's key: the storage refuses its writes.
-	ErrFenced             = errors.New("this node's reservation key is gone: another node revoked its access to the device")
+	ErrFenced = errors.New("this node's reservation key is gone: another node revoked its access to the device")
+	// ErrNotPreempted wraps a failed preempt after which the device still lists the victim's key: the preempt did not
+	// take effect, and the victim may still write.
+	ErrNotPreempted       = errors.New("the preempt did not take effect: the device still lists the node's key")
 	ErrForeignReservation = errors.New("the device holds a reservation of another type or initiator")
 	// ErrReservationConflict is a reservation command the device refused, from SCSI and NVMe alike.
 	ErrReservationConflict = errors.New("reservation conflict")
@@ -87,6 +90,12 @@ type device interface {
 	clear(key uint64) error
 	readKeys() ([]uint64, error)
 	readReservation() (key uint64, typ uint32, err error)
+}
+
+// pathLister lists the devices a register reaches, each of which holds a registration of its own: the paths under a
+// device-mapper map, or the device itself.
+type pathLister interface {
+	pathDevices() ([]device, func(), error)
 }
 
 // PR fences with a Write Exclusive, All Registrants reservation: every registered node may write, and no other
@@ -166,21 +175,73 @@ func (p *PR) Preempt(victim uint64) error {
 	}
 	if err := p.reserveIfNone(); err != nil {
 		if errors.Is(err, ErrForeignReservation) && errors.Is(p.dev.register(p.key, p.key, false), ErrReservationConflict) {
-			return ErrFenced
+			return p.listedAfter(victim, ErrFenced)
 		}
-		return fmt.Errorf("reserving the device before revoking key %#x: %w", victim, err)
+		return p.listedAfter(victim, fmt.Errorf("reserving the device before revoking key %#x: %w", victim, err))
 	}
 	err := p.dev.preemptAbort(p.key, victim)
 	if !errors.Is(err, ErrReservationConflict) {
-		return err
+		return p.listedAfter(victim, err)
 	}
 	// A conflict means the victim is gone already or this node's key is: only a registered key can register itself again.
 	if err := p.dev.register(p.key, p.key, false); errors.Is(err, ErrReservationConflict) {
-		return ErrFenced
+		return p.listedAfter(victim, ErrFenced)
 	} else if err != nil {
-		return err
+		return p.listedAfter(victim, err)
+	}
+	// A device may refuse a preempt from a host it no longer lets write, though this node's key is still listed, as LIO
+	// does once another registration of the host was freed. The victim's key, still listed, tells that apart from a
+	// victim that is gone.
+	if keys, lerr := p.dev.readKeys(); lerr == nil && slices.Contains(keys, victim) {
+		return fmt.Errorf("%w: the device refused the preempt", ErrNotPreempted)
 	}
 	return nil
+}
+
+// listedAfter wraps a failed preempt's err in ErrNotPreempted when the device still lists victim's key.
+func (p *PR) listedAfter(victim uint64, err error) error {
+	if err == nil {
+		return nil
+	}
+	if keys, lerr := p.dev.readKeys(); lerr == nil && slices.Contains(keys, victim) {
+		return fmt.Errorf("%w: %w", ErrNotPreempted, err)
+	}
+	return err
+}
+
+// Registrations returns how many registrations of this node's key the device lists, one per path that registered it,
+// including paths whose session is gone. ErrUnsupported means the device cannot list keys.
+func (p *PR) Registrations() (int, error) {
+	keys, err := p.dev.readKeys()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, key := range keys {
+		if key == p.key {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// Paths returns a PR for each path of the device, each registered on its own, and a function that closes them. A
+// device-mapper map registers through every path at once and, if one path refuses, removes the key from all of them;
+// a PR per path registers only where the key is missing.
+func (p *PR) Paths() ([]*PR, func(), error) {
+	l, ok := p.dev.(pathLister)
+	if !ok {
+		return []*PR{p}, func() {}, nil
+	}
+	devs, closeAll, err := l.pathDevices()
+	if err != nil {
+		return nil, nil, err
+	}
+	paths := make([]*PR, len(devs))
+	for i, dev := range devs {
+		paths[i] = &PR{dev: dev, key: p.key}
+	}
+	return paths, closeAll, nil
 }
 
 // reserveIfNone reserves the device unless it holds a reservation, or reserves anyway where the reservation cannot be read.
@@ -247,11 +308,29 @@ func (p *PR) Unregister() error {
 	return nil
 }
 
+// registeredBeyondPaths reports whether the device lists more registrations of this node's key than its paths hold, as
+// after a rekey that left the earlier session's registration in place: then every path's unregister succeeds and
+// would leave that one behind. A listing that fails says nothing.
+func (p *PR) registeredBeyondPaths() bool {
+	n, err := p.Registrations()
+	if err != nil {
+		return false
+	}
+	paths, closeAll, err := p.Paths()
+	if err != nil {
+		return false
+	}
+	defer closeAll()
+	return n > len(paths)
+}
+
 // Leave unregisters this node's key, also where an earlier iSCSI session of this host keeps it. On LIO no peer revokes
 // such a registration, and while it holds the reservation every session of this host writes past a revoke of a later key.
 func (p *PR) Leave() (earlier bool, err error) {
-	if err := p.Unregister(); !errors.Is(err, ErrFenced) {
-		return false, err
+	if !p.registeredBeyondPaths() {
+		if err := p.Unregister(); !errors.Is(err, ErrFenced) {
+			return false, err
+		}
 	}
 	if err := p.Register(); err != nil {
 		return true, err

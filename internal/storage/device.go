@@ -86,6 +86,8 @@ var ErrOutOfRange = errors.New("I/O outside the device")
 type Device struct {
 	ioShards [NumIOShards]sync.Mutex // Sharded locks for parallel I/O
 	closeMu  sync.RWMutex            // Protects close; held shared during I/O
+	// writeMu is held shared by every write, sync and discard, before closeMu, and exclusively by HoldWrites.
+	writeMu sync.RWMutex
 	// writeGate, when set, runs before every write and can refuse it.
 	writeGate atomic.Pointer[func(offset int64) error]
 	// writeFresh, when set, says without I/O whether a write that passed the
@@ -105,6 +107,10 @@ type Device struct {
 	fencedOnce    sync.Once
 	gone          atomic.Pointer[func(error)]
 	goneOnce      sync.Once
+	rekey         atomic.Pointer[func() error]
+	rekeyMu       sync.Mutex
+	rekeyGen      atomic.Uint64
+	rekeyFailed   bool
 }
 
 // shardIndex returns the shard index for the given offset.
@@ -298,7 +304,11 @@ func (d *Device) writeAt(buf []byte, offset int64, sharded bool) (int, error) {
 		(*observe)(offset, len(buf))
 	}
 	for {
-		if landed, n, err := d.writeIfFresh(buf, offset, sharded); landed {
+		gen := d.rekeyGen.Load()
+		d.writeMu.RLock()
+		landed, n, err := d.writeIfFresh(buf, offset, sharded)
+		d.writeMu.RUnlock()
+		if landed && (!errors.Is(err, syscall.EBADE) || !d.restored(gen, err)) {
 			return n, err
 		}
 		if err := d.CheckWrite(offset); err != nil {
@@ -390,6 +400,18 @@ func (d *Device) CheckWrite(offset int64) error {
 // Sync ensures all written data is persisted to the device.
 // This is a global operation that does not block concurrent I/O.
 func (d *Device) Sync() error {
+	for {
+		gen := d.rekeyGen.Load()
+		err := d.syncOnce()
+		if !errors.Is(err, syscall.EBADE) || !d.restored(gen, err) {
+			return err
+		}
+	}
+}
+
+func (d *Device) syncOnce() error {
+	d.writeMu.RLock()
+	defer d.writeMu.RUnlock()
 	// Acquire shared close lock to prevent device close during sync
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
@@ -426,10 +448,8 @@ func (d *Device) record(err error) {
 		}
 	case !errors.Is(err, io.EOF):
 		d.lastErr.Store(&err)
-		if errors.Is(err, syscall.EBADE) {
-			if fenced := d.fenced.Load(); fenced != nil {
-				d.fencedOnce.Do(func() { (*fenced)(err) })
-			}
+		if errors.Is(err, syscall.EBADE) && d.rekey.Load() == nil {
+			d.fence(err)
 		}
 	}
 }
@@ -453,10 +473,55 @@ func (d *Device) SetGoneHandler(gone func(error)) {
 	d.gone.Store(&gone)
 }
 
+func (d *Device) fence(err error) {
+	if fenced := d.fenced.Load(); fenced != nil {
+		d.fencedOnce.Do(func() { (*fenced)(err) })
+	}
+}
+
 // SetFencedHandler makes the first I/O that fails with a reservation conflict (EBADE) call fenced: another node
 // revoked this node's access to the device, so none of its writes can land any more.
 func (d *Device) SetFencedHandler(fenced func(error)) {
 	d.fenced.Store(&fenced)
+}
+
+// SetRekey makes a write, sync or discard that fails with EBADE call rekey first, outside every device lock. When
+// rekey restores this node's access it returns nil and the I/O runs again; when it fails, the fenced handler runs and
+// rekey is not called again.
+func (d *Device) SetRekey(rekey func() error) {
+	d.rekey.Store(&rekey)
+}
+
+// restored reports, after an I/O that started at rekey generation gen failed with err, EBADE, whether it may run
+// again: another I/O restored this node's access since, or rekey does now. Otherwise it calls the fenced handler.
+func (d *Device) restored(gen uint64, err error) bool {
+	rekey := d.rekey.Load()
+	if rekey == nil {
+		return false
+	}
+	d.rekeyMu.Lock()
+	again := d.rekeyGen.Load() != gen
+	if !again && !d.rekeyFailed {
+		if (*rekey)() == nil {
+			d.rekeyGen.Add(1)
+			again = true
+		} else {
+			d.rekeyFailed = true
+		}
+	}
+	d.rekeyMu.Unlock()
+	if !again {
+		d.fence(err)
+	}
+	return again
+}
+
+// HoldWrites runs fn while none of this device's writes, syncs or discards is in flight, and holds new ones until fn
+// returns. Reads go on, so fn can read the device; fn must not write to it.
+func (d *Device) HoldWrites(fn func() error) error {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+	return fn()
 }
 
 // Fd returns the file descriptor for use with syscalls.
@@ -477,6 +542,18 @@ const blkDiscard = 0x1277
 
 // Discard tells the device that length bytes at offset hold no data any more.
 func (d *Device) Discard(offset, length uint64) error {
+	for {
+		gen := d.rekeyGen.Load()
+		err := d.discardOnce(offset, length)
+		if !errors.Is(err, syscall.EBADE) || !d.restored(gen, err) {
+			return err
+		}
+	}
+}
+
+func (d *Device) discardOnce(offset, length uint64) error {
+	d.writeMu.RLock()
+	defer d.writeMu.RUnlock()
 	d.closeMu.RLock()
 	defer d.closeMu.RUnlock()
 	args := [2]uint64{offset, length}

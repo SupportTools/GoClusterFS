@@ -678,3 +678,100 @@ func TestGoneHandlerSeesENXIO(t *testing.T) {
 		t.Errorf("gone handler calls %v, want one with ENXIO", gone)
 	}
 }
+
+// A write the device refused with EBADE runs again once rekey restored access, and the fenced handler stays quiet.
+func TestRekeyedWriteRunsAgain(t *testing.T) {
+	dev := openTwoSectorDevice(t)
+	var restored atomic.Bool
+	dev.SetWriteFault(func(int64) error {
+		if restored.Load() {
+			return nil
+		}
+		return syscall.EBADE
+	})
+	var rekeys atomic.Int32
+	dev.SetRekey(func() error {
+		rekeys.Add(1)
+		restored.Store(true)
+		return nil
+	})
+	var fenced atomic.Int32
+	dev.SetFencedHandler(func(error) { fenced.Add(1) })
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := dev.WriteAt(NewAlignedBuffer(SectorSize).Bytes(), 0)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("write after rekey: %v", err)
+		}
+	}
+	if rekeys.Load() != 1 || fenced.Load() != 0 {
+		t.Errorf("rekeys %d, fenced %d; want one rekey for every write refused before it, and no fencing", rekeys.Load(), fenced.Load())
+	}
+}
+
+// A failed rekey returns the EBADE, calls the fenced handler once, and is not tried again.
+func TestFailedRekeyFences(t *testing.T) {
+	dev := openTwoSectorDevice(t)
+	dev.SetWriteFault(func(int64) error { return syscall.EBADE })
+	var rekeys, fenced atomic.Int32
+	dev.SetRekey(func() error {
+		rekeys.Add(1)
+		return errors.New("slot taken")
+	})
+	dev.SetFencedHandler(func(error) { fenced.Add(1) })
+	for i := 0; i < 2; i++ {
+		if _, err := dev.WriteAt(NewAlignedBuffer(SectorSize).Bytes(), 0); !errors.Is(err, syscall.EBADE) {
+			t.Errorf("write %d: %v, want EBADE", i, err)
+		}
+	}
+	if rekeys.Load() != 1 || fenced.Load() != 1 {
+		t.Errorf("rekeys %d, fenced %d; want one of each", rekeys.Load(), fenced.Load())
+	}
+}
+
+// HoldWrites waits for writes in flight and holds new ones, but lets reads through.
+func TestHoldWritesLetsReadsThrough(t *testing.T) {
+	dev := openTwoSectorDevice(t)
+	held := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- dev.HoldWrites(func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	if _, err := dev.ReadAt(NewAlignedBuffer(SectorSize).Bytes(), 0); err != nil {
+		t.Fatalf("read while writes are held: %v", err)
+	}
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := dev.WriteAt(NewAlignedBuffer(SectorSize).Bytes(), SectorSize)
+		wrote <- err
+	}()
+	select {
+	case err := <-wrote:
+		t.Fatalf("a write ran while writes were held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-wrote; err != nil {
+		t.Fatal(err)
+	}
+}

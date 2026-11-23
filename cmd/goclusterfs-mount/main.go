@@ -358,6 +358,9 @@ func main() {
 	if fencer.Kind() == "none" {
 		joinUnfenced(nodeReg, *devicePath, *unsafeUnfenced)
 	}
+	if err := requireTakeoverIntent(dev, sb); err != nil {
+		failf("Cannot mark %s for takeover intents: %v; check the device, then mount again", *devicePath, err)
+	}
 	nodeReg.SetSlotLostHandler(func(loss node.SlotLoss) {
 		storage.AwaitStoppedWrite()
 		failf("%s; stopping so two nodes never share a journal. "+
@@ -366,6 +369,7 @@ func main() {
 	dev.SetFencedHandler(nodeReg.Fenced)
 	stopReservationCheck := make(chan struct{})
 	if pr, ok := fencer.(*fence.PR); ok {
+		dev.SetRekey(restoreKey(pr, dev, nodeReg, slotIdx))
 		go keepReserved(pr, stopReservationCheck)
 		go warnStaleKeys(pr, nodeReg, *devicePath, stopReservationCheck)
 	}
@@ -722,6 +726,10 @@ func main() {
 				silentPeers:      cacheMgr.SilentBroadcastPeers,
 				heartbeatAge:     func() time.Duration { return nodeReg.Stats().HeartbeatAge },
 				fencing:          fencer.Kind(),
+				keyRestores: func() (uint64, time.Time) {
+					st := nodeReg.Stats()
+					return st.KeyRestores, st.LastKeyRestore
+				},
 			})
 			apiServer.SetFileService(fileops.New(gfs))
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
@@ -927,6 +935,54 @@ func joinFencing(dev *storage.Device, devicePath string, sb *superblock.Superblo
 		return dev.Quiesce(func() error { return pr.Preempt(fence.NodeKey(owner)) })
 	})
 	return pr
+}
+
+// requireTakeoverIntent sets RequiredTakeoverIntent on a volume formatted before it, once this node joined: the join
+// refused any live node of an older build, and from now on older builds, fsck included, refuse the volume, since they
+// revoke a node without marking an intent first. sb takes the flag too.
+func requireTakeoverIntent(dev *storage.Device, sb *superblock.Superblock) error {
+	current, err := superblock.Read(dev)
+	if err != nil {
+		return err
+	}
+	if current.RequiredFlags&superblock.RequiredTakeoverIntent == 0 {
+		current.RequiredFlags |= superblock.RequiredTakeoverIntent
+		if err := superblock.Write(dev, current); err != nil {
+			return err
+		}
+		log.Printf("Set required flag %#x, takeover intents, on the volume: builds without them, their goclusterfs-fsck included, can no longer mount or check it",
+			superblock.RequiredTakeoverIntent)
+	}
+	sb.RequiredFlags |= superblock.RequiredTakeoverIntent
+	return nil
+}
+
+// restoreKey lets this node register its reservation key again when its storage path lost it, as a dm-multipath path
+// that logged out and in again does, and logs why when the node stops instead.
+func restoreKey(pr *fence.PR, dev *storage.Device, reg *node.Registry, slotIdx int) func() error {
+	k := &fence.Rekeyer{
+		PR:           pr,
+		HoldWrites:   dev.HoldWrites,
+		HeartbeatAge: reg.HeartbeatAge,
+		SlotLive:     func() error { return reg.SlotLive(slotIdx) },
+		StallLimit:   node.StallLimit,
+		Refused: func(err error) {
+			log.Printf("[WARN] Fencing: a write met a reservation conflict, and this node does not register its key again: %v", err)
+			reg.Fenced(err)
+		},
+		Restored: func(age time.Duration) {
+			reg.NoteKeyRestore()
+			log.Printf("[WARN] Fencing: the device no longer knew this node's reservation key %#x, as after its storage path logged out and in again; "+
+				"registered it again with every write held, %v after the last heartbeat. A second loss within %v stops the node", pr.Key(), age.Round(time.Millisecond), fence.RekeyWindow)
+		},
+	}
+	return func() error {
+		err := k.Rekey()
+		if err != nil {
+			log.Printf("[WARN] Fencing: this node does not register its key again: %v", err)
+		}
+		return err
+	}
 }
 
 // openForFencing opens the device again for its reservation ioctls and host lock, which must outlive the device's

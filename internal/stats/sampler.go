@@ -176,6 +176,7 @@ func (s *Sampler) sampleCounters() {
 			ReplayingSlots:            n.Replaying,
 			MountReplayedTransactions: s.src.MountReplay.Transactions,
 			MountDiscardedJournal:     s.src.MountReplay.Discarded,
+			ReservationKeyRestores:    n.KeyRestores,
 			StaleReservationKeys:      n.StaleKeys,
 		}
 	}

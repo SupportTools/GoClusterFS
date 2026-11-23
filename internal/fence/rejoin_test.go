@@ -158,7 +158,7 @@ func takeOverOverTwoPaths(t *testing.T, target *Target) (h *PR, pWrote func() bo
 		t.Fatal(err)
 	}
 	wrote := false
-	paths := twoPaths{paths: []*fakeDevice{{target, "vm2/a"}, {target, "vm2/b"}}, after: func() {}}
+	paths := twoPaths{paths: []*fakeDevice{{t: target, initiator: "vm2/a"}, {t: target, initiator: "vm2/b"}}, after: func() {}}
 	h = &PR{dev: paths, key: 0x4743000000000002}
 	if _, err := h.Join(); err != nil {
 		t.Fatal(err)

@@ -8,6 +8,7 @@ package node
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -25,6 +26,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/supporttools/GoClusterFS/internal/fence"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 )
 
@@ -89,8 +91,8 @@ type Slot struct {
 	BootID        [16]byte       // Kernel boot ID of the node's host
 	PID           uint32         // Mount process ID
 	ProcStart     int64          // Mount process start time (Unix ns)
-	RecoveryOwner [16]byte       // Dead slots: node replaying the journal
-	RecoveryStart int64          // Dead slots: when that replay last renewed its lease (Unix s)
+	RecoveryOwner [16]byte       // Dead slots: node replaying the journal; live slots: node revoking this one
+	RecoveryStart int64          // when that node last renewed its lease or wrote its intent (Unix s)
 	PIDNamespace  uint64         // Inode of the mount process's PID namespace
 	Orphans       []Orphan       // Files this node unlinked that some node may still have open
 	LockLayout    uint32         // How the node's build maps locks to lock records; 0 before builds recorded it
@@ -168,6 +170,8 @@ type Registry struct {
 	replaying            atomic.Uint64 // Bit i: this node is replaying slot i's journal
 	replays              atomic.Uint64
 	replayFailures       atomic.Uint64
+	keyRestores          atomic.Uint64
+	lastKeyRestore       atomic.Int64
 	staleKeys            atomic.Int64
 	failures             map[int]*replayFailure // the last run of identical replay failures per slot
 }
@@ -185,7 +189,7 @@ var (
 	ErrLeaseLost          = errors.New("another node took over this slot's recovery")
 	ErrSlotLost           = errors.New("this node no longer owns its registry slot")
 	ErrOrphansFull        = errors.New("this node's registry slot has no room for another orphan")
-	ErrLockLayout         = errors.New("a live node maps locks to lock records differently from this build")
+	ErrLockLayout         = errors.New("a live node maps locks to lock records, or takes over nodes, differently from this build")
 	// ErrReplayContended marks a replay that failed waiting on other nodes, such as for a lock; it never counts toward a backoff.
 	ErrReplayContended = errors.New("the replay waited too long on other nodes")
 )
@@ -438,12 +442,16 @@ func (r *Registry) SetAdvertiseAddr(addr netip.AddrPort) {
 	r.advertise = addr
 }
 
+// takeoverProtocol is mixed into the lock layout a slot records, so builds that take over nodes in another order
+// refuse to run next to this one: a node that restores its key is safe only from peers that mark an intent first.
+const takeoverProtocol uint32 = 1
+
 // SetLockLayout sets the lock record layout Register writes in this node's
 // slot. Register refuses to join while a live node's slot holds another one.
 func (r *Registry) SetLockLayout(id uint32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.lockLayout = id
+	r.lockLayout = id ^ takeoverProtocol
 }
 
 // checkLockLayouts returns ErrLockLayout naming a node whose slot holds another
@@ -473,6 +481,11 @@ func (r *Registry) checkLockLayouts() error {
 	}
 	for _, i := range other {
 		if _, s, err := r.readSlotRaw(i); err == nil && !silent[i] && differs(s) {
+			if s.LockLayout^r.lockLayout == takeoverProtocol {
+				return fmt.Errorf("%w: node %s in slot %d (%x) takes nodes over without marking an intent in their slot first, "+
+					"as builds before takeover intents do; unmount every node of that build before mounting this one",
+					ErrLockLayout, s.Host(), i, s.UUID[:8])
+			}
 			return fmt.Errorf("%w: node %s in slot %d (%x) has lock layout %08x, this build %08x",
 				ErrLockLayout, s.Host(), i, s.UUID[:8], s.LockLayout, r.lockLayout)
 		}
@@ -784,7 +797,10 @@ func (r *Registry) beat(slotIdx int) error {
 	if afterBeatRead != nil {
 		afterBeatRead()
 	}
-	ours := err == nil && slot.UUID == r.localUUID && slot.State != NodeStateDead
+	ours := err == nil && slot.UUID == r.localUUID && !slot.TakenOver()
+	if ours {
+		failpointSleep(testBeatStall, "heartbeat read slot %d", slotIdx)
+	}
 	takenOver := err == nil && !ours
 	paused := r.sinceLastBeat()
 	if ours && paused <= stallLimit {
@@ -935,31 +951,49 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 	newSlot.JournalOffset, newSlot.JournalSize = r.journalRegion(slotIdx)
 	copy(newSlot.Hostname[:], r.hostname)
 	var owner [16]byte
+	marked := expected
 	// Peers may still hold orphans an earlier owner of this slot listed.
 	if old, err := deserializeSlot(expected); err == nil {
 		newSlot.Orphans = old.Orphans
 		if old.State != NodeStateEmpty {
 			owner = old.UUID
+			// The mark is this node's first write: LIO refuses it after a revoke of a key this host registered from an
+			// earlier session, until the key is registered anew.
+			marked, err = r.markIntent(slotIdx, expected)
+			if errors.Is(err, unix.EBADE) {
+				if err = r.rejoinOnce(err); err == nil {
+					marked, err = r.markIntent(slotIdx, expected)
+				}
+			}
+			if err != nil {
+				return err
+			}
 		}
 	}
-	// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up.
-	if err := r.fenceOut(owner); err != nil {
-		return err
-	}
-
-	success, err := r.casSlot(slotIdx, expected, serializeSlot(newSlot))
-	if errors.Is(err, unix.EBADE) && r.rejoin != nil && !r.rejoined {
-		r.rejoined = true
-		log.Printf("[WARN] Fencing: the device refused this node's first write although it registered its key, as LIO does "+
-			"after a key this host registered from an earlier iSCSI session is revoked; trying to register the key anew (%v)", err)
-		// LIO refuses a preempt from such a host too, and Preempt reads that as the owner being gone, so revoke it again.
-		if rerr := r.rejoin(); rerr != nil {
-			err = fmt.Errorf("%w; not registering anew: %v", err, rerr)
-		} else if err = r.fenceOut(owner); err == nil {
-			success, err = r.casSlot(slotIdx, expected, serializeSlot(newSlot))
+	// Register holds r.mu, but no heartbeat runs yet for a slow preempt to hold up. LIO refuses a preempt from such a
+	// host too, and the device then still lists the owner's key.
+	err := r.fenceOut(owner)
+	if errors.Is(err, fence.ErrNotPreempted) {
+		if err = r.rejoinOnce(err); err == nil {
+			err = r.fenceOut(owner)
 		}
 	}
 	if err != nil {
+		r.undoIntent(slotIdx, expected, marked, owner, err)
+		return err
+	}
+
+	success, err := r.casSlot(slotIdx, marked, serializeSlot(newSlot))
+	if errors.Is(err, unix.EBADE) {
+		if err = r.rejoinOnce(err); err == nil {
+			// LIO refused the preempt before the rejoin too, and Preempt may have read that as the owner being gone.
+			if err = r.fenceOut(owner); err == nil {
+				success, err = r.casSlot(slotIdx, marked, serializeSlot(newSlot))
+			}
+		}
+	}
+	if err != nil {
+		r.undoIntent(slotIdx, expected, marked, owner, err)
 		return err
 	}
 	if !success {
@@ -1466,12 +1500,20 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 	if err != nil {
 		return nil, err
 	}
+	r.mu.Lock()
+	marked, err := r.markIntent(slotIdx, raw)
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	// Before the CAS, so the dead node's late heartbeat cannot land over the Dead mark, and outside r.mu, so a slow
 	// preempt cannot hold up this node's own heartbeat.
-	if err := r.fenceOut(slot.UUID); err != nil {
+	if err := r.revoke(slotIdx, raw, marked, slot.UUID); err != nil {
 		log.Printf("[Recovery] Not recovering slot %d: %v", slotIdx, err)
 		return nil, err
 	}
+	raw = marked
+	failpointSleep(testTakeoverDelay, "slot %d: intent written and node %x revoked; the Dead mark waits", slotIdx, slot.UUID[:8])
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1496,6 +1538,72 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 		Orphans:       slot.Orphans,
 		CheckLease:    r.leaseCheck(slotIdx, slot.UUID, time.Now()),
 	}, nil
+}
+
+// revoke preempts owner's key after this node marked its intent in slotIdx, replacing original with marked, and puts
+// the slot back if the preempt did not take effect (undoIntent). Called without r.mu.
+func (r *Registry) revoke(slotIdx int, original, marked []byte, owner [16]byte) error {
+	err := r.fenceOut(owner)
+	if errors.Is(err, fence.ErrNotPreempted) {
+		r.mu.Lock()
+		r.undoIntent(slotIdx, original, marked, owner, err)
+		r.mu.Unlock()
+	}
+	return err
+}
+
+// undoIntent puts original back in slotIdx after a preempt that failed while the device still listed owner's key: it
+// did not take effect, so owner, if it runs and has not read the intent yet, keeps running. After any other failure
+// the intent stays: owner may have lost its key, and another node takes the slot over once it stays unchanged for
+// deadAfter. Called with r.mu held.
+func (r *Registry) undoIntent(slotIdx int, original, marked []byte, owner [16]byte, err error) {
+	if bytes.Equal(original, marked) || !errors.Is(err, fence.ErrNotPreempted) {
+		return
+	}
+	if ok, cerr := r.casSlot(slotIdx, marked, original); cerr != nil || !ok {
+		log.Printf("[Recovery] Slot %d keeps this node's intent: the preempt of node %x did not take effect, and putting the slot back failed (%v)",
+			slotIdx, owner[:8], cmp.Or(cerr, ErrSlotTaken))
+		return
+	}
+	log.Printf("[Recovery] Put slot %d back as node %x left it: the preempt did not take effect", slotIdx, owner[:8])
+}
+
+// rejoinOnce registers this node's key anew the first time a device that holds it refuses this node, as LIO does after
+// a revoke of a key this host registered from an earlier session. It returns cause when it already tried once.
+func (r *Registry) rejoinOnce(cause error) error {
+	if r.rejoin == nil || r.rejoined {
+		return cause
+	}
+	r.rejoined = true
+	log.Printf("[WARN] Fencing: the device refused this node although it registered its key, as LIO does "+
+		"after a key this host registered from an earlier iSCSI session is revoked; trying to register the key anew (%v)", cause)
+	if err := r.rejoin(); err != nil {
+		return fmt.Errorf("%w; not registering anew: %v", cause, err)
+	}
+	return nil
+}
+
+// markIntent writes this node's UUID as the recovery owner of a live slot that raw holds, before this node revokes
+// the slot's node: a node that registers its key again after the revoke reads the intent and stops. It returns the
+// bytes the next CAS must find, raw itself for a slot that is not live. Called with r.mu held.
+//
+// An intent whose node stops before it marks the slot Dead is a change like any heartbeat: peers take the slot over
+// once it stays unchanged for deadAfter on their own clock, and its node, if it runs, stops at its next heartbeat.
+func (r *Registry) markIntent(slotIdx int, raw []byte) ([]byte, error) {
+	slot, err := deserializeSlot(raw)
+	if err != nil {
+		return nil, err
+	}
+	if slot.State != NodeStateActive && slot.State != NodeStateLeaving {
+		return raw, nil
+	}
+	slot.RecoveryOwner = r.localUUID
+	slot.RecoveryStart = time.Now().Unix()
+	intent := serializeSlot(slot)
+	if ok, err := r.casSlot(slotIdx, raw, intent); err != nil || !ok {
+		return nil, cmp.Or(err, ErrSlotTaken)
+	}
+	return intent, nil
 }
 
 // confirmStale reads slot slotIdx again and returns its raw bytes if it still holds observed's node, stale for timeout.
@@ -1582,9 +1690,18 @@ func (r *Registry) ReleaseSlot(slotIdx int, expected []byte, reset func(renew fu
 	if err != nil {
 		return false, err
 	}
-	if err := r.fenceOut(slot.UUID); err != nil {
+	r.mu.Lock()
+	marked, err := r.markIntent(slotIdx, expected)
+	r.mu.Unlock()
+	if errors.Is(err, ErrSlotTaken) {
+		return false, nil
+	} else if err != nil {
 		return false, err
 	}
+	if err := r.revoke(slotIdx, expected, marked, slot.UUID); err != nil {
+		return false, err
+	}
+	expected = marked
 	slot.Magic = SlotMagic
 	slot.State = NodeStateDead
 	slot.RecoveryOwner = r.localUUID
@@ -1695,17 +1812,66 @@ type Stats struct {
 	ReplayFailures uint64 // replays that failed and were left for a retry
 	Replaying      []int  // slots whose journal this node is replaying now
 	Failing        []FailingReplay
+	// KeyRestores counts the times this node registered its reservation key again, the last at LastKeyRestore.
+	KeyRestores    uint64
+	LastKeyRestore time.Time
 	StaleKeys      int // reservation keys no registry slot owned in this node's check after it joined
 }
 
 // Stats returns this node's liveness and replay counts.
 func (r *Registry) Stats() Stats {
 	st := Stats{Replays: r.replays.Load(), ReplayFailures: r.replayFailures.Load(), Replaying: r.Replaying(), Failing: r.FailingReplays(),
-		StaleKeys: int(r.staleKeys.Load())}
+		KeyRestores: r.keyRestores.Load(), StaleKeys: int(r.staleKeys.Load())}
 	if r.lastBeat.Load() != 0 {
 		st.HeartbeatAge = r.sinceLastBeat()
 	}
+	if at := r.lastKeyRestore.Load(); at != 0 {
+		st.LastKeyRestore = time.Unix(0, at)
+	}
 	return st
+}
+
+// NoteKeyRestore counts a re-register of this node's reservation key, for Stats.
+func (r *Registry) NoteKeyRestore() {
+	r.lastKeyRestore.Store(time.Now().UnixNano())
+	r.keyRestores.Add(1)
+}
+
+// HeartbeatAge is how long ago, on CLOCK_BOOTTIME, this node issued its last heartbeat that landed within StallLimit.
+func (r *Registry) HeartbeatAge() time.Duration {
+	return r.sinceLastBeat()
+}
+
+// Intent returns the node that marked this live slot to take it over and when it marked it; ok is false for a slot
+// no node marked. The marking node preempts the slot's node next, then marks the slot Dead.
+func (s *Slot) Intent() (owner [16]byte, marked time.Time, ok bool) {
+	if (s.State != NodeStateActive && s.State != NodeStateLeaving) || s.RecoveryOwner == ([16]byte{}) {
+		return owner, marked, false
+	}
+	return s.RecoveryOwner, time.Unix(s.RecoveryStart, 0), true
+}
+
+// TakenOver reports whether a peer marked the slot Dead or wrote its intent to take the slot's node over.
+func (s *Slot) TakenOver() bool {
+	return s.State == NodeStateDead || s.RecoveryOwner != [16]byte{}
+}
+
+// SlotLive returns nil while registry slot slotIdx holds this node, is not Dead and names no peer revoking it. It takes
+// no registry lock, so a write the heartbeat makes under them can call it.
+func (r *Registry) SlotLive(slotIdx int) error {
+	slot, err := r.readSlot(slotIdx)
+	switch {
+	case err != nil:
+		return err
+	case slot.UUID != r.localUUID:
+		return fmt.Errorf("slot %d now belongs to node %x", slotIdx, slot.UUID[:8])
+	case slot.State == NodeStateDead:
+		return fmt.Errorf("slot %d is marked Dead: a peer is taking over this node's journal and locks", slotIdx)
+	case slot.RecoveryOwner != [16]byte{}:
+		return fmt.Errorf("slot %d names node %x, which is revoking this node's access to take over its journal and locks",
+			slotIdx, slot.RecoveryOwner[:8])
+	}
+	return nil
 }
 
 // NoteStaleKeys records how many reservation keys no registry slot owned in this node's last check, for Stats.

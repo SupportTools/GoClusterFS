@@ -295,7 +295,7 @@ func New(deviceSize int64, blockSize, bytesPerInode uint64) *Superblock {
 	sb := &Superblock{
 		Version:       CurrentVersion,
 		FeatureFlags:  FeatureSparseFiles | FeatureLargeFiles,
-		RequiredFlags: RequiredJournal | RequiredLockLayout | RequiredSymlinks,
+		RequiredFlags: RequiredJournal | RequiredLockLayout | RequiredSymlinks | RequiredTakeoverIntent,
 
 		// Geometry
 		BlockSize:     uint32(blockSize),

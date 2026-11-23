@@ -24,8 +24,14 @@ func SetRecoveryLease(d time.Duration) (restore func()) {
 // it counts the slot's node as dead rather than slow, and replays it.
 const deadAfter = 2 * HeartbeatTimeout
 
+// DeadAfter is how long peers watch a slot unchanged before they take it over.
+const DeadAfter = deadAfter
+
 // stallLimit is how long a node may go without a heartbeat and still write: one failure scan short of deadAfter.
 const stallLimit = deadAfter - FailureCheckInterval
+
+// StallLimit is stallLimit, for fencing, which may restore this node's key only while peers cannot have taken over.
+const StallLimit = stallLimit
 
 // sighting is what this node last read in a slot: the fields a live node keeps
 // changing, and since when this node's monotonic clock has seen them unchanged.
@@ -227,7 +233,8 @@ func (r *Registry) Occupant(slotIdx int, fresh bool) ([16]byte, Occupancy) {
 		return slot.UUID, OccupiedLapsed
 	case slot.State == NodeStateDead:
 		return slot.UUID, OccupiedReplaying
-	case r.stale(slotIdx, slot, HeartbeatTimeout):
+	case slot.TakenOver(), r.stale(slotIdx, slot, HeartbeatTimeout):
+		// A peer that marked its intent is revoking the node; the mark is a change but no heartbeat.
 		return slot.UUID, OccupiedFailing
 	}
 	return slot.UUID, OccupiedLive

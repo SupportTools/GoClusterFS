@@ -1,6 +1,7 @@
 package fence
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -24,6 +25,11 @@ type Target struct {
 	// holderBySession refuses the holder's initiator's other sessions, as LIO does for an initiator whose sessions
 	// differ in ISID bytes 0-3. open-iscsi's differ only in the qualifier, so LIO takes all of them for the holder.
 	holderBySession bool
+	// failUnregister, when set, is what removing a key returns, as from a path that went down.
+	failUnregister error
+	// refusePreempt makes every preempt conflict, as LIO does for a host whose write flag another freed registration
+	// cleared.
+	refusePreempt bool
 	// unitAttentions is how many unit attentions a preempt queues for each session it removes; each of the session's
 	// next commands gets one as status 0x2 until none is left.
 	unitAttentions int
@@ -84,6 +90,39 @@ func (t *Target) Node(initiator string, key uint64) *PR {
 	return &PR{dev: &fakeDevice{t: t, initiator: initiator}, key: key}
 }
 
+// MultipathNode returns the Fencer of initiator on a dm-multipath map with paths paths, named initiator#0 and up. Like
+// dm, it registers through every path and, if any path refuses, removes the key from all of them.
+func (t *Target) MultipathNode(initiator string, paths int, key uint64) *PR {
+	return &PR{dev: &fakeDevice{t: t, initiator: initiator, paths: paths}, key: key}
+}
+
+// NVMeNode returns the Fencer of host on an NVMe namespace reached over paths controllers. NVMe registers a host, not
+// a path: every path shares one registration, which a reconnect keeps.
+func (t *Target) NVMeNode(host string, paths int, key uint64) *PR {
+	return &PR{dev: &fakeDevice{t: t, initiator: host, paths: paths, perHost: true}, key: key}
+}
+
+// Relogin moves initiator's key to a session the initiator no longer has, as an iSCSI logout and login does on LIO.
+func (t *Target) Relogin(initiator string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	key, ok := t.keys[initiator]
+	if !ok {
+		return
+	}
+	old := initiator + "-old"
+	t.keys[old] = key
+	delete(t.keys, initiator)
+	for i, s := range t.order {
+		if s == initiator {
+			t.order[i] = old
+		}
+	}
+	if t.holder == initiator {
+		t.holder = old
+	}
+}
+
 // SelfTest returns a self-test that runs as initiator, whose 4 KiB writes the target refuses with EBADE, as Linux does,
 // once a reservation shuts initiator out.
 func (t *Target) SelfTest(initiator string, report func(Check)) *SelfTest {
@@ -127,29 +166,79 @@ func (t *Target) Preempted() []uint64 {
 type fakeDevice struct {
 	t         *Target
 	initiator string
+	// paths is the number of paths of a dm-multipath map, named initiator#0 and up; 0 is a plain disk.
+	paths int
+	// perHost makes every path share the initiator's one registration, as NVMe does.
+	perHost bool
+}
+
+// nexuses names the initiator-target nexuses a command from d reaches: one per map path, or the initiator itself.
+func (d *fakeDevice) nexuses() []string {
+	if d.paths == 0 || d.perHost {
+		return []string{d.initiator}
+	}
+	names := make([]string, d.paths)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s#%d", d.initiator, i)
+	}
+	return names
+}
+
+func (d *fakeDevice) pathDevices() ([]device, func(), error) {
+	if d.paths == 0 {
+		return []device{d}, func() {}, nil
+	}
+	devs := make([]device, d.paths)
+	for i := range devs {
+		name := d.initiator
+		if !d.perHost {
+			name = fmt.Sprintf("%s#%d", d.initiator, i)
+		}
+		devs[i] = &fakeDevice{t: d.t, initiator: name}
+	}
+	return devs, func() {}, nil
 }
 
 func (d *fakeDevice) register(old, new uint64, ignore bool) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.attention(d.initiator); err != nil {
-		return err
+	for _, nexus := range d.nexuses() {
+		err := t.attention(nexus)
+		if err == nil {
+			err = t.registerNexus(nexus, old, new, ignore)
+		}
+		if err != nil {
+			if new != 0 {
+				for _, nexus := range d.nexuses() {
+					_ = t.registerNexus(nexus, new, 0, false)
+				}
+			}
+			return err
+		}
 	}
-	cur, registered := t.keys[d.initiator]
+	return nil
+}
+
+// registerNexus registers or removes nexus's key. Called with t.mu held.
+func (t *Target) registerNexus(nexus string, old, new uint64, ignore bool) error {
+	cur, registered := t.keys[nexus]
 	if !ignore && (registered && cur != old || !registered && old != 0) {
 		return ErrReservationConflict
 	}
 	if new != 0 {
 		if registered {
-			t.keys[d.initiator] = new
+			t.keys[nexus] = new
 		} else {
-			t.add(d.initiator, new)
+			t.add(nexus, new)
 		}
 		return nil
 	}
+	if t.failUnregister != nil {
+		return t.failUnregister
+	}
 	if registered {
-		t.drop(d.initiator)
+		t.drop(nexus)
 	}
 	if len(t.keys) == 0 {
 		t.reserved = false
@@ -161,14 +250,15 @@ func (d *fakeDevice) reserve(key uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.attention(d.initiator); err != nil {
+	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
 		return err
 	}
-	if t.keys[d.initiator] != key || key == 0 || t.lio && !t.mayWrite(d.initiator) {
+	if t.keys[first] != key || key == 0 || t.lio && !t.mayWrite(first) {
 		return ErrReservationConflict
 	}
 	if !t.reserved {
-		t.holder = d.initiator
+		t.holder = first
 	}
 	t.reserved = true
 	return nil
@@ -178,10 +268,11 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.attention(d.initiator); err != nil {
+	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
 		return err
 	}
-	if cur, registered := t.keys[d.initiator]; !registered || cur != own || t.lio && !t.mayWrite(d.initiator) {
+	if cur, registered := t.keys[first]; !registered || cur != own || t.lio && !t.mayWrite(first) || t.refusePreempt {
 		return ErrReservationConflict
 	}
 	found, holderKey := false, t.keys[t.holder]
@@ -196,7 +287,7 @@ func (d *fakeDevice) preemptAbort(own, victim uint64) error {
 		return ErrReservationConflict
 	}
 	if t.holder != "" && holderKey == victim {
-		t.holder = d.initiator
+		t.holder = first
 	}
 	t.preempted = append(t.preempted, victim)
 	return nil
@@ -206,10 +297,11 @@ func (d *fakeDevice) clear(key uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.attention(d.initiator); err != nil {
+	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
 		return err
 	}
-	if cur, registered := t.keys[d.initiator]; !registered || cur != key {
+	if cur, registered := t.keys[first]; !registered || cur != key {
 		return ErrReservationConflict
 	}
 	t.keys = map[string]uint64{}
@@ -222,7 +314,7 @@ func (d *fakeDevice) clear(key uint64) error {
 func (d *fakeDevice) readReservation() (uint64, uint32, error) {
 	d.t.mu.Lock()
 	defer d.t.mu.Unlock()
-	if err := d.t.attention(d.initiator); err != nil {
+	if err := d.t.attention(d.nexuses()[0]); err != nil {
 		return 0, 0, err
 	}
 	if !d.t.reserved {
@@ -235,7 +327,7 @@ func (d *fakeDevice) readKeys() ([]uint64, error) {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.attention(d.initiator); err != nil {
+	if err := t.attention(d.nexuses()[0]); err != nil {
 		return nil, err
 	}
 	if t.unlistable {
@@ -254,17 +346,18 @@ func (d *fakeDevice) preempt(own, victim uint64) error {
 	t := d.t
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if err := t.attention(d.initiator); err != nil {
+	first := d.nexuses()[0]
+	if err := t.attention(first); err != nil {
 		return err
 	}
-	if cur, registered := t.keys[d.initiator]; !registered || cur != own || t.lio && !t.mayWrite(d.initiator) {
+	if cur, registered := t.keys[first]; !registered || cur != own || t.lio && !t.mayWrite(first) {
 		return ErrReservationConflict
 	}
 	found, holderKey := false, t.keys[t.holder]
 	for initiator, key := range t.keys {
 		if key == victim {
 			found = true
-			if initiator != d.initiator {
+			if initiator != first {
 				t.drop(initiator)
 				t.attentions[initiator] += t.unitAttentions
 			}
@@ -274,7 +367,7 @@ func (d *fakeDevice) preempt(own, victim uint64) error {
 		return ErrReservationConflict
 	}
 	if t.holder != "" && holderKey == victim {
-		t.holder = d.initiator
+		t.holder = first
 	}
 	return nil
 }

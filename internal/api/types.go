@@ -244,6 +244,7 @@ type NodeStatsResponse struct {
 	ReplayingSlots            []int   `json:"replaying_slots,omitempty"`
 	MountReplayedTransactions int     `json:"mount_replayed_transactions"`
 	MountDiscardedJournal     bool    `json:"mount_discarded_journal"`
+	ReservationKeyRestores    uint64  `json:"reservation_key_restores"`
 	StaleReservationKeys      int     `json:"stale_reservation_keys"`
 }
 

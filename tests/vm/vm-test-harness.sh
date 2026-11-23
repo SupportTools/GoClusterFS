@@ -942,14 +942,54 @@ iscsi_disk() {
     ssh_run "$1" "iscsiadm -m session -P 3 | sed -n 's/.*Attached scsi disk \\([a-z]*\\).*/\\1/p' | head -1"
 }
 
-# multipath_over sets VM $1's one-path dm-multipath map gcfs-mpath on disk $2, by default its current iSCSI disk. A map
-# that exists takes the disk without flushing the writes it queued while it had no path.
+# iscsi_disks prints every disk VM $1's iSCSI sessions attached, one per path.
+iscsi_disks() {
+    ssh_run "$1" "iscsiadm -m session -P 3 | sed -n 's/.*Attached scsi disk \\([a-z]*\\).*/\\1/p' | xargs"
+}
+
+# iscsi_add_path logs VM $1 in to the target once more through iface p$2, as a second path with a session of its own.
+iscsi_add_path() {
+    local portal
+    portal=$(iscsi_portal)
+    ssh_run "$1" "iscsiadm -m iface -I p$2 -o new > /dev/null 2>&1; iscsiadm -m iface -I p$2 -o update -n iface.transport_name -v tcp > /dev/null
+        iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p$2 -o new > /dev/null
+        iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p$2 -o update -n node.session.timeo.replacement_timeout -v 5
+        iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p$2 --login > /dev/null && sleep 2"
+}
+
+# iscsi_drop_path logs VM $1's path p$2 out and deletes it. Its node record replaced the default one, without which a
+# login through iface default finds no record, so it creates that again.
+iscsi_drop_path() {
+    local node
+    node="-T ${ISCSI_TARGET_IQN} -p $(iscsi_portal)"
+    ssh_run "$1" "iscsiadm -m node $node -I p$2 --logout > /dev/null 2>&1
+        iscsiadm -m node $node -I p$2 -o delete > /dev/null 2>&1; iscsiadm -m iface -I p$2 -o delete > /dev/null 2>&1
+        iscsiadm -m node $node -I default > /dev/null 2>&1 && exit 0
+        iscsiadm -m node $node -o new > /dev/null && iscsiadm -m node $node -o update -n node.session.timeo.replacement_timeout -v 5"
+}
+
+# remove_map removes VM $1's map gcfs-mpath. A preempt's abort can fail every path of a map without multipathd, which
+# then queues a fenced mount's I/O, and the mount cannot exit until the queue fails.
+remove_map() {
+    ssh_run "$1" "dmsetup info gcfs-mpath > /dev/null 2>&1 || exit 0
+        dmsetup message gcfs-mpath 0 fail_if_no_path 2>/dev/null; fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null
+        for t in \$(seq 30); do dmsetup remove gcfs-mpath 2>/dev/null && exit 0; sleep 1; done
+        dmsetup status gcfs-mpath >&2; exit 1"
+}
+
+# multipath_over sets VM $1's dm-multipath map gcfs-mpath on the disks after $1, by default every iSCSI disk of VM $1,
+# one path each. A map that exists takes the disks without flushing the writes it queued while it had no path.
 multipath_over() {
-    local disk=${2:-}
-    if [[ -z "$disk" ]]; then
-        disk=$(iscsi_disk "$1") && [[ -n "$disk" ]] || return 1
-    fi
-    ssh_run "$1" "command -v dmsetup > /dev/null || apk add --no-cache device-mapper > /dev/null; modprobe dm-multipath && t=\"0 \$(blockdev --getsz /dev/$disk) multipath 1 queue_if_no_path 0 1 1 round-robin 0 1 1 /dev/$disk 1\" && if dmsetup info gcfs-mpath > /dev/null 2>&1; then dmsetup suspend --noflush gcfs-mpath && dmsetup load gcfs-mpath --table \"\$t\" && dmsetup resume gcfs-mpath; else dmsetup create gcfs-mpath --table \"\$t\"; fi"
+    local vm=$1 disks
+    shift
+    disks=${*:-$(iscsi_disks "$vm")}
+    [[ -n "$disks" ]] || return 1
+    local paths="" n=0 d
+    for d in $disks; do
+        paths="$paths /dev/$d 1"
+        n=$((n + 1))
+    done
+    ssh_run "$vm" "command -v dmsetup > /dev/null || apk add --no-cache device-mapper > /dev/null; modprobe dm-multipath && t=\"0 \$(blockdev --getsz /dev/${disks%% *}) multipath 1 queue_if_no_path 0 1 1 round-robin 0 $n 1$paths\" && if dmsetup info gcfs-mpath > /dev/null 2>&1; then dmsetup suspend --noflush gcfs-mpath && dmsetup load gcfs-mpath --table \"\$t\" && dmsetup resume gcfs-mpath; else dmsetup create gcfs-mpath --table \"\$t\"; fi"
 }
 
 # ssh_run_capped is ssh_run that gives up after $1 seconds, for a command the guest's kernel may never finish.
