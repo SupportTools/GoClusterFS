@@ -205,8 +205,14 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 	if err != nil {
 		return err
 	}
-	charged := false
+	charged, kept := false, false
 	var blocks int64
+	// An inode left unfreed gives back its charge after the deferred closeIntent, so replay can no longer free it.
+	defer func() {
+		if kept {
+			f.commitCharge(ino.ProjectID, blocks, 1)
+		}
+	}()
 	if f.journal != nil {
 		txn := f.journal.Begin()
 		if blocks, err = f.logInodeFree(txn, ino, gen); err != nil {
@@ -226,9 +232,7 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 		return ino.MetaGeneration == gen && ino.LinkCount == 0 && ino.Holders == 0
 	})
 	if err != nil || !ok {
-		if charged {
-			f.commitCharge(ino.ProjectID, blocks, 1)
-		}
+		kept = charged
 		return err
 	}
 	if afterCommit != nil {

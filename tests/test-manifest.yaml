@@ -5845,6 +5845,34 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_charge_test.go::TestQuotaChargesSurviveACrash
 
+  - id: quota-create-lost-slot
+    name: A create that loses its slot is charged once
+    description: A peer takes the create's slot after its commit; the create gives back its charge and retries elsewhere
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaCreateLosingItsSlotIsChargedOnce
+
+  - id: quota-write-conflict-retry
+    name: A write retried after a tree conflict is charged once
+    description: The write's inode write conflicts after its commit, gives back its charge, and the retry's charge is the only one
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaWriteRetriedAfterATreeConflictIsChargedOnce
+
+  - id: quota-truncate-race-retry
+    name: A truncate retried after a race is credited once
+    description: Another change to the inode between the truncate's read and write makes it retry; its first credit is given back
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaTruncateRetriedAfterARaceIsCreditedOnce
+
+  - id: dir-growth-charge-conflict
+    name: Directory growth is charged once per block after a conflict
+    description: A growth whose inode write conflicts gives its charge back before the retry
+    priority: go_only
+    environments:
+      go: internal/dir/quota_charge_test.go::TestGrowthChargesOncePerBlockAfterAConflict
+
   - id: quota-fold-logged
     name: A quota fold is logged in the dead journal
     description: After a fold the dead journal holds a completed fold that owes nothing, and the table has the usage

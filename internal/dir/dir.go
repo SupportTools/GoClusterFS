@@ -112,6 +112,16 @@ func (m *Manager) SetCharge(charge func(project uint32, blocks int64)) {
 	m.charge = charge
 }
 
+// testHookBeforeGrowthWrite, when set by a test, fails a growing directory's inode write with its error.
+var testHookBeforeGrowthWrite func() error
+
+func injectedGrowthFailure() error {
+	if testHookBeforeGrowthWrite != nil {
+		return testHookBeforeGrowthWrite()
+	}
+	return nil
+}
+
 func (m *Manager) charged(project uint32, blocks int64) {
 	if m.charge != nil {
 		m.charge(project, blocks)
@@ -733,7 +743,11 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 	// Write the updated inode to disk.
 	// Use WriteWithLockHeld since we already hold the inode lock.
 	m.charged(freshIno.ProjectID, 1)
-	if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
+	err = injectedGrowthFailure()
+	if err == nil {
+		err = m.inodeTbl.WriteWithLockHeld(freshIno)
+	}
+	if err != nil {
 		if errors.Is(err, extent.ErrTreeConflict) {
 			m.charged(freshIno.ProjectID, -1)
 			return errRetryAdd

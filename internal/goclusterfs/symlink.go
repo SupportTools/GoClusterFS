@@ -109,6 +109,14 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	uid, gid, _ := f.newOwner(ctx, dirIno)
 	project := childProject(dirIno)
 
+	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
+	// so replay can no longer finish the create it undoes.
+	var takeBack func()
+	defer func() {
+		if takeBack != nil {
+			takeBack()
+		}
+	}()
 	if f.journal != nil {
 		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, project, target, block, reserved)
 		if err != nil {
@@ -142,7 +150,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if block != 0 {
 		blocks = 1
 	}
-	uncharge := func() { f.commitCharge(project, -blocks, -1) }
+	uncharge := func() { takeBack = func() { f.commitCharge(project, -blocks, -1) } }
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Symlink %q: ClaimSlot %d failed: %v", name, inodeNum, err)

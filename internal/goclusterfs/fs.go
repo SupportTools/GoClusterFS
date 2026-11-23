@@ -1283,6 +1283,14 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	uid, gid, _ := f.newOwner(ctx, dirIno)
 	project := childProject(dirIno)
 
+	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
+	// so replay can no longer finish the create it undoes.
+	var takeBack func()
+	defer func() {
+		if takeBack != nil {
+			takeBack()
+		}
+	}()
 	if f.journal != nil {
 		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, project, journal.DirEntryRegular)
 		if err != nil {
@@ -1296,7 +1304,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	}
 
 	// Claiming before naming means a crash in between leaks an unnamed inode, not a name for a free slot.
-	uncharge := func() { f.commitCharge(project, 0, -1) }
+	uncharge := func() { takeBack = func() { f.commitCharge(project, 0, -1) } }
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
@@ -1376,6 +1384,14 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	}
 	project := childProject(dirIno)
 
+	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
+	// so replay can no longer finish the create it undoes.
+	var takeBack func()
+	defer func() {
+		if takeBack != nil {
+			takeBack()
+		}
+	}()
 	if f.journal != nil {
 		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, project, journal.DirEntryDirectory)
 		if err != nil {
@@ -1388,7 +1404,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		}
 	}
 
-	uncharge := func() { f.commitCharge(project, -1, -1) }
+	uncharge := func() { takeBack = func() { f.commitCharge(project, -1, -1) } }
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Mkdir %q: ClaimSlot %d failed: %v", name, inodeNum, err)
@@ -1863,12 +1879,14 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	var txn *journal.Transaction
 	var intentSeq uint64
 	var freedBlocks int64
-	// keepCharge undoes the charge of a free that did not happen, once the intent is closed so replay will not free.
-	keepCharge := func() {
-		if willFreeInode && intentSeq != 0 {
+	// A free that did not happen gives back its charge after the deferred closeIntent, so replay can no longer free.
+	kept := false
+	defer func() {
+		if kept && willFreeInode && intentSeq != 0 {
 			d.fs.commitCharge(childIno.ProjectID, freedBlocks, 1)
 		}
-	}
+	}()
+	keepCharge := func() { kept = true }
 	if d.fs.journal != nil {
 		txn = d.fs.journal.Begin()
 
@@ -3223,7 +3241,6 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		defer f.fs.closeIntent(intentSeq)
 		txn = nil // Mark as committed so defer doesn't abort
-		chargedAllocs = len(allocatedExtents)
 		if afterCommit != nil {
 			afterCommit("write")
 		}
@@ -3694,6 +3711,13 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	var txn *journal.Transaction
 	var intentSeq uint64
 	var cutBlocks int64
+	// A truncate that failed after its commit gives back its charge after the deferred closeIntent.
+	truncateFailed := false
+	defer func() {
+		if truncateFailed {
+			f.fs.commitCharge(ino.ProjectID, cutBlocks, 0)
+		}
+	}()
 	if f.fs.journal != nil && mask != 0 {
 		txn = f.fs.journal.Begin()
 
@@ -3733,7 +3757,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		if sz < ino.Size {
 			// Truncate
 			if err := f.fs.extentMgr.Truncate(ctx, ino, sz); err != nil {
-				f.fs.commitCharge(ino.ProjectID, cutBlocks, 0)
+				truncateFailed = true
 				return syscall.EIO, nil
 			}
 		}

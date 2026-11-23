@@ -10,6 +10,8 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/supporttools/GoClusterFS/internal/extent"
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
@@ -64,7 +66,9 @@ func TestQuotaChargesFileOperations(t *testing.T) {
 	step("a mkdir", 3, 2)
 	// The flushes keep the ledger's holds from filling the journal, as the flush loop does.
 	for i := range 80 {
-		createIn(t, sub, fmt.Sprintf("%0200d", i)).Release(ctx, nil)
+		if errno := createIn(t, sub, fmt.Sprintf("%0200d", i)).Release(ctx, nil); errno != 0 {
+			t.Fatalf("release: %v", errno)
+		}
 		flushQuota(t, fsys)
 	}
 	for i := range 80 {
@@ -102,6 +106,111 @@ func TestQuotaChargesFileOperations(t *testing.T) {
 		t.Fatalf("rename over a directory: %v", errno)
 	}
 	step("a rename over a directory", 2+grown, 3)
+
+	flushQuota(t, fsys)
+	if _, err := fsys.journal.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if head, tail := fsys.journal.Region().HeadOffset(), fsys.journal.Region().TailOffset(); head != tail {
+		t.Errorf("after a flush a checkpoint stopped at %d, short of the tail at %d: an intent stays open", head, tail)
+	}
+}
+
+// checkUsage compares a project's usage with what its files map, after retries a test forced.
+func checkUsage(t *testing.T, fsys *FS, pvc *Dir, inodes uint64, files ...*File) {
+	t.Helper()
+	var blocks uint64
+	for _, f := range files {
+		ino, err := fsys.inodeTbl.Read(f.inodeNum)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blocks += ino.AllocatedBlocks
+	}
+	if got, want := usage(t, fsys, pvc), [2]uint64{blocks, inodes}; got != want {
+		t.Errorf("the project uses %v blocks and inodes, want what its files map: %v", got, want)
+	}
+}
+
+// A create that loses its inode slot to a peer after its commit gives back its charge and retries on another slot.
+func TestQuotaCreateLosingItsSlotIsChargedOnce(t *testing.T) {
+	fsys, path, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	peer := openFormattedComponents(t, path)
+	ctx := context.Background()
+	taken := 0
+	afterCommit = func(op string) {
+		if op != "create" || taken > 0 {
+			return
+		}
+		taken++
+		num, err := fsys.inodeTbl.FindFreeSlot()
+		if err == nil {
+			_, err = peer.inodeTbl.ClaimSlot(ctx, num)
+		}
+		if err != nil {
+			t.Errorf("the peer taking the create's slot: %v", err)
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+	f := createIn(t, pvc, "f")
+	afterCommit = nil
+	if taken != 1 {
+		t.Fatal("the create never reached its commit")
+	}
+	checkUsage(t, fsys, pvc, 1, f)
+}
+
+// A write whose inode write hits a tree conflict after its commit gives back its charge before it retries.
+func TestQuotaWriteRetriedAfterATreeConflictIsChargedOnce(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	f := createIn(t, pvc, "f")
+	conflicts := 0
+	testHookBeforeInodeCommit = func() error {
+		if conflicts++; conflicts == 1 {
+			return fmt.Errorf("injected: %w", extent.ErrTreeConflict)
+		}
+		return nil
+	}
+	t.Cleanup(func() { testHookBeforeInodeCommit = nil })
+	writeAt(t, f, pattern(6, int(2*fsys.dataBlockSize())), 0)
+	testHookBeforeInodeCommit = nil
+	if conflicts < 2 {
+		t.Fatalf("the write committed its inode %d times; want a conflict, then a retry", conflicts)
+	}
+	checkUsage(t, fsys, pvc, 1, f)
+}
+
+// A truncate whose inode changed under it after its commit gives back its credit before it retries.
+func TestQuotaTruncateRetriedAfterARaceIsCreditedOnce(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	ctx := context.Background()
+	bs := int64(fsys.dataBlockSize())
+	f := createIn(t, pvc, "f")
+	writeAt(t, f, pattern(7, int(3*bs)), 0)
+	raced := raceSetattr(t, func() syscall.Errno {
+		if _, err := fsys.updateInode(ctx, f.inodeNum, func(ino *inode.Inode) error {
+			ino.Mtime++
+			return nil
+		}); err != nil {
+			return syscall.EIO
+		}
+		return 0
+	})
+	in := &fuse.SetAttrIn{}
+	in.Valid, in.Size = fuse.FATTR_SIZE, uint64(bs)
+	if errno := f.Setattr(ctx, nil, in, &fuse.AttrOut{}); errno != 0 {
+		t.Fatalf("truncate: %v", errno)
+	}
+	if errno := <-raced; errno != 0 {
+		t.Fatalf("the racing inode change: %v", errno)
+	}
+	checkUsage(t, fsys, pvc, 1, f)
 }
 
 // An operation that fails after its commit gives back what it charged: a mkdir whose inode write fails, and a write
