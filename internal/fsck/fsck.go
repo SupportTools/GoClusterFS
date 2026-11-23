@@ -450,6 +450,11 @@ type SuperblockData struct {
 	SnapshotRegSize   uint64
 	LockSlotSize      uint32
 
+	// Project quotas
+	QuotaInode       uint32
+	QuotaFlushMs     uint32
+	QuotaTableBlocks uint32
+
 	// Counters
 	InodeCount    uint64
 	FreeInodes    uint64

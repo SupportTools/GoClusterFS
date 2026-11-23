@@ -69,6 +69,15 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 	if errno := f.childInRange(oldParent, oldName, child); errno != 0 {
 		return errno
 	}
+	if oldParent != newParent {
+		childIno, err := f.inodeTbl.Read(uint32(child))
+		if err != nil {
+			return syscall.EIO
+		}
+		if f.crossesProject(childIno, newDir) {
+			return syscall.EXDEV
+		}
+	}
 	op := &dir.RenameOp{OldParent: oldParent, NewParent: newParent, OldName: oldName, NewName: newName,
 		Child: child, ChildIsDir: ctype == dir.DT_DIR, NoReplace: flags&renameNoReplace != 0}
 	target, ttype, err := f.dirMgr.Lookup(ctx, newDir, newName)

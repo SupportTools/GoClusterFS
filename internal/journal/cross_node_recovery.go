@@ -307,6 +307,10 @@ func initCreated(ctx context.Context, rctx *RecoveryContext, ino *inode.Inode, p
 	ino.Mode = uint16(p.Mode)
 	ino.UID = p.UID
 	ino.GID = p.GID
+	ino.ProjectID = p.ProjectID
+	if ino.IsDir() && p.ProjectID != 0 {
+		ino.Flags |= inode.FlagProjInherit
+	}
 	now := time.Now().UnixNano()
 	ino.Atime = now
 	ino.Mtime = now

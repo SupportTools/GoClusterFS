@@ -52,13 +52,17 @@ const (
 	// without fencing, which could neither write nor be fenced, must not mount the volume.
 	RequiredReservations uint64 = 1 << 7
 
+	// RequiredProjectQuotas means the volume has a quota table and inodes may count against a project, so builds that
+	// would allocate without counting must not mount it.
+	RequiredProjectQuotas uint64 = 1 << 9
+
 	// RequiredLockLayout is the lock record layout of this build.
 	RequiredLockLayout = RequiredTypedLockRecords | RequiredFileIOLocks
 )
 
 // FlagsWeSupport defines which required flags this version understands.
 // Update this as new features are implemented.
-var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks | RequiredReservations
+var FlagsWeSupport uint64 = RequiredJournal | RequiredSnapshots | RequiredLockLayout | RequiredSymlinks | RequiredReservations | RequiredProjectQuotas
 
 // Errors
 var (
@@ -122,8 +126,14 @@ type Superblock struct {
 	// LockSlotSize is the size of one node's claim slot in a lock record (offset 264-267).
 	LockSlotSize uint32
 
-	// Reserved for future use (offset 268-4091)
-	Reserved [3824]byte
+	// Project quotas (offset 268-279): the hidden inode whose data blocks hold the quota table, how often each node
+	// flushes its usage deltas into it, and the table's length in blocks. QuotaInode 0 means the volume has no quotas.
+	QuotaInode       uint32
+	QuotaFlushMs     uint32
+	QuotaTableBlocks uint32
+
+	// Reserved for future use (offset 280-4091)
+	Reserved [3812]byte
 
 	// Checksum - last 4 bytes (offset 4092-4095)
 	Checksum uint32 // CRC32C of bytes 0-4091
@@ -229,6 +239,10 @@ func (sb *Superblock) Serialize() []byte {
 
 	binary.LittleEndian.PutUint32(buf[264:268], sb.LockSlotSize)
 
+	binary.LittleEndian.PutUint32(buf[268:272], sb.QuotaInode)
+	binary.LittleEndian.PutUint32(buf[272:276], sb.QuotaFlushMs)
+	binary.LittleEndian.PutUint32(buf[276:280], sb.QuotaTableBlocks)
+
 	// Reserved (already zero)
 
 	// Compute and store checksum (last 4 bytes)
@@ -306,6 +320,10 @@ func Deserialize(buf []byte) (*Superblock, error) {
 	sb.LastWriteTime = int64(binary.LittleEndian.Uint64(buf[256:264]))
 
 	sb.LockSlotSize = binary.LittleEndian.Uint32(buf[264:268])
+
+	sb.QuotaInode = binary.LittleEndian.Uint32(buf[268:272])
+	sb.QuotaFlushMs = binary.LittleEndian.Uint32(buf[272:276])
+	sb.QuotaTableBlocks = binary.LittleEndian.Uint32(buf[276:280])
 
 	sb.Checksum = storedChecksum
 

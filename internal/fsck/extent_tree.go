@@ -9,7 +9,7 @@ import (
 
 // extentTree is what walking one inode's extent tree found.
 type extentTree struct {
-	nodes   []uint64 // tree node blocks
+	nodes   []uint64 // every block of every tree node
 	extents []ExtentData
 	err     error
 }
@@ -34,7 +34,7 @@ func (c *Checker) walkExtentTree(inodeNum uint32, inode *InodeData) *extentTree 
 		t.err = fmt.Errorf("root node %d: %w", inode.ExtentTreeRoot, err)
 		return t
 	}
-	t.nodes = append(t.nodes, inode.ExtentTreeRoot)
+	t.nodes = append(t.nodes, c.nodeBlocks(inode.ExtentTreeRoot)...)
 
 	switch {
 	case inode.ExtentDepth == 1 && root.Level == extent.LevelLeaf:
@@ -55,7 +55,7 @@ func (c *Checker) walkExtentTree(inodeNum uint32, inode *InodeData) *extentTree 
 					child.Block, leaf.Level, len(leaf.Extents), child.Count)
 				return t
 			}
-			t.nodes = append(t.nodes, child.Block)
+			t.nodes = append(t.nodes, c.nodeBlocks(child.Block)...)
 			if t.err = t.addLeaf(child.Block, leaf, child.First, end); t.err != nil {
 				return t
 			}
@@ -80,11 +80,21 @@ func (t *extentTree) addLeaf(block uint64, leaf *extent.TreeNode, first, end uin
 	return nil
 }
 
-func (c *Checker) readTreeNode(inodeNum uint32, block, gen uint64) (*extent.TreeNode, error) {
-	if block >= c.sbData.TotalBlocks {
-		return nil, fmt.Errorf("block out of range (max %d)", c.sbData.TotalBlocks-1)
+// nodeBlocks returns every block of the tree node that starts at start.
+func (c *Checker) nodeBlocks(start uint64) []uint64 {
+	n := extent.NodeBlocks(uint64(c.sbData.BlockSize))
+	blocks := make([]uint64, n)
+	for i := range n {
+		blocks[i] = start + i
 	}
-	n, err := extent.ReadTreeNode(c.dev, c.sbData.DataRegionOffset, block, gen)
+	return blocks
+}
+
+func (c *Checker) readTreeNode(inodeNum uint32, block, gen uint64) (*extent.TreeNode, error) {
+	if n := extent.NodeBlocks(uint64(c.sbData.BlockSize)); block+n > c.sbData.TotalBlocks || block+n < block {
+		return nil, fmt.Errorf("node blocks %d-%d out of range (max %d)", block, block+n-1, c.sbData.TotalBlocks-1)
+	}
+	n, err := extent.ReadTreeNode(c.dev, c.sbData.DataRegionOffset, uint64(c.sbData.BlockSize), block, gen)
 	if err != nil {
 		return nil, err
 	}

@@ -107,9 +107,10 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		return nil, syscall.EIO
 	}
 	uid, gid, _ := f.newOwner(ctx, dirIno)
+	project := childProject(dirIno)
 
 	if f.journal != nil {
-		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, target, block, reserved)
+		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, project, target, block, reserved)
 		if err != nil {
 			logging.Debugf("Symlink %q: journal commit failed: %v", name, err)
 			// A full journal wrote nothing and Logged put a reserved block back; other failures may leave the record on disk.
@@ -146,6 +147,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	childIno.Mode = inode.S_IFLNK | 0o777
 	childIno.UID = uid
 	childIno.GID = gid
+	joinProject(childIno, project)
 	childIno.LinkCount = 1
 	childIno.Atime = now
 	childIno.Mtime = now
@@ -179,7 +181,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	giveBack = nil
 	f.cacheInode(childIno)
 	f.announceDir(parentNum)
-	fillEntryOut(out, childIno)
+	fillEntryOut(out, childIno, f.blockSize)
 	return f.linkNode(ctx, parent, childIno, out), 0
 }
 
@@ -197,11 +199,12 @@ func (f *FS) symlinkBlock(ctx context.Context, target []byte) (uint64, bool, sys
 		}
 		b = blocks[0]
 	}
-	buf := storage.GetBuffer(BlockSize)
+	buf := storage.GetBuffer(int(f.blockSize))
 	defer storage.PutBuffer(buf)
-	clear(buf.Bytes())
-	copy(buf.Bytes(), target)
-	if _, err := f.dev.WriteAt(buf.Bytes(), int64(f.dataOffset+b*BlockSize)); err != nil {
+	block := buf.Bytes()[:f.blockSize]
+	clear(block)
+	copy(block, target)
+	if _, err := f.dev.WriteAt(block, int64(f.dataOffset+b*f.blockSize)); err != nil {
 		logging.Debugf("Symlink: writing the target to block %d failed: %v", b, err)
 		if reserved {
 			f.reserve.Untake(b)
@@ -213,9 +216,9 @@ func (f *FS) symlinkBlock(ctx context.Context, target []byte) (uint64, bool, sys
 	return b, reserved, 0
 }
 
-func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid uint32, target []byte, block uint64, reserved bool) (uint64, error) {
+func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid, project uint32, target []byte, block uint64, reserved bool) (uint64, error) {
 	link := &journal.SymlinkTargetPayload{InodeNum: uint64(num), DiskBlock: block, Target: target}
-	txn, err := f.createTxn(num, parentNum, name, uint32(inode.S_IFLNK|0o777), uid, gid, journal.DirEntrySymlink, link)
+	txn, err := f.createTxn(num, parentNum, name, uint32(inode.S_IFLNK|0o777), uid, gid, project, journal.DirEntrySymlink, link)
 	if err != nil {
 		return 0, err
 	}
@@ -243,7 +246,7 @@ func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid uint32, tar
 }
 
 func (f *FS) linkNode(ctx context.Context, parent *fs.Inode, ino *inode.Inode, out *fuse.EntryOut) *fs.Inode {
-	fillLinkAttr(&out.Attr, ino)
+	fillLinkAttr(&out.Attr, ino, f.blockSize)
 	return parent.NewPersistentInode(ctx, &Link{fs: f, inodeNum: ino.InodeNum, birth: ino.BirthGeneration}, fs.StableAttr{
 		Mode: fuse.S_IFLNK,
 		Ino:  uint64(ino.InodeNum),
@@ -256,7 +259,7 @@ func (l *Link) current(ino *inode.Inode) bool {
 	return ino.Magic == inode.InodeMagic && ino.IsSymlink() && (l.birth == 0 || ino.BirthGeneration == l.birth)
 }
 
-func fillLinkAttr(out *fuse.Attr, ino *inode.Inode) {
+func fillLinkAttr(out *fuse.Attr, ino *inode.Inode, blockSize uint64) {
 	out.Ino = uint64(ino.InodeNum)
 	out.Mode = fuse.S_IFLNK | 0o777
 	out.Nlink = ino.LinkCount
@@ -266,8 +269,8 @@ func fillLinkAttr(out *fuse.Attr, ino *inode.Inode) {
 	out.Atime, out.Atimensec = uint64(ino.Atime/1e9), uint32(ino.Atime%1e9)
 	out.Mtime, out.Mtimensec = uint64(ino.Mtime/1e9), uint32(ino.Mtime%1e9)
 	out.Ctime, out.Ctimensec = uint64(ino.Ctime/1e9), uint32(ino.Ctime%1e9)
-	out.Blocks = ino.AllocatedBlocks * (BlockSize / 512)
-	out.Blksize = BlockSize
+	out.Blocks = ino.AllocatedBlocks * (blockSize / 512)
+	out.Blksize = uint32(blockSize)
 }
 
 // readLink reads a symlink's inode; ESTALE means its slot now holds something else.
@@ -306,7 +309,7 @@ func (f *FS) symlinkTarget(ino *inode.Inode) ([]byte, syscall.Errno) {
 	}
 	buf := storage.GetBuffer(storage.SectorSize)
 	defer storage.PutBuffer(buf)
-	if _, err := f.dev.ReadAt(buf.Bytes(), int64(f.dataOffset+phys*BlockSize)); err != nil {
+	if _, err := f.dev.ReadAt(buf.Bytes(), int64(f.dataOffset+phys*f.blockSize)); err != nil {
 		return nil, syscall.EIO
 	}
 	return bytes.Clone(buf.Bytes()[:ino.Size]), 0
@@ -318,7 +321,7 @@ func (l *Link) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut)
 		return errno
 	}
 	out.AttrValid = 0
-	fillLinkAttr(&out.Attr, ino)
+	fillLinkAttr(&out.Attr, ino, l.fs.blockSize)
 	return 0
 }
 
@@ -364,6 +367,6 @@ func (l *Link) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	}
 	l.fs.cacheInode(updated)
 	out.AttrValid = 0
-	fillLinkAttr(&out.Attr, updated)
+	fillLinkAttr(&out.Attr, updated, l.fs.blockSize)
 	return 0
 }

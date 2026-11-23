@@ -72,7 +72,7 @@ func openSnapshotFS(t *testing.T, path string) *FS {
 	t.Cleanup(locks.ReleaseCached)
 	bm := bitmap.NewRegion(dev, snapFSBitmapOffset, snapFSDataBlocks, locks, nodeUUID)
 	inodeTbl := inode.NewTable(dev, snapFSInodeOffset, 4096*inode.InodeSize, locks, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset)
+	extentMgr := extent.NewManager(dev, bm, locks, snapFSDataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	refs := refcount.NewRegion(dev, snapFSRefcountOffset, refcount.SizeForBlocks(snapFSDataBlocks), snapFSDataBlocks, locks)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, locks, snapFSDataOffset)

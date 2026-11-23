@@ -53,7 +53,7 @@ func (f *FS) link(ctx context.Context, parent *fs.Inode, parentNum uint32, targe
 		Ino:  uint64(file.inodeNum),
 		Gen:  ino.BirthGeneration,
 	})
-	fillEntryOut(out, ino)
+	fillEntryOut(out, ino, f.blockSize)
 	return ch, 0
 }
 
@@ -78,6 +78,8 @@ func (f *FS) addLink(ctx context.Context, parentNum uint32, file *File, name str
 		return nil, syscall.ENOENT
 	case ino.LinkCount >= maxLinks:
 		return nil, syscall.EMLINK
+	case f.crossesProject(ino, dirIno):
+		return nil, syscall.EXDEV
 	}
 
 	if f.journal != nil {

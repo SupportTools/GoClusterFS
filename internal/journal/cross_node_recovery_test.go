@@ -54,7 +54,7 @@ func testRecoveryContext(t testing.TB) (*RecoveryContext, func()) {
 
 	bm := bitmap.NewRegion(dev, bitmapOffset, totalBlocks, nil, nodeUUID)
 	inodeTbl := inode.NewTable(dev, inodeOffset, inodeCount*inode.InodeSize, nil, nodeUUID)
-	extentMgr := extent.NewManager(dev, bm, nil, dataOffset)
+	extentMgr := extent.NewManager(dev, bm, nil, dataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, nil, dataOffset)
 
@@ -116,10 +116,11 @@ func TestApplyInodeCreate(t *testing.T) {
 	// Create a payload for inode creation
 	// Note: Use inode number < 100 since test context only creates 100 inodes
 	payload := &InodeCreatePayload{
-		InodeNum: 50,
-		Mode:     0644,
-		UID:      1000,
-		GID:      1000,
+		InodeNum:  50,
+		Mode:      0644,
+		UID:       1000,
+		GID:       1000,
+		ProjectID: 7,
 	}
 
 	// Serialize and apply
@@ -145,6 +146,9 @@ func TestApplyInodeCreate(t *testing.T) {
 	}
 	if ino.UID != payload.UID {
 		t.Errorf("Inode UID mismatch: got %d, want %d", ino.UID, payload.UID)
+	}
+	if ino.ProjectID != payload.ProjectID {
+		t.Errorf("replayed create has project %d, want %d", ino.ProjectID, payload.ProjectID)
 	}
 
 	// Test idempotency - applying same operation should skip
@@ -590,7 +594,7 @@ func TestApplyExtentAddIntoTree(t *testing.T) {
 	}
 
 	// Read back through a fresh extent manager, as after a remount.
-	mgr := extent.NewManager(rctx.Dev, rctx.BitmapMgr, nil, 3<<20)
+	mgr := extent.NewManager(rctx.Dev, rctx.BitmapMgr, nil, 3<<20, storage.DefaultBlockSize)
 	ino, err = rctx.InodeTbl.Read(51)
 	if err != nil {
 		t.Fatal(err)

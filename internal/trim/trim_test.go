@@ -102,7 +102,7 @@ func TestBatchThreshold(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  10,
 		MaxAge:     time.Hour, // Long enough not to trigger
 		DataOffset: 0,
@@ -146,7 +146,7 @@ func TestAgeThreshold(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  1000, // High enough not to trigger
 		MaxAge:     100 * time.Millisecond,
 		DataOffset: 0,
@@ -182,7 +182,7 @@ func TestAgeThreshold(t *testing.T) {
 
 func TestQueueRange(t *testing.T) {
 	m := &Manager{
-		config:  Config{BatchSize: 1000},
+		config:  Config{BlockSize: BlockSize, BatchSize: 1000},
 		pending: make([]pendingBlock, 0),
 	}
 
@@ -204,7 +204,7 @@ func TestGracefulShutdown(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  1000, // Won't trigger during test
 		MaxAge:     time.Hour,
 		DataOffset: 0,
@@ -243,7 +243,7 @@ func TestCoalesceRatio(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  10,
 		MaxAge:     time.Hour,
 		DataOffset: 0,
@@ -289,7 +289,7 @@ func TestStatsAreThreadSafe(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	cfg := Config{
+	cfg := Config{BlockSize: BlockSize,
 		BatchSize:  1000,
 		MaxAge:     time.Hour,
 		DataOffset: 0,
@@ -331,7 +331,7 @@ func TestDuplicateBlockDiscardedOnce(t *testing.T) {
 	defer cleanup()
 
 	var calls [][2]uint64
-	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+	m := NewManager(dev, Config{BlockSize: BlockSize, BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
 		calls = append(calls, [2]uint64{offset, length})
 		return nil
 	}})
@@ -354,7 +354,7 @@ func TestFlushDiscardsQueuedBlocksNow(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	m := NewManager(dev, Config{BatchSize: 100, MaxAge: time.Hour, Enabled: false})
+	m := NewManager(dev, Config{BlockSize: BlockSize, BatchSize: 100, MaxAge: time.Hour, Enabled: false})
 	m.Start()
 	defer func() { _ = m.Stop() }()
 
@@ -376,7 +376,7 @@ func TestStatsCountFailedDiscardsAndLastSuccess(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+	m := NewManager(dev, Config{BlockSize: BlockSize, BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
 		if offset == 10*BlockSize {
 			return errors.New("device refused")
 		}
@@ -404,7 +404,7 @@ func TestUnsupportedDeviceIsNotCountedAsDiscarded(t *testing.T) {
 	defer cleanup()
 
 	calls := 0
-	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+	m := NewManager(dev, Config{BlockSize: BlockSize, BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
 		calls++
 		return errDiscardUnsupported
 	}})
@@ -428,7 +428,7 @@ func TestRefusedFlushCountsAsError(t *testing.T) {
 	dev, cleanup := createTestDevice(t)
 	defer cleanup()
 
-	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+	m := NewManager(dev, Config{BlockSize: BlockSize, BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
 		t.Error("Discard ran although the guard refused the flush")
 		return nil
 	}})
@@ -452,7 +452,7 @@ func TestDiscardRefusedByWriteGate(t *testing.T) {
 	dev.SetWriteGate(func(int64) error { return errors.New("node lost its registry slot") })
 
 	discarded := false
-	m := NewManager(dev, Config{BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
+	m := NewManager(dev, Config{BlockSize: BlockSize, BatchSize: 1000, MaxAge: time.Hour, Enabled: true, Discard: func(offset, length uint64) error {
 		discarded = true
 		return nil
 	}})

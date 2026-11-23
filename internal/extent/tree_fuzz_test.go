@@ -27,7 +27,7 @@ func FuzzParseTreeNode(f *testing.F) {
 	f.Fuzz(func(t *testing.T, buf []byte, fixChecksum bool) {
 		if fixChecksum && len(buf) >= nodeHeaderSize {
 			count := int(binary.LittleEndian.Uint32(buf[12:16]))
-			if count <= MaxNodeEntries && nodeHeaderSize+count*nodeEntrySize <= len(buf) {
+			if count <= MaxNodeEntries(BlockSize) && nodeHeaderSize+count*nodeEntrySize <= len(buf) {
 				buf = bytes.Clone(buf)
 				binary.LittleEndian.PutUint32(buf[60:64], nodeChecksum(buf, count))
 			}
@@ -38,13 +38,13 @@ func FuzzParseTreeNode(f *testing.F) {
 				t.Fatalf("extent changed after an encode/decode round trip: %+v != %+v (%v)", again, ext, err)
 			}
 		}
-		n, err := parseTreeNode(buf)
+		n, err := parseTreeNode(buf, BlockSize)
 		if err != nil {
 			return
 		}
 		out := make([]byte, treeNodeSize(n.count()))
 		encodeTreeNode(out, n)
-		again, err := parseTreeNode(out)
+		again, err := parseTreeNode(out, BlockSize)
 		if err != nil {
 			t.Fatalf("decoding a re-encoded node: %v", err)
 		}

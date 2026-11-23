@@ -28,9 +28,6 @@ const (
 	// DirChunkSize is the directory chunk size (4KB).
 	DirChunkSize = 4096
 
-	// DirBlockSize is the data block size for directory content.
-	DirBlockSize = 1 << 20 // 1MB
-
 	// Directory entry file types (POSIX DT_* values)
 	DT_UNKNOWN = 0
 	DT_REG     = 1
@@ -212,7 +209,8 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 	var entries []*DirEntryData
 	var errors []string
 	complete := true
-	blockBuf := storage.NewAlignedBuffer(DirBlockSize).Bytes()
+	blockSize := uint64(c.sbData.BlockSize)
+	blockBuf := storage.NewAlignedBuffer(int(blockSize)).Bytes()
 
 	for _, ext := range c.inodeExtents(inodeNum, inode) {
 		if ext.Length == 0 {
@@ -226,7 +224,7 @@ func (c *Checker) readDirectoryEntries(inodeNum uint32, inode *InodeData, dataOf
 
 		for j := uint64(0); j < ext.Length; j++ {
 			physBlock := ext.PhysicalBlock + j
-			if err := c.readSector(blockBuf, dataOffset+physBlock*DirBlockSize); err != nil {
+			if err := c.readSector(blockBuf, dataOffset+physBlock*blockSize); err != nil {
 				errors = append(errors, fmt.Sprintf("block %d: %v", physBlock, err))
 				continue
 			}
@@ -433,7 +431,7 @@ func (c *Checker) repairDots(fixes []dotFix) error {
 	sb := c.sbData
 	var uuid [16]byte
 	tbl := inode.NewTable(c.dev, sb.InodeTableOffset, sb.InodeTableSize, nil, uuid)
-	mgr := extent.NewManager(c.dev, bitmap.NewRegion(c.dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, uuid), nil, sb.DataRegionOffset)
+	mgr := extent.NewManager(c.dev, bitmap.NewRegion(c.dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, uuid), nil, sb.DataRegionOffset, uint64(sb.BlockSize))
 	mgr.SetRefcounts(refcount.NewRegion(c.dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, nil))
 	tbl.SetTreeFlusher(mgr)
 	dirs := dir.NewManager(c.dev, tbl, mgr, nil, sb.DataRegionOffset)

@@ -80,7 +80,8 @@ remount() {
 # given. Prints "survived" if the same mount process still serves the mount point after RELOGIN_SETTLE, else mounts
 # VM $1 again and prints "stopped".
 relogin_node() {
-    local vm_id=$1 pause=${2:-0} pid disk i portal="10.0.2.2:${ISCSI_PORT}"
+    local vm_id=$1 pause=${2:-0} pid disk i portal
+    portal=$(iscsi_portal)
     pid=$(mount_pid "$vm_id") || return 1
     if (( pause > 0 )); then
         ssh_run "$vm_id" "kill -STOP $pid" || return 1

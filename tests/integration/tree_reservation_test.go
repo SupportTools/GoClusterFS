@@ -15,6 +15,11 @@ func TestTreeReservationsDoNotLeakBlocks(t *testing.T) {
 	if err := mfs.FormatAndMount(false); err != nil {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(mfs.MountPoint, &st); err != nil {
+		t.Fatalf("Statfs failed: %v", err)
+	}
+	fresh := st.Bfree
 
 	// 128KB at block 0 keeps the file off the SFB path; block 2 makes the second extent.
 	if err := mfs.WriteFileAt("append.bin", chunk(1, 128*1024), 0); err != nil {
@@ -30,14 +35,10 @@ func TestTreeReservationsDoNotLeakBlocks(t *testing.T) {
 		t.Fatalf("Remove failed: %v", err)
 	}
 
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(mfs.MountPoint, &st); err != nil {
-		t.Fatalf("Statfs failed: %v", err)
-	}
-	// Every data block except the root directory's.
-	fill := int(st.Blocks-1) * mb
+	// Every block that was free right after the format, so a block a reservation leaked makes the write fail.
+	fill := int(fresh) * mb
 	if err := mfs.WriteFile("fill.bin", make([]byte, fill)); err != nil {
-		t.Fatalf("writing %d MB into an empty volume of %d blocks failed: %v", fill/mb, st.Blocks, err)
+		t.Fatalf("writing %d MB, all a fresh volume had free, after the file was removed failed: %v", fill/mb, err)
 	}
 }
 

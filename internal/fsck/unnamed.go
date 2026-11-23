@@ -59,7 +59,7 @@ func (c *Checker) checkUnnamed() error {
 	var problems []int
 	kept := 0
 	for _, num := range c.unnamed {
-		if c.snapshotData[num] && (c.snapshotRefs[num] || !c.finished[PhaseSnapshots]) {
+		if c.snapshotData[num] && (c.snapshotRefs[num] || !c.finished[PhaseSnapshots]) || c.isQuotaInode(num) {
 			continue
 		}
 		loc := fmt.Sprintf("inode %d", num)
@@ -147,7 +147,7 @@ func (c *Checker) freeInodes(inodes []*InodeData) error {
 	var uuid [16]byte
 	tbl := inode.NewTable(c.dev, sb.InodeTableOffset, sb.InodeTableSize, nil, uuid)
 	bm := bitmap.NewRegion(c.dev, sb.BlockBitmapOffset, sb.TotalBlocks, nil, uuid)
-	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset)
+	mgr := extent.NewManager(c.dev, bm, nil, sb.DataRegionOffset, uint64(sb.BlockSize))
 	mgr.SetRefcounts(refcount.NewRegion(c.dev, sb.RefCountTableOffset, sb.RefCountTableSize, sb.TotalBlocks, nil))
 	tbl.SetTreeFlusher(mgr)
 	ctx := context.Background()

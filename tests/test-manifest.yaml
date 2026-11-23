@@ -324,6 +324,20 @@ scenarios:
       docker: TODO  # counts inode claim collisions from mount debug logs; the Go test covers it
       vm: TODO  # same as docker
 
+  - id: tree-nodes-at-small-blocks
+    name: Extent tree nodes stay at least 64 KB at small block sizes
+    description: At 8 KB blocks a file holds 20,000 scattered extents, past the 15,876 that half-block nodes allowed; each node is an aligned run of 8 blocks, and truncating to 0 frees every one of them
+    priority: go_only
+    environments:
+      go: internal/extent/tree_small_blocks_test.go::TestFragmentedFileAtSmallBlocksOutgrowsHalfBlockNodes
+
+  - id: bitmap-alloc-runs
+    name: Bitmap allocates aligned runs of blocks
+    description: AllocRuns returns runs of 2, 4 or 8 free blocks that start at a multiple of the run length, and rolls back a request it cannot fill
+    priority: go_only
+    environments:
+      go: internal/bitmap/alloc_runs_test.go::TestAllocRunsTakesAlignedFreeRuns
+
   - id: inode-allocation-start
     name: Inode search starts at the node's part of the table
     description: FindFreeSlot starts at a bit-reversed fraction of the table per node slot, wraps around, and still finds every free inode
@@ -5460,6 +5474,66 @@ scenarios:
     priority: go_only
     environments:
       go: internal/fence/fence_test.go::TestIoctlResultMapsBothTransports
+
+  - id: quota-project-xattr
+    name: trusted.goclusterfs.quota gives a directory a project
+    description: An empty directory gets a new project with PROJINHERIT; files, directories and symlinks under it join the project; only the root takes new limits (EPERM inside), a non-empty directory is refused (ENOTEMPTY), removing the attribute lifts the limits and keeps the project, and every node reads the same project
+    priority: high
+    environments:
+      go: internal/goclusterfs/quota_test.go::TestQuotaXattrMakesAProject
+      docker: run-tests.sh::test_quota_project
+      vm: TODO  # Docker covers it across nodes; it adds no storage or fencing behaviour
+
+  - id: quota-project-boundaries
+    name: Links, renames and clones keep files in their project
+    description: A link, rename or clone into another project or out of a file's own fails with EXDEV; a project's root moves only between directories outside every project; a snapshot's data inode takes its file's project
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_test.go::TestQuotaProjectsKeepTheirFiles
+
+  - id: quota-xattr-needs-cap
+    name: Only CAP_SYS_ADMIN changes a directory's quota through the mount
+    description: Without CAP_SYS_ADMIN, setting trusted.goclusterfs.quota fails with EPERM, so a PVC's tenant or a container root that dropped it cannot raise its own limit; as root it gives the directory a project
+    priority: high
+    environments:
+      go: quota_test.go::TestQuotaXattrThroughTheMount
+      docker: run-tests.sh::test_quota_project
+      vm: TODO  # Docker runs setfattr as a container root without CAP_SYS_ADMIN; the VM harness adds nothing to that check
+
+  - id: quota-table-encoding
+    name: The quota table's header and records round-trip and carry checksums
+    description: The header keeps NextProjectID and every slot's FoldedThroughSeq, neighbouring records share a sector without overwriting each other, and a flipped bit or a wrong magic is refused
+    priority: go_only
+    environments:
+      go: internal/quota/table_test.go::TestHeaderRoundTrip
+
+  - id: quota-enable
+    name: Enabling quotas creates the table inode and sets the superblock last
+    description: With no node mounted, as fsck -enable-quotas runs it, Enable allocates the table inode and its first block, writes the header and empty records, names the inode in the superblock and sets RequiredProjectQuotas; a second Enable changes nothing
+    priority: go_only
+    environments:
+      go: internal/quota/enable_test.go::TestEnableCreatesTheTable
+
+  - id: fsck-quota-table
+    name: fsck checks the quota table and keeps its unnamed inode
+    description: A fresh image with a quota table checks clean, the hidden quota inode is not reported as unnamed, and a record sector failing its checksum is an error
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestFsckChecksTheQuotaTable
+
+  - id: quota-enable-interrupted
+    name: An interrupted quota enable leaves no superblock flag
+    description: When the table write fails, the superblock keeps no RequiredProjectQuotas and QuotaInode 0, and fsck -repair frees the inode and block the enable had taken
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/fsck_test.go::TestInterruptedQuotaEnableLeavesNoFlag
+
+  - id: fsck-enable-quotas-refuses-running
+    name: fsck -enable-quotas refuses while a node runs
+    description: With a node's heartbeat changing, -enable-quotas refuses and names the mount, and leaves no quotas; once the node stopped it enables them
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-fsck/quota_test.go::TestEnableQuotasRefusesWhileANodeRuns
 
   - id: fence-preempt-statuses
     name: Preempt reads SCSI and NVMe conflicts alike

@@ -72,6 +72,7 @@ func main() {
 		victim         = flag.Bool("victim", false, "With -test-reservations, be host A of the two-host test: register, reserve, wait for host B to preempt this host, then check that the device refuses a 4 KiB write")
 		preemptKey     = flag.String("preempt", "", "With -test-reservations, be host B of the two-host test: preempt and abort the `KEY` host A printed, then keep a key for 30 seconds while host A tries its write")
 		keepKey        = flag.Bool("keep", false, "With -test-reservations, register a key and reserve, and leave both, to check with -check-kept after the device is detached and attached again or the storage restarts")
+		enableQuota    = flag.Bool("enable-quotas", false, "Create the quota table on a volume formatted without one, so directories can get project quotas, then exit. Refused while a node runs; builds without quotas then refuse the volume")
 		checkKept      = flag.String("check-kept", "", "With -test-reservations, check that the `KEY` -keep left and the reservation survived, then remove the key")
 	)
 	flag.Usage = func() {
@@ -156,6 +157,9 @@ func main() {
 	case *confirm && !*clearReserve:
 		fmt.Fprintln(os.Stderr, "Error: -confirm needs -clear-reservations")
 		os.Exit(fsck.ExitUsage)
+	case *enableQuota && (*testReserve || *clearReserve || *listSlots || releasing || inspecting || *repair):
+		fmt.Fprintln(os.Stderr, "Error: -enable-quotas runs alone")
+		os.Exit(fsck.ExitUsage)
 	case *testReserve && (*clearReserve || *listSlots || releasing || inspecting || *repair):
 		fmt.Fprintln(os.Stderr, "Error: -test-reservations runs alone")
 		os.Exit(fsck.ExitUsage)
@@ -213,6 +217,14 @@ func main() {
 			os.Exit(fsck.ExitOperational)
 		case failed:
 			os.Exit(fsck.ExitUncorrected)
+		}
+		os.Exit(fsck.ExitClean)
+	}
+
+	if *enableQuota {
+		if err := enableQuotas(os.Stdout, dev, devicePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(fsck.ExitOperational)
 		}
 		os.Exit(fsck.ExitClean)
 	}
