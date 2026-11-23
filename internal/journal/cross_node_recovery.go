@@ -235,6 +235,9 @@ func applyEntry(ctx context.Context, rctx *RecoveryContext, r *txnReplay, entry 
 	case TxnOpBlockReserve, TxnOpBlockUse:
 		// Read before replay to free unused reserved blocks; nothing to apply.
 		return false, nil
+	case TxnOpQuotaDelta, TxnOpQuotaFlush, TxnOpQuotaFold:
+		// Folded into the quota table as a whole before replay: see QuotaReplay.
+		return false, nil
 	default:
 		log.Printf("[Recovery] Skipping %s, which this build no longer logs and replay does not need", entry.Entry.OpType)
 		return false, nil
