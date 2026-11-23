@@ -34,6 +34,8 @@ type RecoveryContext struct {
 	OrphanHolders func(num uint32) (uint64, error)
 	AddOrphan     func(num uint32, birth uint64) error
 	FreeSFBSlot   func(ctx context.Context, packed uint64)
+	// Charge, when set, takes what replay frees with no record of its own, an orphan, off the inode's quota project.
+	Charge func(project uint32, blocks, inodes int64)
 	// FoldQuota, when set, folds what the dirty journal in region, of registry slot slot and its node owner, owes the
 	// quota table, before replay begins.
 	FoldQuota func(ctx context.Context, slot int, owner [16]byte, region *Region) error
@@ -534,6 +536,9 @@ func freeOrphan(ctx context.Context, rctx *RecoveryContext, num uint32, gen uint
 		return err
 	}
 	log.Printf("[Recovery] LinkDrop: freed inode %d", num)
+	if rctx.Charge != nil {
+		rctx.Charge(freed.ProjectID, -int64(freed.AllocatedBlocks), -1)
+	}
 	sfbBacked, sfbSlot := freed.IsSFBBacked(), freed.InlineExtents[0].PhysicalBlock
 	if err := rctx.ExtentMgr.Delete(ctx, freed); err != nil {
 		return err

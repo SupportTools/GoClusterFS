@@ -414,6 +414,7 @@ func main() {
 	}
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
+	ownCharges := laterCharges{}
 	dirMgr.SetIndexLimit(*dirIndex)
 
 	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write, and replay frees shared blocks through them.
@@ -453,6 +454,11 @@ func main() {
 			},
 		}
 		// Use per-transaction handler for self-recovery
+		// This node's journal does not exist yet, so the replay's charges wait for it.
+		if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
+			recoveryCtx.Charge = ownCharges.add
+			dirMgr.SetCharge(func(project uint32, blocks int64) { ownCharges.add(project, blocks, 0) })
+		}
 		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
 		releaseReserved := recoveryCtx.ReleaseReserved(lock.ForReplay(context.Background()))
 
@@ -605,6 +611,7 @@ func main() {
 			goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
 		},
 		FoldQuota: foldQuota,
+		Charge:    func(project uint32, blocks, inodes int64) { gfs.ChargeQuota(project, blocks, inodes) },
 	}
 	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)
 	nodeReg.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
@@ -646,6 +653,9 @@ func main() {
 	}
 	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
 		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
+		for project, c := range ownCharges {
+			gfs.ChargeQuota(project, c[0], c[1])
+		}
 		gfs.SetStopNode(func(reason string) {
 			failf("%s; stopping this node so a peer replays its journal. Mount again once the device is healthy", reason)
 		})
@@ -1028,6 +1038,16 @@ func keepReserved(pr *fence.PR, stop <-chan struct{}) {
 					"so a revoked node could have gone on writing; reserved it again", pr.Key())
 			}
 		}
+	}
+}
+
+// laterCharges collects, per quota project, the blocks and inodes a replay frees or maps before this node's journal
+// can log them.
+type laterCharges map[uint32][2]int64
+
+func (c laterCharges) add(project uint32, blocks, inodes int64) {
+	if project != 0 {
+		c[project] = [2]int64{c[project][0] + blocks, c[project][1] + inodes}
 	}
 }
 

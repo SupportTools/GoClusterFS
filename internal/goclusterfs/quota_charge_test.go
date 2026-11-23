@@ -7,11 +7,14 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/journal"
+	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
@@ -266,5 +269,105 @@ func TestQuotaChargesSurviveACrash(t *testing.T) {
 	foldCrashed(t, peer, offset, size)
 	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
 		t.Errorf("after the crash the table holds %v blocks and inodes, want the file's 1 block and its inode", got)
+	}
+}
+
+// waitUsage waits for a project's usage to reach want, as a background job such as a snapshot delete changes it.
+func waitUsage(t *testing.T, fsys *FS, pvc *Dir, want [2]uint64) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := usage(t, fsys, pvc)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the project uses %v blocks and inodes, want %v", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A snapshot's data inode counts against the project of the file it was taken of, with every block it shares, and
+// deleting the snapshot gives them back.
+func TestQuotaChargesSnapshots(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	f := createIn(t, pvc, "f")
+	writeAt(t, f, pattern(9, int(2*fsys.dataBlockSize())), 0)
+	setxattr(t, f, "user.snapshot", "s1")
+	if got := usage(t, fsys, pvc); got != [2]uint64{4, 2} {
+		t.Errorf("after a snapshot the project uses %v blocks and inodes, want the file's and the snapshot's 2 blocks and 1 inode each", got)
+	}
+	setxattr(t, f, "user.snapshot.delete", "s1")
+	waitUsage(t, fsys, pvc, [2]uint64{2, 1})
+}
+
+// A file unlinked while open, whose node crashes before the unlink's changes land, is freed by the replay with no
+// record of its own: the replaying node gives back its blocks and inode.
+func TestQuotaCreditsAnOrphanTheReplayFrees(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	ctx := context.Background()
+	f := createIn(t, pvc, "f")
+	writeAt(t, f, pattern(4, 100), 0)
+	crashed := crashAfterCommit(t, fsys, "unlink")
+	go func() { _ = pvc.Unlink(ctx, "f") }()
+	<-crashed
+
+	peer := openFormattedFS(t, path)
+	var err error
+	if peer.journal, err = journal.Init(peer.dev, offset+size, size, peer.nodeUUID, 1, journal.DefaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	defer adoptCrashed(t, peer, fsys.nodeUUID)()
+	owner := fsys.nodeUUID
+	fold := func(region *journal.Region) error {
+		return peer.quotaGuard.Fold(lock.ForReplay(ctx), peer.quotaTable, int(owner[15]), int(peer.nodeUUID[15]), owner, region)
+	}
+	rctx := &journal.RecoveryContext{Dev: peer.dev, InodeTbl: peer.inodeTbl, BitmapMgr: peer.bitmapMgr, DirMgr: peer.dirMgr,
+		ExtentMgr: peer.extentMgr, Charge: peer.ChargeQuota}
+	if _, err := journal.ScanFoldAndRecover(peer.dev, offset, size, fold, journal.CreateTxnRecoveryHandler(rctx), nil); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	flushQuota(t, peer)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{} {
+		t.Errorf("after the replay freed the orphan the table holds %v blocks and inodes, want none", got)
+	}
+}
+
+// A symlink that loses its inode slot to a peer after its commit gives back its charge and retries on another slot.
+func TestQuotaSymlinkLosingItsSlotIsChargedOnce(t *testing.T) {
+	fsys, path, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	peer := openFormattedComponents(t, path)
+	ctx := context.Background()
+	taken := 0
+	afterCommit = func(op string) {
+		if op != "symlink" || taken > 0 {
+			return
+		}
+		taken++
+		num, err := fsys.inodeTbl.FindFreeSlot()
+		if err == nil {
+			_, err = peer.inodeTbl.ClaimSlot(ctx, num)
+		}
+		if err != nil {
+			t.Errorf("the peer taking the symlink's slot: %v", err)
+		}
+	}
+	t.Cleanup(func() { afterCommit = nil })
+	if _, errno := pvc.Symlink(ctx, strings.Repeat("t", 200), "l", &fuse.EntryOut{}); errno != 0 {
+		t.Fatalf("symlink: %v", errno)
+	}
+	afterCommit = nil
+	if taken != 1 {
+		t.Fatal("the symlink never reached its commit")
+	}
+	if got := usage(t, fsys, pvc); got != [2]uint64{1, 1} {
+		t.Errorf("after the retried symlink the project uses %v blocks and inodes, want its 1 block and 1 inode", got)
 	}
 }

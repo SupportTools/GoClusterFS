@@ -5866,6 +5866,34 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_charge_test.go::TestQuotaTruncateRetriedAfterARaceIsCreditedOnce
 
+  - id: quota-charges-snapshots
+    name: Snapshots count against their file's project
+    description: A snapshot's data inode charges its inode and every block it shares, and deleting the snapshot gives them back
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaChargesSnapshots
+
+  - id: quota-replay-freed-orphan
+    name: An orphan the replay frees is credited
+    description: A file unlinked while open on a node that crashes is freed by the peer's replay, which gives back its blocks and inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaCreditsAnOrphanTheReplayFrees
+
+  - id: quota-symlink-lost-slot
+    name: A symlink that loses its slot is charged once
+    description: A peer takes the symlink's slot after its commit; the symlink gives back its charge and retries
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaSymlinkLosingItsSlotIsChargedOnce
+
+  - id: quota-own-replay-later-charges
+    name: Own-slot replay charges wait for the journal
+    description: Charges an own-slot replay makes before the journal exists add up per project, and project 0 counts nothing
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/quota_test.go::TestLaterChargesAddUpPerProject
+
   - id: dir-growth-charge-conflict
     name: Directory growth is charged once per block after a conflict
     description: A growth whose inode write conflicts gives its charge back before the retry
