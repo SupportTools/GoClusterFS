@@ -396,10 +396,24 @@ scenarios:
 
   - id: fallocate-maps-holes
     name: fallocate maps only the holes of its range
-    description: In a file with an extent tree, fallocate allocates unwritten blocks for each hole in one pass, keeps written blocks, returns the new blocks, and a second call allocates nothing
+    description: In a file with an extent tree, fallocate allocates unwritten blocks for each hole in one pass, including the hole after the last extent, keeps written blocks, returns the new blocks, and a second call allocates nothing
     priority: go_only
     environments:
       go: internal/extent/tree_test.go::TestFallocateMapsOnlyHoles
+
+  - id: fsck-cross-linked-blocks
+    name: fsck reports a block two inodes map without FlagShared
+    description: A block a second inode maps without FlagShared is a Critical problem naming the first inode, and a block both inodes map with FlagShared is not reported
+    priority: go_only
+    environments:
+      go: internal/fsck/fsck_test.go::TestFsckReportsCrossLinkedBlocks
+
+  - id: reserve-default-64mb
+    name: The default block reserve is 64 MB of blocks
+    description: DefaultBlocks gives 64 blocks at 1 MB, 256 at 256 KB and 8192 at 8 KB
+    priority: go_only
+    environments:
+      go: internal/reserve/reserve_test.go::TestDefaultReserveIs64MB
 
   - id: inode-allocation-start
     name: Inode search starts at the node's part of the table

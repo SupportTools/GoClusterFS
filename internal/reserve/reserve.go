@@ -21,6 +21,11 @@ const (
 	MaxPeerWait = DefaultIdle + 2*tick
 )
 
+// DefaultBlocks is how many blocks of blockSize make the default reserve of DefaultBytes.
+func DefaultBlocks(blockSize uint64) int {
+	return int(DefaultBytes / blockSize)
+}
+
 type Bitmap interface {
 	Reserve(ctx context.Context, n int, record func([]uint64) (keep bool), end func() error) ([]uint64, error)
 	FreeCount() uint64

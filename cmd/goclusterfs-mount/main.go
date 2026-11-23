@@ -549,7 +549,7 @@ func main() {
 	})
 	var res *reserve.Manager
 	if *blockReserve < 0 {
-		*blockReserve = int(reserve.DefaultBytes / sb.BlockSize)
+		*blockReserve = reserve.DefaultBlocks(uint64(sb.BlockSize))
 	}
 	if j != nil && *blockReserve > 0 {
 		res = reserve.New(reserve.Config{Size: *blockReserve}, bm, j, extentMgr.ReleaseBlocks, func() int {

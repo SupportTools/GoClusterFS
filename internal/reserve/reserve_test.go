@@ -508,3 +508,14 @@ func TestPeerRequestsCoalesce(t *testing.T) {
 		t.Errorf("%d returns in 2.5 ticks of requests, want 1 to 3", got)
 	}
 }
+
+func TestDefaultReserveIs64MB(t *testing.T) {
+	for _, c := range []struct {
+		blockSize uint64
+		blocks    int
+	}{{1 << 20, 64}, {256 << 10, 256}, {8 << 10, 8192}} {
+		if got := DefaultBlocks(c.blockSize); got != c.blocks {
+			t.Errorf("DefaultBlocks(%d) = %d, want %d", c.blockSize, got, c.blocks)
+		}
+	}
+}

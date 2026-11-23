@@ -1014,4 +1014,10 @@ func TestFallocateMapsOnlyHoles(t *testing.T) {
 	if _, _, err := env.mgr.Lookup(ino, 12); err != ErrExtentNotFound {
 		t.Errorf("block 12 past the range: %v, want unmapped", err)
 	}
+	if fresh, err := env.mgr.Fallocate(env.ctx, ino, 12, 22); err != nil || len(fresh) != 7 {
+		t.Fatalf("Fallocate(12, 22) = %d blocks, %v; want 7: 12-13, 15, 17 and 19-21 after the last extent", len(fresh), err)
+	}
+	if _, _, err := env.mgr.Lookup(ino, 21); err != nil {
+		t.Errorf("block 21, in the hole after the last extent: %v", err)
+	}
 }
