@@ -359,6 +359,13 @@ scenarios:
     environments:
       go: internal/bitmap/alloc_runs_test.go::TestAllocRunsTakesAlignedFreeRuns
 
+  - id: bitmap-alloc-runs-end
+    name: Bitmap runs stay inside the bitmap
+    description: In a 13-block bitmap, runs of 4 start at 0, 4 and 8, and a fourth request fails with ErrNoFreeBlocks instead of returning a run past block 12
+    priority: go_only
+    environments:
+      go: internal/bitmap/alloc_runs_test.go::TestAllocRunsStaysInsideTheBitmap
+
   - id: inode-allocation-start
     name: Inode search starts at the node's part of the table
     description: FindFreeSlot starts at a bit-reversed fraction of the table per node slot, wraps around, and still finds every free inode
@@ -1677,7 +1684,7 @@ scenarios:
 
   - id: fsck-runtime-image-unit
     name: fsck accepts everything the runtime writes
-    description: Snapshots, clones, snapshot clones, copies on write in inline and tree files, deletes and unlinks leave no fsck problem
+    description: Snapshots, clones, snapshot clones, copies on write in inline and tree files, deletes and unlinks leave no fsck problem at 1 MB, 64 KB and 8 KB blocks, and fsck -repair frees nothing
     priority: go_only
     environments:
       go: internal/goclusterfs/fsck_test.go::TestFsckAcceptsRuntimeImage

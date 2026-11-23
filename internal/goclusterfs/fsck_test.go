@@ -222,6 +222,15 @@ func fsckAcceptsRuntimeImage(t *testing.T, blockSize uint64) {
 	if len(r.Problems) > 0 || r.ExitCode() != fsck.ExitClean {
 		t.Fatalf("fsck exit %d on a runtime image:%s", r.ExitCode(), problemList(r))
 	}
+	free := fsys.bitmapMgr.FreeCount()
+	repair := fsck.DefaultOptions()
+	repair.Mode = fsck.Repair
+	if r := runFsck(t, fsys, repair); len(r.Problems) > 0 || r.RepairedCount != 0 {
+		t.Fatalf("fsck -repair on a runtime image: exit %d, repaired %d:%s", r.ExitCode(), r.RepairedCount, problemList(r))
+	}
+	if got := fsys.bitmapMgr.FreeCount(); got != free {
+		t.Fatalf("fsck -repair freed %d blocks of a clean image", got-free)
+	}
 }
 
 // shareTreeLikeOlderVersions marks every extent of a depth-1 tree inode shared
