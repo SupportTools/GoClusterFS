@@ -613,7 +613,7 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 
 Sizes below 1 MB are experimental until overwrites get faster. An overwrite checks, locks and writes each block on its own: a 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
 
-fsck needs about 3 MB of memory per 10 GB at 8 KB blocks: one bit and one byte per block. A check of a full 1 TB volume at 8 KB took 24 s and 302 MB.
+fsck tracks each block in one bit and one byte. A check of a 1 TB volume at 8 KB blocks, 90% full, took 24 s and 302 MB of memory.
 
 ### Cache Tuning
 
