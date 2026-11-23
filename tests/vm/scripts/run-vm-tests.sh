@@ -4494,12 +4494,17 @@ relogin_last_path() {
 # clear_write_flag registers and removes a spare key on VM $1's newest iSCSI path. LIO keeps one write flag per
 # initiator and clears it when any of the initiator's registrations goes, so VM $1's next write meets a reservation
 # conflict while its key stays listed, as a target that checks writes per session would refuse the relogged path.
+# Such a target refused it already, and the node registered its key on the path, so the spare register conflicts.
 clear_write_flag() {
     local disk
     disk=$(ssh_run "$1" "iscsiadm -m session -P 3 | awk '/Iface Name:/ {i = \$3} /Attached scsi disk/ {print i, \$4}' | sort | tail -1 | cut -d' ' -f2")
     ssh_run "$1" "command -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null
-        sg_persist --out --register --param-sark=0x47430000f1a90001 /dev/$disk > /dev/null &&
-            sg_persist --out --register --param-rk=0x47430000f1a90001 --param-sark=0 /dev/$disk > /dev/null"
+        if ! out=\$(sg_persist --out --register --param-sark=0x47430000f1a90001 /dev/$disk 2>&1); then
+            case \"\$out\" in *'Reservation conflict'*) exit 0 ;; esac
+            echo \"\$out\" >&2
+            exit 1
+        fi
+        sg_persist --out --register --param-rk=0x47430000f1a90001 --param-sark=0 /dev/$disk > /dev/null"
 }
 
 # write_load writes small files with fsync on VM $1 and records ok or fail for each in /tmp/load.out.
