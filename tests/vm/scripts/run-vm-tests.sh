@@ -5324,19 +5324,20 @@ test_clone_in_place_write() {
     return 0
 }
 
-# Snapshots a file, overwrites both of its blocks, then deletes the snapshot.
-# The delete must finish and give back exactly the two blocks only the
-# snapshot held.
+# Snapshots a 2 MB file, overwrites all of it, then deletes the snapshot.
+# The delete must finish and give back exactly the blocks only the snapshot
+# held.
 test_snapshot_delete_after_overwrite() {
     log_info "Testing snapshot delete after overwrite..."
     ensure_cluster_healthy 2
 
     local file=/mnt/goclusterfs/snap_delete.bin
-    local free_before free_now
+    local free_before free_now blocks
 
     ssh_run 1 "rm -f $file"
     ssh_run 1 "head -c 2097152 /dev/urandom > $file" || return 1
     sleep "$RESERVE_IDLE_RETURN_SECS"
+    blocks=$((2097152 / $(ssh_run 1 "stat -f -c %S /mnt/goclusterfs")))
     free_before=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
     ssh_run 1 "setfattr -n user.snapshot -v snap_delete_temp $file" || {
         log_error "snapshot failed"
@@ -5344,8 +5345,8 @@ test_snapshot_delete_after_overwrite() {
     }
     ssh_run 1 "head -c 2097152 /dev/urandom > /tmp/snap_new && dd if=/tmp/snap_new of=$file bs=1048576 conv=notrunc 2>/dev/null" || return 1
     free_now=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
-    if [ "$free_now" -ne $((free_before - 2)) ]; then
-        log_error "$free_now free blocks after overwriting 2 snapshotted blocks, want $((free_before - 2))"
+    if [ "$free_now" -ne $((free_before - blocks)) ]; then
+        log_error "$free_now free blocks after overwriting $blocks snapshotted blocks, want $((free_before - blocks))"
         return 1
     fi
 
