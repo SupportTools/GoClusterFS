@@ -324,6 +324,20 @@ scenarios:
       docker: TODO  # counts inode claim collisions from mount debug logs; the Go test covers it
       vm: TODO  # same as docker
 
+  - id: tree-nodes-at-small-blocks
+    name: Extent tree nodes stay at least 64 KB at small block sizes
+    description: At 8 KB blocks a file holds 20,000 scattered extents, past the 15,876 that half-block nodes allowed; each node is an aligned run of 8 blocks, and truncating to 0 frees every one of them
+    priority: go_only
+    environments:
+      go: internal/extent/tree_small_blocks_test.go::TestFragmentedFileAtSmallBlocksOutgrowsHalfBlockNodes
+
+  - id: bitmap-alloc-runs
+    name: Bitmap allocates aligned runs of blocks
+    description: AllocRuns returns runs of 2, 4 or 8 free blocks that start at a multiple of the run length, and rolls back a request it cannot fill
+    priority: go_only
+    environments:
+      go: internal/bitmap/alloc_runs_test.go::TestAllocRunsTakesAlignedFreeRuns
+
   - id: inode-allocation-start
     name: Inode search starts at the node's part of the table
     description: FindFreeSlot starts at a bit-reversed fraction of the table per node slot, wraps around, and still finds every free inode

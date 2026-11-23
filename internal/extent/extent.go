@@ -447,7 +447,7 @@ func (m *Manager) Delete(ctx context.Context, ino *inode.Inode) error {
 	}
 	if p := pendingOf(ino); p != nil {
 		m.freeBlocks(ctx, p.release)
-		m.freeBlocks(ctx, p.fresh)
+		m.freeBlocks(ctx, m.nodeRuns(p.fresh))
 		ino.PendingTree = nil
 	}
 	ino.Size = 0
