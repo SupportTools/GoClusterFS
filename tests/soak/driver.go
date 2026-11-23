@@ -41,6 +41,7 @@ type config struct {
 	opTimeout    time.Duration
 	sshBasePort  int
 	diskMB       int
+	blockSize    uint64
 	budget       int64
 	stallAfter   time.Duration
 	relogin      bool
@@ -806,7 +807,7 @@ func newDriver(cfg config) (*driver, func(), error) {
 		return nil, nil, err
 	}
 	env := []string{"NODE_COUNT=3", fmt.Sprintf("VM_SSH_BASE_PORT=%d", cfg.sshBasePort), fmt.Sprintf("VM_CLUSTER_SIZE_MB=%d", cfg.diskMB),
-		fmt.Sprintf("MULTIPATH=%t", cfg.relogin)}
+		fmt.Sprintf("MULTIPATH=%t", cfg.relogin), fmt.Sprintf("VM_BLOCK_SIZE=%d", cfg.blockSize)}
 	ctl, err := startController(filepath.Join(cfg.checkout, "tests/soak/cluster.sh"), env, clusterLog)
 	if err != nil {
 		return nil, nil, err
