@@ -5717,6 +5717,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_flush_test.go::TestQuotaFlushWaitsOutAdoptedQuotaLock
 
+  - id: quota-fold-logged
+    name: A quota fold is logged in the dead journal
+    description: After a fold the dead journal holds a completed fold that owes nothing, and the table has the usage
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAQuotaFoldIsLoggedInTheDeadJournal
+
+  - id: fsck-salvage-folds-quota
+    name: A salvaging release folds quota usage
+    description: fsck -release-slot -salvage folds the usage the slot's journal owes the quota table
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotSalvageFoldsQuotaUsage
+
   - id: fence-preempt-statuses
     name: Preempt reads SCSI and NVMe conflicts alike
     description: A conflict from either transport is a victim already gone while this node's own key holds, ErrFenced once it is gone, and any other status stops the takeover

@@ -161,6 +161,28 @@ func TestUnflushedQuotaUsageIsFoldedAfterACrash(t *testing.T) {
 	}
 }
 
+// The fold goes into the dead journal before its writes, so the journal owes nothing once it completed.
+func TestAQuotaFoldIsLoggedInTheDeadJournal(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	quotaProject(t, fsys, "pvc")
+	commitDelta(t, fsys, 1, 5, 1)
+
+	peer := openFormattedFS(t, path)
+	foldCrashed(t, peer, offset, size)
+	region, err := journal.OpenRegionForRecovery(peer.dev, offset, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := journal.ReadQuotaReplay(region)
+	if err != nil || !q.Folded || q.Owes() {
+		t.Errorf("after the fold the journal reads %+v, %v; want a completed fold that owes nothing", q, err)
+	}
+	if got := tableUsage(t, peer, 1); got != [2]uint64{5, 1} {
+		t.Errorf("after the fold the table holds %v, want 5 blocks and 1 inode", got)
+	}
+}
+
 // A replayer that dies after appending its fold to the journal, before it wrote the usage, leaves the fold for the
 // next replay, which writes it once. A completed fold owes nothing, so later flushes stay.
 func TestAQuotaFoldCutShortIsRedoneOnce(t *testing.T) {

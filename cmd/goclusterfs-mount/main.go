@@ -2,6 +2,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -641,7 +642,7 @@ func main() {
 	}
 	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
 		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
-		gfs.StartQuotaFlush(quota.DefaultFlushMs * time.Millisecond)
+		gfs.StartQuotaFlush(time.Duration(cmp.Or(sb.QuotaFlushMs, quota.DefaultFlushMs)) * time.Millisecond)
 	}
 
 	// Verify root exists
