@@ -43,8 +43,8 @@ func (c *Checker) crossValidate() error {
 	}
 
 	// Check for phantom blocks (referenced but not allocated)
-	for block, refs := range c.inodeBlocks {
-		if refs > 0 && !c.bitmapAllocated[block] {
+	for block, refs := range c.inodeBlocks.all() {
+		if !c.bitmapAllocated.has(block) {
 			phantomBlocks++
 			if phantomBlocks <= 10 {
 				c.addProblem(PhaseCrossValidation, Critical, fmt.Sprintf("block %d", block),
@@ -60,7 +60,7 @@ func (c *Checker) crossValidate() error {
 	}
 
 	c.result.TotalBlocks = c.sbData.TotalBlocks
-	c.result.AllocatedBlocks = uint64(len(c.bitmapAllocated))
+	c.result.AllocatedBlocks = c.bitmapAllocated.count
 	c.result.TotalInodes = c.sbData.InodeTableSize / InodeSize
 
 	c.logf("  Phantom blocks: %d\n", phantomBlocks)

@@ -14,12 +14,17 @@ import (
 )
 
 const (
-	DefaultSize = 64
-	DefaultIdle = 10 * time.Second
-	tick        = time.Second
+	DefaultBytes = 64 << 20
+	DefaultIdle  = 10 * time.Second
+	tick         = time.Second
 	// MaxPeerWait covers a peer's idle return, so a lost broadcast cannot cause ENOSPC.
 	MaxPeerWait = DefaultIdle + 2*tick
 )
+
+// DefaultBlocks is how many blocks of blockSize make the default reserve of DefaultBytes.
+func DefaultBlocks(blockSize uint64) int {
+	return int(DefaultBytes / blockSize)
+}
 
 type Bitmap interface {
 	Reserve(ctx context.Context, n int, record func([]uint64) (keep bool), end func() error) ([]uint64, error)

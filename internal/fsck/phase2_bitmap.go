@@ -86,7 +86,7 @@ func (c *Checker) checkBitmap() error {
 				isAllocated := (b & (1 << bitIdx)) != 0
 				if isAllocated {
 					allocatedCount++
-					c.bitmapAllocated[blockNum] = true
+					c.bitmapAllocated.add(blockNum)
 				}
 			}
 		}
@@ -101,14 +101,4 @@ func (c *Checker) checkBitmap() error {
 	c.logf("  Checksum errors: %d\n", checksumErrors)
 
 	return nil
-}
-
-// GetAllocatedBlocks returns a copy of the allocated block set.
-// Used for cross-validation with other phases.
-func (c *Checker) GetAllocatedBlocks() map[uint64]bool {
-	result := make(map[uint64]bool, len(c.bitmapAllocated))
-	for k, v := range c.bitmapAllocated {
-		result[k] = v
-	}
-	return result
 }

@@ -126,7 +126,7 @@ func (c *Checker) freeInodes(inodes []*InodeData) error {
 	var touched []uint64
 	for _, ino := range inodes {
 		for _, b := range c.mappedBlocks(ino.InodeNum, ino) {
-			c.inodeBlocks[b]--
+			c.inodeBlocks.add(b, -1)
 			touched = append(touched, b)
 		}
 		delete(c.inodeUsed, ino.InodeNum)
@@ -136,8 +136,8 @@ func (c *Checker) freeInodes(inodes []*InodeData) error {
 	touched = slices.Compact(touched)
 	if c.opts.DryRun {
 		for _, b := range touched {
-			if c.inodeBlocks[b] == 0 {
-				delete(c.bitmapAllocated, b)
+			if c.inodeBlocks.get(b) == 0 {
+				c.bitmapAllocated.remove(b)
 			}
 		}
 		return nil
@@ -193,9 +193,9 @@ func (c *Checker) rereadAllocated(blocks []uint64) error {
 		}
 		bit := b % BitmapBitsPerSector
 		if buf[bit/8]&(1<<(bit%8)) != 0 {
-			c.bitmapAllocated[b] = true
+			c.bitmapAllocated.add(b)
 		} else {
-			delete(c.bitmapAllocated, b)
+			c.bitmapAllocated.remove(b)
 		}
 	}
 	return nil

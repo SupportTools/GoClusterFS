@@ -371,9 +371,9 @@ What is safe today: a node that crashes or is killed and stays down, and a clean
 
 ### Block Reserves
 
-Each node takes up to 64 free blocks from the block bitmap at once (`-block-reserve`), under one hold of the cluster-wide bitmap lock, and hands them to its writes without that lock. Without reserves, every new data block takes the bitmap lock, and with four nodes writing at once about 60% of their time went to waiting for it. Only new data blocks of writes come from the reserve. Extent-tree blocks, directory blocks, copy-on-write copies and `fallocate` still take the bitmap lock.
+Each node takes up to 64 MB of free blocks from the block bitmap at once (`-block-reserve`, 64 blocks at 1 MB and 8192 at 8 KB), under one hold of the cluster-wide bitmap lock, and hands them to its writes without that lock. Without reserves, every new data block takes the bitmap lock, and with four nodes writing at once about 60% of their time went to waiting for it. Only new data blocks of writes come from the reserve. Extent-tree blocks, directory blocks, copy-on-write copies and `fallocate` still take the bitmap lock.
 
-- **Size.** A reserve holds at most `-block-reserve` blocks, and at most 1/16 of the free blocks per mounted node. There are no reserves while fewer blocks are free than 1% of the device or two reserves per mounted node.
+- **Size.** A reserve holds at most `-block-reserve` blocks, by default 64 MB of them, and at most 1/16 of the free blocks per mounted node. There are no reserves while fewer blocks are free than 1% of the device or two reserves per mounted node.
 - **Going back.** A node gives its unused reserve back within 11 seconds of its last write, at a clean unmount, and when a write finds free space below that line.
 - **Full device.** A node that finds no free block gives back its own reserve, asks the other nodes over broadcast to give back theirs, once a second, and retries for up to 12 seconds before it fails with `ENOSPC`. It logs the wait at INFO, and `goclusterfs_reserve_peer_waits_total` and `goclusterfs_reserve_peer_wait_seconds_total` count it. Without broadcast, other nodes still give back idle reserves within 11 seconds. A node answers at most one request a second.
 - **`df`.** A node counts its own unused reserve as free, since its writes can use it. Other nodes' reserves count as used until they give them back, so `df` on two nodes can differ by up to 64 MB per node at the default.
@@ -617,10 +617,9 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 
 `-format -block-size` sets the data block size, a power of two from 8 KB to 1 MB, for the life of the volume. Every file with data takes whole blocks, so small blocks save space on volumes of many small files: a 155 MB node_modules tree took 1.5 times its size at 8 KB, 5.9 times at 64 KB and 83 times at 1 MB.
 
-Sizes below 1 MB are experimental until two fixes land:
+Sizes below 1 MB are experimental until overwrites get faster. An overwrite checks, locks and writes each block on its own: a 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
 
-- **fsck memory.** fsck keeps a map entry for every allocated block, about 1.6 GB of memory per 100 GB at 8 KB.
-- **Overwrites.** An overwrite checks, locks and writes each block on its own. A 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
+fsck tracks each block in one bit and one byte. A check of a 1 TB volume at 8 KB blocks, 90% full, took 24 s and 302 MB of memory.
 
 ### Cache Tuning
 

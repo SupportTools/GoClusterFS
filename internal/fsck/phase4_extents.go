@@ -22,11 +22,10 @@ func (c *Checker) checkExtents() error {
 	totalBlocks := sb.TotalBlocks
 
 	c.logf("  Total data blocks: %d\n", totalBlocks)
-	c.logf("  Blocks referenced by inodes: %d\n", len(c.inodeBlocks))
+	c.logf("  Blocks referenced by inodes: %d\n", c.inodeBlocks.referred)
 
-	// Track physical block usage to detect overlaps
-	// blockOwner maps physicalBlock -> first inode that claimed it
-	blockOwner := make(map[uint64]uint32)
+	// sharedOwner maps each block several extents map to the first inode that claimed it.
+	sharedOwner := make(map[uint64]uint32)
 
 	extentErrors := 0
 	orphanedBlocks := uint64(0)
@@ -81,7 +80,7 @@ func (c *Checker) checkExtents() error {
 							fmt.Sprintf("SFB container block %d out of range (max %d)", containerBlock, totalBlocks-1),
 							false)
 						extentErrors++
-					} else if !c.bitmapAllocated[containerBlock] {
+					} else if !c.bitmapAllocated.has(containerBlock) {
 						c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
 							fmt.Sprintf("SFB container block %d not marked allocated in bitmap", containerBlock),
 							false)
@@ -103,7 +102,7 @@ func (c *Checker) checkExtents() error {
 					physBlock := ext.PhysicalBlock + j
 
 					// Check if block is allocated in bitmap
-					if !c.bitmapAllocated[physBlock] {
+					if !c.bitmapAllocated.has(physBlock) {
 						c.addProblem(PhaseExtents, Error, fmt.Sprintf("inode %d ext %d", inodeNum, extIdx),
 							fmt.Sprintf("physical block %d not marked allocated in bitmap", physBlock),
 							false)
@@ -119,8 +118,10 @@ func (c *Checker) checkExtents() error {
 						continue
 					}
 
-					// Check for overlapping ownership
-					if owner, exists := blockOwner[physBlock]; exists {
+					if c.inodeBlocks.get(physBlock) < 2 {
+						continue
+					}
+					if owner, exists := sharedOwner[physBlock]; exists {
 						// Block is shared - check if both have FlagShared
 						isShared := (ext.Flags & ExtentFlagShared) != 0
 						if !isShared && owner != inodeNum {
@@ -130,7 +131,7 @@ func (c *Checker) checkExtents() error {
 							overlappingBlocks++
 						}
 					} else {
-						blockOwner[physBlock] = inodeNum
+						sharedOwner[physBlock] = inodeNum
 					}
 				}
 
@@ -158,7 +159,7 @@ func (c *Checker) checkExtents() error {
 				}
 				for _, block := range tree.nodes {
 					location := fmt.Sprintf("inode %d tree node %d", inodeNum, block)
-					if !c.bitmapAllocated[block] {
+					if !c.bitmapAllocated.has(block) {
 						c.addProblem(PhaseExtents, Error, location,
 							"extent tree node block not marked allocated in bitmap",
 							false)

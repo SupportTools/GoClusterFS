@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"runtime"
 	"sort"
 	"testing"
 
@@ -207,5 +208,43 @@ func TestFindFreeSlotStartsOverForInodesOtherNodesFreed(t *testing.T) {
 	a.restartEvery = 0
 	if num, err := a.FindFreeSlot(); err != nil || num != 5 {
 		t.Errorf("FindFreeSlot = %d, %v; want inode 5, which the other node freed", num, err)
+	}
+}
+
+// FreeCount reflects this node's claims and frees at once, and another node's
+// once its estimate is older than recountAfter.
+func TestFreeCountIsCachedAndAdjusted(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+	local := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
+	peer := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+
+	usable := uint64(64 - InodeFirstUsable)
+	if got := local.FreeCount(); got != usable {
+		t.Fatalf("FreeCount = %d, want %d", got, usable)
+	}
+	for _, num := range []uint32{10, 11, 12} {
+		if _, err := local.ClaimSlot(ctx, num); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := local.Free(ctx, 11); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := peer.ClaimSlot(ctx, 20); err != nil {
+		t.Fatal(err)
+	}
+	if got := local.FreeCount(); got != usable-2 {
+		t.Fatalf("FreeCount after 3 local claims, 1 local free and 1 peer claim = %d, want the cached %d", got, usable-2)
+	}
+
+	local.countedAt.Store(0)
+	local.FreeCount()
+	for local.counting.Load() {
+		runtime.Gosched()
+	}
+	if got := local.FreeCount(); got != usable-3 {
+		t.Errorf("FreeCount after the refresh = %d, want %d", got, usable-3)
 	}
 }

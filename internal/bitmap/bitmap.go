@@ -34,6 +34,9 @@ const (
 
 	// BytesPerSector is the usable bytes for bitmap data per sector.
 	BytesPerSector = SectorSize - ChecksumSize
+
+	// scanBytes is how much of the bitmap a count reads at once.
+	scanBytes = 1 << 20
 )
 
 // Errors
@@ -617,29 +620,45 @@ func (r *Region) Scan(ctx context.Context) (free, allocated uint64, err error) {
 	return r.totalBlocks - allocated, allocated, nil
 }
 
-// countAllocated counts allocated blocks in the on-disk bitmap. A sector it
-// cannot read counts as fully allocated, and the first such error is returned.
-// It runs without r.mu so a slow scan does not stall this node's Alloc and Free.
+// countAllocated counts allocated blocks in the on-disk bitmap, reading up to
+// 1 MB at once. A sector it cannot read counts as fully allocated, and the
+// first such error is returned. It runs without r.mu so a slow scan does not
+// stall this node's Alloc and Free.
 func (r *Region) countAllocated() (uint64, error) {
+	buf := storage.GetBuffer(scanBytes)
+	defer storage.PutBuffer(buf)
+
 	var allocated uint64
 	var firstErr error
-	for base := uint64(0); base < r.totalBlocks; base += BitsPerSector {
-		blocks := min(BitsPerSector, r.totalBlocks-base)
-		sectorData, err := r.readSector(base / BitsPerSector)
-		if err != nil {
-			allocated += blocks
-			if firstErr == nil {
-				firstErr = fmt.Errorf("failed to read bitmap sector %d: %w", base/BitsPerSector, err)
+	numSectors := (r.totalBlocks + BitsPerSector - 1) / BitsPerSector
+	for first := uint64(0); first < numSectors; first += scanBytes / SectorSize {
+		n := min(scanBytes/SectorSize, numSectors-first)
+		raw := buf.Bytes()[:n*SectorSize]
+		_, readErr := r.dev.ReadAt(raw, int64(r.offset+first*SectorSize))
+		for i := range n {
+			sectorIdx := first + i
+			var data []byte
+			var err error
+			if readErr == nil {
+				data, err = sectorBits(raw[i*SectorSize : (i+1)*SectorSize])
+			} else {
+				data, err = r.readSector(sectorIdx)
 			}
-			continue
-		}
-
-		full := blocks / 8
-		for _, b := range sectorData[:full] {
-			allocated += uint64(bits.OnesCount8(b))
-		}
-		if rem := blocks % 8; rem != 0 {
-			allocated += uint64(bits.OnesCount8(sectorData[full] & (1<<rem - 1)))
+			blocks := min(BitsPerSector, r.totalBlocks-sectorIdx*BitsPerSector)
+			if err != nil {
+				allocated += blocks
+				if firstErr == nil {
+					firstErr = fmt.Errorf("failed to read bitmap sector %d: %w", sectorIdx, err)
+				}
+				continue
+			}
+			full := blocks / 8
+			for _, b := range data[:full] {
+				allocated += uint64(bits.OnesCount8(b))
+			}
+			if rem := blocks % 8; rem != 0 {
+				allocated += uint64(bits.OnesCount8(data[full] & (1<<rem - 1)))
+			}
 		}
 	}
 	return allocated, firstErr
@@ -688,40 +707,28 @@ func (r *Region) readSector(sectorIdx uint64) ([]byte, error) {
 	buf := storage.GetBuffer(SectorSize)
 	defer storage.PutBuffer(buf)
 
-	if _, err := r.dev.ReadAt(buf.Bytes(), offset); err != nil {
+	if _, err := r.dev.ReadAt(buf.Bytes()[:SectorSize], offset); err != nil {
 		return nil, err
 	}
-
-	data := buf.Bytes()
-
-	// Verify checksum (skip for all-zero sectors which are valid empty sectors)
-	storedChecksum := binary.LittleEndian.Uint32(data[SectorSize-ChecksumSize:])
-	computedChecksum := storage.CRC32C(data[:SectorSize-ChecksumSize])
-
-	// All-zero sector is valid (initial state)
-	if storedChecksum == 0 {
-		allZero := true
-		for i := 0; i < SectorSize-ChecksumSize; i++ {
-			if data[i] != 0 {
-				allZero = false
-				break
-			}
-		}
-		if allZero {
-			// Return a copy of the zero data
-			result := make([]byte, BytesPerSector)
-			return result, nil
-		}
+	data, err := sectorBits(buf.Bytes()[:SectorSize])
+	if err != nil {
+		return nil, err
 	}
+	return slices.Clone(data), nil
+}
 
-	if storedChecksum != computedChecksum {
+// sectorBits checks a raw sector's checksum and returns its bitmap bytes. An
+// all-zero sector was never written and is valid.
+func sectorBits(raw []byte) ([]byte, error) {
+	data := raw[:BytesPerSector]
+	stored := binary.LittleEndian.Uint32(raw[SectorSize-ChecksumSize:])
+	if stored == 0 && !slices.ContainsFunc(data, func(b byte) bool { return b != 0 }) {
+		return data, nil
+	}
+	if stored != storage.CRC32C(data) {
 		return nil, ErrInvalidChecksum
 	}
-
-	// Return a copy of the data portion
-	result := make([]byte, BytesPerSector)
-	copy(result, data[:BytesPerSector])
-	return result, nil
+	return data, nil
 }
 
 // writeSector writes a bitmap sector to disk with checksum.

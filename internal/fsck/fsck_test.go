@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -595,5 +596,72 @@ func TestFsckRefusesOlderLockRecordLayouts(t *testing.T) {
 					name, result.Aborted, result.Problems)
 			}
 		})
+	}
+}
+
+// A block two inodes map without FlagShared is reported, and one they share
+// with FlagShared is not.
+func TestFsckReportsCrossLinkedBlocks(t *testing.T) {
+	const totalBlocks = 29
+	dev, cleanup := testDevice(t, 40)
+	defer cleanup()
+	writeSuperblock(t, dev, totalBlocks)
+	initRootInode(t, dev)
+
+	var uuid [16]byte
+	ctx := context.Background()
+	bm := bitmap.NewRegion(dev, testLayout.BlockBitmapOffset, totalBlocks, nil, uuid)
+	tbl := inode.NewTable(dev, testLayout.InodeTableOffset, testLayout.InodeTableSize, nil, uuid)
+	mgr := extent.NewManager(dev, bm, nil, testLayout.DataRegionOffset, storage.DefaultBlockSize)
+	tbl.SetTreeFlusher(mgr)
+
+	newFile := func() *inode.Inode {
+		num, err := tbl.FindFreeSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino, err := tbl.ClaimSlot(ctx, num)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino.Mode = inode.S_IFREG | 0o644
+		ino.Size = storage.DefaultBlockSize
+		return ino
+	}
+	ownedFile := func(flags uint32) (*inode.Inode, uint64) {
+		ino := newFile()
+		ext, err := mgr.AllocateBlocks(ctx, ino, 0, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ino.InlineExtents[0].Flags |= flags
+		if err := tbl.Write(ctx, ino); err != nil {
+			t.Fatal(err)
+		}
+		return ino, ext.PhysicalBlock
+	}
+	mapAlso := func(block uint64, flags uint32) {
+		ino := newFile()
+		ino.InlineExtents[0] = inode.InlineExtent{PhysicalBlock: block, Length: 1, Flags: extent.FlagAllocated | flags}
+		ino.ExtentCount = 1
+		if err := tbl.Write(ctx, ino); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner, linked := ownedFile(0)
+	mapAlso(linked, 0)
+	_, shared := ownedFile(extent.FlagShared)
+	mapAlso(shared, extent.FlagShared)
+
+	want := fmt.Sprintf("block %d also claimed by inode %d without FlagShared", linked, owner.InodeNum)
+	found := false
+	for _, p := range extentProblems(dev) {
+		if strings.Contains(p.Message, fmt.Sprintf("block %d also claimed", shared)) {
+			t.Errorf("block %d, which both inodes share with FlagShared, reported: %s", shared, p.Message)
+		}
+		found = found || p.Severity == fsck.Critical && strings.Contains(p.Message, want)
+	}
+	if !found {
+		t.Fatalf("no Critical %q among the extent problems", want)
 	}
 }

@@ -389,9 +389,9 @@ type Checker struct {
 	sbData *SuperblockData
 
 	// Collected data for cross-validation
-	bitmapAllocated map[uint64]bool // blocks marked allocated in bitmap
+	bitmapAllocated blockSet        // blocks marked allocated in bitmap
 	badBitmap       map[uint64]bool // bitmap sectors with a bad checksum
-	inodeBlocks     map[uint64]int  // block -> reference count from inodes
+	inodeBlocks     blockRefs       // block -> reference count from inodes
 	inodeUsed       map[uint32]bool // inode numbers that are in use
 	inodeBirth      map[uint32]uint64
 	entryType       map[uint32]uint8 // the directory entry type each inode in use should have
@@ -481,10 +481,8 @@ func New(dev *storage.Device, opts Options) *Checker {
 		dev:             dev,
 		opts:            opts,
 		result:          &Result{Mode: opts.Mode},
-		bitmapAllocated: make(map[uint64]bool),
 		badBitmap:       make(map[uint64]bool),
 		finished:        make(map[Phase]bool),
-		inodeBlocks:     make(map[uint64]int),
 		inodeUsed:       make(map[uint32]bool),
 		inodeBirth:      make(map[uint32]uint64),
 		entryType:       make(map[uint32]uint8),
