@@ -4481,7 +4481,8 @@ test_fencing_reservation_self_test() {
 # relogin_last_path logs VM $1's last iSCSI path out and in again, as a session loss does, and points its map at the
 # new disk. The target keeps the key the old session registered.
 relogin_last_path() {
-    local portal="10.0.2.2:${ISCSI_PORT}" iface
+    local portal iface
+    portal=$(iscsi_portal)
     iface=$(ssh_run "$1" "iscsiadm -m session -P 1 | awk '/Iface Name:/ {print \$3}' | sort | tail -1")
     # The new disk attaches a moment after the login; a map reloaded before it would be left with no path.
     ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --logout > /dev/null; sleep 1; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I $iface --login > /dev/null
@@ -4534,7 +4535,8 @@ test_fencing_session_relogin() {
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
-    local result=0 out vm keys portal="10.0.2.2:${ISCSI_PORT}" fsck=/usr/local/bin/goclusterfs-fsck
+    local result=0 out vm keys portal fsck=/usr/local/bin/goclusterfs-fsck
+    portal=$(iscsi_portal)
     for vm in 1 2; do
         if [[ -n "$(mount_pids "$vm")" ]]; then
             unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
@@ -4728,8 +4730,8 @@ rekey_pause_cleanup() {
     ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath 2>/dev/null; true"
     iscsi_drop_path "$1" 1
     ssh_run "$1" "if [ ! -b $(cluster_device) ]; then
-            iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I default --logout > /dev/null 2>&1
-            iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT} -I default --login > /dev/null 2>&1
+            iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p $(iscsi_portal) -I default --logout > /dev/null 2>&1
+            iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p $(iscsi_portal) -I default --login > /dev/null 2>&1
             for t in \$(seq 20); do [ -b $(cluster_device) ] && break; sleep 1; done
         fi; true"
 }

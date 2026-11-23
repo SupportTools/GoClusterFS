@@ -870,7 +870,8 @@ iscsi_disks() {
 
 # iscsi_add_path logs VM $1 in to the target once more through iface p$2, as a second path with a session of its own.
 iscsi_add_path() {
-    local portal="10.0.2.2:${ISCSI_PORT}"
+    local portal
+    portal=$(iscsi_portal)
     ssh_run "$1" "iscsiadm -m iface -I p$2 -o new > /dev/null 2>&1; iscsiadm -m iface -I p$2 -o update -n iface.transport_name -v tcp > /dev/null
         iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p$2 -o new > /dev/null
         iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} -I p$2 -o update -n node.session.timeo.replacement_timeout -v 5
@@ -880,7 +881,8 @@ iscsi_add_path() {
 # iscsi_drop_path logs VM $1's path p$2 out and deletes it. Its node record replaced the default one, without which a
 # login through iface default finds no record, so it creates that again.
 iscsi_drop_path() {
-    local node="-T ${ISCSI_TARGET_IQN} -p 10.0.2.2:${ISCSI_PORT}"
+    local node
+    node="-T ${ISCSI_TARGET_IQN} -p $(iscsi_portal)"
     ssh_run "$1" "iscsiadm -m node $node -I p$2 --logout > /dev/null 2>&1
         iscsiadm -m node $node -I p$2 -o delete > /dev/null 2>&1; iscsiadm -m iface -I p$2 -o delete > /dev/null 2>&1
         iscsiadm -m node $node -I default > /dev/null 2>&1 && exit 0
