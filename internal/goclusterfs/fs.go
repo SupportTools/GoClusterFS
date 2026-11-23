@@ -160,6 +160,8 @@ type FS struct {
 	quotaStop      chan struct{}
 	quotaDone      chan struct{}
 	quotaStuck     atomic.Bool // a flush failed after its commit; the journal keeps it for a replay
+	openQuota      func() (quota.Table, error)
+	stopNode       func(reason string)
 
 	// Configuration
 	nodeUUID   [16]byte

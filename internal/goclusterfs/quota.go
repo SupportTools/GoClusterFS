@@ -50,6 +50,9 @@ func joinProject(ino *inode.Inode, p uint32) {
 }
 
 func (f *FS) quotaTable() (quota.Table, error) {
+	if f.openQuota != nil {
+		return f.openQuota()
+	}
 	return quota.Open(f.dev, f.inodeTbl, f.quotaInode, f.dataOffset, f.dataBlockSize())
 }
 

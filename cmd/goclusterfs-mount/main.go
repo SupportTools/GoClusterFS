@@ -642,6 +642,9 @@ func main() {
 	}
 	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
 		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
+		gfs.SetStopNode(func(reason string) {
+			failf("%s; stopping this node so a peer replays its journal. Mount again once the device is healthy", reason)
+		})
 		gfs.StartQuotaFlush(time.Duration(cmp.Or(sb.QuotaFlushMs, quota.DefaultFlushMs)) * time.Millisecond)
 	}
 

@@ -76,7 +76,12 @@ func (f *FS) flushQuota(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	keepLock := false
+	defer func() {
+		if !keepLock {
+			unlock()
+		}
+	}()
 	if f.quotaGuard.Adopted() {
 		return nil
 	}
@@ -114,15 +119,31 @@ func (f *FS) flushQuota(ctx context.Context) error {
 	}
 	for _, u := range flushed {
 		if err := tbl.SetUsage(u.Project, u.NewBlocks, u.NewInodes); err != nil {
-			f.quotaStuck.Store(true)
-			log.Printf("[ERROR] quota: writing the usage of project %d failed: %v. This node stops flushing; its journal keeps the flush for the next replay", u.Project, err)
-			return err
+			keepLock = true
+			return f.quotaFlushFailed(fmt.Errorf("writing the usage of project %d: %w", u.Project, err))
 		}
 	}
 	if err := f.journal.CompleteIntentDurable(seq); err != nil {
-		f.quotaStuck.Store(true)
-		log.Printf("[ERROR] quota: completing a flush failed: %v. This node stops flushing; its journal keeps the flush for the next replay", err)
-		return err
+		keepLock = true
+		return f.quotaFlushFailed(fmt.Errorf("completing the flush: %w", err))
 	}
 	return nil
+}
+
+// quotaFlushFailed handles a flush that failed after its commit. A replay of this node's journal writes the flush
+// again over whatever usage the table holds then, so this node keeps the quota lock, which keeps every node off the
+// table, stops flushing, and stops the node when the mount set how.
+func (f *FS) quotaFlushFailed(err error) error {
+	f.quotaStuck.Store(true)
+	reason := fmt.Sprintf("quota: %v after the flush was logged; the quota lock stays held until a replay of this node's journal writes the flush again", err)
+	log.Printf("[ERROR] %s", reason)
+	if f.stopNode != nil {
+		f.stopNode(reason)
+	}
+	return err
+}
+
+// SetStopNode sets how this node stops when it cannot go on safely, such as after a quota flush failed halfway.
+func (f *FS) SetStopNode(stop func(reason string)) {
+	f.stopNode = stop
 }

@@ -2,13 +2,16 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 )
 
 // quotaProject makes directory name a project of fsys, whose journal is set, and returns it.
@@ -223,6 +226,107 @@ func TestAQuotaFoldCutShortIsRedoneOnce(t *testing.T) {
 	foldCrashed(t, peer, offset, size)
 	if got := tableUsage(t, peer, 1); got != [2]uint64{6, 1} {
 		t.Errorf("a completed fold wrote the table again: %v, want the later 6 blocks", got)
+	}
+}
+
+// A replayer that dies with its fold in the dead journal but not yet written leaves the quota lock claimed in the dead
+// node's slot, so no peer flush lands under the fold. The slot's next replay adopts that claim, redoes the fold once,
+// and frees the lock.
+func TestAReplayerDyingMidFoldKeepsTheQuotaLockInTheDeadSlot(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	quotaProject(t, fsys, "pvc")
+	commitDelta(t, fsys, 1, 5, 1)
+	dead, deadSlot := fsys.nodeUUID, int(fsys.nodeUUID[15])
+
+	replayer := openFormattedFS(t, path)
+	appended := make(chan struct{})
+	restore := quota.SetAfterFoldAppend(func() {
+		close(appended)
+		select {}
+	})
+	go func() {
+		region, err := journal.OpenRegionForRecovery(replayer.dev, offset, size)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := replayer.lockMgr.AdoptOwner(dead, deadSlot); err != nil {
+			t.Error(err)
+			return
+		}
+		_ = replayer.quotaGuard.Fold(lock.ForReplay(context.Background()), replayer.quotaTable, deadSlot, int(replayer.nodeUUID[15]), dead, region)
+	}()
+	<-appended
+	restore()
+	if got := tableUsage(t, replayer, 1); got != [2]uint64{} {
+		t.Fatalf("the stopped fold wrote %v", got)
+	}
+
+	next := openFormattedFS(t, path)
+	adopted, err := next.lockMgr.AdoptOwner(dead, deadSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(adopted, next.lockMgr.Record(lock.LockTypeQuota, 0)) {
+		t.Fatalf("the dead node's slot holds no quota lock claim while its fold is half done; the next replay adopted records %v", adopted)
+	}
+	defer adoptCrashed(t, next, replayer.nodeUUID)()
+	region, err := journal.OpenRegionForRecovery(next.dev, offset, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.quotaGuard.Fold(lock.ForReplay(context.Background()), next.quotaTable, deadSlot, int(next.nodeUUID[15]), dead, region); err != nil {
+		t.Fatalf("redo the fold: %v", err)
+	}
+	if err := next.lockMgr.ReleaseAdopted(adopted); err != nil {
+		t.Fatal(err)
+	}
+	if got := tableUsage(t, next, 1); got != [2]uint64{5, 1} {
+		t.Errorf("after the redo the table holds %v, want 5 blocks and 1 inode", got)
+	}
+	if again, err := next.lockMgr.AdoptOwner(dead, deadSlot); err != nil || len(again) != 0 {
+		t.Errorf("after the replay the dead node's slot still holds claims %v, %v", again, err)
+	}
+}
+
+// A flush whose table write fails after its commit stops the node and keeps the quota lock, so no peer writes the
+// table before the node's replay writes the flush again.
+func TestAFlushFailingAfterItsCommitStopsTheNode(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	quotaProject(t, fsys, "pvc")
+	var stopped string
+	fsys.SetStopNode(func(reason string) { stopped = reason })
+	// A flush of one project reads its record once, then reads it twice more and writes it to set the usage.
+	sectors := 0
+	fsys.openQuota = func() (quota.Table, error) {
+		tbl, err := quota.Open(fsys.dev, fsys.inodeTbl, fsys.quotaInode, fsys.dataOffset, fsys.dataBlockSize())
+		at := tbl.At
+		tbl.At = func(sector uint64) (int64, error) {
+			if sectors++; sectors > 3 {
+				return 0, errors.New("injected write failure")
+			}
+			return at(sector)
+		}
+		return tbl, err
+	}
+	commitDelta(t, fsys, 1, 3, 1)
+	if err := fsys.flushQuota(context.Background()); err == nil || stopped == "" {
+		t.Fatalf("a flush whose write failed returned %v and stopped the node with %q", err, stopped)
+	}
+	fsys.openQuota = nil
+
+	peer := openFormattedFS(t, path)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if unlock, err := peer.quotaGuard.Lock(ctx); err == nil {
+		unlock()
+		t.Fatal("a peer took the quota lock while the failed flush waits for its replay")
+	}
+	foldCrashed(t, peer, offset, size)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{3, 1} {
+		t.Errorf("after the replay the table holds %v, want the failed flush's 3 blocks and 1 inode", got)
 	}
 }
 

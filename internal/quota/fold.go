@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -47,10 +48,21 @@ func (g *Guard) Adopted() bool {
 	return g.locks != nil && g.locks.Adopted(lock.LockTypeQuota, 0)
 }
 
+// afterFoldAppend, when set, runs once a fold is in the journal and before its writes.
+var afterFoldAppend atomic.Pointer[func()]
+
+// SetAfterFoldAppend makes Fold run fn after it appends a fold and before it writes the usage, so tests can stop a
+// replayer there, and returns the func that removes it.
+func SetAfterFoldAppend(fn func()) (restore func()) {
+	afterFoldAppend.Store(&fn)
+	return func() { afterFoldAppend.Store(nil) }
+}
+
 // Fold folds what the dirty journal in region owes the table, before replay begins. slot and owner are the journal's
 // registry slot and that slot's node; ownSlot is this node's. Under the quota lock Fold appends the fold to the
 // journal, writes the usage and completes the fold. For another node's slot it keeps a claim on the lock in that
-// slot meanwhile: if this node dies halfway, peers stay off the table until a replay of the slot redoes the fold.
+// slot until the fold completes: if this node dies or the fold fails halfway, peers stay off the table until a
+// replay of the slot adopts the claim and redoes the fold.
 func (g *Guard) Fold(ctx context.Context, open func() (Table, error), slot, ownSlot int, owner [16]byte, region *journal.Region) error {
 	q, err := journal.ReadQuotaReplay(region)
 	if err != nil {
@@ -82,21 +94,19 @@ func (g *Guard) Fold(ctx context.Context, open func() (Table, error), slot, ownS
 	if !q.Folded && len(folds) == 0 {
 		return nil
 	}
+	clearKept := func() error { return nil }
 	if slot != ownSlot && g.locks != nil {
-		release, err := g.locks.KeepFor(lock.LockTypeQuota, 0, owner, slot)
-		if err != nil {
+		if clearKept, err = g.locks.KeepFor(lock.LockTypeQuota, 0, owner, slot); err != nil {
 			return fmt.Errorf("keeping the quota lock in slot %d: %w", slot, err)
 		}
-		defer func() {
-			if err := release(); err != nil {
-				log.Printf("[WARN] quota: clearing the quota lock kept in slot %d failed: %v", slot, err)
-			}
-		}()
 	}
 	if !q.Folded {
 		if seq, err = journal.AppendQuotaFold(region, folds); err != nil {
 			return err
 		}
+	}
+	if hook := afterFoldAppend.Load(); hook != nil {
+		(*hook)()
 	}
 	for _, f := range folds {
 		if err := tbl.SetUsage(f.Project, f.NewBlocks, f.NewInodes); err != nil {
@@ -105,6 +115,9 @@ func (g *Guard) Fold(ctx context.Context, open func() (Table, error), slot, ownS
 	}
 	if err := journal.CompleteQuotaFold(region, seq); err != nil {
 		return err
+	}
+	if err := clearKept(); err != nil {
+		log.Printf("[WARN] quota: clearing the quota lock kept in slot %d failed: %v; the slot's next replay clears it", slot, err)
 	}
 	log.Printf("quota: folded the usage of %d projects from the journal of slot %d", len(folds), slot)
 	return nil

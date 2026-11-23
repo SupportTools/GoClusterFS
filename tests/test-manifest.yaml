@@ -5717,6 +5717,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_flush_test.go::TestQuotaFlushWaitsOutAdoptedQuotaLock
 
+  - id: quota-fold-keeps-dead-slot-claim
+    name: A replayer dying mid-fold keeps the quota lock in the dead slot
+    description: With the fold in the dead journal but unwritten, the dead slot holds the quota claim; the slot's next replay adopts it, redoes the fold once and frees the lock
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAReplayerDyingMidFoldKeepsTheQuotaLockInTheDeadSlot
+
+  - id: quota-flush-failure-stops-node
+    name: A flush failing after its commit stops the node
+    description: The node stops and keeps the quota lock so no peer writes the table, and the replay of its journal writes the flush
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAFlushFailingAfterItsCommitStopsTheNode
+
   - id: quota-fold-logged
     name: A quota fold is logged in the dead journal
     description: After a fold the dead journal holds a completed fold that owes nothing, and the table has the usage
