@@ -890,6 +890,15 @@ iscsi_drop_path() {
         iscsiadm -m node $node -o new > /dev/null && iscsiadm -m node $node -o update -n node.session.timeo.replacement_timeout -v 5"
 }
 
+# remove_map removes VM $1's map gcfs-mpath. A preempt's abort can fail every path of a map without multipathd, which
+# then queues a fenced mount's I/O, and the mount cannot exit until the queue fails.
+remove_map() {
+    ssh_run "$1" "dmsetup info gcfs-mpath > /dev/null 2>&1 || exit 0
+        dmsetup message gcfs-mpath 0 fail_if_no_path 2>/dev/null; fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null
+        for t in \$(seq 30); do dmsetup remove gcfs-mpath 2>/dev/null && exit 0; sleep 1; done
+        dmsetup status gcfs-mpath >&2; exit 1"
+}
+
 # multipath_over sets VM $1's dm-multipath map gcfs-mpath on the disks after $1, by default every iSCSI disk of VM $1,
 # one path each. A map that exists takes the disks without flushing the writes it queued while it had no path.
 multipath_over() {

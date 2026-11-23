@@ -4580,10 +4580,16 @@ test_fencing_session_relogin() {
         log_error "the device lists VM 1's key $keys times after the re-register, want 3: the old session, the other path and the relogged path"
         result=1
     fi
-    local restored
+    if sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -q "lost this node's key again\|The device refused a write"; then
+        log_error "VM 1 lost its key again before VM 2 preempted it"
+        result=1
+    fi
+    local restored preempted
     restored=$(sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -c "registered it again")
+    preempted="fencing relogin preempt $(date +%s)"
+    mark_vm_logs "$preempted"
     ssh_run 2 "sg_persist --out --preempt-abort --param-rk=$(reservation_key 2) --param-sark=$(reservation_key 1) --prout-type=7 $(cluster_device) > /dev/null" || result=1
-    wait_log 1 "a peer preempted this node\|lost this node's key again" 60 "$marker" || result=1
+    wait_log 1 "a peer preempted this node\|lost this node's key again" 60 "$preempted" || result=1
     if ! wait_stopped 1 30; then
         log_error "VM 1 still runs 30s after its key was preempted"
         result=1
@@ -4608,7 +4614,11 @@ test_fencing_session_relogin() {
     fi
 
     ssh_run 2 "$fsck -clear-reservations -confirm $(cluster_device) > /dev/null 2>&1" || result=1
-    ssh_run 1 "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath; true"
+    if ! remove_map 1; then
+        log_warn "VM 1: restarting it, since its map gcfs-mpath stays busy"
+        kill_vm 1
+        { start_vm 1 && wait_vm_healthy 1 120; } || result=1
+    fi
     iscsi_drop_path 1 1 || result=1
     fencing_restart pr || result=1
     return $result
@@ -4732,7 +4742,7 @@ rekey_pause_cleanup() {
         wait_vm_healthy "$1" 120 || return 1
         return 0
     fi
-    ssh_run "$1" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; dmsetup remove gcfs-mpath 2>/dev/null; true"
+    remove_map "$1"
     iscsi_drop_path "$1" 1
     ssh_run "$1" "if [ ! -b $(cluster_device) ]; then
             iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p $(iscsi_portal) -I default --logout > /dev/null 2>&1
