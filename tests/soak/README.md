@@ -49,6 +49,8 @@ flock /tmp/goclusterfs-soak.lock systemd-run --scope -p MemoryMax=8G -p CPUQuota
 
 The VMs use SSH ports from `-ssh-base-port` (3122), so the soak can share a host with other VM test runs. It logs a summary every minute.
 
+`-block-size 8192` formats the shared disk with 8 KB data blocks; any power of two from 8 KB to 1 MB works. The workload and `-budget` stay in MB at every block size.
+
 With `VM_STORAGE=iscsi` in the environment, the nodes mount the shared disk as an iSCSI LUN from a target VM, so `-format` turns on storage fencing. The hourly fsck checks that LUN too.
 
 ## Replay

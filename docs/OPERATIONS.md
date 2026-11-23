@@ -615,11 +615,22 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 
 ### Block Size
 
-`-format -block-size` sets the data block size, a power of two from 8 KB to 1 MB, for the life of the volume. Every file with data takes whole blocks, so small blocks save space on volumes of many small files: a 155 MB node_modules tree took 1.5 times its size at 8 KB, 5.9 times at 64 KB and 83 times at 1 MB.
+`-format -block-size` sets the data block size, a power of two from 8 KB to 1 MB, for the life of the volume. `-bytes-per-inode` defaults to one inode per block at 1 MB and max(2 × block size, 16 KB) below.
 
-Sizes below 1 MB are experimental until overwrites get faster. An overwrite checks, locks and writes each block on its own: a 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
+| Volume | `-block-size` | `-bytes-per-inode` | Why |
+|---|---|---|---|
+| VM disks, databases, other large files | `1048576`, or `262144` if they are snapshotted often | default | Fewest blocks and extents per byte. A file first written in random order has one extent per block, and a file holds at most about 33.5M extents at 1 MB, 8.4M at 256 KB and 1M at 64 KB or 8 KB. After a snapshot a 4 KB write copies a whole block: 1,000 random 4 KB writes copied 453 MB at 1 MB and 204 MB at 256 KB |
+| Many small files: package trees, source trees | `8192` | default (16 KB) | A 155 MB node_modules tree took 235 MB at 8 KB, 909 MB at 64 KB and 12.8 GB at 1 MB; a Kubernetes source tree took 1.8, 8.5 and 129 times its 80 MB |
+| Mixed | `65536` | default (128 KB) | 5.9 to 8.5 times the data on small-file trees, and a file can reach 68 GB even when every block is its own extent |
 
-fsck tracks each block in one bit and one byte. A check of a 1 TB volume at 8 KB blocks, 90% full, took 24 s and 302 MB of memory.
+Speed per file and per byte barely changes with the block size. Writes handle contiguous blocks as one run: on a tmpfs-backed volume, a 512 MB overwrite with 128 KB writes ran at 257 MB/s at 8 KB and 251 MB/s at 1 MB, with the same device reads and writes, and copying the node_modules tree in ran at 260 to 390 entries a second at every size.
+
+Things to know about small blocks:
+
+- **Extents per file.** A file whose blocks were first written in random order, such as a VM image, can hit `EFBIG` at 8.5 GB with 8 KB blocks.
+- **Contiguous tree nodes.** Extent tree nodes are at least 64 KB, 8 blocks in a row at 8 KB. On a nearly full, fragmented volume, a file's tree can fail to grow with `ENOSPC` before the volume is full.
+- **`df -i` lags.** At 16 KB per inode a 100 GB volume has a 1.6 GB inode table. `statfs` counts free inodes in a background scan that runs at most every 30 times its last duration, so other nodes' creates and removes show up that late: about 7 minutes for a 1.6 GB table at 115 MB/s. This node's own creates and removes show up at once.
+- **fsck** tracks each block in one bit and one byte. A check of a 1 TB volume at 8 KB blocks, 90% full, took 24 s and 302 MB of memory.
 
 ### Cache Tuning
 

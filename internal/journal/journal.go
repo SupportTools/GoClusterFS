@@ -96,6 +96,7 @@ type Journal struct {
 	pendingIntents map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
 	unsyncedEnds   map[uint64]bool   // intents the in-memory head passed before the superblock was synced
 	checkpointHook atomic.Pointer[func()]
+	quotaPressure  atomic.Pointer[func()]
 	hookRunning    atomic.Bool
 
 	// Checkpoint tracking
@@ -204,6 +205,8 @@ func (j *Journal) Stop() error {
 		case flushErr != nil:
 			// Leave the journal dirty so the next mount replays what may not have synced.
 			cleanErr = fmt.Errorf("failed to flush batched commits: %w", flushErr)
+		case len(j.quota.holds) > 0:
+			cleanErr = fmt.Errorf("%d quota projects have usage no flush moved into the table; the journal stays for a replay to fold", len(j.quota.holds))
 		case len(j.activeTxns) == 0 && len(j.pendingIntents) == 0:
 			// Mark journal clean on orderly shutdown
 			if err := j.region.MarkClean(); err != nil {
@@ -244,6 +247,21 @@ func (j *Journal) periodicCheckpoint() {
 // SetCheckpointHook also runs fn early when the oldest intent is half a ring behind, since bursts fill the ring.
 func (j *Journal) SetCheckpointHook(fn func()) {
 	j.checkpointHook.Store(&fn)
+}
+
+// SetQuotaPressureHook runs fn, which must not block, after a commit once the oldest delta no flush covered is half
+// a ring behind, so the node flushes before its holds fill the journal.
+func (j *Journal) SetQuotaPressureHook(fn func()) {
+	j.quotaPressure.Store(&fn)
+}
+
+func (j *Journal) quotaLagLocked() uint32 {
+	size, tail := j.region.DataAreaSize(), j.region.TailOffset()
+	var oldest uint32
+	for _, h := range j.quota.holds {
+		oldest = max(oldest, (tail+size-h.start)%size)
+	}
+	return oldest
 }
 
 func (j *Journal) runHookAsync() {
@@ -420,6 +438,7 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 	j.pendingIntents[seq] = start
 	j.quota.apply(seq, start, txn.quota, 1)
 	pressed := j.oldestIntentLagLocked() > j.region.DataAreaSize()/2
+	quotaPressed := j.quotaLagLocked() > j.region.DataAreaSize()/2
 
 	// Release lock BEFORE sync operations to avoid deadlock
 	// The sync operations (CommitSync/CommitBatch) may need to acquire
@@ -427,6 +446,9 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 	j.mu.Unlock()
 	if pressed {
 		j.runHookAsync()
+	}
+	if hook := j.quotaPressure.Load(); quotaPressed && hook != nil {
+		(*hook)()
 	}
 
 	// COMMIT POINT - sync to disk
@@ -788,6 +810,12 @@ func (j *Journal) Region() *Region {
 // - result, nil if recovery succeeded
 // - nil, error if the journal header is damaged or recovery failed
 func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handler RecoveryHandler, release func([]uint64) error) (*ScanRecoveryResult, error) {
+	return ScanFoldAndRecover(dev, regionOffset, regionSize, nil, handler, release)
+}
+
+// ScanFoldAndRecover is ScanAndRecover that first passes a dirty journal to fold, which folds what it owes the quota
+// table.
+func ScanFoldAndRecover(dev *storage.Device, regionOffset, regionSize uint64, fold func(*Region) error, handler RecoveryHandler, release func([]uint64) error) (*ScanRecoveryResult, error) {
 	region, err := OpenRegionForRecovery(dev, regionOffset, regionSize)
 	if errors.Is(err, ErrJournalUninitialized) {
 		return nil, nil
@@ -811,7 +839,11 @@ func ScanAndRecover(dev *storage.Device, regionOffset, regionSize uint64, handle
 		Generation: sb.NodeGeneration,
 	}
 
-	// Perform recovery
+	if fold != nil {
+		if err := fold(region); err != nil {
+			return nil, fmt.Errorf("folding the journal's quota usage: %w", err)
+		}
+	}
 	stats, err := RecoverReleasing(region, handler, nil, release)
 	if err != nil {
 		return nil, fmt.Errorf("journal recovery failed: %w", err)

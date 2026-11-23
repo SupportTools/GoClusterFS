@@ -79,7 +79,7 @@ func (m *Manager) HeldLocks() []string {
 func formatLockInfo(key lockKey, held *heldLock) string {
 	typeNames := []string{
 		"Volume", "SnapshotReg", "Snapshot", "Journal",
-		"RefCount", "LockRegion", "BlockBitmap", "SFBContainer",
+		"RefCount", "Quota", "BlockBitmap", "SFBContainer",
 		"Inode", "Extent",
 	}
 	modeNames := []string{"None", "Shared", "Exclusive"}

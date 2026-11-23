@@ -11,7 +11,9 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/node"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/refcount"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 // Salvage says how far a salvaging release replayed a slot's journal.
@@ -39,6 +41,10 @@ func (c *Checker) salvage(i int, renew func() error) (*Salvage, error) {
 		return s, nil
 	}
 	rctx := c.replayContext()
+	if err := c.foldQuota(i, rctx.InodeTbl, region); err != nil {
+		s.Err = fmt.Errorf("folding the journal's quota usage: %w", err)
+		return s, nil
+	}
 	apply := journal.CreateTxnRecoveryHandler(rctx)
 	handler := func(txn *journal.RecoveredTxn) error {
 		if err := apply(txn); err != nil {
@@ -60,6 +66,18 @@ func (c *Checker) salvage(i int, renew func() error) (*Salvage, error) {
 		return nil, stopErr
 	}
 	return s, nil
+}
+
+// foldQuota folds what slot i's journal owes the quota table, without locks like the rest of the salvage.
+func (c *Checker) foldQuota(i int, inodes *inode.Table, region *journal.Region) error {
+	sb := c.sbData
+	if sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 {
+		return nil
+	}
+	open := func() (quota.Table, error) {
+		return quota.Open(c.dev, inodes, sb.QuotaInode, sb.DataRegionOffset, uint64(sb.BlockSize))
+	}
+	return quota.NewGuard(nil).Fold(context.Background(), open, i, i, [16]byte{}, region)
 }
 
 // othersUnchanged fails once a registry slot other than i differs from what planning read, which means a node started.

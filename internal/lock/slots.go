@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"math/bits"
 	"strings"
 	"time"
 
@@ -50,11 +51,6 @@ type claimSlot struct {
 	resourceID  uint64
 	owner       [16]byte
 	acquireTime int64 // Unix nanoseconds
-}
-
-type adoptedSlot struct {
-	slot  int
-	owner [16]byte
 }
 
 type slotRef struct {
@@ -160,15 +156,16 @@ func (m *Manager) readRow(recordID uint64) ([]byte, error) {
 // until its registry slot is empty. Without one, it stays live until it is older
 // than StaleThreshold, or for a torn slot, until it stays torn for tornExpiry.
 //
-// ignore is the slot of a dead node whose claim this node adopted for a replay.
-// Another dead node's adopted claim then counts as lower only in a lower slot
-// and not at all in a higher one, so two replays sharing a record take turns.
-func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignore int) (conflict, lower bool, by blocker) {
+// ignore has a bit for each slot of a dead node whose claim this node adopted
+// for a replay. Another dead node's adopted claim then counts as lower only
+// below the lowest of those slots and not at all above it, so two replays
+// sharing a record take turns.
+func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignore uint64) (conflict, lower bool, by blocker) {
 	m.mu.Lock()
 	view := m.ownerView
 	m.mu.Unlock()
 	for slot := range SlotsPerRecord {
-		if slot == m.nodeSlot || slot == ignore {
+		if slot == m.nodeSlot || ignore&(1<<slot) != 0 {
 			continue
 		}
 		s, err := decodeSlot(rowSlot(row, slot))
@@ -181,7 +178,7 @@ func (m *Manager) rowConflicts(recordID uint64, row []byte, mode LockMode, ignor
 			continue
 		}
 		adopted := s != nil && s.adopted
-		takesTurns := adopted && ignore >= 0 && slot > ignore
+		takesTurns := adopted && ignore != 0 && slot > bits.TrailingZeros64(ignore)
 		b := blocker{slot: slot}
 		if view == nil {
 			if takesTurns || tornTooLong || (s != nil && s.stale()) {
@@ -246,7 +243,7 @@ func (m *Manager) liveMark(row []byte, writes bool) (blocker, bool) {
 // claim then waits, without keeping its claim, behind any write claim and any
 // live node's mark that waits for one. Otherwise readers in lower slots that
 // keep a record busy would shut out a writer in a higher one.
-func (m *Manager) claimConflicts(recordID uint64, row []byte, mode LockMode, ignore int, yield bool) (conflict, lower bool, by blocker) {
+func (m *Manager) claimConflicts(recordID uint64, row []byte, mode LockMode, ignore uint64, yield bool) (conflict, lower bool, by blocker) {
 	conflict, lower, by = m.rowConflicts(recordID, row, mode, ignore)
 	if !yield || mode != LockModeShared {
 		return conflict, lower, by
@@ -305,8 +302,17 @@ func (m *Manager) tornTooLong(ref slotRef, torn []byte) bool {
 // ownAdoptedLocked reports whether AdoptOwner kept recordID in this node's own
 // slot, for the predecessor that last used it.
 func (m *Manager) ownAdoptedLocked(recordID uint64) bool {
-	a, ok := m.adopted[recordID]
-	return ok && a.slot == m.nodeSlot
+	_, ok := m.adopted[recordID][m.nodeSlot]
+	return ok
+}
+
+// adoptedSlotsLocked returns a bit for each slot this node adopted recordID in.
+func (m *Manager) adoptedSlotsLocked(recordID uint64) uint64 {
+	var slots uint64
+	for slot := range m.adopted[recordID] {
+		slots |= 1 << slot
+	}
+	return slots
 }
 
 // ownClaim is what this node writes in its slot to claim recordID in mode. A
@@ -371,10 +377,7 @@ func (m *Manager) claim(recordID uint64, key lockKey, mode LockMode, yield bool)
 	m.mu.Lock()
 	c := m.claims[recordID]
 	rewrite := c.written.IsZero() || c.mode != mode || age(c.written) > m.timing.renewAfter
-	ignore := -1
-	if a, ok := m.adopted[recordID]; ok {
-		ignore = a.slot
-	}
+	ignore := m.adoptedSlotsLocked(recordID)
 	behindLower, marked := c.behindLower, c.marked
 	m.mu.Unlock()
 

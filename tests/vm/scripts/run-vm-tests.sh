@@ -4065,11 +4065,20 @@ test_fencing_lost_reservation() {
         log_error "VM 1 still runs 20s after the device lost its reservation and VM 1's key"
         result=1
     fi
-    if [[ -z "$(mount_pids 2)" || "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
-        log_error "VM 2 stopped, or did not reserve the device again"
+    # VM 2 reserves on its next failure scan, which can come up to 5s after the one that stopped VM 1.
+    for t in $(seq 12); do
+        [[ "$(reservation_holder)" != *"No SPC-3 Reservation holder"* ]] && break
+        sleep 1
+    done
+    if [[ "$(reservation_holder)" == *"No SPC-3 Reservation holder"* ]]; then
+        log_error "12s after VM 1 stopped, VM 2 had not reserved the device again"
         result=1
     fi
-    sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E "Fencing|stopping" | tail -2
+    if [[ -z "$(mount_pids 2)" ]]; then
+        log_error "VM 2 stopped after the device lost VM 1's key"
+        result=1
+    fi
+    sed -n "/$marker/,\$p" "$(get_vm_mount_log 1)" | grep -E "Fencing|stopping" | tail -2 | sed 's/^/VM 1: /'
     fencing_restart pr || result=1
     return $result
 }
@@ -5608,19 +5617,23 @@ test_clone_in_place_write() {
     return 0
 }
 
-# Snapshots a file, overwrites both of its blocks, then deletes the snapshot.
-# The delete must finish and give back exactly the two blocks only the
-# snapshot held.
+# Snapshots a 2 MB file, overwrites all of it, then deletes the snapshot.
+# The delete must finish and give back the blocks only the snapshot held. When
+# earlier tests left free space fragmented, the file starts with an extent tree,
+# and its contiguous copies can make that tree's node free too.
 test_snapshot_delete_after_overwrite() {
     log_info "Testing snapshot delete after overwrite..."
     ensure_cluster_healthy 2
 
     local file=/mnt/goclusterfs/snap_delete.bin
-    local free_before free_now
+    local free_before free_now bs blocks node_blocks
 
     ssh_run 1 "rm -f $file"
     ssh_run 1 "head -c 2097152 /dev/urandom > $file" || return 1
     sleep "$RESERVE_IDLE_RETURN_SECS"
+    bs=$(ssh_run 1 "stat -f -c %S /mnt/goclusterfs")
+    blocks=$((2097152 / bs))
+    node_blocks=$(( (bs > 65536 ? bs : 65536) / bs ))
     free_before=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
     ssh_run 1 "setfattr -n user.snapshot -v snap_delete_temp $file" || {
         log_error "snapshot failed"
@@ -5628,8 +5641,8 @@ test_snapshot_delete_after_overwrite() {
     }
     ssh_run 1 "head -c 2097152 /dev/urandom > /tmp/snap_new && dd if=/tmp/snap_new of=$file bs=1048576 conv=notrunc 2>/dev/null" || return 1
     free_now=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
-    if [ "$free_now" -ne $((free_before - 2)) ]; then
-        log_error "$free_now free blocks after overwriting 2 snapshotted blocks, want $((free_before - 2))"
+    if [ "$free_now" -ne $((free_before - blocks)) ]; then
+        log_error "$free_now free blocks after overwriting $blocks snapshotted blocks, want $((free_before - blocks))"
         return 1
     fi
 
@@ -5647,8 +5660,8 @@ test_snapshot_delete_after_overwrite() {
         sleep 0.1
     done
     free_now=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
-    if [ "$free_now" -ne "$free_before" ]; then
-        log_error "$free_now free blocks after deleting the snapshot, want $free_before"
+    if [ "$free_now" -ne "$free_before" ] && [ "$free_now" -ne $((free_before + node_blocks)) ]; then
+        log_error "$free_now free blocks after deleting the snapshot, want $free_before, or $((free_before + node_blocks)) with the file's tree node"
         return 1
     fi
     md5_on_vm_matches 1 "$file" "$(ssh_run 1 "md5sum < /tmp/snap_new | cut -d' ' -f1")" || return 1

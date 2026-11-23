@@ -62,7 +62,9 @@ func TestReadNeverSeesPartOfAnotherNodesWrite(t *testing.T) {
 	fsB := openLockedTreeFSNode(t, path, lockPath, 2)
 	fileA := newRegularFile(t, fsA)
 	before, after := pattern(1, 2*BlockSize), pattern(2, 2*BlockSize)
-	writeAt(t, fileA, before, 0)
+	// Written in reverse, the blocks are not contiguous, so the overwrite writes them one at a time.
+	writeAt(t, fileA, before[BlockSize:], BlockSize)
+	writeAt(t, fileA, before[:BlockSize], 0)
 	fileB := fileNode(fsB, fileA.inodeNum)
 
 	var read <-chan readResult

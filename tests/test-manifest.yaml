@@ -345,6 +345,71 @@ scenarios:
     environments:
       go: internal/goclusterfs/extent_lock_region_test.go::TestExtentLockCoversAMegabyte
 
+  - id: overwrite-run-one-write
+    name: An overwrite of contiguous written blocks is one device write
+    description: At 8 KB blocks an unaligned overwrite of 8 blocks that one extent maps, across a megabyte of the data region, makes one data write, takes both extent locks in record order, and leaves the bytes around it unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestOverwriteOfARunIsOneDeviceWrite
+
+  - id: new-blocks-one-write
+    name: New blocks that follow each other on the device are one write
+    description: At 8 KB blocks a 128 KB write into an empty file maps 16 contiguous blocks and reaches the device as one data write
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestNewBlocksThatFollowEachOtherAreOneDeviceWrite
+
+  - id: fallocated-write-one-run
+    name: A write into fallocated blocks clears them as one run
+    description: At 8 KB blocks an unaligned write over 16 fallocated blocks makes 3 data writes, the zeroed head, the zeroed tail and the data, and the bytes it does not cover read as zeros
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestWriteIntoFallocatedBlocksIsOneRun
+
+  - id: run-stops-at-clone-shared-blocks
+    name: A run does not extend into blocks a clone still shares
+    description: After a clone's first block is copied, a four-block overwrite of the original, inside the file and growing it, copies the three blocks still shared and leaves the clone's data unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_run_guards_test.go::TestRunStopsAtBlocksACloneShares
+
+  - id: new-block-data-before-inode
+    name: New blocks' data lands before the inode write that maps them
+    description: A crash right after the first inode write of a write into holes leaves every mapped block holding the write's data or a hole, never a freed block's old bytes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_run_guards_test.go::TestNewBlockDataLandsBeforeTheInodeMapsIt
+
+  - id: fallocated-run-zeroes-tail
+    name: A first write into fallocated blocks zeroes the last block's tail
+    description: Over old disk contents, a write from the middle of block 0 to the middle of block 2 of a fallocated file leaves the uncovered head and tail reading zeros
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_run_guards_test.go::TestFallocatedRunZeroesTheTailOfItsLastBlock
+
+  - id: run-retries-when-extent-shrinks
+    name: A run retries when its extent shrank before the lock
+    description: When another node truncates the file and a new file takes the freed blocks between planning and the in-place check, the write retries and the new file's data stays intact
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_run_guards_test.go::TestRunRetriesWhenItsExtentShrinks
+
+  - id: snapshot-delete-file-with-tree
+    name: Snapshot delete of a file with an extent tree frees nothing in use
+    description: A fragmented file is snapshotted, overwritten and its snapshot deleted; free blocks return to the start or one tree node above, and with reserves off later allocations leave both files intact and fsck clean
+    priority: medium
+    environments:
+      go: snapshot_tree_test.go::TestSnapshotDeleteOfAFileWithATree
+      docker: TODO
+      vm: TODO
+
+  - id: clear-unwritten-range
+    name: ClearUnwrittenRange stops at the end of the unwritten extent
+    description: Clearing 3 blocks inside an 8-block unwritten extent marks 3, clearing 10 near its end marks 2, and clearing written blocks marks none
+    priority: go_only
+    environments:
+      go: internal/extent/tree_test.go::TestClearUnwrittenRangeStopsAtTheExtentEnd
+
   - id: tree-nodes-at-small-blocks
     name: Extent tree nodes stay at least 64 KB at small block sizes
     description: At 8 KB blocks a file holds 20,000 scattered extents, past the 15,876 that half-block nodes allowed; each node is an aligned run of 8 blocks, and truncating to 0 frees every one of them
@@ -4195,6 +4260,13 @@ scenarios:
     environments:
       go: internal/lock/slots_fuzz_test.go::FuzzLockRow
 
+  - id: fuzz-adopted-turns
+    name: Fuzz two replays sharing a record
+    description: Two nodes that adopted any disjoint sets of dead slots holding one record take turns by their lowest adopted slot, with or without an owner view, and never both wait
+    priority: go_only
+    environments:
+      go: internal/lock/slots_fuzz_test.go::FuzzAdoptedTurns
+
   - id: fuzz-registry-slot
     name: Fuzz node registry slots
     description: A slot decodes only with a valid checksum or when all zero, round-trips, agrees with its lease expiry, and registry reads report no node in the empty slots around it
@@ -5654,12 +5726,117 @@ scenarios:
     environments:
       go: internal/journal/quota_test.go::TestQuotaFoldInTheJournalStandsForTheRecordsBefore
 
-  - id: quota-peer-replay-skips
-    name: A peer's replay applies no quota record
-    description: Replaying a dead journal with quota records succeeds and skips them
+  - id: quota-peer-replay-folds
+    name: A peer's replay folds quota usage before it begins
+    description: Replaying a dead journal passes it to the fold hook with the slot and its node while it is still Dirty, then applies no quota record
     priority: go_only
     environments:
-      go: internal/journal/quota_test.go::TestPeerReplaySkipsQuotaRecords
+      go: internal/journal/quota_test.go::TestPeerReplayFoldsQuotaRecordsFirst
+
+  - id: quota-stop-keeps-unflushed
+    name: Stop keeps a journal with unflushed quota usage dirty
+    description: Stop returns an error and leaves the deltas for a replay to fold
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestStopLeavesUnflushedQuotaForReplay
+
+  - id: quota-pressure-hook
+    name: Quota holds press for a flush before they fill the journal
+    description: The pressure hook runs once the oldest unflushed delta is half a ring behind, and not while no delta waits
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaPressureHookRunsBeforeHoldsFillTheRing
+
+  - id: lock-keep-for-dead-slot
+    name: A fold keeps the quota lock in the dead slot
+    description: KeepFor holds peers off until cleared, a later replay of the slot adopts the claim, and a claim the dead node held stays until its replay releases it
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestKeepForHoldsTheLockInADeadSlot
+
+  - id: lock-adopt-record-in-two-slots
+    name: One node adopts a record held in two dead slots
+    description: A replayer that died holding a record it adopted leaves two dead claims; the node replaying both passes over both and releases each with its own replay
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestOneNodeAdoptsARecordInTwoDeadSlots
+
+  - id: lock-replay-passes-every-adopted-slot
+    name: A replay passes over every slot it adopted a record in
+    description: With the higher adopted slot still failing in the registry, only adoption lets the replay take the record
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAReplayPassesOverEverySlotItAdopted
+
+  - id: lock-adopted-turns-lowest-slot
+    name: Replays sharing a record take turns by their lowest adopted slot
+    description: X adopting slots 1 and 6 goes before Y adopting 3, and Y adopting 3 goes before X adopting 4 and 6
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptedReplaysTakeTurnsByLowestSlot
+
+  - id: quota-flush
+    name: A flush moves the ledger into the quota table
+    description: The table gets the ledger's usage, the quota xattr counts unflushed usage, and a checkpoint passes every delta afterwards
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestQuotaFlushMovesTheLedgerIntoTheTable
+
+  - id: quota-flush-at-unmount
+    name: The last flush empties the ledger
+    description: Stopping the flush loop flushes what is left, and the journal stops clean
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestStoppingTheQuotaFlushEmptiesTheLedger
+
+  - id: quota-fold-after-crash
+    name: Unflushed quota usage is folded after a crash
+    description: The replaying node adds the crashed node's deltas no flush covered to what its flushes wrote
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestUnflushedQuotaUsageIsFoldedAfterACrash
+
+  - id: quota-fold-cut-short
+    name: A fold cut short is redone once
+    description: A fold appended before its writes is written by the next replay, twice-run folds count once, and a completed fold leaves later usage alone
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAQuotaFoldCutShortIsRedoneOnce
+
+  - id: quota-flush-waits-replay
+    name: A flush waits out an adopted quota lock
+    description: While this node keeps a dead node's quota lock for a replay, flushes write nothing; afterwards they do
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestQuotaFlushWaitsOutAdoptedQuotaLock
+
+  - id: quota-fold-keeps-dead-slot-claim
+    name: A replayer dying mid-fold keeps the quota lock in the dead slot
+    description: With the fold in the dead journal but unwritten, the dead slot holds the quota claim; the slot's next replay adopts it, redoes the fold once and frees the lock
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAReplayerDyingMidFoldKeepsTheQuotaLockInTheDeadSlot
+
+  - id: quota-flush-failure-stops-node
+    name: A flush failing after its commit stops the node
+    description: The node stops and keeps the quota lock so no peer writes the table, and the replay of its journal writes the flush
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAFlushFailingAfterItsCommitStopsTheNode
+
+  - id: quota-fold-logged
+    name: A quota fold is logged in the dead journal
+    description: After a fold the dead journal holds a completed fold that owes nothing, and the table has the usage
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_flush_test.go::TestAQuotaFoldIsLoggedInTheDeadJournal
+
+  - id: fsck-salvage-folds-quota
+    name: A salvaging release folds quota usage
+    description: fsck -release-slot -salvage folds the usage the slot's journal owes the quota table
+    priority: go_only
+    environments:
+      go: internal/fsck/slots_test.go::TestReleaseSlotSalvageFoldsQuotaUsage
 
   - id: fence-preempt-statuses
     name: Preempt reads SCSI and NVMe conflicts alike

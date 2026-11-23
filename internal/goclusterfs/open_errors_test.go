@@ -125,7 +125,7 @@ func TestInPlaceWriteRefusesTheNextFileInItsSlot(t *testing.T) {
 	if next.inodeNum != old.inodeNum || physicalBlock(t, fsys, next.inodeNum, 0) != block {
 		t.Fatalf("the new file is inode %d at block %d; the test needs inode %d at block %d", next.inodeNum, physicalBlock(t, fsys, next.inodeNum, 0), old.inodeNum, block)
 	}
-	if err := old.stillWritableInPlace(0, block); !errors.Is(err, syscall.ESTALE) {
+	if err := old.stillWritableInPlace(0, block, 1); !errors.Is(err, syscall.ESTALE) {
 		t.Errorf("in-place check for the old file's node: %v, want ESTALE", err)
 	}
 	checkAt(t, next, pattern(2, 4096), 0)

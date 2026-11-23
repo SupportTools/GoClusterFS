@@ -333,31 +333,40 @@ func contiguousRuns(logicalBlock uint64, blocks []uint64, flags uint32) []Extent
 // the extent so its other blocks still read as zeros. Called on first write to
 // the block. Returns true if the block was unwritten, false if already written.
 func (m *Manager) ClearUnwritten(ctx context.Context, ino *inode.Inode, logicalBlock uint64) (bool, error) {
-	ext, _, err := m.Lookup(ino, logicalBlock)
+	n, err := m.ClearUnwrittenRange(ctx, ino, logicalBlock, 1)
+	return n > 0, err
+}
+
+// ClearUnwrittenRange marks up to n blocks from logicalBlock as written, as far
+// as the unwritten extent that holds logicalBlock reaches, and returns how many
+// it marked: 0 if that block is already written.
+func (m *Manager) ClearUnwrittenRange(ctx context.Context, ino *inode.Inode, logicalBlock, n uint64) (uint64, error) {
+	ext, off, err := m.Lookup(ino, logicalBlock)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	if ext.Flags&FlagUnwritten == 0 {
-		return false, nil
+		return 0, nil
 	}
+	n = min(n, ext.Length-off)
 	e, err := m.edit(ctx, ino)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	removed, err := e.removeRange(logicalBlock, logicalBlock+1)
+	removed, err := e.removeRange(logicalBlock, logicalBlock+n)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	block := removed[0]
-	block.Flags &^= FlagUnwritten
-	if err := e.insert(block); err != nil {
-		return false, err
+	run := removed[0]
+	run.Flags &^= FlagUnwritten
+	if err := e.insert(run); err != nil {
+		return 0, err
 	}
 	if err := e.commit(); err != nil {
-		return false, err
+		return 0, err
 	}
-	ino.WrittenBlocks++
-	return true, nil
+	ino.WrittenBlocks += n
+	return n, nil
 }
 
 // FreeExtent frees the physical blocks for the extent containing logicalBlock.
