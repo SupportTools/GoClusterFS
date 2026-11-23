@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	blockSize = 1 << 20
+	blockSize = 1 << 20 // the unit of the budget and of write sizes, whatever the volume's block size
 	maxFile   = 8 << 20
 	// anyErrno is the expected result of an operation that must fail, with any errno.
 	anyErrno = -2
@@ -247,7 +247,7 @@ func (m *Model) apply(op *Op) {
 	}
 }
 
-// blocks estimates the data blocks the model holds, counting each snapshot as a full copy.
+// blocks estimates the MB the model holds, counting each snapshot as a full copy.
 func (m *Model) blocks() int64 {
 	var n int64
 	counted := map[*File]bool{}
