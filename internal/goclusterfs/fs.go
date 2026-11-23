@@ -1018,9 +1018,48 @@ func injectedMkdirFailure() error {
 }
 
 // logExtentFree records that the operation cuts ino to newSize and frees its blocks past it, so that replay can
-// finish that if the operation's inode write never landed.
-func logExtentFree(txn *journal.Transaction, ino *inode.Inode, newSize uint64) error {
-	return txn.LogExtentFree(&journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration, Size: newSize})
+// finish that if the operation's inode write never landed, and takes them off ino's project. It returns how many.
+func (f *FS) logExtentFree(txn *journal.Transaction, ino *inode.Inode, newSize uint64) (int64, error) {
+	blocks, err := f.blocksPast(ino, newSize)
+	if err == nil {
+		err = f.chargeQuota(txn, ino.ProjectID, -blocks, 0)
+	}
+	if err == nil {
+		err = txn.LogExtentFree(&journal.ExtentFreePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: ino.MetaGeneration, Size: newSize})
+	}
+	return blocks, err
+}
+
+// logInodeFree records that the operation frees inode ino, at MetaGeneration gen, with its blocks, and takes them and
+// the inode off its project. It returns how many blocks.
+func (f *FS) logInodeFree(txn *journal.Transaction, ino *inode.Inode, gen uint64) (int64, error) {
+	blocks, err := f.logExtentFree(txn, ino, 0)
+	if err == nil {
+		err = f.chargeQuota(txn, ino.ProjectID, 0, -1)
+	}
+	if err == nil {
+		err = txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: uint64(ino.InodeNum), MetaGeneration: gen})
+	}
+	return blocks, err
+}
+
+// blocksPast counts the blocks ino maps at or past size, which cutting it to size frees.
+func (f *FS) blocksPast(ino *inode.Inode, size uint64) (int64, error) {
+	if size == 0 || f.quotaInode == 0 || ino.ProjectID == 0 {
+		return int64(ino.AllocatedBlocks), nil
+	}
+	exts, err := f.extentMgr.ListExtents(ino)
+	if err != nil {
+		return 0, err
+	}
+	first := f.extentMgr.BlocksForSize(size)
+	var n uint64
+	for _, x := range exts {
+		if end := x.LogicalBlock + x.Length; end > first {
+			n += end - max(x.LogicalBlock, first)
+		}
+	}
+	return int64(min(n, ino.AllocatedBlocks)), nil
 }
 
 // freeSlotGeneration returns the MetaGeneration of a free inode slot. A create logs it so that replay can tell whether
@@ -1103,6 +1142,14 @@ func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid, proje
 	return f.journal.Commit(txn)
 }
 
+// createBlocks is how many blocks a create maps: a directory's first block, or a long symlink target's.
+func createBlocks(entryType journal.DirEntryType, link *journal.SymlinkTargetPayload) int64 {
+	if entryType == journal.DirEntryDirectory || link != nil && link.DiskBlock != 0 {
+		return 1
+	}
+	return 0
+}
+
 // createTxn builds the transaction that creates inode num, with link's target when it is a symlink, and names it.
 func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid, project uint32, entryType journal.DirEntryType, link *journal.SymlinkTargetPayload) (*journal.Transaction, error) {
 	txn := f.journal.Begin()
@@ -1116,6 +1163,9 @@ func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid, proje
 		ProjectID:      project,
 		MetaGeneration: f.freeSlotGeneration(num),
 	})
+	if err == nil {
+		err = f.chargeQuota(txn, project, createBlocks(entryType, link), 1)
+	}
 	if err == nil && link != nil {
 		err = txn.LogSymlinkTarget(link)
 	}
@@ -1233,6 +1283,14 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	uid, gid, _ := f.newOwner(ctx, dirIno)
 	project := childProject(dirIno)
 
+	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
+	// so replay can no longer finish the create it undoes.
+	var takeBack func()
+	defer func() {
+		if takeBack != nil {
+			takeBack()
+		}
+	}()
 	if f.journal != nil {
 		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, project, journal.DirEntryRegular)
 		if err != nil {
@@ -1246,9 +1304,11 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	}
 
 	// Claiming before naming means a crash in between leaks an unnamed inode, not a name for a free slot.
+	uncharge := func() { takeBack = func() { f.commitCharge(project, 0, -1) } }
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
+		uncharge()
 		return nil, claimErrno(err)
 	}
 	// Counted before the name appears: a peer may unlink it at once, and this node must hold the file for its caller.
@@ -1266,6 +1326,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		logging.Debugf("Create %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
 		f.addOpen(childIno.InodeNum, -1)
 		f.freeNewInode(ctx, childIno.InodeNum)
+		uncharge()
 		return nil, syscall.EIO
 	}
 	if afterCommit != nil {
@@ -1276,6 +1337,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		logging.Debugf("Create %q: dirMgr.Add failed: %v", name, err)
 		f.addOpen(childIno.InodeNum, -1)
 		f.freeNewInode(ctx, childIno.InodeNum)
+		uncharge()
 		return nil, nameErrno(err)
 	}
 	if afterCommit != nil {
@@ -1322,6 +1384,14 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	}
 	project := childProject(dirIno)
 
+	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
+	// so replay can no longer finish the create it undoes.
+	var takeBack func()
+	defer func() {
+		if takeBack != nil {
+			takeBack()
+		}
+	}()
 	if f.journal != nil {
 		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, project, journal.DirEntryDirectory)
 		if err != nil {
@@ -1334,9 +1404,11 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		}
 	}
 
+	uncharge := func() { takeBack = func() { f.commitCharge(project, -1, -1) } }
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Mkdir %q: ClaimSlot %d failed: %v", name, inodeNum, err)
+		uncharge()
 		return nil, claimErrno(err)
 	}
 	now := time.Now().UnixNano()
@@ -1351,6 +1423,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err := f.dirMgr.InitDirectory(ctx, childIno, uint64(parentNum)); err != nil {
 		logging.Debugf("Mkdir %q: InitDirectory failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
+		uncharge()
 		return nil, syscall.EIO
 	}
 	err = injectedMkdirFailure()
@@ -1360,6 +1433,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err != nil {
 		logging.Debugf("Mkdir %q: Write inode failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
+		uncharge()
 		return nil, syscall.EIO
 	}
 	if afterCommit != nil {
@@ -1372,6 +1446,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	}); err != nil {
 		logging.Debugf("Mkdir %q: dirMgr.Add failed: %v", name, err)
 		f.dropNewInode(ctx, childIno)
+		uncharge()
 		return nil, nameErrno(err)
 	}
 	f.cacheInode(childIno)
@@ -1803,6 +1878,15 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
 	var intentSeq uint64
+	var freedBlocks int64
+	// A free that did not happen gives back its charge after the deferred closeIntent, so replay can no longer free.
+	kept := false
+	defer func() {
+		if kept && willFreeInode && intentSeq != 0 {
+			d.fs.commitCharge(childIno.ProjectID, freedBlocks, 1)
+		}
+	}()
+	keepCharge := func() { kept = true }
 	if d.fs.journal != nil {
 		txn = d.fs.journal.Begin()
 
@@ -1824,18 +1908,8 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 			return syscall.EIO
 		}
 
-		// If link count will become 0, log inode deletion and extent freeing
 		if willFreeInode {
-			if err := logExtentFree(txn, childIno, 0); err != nil {
-				d.fs.journal.Abort(txn)
-				return syscall.EIO
-			}
-
-			// Log inode deletion
-			if err := txn.LogInodeDelete(&journal.InodeDeletePayload{
-				InodeNum:       uint64(childInodeNum),
-				MetaGeneration: childIno.MetaGeneration,
-			}); err != nil {
+			if freedBlocks, err = d.fs.logInodeFree(txn, childIno, childIno.MetaGeneration); err != nil {
 				d.fs.journal.Abort(txn)
 				return syscall.EIO
 			}
@@ -1893,12 +1967,16 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 	})
 	switch {
 	case err != nil:
+		keepCharge()
 		return nameErrno(err)
 	case readFailed:
+		keepCharge()
 		return syscall.EIO
 	case changed:
+		keepCharge()
 		return syscall.EAGAIN
 	case !removed:
+		keepCharge()
 		return syscall.ENOENT
 	}
 	if afterCommit != nil {
@@ -1915,8 +1993,10 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 		// Free the inode first: once it is gone, replaying this unlink's ExtentFree cannot free the blocks a second time.
 		if err != nil {
 			log.Printf("[WARN] removeEntry %q: inode %d not freed, keeping its blocks: %v", name, childInodeNum, err)
+			keepCharge()
 		} else if !ok {
 			log.Printf("[WARN] removeEntry %q: directory inode %d changed after its name was removed, keeping it", name, childInodeNum)
+			keepCharge()
 		} else {
 			if afterCommit != nil {
 				afterCommit("unlink: inode freed")
@@ -2536,6 +2616,15 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	var cowDone []*extent.CoWResult
 	// How many of allocatedExtents and cowDone a mid-write persist already put on disk.
 	committedAllocs, committedCoW := 0, 0
+	// How many of allocatedExtents the file's project was charged for.
+	chargedAllocs := 0
+	newAllocBlocks := func(from int) int64 {
+		var n int64
+		for _, alloc := range allocatedExtents[from:] {
+			n += int64(alloc.count)
+		}
+		return n
+	}
 	// No inode write may map these until their use is logged.
 	var reserveOut []uint64
 	var intents []uint64
@@ -2614,9 +2703,15 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				f.fs.extentMgr.DiscardPending(ctx, ino)
 				return err
 			}
+			charged := newAllocBlocks(chargedAllocs)
+			f.fs.commitCharge(ino.ProjectID, charged, 0)
+			chargedAllocs = len(allocatedExtents)
 			copiesMayBeOnDisk = true
 			if err := f.fs.inodeTbl.WriteWithLockHeld(ino); err != nil {
 				logging.Debugf("Write inode %d: persisting inode before unlocking failed: %v", f.inodeNum, err)
+				if errors.Is(err, extent.ErrTreeConflict) {
+					f.fs.commitCharge(ino.ProjectID, -charged, 0)
+				}
 				releaseInodeLock()
 				f.fs.extentMgr.DiscardPending(ctx, ino)
 				return retryOnTreeConflict(err)
@@ -3111,6 +3206,10 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 
+		if err := f.fs.chargeQuota(txn, ino.ProjectID, newAllocBlocks(chargedAllocs), 0); err != nil {
+			return 0, syscall.EIO
+		}
+
 		// Log inode update (size and mtime)
 		mask := journal.InodeUpdateMtime
 		if newSize != ino.Size {
@@ -3181,6 +3280,22 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		return unused
 	}
+	// freedAllocs counts the blocks among unused that this write allocated, which its charge counted.
+	freedAllocs := func(unused []uint64) int64 {
+		allocated := map[uint64]bool{}
+		for _, alloc := range allocatedExtents[committedAllocs:] {
+			for i := uint64(0); i < uint64(alloc.count); i++ {
+				allocated[alloc.physicalBlock+i] = true
+			}
+		}
+		var n int64
+		for _, b := range unused {
+			if allocated[b] {
+				n++
+			}
+		}
+		return n
+	}
 	writeFailed := func(err error) error {
 		conflict := errors.Is(err, extent.ErrTreeConflict)
 		var unused []uint64
@@ -3206,6 +3321,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		if !conflict {
 			f.fs.freeUnused(ctx, f.inodeNum, unused...)
+			f.fs.commitCharge(ino.ProjectID, -freedAllocs(unused), 0)
 			cowDone = cowDone[:committedCoW]
 			return syscall.EIO
 		}
@@ -3213,6 +3329,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if err := f.fs.extentMgr.FreePhysicalBlock(ctx, b); err != nil {
 				logging.Debugf("Write inode %d: freeing block %d after tree conflict failed: %v", f.inodeNum, b, err)
 			}
+		}
+		if intentSeq > 0 {
+			f.fs.commitCharge(ino.ProjectID, -newAllocBlocks(committedAllocs), 0)
 		}
 		// The retry finds these blocks already copied, so release the old ones now.
 		releaseCopied(cowDone[:committedCoW])
@@ -3591,12 +3710,21 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 	// === WAL: Begin transaction and log intent ===
 	var txn *journal.Transaction
 	var intentSeq uint64
+	var cutBlocks int64
+	// A truncate that failed after its commit gives back its charge after the deferred closeIntent.
+	truncateFailed := false
+	defer func() {
+		if truncateFailed {
+			f.fs.commitCharge(ino.ProjectID, cutBlocks, 0)
+		}
+	}()
 	if f.fs.journal != nil && mask != 0 {
 		txn = f.fs.journal.Begin()
 
 		if truncating && blocksToFree > 0 {
 			newSize, _ := in.GetSize()
-			if err := logExtentFree(txn, ino, newSize); err != nil {
+			var err error
+			if cutBlocks, err = f.fs.logExtentFree(txn, ino, newSize); err != nil {
 				f.fs.journal.Abort(txn)
 				return syscall.EIO, nil
 			}
@@ -3629,6 +3757,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 		if sz < ino.Size {
 			// Truncate
 			if err := f.fs.extentMgr.Truncate(ctx, ino, sz); err != nil {
+				truncateFailed = true
 				return syscall.EIO, nil
 			}
 		}
@@ -3668,6 +3797,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 				if err := f.fs.journal.CompleteIntent(intentSeq); err != nil {
 					log.Printf("[WARN] Setattr inode %d: closing intent %d before the retry failed: %v", f.inodeNum, intentSeq, err)
 				}
+				f.fs.commitCharge(ino.ProjectID, cutBlocks, 0)
 			}
 			return 0, err
 		}
@@ -3829,10 +3959,12 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 	ino.Ctime = now
 	ino.MetaGeneration++
 
-	// Write updated inode
+	// No record maps the new blocks, so their charge commits before the write that does.
+	f.fs.commitCharge(ino.ProjectID, int64(len(newBlocks)), 0)
 	if err := f.fs.inodeTbl.Write(ctx, ino); err != nil {
 		logging.Debugf("Allocate inode %d: write inode failed: %v", f.inodeNum, err)
 		if errors.Is(err, extent.ErrTreeConflict) {
+			f.fs.commitCharge(ino.ProjectID, -int64(len(newBlocks)), 0)
 			return 0, err
 		}
 		committed = true // the inode on disk may already map newBlocks

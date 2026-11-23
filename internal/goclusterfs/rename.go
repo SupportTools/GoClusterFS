@@ -144,6 +144,13 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 		log.Printf("[WARN] rename %q to %q failed after its commit; leaving intent %d for replay: %v", oldName, newName, intentSeq, err)
 		return syscall.EIO
 	}
+	// A replaced directory left unfreed gives back its charge after the deferred closeIntent, so replay cannot free it.
+	var kept *inode.Inode
+	defer func() {
+		if kept != nil {
+			f.commitCharge(kept.ProjectID, int64(kept.AllocatedBlocks), 1)
+		}
+	}()
 	if intentSeq != 0 {
 		defer f.closeIntent(intentSeq)
 	}
@@ -166,7 +173,9 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 	switch {
 	case r.Target == nil:
 	case op.TargetIsDir:
-		f.freeReplacedDir(ctx, r.Target)
+		if !f.freeReplacedDir(ctx, r.Target) {
+			kept = r.Target
+		}
 	default:
 		if err := f.dropLink(ctx, r.Target.InodeNum, live); err != nil {
 			log.Printf("[WARN] rename over %q: link of inode %d not dropped: %v", newName, r.Target.InodeNum, err)
@@ -199,9 +208,7 @@ func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, 
 	switch {
 	case err != nil || r.Target == nil:
 	case op.TargetIsDir:
-		if err = logExtentFree(txn, r.Target, 0); err == nil {
-			err = txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: uint64(r.Target.InodeNum), MetaGeneration: r.Target.MetaGeneration})
-		}
+		_, err = f.logInodeFree(txn, r.Target, r.Target.MetaGeneration)
 	default:
 		err = txn.LogLinkDrop(&journal.LinkDropPayload{InodeNum: uint64(r.Target.InodeNum), MetaGeneration: r.Target.MetaGeneration})
 	}
@@ -212,8 +219,9 @@ func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, 
 	return f.journal.Commit(txn)
 }
 
-// freeReplacedDir frees an empty directory a rename replaced, unless it changed since the rename checked it.
-func (f *FS) freeReplacedDir(ctx context.Context, target *inode.Inode) {
+// freeReplacedDir frees an empty directory a rename replaced, unless it changed since the rename checked it, and
+// reports whether it did.
+func (f *FS) freeReplacedDir(ctx context.Context, target *inode.Inode) bool {
 	var freed *inode.Inode
 	ok, err := f.inodeTbl.FreeIf(ctx, target.InodeNum, func(ino *inode.Inode) bool {
 		freed = ino
@@ -222,8 +230,10 @@ func (f *FS) freeReplacedDir(ctx context.Context, target *inode.Inode) {
 	switch {
 	case err != nil:
 		log.Printf("[WARN] rename: replaced directory inode %d not freed, keeping its blocks: %v", target.InodeNum, err)
+		return false
 	case !ok:
 		log.Printf("[WARN] rename: replaced directory inode %d changed after it lost its name, keeping it", target.InodeNum)
+		return false
 	default:
 		f.invalidateInode(target.InodeNum)
 		if err := f.extentMgr.Delete(ctx, freed); err != nil {
@@ -233,6 +243,7 @@ func (f *FS) freeReplacedDir(ctx context.Context, target *inode.Inode) {
 			afterCommit("rename: target freed")
 		}
 	}
+	return true
 }
 
 func entryTypeOf(ftype uint8) journal.DirEntryType {

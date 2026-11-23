@@ -12,6 +12,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fs"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/quota"
 )
 
@@ -29,9 +30,43 @@ var (
 // limits count, and the quota lock this node's replays share; num 0, the default, leaves quotas off.
 func (f *FS) SetQuotaTable(num uint32, blockSize uint64, guard *quota.Guard) {
 	f.quotaInode, f.quotaBlockSize, f.quotaGuard = num, blockSize, guard
+	if f.dirMgr != nil {
+		f.dirMgr.SetCharge(func(project uint32, blocks int64) { f.commitCharge(project, blocks, 0) })
+	}
 }
 
 func (f *FS) dataBlockSize() uint64 { return f.quotaBlockSize }
+
+// chargeQuota logs a change to project's usage into txn, the transaction whose replay makes the change happen.
+func (f *FS) chargeQuota(txn *journal.Transaction, project uint32, blocks, inodes int64) error {
+	if project == 0 || f.quotaInode == 0 || blocks == 0 && inodes == 0 {
+		return nil
+	}
+	return txn.LogQuotaDelta(&journal.QuotaDeltaPayload{Project: project, Blocks: blocks, Inodes: inodes})
+}
+
+// commitCharge commits a change to project's usage in a transaction of its own: for a change no replayable record
+// makes, committed before the write that makes it, or to take back what a failed operation charged. A failed commit
+// leaves the usage off until goclusterfs-fsck -repair recounts it.
+func (f *FS) commitCharge(project uint32, blocks, inodes int64) {
+	if f.journal == nil || project == 0 || f.quotaInode == 0 || blocks == 0 && inodes == 0 {
+		return
+	}
+	txn := f.journal.Begin()
+	err := f.chargeQuota(txn, project, blocks, inodes)
+	var seq uint64
+	if err == nil {
+		seq, err = f.journal.Commit(txn)
+	}
+	if err == nil {
+		err = f.journal.CompleteIntent(seq)
+	} else {
+		f.journal.Abort(txn)
+	}
+	if err != nil {
+		log.Printf("[WARN] quota: logging %+d blocks and %+d inodes of project %d failed: %v; its usage stays off until goclusterfs-fsck -repair", blocks, inodes, project, err)
+	}
+}
 
 // childProject is the project a new inode in directory dir takes.
 func childProject(dir *inode.Inode) uint32 {

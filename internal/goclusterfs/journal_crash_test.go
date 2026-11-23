@@ -19,7 +19,12 @@ import (
 // journaledFS opens a formatted image with a root directory and a journal in slot 0's region.
 func journaledFS(t *testing.T) (fsys *FS, path string, offset, size uint64) {
 	t.Helper()
-	path = newFormattedImage(t)
+	return journaledImage(t, newFormattedImage(t))
+}
+
+// journaledImage is journaledFS on the formatted image at path.
+func journaledImage(t *testing.T, path string) (fsys *FS, _ string, offset, size uint64) {
+	t.Helper()
 	fsys = openFormattedFS(t, path)
 	if err := fsys.InitRoot(context.Background()); err != nil {
 		t.Fatal(err)
