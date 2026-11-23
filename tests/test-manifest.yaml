@@ -394,6 +394,15 @@ scenarios:
     environments:
       go: internal/goclusterfs/write_run_guards_test.go::TestRunRetriesWhenItsExtentShrinks
 
+  - id: snapshot-delete-file-with-tree
+    name: Snapshot delete of a file with an extent tree frees nothing in use
+    description: A fragmented file is snapshotted, overwritten and its snapshot deleted; free blocks return to the start or one tree node above, and with reserves off later allocations leave both files intact and fsck clean
+    priority: medium
+    environments:
+      go: snapshot_tree_test.go::TestSnapshotDeleteOfAFileWithATree
+      docker: TODO
+      vm: TODO
+
   - id: clear-unwritten-range
     name: ClearUnwrittenRange stops at the end of the unwritten extent
     description: Clearing 3 blocks inside an 8-block unwritten extent marks 3, clearing 10 near its end marks 2, and clearing written blocks marks none

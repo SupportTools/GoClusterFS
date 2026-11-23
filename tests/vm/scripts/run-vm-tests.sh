@@ -5325,19 +5325,22 @@ test_clone_in_place_write() {
 }
 
 # Snapshots a 2 MB file, overwrites all of it, then deletes the snapshot.
-# The delete must finish and give back exactly the blocks only the snapshot
-# held.
+# The delete must finish and give back the blocks only the snapshot held. When
+# earlier tests left free space fragmented, the file starts with an extent tree,
+# and its contiguous copies can make that tree's node free too.
 test_snapshot_delete_after_overwrite() {
     log_info "Testing snapshot delete after overwrite..."
     ensure_cluster_healthy 2
 
     local file=/mnt/goclusterfs/snap_delete.bin
-    local free_before free_now blocks
+    local free_before free_now bs blocks node_blocks
 
     ssh_run 1 "rm -f $file"
     ssh_run 1 "head -c 2097152 /dev/urandom > $file" || return 1
     sleep "$RESERVE_IDLE_RETURN_SECS"
-    blocks=$((2097152 / $(ssh_run 1 "stat -f -c %S /mnt/goclusterfs")))
+    bs=$(ssh_run 1 "stat -f -c %S /mnt/goclusterfs")
+    blocks=$((2097152 / bs))
+    node_blocks=$(( (bs > 65536 ? bs : 65536) / bs ))
     free_before=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
     ssh_run 1 "setfattr -n user.snapshot -v snap_delete_temp $file" || {
         log_error "snapshot failed"
@@ -5364,8 +5367,8 @@ test_snapshot_delete_after_overwrite() {
         sleep 0.1
     done
     free_now=$(ssh_run 1 "stat -f -c %f /mnt/goclusterfs")
-    if [ "$free_now" -ne "$free_before" ]; then
-        log_error "$free_now free blocks after deleting the snapshot, want $free_before"
+    if [ "$free_now" -ne "$free_before" ] && [ "$free_now" -ne $((free_before + node_blocks)) ]; then
+        log_error "$free_now free blocks after deleting the snapshot, want $free_before, or $((free_before + node_blocks)) with the file's tree node"
         return 1
     fi
     md5_on_vm_matches 1 "$file" "$(ssh_run 1 "md5sum < /tmp/snap_new | cut -d' ' -f1")" || return 1
