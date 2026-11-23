@@ -338,6 +338,13 @@ scenarios:
     environments:
       go: internal/superblock/block_size_test.go::TestFormatRefusesOtherBlockSizes
 
+  - id: extent-lock-covers-megabyte
+    name: An extent lock covers 1 MB of the data region
+    description: At 8 KB blocks a peer holding the extent lock of one block holds off an in-place write to another block of the same megabyte; at 1 MB blocks the key is the block number, as before
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestExtentLockCoversAMegabyte
+
   - id: tree-nodes-at-small-blocks
     name: Extent tree nodes stay at least 64 KB at small block sizes
     description: At 8 KB blocks a file holds 20,000 scattered extents, past the 15,876 that half-block nodes allowed; each node is an aligned run of 8 blocks, and truncating to 0 frees every one of them
