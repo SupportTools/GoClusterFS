@@ -86,7 +86,7 @@ func main() {
 		mountPoint = flag.String("mount", "", "Directory to mount the filesystem on; required")
 		format     = flag.Bool("format", false, "Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first")
 		blockSize  = flag.Uint64("block-size", superblock.MaxBlockSize,
-			fmt.Sprintf("With -format: data block size in bytes, a power of two from %d to %d; fixed until the next format. 8192 or 16384 for volumes of small files, 65536 for mixed ones, 1048576 for VM disks and large files", superblock.MinBlockSize, superblock.MaxBlockSize))
+			fmt.Sprintf("With -format: data block size in bytes, a power of two from %d to %d; fixed until the next format. 8192 or 16384 for volumes of small files, 65536 for mixed ones, 1048576 for VM disks and large files. Sizes below 1048576 are experimental: at 8192, fsck needs about 1.6 GB of memory per 100 GB, and 128 KB overwrites run at a quarter of the 1 MB speed", superblock.MinBlockSize, superblock.MaxBlockSize))
 		inodeRatio = flag.Uint64("bytes-per-inode", 0,
 			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes); fixed until the next format. 0 picks one per block at 1 MB blocks, and max(2 × block size, 16 KB) below", superblock.MinInodes, superblock.MaxInodes))
 		debug      = flag.Bool("debug", false, "Print [DEBUG] log lines")
@@ -131,7 +131,7 @@ func main() {
 		trimMaxAge    = flag.Duration("trim-age", 5*time.Second, "Longest a freed block waits for its discard")
 
 		// SFB configuration (Sub-File Block containers for small files)
-		_ = flag.Bool("sfb", true, "Ignored: SFB containers are disabled, and every file uses full 1MB blocks")
+		_ = flag.Bool("sfb", true, "Ignored: SFB containers are disabled, and every file uses full blocks")
 
 		// Snapshot configuration
 		snapshotsEnabled = flag.Bool("snapshots", true, "File snapshots and clones through extended attributes (user.snapshot, user.clone)")
@@ -317,7 +317,7 @@ func main() {
 	inodeCount := sb.InodeCount
 
 	log.Printf("Layout: v%d, %d data blocks (%d MB), %d inodes, %d node slots",
-		sb.Version, totalBlocks, totalBlocks, inodeCount, sb.MaxNodes)
+		sb.Version, totalBlocks, totalBlocks*uint64(sb.BlockSize)>>20, inodeCount, sb.MaxNodes)
 
 	ctx := context.Background()
 
@@ -539,7 +539,7 @@ func main() {
 		log.Println("TRIM: disabled")
 	}
 
-	log.Println("SFB: disabled (-sfb is ignored); new files use full 1MB blocks, and files older builds stored in SFB slots move to full blocks on their next write")
+	log.Println("SFB: disabled (-sfb is ignored); new files use full blocks, and files older builds stored in SFB slots move to full blocks on their next write")
 
 	// Create filesystem with journal, TRIM, and refcount for crash consistency
 	gfs := goclusterfs.NewWithComponents(dev, bm, inodeTbl, extentMgr, dirMgr, cacheMgr, j, trimMgr, nil, refcountReg, lockMgr, nodeUUID, dataOffset)

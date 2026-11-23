@@ -29,7 +29,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 
 - **Linux only.** GoClusterFS needs FUSE and O_DIRECT.
 - **Rename takes one flag.** `RENAME_NOREPLACE` works; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`.
-- **Every file with data uses at least one full block.** Blocks are 1 MB unless `-format -block-size` picks a power of two from 8 KB, which the volume keeps. Small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
+- **Every file with data uses at least one full block.** Blocks are 1 MB unless `-format -block-size` picks a power of two from 8 KB, which the volume keeps. Sizes below 1 MB are experimental: at 8 KB, fsck needs about 1.6 GB of memory per 100 GB, and a 512 MB overwrite with 128 KB writes ran at 57 MB/s against 263 at 1 MB. See [Block Size](docs/OPERATIONS.md#block-size). Small-file packing (SFB) is disabled since [#12](https://github.com/SupportTools/GoClusterFS/pull/12), so `-sfb` has no effect.
 - **`ls -l` of a large directory is slow.** Each lookup reads two inodes from disk, about 0.3 ms on our test host, and `ls -l` repeats its lookups once it runs longer than `-attr-timeout`. In one test, `ls -l` took 0.14 s on 1,000 files and 14 s on 10,000.
 - **Other nodes' changes can show up late.** The kernel caches file attributes and directory entries for `-attr-timeout` (default 1s). For that long, `stat` and `ls` can show another node's file with its old size and mtime. A file that stays open can use the old size and block mappings for about twice `-attr-timeout`. Opening the file again reads the current data. See [Cache Flags](docs/API-CONFIG.md#cache-flags).
 - **On-disk format version 3.** Mount refuses images formatted by earlier builds, including version 3 images formatted before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) gave each lock type its own lock records. Copy the data off with the build that formatted the image, reformat, and copy it back.
@@ -103,7 +103,7 @@ These are the `goclusterfs-mount` flags. Run `./goclusterfs-mount -h` for the fu
 | `-device` | (required) | Path to block device or image file |
 | `-mount` | (required) | Mount point directory (must exist) |
 | `-format` | `false` | Erase the device, create an empty filesystem, then mount it. Does not check for other nodes: unmount every node first |
-| `-block-size` | `1048576` | With `-format`: data block size, a power of two from 8192 to 1048576 |
+| `-block-size` | `1048576` | With `-format`: data block size, a power of two from 8192 to 1048576; below 1048576 experimental |
 | `-bytes-per-inode` | `0` | With `-format`: one inode per this many bytes of device (4096 to 16,777,216 inodes); 0 picks one per block at 1 MB blocks and max(2 × block size, 16 KB) below |
 | `-debug` | `false` | Print `[DEBUG]` log lines: file operations, locks, allocation |
 | `-fuse-debug` | `false` | Log every FUSE request and reply |
