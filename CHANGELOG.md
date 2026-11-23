@@ -88,6 +88,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Writes handle contiguous blocks as one run instead of block by block. An overwrite of blocks one extent maps takes one in-place check, one extent lock per megabyte and one device write; new blocks that follow each other on the device are written together; and a first write into `fallocate`d blocks clears the whole range it covers at once. At 8 KB blocks, a 512 MB overwrite with 128 KB writes went from 57 to 257 MB/s on a tmpfs-backed volume, the same as at 1 MB, and writing into a `fallocate`d 512 MB file from 43 to 456 MB/s.
 - `goclusterfs-fsck` tracks blocks in a bitset and one byte per block instead of maps. On a 100 GB volume at 8 KB blocks with 90 GB allocated, a check takes 3.2 s and 39 MB of memory instead of 23 s and 1.6 GB.
 - `statfs` (`df`) no longer reads the whole inode table on every call. It returns a free-inode count that this node's creates and removes adjust at once, and that a background scan refreshes once it is older than 30 times the last scan took, at least a second. Other nodes' creates and removes show up late by that much. At 16 KB per inode the table of a 100 GB volume is 1.6 GB. `statfs` also reads the block bitmap 1 MB at a time instead of 4 KB.
 - `-block-reserve` defaults to 64 MB of blocks instead of 64 blocks: 64 at 1 MB, 8192 at 8 KB. Pass a number of blocks to choose another size, as before.
