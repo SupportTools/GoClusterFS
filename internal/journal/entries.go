@@ -49,6 +49,11 @@ const (
 	TxnOpSnapshotCreate TxnOpType = 0x0600
 	TxnOpSnapshotDelete TxnOpType = 0x0601
 	TxnOpRefCountUpdate TxnOpType = 0x0602
+
+	// Quota usage (0x07xx)
+	TxnOpQuotaDelta TxnOpType = 0x0700
+	TxnOpQuotaFlush TxnOpType = 0x0701
+	TxnOpQuotaFold  TxnOpType = 0x0702
 )
 
 // String returns a human-readable representation of the operation type.
@@ -100,6 +105,12 @@ func (op TxnOpType) String() string {
 		return "SnapshotDelete"
 	case TxnOpRefCountUpdate:
 		return "RefCountUpdate"
+	case TxnOpQuotaDelta:
+		return "QuotaDelta"
+	case TxnOpQuotaFlush:
+		return "QuotaFlush"
+	case TxnOpQuotaFold:
+		return "QuotaFold"
 	default:
 		return "Unknown"
 	}

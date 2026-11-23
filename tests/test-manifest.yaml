@@ -5481,7 +5481,7 @@ scenarios:
 
   - id: quota-table-encoding
     name: The quota table's header and records round-trip and carry checksums
-    description: The header keeps NextProjectID and every slot's FoldedThroughSeq, neighbouring records share a sector without overwriting each other, and a flipped bit or a wrong magic is refused
+    description: The header keeps NextProjectID, neighbouring records share a sector without overwriting each other, and a flipped bit or a wrong magic is refused
     priority: go_only
     environments:
       go: internal/quota/table_test.go::TestHeaderRoundTrip
@@ -5513,6 +5513,55 @@ scenarios:
     priority: go_only
     environments:
       go: cmd/goclusterfs-fsck/quota_test.go::TestEnableQuotasRefusesWhileANodeRuns
+
+  - id: quota-ledger-flush
+    name: A quota flush covers the deltas committed before it
+    description: The flush built under the journal's lock covers every delta committed before it, and the ledger keeps only later ones
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaFlushCoversTheLedger
+
+  - id: quota-ledger-holds
+    name: Quota holds move to the first delta after a durable flush
+    description: A project's hold stays at its first uncovered delta, moves to the first delta after a durable flush, survives a taken-back delta, and goes once nothing is pending
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaHoldsMoveToTheFirstDeltaAfterAFlush
+
+  - id: quota-hold-checkpoint
+    name: A checkpoint keeps unflushed quota deltas
+    description: Completed deltas no flush covered stay in the journal through a checkpoint, and a flush lets the checkpoint reach the tail
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaHoldKeepsUnflushedDeltasThroughACheckpoint
+
+  - id: quota-replay-read
+    name: Replay reads a journal's unflushed quota records
+    description: Per project the deltas after its last flush count, completed or not, unfinished flushes are listed, and a transaction whose commit failed counts for nothing
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestReadQuotaReplay
+
+  - id: quota-replay-fold
+    name: The quota fold applies only updates that did not land
+    description: An update applies only while usage holds its old value, running deltas add on, usage stops at zero, and unchanged projects are left out
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaReplayFold
+
+  - id: quota-fold-in-journal
+    name: A fold in the journal stands for the quota records before it
+    description: After a fold is appended, a second replay redoes only its writes that did not land, a journal whose replay began reads as folded, and replay passes over the fold
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestQuotaFoldInTheJournalStandsForTheRecordsBefore
+
+  - id: quota-peer-replay-skips
+    name: A peer's replay applies no quota record
+    description: Replaying a dead journal with quota records succeeds and skips them
+    priority: go_only
+    environments:
+      go: internal/journal/quota_test.go::TestPeerReplaySkipsQuotaRecords
 
   - id: fence-preempt-statuses
     name: Preempt reads SCSI and NVMe conflicts alike

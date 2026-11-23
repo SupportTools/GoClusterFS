@@ -121,6 +121,7 @@ type Transaction struct {
 	header  TxnHeader
 	entries []TxnEntry
 	data    []byte // Serialized entries including payloads
+	quota   []quotaChange
 
 	committed bool
 }
@@ -153,11 +154,23 @@ func (txn *Transaction) setSeq(seq uint64) {
 // completionLength is the length of a completion record: a header and the completed intent's seq.
 const completionLength = TxnHeaderSize + 8
 
+// abandonLength is the length of a completion record that also marks its intent abandoned: its commit failed, so
+// its operation never ran. Only transactions with quota records end this way, so builds without quotas never meet it.
+const abandonLength = completionLength + 8
+
+const completionAbandoned uint64 = 1
+
 // completionRecord marks intent intentSeq done. Version 2 journals write it in place of an IntentCompletion, so that
 // it carries the seq and owner every record is checked against.
 func completionRecord(seq uint64, nodeUUID [16]byte, generation, intentSeq uint64) ([]byte, error) {
 	txn := NewTransaction(seq, nodeUUID, generation)
 	txn.data = binary.LittleEndian.AppendUint64(nil, intentSeq)
+	return txn.serialize(TxnTypeIntentComplete)
+}
+
+func abandonRecord(seq uint64, nodeUUID [16]byte, generation, intentSeq uint64) ([]byte, error) {
+	txn := NewTransaction(seq, nodeUUID, generation)
+	txn.data = binary.LittleEndian.AppendUint64(binary.LittleEndian.AppendUint64(nil, intentSeq), completionAbandoned)
 	return txn.serialize(TxnTypeIntentComplete)
 }
 
