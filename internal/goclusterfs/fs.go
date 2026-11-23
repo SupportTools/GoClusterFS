@@ -137,22 +137,24 @@ type FS struct {
 	releaseSlot func()
 
 	// Managers
-	lockMgr     *lock.Manager
-	bitmapMgr   *bitmap.Region
-	inodeTbl    *inode.Table
-	extentMgr   *extent.Manager
-	dirMgr      *dir.Manager
-	cacheMgr    *cache.Manager     // Inode cache for read optimization
-	journal     *journal.Journal   // Per-node journal for crash consistency (WAL)
-	reserve     *reserve.Manager   // this node's batch of data blocks; nil without a journal
-	symlinks    bool               // the volume was formatted with RequiredSymlinks
-	noSymlinks  sync.Once          // warns once that this volume cannot hold symlinks
-	trimMgr     *trim.Manager      // TRIM manager for batched block discards
-	sfbMgr      *sfb.Manager       // SFB manager for small file storage (optional)
-	refcountReg *refcount.Region   // Reference count table for CoW/snapshots (optional)
-	snapshotReg *snapshot.Registry // Snapshot registry for managing snapshot descriptors
-	snapshotWkr *snapshot.Worker   // Background worker for async refcount updates
-	snapshotsUp atomic.Bool        // snapshotReg and snapshotWkr are set, for the failure detector's goroutine
+	lockMgr        *lock.Manager
+	bitmapMgr      *bitmap.Region
+	inodeTbl       *inode.Table
+	extentMgr      *extent.Manager
+	dirMgr         *dir.Manager
+	cacheMgr       *cache.Manager     // Inode cache for read optimization
+	journal        *journal.Journal   // Per-node journal for crash consistency (WAL)
+	reserve        *reserve.Manager   // this node's batch of data blocks; nil without a journal
+	symlinks       bool               // the volume was formatted with RequiredSymlinks
+	noSymlinks     sync.Once          // warns once that this volume cannot hold symlinks
+	trimMgr        *trim.Manager      // TRIM manager for batched block discards
+	sfbMgr         *sfb.Manager       // SFB manager for small file storage (optional)
+	refcountReg    *refcount.Region   // Reference count table for CoW/snapshots (optional)
+	snapshotReg    *snapshot.Registry // Snapshot registry for managing snapshot descriptors
+	snapshotWkr    *snapshot.Worker   // Background worker for async refcount updates
+	snapshotsUp    atomic.Bool        // snapshotReg and snapshotWkr are set, for the failure detector's goroutine
+	quotaInode     uint32             // holds the quota table; 0 when the volume has no quotas
+	quotaBlockSize uint64             // the volume's block size, in which quota usage counts
 
 	// Configuration
 	nodeUUID   [16]byte
@@ -1083,8 +1085,8 @@ func mayAccess(ino *inode.Inode, uid, gid uint32, want uint16) bool {
 }
 
 // logCreate commits the intent to create inode num with mode and to name it in directory parentNum.
-func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32, entryType journal.DirEntryType) (uint64, error) {
-	txn, err := f.createTxn(num, parentNum, name, mode, uid, gid, entryType, nil)
+func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid, project uint32, entryType journal.DirEntryType) (uint64, error) {
+	txn, err := f.createTxn(num, parentNum, name, mode, uid, gid, project, entryType, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -1092,7 +1094,7 @@ func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid uint32
 }
 
 // createTxn builds the transaction that creates inode num, with link's target when it is a symlink, and names it.
-func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid uint32, entryType journal.DirEntryType, link *journal.SymlinkTargetPayload) (*journal.Transaction, error) {
+func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid, project uint32, entryType journal.DirEntryType, link *journal.SymlinkTargetPayload) (*journal.Transaction, error) {
 	txn := f.journal.Begin()
 	err := txn.LogInodeCreate(&journal.InodeCreatePayload{
 		InodeNum:       uint64(num),
@@ -1101,6 +1103,7 @@ func (f *FS) createTxn(num, parentNum uint32, name string, mode, uid, gid uint32
 		GID:            gid,
 		ParentInodeNum: uint64(parentNum),
 		NameHash:       hashString(name),
+		ProjectID:      project,
 		MetaGeneration: f.freeSlotGeneration(num),
 	})
 	if err == nil && link != nil {
@@ -1218,9 +1221,10 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		return nil, syscall.EIO
 	}
 	uid, gid, _ := f.newOwner(ctx, dirIno)
+	project := childProject(dirIno)
 
 	if f.journal != nil {
-		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, journal.DirEntryRegular)
+		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, project, journal.DirEntryRegular)
 		if err != nil {
 			logging.Debugf("Create %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
@@ -1243,6 +1247,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	childIno.Mode = inode.S_IFREG | uint16(mode&0o7777)
 	childIno.UID = uid
 	childIno.GID = gid
+	joinProject(childIno, project)
 	childIno.LinkCount = 1
 	childIno.Atime = now
 	childIno.Mtime = now
@@ -1305,9 +1310,10 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if setgid {
 		perm |= inode.S_ISGID
 	}
+	project := childProject(dirIno)
 
 	if f.journal != nil {
-		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, journal.DirEntryDirectory)
+		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, project, journal.DirEntryDirectory)
 		if err != nil {
 			logging.Debugf("Mkdir %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
@@ -1327,6 +1333,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	childIno.Mode = inode.S_IFDIR | perm
 	childIno.UID = uid
 	childIno.GID = gid
+	joinProject(childIno, project)
 	childIno.LinkCount = 2
 	childIno.Atime = now
 	childIno.Mtime = now
@@ -4072,6 +4079,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		ino.Mode, ino.UID, ino.GID = src.Mode, src.UID, src.GID
 		ino.Mtime, ino.Ctime = src.Mtime, src.Ctime
 		ino.Flags |= inode.FlagSnapshotData
+		ino.ProjectID = src.ProjectID
 	})
 	if err != nil {
 		log.Printf("[snapshot] No inode for the data of a snapshot of inode %d: %v", f.inodeNum, err)
@@ -4191,6 +4199,10 @@ func (f *File) cloneInode(ctx context.Context, srcNum uint32, destPath string, s
 	if err != nil {
 		log.Printf("[clone] Failed to read source inode %d: %v", srcNum, err)
 		return syscall.EIO
+	}
+	if f.fs.crossesProject(srcIno, rootIno) {
+		log.Printf("[clone] Inode %d counts against quota project %d, and its clone would land outside it", srcNum, srcIno.ProjectID)
+		return syscall.EXDEV
 	}
 
 	mode, uid, gid := srcIno.Mode, srcIno.UID, srcIno.GID
