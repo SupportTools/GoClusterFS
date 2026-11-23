@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"syscall"
+	"time"
 )
 
 var (
@@ -254,8 +256,24 @@ func (p *PR) reserveIfNone() error {
 
 // KeepReserved reserves the device again if it holds no reservation while this node's key is registered, and reports
 // whether it did. It returns ErrFenced if this node's key is gone too: the node cannot tell a storage reset from its
-// own fencing.
+// own fencing. A device-mapper map answers EAGAIN while it is suspended, as when multipath reloads its table after a
+// path logs out and in, so KeepReserved tries again a few times before it returns EAGAIN.
 func (p *PR) KeepReserved() (bool, error) {
+	for try := 1; ; try++ {
+		reserved, err := p.keepReserved()
+		if !errors.Is(err, syscall.EAGAIN) || try == busyTries {
+			return reserved, err
+		}
+		time.Sleep(busyPause)
+	}
+}
+
+const (
+	busyTries = 3
+	busyPause = 250 * time.Millisecond
+)
+
+func (p *PR) keepReserved() (bool, error) {
 	if _, typ, err := p.dev.readReservation(); err != nil || typ != 0 {
 		return false, err
 	}

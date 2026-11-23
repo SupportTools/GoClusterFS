@@ -520,6 +520,81 @@ may_format_target() {
     return 1
 }
 
+# target_query runs the script on stdin, with $dev, an iSCSI disk, and pr, sg_persist sent again after a unit attention,
+# so it asks the target itself, whatever kind it is. With 2 nodes it asks from VM 3, which no test mounts, so it never
+# takes a unit attention a node under test should get; with more it asks from the first node that answers.
+target_query() {
+    local script vm disk vms
+    script=$(cat)
+    if [[ $NODE_COUNT -lt 3 ]]; then
+        start_vm 3 false > /dev/null 2>&1 || { log_error "target_query: VM 3, which asks the target, did not start"; return 1; }
+        vms=3
+    else
+        vms=$(seq 1 "$NODE_COUNT")
+    fi
+    for vm in $vms; do
+        disk=$(iscsi_disk "$vm" 2> /dev/null) && [[ -n "$disk" ]] || continue
+        printf '%s\ndev=/dev/%s\n%s\n' "$TARGET_QUERY_PRELUDE" "$disk" "$script" | ssh_run_capped 60 "$vm" "sh -s" && return 0
+    done
+    log_error "target_query: no VM could ask the target"
+    return 1
+}
+
+TARGET_QUERY_PRELUDE='command -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null
+pr() {
+    i=0
+    while :; do
+        out=$(sg_persist "$@" 2>&1) && { echo "$out"; return 0; }
+        i=$((i + 1))
+        case "$out" in *"nit attention"*) [ $i -lt 5 ] && continue ;; esac
+        echo "$out" >&2
+        return 1
+    done
+}'
+
+# log_target_reservations logs each key the external target holds, with its initiator, ISID and whether it holds the
+# reservation, then the reservation itself, all labelled $1, and sets TARGET_KEYS to the keys.
+log_target_reservations() {
+    local out line
+    TARGET_KEYS=""
+    if ! out=$(target_query <<'QUERY'
+full=$(pr --in --read-full-status "$dev") || exit 1
+res=$(pr --in --read-reservation "$dev") || exit 1
+echo "$full" | awk '/Key=/ { if (k != "") print k, n, h; sub(/.*Key=/, ""); k = $1; n = "?"; h = "" }
+    /Reservation holder/ { h = "holder" }
+    /iSCSI (name|world wide unique port id)/ { n = $NF }
+    END { if (k != "") print k, n, h; else print "no keys" }'
+echo "reservation:" $res
+QUERY
+    ); then
+        log_error "reading the reservations of ${ISCSI_TARGET_IQN} $1 failed"
+        return 1
+    fi
+    log_info "External target ${ISCSI_TARGET_IQN} $1:"
+    while IFS= read -r line; do
+        log_info "  $line"
+    done <<< "$out"
+    TARGET_KEYS=$(awk '/^0x/ { print $1 }' <<< "$out" | sort -u | xargs)
+}
+
+# clear_target_leftovers logs the external target's reservations before VM $1 formats device $2. A key left by an
+# earlier test or run gets a warning that names it, and fsck -clear-reservations on VM $1 removes every key.
+clear_target_leftovers() {
+    local vm="$1" device="$2" out
+    log_target_reservations "before VM $vm formats" || return 1
+    [[ -n "$TARGET_KEYS" ]] || return 0
+    log_warn "External target ${ISCSI_TARGET_IQN} holds keys an earlier test or run left: ${TARGET_KEYS}; removing them with fsck -clear-reservations"
+    if ! out=$(ssh_run "$vm" "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm -force $device 2>&1"); then
+        log_error "fsck -clear-reservations on VM $vm failed: $out"
+        return 1
+    fi
+    log_target_reservations "after fsck -clear-reservations" || return 1
+    if [[ -n "$TARGET_KEYS" ]]; then
+        log_error "keys left after fsck -clear-reservations: $TARGET_KEYS"
+        return 1
+    fi
+}
+
 # relogin_iscsi logs node VM $1 out of the target and in again, as detaching and attaching the disk would.
 relogin_iscsi() {
     local portal
@@ -729,6 +804,9 @@ setup_goclusterfs() {
     fi
     scp ${SSH_OPTIONS} -i "$(get_ssh_key)" -P "$ssh_port" \
         "${binaries[@]}" "${SSH_USER}@127.0.0.1:/usr/local/bin/"
+    if [[ "$format_disk" == "true" && "$EXTERNAL_TARGET" == true ]]; then
+        clear_target_leftovers "$vm_id" "$device" || return 1
+    fi
 
     # Mount GoClusterFS
     # Virtio volumes have no reservations, and tests run several nodes on them; on a fenced volume the flag does nothing.
