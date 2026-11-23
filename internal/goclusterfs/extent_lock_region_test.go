@@ -2,6 +2,7 @@ package goclusterfs
 
 import (
 	"context"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -60,4 +61,33 @@ func TestExtentLockCoversAMegabyte(t *testing.T) {
 		t.Fatalf("write after the peer let go: %v", errno)
 	}
 	checkAt(t, f, pattern(2, 4096), 200*blockSize)
+}
+
+// An overwrite of written blocks that one extent maps goes to the device in one
+// write, and one that crosses a megabyte takes the extent locks of both.
+func TestOverwriteOfARunIsOneDeviceWrite(t *testing.T) {
+	const blockSize = 8 << 10
+	path, lockPath := newTreeFSImage(t), newLockImage(t)
+	fsys := withBlockSize(openLockedTreeFSNode(t, path, lockPath, 1), blockSize)
+	f := newRegularFile(t, fsys)
+	writeAt(t, f, pattern(1, 256*blockSize), 0)
+	start, end := uint64(124), uint64(132)
+	if fsys.extentLockKey(physicalBlock(t, fsys, f.inodeNum, start)) == fsys.extentLockKey(physicalBlock(t, fsys, f.inodeNum, end-1)) {
+		t.Fatal("blocks 124 to 131 do not cross a megabyte of the data region")
+	}
+
+	var dataWrites atomic.Int64
+	fsys.dev.SetWriteObserver(func(offset int64, n int) {
+		if offset >= treeFSDataOffset {
+			dataWrites.Add(1)
+		}
+	})
+	data := pattern(2, int((end-start)*blockSize-4096))
+	writeAt(t, f, data, int64(start*blockSize+512))
+	fsys.dev.SetWriteObserver(nil)
+	if n := dataWrites.Load(); n != 1 {
+		t.Errorf("overwriting 8 blocks made %d data writes, want 1", n)
+	}
+	checkAt(t, f, data, int64(start*blockSize+512))
+	checkAt(t, f, pattern(1, 256*blockSize)[:start*blockSize+512], 0)
 }

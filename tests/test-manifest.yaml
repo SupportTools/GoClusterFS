@@ -345,6 +345,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/extent_lock_region_test.go::TestExtentLockCoversAMegabyte
 
+  - id: overwrite-run-one-write
+    name: An overwrite of contiguous written blocks is one device write
+    description: At 8 KB blocks an unaligned overwrite of 8 blocks that one extent maps, across a megabyte of the data region, makes one data write, takes both extent locks in record order, and leaves the bytes around it unchanged
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/extent_lock_region_test.go::TestOverwriteOfARunIsOneDeviceWrite
+
   - id: tree-nodes-at-small-blocks
     name: Extent tree nodes stay at least 64 KB at small block sizes
     description: At 8 KB blocks a file holds 20,000 scattered extents, past the 15,876 that half-block nodes allowed; each node is an aligned run of 8 blocks, and truncating to 0 frees every one of them
