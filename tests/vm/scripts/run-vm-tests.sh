@@ -3981,6 +3981,20 @@ test_fencing_clear_reservations() {
     return $result
 }
 
+# release_external_target unmounts every node at the end of a run, so each removes its key from the external target,
+# which keeps registrations across runs. A key the target holds after that is a cleanup leak.
+release_external_target() {
+    local vm
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        [[ -n "$(mount_pids "$vm" 2> /dev/null)" ]] || continue
+        unmount_goclusterfs "$vm" || log_error "VM $vm did not unmount cleanly at the end of the run"
+    done
+    log_target_reservations "at the end of the run, after every node unmounted" || return 1
+    if [[ -n "$TARGET_KEYS" ]]; then
+        log_error "Cleanup leak: ${ISCSI_TARGET_IQN} still holds keys after every node unmounted: ${TARGET_KEYS}"
+    fi
+}
+
 # skip_on_external_target logs SKIP with reason $1 and succeeds when the tests run against an external target.
 skip_on_external_target() {
     [[ "$EXTERNAL_TARGET" == true ]] || return 1
@@ -5667,7 +5681,7 @@ EOF
     log_info "Results written to $RESULTS_DIR"
 
     if [[ "$EXTERNAL_TARGET" == true ]]; then
-        log_target_reservations "at the end of the run"
+        release_external_target
     fi
 
     # Cleanup VMs
