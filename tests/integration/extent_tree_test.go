@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/supporttools/GoClusterFS/internal/extent"
 )
 
 const mb = 1024 * 1024
@@ -48,7 +50,7 @@ func checkFile(t *testing.T, mfs *MountedFS, name string, want []byte) {
 	}
 }
 
-// TestExtentTreeSparseWrites writes at seven scattered 1MB blocks, more than
+// TestExtentTreeSparseWrites writes into seven scattered blocks, more than
 // the two extents an inode holds inline, and reads the file back before and
 // after a remount.
 func TestExtentTreeSparseWrites(t *testing.T) {
@@ -57,24 +59,24 @@ func TestExtentTreeSparseWrites(t *testing.T) {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
 
-	// The first write lands past 64KB so the file never uses an SFB slot.
+	bs := blockSizeOf(t, mfs)
 	blocks := []int{12, 3, 7, 0, 20, 15, 30}
-	const size = 64 * 1024
-	want := make([]byte, 30*mb+size)
+	size := min(64*1024, bs)
+	want := make([]byte, 30*bs+size)
 	for i, blk := range blocks {
 		data := chunk(byte(i+1), size)
-		if err := mfs.WriteFileAt("sparse.bin", data, int64(blk*mb)); err != nil {
+		if err := mfs.WriteFileAt("sparse.bin", data, int64(blk*bs)); err != nil {
 			t.Fatalf("write at block %d failed: %v", blk, err)
 		}
-		copy(want[blk*mb:], data)
+		copy(want[blk*bs:], data)
 	}
 
 	var st syscall.Stat_t
 	if err := syscall.Stat(mfs.Path("sparse.bin"), &st); err != nil {
 		t.Fatalf("Stat failed: %v", err)
 	}
-	if wantBlocks := int64(len(blocks)) * mb / 512; st.Blocks != wantBlocks {
-		t.Errorf("st_blocks = %d, want %d (one 1MB block per write)", st.Blocks, wantBlocks)
+	if wantBlocks := int64(len(blocks) * bs / 512); st.Blocks != wantBlocks {
+		t.Errorf("st_blocks = %d, want %d (one block per write)", st.Blocks, wantBlocks)
 	}
 
 	checkFile(t, mfs, "sparse.bin", want)
@@ -132,6 +134,8 @@ func TestExtentTreeTruncate(t *testing.T) {
 	if err := mfs.FormatAndMount(false); err != nil {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
+	bs := blockSizeOf(t, mfs)
+	treeBlocks := int64(extent.NodeBlocks(uint64(bs)))
 
 	frag, err := os.OpenFile(mfs.Path("frag.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -143,12 +147,12 @@ func TestExtentTreeTruncate(t *testing.T) {
 	}
 	var want []byte
 	for blk := 0; blk < 6; blk++ {
-		data := chunk(byte(blk+1), mb)
+		data := chunk(byte(blk+1), bs)
 		if _, err := frag.Write(data); err != nil {
 			t.Fatalf("append block %d failed: %v", blk, err)
 		}
 		want = append(want, data...)
-		if _, err := filler.Write(chunk(0xAA, mb)); err != nil {
+		if _, err := filler.Write(chunk(0xAA, bs)); err != nil {
 			t.Fatalf("filler append %d failed: %v", blk, err)
 		}
 	}
@@ -159,8 +163,8 @@ func TestExtentTreeTruncate(t *testing.T) {
 	if err := syscall.Statfs(mfs.MountPoint, &before); err != nil {
 		t.Fatal(err)
 	}
-	const keep = mb + mb/2
-	if err := os.Truncate(mfs.Path("frag.bin"), keep); err != nil {
+	keep := bs + bs/2
+	if err := os.Truncate(mfs.Path("frag.bin"), int64(keep)); err != nil {
 		t.Fatalf("Truncate failed: %v", err)
 	}
 	var after syscall.Statfs_t
@@ -170,8 +174,8 @@ func TestExtentTreeTruncate(t *testing.T) {
 
 	// Blocks 2-5 are freed, and the two remaining extents move back inline,
 	// which frees the tree block as well.
-	if freed := after.Bfree - before.Bfree; freed != 5 {
-		t.Errorf("truncate freed %d blocks, want 5 (4 data + 1 extent tree)", freed)
+	if freed := int64(after.Bfree - before.Bfree); freed != 4+treeBlocks {
+		t.Errorf("truncate freed %d blocks, want %d (4 data + the extent tree node)", freed, 4+treeBlocks)
 	}
 	checkFile(t, mfs, "frag.bin", want[:keep])
 	remount(t, mfs)
@@ -189,6 +193,8 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	if err := mfs.FormatAndMount(false); err != nil {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
+	bs := blockSizeOf(t, mfs)
+	treeBlocks := int64(extent.NodeBlocks(uint64(bs)))
 
 	frag, err := os.OpenFile(mfs.Path("frag.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -200,12 +206,12 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	}
 	var want []byte
 	for blk := 0; blk < 6; blk++ {
-		data := chunk(byte(blk+1), mb)
+		data := chunk(byte(blk+1), bs)
 		if _, err := frag.Write(data); err != nil {
 			t.Fatalf("append block %d failed: %v", blk, err)
 		}
 		want = append(want, data...)
-		if _, err := filler.Write(chunk(0xAA, mb)); err != nil {
+		if _, err := filler.Write(chunk(0xAA, bs)); err != nil {
 			t.Fatalf("filler append %d failed: %v", blk, err)
 		}
 	}
@@ -238,7 +244,7 @@ func TestExtentTreeSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tail := chunk(0x77, mb)
+	tail := chunk(0x77, bs)
 	if _, err := f.Write(tail); err != nil {
 		t.Fatalf("append after snapshot failed: %v", err)
 	}
@@ -247,10 +253,10 @@ func TestExtentTreeSnapshot(t *testing.T) {
 
 	// Blocks 4 and 5 are shared with the clone and the snapshot; only the new block 6 is freed.
 	before := freeBlocks()
-	if err := os.Truncate(path, 4*mb); err != nil {
+	if err := os.Truncate(path, int64(4*bs)); err != nil {
 		t.Fatalf("Truncate failed: %v", err)
 	}
-	want = want[:4*mb]
+	want = want[:4*bs]
 	if got := freeBlocks() - before; got != 1 {
 		t.Errorf("truncating shared and private blocks freed %d blocks, want 1", got)
 	}
@@ -262,9 +268,9 @@ func TestExtentTreeSnapshot(t *testing.T) {
 		t.Fatalf("deleting snapshot failed: %v", err)
 	}
 	waitForSnapshotState(t, path, "", "tree-snap")
-	// The snapshot's own extent tree node is the only block nothing else maps.
-	if got := freeBlocks() - before; got != 1 {
-		t.Errorf("deleting the snapshot freed %d blocks, want 1", got)
+	// The snapshot's own extent tree node is all that nothing else maps.
+	if got := freeBlocks() - before; got != treeBlocks {
+		t.Errorf("deleting the snapshot freed %d blocks, want %d", got, treeBlocks)
 	}
 
 	remount(t, mfs)

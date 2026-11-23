@@ -2220,16 +2220,23 @@ func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint3
 	return 0, syscall.EAGAIN
 }
 
-// waitOutReplay waits, holding no lock, for the lock of block physBlock that a
-// failing node holds until its replay ends, then has the write retried. A
-// replay that needed the inode lock this write gave up can finish meanwhile.
+// waitOutReplay waits, holding no lock, for the extent lock of block physBlock
+// that a failing node holds until its replay ends, then has the write retried.
+// A replay that needed the inode lock this write gave up can finish meanwhile.
 func (f *File) waitOutReplay(ctx context.Context, physBlock uint64) error {
-	if err := f.fs.lockMgr.AcquireExtent(ctx, physBlock, lock.LockModeExclusive); err != nil {
+	key := f.fs.extentLockKey(physBlock)
+	if err := f.fs.lockMgr.AcquireExtent(ctx, key, lock.LockModeExclusive); err != nil {
 		log.Printf("[WARN] Write inode %d: waiting for block %d after its holder's replay failed: %v", f.inodeNum, physBlock, err)
 		return syscall.EIO
 	}
-	f.fs.release(lock.LockTypeExtent, physBlock, "block")
+	f.fs.release(lock.LockTypeExtent, key, "block")
 	return errRetryWrite
+}
+
+// extentLockKey names the extent lock that covers physBlock: one per 1 MB of the data region, whatever the block
+// size, so at 1 MB blocks it is the block number.
+func (f *FS) extentLockKey(physBlock uint64) uint64 {
+	return physBlock * f.blockSize >> 20
 }
 
 // stillWritableInPlace checks, under the inode lock, that the slot still holds this file, that logical block
@@ -2850,6 +2857,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Calculate physical location
 		physBlock := ext.PhysicalBlock + extOffset
+		extentKey := f.fs.extentLockKey(physBlock)
 		diskOffset := int64(f.fs.dataOffset + physBlock*f.fs.blockSize + blockOffset)
 
 		// Write to disk
@@ -2877,7 +2885,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if !lockHeld && f.fs.lockMgr != nil {
 			// A shared hold could not take the extent lock below on the same record.
 			mode := lock.LockModeShared
-			if !newBlock && f.fs.lockMgr.SameRecord(lock.LockTypeInode, uint64(f.inodeNum), lock.LockTypeExtent, physBlock) {
+			if !newBlock && f.fs.lockMgr.SameRecord(lock.LockTypeInode, uint64(f.inodeNum), lock.LockTypeExtent, extentKey) {
 				mode = lock.LockModeExclusive
 			}
 			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), mode); err != nil {
@@ -2905,7 +2913,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if retryable {
 				extentCtx = lock.Retryable(ctx)
 			}
-			if err := f.fs.lockMgr.AcquireExtent(extentCtx, physBlock, lock.LockModeExclusive); err != nil {
+			if err := f.fs.lockMgr.AcquireExtent(extentCtx, extentKey, lock.LockModeExclusive); err != nil {
 				logging.Debugf("Write inode %d: failed to acquire extent lock for block %d: %v",
 					f.inodeNum, physBlock, err)
 				releaseInPlaceLock()
@@ -2932,7 +2940,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			if err != nil {
 				logging.Debugf("Write inode %d: zeroing block %d failed: %v", f.inodeNum, physBlock, err)
 				if extentLockHeld {
-					f.fs.release(lock.LockTypeExtent, physBlock, "block")
+					f.fs.release(lock.LockTypeExtent, extentKey, "block")
 				}
 				releaseInPlaceLock()
 				return 0, syscall.EIO
@@ -2942,7 +2950,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if err := f.fs.writeSpan(data[bytesWritten:bytesWritten+toWrite], diskOffset); err != nil {
 			logging.Debugf("Write inode %d: writing %d bytes at %d failed: %v", f.inodeNum, toWrite, diskOffset, err)
 			if extentLockHeld {
-				f.fs.release(lock.LockTypeExtent, physBlock, "block")
+				f.fs.release(lock.LockTypeExtent, extentKey, "block")
 			}
 			releaseInPlaceLock()
 			return 0, syscall.EIO
@@ -2950,7 +2958,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 		// Release extent lock after completing write to this block
 		if extentLockHeld {
-			f.fs.release(lock.LockTypeExtent, physBlock, "block")
+			f.fs.release(lock.LockTypeExtent, extentKey, "block")
 		}
 		releaseInPlaceLock()
 

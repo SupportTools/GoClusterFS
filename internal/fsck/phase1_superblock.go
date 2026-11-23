@@ -63,9 +63,9 @@ func (c *Checker) checkSuperblock() error {
 	c.logf("  Required Flags: 0x%X (OK)\n", sb.RequiredFlags)
 
 	// Check block size
-	if sb.BlockSize != 1048576 { // 1MB
+	if !superblock.ValidBlockSize(uint64(sb.BlockSize)) {
 		c.addProblem(PhaseSuperblock, Fatal, "offset 48",
-			fmt.Sprintf("invalid block size: %d (expected 1MB = 1048576)", sb.BlockSize),
+			fmt.Sprintf("invalid block size: %d (%v)", sb.BlockSize, superblock.ErrInvalidBlockSize),
 			false)
 		return fmt.Errorf("invalid block size")
 	}

@@ -1024,14 +1024,15 @@ func TestSnapshotDeleteAfterOverwrite(t *testing.T) {
 	if err := mfs.FormatAndMount(false); err != nil {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
+	bs := blockSizeOf(t, mfs)
 
-	if err := mfs.WriteFile("data.bin", chunk(7, 2*mb)); err != nil {
+	if err := mfs.WriteFile("data.bin", chunk(7, 2*bs)); err != nil {
 		t.Fatal(err)
 	}
 	free := freeBlocks(t, mfs)
 	setxattr(t, mfs.Path("data.bin"), "user.snapshot", "temp")
 
-	updated := chunk(8, 2*mb)
+	updated := chunk(8, 2*bs)
 	if err := mfs.WriteFileAt("data.bin", updated, 0); err != nil {
 		t.Fatal(err)
 	}

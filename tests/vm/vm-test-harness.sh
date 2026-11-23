@@ -49,6 +49,7 @@ BROADCAST_IFACE=eth1
 # VM_STORAGE=iscsi serves the cluster image from VM ${TARGET_VM_ID} over iSCSI (Linux LIO, with SCSI-3 persistent
 # reservations), so nodes fence each other. virtio, the default, shares the image as a virtio disk without reservations.
 VM_STORAGE=${VM_STORAGE:-virtio}
+# VM_BLOCK_SIZE, when set, formats the cluster image with -block-size VM_BLOCK_SIZE.
 TARGET_VM_ID=9
 ISCSI_PORT=$((SSH_BASE_PORT + 100))
 # With ISCSI_PORTAL (ip:port) and ISCSI_TARGET_IQN, node VMs log in to that external target instead, such as a NAS LUN
@@ -735,7 +736,7 @@ setup_goclusterfs() {
     if [[ "$format_disk" == "true" ]]; then
         log_info "Formatting shared disk on VM $vm_id..."
         # One inode per 64 KB gives the 1 GB disk 16384 inodes, enough for test_more_than_4096_files
-        mount_args="$mount_args -format -bytes-per-inode 65536"
+        mount_args="$mount_args -format -bytes-per-inode 65536${VM_BLOCK_SIZE:+ -block-size $VM_BLOCK_SIZE}"
     fi
 
     # /var/log/goclusterfs.log is lost when the VM dies; the log device keeps a copy on the host

@@ -88,7 +88,7 @@ if [ "$FORMAT_ON_START" = "true" ]; then
     else
         log "Formatting filesystem (FORMAT_ON_START=true, first run)"
         # One inode per 64 KB gives the 768 MB image 12288 inodes, enough for test_more_than_4096_files
-        MOUNT_ARGS="$MOUNT_ARGS -format -bytes-per-inode 65536"
+        MOUNT_ARGS="$MOUNT_ARGS -format -bytes-per-inode 65536${BLOCK_SIZE:+ -block-size $BLOCK_SIZE}"
         # Create flag file to mark that formatting is done
         touch "$FORMAT_DONE_FLAG"
     fi

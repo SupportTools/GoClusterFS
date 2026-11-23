@@ -66,12 +66,12 @@ func testDevice(t testing.TB, dataMB int) (*storage.Device, func()) {
 }
 
 // testLayout is the layout of every test device: up to 4 GB, data blocks start at 326 MB.
-var testLayout = superblock.New(superblock.MinDeviceSize, 0)
+var testLayout = superblock.New(superblock.MinDeviceSize, 0, 0)
 
 // writeSuperblock writes the v3 superblock for dev with totalBlocks data blocks.
 func writeSuperblock(t testing.TB, dev *storage.Device, totalBlocks uint64) {
 	t.Helper()
-	sb := superblock.New(dev.Size(), 0)
+	sb := superblock.New(dev.Size(), 0, 0)
 	sb.TotalBlocks, sb.FreeBlocks = totalBlocks, totalBlocks
 
 	buf := sb.Serialize()
@@ -576,7 +576,7 @@ func TestFsckRefusesOlderLockRecordLayouts(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			dev, cleanup := testDevice(t, 20)
 			defer cleanup()
-			sb := superblock.New(dev.Size(), 0)
+			sb := superblock.New(dev.Size(), 0, 0)
 			sb.TotalBlocks, sb.FreeBlocks = 9, 9
 			sb.RequiredFlags &^= missing
 			if _, err := dev.WriteAt(sb.Serialize(), 0); err != nil {
