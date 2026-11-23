@@ -169,17 +169,18 @@ func TestReadQuotaReplay(t *testing.T) {
 	}
 }
 
-// The fold applies an update only while usage still holds its old value, adds the running deltas, stops at zero,
-// and leaves out projects it does not change.
+// The fold writes each unfinished update again, landed or not, adds the running deltas, stops at zero, and leaves out
+// projects it does not change.
 func TestQuotaReplayFold(t *testing.T) {
 	q := &QuotaReplay{
 		Running: map[uint32]QuotaDeltaPayload{1: {Project: 1, Blocks: 3}, 2: {Project: 2, Blocks: -5}, 4: {Project: 4, Inodes: 1}},
 		Updates: []QuotaUpdatePayload{
 			{Project: 1, OldBlocks: 10, OldInodes: 1, NewBlocks: 12, NewInodes: 1},
 			{Project: 3, OldBlocks: 7, NewBlocks: 9},
+			{Project: 5, OldBlocks: 1, NewBlocks: 2},
 		},
 	}
-	table := map[uint32][2]uint64{1: {10, 1}, 2: {3, 0}, 3: {9, 0}}
+	table := map[uint32][2]uint64{1: {10, 1}, 2: {3, 0}, 3: {9, 0}, 5: {7, 0}}
 	folds, err := q.Fold(func(p uint32) (uint64, uint64, error) { return table[p][0], table[p][1], nil })
 	if err != nil {
 		t.Fatal(err)
@@ -188,6 +189,7 @@ func TestQuotaReplayFold(t *testing.T) {
 		{Project: 1, OldBlocks: 10, OldInodes: 1, NewBlocks: 15, NewInodes: 1},
 		{Project: 2, OldBlocks: 3},
 		{Project: 4, NewInodes: 1},
+		{Project: 5, OldBlocks: 7, NewBlocks: 2},
 	}
 	if !reflect.DeepEqual(folds, want) {
 		t.Errorf("folds = %+v\nwant    %+v", folds, want)

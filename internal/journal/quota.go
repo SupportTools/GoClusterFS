@@ -261,8 +261,8 @@ func (q *QuotaReplay) add(e *RecoveredEntry, completed bool) error {
 }
 
 // Fold returns the usage changes that bring the table up to date with the journal, with Old set to what used reads
-// now. Each update applies only while the usage still holds its Old, since otherwise it landed, and then the running
-// deltas add on. Usage that would go below zero stops at zero.
+// now. Each unfinished update is written again: the quota lock kept every other writer off the record since, so it
+// holds the update's Old or its New. The running deltas add on, and usage that would go below zero stops at zero.
 func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, err error)) ([]QuotaUpdatePayload, error) {
 	projects := slices.Collect(maps.Keys(q.Running))
 	for _, u := range q.Updates {
@@ -277,9 +277,14 @@ func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, err
 		}
 		f := QuotaUpdatePayload{Project: project, OldBlocks: blocks, OldInodes: inodes, NewBlocks: blocks, NewInodes: inodes}
 		for _, u := range q.Updates {
-			if u.Project == project && f.NewBlocks == u.OldBlocks && f.NewInodes == u.OldInodes {
-				f.NewBlocks, f.NewInodes = u.NewBlocks, u.NewInodes
+			if u.Project != project {
+				continue
 			}
+			if !f.holds(u.OldBlocks, u.OldInodes) && !f.holds(u.NewBlocks, u.NewInodes) {
+				log.Printf("[WARN] quota: project %d uses %d blocks and %d inodes, neither before nor after its unfinished update from %d/%d to %d/%d; writing the update again",
+					project, f.NewBlocks, f.NewInodes, u.OldBlocks, u.OldInodes, u.NewBlocks, u.NewInodes)
+			}
+			f.NewBlocks, f.NewInodes = u.NewBlocks, u.NewInodes
 		}
 		r := q.Running[project]
 		f.NewBlocks = addClamped(f.NewBlocks, r.Blocks, project, "blocks")
@@ -289,6 +294,10 @@ func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, err
 		}
 	}
 	return folds, nil
+}
+
+func (f *QuotaUpdatePayload) holds(blocks, inodes uint64) bool {
+	return f.NewBlocks == blocks && f.NewInodes == inodes
 }
 
 func addClamped(used uint64, delta int64, project uint32, what string) uint64 {
