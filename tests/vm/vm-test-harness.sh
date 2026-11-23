@@ -51,7 +51,18 @@ BROADCAST_IFACE=eth1
 VM_STORAGE=${VM_STORAGE:-virtio}
 TARGET_VM_ID=9
 ISCSI_PORT=$((SSH_BASE_PORT + 100))
-ISCSI_TARGET_IQN="iqn.2026-11.dev.goclusterfs:target"
+# With ISCSI_PORTAL (ip:port) and ISCSI_TARGET_IQN, node VMs log in to that external target instead, such as a NAS LUN
+# that accepts the initiators iqn.2026-11.dev.goclusterfs:vm1, vm2, ..., and no target VM boots.
+ISCSI_PORTAL=${ISCSI_PORTAL:-}
+EXTERNAL_TARGET=false
+if [[ "$VM_STORAGE" == iscsi && -n "$ISCSI_PORTAL" ]]; then
+    if [[ -z "${ISCSI_TARGET_IQN:-}" ]]; then
+        echo "ISCSI_PORTAL=${ISCSI_PORTAL} needs ISCSI_TARGET_IQN, the external target's IQN" >&2
+        exit 1
+    fi
+    EXTERNAL_TARGET=true
+fi
+ISCSI_TARGET_IQN=${ISCSI_TARGET_IQN:-iqn.2026-11.dev.goclusterfs:target}
 # The virt ISO's kernel lacks LIO's target modules; the standard ISO has them.
 STD_ISO_NAME="alpine-standard-${ALPINE_VERSION}.0-x86_64.iso"
 STD_ISO_PATH="${VM_DIR}/${STD_ISO_NAME}"
@@ -261,7 +272,7 @@ EOF
 # =============================================================================
 download_iso() {
     download_pinned "${ISO_PATH}" "${ISO_URL}" "${ISO_SHA256}" || return 1
-    if [[ "$VM_STORAGE" == iscsi ]]; then
+    if [[ "$VM_STORAGE" == iscsi && "$EXTERNAL_TARGET" != true ]]; then
         download_pinned "${STD_ISO_PATH}" "${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/x86_64/${STD_ISO_NAME}" "${STD_ISO_SHA256}"
     fi
 }
@@ -417,7 +428,7 @@ start_vm() {
 
     download_iso || return 1
     create_shared_disk || return 1
-    if [[ "$VM_STORAGE" == iscsi && "$vm_id" != "$TARGET_VM_ID" ]]; then
+    if [[ "$VM_STORAGE" == iscsi && "$vm_id" != "$TARGET_VM_ID" && "$EXTERNAL_TARGET" != true ]]; then
         start_vm "$TARGET_VM_ID" || return 1
     fi
 
@@ -476,6 +487,10 @@ SCRIPT
 # under its old serial. With "keep" it first copies the file LIO saved the reservations in (APTPL) to the host, and
 # restores it before nodes reconnect, as OPERATIONS.md says; without, the reservations are lost.
 power_cycle_target() {
+    if [[ "$EXTERNAL_TARGET" == true ]]; then
+        log_error "power_cycle_target: the external target ${ISCSI_TARGET_IQN} has no target VM to power cycle"
+        return 1
+    fi
     local keep="${1:-}" serial saved="${VM_RUN_DIR}/aptpl.saved"
     serial=$(ssh_run_capped 30 "$TARGET_VM_ID" "sed 's/.*: //' /sys/kernel/config/target/core/iblock_0/lun0/wwn/vpd_unit_serial") || return 1
     if [[ "$keep" == keep ]]; then
@@ -491,15 +506,30 @@ power_cycle_target() {
     fi
 }
 
+# iscsi_portal prints where node VMs reach the target: the external portal, or the target VM through the host.
+iscsi_portal() {
+    if [[ "$EXTERNAL_TARGET" == true ]]; then echo "$ISCSI_PORTAL"; else echo "10.0.2.2:${ISCSI_PORT}"; fi
+}
+
+# may_format_target refuses to format an external target whose IQN lacks gcfs-test, so a wrong IQN cannot wipe a
+# real volume.
+may_format_target() {
+    [[ "$EXTERNAL_TARGET" != true || "$ISCSI_TARGET_IQN" == *gcfs-test* ]] && return 0
+    log_error "Refusing to format ${ISCSI_TARGET_IQN} at ${ISCSI_PORTAL}: only an external target whose IQN contains gcfs-test may be formatted"
+    return 1
+}
+
 # relogin_iscsi logs node VM $1 out of the target and in again, as detaching and attaching the disk would.
 relogin_iscsi() {
-    local portal="10.0.2.2:${ISCSI_PORT}"
+    local portal
+    portal=$(iscsi_portal)
     ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null 2>&1; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null && for t in \$(seq 20); do dd if=/dev/sda of=/dev/null bs=4096 count=1 iflag=direct 2>/dev/null && exit 0; sleep 1; done; exit 1"
 }
 
 # login_iscsi logs node VM $1 in to the target as its own initiator, which fails I/O after 5 s instead of queuing it.
 login_iscsi() {
-    local vm_id="$1" portal="10.0.2.2:${ISCSI_PORT}"
+    local vm_id="$1" portal
+    portal=$(iscsi_portal)
     ssh_run "$vm_id" "sh -s" <<SCRIPT
 set -e
 apk add --no-cache open-iscsi > /dev/null
@@ -686,6 +716,9 @@ setup_goclusterfs() {
     local extra_args="${5:-}"
     local ssh_port=$(get_vm_ssh_port "$vm_id")
 
+    if [[ "$format_disk" == "true" ]] && ! may_format_target; then
+        return 1
+    fi
     log_info "Setting up GoClusterFS on VM $vm_id (format=$format_disk)..."
 
     log_info "Copying goclusterfs binaries..."

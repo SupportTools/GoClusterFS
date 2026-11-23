@@ -3943,7 +3943,7 @@ test_fencing_clear_reservations() {
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
-    local result=0 out pr=/sys/kernel/config/target/core/iblock_0/lun0/pr
+    local result=0 out
     fencing_restart pr || return 1
     out=$(ssh_run 2 "/usr/local/bin/goclusterfs-fsck -clear-reservations -confirm -force $(cluster_device) 2>&1; echo rc=\$?")
     if [[ "$out" != *"clearing refused: the filesystem is mounted by"* ]]; then
@@ -3971,7 +3971,7 @@ test_fencing_clear_reservations() {
         log_error "keys left after fsck -clear-reservations: $(registered_initiators | tr '\n' ' ')"
         result=1
     fi
-    out=$(ssh_run "$TARGET_VM_ID" "tr -d '\\000' < $pr/res_pr_type")
+    out=$(reservation_holder)
     if [[ "$out" != *"No SPC-3 Reservation holder"* ]]; then
         log_error "the target still holds a reservation after fsck -clear-reservations: $out"
         result=1
@@ -3982,8 +3982,53 @@ test_fencing_clear_reservations() {
     return $result
 }
 
+# target_query runs the script on stdin, with $dev, an iSCSI disk, and pr, sg_persist sent again after a unit attention,
+# so it asks the target itself, whatever kind it is. With 2 nodes it asks from VM 3, which no test mounts, so it never
+# takes a unit attention a node under test should get; with more it asks from the first node that answers.
+target_query() {
+    local script vm disk vms
+    script=$(cat)
+    if [[ $NODE_COUNT -lt 3 ]]; then
+        start_vm 3 false > /dev/null 2>&1 || { log_error "target_query: VM 3, which asks the target, did not start"; return 1; }
+        vms=3
+    else
+        vms=$(seq 1 "$NODE_COUNT")
+    fi
+    for vm in $vms; do
+        disk=$(iscsi_disk "$vm" 2> /dev/null) && [[ -n "$disk" ]] || continue
+        printf '%s\ndev=/dev/%s\n%s\n' "$TARGET_QUERY_PRELUDE" "$disk" "$script" | ssh_run_capped 60 "$vm" "sh -s" && return 0
+    done
+    log_error "target_query: no VM could ask the target"
+    return 1
+}
+
+TARGET_QUERY_PRELUDE='command -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null
+pr() {
+    i=0
+    while :; do
+        out=$(sg_persist "$@" 2>&1) && { echo "$out"; return 0; }
+        i=$((i + 1))
+        case "$out" in *"nit attention"*) [ $i -lt 5 ] && continue ;; esac
+        echo "$out" >&2
+        return 1
+    done
+}'
+
+# skip_on_external_target logs SKIP with reason $1 and succeeds when the tests run against an external target.
+skip_on_external_target() {
+    [[ "$EXTERNAL_TARGET" == true ]] || return 1
+    log_info "SKIP: external target ${ISCSI_TARGET_IQN}: $1"
+}
+
 # reservation_holder prints the target's reservation holder, or "No SPC-3 Reservation holder".
 reservation_holder() {
+    if [[ "$EXTERNAL_TARGET" == true ]]; then
+        target_query <<'QUERY'
+out=$(pr --in --read-reservation "$dev") || exit 1
+case "$out" in *"NO reservation"*) echo "No SPC-3 Reservation holder" ;; *) echo "$out" ;; esac
+QUERY
+        return
+    fi
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_holder"
 }
 
@@ -4049,6 +4094,15 @@ test_fencing_lost_reservation() {
 
 # registered_initiators lists the initiators the target holds a reservation key for, one per line.
 registered_initiators() {
+    if [[ "$EXTERNAL_TARGET" == true ]]; then
+        target_query <<'QUERY'
+out=$(pr --in --read-full-status "$dev") || exit 1
+echo "$out" | awk '/Key=/ { sub(/.*Key=/, ""); key = $1 } /iSCSI (name|world wide unique port id)/ { n = $NF; if (n !~ /,/) n = n ","; print "iSCSI Node: " n " Key: " key }'
+QUERY
+        # A failed query must fail a test that looks for no keys as well as one that looks for a key.
+        [[ $? -eq 0 ]] || echo "the target query failed: goclusterfs:vm?"
+        return
+    fi
     ssh_run_capped 30 "$TARGET_VM_ID" "tr -d '\\000' < /sys/kernel/config/target/core/iblock_0/lun0/pr/res_pr_registered_i_pts"
 }
 
@@ -4082,7 +4136,8 @@ test_fencing_unmount_removes_key() {
 # relogin_under_map logs VM $1's only iSCSI path out and in under its multipath map gcfs-mpath, which keeps its mount
 # running. The new session has a new ISID, and LIO keeps the old session's registration.
 relogin_under_map() {
-    local disk i portal="10.0.2.2:${ISCSI_PORT}"
+    local disk i portal
+    portal=$(iscsi_portal)
     ssh_run "$1" "iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --logout > /dev/null; sleep 2; iscsiadm -m node -T ${ISCSI_TARGET_IQN} -p ${portal} --login > /dev/null" || return 1
     for i in $(seq 1 20); do
         disk=$(iscsi_disk "$1")
@@ -4384,8 +4439,11 @@ test_fencing_reservation_self_test() {
         result=1
     fi
 
-    local how
-    for how in relogin restore lose; do
+    local how hows="relogin restore lose"
+    if skip_on_external_target "the -keep and -check-kept steps log out or power cycle the LIO target VM"; then
+        hows=""
+    fi
+    for how in $hows; do
         key=$(kept_key "$(reservation_test 1 "-force -keep")")
         if [[ -z "$key" ]]; then
             log_error "fsck -test-reservations -keep left no key"
