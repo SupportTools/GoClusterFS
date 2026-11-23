@@ -4957,6 +4957,13 @@ scenarios:
     environments:
       go: internal/lock/reclaim_test.go::TestAdoptOwnerOfOwnSlotPredecessor
 
+  - id: lock-adopt-earlier-slot-node
+    name: A replay takes over an earlier node's claims in the slot it replays
+    description: A killed node's claim under a slot that a later, refused mount registered in is adopted by the slot's replay, which then gets the record
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptOwnerKeepsAnEarlierSlotNodesClaim
+
   - id: superblock-refuses-layout-without-lock-slots
     name: Mount refuses layout without lock slots
     description: A v3 image formatted before per-node lock slots, with a 1 MB lock region and no slot size, is refused with a message to reformat
