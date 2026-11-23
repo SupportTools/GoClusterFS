@@ -100,7 +100,11 @@ func FuzzLockRow(f *testing.F) {
 		row, kinds := fuzzRow(desc)
 
 		m := NewManager(nil, 0, RowSize, [16]byte{0xee}, self)
-		conflict, lower, by := m.rowConflicts(0, row, mode, ign)
+		var ignored uint64
+		if ign >= 0 {
+			ignored = 1 << ign
+		}
+		conflict, lower, by := m.rowConflicts(0, row, mode, ignored)
 		mustConflict, mayConflict := false, false
 		for slot, kind := range kinds {
 			if slot == self || slot == ign {
@@ -134,7 +138,7 @@ func FuzzLockRow(f *testing.F) {
 
 		state := func(slot int) OwnerState { return OwnerState((int(views) + slot) % 5) }
 		m.SetOwnerView(func(slot int, _ bool) ([16]byte, OwnerState) { return [16]byte{byte(slot)}, state(slot) })
-		if conflict, _, by := m.rowConflicts(0, row, mode, ign); conflict && state(by.slot) == OwnerReleased {
+		if conflict, _, by := m.rowConflicts(0, row, mode, ignored); conflict && state(by.slot) == OwnerReleased {
 			t.Fatalf("slot %d conflicts although its registry slot is empty", by.slot)
 		}
 		m.othersWaiting(row)

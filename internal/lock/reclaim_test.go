@@ -412,3 +412,48 @@ func TestKeepForHoldsTheLockInADeadSlot(t *testing.T) {
 	}
 	requireAcquired(t, peer, LockTypeQuota, 0, LockModeExclusive)
 }
+
+// A replayer that took a record it had adopted and then died leaves claims on that record in two dead slots. A node
+// that replays both passes over both, and releasing one replay's adoption leaves the other slot's claim to its own.
+func TestOneNodeAdoptsARecordInTwoDeadSlots(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	dead := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{2}, 2)
+	next := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	reg := newFakeRegistry()
+	reg.set(1, OwnerRecovering)
+	reg.set(2, OwnerRecovering)
+	reg.set(3, OwnerAlive)
+	reg.set(4, OwnerAlive)
+	next.SetOwnerView(reg.view)
+	peer.SetOwnerView(reg.view)
+
+	requireAcquired(t, dead, LockTypeInode, 2, LockModeExclusive)
+	if _, err := replayer.AdoptOwner([16]byte{1}, 1); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, replayer, LockTypeInode, 2, LockModeExclusive)
+
+	ofDead, err := next.AdoptOwner([16]byte{1}, 1)
+	if err != nil || len(ofDead) != 1 {
+		t.Fatalf("adopting the first dead node: %v, %v", ofDead, err)
+	}
+	ofReplayer, err := next.AdoptOwner([16]byte{2}, 2)
+	if err != nil || len(ofReplayer) != 1 {
+		t.Fatalf("adopting the dead replayer: %v, %v", ofReplayer, err)
+	}
+	requireAcquired(t, next, LockTypeInode, 2, LockModeExclusive)
+	release(t, next, LockTypeInode, 2)
+	next.ReleaseCached()
+
+	if err := next.ReleaseAdopted(ofReplayer); err != nil {
+		t.Fatal(err)
+	}
+	requireBlocked(t, peer, LockTypeInode, 2, LockModeExclusive)
+	if err := next.ReleaseAdopted(ofDead); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, peer, LockTypeInode, 2, LockModeExclusive)
+}

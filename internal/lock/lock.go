@@ -160,8 +160,9 @@ type Manager struct {
 	retrying map[uint64]int
 	// unreleased holds records whose slot this node failed to clear; the watcher clears them again.
 	unreleased map[uint64]bool
-	// adopted maps each record AdoptOwner kept for a dead node to that node's slot.
-	adopted map[uint64]adoptedSlot
+	// adopted maps each record AdoptOwner kept to the dead nodes' slots it kept it in, and their nodes. A replayer that
+	// died after taking a record it had adopted leaves claims in two dead slots, and one node may replay both.
+	adopted map[uint64]map[int][16]byte
 	// ownerView, when set, says which node holds each registry slot.
 	ownerView OwnerView
 	// tornSince is when this node first read each slot that fails its checksum
@@ -335,7 +336,7 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		contested:  make(map[uint64]time.Time),
 		claims:     make(map[uint64]*pendingClaim),
 		retrying:   make(map[uint64]int),
-		adopted:    make(map[uint64]adoptedSlot),
+		adopted:    make(map[uint64]map[int][16]byte),
 		unreleased: make(map[uint64]bool),
 		tornSince:  make(map[slotRef]tornSighting),
 		timing:     defaultTimings(),
@@ -827,10 +828,7 @@ func (m *Manager) renewIdleTurn(recordID uint64) (yield bool) {
 	m.mu.Lock()
 	rec, ok := m.records[recordID]
 	over := ok && m.turnOverLocked(recordID, rec)
-	ignore := -1
-	if a, ok := m.adopted[recordID]; ok {
-		ignore = a.slot
-	}
+	ignore := m.adoptedSlotsLocked(recordID)
 	m.mu.Unlock()
 	if !over {
 		return false
@@ -875,10 +873,7 @@ func (m *Manager) stillYielding(recordID uint64, mode LockMode, yieldedAt time.T
 			return false, err
 		}
 		m.mu.Lock()
-		ignore := -1
-		if a, ok := m.adopted[recordID]; ok {
-			ignore = a.slot
-		}
+		ignore := m.adoptedSlotsLocked(recordID)
 		m.mu.Unlock()
 		if conflict, _, _ := m.rowConflicts(recordID, row, mode, ignore); conflict || m.othersWaiting(row) {
 			return true, nil

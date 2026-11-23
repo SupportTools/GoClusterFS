@@ -268,7 +268,7 @@ func TestAReplayerDyingMidFoldKeepsTheQuotaLockInTheDeadSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(adopted, next.lockMgr.Record(lock.LockTypeQuota, 0)) {
+	if !slices.Contains(adopted, lock.Adoption{Record: next.lockMgr.Record(lock.LockTypeQuota, 0), Slot: deadSlot}) {
 		t.Fatalf("the dead node's slot holds no quota lock claim while its fold is half done; the next replay adopted records %v", adopted)
 	}
 	defer adoptCrashed(t, next, replayer.nodeUUID)()

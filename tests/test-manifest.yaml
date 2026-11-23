@@ -5682,6 +5682,13 @@ scenarios:
     environments:
       go: internal/lock/reclaim_test.go::TestKeepForHoldsTheLockInADeadSlot
 
+  - id: lock-adopt-record-in-two-slots
+    name: One node adopts a record held in two dead slots
+    description: A replayer that died holding a record it adopted leaves two dead claims; the node replaying both passes over both and releases each with its own replay
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestOneNodeAdoptsARecordInTwoDeadSlots
+
   - id: quota-flush
     name: A flush moves the ledger into the quota table
     description: The table gets the ledger's usage, the quota xattr counts unflushed usage, and a checkpoint passes every delta afterwards
