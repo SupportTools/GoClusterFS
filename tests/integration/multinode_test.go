@@ -2053,6 +2053,10 @@ func TestMultiNodeWritesToOneFallocatedBlock(t *testing.T) {
 // the other node allocated and freed.
 func TestMultiNodeStatfsFreeBlocks(t *testing.T) {
 	cluster := NewMultiNodeCluster(t, 2, 50)
+	// A peer counts another node's block reserve as used; at small block sizes this volume is big enough for one.
+	for i := range cluster.NodeCount() {
+		cluster.Node(i).ExtraArgs = []string{"-block-reserve=0"}
+	}
 	if err := cluster.FormatAndStartFirst(false); err != nil {
 		t.Fatalf("Failed to format and start first node: %v", err)
 	}
