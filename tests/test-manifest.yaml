@@ -5454,6 +5454,31 @@ scenarios:
     environments:
       go: internal/fence/fence_test.go::TestIoctlResultMapsBothTransports
 
+  - id: quota-project-xattr
+    name: trusted.goclusterfs.quota gives a directory a project
+    description: An empty directory gets a new project with PROJINHERIT; files, directories and symlinks under it join the project; only the root takes new limits (EPERM inside), a non-empty directory is refused (ENOTEMPTY), removing the attribute lifts the limits and keeps the project, and every node reads the same project
+    priority: high
+    environments:
+      go: internal/goclusterfs/quota_test.go::TestQuotaXattrMakesAProject
+      docker: run-tests.sh::test_quota_project
+      vm: TODO  # Docker covers it across nodes; it adds no storage or fencing behaviour
+
+  - id: quota-project-boundaries
+    name: Links, renames and clones keep files in their project
+    description: A link, rename or clone into another project or out of a file's own fails with EXDEV; a project's root moves only between directories outside every project; a snapshot's data inode takes its file's project
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_test.go::TestQuotaProjectsKeepTheirFiles
+
+  - id: quota-xattr-needs-cap
+    name: Only CAP_SYS_ADMIN changes a directory's quota through the mount
+    description: Without CAP_SYS_ADMIN, setting trusted.goclusterfs.quota fails with EPERM, so a PVC's tenant or a container root that dropped it cannot raise its own limit; as root it gives the directory a project
+    priority: high
+    environments:
+      go: quota_test.go::TestQuotaXattrThroughTheMount
+      docker: run-tests.sh::test_quota_project
+      vm: TODO  # Docker runs setfattr as a container root without CAP_SYS_ADMIN; the VM harness adds nothing to that check
+
   - id: quota-table-encoding
     name: The quota table's header and records round-trip and carry checksums
     description: The header keeps NextProjectID and every slot's FoldedThroughSeq, neighbouring records share a sector without overwriting each other, and a flipped bit or a wrong magic is refused
