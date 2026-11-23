@@ -3022,7 +3022,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		var writeErr error
 		if newBlock && !zeroFirst {
 			writeErr = joiner.add(data[bytesWritten:bytesWritten+toWrite], diskOffset)
-		} else if writeErr = joiner.flush(); writeErr == nil {
+		} else {
 			writeErr = f.fs.writeSpan(data[bytesWritten:bytesWritten+toWrite], diskOffset)
 		}
 		if writeErr != nil {
