@@ -611,7 +611,7 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 
 `-format -block-size` sets the data block size, a power of two from 8 KB to 1 MB, for the life of the volume. Every file with data takes whole blocks, so small blocks save space on volumes of many small files: a 155 MB node_modules tree took 1.5 times its size at 8 KB, 5.9 times at 64 KB and 83 times at 1 MB.
 
-Sizes below 1 MB are experimental until overwrites get faster. An overwrite checks, locks and writes each block on its own: a 512 MB overwrite with 128 KB writes ran at 57 MB/s at 8 KB, against 263 MB/s at 1 MB.
+Writes handle contiguous blocks as one run, so large files cost about the same at any block size. On a tmpfs-backed volume, a 512 MB overwrite with 128 KB writes ran at 257 MB/s at 8 KB and 251 MB/s at 1 MB, with the same device reads and writes.
 
 fsck tracks each block in one bit and one byte. A check of a 1 TB volume at 8 KB blocks, 90% full, took 24 s and 302 MB of memory.
 
