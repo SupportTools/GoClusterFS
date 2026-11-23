@@ -106,6 +106,33 @@ func TestAdoptOwnerClearsDeadNodesTornSlot(t *testing.T) {
 	requireAcquired(t, peer, LockTypeInode, 2, LockModeExclusive)
 }
 
+// A node killed while it held a lock, then a mount that registered in its slot and stopped before its replay, leaves
+// the killed node's claim under the second node's slot. The replay of that slot takes it over like the second node's
+// own, or it waits for itself.
+func TestAdoptOwnerKeepsAnEarlierSlotNodesClaim(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+
+	killed := NewManager(dev, 0, reclaimRegion, [16]byte{1}, 1)
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{3}, 3)
+	peer := NewManager(dev, 0, reclaimRegion, [16]byte{4}, 4)
+	requireAcquired(t, killed, LockTypeInode, 2, LockModeExclusive)
+
+	refused := [16]byte{5}
+	adopted, err := replayer.AdoptOwner(refused, 1)
+	if err != nil || len(adopted) != 1 {
+		t.Fatalf("AdoptOwner = %v, %v; want the killed node's record", adopted, err)
+	}
+	requireBlocked(t, peer, LockTypeInode, 2, LockModeExclusive)
+	requireAcquired(t, replayer, LockTypeInode, 2, LockModeExclusive)
+	release(t, replayer, LockTypeInode, 2)
+	replayer.ReleaseCached()
+	if err := replayer.ReleaseAdopted(adopted); err != nil {
+		t.Fatal(err)
+	}
+	requireAcquired(t, peer, LockTypeInode, 2, LockModeExclusive)
+}
+
 // A node restarted into its own registry slot finds its predecessor's claims
 // in that slot. They keep peers off during the replay; after it, ReleaseAdopted
 // clears the ones the new node does not use itself.

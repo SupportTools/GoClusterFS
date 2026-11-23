@@ -47,7 +47,8 @@ func withoutOverride(cluster *MultiNodeCluster, node *MountedFS) []string {
 // crashed journal. When that mount is refused, the slot must stay for a peer to
 // replay, as after a crash; an empty slot's journal is never replayed.
 func TestRefusedRemountLeavesTheCrashedJournalToAPeer(t *testing.T) {
-	cluster := NewMultiNodeCluster(t, 2, 64)
+	// Big enough that the crashed node reserves blocks ahead, which the replay frees under the bitmap lock.
+	cluster := NewMultiNodeCluster(t, 2, 1024)
 	peer, node := cluster.Node(0), cluster.Node(1)
 	peerLog, nodeLog := &syncBuffer{}, &syncBuffer{}
 	peer.Log, node.Log = peerLog, nodeLog

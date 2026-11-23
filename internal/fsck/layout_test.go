@@ -20,7 +20,7 @@ func formattedDevice(t *testing.T, mutate func(*superblock.Superblock)) *storage
 	dev, cleanup := testDevice(t, 64)
 	t.Cleanup(cleanup)
 
-	sb, err := superblock.Format(dev, 0)
+	sb, err := superblock.Format(dev, 0, 0)
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}

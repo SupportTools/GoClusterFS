@@ -59,7 +59,7 @@ func TestFormatThenRead(t *testing.T) {
 		writeAt(t, dev, offset, []byte("stale metadata from an earlier format"))
 	}
 
-	formatted, err := Format(dev, 0)
+	formatted, err := Format(dev, 0, 0)
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestFormatThenRead(t *testing.T) {
 
 func TestFormatKeepsSparseImageSparse(t *testing.T) {
 	dev, path := testDeviceAt(t, MinDeviceSize)
-	if _, err := Format(dev, 0); err != nil {
+	if _, err := Format(dev, 0, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	var st syscall.Stat_t
@@ -99,7 +99,7 @@ func TestFormatKeepsSparseImageSparse(t *testing.T) {
 
 func TestFormatRejectsSmallDevice(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize-1<<20)
-	if _, err := Format(dev, 0); !errors.Is(err, ErrDeviceTooSmall) {
+	if _, err := Format(dev, 0, 0); !errors.Is(err, ErrDeviceTooSmall) {
 		t.Errorf("Format on %d-byte device: err = %v, want ErrDeviceTooSmall", dev.Size(), err)
 	}
 }
@@ -124,7 +124,7 @@ func TestReadLegacyLayout(t *testing.T) {
 
 func TestReadRejectsVersion1(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size(), 0)
+	sb := New(dev.Size(), 0, 0)
 	sb.Version = 1
 	writeAt(t, dev, 0, sb.Serialize())
 
@@ -135,7 +135,7 @@ func TestReadRejectsVersion1(t *testing.T) {
 
 func TestReadDestroyedSuperblock(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	if _, err := Format(dev, 0); err != nil {
+	if _, err := Format(dev, 0, 0); err != nil {
 		t.Fatalf("Format: %v", err)
 	}
 	slot := make([]byte, 4)
@@ -150,7 +150,7 @@ func TestReadDestroyedSuperblock(t *testing.T) {
 
 func TestFormatRefusesNoDataBlocks(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	_, err := Format(dev, 64<<10)
+	_, err := Format(dev, 0, 64<<10)
 	if !errors.Is(err, ErrDeviceTooSmall) || !strings.Contains(err.Error(), "-bytes-per-inode") {
 		t.Errorf("Format with no room for data blocks: err = %v, want ErrDeviceTooSmall naming -bytes-per-inode", err)
 	}
@@ -158,7 +158,7 @@ func TestFormatRefusesNoDataBlocks(t *testing.T) {
 
 func TestReadRejectsVersion2(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size(), 0)
+	sb := New(dev.Size(), 0, 0)
 	sb.Version = 2
 	writeAt(t, dev, 0, sb.Serialize())
 
@@ -172,7 +172,7 @@ func TestReadRejectsVersion2(t *testing.T) {
 // and no slot size. Mount must refuse them and say to reformat.
 func TestReadRejectsLayoutWithoutLockSlots(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size(), 0)
+	sb := New(dev.Size(), 0, 0)
 	shift := sb.LockBitmapSize - 1<<20
 	sb.LockSlotSize, sb.LockBitmapSize = 0, 1<<20
 	for _, offset := range []*uint64{&sb.SnapshotRegOffset, &sb.JournalRegionOffset, &sb.BlockBitmapOffset,
@@ -190,7 +190,7 @@ func TestReadRejectsLayoutWithoutLockSlots(t *testing.T) {
 
 func TestReadAfterDeviceGrows(t *testing.T) {
 	dev, path := testDeviceAt(t, MinDeviceSize+8<<20)
-	formatted, err := Format(dev, 64<<10)
+	formatted, err := Format(dev, 0, 64<<10)
 	if err != nil {
 		t.Fatalf("Format: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestReadAfterDeviceGrows(t *testing.T) {
 
 func TestReadRejectsForeignJournalGeometry(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size(), 0)
+	sb := New(dev.Size(), 0, 0)
 	sb.MaxNodes = 16
 	writeAt(t, dev, 0, sb.Serialize())
 
@@ -226,7 +226,7 @@ func TestReadRejectsForeignJournalGeometry(t *testing.T) {
 
 func TestReadRejectsMovedRegion(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	sb := New(dev.Size(), 0)
+	sb := New(dev.Size(), 0, 0)
 	sb.RefCountTableOffset += 4096
 	writeAt(t, dev, 0, sb.Serialize())
 

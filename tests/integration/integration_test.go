@@ -977,8 +977,8 @@ func TestStatfsAvailableBlocks(t *testing.T) {
 	t.Logf("Before allocation: Blocks=%d, Bfree=%d, Bavail=%d",
 		statBefore.Blocks, statBefore.Bfree, statBefore.Bavail)
 
-	// Create file that allocates 2 blocks (2MB)
-	data := make([]byte, 2*1024*1024)
+	// Create file that allocates 2 blocks
+	data := make([]byte, 2*blockSizeOf(t, mfs))
 	if err := mfs.WriteFile("bigfile.bin", data); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -1027,7 +1027,7 @@ func TestStatfsFreeBlocksAfterRemount(t *testing.T) {
 
 	const fileBlocks = 5
 	formatted := statfs(t, mfs)
-	if err := mfs.WriteFile("five-blocks.bin", make([]byte, fileBlocks*1024*1024)); err != nil {
+	if err := mfs.WriteFile("five-blocks.bin", make([]byte, fileBlocks*blockSizeOf(t, mfs))); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 	written := statfs(t, mfs)
@@ -1057,8 +1057,9 @@ func TestSparseFileBlocks(t *testing.T) {
 		t.Fatalf("OpenFile failed: %v", err)
 	}
 
-	// Seek to 2MB offset (past first 2 blocks)
-	sparseOffset := int64(2 * 1024 * 1024)
+	// Seek past the first 2 blocks
+	bs := int64(blockSizeOf(t, mfs))
+	sparseOffset := 2 * bs
 	if _, err := f.Seek(sparseOffset, 0); err != nil {
 		mustClose(t, f)
 		t.Fatalf("Seek failed: %v", err)
@@ -1090,10 +1091,8 @@ func TestSparseFileBlocks(t *testing.T) {
 		t.Errorf("Size = %d, want %d", stat.Size, expectedSize)
 	}
 
-	// With allocate-on-write, only the block containing the written data
-	// should be allocated (1 block = 2048 × 512-byte units)
-	// The sparse gap (first 2MB) should NOT be allocated
-	expectedBlocks := int64(2048) // Only 1 block for the 1KB write at offset 2MB
+	// With allocate-on-write, only the block holding the written data is allocated, not the gap
+	expectedBlocks := bs / 512
 	if stat.Blocks != expectedBlocks {
 		t.Errorf("st_blocks = %d, want %d (sparse file should only allocate written blocks)",
 			stat.Blocks, expectedBlocks)

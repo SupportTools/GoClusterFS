@@ -29,7 +29,7 @@ func TestJoinSetsRequiredTakeoverIntentOnce(t *testing.T) {
 		t.Skipf("O_DIRECT not supported: %v", err)
 	}
 	t.Cleanup(func() { _ = dev.Close() })
-	sb, err := superblock.Format(dev, 0)
+	sb, err := superblock.Format(dev, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

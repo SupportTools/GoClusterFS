@@ -44,6 +44,7 @@ services:
       - DEVICE_PATH=/data/cluster.img
       - MOUNT_POINT=/mnt/goclusterfs
       - FORMAT_ON_START=true
+      - BLOCK_SIZE=${BLOCK_SIZE:-}
       - DEBUG=${DEBUG:-false}
       # Short, so a node no longer heard on broadcast is reported within seconds
       - BROADCAST_HEARTBEAT=${BROADCAST_HEARTBEAT:-2s}

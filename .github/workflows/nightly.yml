@@ -90,6 +90,62 @@ jobs:
             hangs/
           retention-days: 14
 
+  integration-8k:
+    name: Integration at 8 KB blocks, full (group ${{ matrix.group }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # tests/scripts/integration-groups.sh splits the tests by their run time without -short
+        group: [1, 2, 3]
+    env:
+      INTEGRATION_TIMINGS: tests/scripts/integration-timings-full.txt
+      GOCLUSTERFS_TEST_BLOCK_SIZE: "8192"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache: true
+
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-dev
+          sudo modprobe fuse
+          # TestNonRootUsersAcrossNodes mounts with -allow-other as the runner user
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          which fusermount || which fusermount3
+
+      - name: Build
+        run: make build
+
+      - name: Check test groups
+        run: tests/scripts/integration-groups.sh check ${{ strategy.job-total }}
+
+      - name: Integration tests without -short, 8 KB blocks
+        shell: bash
+        env:
+          GOCLUSTERFS_HANG_DIR: ${{ github.workspace }}/hangs
+        run: |
+          tests=$(tests/scripts/integration-groups.sh regex ${{ strategy.job-total }} ${{ matrix.group }})
+          go test -v -timeout 30m -run "$tests" ./tests/integration/... 2>&1 | tee integration-${{ matrix.group }}.log
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-integration-8k-${{ matrix.group }}
+          path: |
+            integration-${{ matrix.group }}.log
+            hangs/
+          retention-days: 14
+
   docker:
     name: Docker
     uses: ./.github/workflows/docker-integration.yml
@@ -296,7 +352,7 @@ jobs:
   summary:
     name: Summary
     if: always()
-    needs: [integration, docker, race, eio-sweep, fuzz-targets, fuzz]
+    needs: [integration, integration-8k, docker, race, eio-sweep, fuzz-targets, fuzz]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

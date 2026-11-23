@@ -15,14 +15,14 @@ func (m *Manager) ReleaseInode(inodeNum uint64) error {
 	return m.Release(LockTypeInode, inodeNum)
 }
 
-// AcquireExtent acquires a lock on an extent/block.
-func (m *Manager) AcquireExtent(ctx context.Context, blockNum uint64, mode LockMode) error {
-	return m.Acquire(ctx, LockTypeExtent, blockNum, mode)
+// AcquireExtent acquires an extent lock, which guards in-place writes to the data blocks its key covers.
+func (m *Manager) AcquireExtent(ctx context.Context, key uint64, mode LockMode) error {
+	return m.Acquire(ctx, LockTypeExtent, key, mode)
 }
 
 // ReleaseExtent releases an extent lock.
-func (m *Manager) ReleaseExtent(blockNum uint64) error {
-	return m.Release(LockTypeExtent, blockNum)
+func (m *Manager) ReleaseExtent(key uint64) error {
+	return m.Release(LockTypeExtent, key)
 }
 
 // AcquireBlockBitmap acquires the block bitmap lock.

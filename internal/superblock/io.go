@@ -18,8 +18,12 @@ const (
 	// NodeJournalSize is the size of each node slot's journal region.
 	NodeJournalSize = 4 << 20
 
-	// DefaultBytesPerInode gives one inode per data block, since every non-empty file takes at least one block.
+	// DefaultBytesPerInode gives one inode per data block at the default 1 MB block size.
 	DefaultBytesPerInode = storage.DefaultBlockSize
+
+	// MinBlockSize and MaxBlockSize bound the data block size a volume is formatted with.
+	MinBlockSize = 8 << 10
+	MaxBlockSize = 1 << 20
 
 	// MinInodes and MaxInodes bound the inode table to 1 MB and 4 GB.
 	MinInodes = regionSize / inodeSize
@@ -59,6 +63,8 @@ var (
 		"There is no tool to rebuild it; restore the device from backup. Do not run -format, which destroys the data, " +
 		"unless you wiped the device on purpose")
 	ErrUnsupportedLayout = errors.New("superblock layout is not supported by this version")
+
+	ErrInvalidBlockSize = fmt.Errorf("block size must be a power of two from %d KB to %d MB", MinBlockSize>>10, MaxBlockSize>>20)
 )
 
 // Read reads and validates the superblock from a device.
@@ -135,7 +141,7 @@ func (sb *Superblock) layout() []region {
 // CheckLayout requires the v3 region order, each region inside the device and big enough for the stored block and inode counts.
 func (sb *Superblock) CheckLayout(deviceSize int64) error {
 	size := uint64(max(deviceSize, 0))
-	if sb.BlockSize != storage.DefaultBlockSize || sb.MetaBlockSize != storage.MetadataBlockSize ||
+	if !ValidBlockSize(uint64(sb.BlockSize)) || sb.MetaBlockSize != storage.MetadataBlockSize ||
 		sb.InodeSize != inodeSize || sb.MaxNodes != MaxNodes || sb.InodeCount < MinInodes || sb.InodeCount > MaxInodes ||
 		sb.InodeTableSize != sb.InodeCount*inodeSize {
 		return fmt.Errorf("%w: block size %d, metadata block %d, inode size %d, %d node slots, %d inodes in %d bytes",
@@ -204,13 +210,32 @@ func Write(dev *storage.Device, sb *Superblock) error {
 	return dev.Sync()
 }
 
+// ValidBlockSize reports whether a volume may use data blocks of bs bytes.
+func ValidBlockSize(bs uint64) bool {
+	return bs >= MinBlockSize && bs <= MaxBlockSize && bs&(bs-1) == 0
+}
+
+// DefaultBytesPerInodeFor is the inode density -format uses at block size bs:
+// one inode per block at 1 MB, and one per max(2 × bs, 16 KB) below, since
+// volumes formatted with small blocks hold many small files.
+func DefaultBytesPerInodeFor(bs uint64) uint64 {
+	if bs >= storage.DefaultBlockSize {
+		return DefaultBytesPerInode
+	}
+	return max(2*bs, 16<<10)
+}
+
 // Format zeroes the metadata and journal headers, then writes the superblock last so an interrupted format never mounts.
-func Format(dev *storage.Device, bytesPerInode uint64) (*Superblock, error) {
+// blockSize 0 means 1 MB, and bytesPerInode 0 means DefaultBytesPerInodeFor(blockSize).
+func Format(dev *storage.Device, blockSize, bytesPerInode uint64) (*Superblock, error) {
 	if dev.Size() < MinDeviceSize {
 		return nil, fmt.Errorf("%w: %d MB, need at least %d MB",
 			ErrDeviceTooSmall, dev.Size()>>20, MinDeviceSize>>20)
 	}
-	sb := New(dev.Size(), bytesPerInode)
+	if blockSize != 0 && !ValidBlockSize(blockSize) {
+		return nil, fmt.Errorf("%w: %d", ErrInvalidBlockSize, blockSize)
+	}
+	sb := New(dev.Size(), blockSize, bytesPerInode)
 	if sb.TotalBlocks == 0 {
 		return nil, fmt.Errorf("%w: the %d MB inode table leaves no room for data blocks on %d MB; use a larger -bytes-per-inode",
 			ErrDeviceTooSmall, sb.InodeTableSize>>20, dev.Size()>>20)
@@ -261,15 +286,19 @@ func Format(dev *storage.Device, bytesPerInode uint64) (*Superblock, error) {
 	return sb, nil
 }
 
-// New lays out a superblock for the device; bytesPerInode 0 means DefaultBytesPerInode.
-func New(deviceSize int64, bytesPerInode uint64) *Superblock {
+// New lays out a superblock for the device; blockSize 0 means 1 MB and
+// bytesPerInode 0 means DefaultBytesPerInodeFor(blockSize).
+func New(deviceSize int64, blockSize, bytesPerInode uint64) *Superblock {
+	if blockSize == 0 {
+		blockSize = storage.DefaultBlockSize
+	}
 	sb := &Superblock{
 		Version:       CurrentVersion,
 		FeatureFlags:  FeatureSparseFiles | FeatureLargeFiles,
 		RequiredFlags: RequiredJournal | RequiredLockLayout | RequiredSymlinks | RequiredTakeoverIntent,
 
 		// Geometry
-		BlockSize:     storage.DefaultBlockSize,  // 1MB
+		BlockSize:     uint32(blockSize),
 		MetaBlockSize: storage.MetadataBlockSize, // 4KB
 		MaxNodes:      MaxNodes,
 		InodeSize:     inodeSize,
@@ -285,7 +314,7 @@ func New(deviceSize int64, bytesPerInode uint64) *Superblock {
 	rand.Read(sb.UUID[:])
 
 	if bytesPerInode == 0 {
-		bytesPerInode = DefaultBytesPerInode
+		bytesPerInode = DefaultBytesPerInodeFor(blockSize)
 	}
 	calculateLayout(sb, deviceSize, bytesPerInode)
 

@@ -42,3 +42,26 @@ func TestAllocRunsTakesAlignedFreeRuns(t *testing.T) {
 		t.Error("a run length of 3 was accepted")
 	}
 }
+
+// A run never reaches past the last block, even when the block count is not a
+// multiple of the run length.
+func TestAllocRunsStaysInsideTheBitmap(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	region := NewRegion(dev, 0, 13, nil, [16]byte{})
+	starts, err := region.AllocRuns(context.Background(), 3, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range starts {
+		if s+4 > 13 {
+			t.Fatalf("AllocRuns returned a run of 4 at block %d, past block 12", s)
+		}
+	}
+	if _, err := region.AllocRuns(context.Background(), 1, 4); !errors.Is(err, ErrNoFreeBlocks) {
+		t.Fatalf("a fourth run of 4 in 13 blocks: %v, want ErrNoFreeBlocks", err)
+	}
+	if free := region.FreeCount(); free != 1 {
+		t.Fatalf("%d blocks free after the failed run, want block 12 alone", free)
+	}
+}

@@ -243,7 +243,7 @@ func TestCanMountRefusesLockRecordsWithoutFileIOLocks(t *testing.T) {
 
 func TestNewSuperblock(t *testing.T) {
 	deviceSize := int64(10 << 30) // 10GB
-	sb := New(deviceSize, 0)
+	sb := New(deviceSize, 0, 0)
 
 	// Check magic
 	if string(sb.Magic[:len(Magic)]) != Magic {
@@ -301,8 +301,8 @@ func TestNewSuperblock(t *testing.T) {
 	if sb.InodeCount != 3<<20/256 {
 		t.Errorf("InodeCount = %d, want %d (10240 rounded up to fill 3 MB)", sb.InodeCount, 3<<20/256)
 	}
-	if New(MinDeviceSize, 0).TotalBlocks != 1 {
-		t.Errorf("MinDeviceSize leaves %d data blocks, want 1", New(MinDeviceSize, 0).TotalBlocks)
+	if New(MinDeviceSize, 0, 0).TotalBlocks != 1 {
+		t.Errorf("MinDeviceSize leaves %d data blocks, want 1", New(MinDeviceSize, 0, 0).TotalBlocks)
 	}
 
 	// Check timestamps
@@ -332,7 +332,7 @@ func TestSectorCapacitiesMatchRegions(t *testing.T) {
 
 func TestLayoutCoversEveryBlock(t *testing.T) {
 	for _, size := range []int64{MinDeviceSize, 10 << 30, 128 << 30, 200 << 30, 9 << 40, 100 << 40} {
-		sb := New(size, 0)
+		sb := New(size, 0, 0)
 		if err := sb.CheckLayout(size); err != nil {
 			t.Errorf("%d GB: %v", size>>30, err)
 		}
@@ -359,7 +359,7 @@ func TestBytesPerInode(t *testing.T) {
 		{100 << 40, 4096, MaxInodes},
 		{MinDeviceSize, 1 << 30, MinInodes},
 	} {
-		sb := New(tc.size, tc.bytesPerInode)
+		sb := New(tc.size, 0, tc.bytesPerInode)
 		if sb.InodeCount != tc.want || sb.InodeTableSize != tc.want*inodeSize {
 			t.Errorf("%d bytes at %d per inode: %d inodes in %d bytes, want %d",
 				tc.size, tc.bytesPerInode, sb.InodeCount, sb.InodeTableSize, tc.want)
@@ -373,7 +373,7 @@ func TestBytesPerInode(t *testing.T) {
 // A bitmap size of nearly 2^64 wraps the next offset back to 1 MB, which would put the refcount table on the node registry.
 func TestCheckLayoutRejectsWrappedOffsets(t *testing.T) {
 	const size = 1 << 30
-	sb := New(size, 0)
+	sb := New(size, 0, 0)
 	sb.BlockBitmapSize = -sb.BlockBitmapOffset + regionSize
 	sb.RefCountTableOffset, sb.RefCountTableSize = regionSize, regionSize
 	sb.InodeTableOffset, sb.InodeTableSize, sb.InodeCount = 2*regionSize, regionSize, MinInodes
@@ -385,7 +385,7 @@ func TestCheckLayoutRejectsWrappedOffsets(t *testing.T) {
 }
 
 func TestCheckLayoutRequiresInodeCountToFillTable(t *testing.T) {
-	sb := New(200<<30, 0)
+	sb := New(200<<30, 0, 0)
 	sb.InodeCount -= 255
 	if err := sb.CheckLayout(200 << 30); !errors.Is(err, ErrUnsupportedLayout) {
 		t.Errorf("CheckLayout with %d inodes in a %d-inode table: err = %v, want ErrUnsupportedLayout",
@@ -400,7 +400,7 @@ func TestRegistrySlotMagicMatchesNode(t *testing.T) {
 }
 
 func TestCheckLayoutRejectsRegionsTooSmallForBlocks(t *testing.T) {
-	sb := New(1<<40, 0)
+	sb := New(1<<40, 0, 0)
 	sb.TotalBlocks = 1500000
 	err := sb.CheckLayout(2 << 40)
 	if !errors.Is(err, ErrUnsupportedLayout) || !strings.Contains(err.Error(), "refcount table") {
@@ -455,7 +455,7 @@ func TestFeatureFlags(t *testing.T) {
 }
 
 func BenchmarkSerialize(b *testing.B) {
-	sb := New(10<<30, 0)
+	sb := New(10<<30, 0, 0)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -464,7 +464,7 @@ func BenchmarkSerialize(b *testing.B) {
 }
 
 func BenchmarkDeserialize(b *testing.B) {
-	sb := New(10<<30, 0)
+	sb := New(10<<30, 0, 0)
 	data := sb.Serialize()
 
 	b.ResetTimer()
@@ -492,7 +492,7 @@ func TestReservationsFlagIsOptionalButKnown(t *testing.T) {
 // A volume formatted now carries RequiredTakeoverIntent, so a build from before takeover intents, whose fsck would
 // revoke a node without marking an intent first, refuses to mount or check it.
 func TestBuildsWithoutTakeoverIntentsRefuseANewVolume(t *testing.T) {
-	sb := New(1<<30, 0)
+	sb := New(1<<30, 0, 0)
 	if sb.RequiredFlags&RequiredTakeoverIntent == 0 {
 		t.Fatal("a new volume lacks RequiredTakeoverIntent")
 	}
