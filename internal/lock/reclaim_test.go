@@ -457,3 +457,93 @@ func TestOneNodeAdoptsARecordInTwoDeadSlots(t *testing.T) {
 	}
 	requireAcquired(t, peer, LockTypeInode, 2, LockModeExclusive)
 }
+
+// deadClaims writes an exclusive claim on recordID in each of slots, owned by the slot's node, as dead nodes leave
+// them.
+func deadClaims(t *testing.T, m *Manager, recordID uint64, slots ...int) {
+	t.Helper()
+	for _, slot := range slots {
+		claim := &claimSlot{mode: LockModeExclusive, owner: [16]byte{byte(slot)}, acquireTime: time.Now().UnixNano()}
+		if err := m.writeSlot(recordID, slot, claim); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func adoptSlots(t *testing.T, m *Manager, slots ...int) {
+	t.Helper()
+	for _, slot := range slots {
+		if adopted, err := m.AdoptOwner([16]byte{byte(slot)}, slot); err != nil || len(adopted) != 1 {
+			t.Fatalf("node %d adopting slot %d: %v, %v", m.nodeSlot, slot, adopted, err)
+		}
+	}
+}
+
+// A replay passes over the claims of every dead slot it adopted a record in, not only the lowest: a slot the registry
+// still shows as failing does not take turns, so only adoption lets the replay past it.
+func TestAReplayPassesOverEverySlotItAdopted(t *testing.T) {
+	dev, cleanup := createTestDevice(t, reclaimRegion)
+	defer cleanup()
+	replayer := NewManager(dev, 0, reclaimRegion, [16]byte{9}, 9)
+	reg := newFakeRegistry()
+	reg.set(2, OwnerRecovering)
+	reg.set(5, OwnerFailing)
+	reg.set(9, OwnerAlive)
+	replayer.SetOwnerView(reg.view)
+	recordID := replayer.hashToRecord(LockTypeInode, 2)
+	deadClaims(t, replayer, recordID, 2, 5)
+	adoptSlots(t, replayer, 2, 5)
+
+	replayer.mu.Lock()
+	slots := replayer.adoptedSlotsLocked(recordID)
+	replayer.mu.Unlock()
+	if slots != 1<<2|1<<5 {
+		t.Errorf("adopted slots %#b, want slots 2 and 5", slots)
+	}
+	if err := acquireWithin(replayer, time.Second, LockTypeInode, 2, LockModeExclusive); err != nil {
+		t.Fatalf("the replay could not take the record it adopted in slots 2 and 5: %v", err)
+	}
+	release(t, replayer, LockTypeInode, 2)
+}
+
+// Two nodes replaying dead nodes that hold one record take turns by their lowest adopted slot, whatever their other
+// adopted slots are: the lower goes first and the other waits, and neither waits on the other at once.
+func TestAdoptedReplaysTakeTurnsByLowestSlot(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		x, y   []int
+		xFirst bool
+	}{
+		{"X adopts 1 and 6, Y adopts 3", []int{1, 6}, []int{3}, true},
+		{"X adopts 4 and 6, Y adopts 3", []int{4, 6}, []int{3}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dev, cleanup := createTestDevice(t, reclaimRegion)
+			defer cleanup()
+			x := NewManager(dev, 0, reclaimRegion, [16]byte{10}, 10)
+			y := NewManager(dev, 0, reclaimRegion, [16]byte{11}, 11)
+			reg := newFakeRegistry()
+			for _, slot := range append(append([]int{}, tc.x...), tc.y...) {
+				reg.set(slot, OwnerRecovering)
+			}
+			reg.set(10, OwnerAlive)
+			reg.set(11, OwnerAlive)
+			x.SetOwnerView(reg.view)
+			y.SetOwnerView(reg.view)
+			recordID := x.hashToRecord(LockTypeInode, 2)
+			deadClaims(t, x, recordID, tc.x...)
+			deadClaims(t, y, recordID, tc.y...)
+			adoptSlots(t, x, tc.x...)
+			adoptSlots(t, y, tc.y...)
+
+			first, second := x, y
+			if !tc.xFirst {
+				first, second = y, x
+			}
+			requireAcquired(t, first, LockTypeInode, 2, LockModeExclusive)
+			release(t, first, LockTypeInode, 2)
+			first.ReleaseCached()
+			requireBlocked(t, second, LockTypeInode, 2, LockModeExclusive)
+		})
+	}
+}

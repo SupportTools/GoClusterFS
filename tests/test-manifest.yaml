@@ -4195,6 +4195,13 @@ scenarios:
     environments:
       go: internal/lock/slots_fuzz_test.go::FuzzLockRow
 
+  - id: fuzz-adopted-turns
+    name: Fuzz two replays sharing a record
+    description: Two nodes that adopted any disjoint sets of dead slots holding one record take turns by their lowest adopted slot, with or without an owner view, and never both wait
+    priority: go_only
+    environments:
+      go: internal/lock/slots_fuzz_test.go::FuzzAdoptedTurns
+
   - id: fuzz-registry-slot
     name: Fuzz node registry slots
     description: A slot decodes only with a valid checksum or when all zero, round-trips, agrees with its lease expiry, and registry reads report no node in the empty slots around it
@@ -5688,6 +5695,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/reclaim_test.go::TestOneNodeAdoptsARecordInTwoDeadSlots
+
+  - id: lock-replay-passes-every-adopted-slot
+    name: A replay passes over every slot it adopted a record in
+    description: With the higher adopted slot still failing in the registry, only adoption lets the replay take the record
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAReplayPassesOverEverySlotItAdopted
+
+  - id: lock-adopted-turns-lowest-slot
+    name: Replays sharing a record take turns by their lowest adopted slot
+    description: X adopting slots 1 and 6 goes before Y adopting 3, and Y adopting 3 goes before X adopting 4 and 6
+    priority: go_only
+    environments:
+      go: internal/lock/reclaim_test.go::TestAdoptedReplaysTakeTurnsByLowestSlot
 
   - id: quota-flush
     name: A flush moves the ledger into the quota table
