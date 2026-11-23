@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
-	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/node"
 )
 
@@ -206,13 +205,11 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 	if err != nil {
 		return err
 	}
+	charged := false
+	var blocks int64
 	if f.journal != nil {
 		txn := f.journal.Begin()
-		if err := logExtentFree(txn, ino, 0); err != nil {
-			f.journal.Abort(txn)
-			return err
-		}
-		if err := txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: uint64(num), MetaGeneration: gen}); err != nil {
+		if blocks, err = f.logInodeFree(txn, ino, gen); err != nil {
 			f.journal.Abort(txn)
 			return err
 		}
@@ -221,6 +218,7 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 			return err
 		}
 		defer f.closeIntent(seq)
+		charged = true
 	}
 	var freed *inode.Inode
 	ok, err := f.inodeTbl.FreeIf(ctx, num, func(ino *inode.Inode) bool {
@@ -228,6 +226,9 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 		return ino.MetaGeneration == gen && ino.LinkCount == 0 && ino.Holders == 0
 	})
 	if err != nil || !ok {
+		if charged {
+			f.commitCharge(ino.ProjectID, blocks, 1)
+		}
 		return err
 	}
 	if afterCommit != nil {

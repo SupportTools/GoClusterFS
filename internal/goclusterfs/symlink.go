@@ -138,9 +138,15 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		}
 	}
 
+	var blocks int64
+	if block != 0 {
+		blocks = 1
+	}
+	uncharge := func() { f.commitCharge(project, -blocks, -1) }
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Symlink %q: ClaimSlot %d failed: %v", name, inodeNum, err)
+		uncharge()
 		return nil, claimErrno(err)
 	}
 	now := time.Now().UnixNano()
@@ -159,6 +165,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		if err := f.extentMgr.Insert(ctx, childIno, ext); err != nil {
 			logging.Debugf("Symlink %q: mapping block %d failed: %v", name, block, err)
 			f.freeNewInode(ctx, childIno.InodeNum)
+			uncharge()
 			return nil, syscall.EIO
 		}
 		childIno.Size = uint64(len(target))
@@ -167,6 +174,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err := f.inodeTbl.Write(ctx, childIno); err != nil {
 		logging.Debugf("Symlink %q: Write inode %d failed: %v", name, childIno.InodeNum, err)
 		f.freeNewInode(ctx, childIno.InodeNum)
+		uncharge()
 		return nil, syscall.EIO
 	}
 	if afterCommit != nil {
@@ -176,6 +184,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	if err := f.dirMgr.AddAndUpdate(ctx, dirIno, name, uint64(inodeNum), dir.DT_LNK, func(p *inode.Inode) { p.Mtime = now }); err != nil {
 		logging.Debugf("Symlink %q: dirMgr.Add failed: %v", name, err)
 		f.freeNewInode(ctx, childIno.InodeNum)
+		uncharge()
 		return nil, nameErrno(err)
 	}
 	giveBack = nil

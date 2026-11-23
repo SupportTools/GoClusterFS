@@ -199,9 +199,7 @@ func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, 
 	switch {
 	case err != nil || r.Target == nil:
 	case op.TargetIsDir:
-		if err = logExtentFree(txn, r.Target, 0); err == nil {
-			err = txn.LogInodeDelete(&journal.InodeDeletePayload{InodeNum: uint64(r.Target.InodeNum), MetaGeneration: r.Target.MetaGeneration})
-		}
+		_, err = f.logInodeFree(txn, r.Target, r.Target.MetaGeneration)
 	default:
 		err = txn.LogLinkDrop(&journal.LinkDropPayload{InodeNum: uint64(r.Target.InodeNum), MetaGeneration: r.Target.MetaGeneration})
 	}
@@ -222,8 +220,10 @@ func (f *FS) freeReplacedDir(ctx context.Context, target *inode.Inode) {
 	switch {
 	case err != nil:
 		log.Printf("[WARN] rename: replaced directory inode %d not freed, keeping its blocks: %v", target.InodeNum, err)
+		f.commitCharge(target.ProjectID, int64(target.AllocatedBlocks), 1)
 	case !ok:
 		log.Printf("[WARN] rename: replaced directory inode %d changed after it lost its name, keeping it", target.InodeNum)
+		f.commitCharge(target.ProjectID, int64(target.AllocatedBlocks), 1)
 	default:
 		f.invalidateInode(target.InodeNum)
 		if err := f.extentMgr.Delete(ctx, freed); err != nil {

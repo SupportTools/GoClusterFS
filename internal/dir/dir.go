@@ -102,6 +102,20 @@ type Manager struct {
 	indexes    *indexCache
 	// dirMu serializes this node's changes to a directory: its cluster lock admits every goroutine on the node at once.
 	dirMu [dirStripes]sync.RWMutex
+	// charge, when set, counts blocks a directory maps against its quota project.
+	charge func(project uint32, blocks int64)
+}
+
+// SetCharge makes growing a directory call charge with the directory's project, before the inode write that maps the
+// new block.
+func (m *Manager) SetCharge(charge func(project uint32, blocks int64)) {
+	m.charge = charge
+}
+
+func (m *Manager) charged(project uint32, blocks int64) {
+	if m.charge != nil {
+		m.charge(project, blocks)
+	}
 }
 
 const dirStripes = 256
@@ -718,8 +732,10 @@ func (m *Manager) appendBlock(ctx context.Context, dirIno *inode.Inode, settled 
 
 	// Write the updated inode to disk.
 	// Use WriteWithLockHeld since we already hold the inode lock.
+	m.charged(freshIno.ProjectID, 1)
 	if err := m.inodeTbl.WriteWithLockHeld(freshIno); err != nil {
 		if errors.Is(err, extent.ErrTreeConflict) {
+			m.charged(freshIno.ProjectID, -1)
 			return errRetryAdd
 		}
 		blockUsed = true // the inode on disk may already map physBlock

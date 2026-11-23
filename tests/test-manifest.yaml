@@ -5824,6 +5824,27 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_flush_test.go::TestAFlushFailingAfterItsCommitStopsTheNode
 
+  - id: quota-charges-files
+    name: File operations charge their quota project
+    description: Create, write (new blocks only), fallocate, truncate, mkdir, directory growth, short and long symlinks, unlink of an open file at its last close, and a rename over a directory charge or give back blocks and inodes
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaChargesFileOperations
+
+  - id: quota-charges-given-back
+    name: Failed operations give back their quota charges
+    description: A mkdir whose inode write fails and a write that fails after its commit leave usage at what the files map
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaGivesBackFailedOperations
+
+  - id: quota-charges-crash
+    name: Quota charges survive a crash
+    description: A create, a write and a truncate charged before any flush reach the table through the replay's fold
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaChargesSurviveACrash
+
   - id: quota-fold-logged
     name: A quota fold is logged in the dead journal
     description: After a fold the dead journal holds a completed fold that owes nothing, and the table has the usage
