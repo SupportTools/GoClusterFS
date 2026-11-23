@@ -3981,37 +3981,19 @@ test_fencing_clear_reservations() {
     return $result
 }
 
-# target_query runs the script on stdin, with $dev, an iSCSI disk, and pr, sg_persist sent again after a unit attention,
-# so it asks the target itself, whatever kind it is. With 2 nodes it asks from VM 3, which no test mounts, so it never
-# takes a unit attention a node under test should get; with more it asks from the first node that answers.
-target_query() {
-    local script vm disk vms
-    script=$(cat)
-    if [[ $NODE_COUNT -lt 3 ]]; then
-        start_vm 3 false > /dev/null 2>&1 || { log_error "target_query: VM 3, which asks the target, did not start"; return 1; }
-        vms=3
-    else
-        vms=$(seq 1 "$NODE_COUNT")
+# release_external_target unmounts every node at the end of a run, so each removes its key from the external target,
+# which keeps registrations across runs. A key the target holds after that is a cleanup leak.
+release_external_target() {
+    local vm
+    for vm in $(seq 1 "$NODE_COUNT"); do
+        [[ -n "$(mount_pids "$vm" 2> /dev/null)" ]] || continue
+        unmount_goclusterfs "$vm" || log_error "VM $vm did not unmount cleanly at the end of the run"
+    done
+    log_target_reservations "at the end of the run, after every node unmounted" || return 1
+    if [[ -n "$TARGET_KEYS" ]]; then
+        log_error "Cleanup leak: ${ISCSI_TARGET_IQN} still holds keys after every node unmounted: ${TARGET_KEYS}"
     fi
-    for vm in $vms; do
-        disk=$(iscsi_disk "$vm" 2> /dev/null) && [[ -n "$disk" ]] || continue
-        printf '%s\ndev=/dev/%s\n%s\n' "$TARGET_QUERY_PRELUDE" "$disk" "$script" | ssh_run_capped 60 "$vm" "sh -s" && return 0
-    done
-    log_error "target_query: no VM could ask the target"
-    return 1
 }
-
-TARGET_QUERY_PRELUDE='command -v sg_persist > /dev/null || apk add --no-cache sg3_utils > /dev/null
-pr() {
-    i=0
-    while :; do
-        out=$(sg_persist "$@" 2>&1) && { echo "$out"; return 0; }
-        i=$((i + 1))
-        case "$out" in *"nit attention"*) [ $i -lt 5 ] && continue ;; esac
-        echo "$out" >&2
-        return 1
-    done
-}'
 
 # skip_on_external_target logs SKIP with reason $1 and succeeds when the tests run against an external target.
 skip_on_external_target() {
@@ -5697,6 +5679,10 @@ EOF
     echo "</testsuite>" >> "$RESULTS_DIR/junit.xml"
 
     log_info "Results written to $RESULTS_DIR"
+
+    if [[ "$EXTERNAL_TARGET" == true ]]; then
+        release_external_target
+    fi
 
     # Cleanup VMs
     log_info "Cleaning up VMs..."
