@@ -54,7 +54,7 @@ type pendingTree struct {
 	index    uint64
 	hasIndex bool
 	leaves   []*leafRef
-	fresh    []uint64 // tree blocks allocated since base
+	fresh    []uint64 // first blocks of the tree nodes allocated since base
 	release  []uint64 // blocks to free after the commit
 }
 
@@ -435,10 +435,10 @@ func (e *editor) drop(blocks []uint64) {
 	for _, b := range blocks {
 		if i := indexOf(e.fresh, b); i >= 0 {
 			e.fresh = append(e.fresh[:i], e.fresh[i+1:]...)
-			e.m.freeBlocks(e.ctx, []uint64{b})
+			e.m.freeBlocks(e.ctx, e.m.nodeRuns([]uint64{b}))
 			continue
 		}
-		e.release = append(e.release, b)
+		e.release = append(e.release, e.m.nodeRuns([]uint64{b})...)
 	}
 }
 
@@ -647,7 +647,7 @@ func (m *Manager) ReserveTreeBlocks(ctx context.Context, ino *inode.Inode) (cont
 	if err != nil || need == 0 {
 		return ctx, noop, err
 	}
-	blocks, err := m.bitmap.Alloc(ctx, need)
+	blocks, err := m.bitmap.AllocRuns(ctx, need, int(NodeBlocks(m.blockSize)))
 	if err != nil {
 		return ctx, noop, err
 	}
@@ -657,7 +657,7 @@ func (m *Manager) ReserveTreeBlocks(ctx context.Context, ino *inode.Inode) (cont
 		left := r.blocks
 		r.blocks = nil
 		r.mu.Unlock()
-		m.freeBlocks(context.Background(), left)
+		m.freeBlocks(context.Background(), m.nodeRuns(left))
 	}
 	return context.WithValue(ctx, reservationKey{}, r), release, nil
 }
@@ -704,7 +704,7 @@ func (m *Manager) allocTreeBlocks(ctx context.Context, n int) ([]uint64, error) 
 		r.mu.Unlock()
 	}
 	if len(out) < n {
-		more, err := m.bitmap.Alloc(ctx, n-len(out))
+		more, err := m.bitmap.AllocRuns(ctx, n-len(out), int(NodeBlocks(m.blockSize)))
 		if err != nil {
 			if r != nil {
 				r.mu.Lock()
@@ -815,7 +815,22 @@ func (m *Manager) deferFree(blocks ...uint64) {
 // would have released stay allocated because the inode on disk may use them.
 func (m *Manager) DiscardPending(ctx context.Context, ino *inode.Inode) {
 	if p := pendingOf(ino); p != nil {
-		m.freeBlocks(ctx, p.fresh)
+		m.freeBlocks(ctx, m.nodeRuns(p.fresh))
 		ino.PendingTree = nil
 	}
+}
+
+// nodeRuns returns every block of the tree nodes that start at starts.
+func (m *Manager) nodeRuns(starts []uint64) []uint64 {
+	n := NodeBlocks(m.blockSize)
+	if n == 1 {
+		return starts
+	}
+	blocks := make([]uint64, 0, len(starts)*int(n))
+	for _, s := range starts {
+		for i := range n {
+			blocks = append(blocks, s+i)
+		}
+	}
+	return blocks
 }
