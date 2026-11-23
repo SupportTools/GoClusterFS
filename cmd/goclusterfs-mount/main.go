@@ -86,7 +86,7 @@ func main() {
 		mountPoint = flag.String("mount", "", "Directory to mount the filesystem on; required")
 		format     = flag.Bool("format", false, "Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first")
 		blockSize  = flag.Uint64("block-size", superblock.MaxBlockSize,
-			fmt.Sprintf("With -format: data block size in bytes, a power of two from %d to %d; fixed until the next format. 8192 or 16384 for volumes of small files, 65536 for mixed ones, 1048576 for VM disks and large files. Sizes below 1048576 are experimental: at 8192, 128 KB overwrites run at a quarter of the 1 MB speed", superblock.MinBlockSize, superblock.MaxBlockSize))
+			fmt.Sprintf("With -format: data block size in bytes, a power of two from %d to %d; fixed until the next format. 8192 or 16384 for volumes of small files, 65536 for mixed ones, 1048576 for VM disks and large files", superblock.MinBlockSize, superblock.MaxBlockSize))
 		inodeRatio = flag.Uint64("bytes-per-inode", 0,
 			fmt.Sprintf("With -format: one inode per this many bytes of device (%d to %d inodes); fixed until the next format. 0 picks one per block at 1 MB blocks, and max(2 × block size, 16 KB) below", superblock.MinInodes, superblock.MaxInodes))
 		debug      = flag.Bool("debug", false, "Print [DEBUG] log lines")

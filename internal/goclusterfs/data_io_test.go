@@ -7,7 +7,8 @@ import (
 	"testing"
 )
 
-// A 1 MB request used to reach the device as 256 I/Os of 4 KB.
+// A 1 MB request used to reach the device as 256 I/Os of 4 KB, and a write
+// across a block boundary as one I/O per block.
 func TestDataReachesTheDeviceInOneIOPerContiguousSpan(t *testing.T) {
 	fsys := openFormattedFS(t, newFormattedImage(t))
 	f := createFile(t, fsys, "f")
@@ -31,6 +32,10 @@ func TestDataReachesTheDeviceInOneIOPerContiguousSpan(t *testing.T) {
 		fsys.dev.SetReadFault(func(int64) error { return nil })
 		fsys.dev.SetWriteObserver(nil)
 	})
+	contiguous := 1
+	if a, b := fileBlock(t, fsys, f, 0), fileBlock(t, fsys, f, 1); b != a+1 {
+		contiguous = 2
+	}
 
 	for i, c := range []struct {
 		name        string
@@ -41,7 +46,7 @@ func TestDataReachesTheDeviceInOneIOPerContiguousSpan(t *testing.T) {
 		{"one byte", 100, 1, 1, 1},
 		{"partial sectors at both ends", 4000, 8300, 2, 1},
 		{"whole sectors", 8192, 65536, 0, 1},
-		{"across a block boundary", BlockSize - 4096, 8192, 0, 2},
+		{"across a block boundary", BlockSize - 4096, 8192, 0, contiguous},
 	} {
 		data := pattern(byte(i+2), c.n)
 		copy(content[c.off:], data)
@@ -53,10 +58,6 @@ func TestDataReachesTheDeviceInOneIOPerContiguousSpan(t *testing.T) {
 		}
 	}
 
-	contiguous := 1
-	if a, b := fileBlock(t, fsys, f, 0), fileBlock(t, fsys, f, 1); b != a+1 {
-		contiguous = 2
-	}
 	for _, c := range []struct {
 		name   string
 		off, n int

@@ -33,7 +33,7 @@ These are the `goclusterfs-mount` flags:
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `-format` | bool | `false` | Erase the device and create an empty filesystem, then mount it. Destroys all data and does not check for other nodes: unmount every node first |
-| `-block-size` | uint | `1048576` | With `-format`: data block size in bytes, a power of two from 8192 to 1048576. The volume keeps it; without `-format` the flag is an error. Sizes below 1048576 are experimental, see [Block Size](OPERATIONS.md#block-size) |
+| `-block-size` | uint | `1048576` | With `-format`: data block size in bytes, a power of two from 8192 to 1048576. The volume keeps it; without `-format` the flag is an error. See [Block Size](OPERATIONS.md#block-size) |
 | `-bytes-per-inode` | uint | `0` | With `-format`: one inode per this many bytes of device, 4096 to 16,777,216 inodes. 0 picks one per block at 1 MB blocks, and max(2 × block size, 16 KB) below |
 | `-fencing` | string | `auto` | With `-format`: `pr` fences dead nodes with persistent reservations and fails if the device lacks them, `none` formats without fencing, and `auto` picks `pr` when the device supports it. See [Storage Fencing](OPERATIONS.md#storage-fencing) |
 | `-require-fencing` | bool | `false` | Refuse to mount a volume formatted without fencing |

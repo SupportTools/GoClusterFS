@@ -1021,3 +1021,34 @@ func TestFallocateMapsOnlyHoles(t *testing.T) {
 		t.Errorf("block 21, in the hole after the last extent: %v", err)
 	}
 }
+
+// ClearUnwrittenRange marks the blocks a write covers as written, up to the end
+// of the unwritten extent, and leaves the rest unwritten.
+func TestClearUnwrittenRangeStopsAtTheExtentEnd(t *testing.T) {
+	env := newTreeEnv(t, 0)
+	ino := env.newInode()
+	if _, err := env.mgr.AllocateUnwritten(env.ctx, ino, 0, 8); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := env.mgr.ClearUnwrittenRange(env.ctx, ino, 2, 3); err != nil || n != 3 {
+		t.Fatalf("ClearUnwrittenRange(2, 3) = %d, %v; want 3", n, err)
+	}
+	if n, err := env.mgr.ClearUnwrittenRange(env.ctx, ino, 6, 10); err != nil || n != 2 {
+		t.Fatalf("ClearUnwrittenRange(6, 10) = %d, %v; want 2, to the end of the extent", n, err)
+	}
+	if n, err := env.mgr.ClearUnwrittenRange(env.ctx, ino, 3, 2); err != nil || n != 0 {
+		t.Fatalf("ClearUnwrittenRange on written blocks = %d, %v; want 0", n, err)
+	}
+	for blk := uint64(0); blk < 8; blk++ {
+		ext, _, err := env.mgr.Lookup(ino, blk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if written := ext.Flags&FlagUnwritten == 0; written != (blk >= 2 && blk != 5) {
+			t.Errorf("block %d written = %v", blk, written)
+		}
+	}
+	if ino.WrittenBlocks != 5 {
+		t.Errorf("WrittenBlocks = %d, want 5", ino.WrittenBlocks)
+	}
+}
