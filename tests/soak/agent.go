@@ -186,13 +186,31 @@ func entryName(dir string, e os.DirEntry) string {
 }
 
 // writeSynced writes data at off and syncs the file. It returns how much a failed write wrote, synced too, since a
-// write that passes a quota limit part way keeps its first bytes.
+// write that passes a quota limit part way keeps its first bytes. It calls pwrite itself: os.File.WriteAt drops the
+// count of a call that wrote some bytes and then failed.
 func writeSynced(p string, off int64, data []byte) (int64, error) {
 	f, err := os.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {
 		return 0, err
 	}
-	n, werr := f.WriteAt(data, off)
+	var n int
+	var werr error
+	for n < len(data) {
+		m, err := unix.Pwrite(int(f.Fd()), data[n:], off+int64(n))
+		if m > 0 {
+			n += m
+		}
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err == nil && m == 0 {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			werr = err
+			break
+		}
+	}
 	serr := f.Sync()
 	cerr := f.Close()
 	if werr != nil {
