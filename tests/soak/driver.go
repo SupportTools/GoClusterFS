@@ -158,7 +158,10 @@ func (d *driver) bringUp() error {
 			return fmt.Errorf("mkdir %s: %v %s", dir, err, resp.Err)
 		}
 	}
-	return d.setQuotas(d.nodes[0])
+	if err := d.setQuotas(d.nodes[0]); err != nil {
+		return err
+	}
+	return d.checkStatfs(d.nodes[0])
 }
 
 func (d *driver) connect(n *node) error {
@@ -786,6 +789,10 @@ func (d *driver) quiescedFsck() {
 			d.fail("after fsck: node %d: %v", n.id, err)
 			return
 		}
+		if err := d.checkStatfs(n); err != nil {
+			d.fail("after fsck: node %d: %v", n.id, err)
+			return
+		}
 	}
 	log.Printf("fsck: %d leaks repaired, every node shows the model (%s)", len(leaks), time.Since(start).Round(time.Second))
 }
@@ -810,6 +817,15 @@ func (d *driver) barrier() {
 		}
 		if err := d.onNode(n, func() error { return d.checkQuotas(n) }); err != nil {
 			d.fail("barrier: node %d: %v", n.id, err)
+			return
+		}
+	}
+	// Skipped while a fault runs: a stopped node would hold the check up, and a recovering one is behind.
+	if d.faultMu.TryLock() {
+		err := d.checkAgreement(d.upNodes())
+		d.faultMu.Unlock()
+		if err != nil {
+			d.fail("barrier: %v", err)
 			return
 		}
 	}

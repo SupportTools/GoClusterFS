@@ -127,6 +127,11 @@ func serve(root string, req request) response {
 		if n, err = unix.Getxattr(p, req.Attr, buf); err == nil {
 			resp.Text = string(buf[:n])
 		}
+	case "statfs":
+		var st unix.Statfs_t
+		if err = unix.Statfs(p, &st); err == nil {
+			resp.Text = fmt.Sprintf("%d %d", int64(st.Blocks)*st.Frsize, st.Files)
+		}
 	case "read":
 		var data []byte
 		if data, err = os.ReadFile(p); err == nil {

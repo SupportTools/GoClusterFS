@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const quotaXattr = "trusted.goclusterfs.quota"
@@ -114,3 +115,66 @@ func (d *driver) setQuotas(n *node) error {
 
 // isQuotaDrift reports an fsck line about a project whose table usage differs from what its inodes use.
 func isQuotaDrift(line string) bool { return strings.Contains(line, "the quota table counts") }
+
+// checkStatfs checks that df on each project root shows its limits: the byte limit as the size, the inode limit as
+// the inode count.
+func (d *driver) checkStatfs(n *node) error {
+	for _, root := range slices.Sorted(maps.Keys(quotaDirs)) {
+		want, err := parseQuotaUsage(quotaDirs[root] + " used_bytes=0 used_inodes=0")
+		if err != nil {
+			return err
+		}
+		resp, err := d.call(n, request{Op: "statfs", Path: root})
+		if err != nil {
+			return err
+		}
+		var size, files int64
+		if _, err := fmt.Sscan(resp.Text, &size, &files); resp.Errno != 0 || err != nil {
+			return fmt.Errorf("statfs %s: errno %d (%s) %v", root, resp.Errno, resp.Err, err)
+		}
+		if want.limitBytes != 0 && size != want.limitBytes || want.limitInodes != 0 && files != want.limitInodes {
+			return fmt.Errorf("df on %s shows %d bytes and %d inodes, want its limits %d and %d", root, size, files, want.limitBytes, want.limitInodes)
+		}
+	}
+	return nil
+}
+
+// quotaAgreement is how long nodes may take to report the same usage once operations stop: each flushes every second.
+const quotaAgreement = 3 * time.Second
+
+// checkAgreement checks that every node reports the same usage of each project within quotaAgreement. The caller
+// holds every lane paused.
+func (d *driver) checkAgreement(nodes []*node) error {
+	if len(nodes) < 2 {
+		return nil
+	}
+	deadline := time.Now().Add(quotaAgreement)
+	for {
+		seen, err := d.usageByNode(nodes)
+		if err != nil || len(seen) == 1 {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("nodes still report different project usage %v after operations stopped: %v", quotaAgreement, seen)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// usageByNode maps each distinct usage report, every project's, to the nodes that gave it.
+func (d *driver) usageByNode(nodes []*node) (map[string][]int, error) {
+	seen := map[string][]int{}
+	for _, n := range nodes {
+		var report []string
+		for _, root := range slices.Sorted(maps.Keys(quotaDirs)) {
+			u, err := d.quotaUsage(n, root)
+			if err != nil {
+				return nil, fmt.Errorf("node %d: %w", n.id, err)
+			}
+			report = append(report, fmt.Sprintf("%s=%d/%d", root, u.usedBytes, u.usedInodes))
+		}
+		key := strings.Join(report, " ")
+		seen[key] = append(seen[key], n.id)
+	}
+	return seen, nil
+}
