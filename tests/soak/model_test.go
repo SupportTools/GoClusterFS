@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"math/rand/v2"
 	"strings"
 	"syscall"
@@ -231,5 +232,30 @@ func TestParseQuotaUsage(t *testing.T) {
 	}
 	if _, err := parseQuotaUsage("project=3 bytes=1"); err == nil {
 		t.Fatal("a value without usage parsed")
+	}
+}
+
+func TestQuotaDriftBound(t *testing.T) {
+	d := &driver{cfg: config{lanes: 3, blockSize: 1 << 20}}
+	line := func(table, tableInodes, use, useInodes int) string {
+		return fmt.Sprintf("[ERROR] quota project 1: the quota table counts %d blocks and %d inodes, but the project's inodes use %d blocks and %d inodes", table, tableInodes, use, useInodes)
+	}
+	for _, c := range []struct {
+		line   string
+		faults int64
+		ok     bool
+	}{
+		{line(10, 3, 10, 3), 0, true},
+		{line(11, 3, 10, 3), 0, false},
+		{line(11, 4, 10, 3), 1, true},
+		{line(37, 6, 10, 3), 1, true},
+		{line(38, 3, 10, 3), 1, false},
+		{line(10, 7, 10, 3), 1, false},
+		{line(9, 3, 10, 3), 1, false},
+		{line(10, 2, 10, 3), 2, false},
+	} {
+		if err := d.checkDrift(c.line, c.faults); (err == nil) != c.ok {
+			t.Errorf("%s after %d faults: %v, want ok %v", c.line, c.faults, err, c.ok)
+		}
 	}
 }

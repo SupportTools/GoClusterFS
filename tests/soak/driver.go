@@ -100,6 +100,8 @@ type driver struct {
 	edquot, quotaDrift                                               atomic.Int64
 	// faultsAtFsck is the fault count when the last fsck ran: usage may drift only across a fault.
 	faultsAtFsck atomic.Int64
+	// lastFree holds, per project root, the Unix ms when an operation last freed something there.
+	lastFree map[string]*atomic.Int64
 	// waitsOf reads a node's wait totals for slow-check records; nil leaves them out.
 	waitsOf   func(*node) waits
 	slowestMs atomic.Int64
@@ -530,6 +532,7 @@ func (d *driver) check(op *Op) {
 		d.model.apply(op)
 		d.model.mu.Unlock()
 	}
+	d.noteFree(op)
 	if op.Got == int(syscall.EDQUOT) {
 		d.edquot.Add(1)
 		n := d.nodes[op.Node-1]
@@ -745,15 +748,17 @@ func (d *driver) quiescedFsck() {
 	}
 	d.fscks.Add(1)
 	faults := d.faults.Load()
-	quiet := faults == d.faultsAtFsck.Swap(faults)
+	since := faults - d.faultsAtFsck.Swap(faults)
 	d.logRecord(record{Type: "fsck", Detail: fmt.Sprintf("%s, %d leaks, %d quota drift, %d other", rc, len(leaks), len(drift), len(other)), Op: Op{At: start.UnixMilli()}})
 	if len(other) > 0 {
 		d.fail("fsck found more than leaks:\n%s", strings.Join(other, "\n"))
 		return
 	}
-	if len(drift) > 0 && quiet {
-		d.fail("fsck found quota usage that drifted with no fault since the last fsck:\n%s", strings.Join(drift, "\n"))
-		return
+	for _, line := range drift {
+		if err := d.checkDrift(line, since); err != nil {
+			d.fail("fsck: %v", err)
+			return
+		}
 	}
 	if len(drift) > 0 {
 		d.quotaDrift.Add(int64(len(drift)))
@@ -866,7 +871,10 @@ func newDriver(cfg config) (*driver, func(), error) {
 		return nil, nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, running: map[*Op]*File{}, victims: make(chan *node)}
+	d := &driver{cfg: cfg, ctl: ctl, model: newModel(), logw: logf, stderr: clusterLog, ctx: ctx, cancel: cancel, pending: map[int][]*uncertain{}, running: map[*Op]*File{}, victims: make(chan *node), lastFree: map[string]*atomic.Int64{}}
+	for root := range quotaDirs {
+		d.lastFree[root] = new(atomic.Int64)
+	}
 	d.waitsOf = d.nodeWaits
 	cleanup := func() {
 		cancel()

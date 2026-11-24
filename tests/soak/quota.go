@@ -67,18 +67,44 @@ func (d *driver) overshoot(root string, u quotaUsage) error {
 	return nil
 }
 
-// checkRefusal checks, on the node that refused op with EDQUOT, that its project is near a limit and not past one.
-func (d *driver) checkRefusal(n *node, op *Op) error {
-	root := projectOf(op.Path)
+// opProject returns the project op's path lies in, or that its new entry lands in.
+func opProject(op *Op) string {
 	if op.Kind == "create" || op.Kind == "mkdir" || op.Kind == "symlink" {
-		root = projectOf(path.Dir(op.Path))
+		return projectOf(path.Dir(op.Path))
 	}
+	return projectOf(op.Path)
+}
+
+// noteFree records when an operation that may free blocks or inodes finished. A snapshot's data inode has no path,
+// so a snapshot delete counts in every project.
+func (d *driver) noteFree(op *Op) {
+	if op.Got != 0 || !slices.Contains([]string{"unlink", "truncate", "rmdir", "rename", "snapdelete", "orphandelete"}, op.Kind) {
+		return
+	}
+	now := time.Now().UnixMilli()
+	for root := range quotaDirs {
+		if op.Kind == "snapdelete" || op.Kind == "orphandelete" || projectOf(op.Path) == root || projectOf(op.Path2) == root {
+			d.lastFree[root].Store(now)
+		}
+	}
+}
+
+// freedLately reports whether an operation freed something in project root within 2 s before op started: a peer's
+// unflushed frees still count against the limit until it flushes, each second.
+func (d *driver) freedLately(root string, op *Op) bool {
+	return d.lastFree[root].Load() >= op.At-2000
+}
+
+// checkRefusal checks, on the node that refused op with EDQUOT, that its project is near a limit, unless something
+// was freed there lately, and not past one.
+func (d *driver) checkRefusal(n *node, op *Op) error {
+	root := opProject(op)
 	u, err := d.quotaUsage(n, root)
 	if err != nil {
 		return err
 	}
 	sb, si := d.quotaSlack()
-	if !(u.limitBytes != 0 && u.usedBytes >= u.limitBytes-sb || u.limitInodes != 0 && u.usedInodes >= u.limitInodes-si) {
+	if !d.freedLately(root, op) && !(u.limitBytes != 0 && u.usedBytes >= u.limitBytes-sb || u.limitInodes != 0 && u.usedInodes >= u.limitInodes-si) {
 		return fmt.Errorf("EDQUOT while project %s uses %d bytes and %d inodes, far below its limits of %d and %d",
 			root, u.usedBytes, u.usedInodes, u.limitBytes, u.limitInodes)
 	}
@@ -115,6 +141,28 @@ func (d *driver) setQuotas(n *node) error {
 
 // isQuotaDrift reports an fsck line about a project whose table usage differs from what its inodes use.
 func isQuotaDrift(line string) bool { return strings.Contains(line, "the quota table counts") }
+
+// checkDrift checks an fsck drift line against what faults may leave: usage high, never low, by at most one
+// operation in flight per lane on each faulted node, sized as a snapshot of a whole file, and one inode for each.
+func (d *driver) checkDrift(line string, faults int64) error {
+	var table, tableInodes, use, useInodes int64
+	i := strings.Index(line, "the quota table counts")
+	if i < 0 {
+		return fmt.Errorf("unparsed drift: %s", line)
+	}
+	if _, err := fmt.Sscanf(line[i:], "the quota table counts %d blocks and %d inodes, but the project's inodes use %d blocks and %d inodes",
+		&table, &tableInodes, &use, &useInodes); err != nil {
+		return fmt.Errorf("unparsed drift %q: %w", line, err)
+	}
+	bs := int64(d.cfg.blockSize)
+	maxBlocks := faults * int64(d.cfg.lanes) * ((maxFile + blockSize + bs - 1) / bs)
+	maxInodes := faults * int64(d.cfg.lanes)
+	if up, upInodes := table-use, tableInodes-useInodes; up < 0 || upInodes < 0 || up > maxBlocks || upInodes > maxInodes {
+		return fmt.Errorf("usage drifted by %d blocks and %d inodes, outside 0 to %d blocks and 0 to %d inodes for %d faults: %s",
+			up, upInodes, maxBlocks, maxInodes, faults, line)
+	}
+	return nil
+}
 
 // checkStatfs checks that df on each project root shows its limits: the byte limit as the size, the inode limit as
 // the inode count.
