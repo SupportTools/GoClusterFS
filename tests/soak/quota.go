@@ -116,7 +116,8 @@ func (d *driver) checkRefusal(n *node, op *Op) error {
 		return err
 	}
 	b, i := allocation(op)
-	if !d.freedLately(root, op) && !(u.limitBytes != 0 && u.usedBytes+b > u.limitBytes || u.limitInodes != 0 && u.usedInodes+i > u.limitInodes) {
+	passes := u.limitBytes != 0 && u.usedBytes+b > u.limitBytes || u.limitInodes != 0 && u.usedInodes+i > u.limitInodes
+	if !passes && !d.freedLately(root, op) {
 		return fmt.Errorf("EDQUOT while project %s uses %d bytes and %d inodes, so %s could add %d bytes and %d inodes within its limits of %d and %d",
 			root, u.usedBytes, u.usedInodes, op.Kind, b, i, u.limitBytes, u.limitInodes)
 	}
