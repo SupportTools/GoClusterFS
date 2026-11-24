@@ -631,6 +631,23 @@ func main() {
 	gfs.SetDirectIO(*directIO)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
 	cacheMgr.OnOrphans(nodeReg.KickOrphans)
+	quotasSet := false
+	setUpQuotas := func() {
+		if quotasSet || sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 {
+			return
+		}
+		quotasSet = true
+		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
+		for project, c := range ownCharges {
+			gfs.ChargeQuota(project, c[0], c[1])
+		}
+		gfs.SetStopNode(func(reason string) {
+			failf("%s; stopping this node so a peer replays its journal. Mount again once the device is healthy", reason)
+		})
+		gfs.StartQuotaFlush(time.Duration(cmp.Or(sb.QuotaFlushMs, quota.DefaultFlushMs)) * time.Millisecond)
+	}
+	// Freeing orphans and replaying peers change usage, which counts only once the quota table is set.
+	setUpQuotas()
 	// Nothing is open here yet: let go of what this slot held before a crash.
 	if err := gfs.ForgetSlot(lock.ForReplay(context.Background()), slotIdx, nil); err != nil {
 		log.Printf("[WARN] letting go of orphans this slot held before: %v", err)
@@ -651,16 +668,7 @@ func main() {
 		}
 		log.Printf("Filesystem formatted successfully, with project quotas in inode %d", sb.QuotaInode)
 	}
-	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
-		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
-		for project, c := range ownCharges {
-			gfs.ChargeQuota(project, c[0], c[1])
-		}
-		gfs.SetStopNode(func(reason string) {
-			failf("%s; stopping this node so a peer replays its journal. Mount again once the device is healthy", reason)
-		})
-		gfs.StartQuotaFlush(time.Duration(cmp.Or(sb.QuotaFlushMs, quota.DefaultFlushMs)) * time.Millisecond)
-	}
+	setUpQuotas()
 
 	// Verify root exists
 	rootIno, err := inodeTbl.Read(inode.InodeRoot)

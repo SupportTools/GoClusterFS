@@ -300,6 +300,12 @@ func TestQuotaChargesSnapshots(t *testing.T) {
 	if got := usage(t, fsys, pvc); got != [2]uint64{4, 2} {
 		t.Errorf("after a snapshot the project uses %v blocks and inodes, want the file's and the snapshot's 2 blocks and 1 inode each", got)
 	}
+	if errno := f.Setxattr(context.Background(), "user.snapshot", []byte("s1"), 0); errno != syscall.EEXIST {
+		t.Fatalf("a second snapshot named s1: %v, want EEXIST", errno)
+	}
+	if got := usage(t, fsys, pvc); got != [2]uint64{4, 2} {
+		t.Errorf("after a snapshot refused as a duplicate the project uses %v blocks and inodes, want 4 and 2 as before", got)
+	}
 	setxattr(t, f, "user.snapshot.delete", "s1")
 	waitUsage(t, fsys, pvc, [2]uint64{2, 1})
 }
@@ -369,5 +375,45 @@ func TestQuotaSymlinkLosingItsSlotIsChargedOnce(t *testing.T) {
 	}
 	if got := usage(t, fsys, pvc); got != [2]uint64{1, 1} {
 		t.Errorf("after the retried symlink the project uses %v blocks and inodes, want its 1 block and 1 inode", got)
+	}
+}
+
+// A rename over a file frees the replaced file as an orphan after its own link drop. A crash between the free's commit
+// and the free leaves the free's record for the replay; the rename's intent closed when its link drop landed, so the
+// replay does not free the file a second time with a second credit.
+func TestQuotaOrphanFreedOnceAfterACrash(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	ctx := context.Background()
+	for _, name := range []string{"a", "b"} {
+		f := createIn(t, pvc, name)
+		writeAt(t, f, pattern(2, 100), 0)
+		if errno := f.Release(ctx, nil); errno != 0 {
+			t.Fatalf("release %s: %v", name, errno)
+		}
+	}
+	crashed := crashAfterCommit(t, fsys, "orphan free")
+	go func() { _ = pvc.Rename(ctx, "a", pvc, "b", 0) }()
+	<-crashed
+
+	peer := openFormattedFS(t, path)
+	var err error
+	if peer.journal, err = journal.Init(peer.dev, offset+size, size, peer.nodeUUID, 1, journal.DefaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	defer adoptCrashed(t, peer, fsys.nodeUUID)()
+	owner := fsys.nodeUUID
+	fold := func(region *journal.Region) error {
+		return peer.quotaGuard.Fold(lock.ForReplay(ctx), peer.quotaTable, int(owner[15]), int(peer.nodeUUID[15]), owner, region)
+	}
+	rctx := &journal.RecoveryContext{Dev: peer.dev, InodeTbl: peer.inodeTbl, BitmapMgr: peer.bitmapMgr, DirMgr: peer.dirMgr,
+		ExtentMgr: peer.extentMgr, Charge: peer.ChargeQuota}
+	if _, err := journal.ScanFoldAndRecover(peer.dev, offset, size, fold, journal.CreateTxnRecoveryHandler(rctx), nil); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	flushQuota(t, peer)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
+		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file's 1 block and 1 inode", got)
 	}
 }

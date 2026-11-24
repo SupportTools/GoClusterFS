@@ -177,7 +177,11 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 			kept = r.Target
 		}
 	default:
-		if err := f.dropLink(ctx, r.Target.InodeNum, live); err != nil {
+		if err := f.dropLink(ctx, r.Target.InodeNum, live, func() {
+			if intentSeq != 0 {
+				f.closeIntent(intentSeq)
+			}
+		}); err != nil {
 			log.Printf("[WARN] rename over %q: link of inode %d not dropped: %v", newName, r.Target.InodeNum, err)
 		} else {
 			reserved = false

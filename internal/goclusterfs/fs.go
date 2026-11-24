@@ -2013,7 +2013,11 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 				afterCommit("unlink: blocks freed")
 			}
 		}
-	} else if err := d.fs.dropLink(ctx, uint32(childInodeNum), live); err != nil {
+	} else if err := d.fs.dropLink(ctx, uint32(childInodeNum), live, func() {
+		if intentSeq > 0 {
+			d.fs.closeIntent(intentSeq)
+		}
+	}); err != nil {
 		log.Printf("[WARN] removeEntry %q: link of inode %d not dropped: %v", name, childInodeNum, err)
 	} else {
 		reserved = false
