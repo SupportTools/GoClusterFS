@@ -130,10 +130,8 @@ func (f *FS) notifyOrphans() {
 
 var errOrphansFull = errors.New("too many unlinked files are still open")
 
-// dropLink removes one link; at zero the slots in live, from reserveOrphan, hold the file. dropped, when set, runs
-// once the link is gone and before the file is freed: it closes the intent that logged the drop, so a replay cannot
-// free the file a second time, with a second credit, ahead of the free's own record.
-func (f *FS) dropLink(ctx context.Context, num uint32, live uint64, dropped func()) error {
+// dropLink removes one link; at zero the slots in live, from reserveOrphan, hold the file.
+func (f *FS) dropLink(ctx context.Context, num uint32, live uint64) error {
 	unlock := f.lockInode(num)
 	ino, err := f.updateUnderInodeLock(ctx, num, func(ino *inode.Inode) error {
 		if ino.LinkCount == 0 {
@@ -152,8 +150,8 @@ func (f *FS) dropLink(ctx context.Context, num uint32, live uint64, dropped func
 	if err != nil {
 		return err
 	}
-	if dropped != nil {
-		dropped()
+	if afterCommit != nil {
+		afterCommit("link dropped")
 	}
 	f.cacheInode(ino)
 	switch {

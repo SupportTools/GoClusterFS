@@ -333,7 +333,7 @@ func TestPeerReleasesAnOrphanItSawBeforeTheDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeA.LearnOrphans(context.Background(), 1, cluster.list(1))
-	if err := nodeB.dropLink(ctx, f.inodeNum, live, nil); err != nil {
+	if err := nodeB.dropLink(ctx, f.inodeNum, live); err != nil {
 		t.Fatal(err)
 	}
 	if ino := readInode(t, nodeA, f.inodeNum); ino.LinkCount != 0 || ino.Holders != 1 {

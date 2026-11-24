@@ -323,22 +323,8 @@ func TestQuotaCreditsAnOrphanTheReplayFrees(t *testing.T) {
 	go func() { _ = pvc.Unlink(ctx, "f") }()
 	<-crashed
 
-	peer := openFormattedFS(t, path)
-	var err error
-	if peer.journal, err = journal.Init(peer.dev, offset+size, size, peer.nodeUUID, 1, journal.DefaultConfig()); err != nil {
-		t.Fatal(err)
-	}
-	defer adoptCrashed(t, peer, fsys.nodeUUID)()
-	owner := fsys.nodeUUID
-	fold := func(region *journal.Region) error {
-		return peer.quotaGuard.Fold(lock.ForReplay(ctx), peer.quotaTable, int(owner[15]), int(peer.nodeUUID[15]), owner, region)
-	}
-	rctx := &journal.RecoveryContext{Dev: peer.dev, InodeTbl: peer.inodeTbl, BitmapMgr: peer.bitmapMgr, DirMgr: peer.dirMgr,
-		ExtentMgr: peer.extentMgr, Charge: peer.ChargeQuota}
-	if _, err := journal.ScanFoldAndRecover(peer.dev, offset, size, fold, journal.CreateTxnRecoveryHandler(rctx), nil); err != nil {
-		t.Fatalf("replay: %v", err)
-	}
-	flushQuota(t, peer)
+	peer := journaledPeer(t, path, offset, size)
+	replayCrashedWithCharges(t, peer, fsys.nodeUUID, offset, size)
 	if got := tableUsage(t, peer, 1); got != [2]uint64{} {
 		t.Errorf("after the replay freed the orphan the table holds %v blocks and inodes, want none", got)
 	}
@@ -397,22 +383,71 @@ func TestQuotaOrphanFreedOnceAfterACrash(t *testing.T) {
 	go func() { _ = pvc.Rename(ctx, "a", pvc, "b", 0) }()
 	<-crashed
 
+	peer := journaledPeer(t, path, offset, size)
+	replayCrashedWithCharges(t, peer, fsys.nodeUUID, offset, size)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
+		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file's 1 block and 1 inode", got)
+	}
+}
+
+// journaledPeer opens the image at path as another node, with its journal in the slot after the crashed node's.
+func journaledPeer(t *testing.T, path string, offset, size uint64) *FS {
+	t.Helper()
 	peer := openFormattedFS(t, path)
 	var err error
 	if peer.journal, err = journal.Init(peer.dev, offset+size, size, peer.nodeUUID, 1, journal.DefaultConfig()); err != nil {
 		t.Fatal(err)
 	}
-	defer adoptCrashed(t, peer, fsys.nodeUUID)()
-	owner := fsys.nodeUUID
-	fold := func(region *journal.Region) error {
-		return peer.quotaGuard.Fold(lock.ForReplay(ctx), peer.quotaTable, int(owner[15]), int(peer.nodeUUID[15]), owner, region)
-	}
+	return peer
+}
+
+// replayCrashedWithCharges replays the crashed node owner's journal at offset on peer as a peer's mount does: it adopts
+// owner's locks, folds the journal's quota usage, reads its inode frees, replays it with credits on peer's journal,
+// and flushes peer's ledger.
+func replayCrashedWithCharges(t *testing.T, peer *FS, owner [16]byte, offset, size uint64) {
+	t.Helper()
+	ctx := context.Background()
+	defer adoptCrashed(t, peer, owner)()
 	rctx := &journal.RecoveryContext{Dev: peer.dev, InodeTbl: peer.inodeTbl, BitmapMgr: peer.bitmapMgr, DirMgr: peer.dirMgr,
 		ExtentMgr: peer.extentMgr, Charge: peer.ChargeQuota}
-	if _, err := journal.ScanFoldAndRecover(peer.dev, offset, size, fold, journal.CreateTxnRecoveryHandler(rctx), nil); err != nil {
+	replay := journal.NewReplay(rctx)
+	prepare := func(region *journal.Region) error {
+		if err := peer.quotaGuard.Fold(lock.ForReplay(ctx), peer.quotaTable, int(owner[15]), int(peer.nodeUUID[15]), owner, region); err != nil {
+			return err
+		}
+		return replay.Prepare(region)
+	}
+	if _, err := journal.ScanFoldAndRecover(peer.dev, offset, size, prepare, replay.Handle, nil); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
 	flushQuota(t, peer)
+}
+
+// A rename over a file that crashes after the file's last link is gone, before its free is logged, leaves the free to
+// the replay of the rename's link drop: the file is freed, not leaked, and credited once.
+func TestQuotaOrphanFreedByReplayWhenItsFreeWasNotLogged(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	ctx := context.Background()
+	var replaced uint32
+	for _, name := range []string{"a", "b"} {
+		f := createIn(t, pvc, name)
+		writeAt(t, f, pattern(3, 100), 0)
+		if errno := f.Release(ctx, nil); errno != 0 {
+			t.Fatalf("release %s: %v", name, errno)
+		}
+		replaced = f.inodeNum
+	}
+	crashed := crashAfterCommit(t, fsys, "link dropped")
+	go func() { _ = pvc.Rename(ctx, "a", pvc, "b", 0) }()
+	<-crashed
+
+	peer := journaledPeer(t, path, offset, size)
+	replayCrashedWithCharges(t, peer, fsys.nodeUUID, offset, size)
+	if ino, err := peer.inodeTbl.Read(replaced); err != nil || ino.Magic == inode.InodeMagic {
+		t.Errorf("after the replay the replaced file's inode %d is %+v, %v; want it freed", replaced, ino, err)
+	}
 	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
 		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file's 1 block and 1 inode", got)
 	}

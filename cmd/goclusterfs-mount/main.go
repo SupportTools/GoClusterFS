@@ -459,14 +459,17 @@ func main() {
 			recoveryCtx.Charge = ownCharges.add
 			dirMgr.SetCharge(func(project uint32, blocks int64) { ownCharges.add(project, blocks, 0) })
 		}
-		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
+		replay := journal.NewReplay(recoveryCtx)
 		releaseReserved := recoveryCtx.ReleaseReserved(lock.ForReplay(context.Background()))
 
 		// Replay a dirty journal left in this slot's region by its previous owner
-		fold := func(region *journal.Region) error {
-			return foldQuota(lock.ForReplay(context.Background()), slotIdx, nodeUUID, region)
+		prepare := func(region *journal.Region) error {
+			if err := foldQuota(lock.ForReplay(context.Background()), slotIdx, nodeUUID, region); err != nil {
+				return err
+			}
+			return replay.Prepare(region)
 		}
-		result, err := recoverOwnJournal(dev, journalOffset, journalSize, fold, recoveryHandler, releaseReserved, slotIdx)
+		result, err := recoverOwnJournal(dev, journalOffset, journalSize, prepare, replay.Handle, releaseReserved, slotIdx)
 		if err != nil {
 			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}

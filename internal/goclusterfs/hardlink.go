@@ -160,7 +160,7 @@ func (f *FS) dropUnnamedLink(ctx context.Context, num uint32) {
 		live, err = f.reserveOrphan(ino)
 	}
 	if err == nil {
-		err = f.dropLink(ctx, num, live, nil)
+		err = f.dropLink(ctx, num, live)
 	}
 	if err != nil {
 		log.Printf("[WARN] inode %d: keeps a link without a name, which fsck -repair takes back: %v", num, err)
