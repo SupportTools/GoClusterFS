@@ -201,3 +201,20 @@ type SnapshotListResponse struct {
 	Snapshots []SnapshotInfo `json:"snapshots"`
 	Total     int            `json:"total"`
 }
+
+// QuotaInfo is a project's limits and usage, returned by GET and PUT /api/v1/quotas; a limit of 0 means none.
+type QuotaInfo struct {
+	Path       string `json:"path"`
+	Project    uint32 `json:"project"`
+	Bytes      uint64 `json:"bytes"`
+	Inodes     uint64 `json:"inodes"`
+	UsedBytes  uint64 `json:"used_bytes"`
+	UsedInodes uint64 `json:"used_inodes"`
+}
+
+// QuotaRequest is sent to PUT /api/v1/quotas.
+type QuotaRequest struct {
+	Path   string  `json:"path"`
+	Bytes  *uint64 `json:"bytes,omitempty"`
+	Inodes *uint64 `json:"inodes,omitempty"`
+}

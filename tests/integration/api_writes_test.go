@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -507,5 +508,82 @@ func TestMountTokenSources(t *testing.T) {
 	out, _ = runMount(t, "-device", missing, "-mount", dir, "-api-token", "from-flag")
 	if !strings.Contains(out, "WARNING: -api-token is visible to every local user") {
 		t.Errorf("no warning for -api-token:\n%s", out)
+	}
+}
+
+// The API sets and reads a directory's quota behind its token, without CAP_SYS_ADMIN, and what it sets holds through
+// the mount: a write past the limit fails with EDQUOT and statfs on the directory shows the limit.
+func TestAPIQuotaThroughTheMount(t *testing.T) {
+	m := startAPIMount(t, "secret", 64)
+	if err := os.Mkdir(m.Path("pvc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(m.Path("plain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var root unix.Statfs_t
+	if err := unix.Statfs(m.MountPoint, &root); err != nil {
+		t.Fatal(err)
+	}
+	bs := uint64(root.Bsize)
+	type quotaInfo struct {
+		Path       string `json:"path"`
+		Project    uint32 `json:"project"`
+		Bytes      uint64 `json:"bytes"`
+		Inodes     uint64 `json:"inodes"`
+		UsedBytes  uint64 `json:"used_bytes"`
+		UsedInodes uint64 `json:"used_inodes"`
+	}
+	decode := func(out string) quotaInfo {
+		t.Helper()
+		var q quotaInfo
+		if err := json.Unmarshal([]byte(out), &q); err != nil {
+			t.Fatalf("decode %s: %v", out, err)
+		}
+		return q
+	}
+
+	q := decode(m.mustCall(t, http.StatusOK, "PUT", "/api/v1/quotas", map[string]any{"path": "/pvc", "bytes": 4 << 20, "inodes": 10}))
+	if want := (quotaInfo{Path: "/pvc", Project: 1, Bytes: 4 << 20, Inodes: 10, UsedBytes: bs, UsedInodes: 1}); q != want {
+		t.Errorf("PUT a new project: %+v, want %+v", q, want)
+	}
+	if err := m.WriteFile("pvc/a", bytes.Repeat([]byte("a"), 2<<20)); err != nil {
+		t.Fatalf("a write within the limit: %v", err)
+	}
+	if err := m.WriteFile("pvc/b", bytes.Repeat([]byte("b"), 3<<20)); !errors.Is(err, unix.EDQUOT) {
+		t.Errorf("a write past the limit: %v, want EDQUOT", err)
+	}
+	q = decode(m.mustCall(t, http.StatusOK, "GET", "/api/v1/quotas?path=/pvc", nil))
+	var st unix.Statfs_t
+	if err := unix.Statfs(m.Path("pvc"), &st); err != nil || uint64(st.Blocks)*uint64(st.Bsize) != 4<<20 {
+		t.Errorf("statfs on the project: %d blocks of %d, %v; want the 4 MiB limit", st.Blocks, st.Bsize, err)
+	}
+	// The kernel splits b's write into requests of at most 1 MiB, and those that fit before the limit land.
+	if free := uint64(st.Bfree) * uint64(st.Bsize); q.UsedBytes < 2<<20+bs || q.UsedBytes != 4<<20-free || q.UsedInodes != 3 {
+		t.Errorf("GET after the writes: %+v, want at least the root's block and a's 2 MiB, the limit less statfs's %d free bytes, and 3 inodes", q, free)
+	}
+
+	for _, tc := range []struct {
+		method, path string
+		body         any
+		want         int
+	}{
+		{"GET", "/api/v1/quotas?path=/plain", nil, http.StatusNotFound},
+		{"GET", "/api/v1/quotas?path=/missing", nil, http.StatusNotFound},
+		{"GET", "/api/v1/quotas?path=/pvc/a", nil, http.StatusBadRequest},
+		{"PUT", "/api/v1/quotas", map[string]any{"path": "/", "bytes": 1}, http.StatusForbidden},
+		{"PUT", "/api/v1/quotas", map[string]any{"path": "/plain/../pvc", "bytes": 1}, http.StatusBadRequest},
+		{"PUT", "/api/v1/quotas", map[string]any{"path": "/pvc"}, http.StatusBadRequest},
+	} {
+		if status, out, err := m.call(tc.method, tc.path, tc.body); err != nil || status != tc.want {
+			t.Errorf("%s %s %v: status %d err %v, want %d\n%s", tc.method, tc.path, tc.body, status, err, tc.want, out)
+		}
+	}
+	noToken := &apiMount{MountedFS: m.MountedFS, addr: m.addr}
+	if status, _, _ := noToken.call("PUT", "/api/v1/quotas", map[string]any{"path": "/plain", "bytes": 1}); status != http.StatusUnauthorized {
+		t.Errorf("PUT without a token: status %d, want 401", status)
+	}
+	if !strings.Contains(m.log.String(), `api write: client=127.0.0.1 action=quota.set path="/pvc"`) {
+		t.Error("mount did not log the quota write")
 	}
 }

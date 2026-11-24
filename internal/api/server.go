@@ -46,6 +46,7 @@ type Server struct {
 	// Services behind the write endpoints (optional)
 	fileService  FileService
 	adminService AdminService
+	quotaService QuotaService
 
 	// Requests in flight; Stop waits for them so the mount outlives them.
 	requests       sync.WaitGroup

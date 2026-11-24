@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // Health fetches the health status from the API. An unhealthy mount answers
 // 503 with the same body, which Health returns without an error.
 func (c *Client) Health(ctx context.Context) (*HealthResponse, error) {
-	body, status, err := c.send(ctx, http.MethodGet, "/health")
+	body, status, err := c.send(ctx, http.MethodGet, "/health", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +111,26 @@ func (c *Client) ClusterInfo(ctx context.Context) (*ClusterInfoResponse, error) 
 func (c *Client) Snapshots(ctx context.Context) (*SnapshotListResponse, error) {
 	var resp SnapshotListResponse
 	if err := c.Get(ctx, "/api/v1/snapshots", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// Quota returns the project quota of the directory at path in the mount, from GET /api/v1/quotas. The API answers
+// only with the token.
+func (c *Client) Quota(ctx context.Context, path string) (*QuotaInfo, error) {
+	var resp QuotaInfo
+	if err := c.Get(ctx, "/api/v1/quotas?path="+url.QueryEscape(path), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SetQuota sets the project quota of the directory at path through PUT /api/v1/quotas; a nil limit is left out, which
+// the API takes as 0, no limit.
+func (c *Client) SetQuota(ctx context.Context, path string, bytes, inodes *uint64) (*QuotaInfo, error) {
+	var resp QuotaInfo
+	if err := c.Put(ctx, "/api/v1/quotas", QuotaRequest{Path: path, Bytes: bytes, Inodes: inodes}, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil

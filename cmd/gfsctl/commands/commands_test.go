@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -179,6 +180,8 @@ func TestJSONMatchesServerTypes(t *testing.T) {
 			{ID: 65, Name: "nightly", Inode: 12, State: "active", SizeBytes: 3 << 20, Blocks: 3, CreatedAt: "2026-11-16T00:00:00Z"},
 			{ID: 129, Name: "old", Inode: 40, State: "active", SizeBytes: 1 << 20, Blocks: 1, Orphan: true},
 		}}},
+		{[]string{"quota", "get", "/pvc"}, "/api/v1/quotas", &api.QuotaInfo{Path: "/pvc", Project: 4, Bytes: 1 << 30, Inodes: 10, UsedBytes: 1 << 20, UsedInodes: 2}},
+		{[]string{"quota", "set", "/pvc", "--bytes", "1"}, "/api/v1/quotas", &api.QuotaInfo{Path: "/pvc", Project: 4, Bytes: 1 << 20}},
 		{[]string{"stats", "all"}, "/api/v1/stats/all", &api.AllStatsResponse{CollectedAt: "now", Cache: cacheStats, Journal: journal, Trim: trim, Lock: lock, SFB: sfb, Cluster: cluster}},
 	}
 	for _, tc := range cases {
@@ -359,4 +362,47 @@ func newServer(t *testing.T, h http.Handler) *httptest.Server {
 		t.Fatal(err)
 	}
 	return srv
+}
+
+// quota get asks for the escaped path with the token; quota set sends only the limits it was given, and refuses to
+// send none.
+func TestQuota(t *testing.T) {
+	var method, query, body string
+	srv := newServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, _ := io.ReadAll(r.Body)
+		method, query, body = r.Method, r.URL.RawQuery, string(data)
+		_ = json.NewEncoder(w).Encode(api.QuotaInfo{Path: "/pvc 1", Project: 4, Bytes: 1 << 30, UsedBytes: 3 << 20, UsedInodes: 2})
+	}))
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := []string{"--host", u.Hostname(), "--port", u.Port(), "--token", "secret"}
+
+	out, _, err := run(t, append(at, "quota", "get", "/pvc 1")...)
+	if err != nil || method != "GET" || query != "path=%2Fpvc+1" {
+		t.Fatalf("quota get: %v, sent %s ?%s", err, method, query)
+	}
+	for _, want := range []string{"/pvc 1", "3.00 MB of 1.00 GB", "2 of none"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("quota get printed no %q:\n%s", want, out)
+		}
+	}
+	for _, c := range []struct {
+		flags []string
+		want  string
+	}{
+		{[]string{"--bytes", "1073741824", "--inodes", "10"}, `{"path":"/pvc 1","bytes":1073741824,"inodes":10}`},
+		{[]string{"--bytes", "1073741824"}, `{"path":"/pvc 1","bytes":1073741824}`},
+		{[]string{"--inodes", "0"}, `{"path":"/pvc 1","inodes":0}`},
+	} {
+		if _, _, err := run(t, append(append(at, "quota", "set", "/pvc 1"), c.flags...)...); err != nil || method != "PUT" || body != c.want {
+			t.Errorf("quota set %v: %v, sent %s %s, want PUT %s", c.flags, err, method, body, c.want)
+		}
+	}
+	method = ""
+	if _, _, err := run(t, append(at, "quota", "set", "/pvc 1")...); ExitCode(err) != cli.ExitUsage || method != "" {
+		t.Errorf("quota set without limits: exit %d, sent %q; want exit %d and no request", ExitCode(err), method, cli.ExitUsage)
+	}
 }

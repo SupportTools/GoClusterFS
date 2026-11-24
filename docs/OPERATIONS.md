@@ -197,6 +197,7 @@ getfattr -n trusted.goclusterfs.quota /mnt/fs/pvc-1
 # trusted.goclusterfs.quota="project=1 bytes=10737418240 inodes=100000 used_bytes=1048576 used_inodes=1"
 ```
 
+- **Through the API.** `PUT /api/v1/quotas` and `GET /api/v1/quotas?path=` on any node, or `gfsctl quota set` and `gfsctl quota get`, do the same as the attribute, without CAP_SYS_ADMIN, behind the API's token. See [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints).
 - **Setting a quota.** The directory must be empty; it then becomes the root of a new project. Every file, directory and symlink made under it joins the project. Setting the attribute on the project's root again changes the limits. A limit of 0 means none. `setfattr -x` lifts both limits, and the project keeps counting. Directories inside a project and the volume root cannot take a quota (`EPERM`). The `XATTR_CREATE` and `XATTR_REPLACE` flags are ignored.
 - **What counts.** `used_bytes` is the blocks the project's files, directories and symlinks map, the project's root directory included, in whole blocks of the volume's block size. A snapshot counts every block it shares with its file. `used_inodes` counts files, directories, symlinks and snapshots.
 - **Limits.** A create, mkdir, write, fallocate or snapshot that would pass a limit fails with `EDQUOT` ("Disk quota exceeded"). A write that would pass it fails whole; it is not cut short. Only blocks a file does not map yet count, so overwriting a file in a full project works. Truncate, unlink and rmdir always work. Root is limited too.

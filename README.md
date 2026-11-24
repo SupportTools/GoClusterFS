@@ -170,7 +170,7 @@ The API only listens on this host by default. Mount refuses to start when `-api-
 
 ## gfsctl
 
-`gfsctl` reads a mount's HTTP API from the command line. It only reads; it changes nothing. `make build` builds it, and release archives include it.
+`gfsctl` reads a mount's HTTP API from the command line. It changes nothing except a directory's project quota, with `quota set`. `make build` builds it, and release archives include it.
 
 ```bash
 ./gfsctl status              # mount state, version, capacity
@@ -178,6 +178,8 @@ The API only listens on this host by default. Mount refuses to start when `-api-
 ./gfsctl stats               # overview; also: cache, journal, trim, lock, sfb, cluster, all
 ./gfsctl metrics             # Prometheus text from /metrics
 ./gfsctl snapshots           # every snapshot, orphans marked; needs the API token
+./gfsctl quota get /pvc-1    # a directory's project limits and usage; needs the API token
+./gfsctl quota set /pvc-1 --bytes 10737418240 --inodes 100000
 ./gfsctl status -w -i 5s     # refresh every 5 s
 ./gfsctl stats all -o json   # JSON for scripts
 ```

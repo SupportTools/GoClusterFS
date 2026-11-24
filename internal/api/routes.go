@@ -74,6 +74,8 @@ func (s *Server) handleAPIv1(w http.ResponseWriter, r *http.Request) {
 		s.handleSnapshots(w, r)
 	case path == "/clones":
 		s.handleClones(w, r)
+	case path == "/quotas":
+		s.handleQuotas(w, r)
 	case strings.HasPrefix(path, "/admin/"):
 		s.handleAdmin(w, r)
 	default:

@@ -164,16 +164,21 @@ func (f *FS) projectRoot(num uint32, tbl quota.Table) (*inode.Inode, *quota.Reco
 // setQuota gives empty directory num a new project with the limits in value, or changes the limits of the project
 // whose root it is. The record goes in before the directory names it, so a crash leaves at worst an unused record.
 func (f *FS) setQuota(ctx context.Context, num uint32, value string) syscall.Errno {
+	setting, err := parseQuotaSetting(value)
+	if err != nil {
+		log.Printf("[WARN] %s on directory inode %d: %v", quotaXattr, num, err)
+		return syscall.EINVAL
+	}
+	return f.setLimits(ctx, num, setting)
+}
+
+// setLimits is setQuota with the value parsed.
+func (f *FS) setLimits(ctx context.Context, num uint32, setting quotaSetting) syscall.Errno {
 	switch {
 	case f.quotaInode == 0:
 		return syscall.ENOTSUP
 	case num == inode.InodeRoot:
 		return syscall.EPERM
-	}
-	setting, err := parseQuotaSetting(value)
-	if err != nil {
-		log.Printf("[WARN] %s on directory inode %d: %v", quotaXattr, num, err)
-		return syscall.EINVAL
 	}
 	blockSize := f.dataBlockSize()
 	limitBlocks := setting.bytes / blockSize
@@ -285,30 +290,45 @@ func (f *FS) clearQuota(ctx context.Context, num uint32) syscall.Errno {
 	return 0
 }
 
-// quotaValue is what reading quotaXattr on directory num returns.
-func (f *FS) quotaValue(num uint32) (string, syscall.Errno) {
+// projectQuota returns the limits and usage of the project directory num is in, or ENODATA when it is in none.
+func (f *FS) projectQuota(num uint32) (*quota.Status, syscall.Errno) {
 	if f.quotaInode == 0 {
-		return "", syscall.ENODATA
+		return nil, syscall.ENODATA
 	}
 	tbl, err := f.quotaTable()
 	if err != nil {
-		return "", syscall.EIO
+		return nil, syscall.EIO
 	}
 	ino, err := f.inodeTbl.Read(num)
 	if err != nil {
-		return "", syscall.EIO
+		return nil, syscall.EIO
 	}
 	if ino.ProjectID == 0 {
-		return "", syscall.ENODATA
+		return nil, syscall.ENODATA
 	}
 	rec, err := tbl.Record(ino.ProjectID)
 	if err != nil {
-		return "", syscall.EIO
+		return nil, syscall.EIO
 	}
 	usedBlocks, usedInodes := f.projectUsage(ino.ProjectID, rec)
 	blockSize := f.dataBlockSize()
+	return &quota.Status{
+		Project:     ino.ProjectID,
+		LimitBytes:  rec.LimitBlocks * blockSize,
+		LimitInodes: rec.LimitInodes,
+		UsedBytes:   usedBlocks * blockSize,
+		UsedInodes:  usedInodes,
+	}, 0
+}
+
+// quotaValue is what reading quotaXattr on directory num returns.
+func (f *FS) quotaValue(num uint32) (string, syscall.Errno) {
+	q, errno := f.projectQuota(num)
+	if errno != 0 {
+		return "", errno
+	}
 	return fmt.Sprintf("project=%d bytes=%d inodes=%d used_bytes=%d used_inodes=%d",
-		ino.ProjectID, rec.LimitBlocks*blockSize, rec.LimitInodes, usedBlocks*blockSize, usedInodes), 0
+		q.Project, q.LimitBytes, q.LimitInodes, q.UsedBytes, q.UsedInodes), 0
 }
 
 // projectUsage is project's usage in rec plus this node's changes no flush moved into the table yet.

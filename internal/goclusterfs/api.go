@@ -14,6 +14,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 )
 
@@ -77,8 +78,37 @@ func (f *FS) setxattrAt(ctx context.Context, p, attr, value, newPath string) err
 
 // lookupFile finds the regular file at the absolute, clean path p, refusing a symlink anywhere on the way.
 func (f *FS) lookupFile(ctx context.Context, p string) (*File, error) {
-	if !strings.HasPrefix(p, "/") || path.Clean(p) != p || p == "/" || strings.ContainsRune(p, '\x00') {
+	if p == "/" {
 		return nil, fmt.Errorf("%q is not an absolute, clean path to a file: %w", p, syscall.EINVAL)
+	}
+	ino, err := f.lookupPath(ctx, p)
+	switch {
+	case err != nil:
+		return nil, err
+	case ino.IsDir():
+		return nil, fmt.Errorf("%s: %w", p, syscall.EISDIR)
+	case !ino.IsFile():
+		return nil, fmt.Errorf("%s is not a regular file: %w", p, syscall.EINVAL)
+	}
+	return newFile(f, ino), nil
+}
+
+// lookupDir finds the directory at the absolute, clean path p, refusing a symlink anywhere on the way.
+func (f *FS) lookupDir(ctx context.Context, p string) (*inode.Inode, error) {
+	ino, err := f.lookupPath(ctx, p)
+	if err == nil && !ino.IsDir() {
+		return nil, fmt.Errorf("%s: %w", p, syscall.ENOTDIR)
+	}
+	return ino, err
+}
+
+// lookupPath finds the inode at the absolute, clean path p, refusing a symlink anywhere on the way.
+func (f *FS) lookupPath(ctx context.Context, p string) (*inode.Inode, error) {
+	if !strings.HasPrefix(p, "/") || path.Clean(p) != p || strings.ContainsRune(p, '\x00') {
+		return nil, fmt.Errorf("%q is not an absolute, clean path: %w", p, syscall.EINVAL)
+	}
+	if p == "/" {
+		return f.inodeTbl.Read(inode.InodeRoot)
 	}
 	names := strings.Split(p[1:], "/")
 	parent, err := f.getInode(inode.InodeRoot)
@@ -110,12 +140,34 @@ func (f *FS) lookupFile(ctx context.Context, p string) (*File, error) {
 		return nil, err
 	case ino.IsSymlink():
 		return nil, fmt.Errorf("%s is a symlink: %w", p, syscall.ELOOP)
-	case ino.IsDir():
-		return nil, fmt.Errorf("%s: %w", p, syscall.EISDIR)
-	case !ino.IsFile():
-		return nil, fmt.Errorf("%s is not a regular file: %w", p, syscall.EINVAL)
 	}
-	return newFile(f, ino), nil
+	return ino, nil
+}
+
+// ProjectQuota returns what reading trusted.goclusterfs.quota on the directory at p returns.
+func (f *FS) ProjectQuota(ctx context.Context, p string) (*quota.Status, error) {
+	dirIno, err := f.lookupDir(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	q, errno := f.projectQuota(dirIno.InodeNum)
+	if errno != 0 {
+		return nil, fmt.Errorf("%s: %w", p, errno)
+	}
+	return q, nil
+}
+
+// SetProjectQuota does what setting trusted.goclusterfs.quota to "bytes=N inodes=N" on the directory at p does, and
+// returns the project's limits and usage after it.
+func (f *FS) SetProjectQuota(ctx context.Context, p string, bytes, inodes uint64) (*quota.Status, error) {
+	dirIno, err := f.lookupDir(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	if errno := f.setLimits(ctx, dirIno.InodeNum, quotaSetting{bytes: bytes, inodes: inodes}); errno != 0 {
+		return nil, fmt.Errorf("%s: %w", p, errno)
+	}
+	return f.ProjectQuota(ctx, p)
 }
 
 func (f *FS) lookupName(ctx context.Context, parent *inode.Inode, name, p string) (uint32, error) {

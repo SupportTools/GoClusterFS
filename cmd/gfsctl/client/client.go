@@ -2,6 +2,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -81,8 +82,8 @@ func (c *Client) BaseURL() string {
 
 // doRequest performs an HTTP request and returns the response body. A
 // status of 400 or above is an *APIError.
-func (c *Client) doRequest(ctx context.Context, method, path string) ([]byte, error) {
-	body, status, err := c.send(ctx, method, path)
+func (c *Client) doRequest(ctx context.Context, method, path string, in []byte) ([]byte, error) {
+	body, status, err := c.send(ctx, method, path, in)
 	if err != nil {
 		return nil, err
 	}
@@ -93,15 +94,22 @@ func (c *Client) doRequest(ctx context.Context, method, path string) ([]byte, er
 }
 
 // send performs an HTTP request and returns the body and status whatever the status.
-func (c *Client) send(ctx context.Context, method, path string) ([]byte, int, error) {
+func (c *Client) send(ctx context.Context, method, path string, in []byte) ([]byte, int, error) {
 	url := c.baseURL + path
 
-	req, err := http.NewRequestWithContext(ctx, method, url, nil)
+	var reqBody io.Reader
+	if in != nil {
+		reqBody = bytes.NewReader(in)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
 	if err != nil {
 		return nil, 0, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Accept", "application/json")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}
@@ -137,21 +145,39 @@ func apiError(status int, body []byte) *APIError {
 
 // Get performs a GET request and decodes the JSON response into v.
 func (c *Client) Get(ctx context.Context, path string, v interface{}) error {
-	body, err := c.doRequest(ctx, http.MethodGet, path)
+	body, err := c.doRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
-	if v != nil {
-		if err := json.Unmarshal(body, v); err != nil {
-			return fmt.Errorf("decode response: %w", err)
-		}
+	return decode(body, v)
+}
+
+// Put sends in as JSON in a PUT request and decodes the JSON response into v.
+func (c *Client) Put(ctx context.Context, path string, in, v interface{}) error {
+	data, err := json.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("encode request: %w", err)
+	}
+	body, err := c.doRequest(ctx, http.MethodPut, path, data)
+	if err != nil {
+		return err
+	}
+	return decode(body, v)
+}
+
+func decode(body []byte, v interface{}) error {
+	if v == nil {
+		return nil
+	}
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
 }
 
 // GetRaw performs a GET request and returns the raw response body.
 func (c *Client) GetRaw(ctx context.Context, path string) ([]byte, error) {
-	return c.doRequest(ctx, http.MethodGet, path)
+	return c.doRequest(ctx, http.MethodGet, path, nil)
 }
 
 // ErrorResponse represents an API error response.

@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `GET` and `PUT /api/v1/quotas` read and set a directory's project quota, as the `trusted.goclusterfs.quota` attribute does, behind the API token and without CAP_SYS_ADMIN. `gfsctl quota get PATH` and `gfsctl quota set PATH --bytes N --inodes N` call them.
 - `goclusterfs-fsck` recounts each quota project's usage from its inodes and reports a project whose usage in the quota table differs, which an I/O error or a crash at the wrong moment can leave; `-repair` writes the recount. It checks only when every journal is clean. It also reports inodes in a project with no record and names in another project than their directory gives.
 - `df` and `statfs` on a directory or file in a project with limits report the project's limits as its size, and what they leave as its free space and inodes, as XFS does for a project's directories.
 
