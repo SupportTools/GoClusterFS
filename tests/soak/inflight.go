@@ -45,7 +45,7 @@ var errUnsettled = errors.New("not settled yet")
 
 // resolve returns "before", "after" or, for a write, "torn", and applies the outcome to the model.
 func (d *driver) resolve(n *node, op *Op) (string, error) {
-	if op.Want != 0 {
+	if op.Want != 0 && op.Want != okOrEDQUOT {
 		return "before", nil
 	}
 	var outcome string

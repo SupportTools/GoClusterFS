@@ -182,3 +182,54 @@ func TestTornWriteIsSectorsOfBeforeOrAfter(t *testing.T) {
 		t.Error("a result shorter than the file was before passed")
 	}
 }
+
+// Allocations inside a project may meet its limit, nothing moves or links between projects, and a write the limit
+// stops part way keeps the bytes it wrote.
+func TestModelFollowsQuotaRules(t *testing.T) {
+	m := newModel()
+	in, out := "/soak/qa/l0-f1", "/soak/d0/l0-f2"
+	step(t, m, &Op{Kind: "create", Path: in}, okOrEDQUOT)
+	m.apply(&Op{Kind: "create", Path: in})
+	step(t, m, &Op{Kind: "create", Path: out}, 0)
+	step(t, m, &Op{Kind: "create", Path: in}, int(syscall.EEXIST))
+	step(t, m, &Op{Kind: "write", Path: "/soak/qa/l0-missing", Len: 5}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "write", Path: in, Len: 5}, okOrEDQUOT)
+	step(t, m, &Op{Kind: "truncate", Path: in, Len: 100}, 0)
+	step(t, m, &Op{Kind: "snapshot", Path: in, Name: "l0-s1"}, okOrEDQUOT)
+	step(t, m, &Op{Kind: "mkdir", Path: "/soak/qb/l0-d1"}, okOrEDQUOT)
+	m.apply(&Op{Kind: "mkdir", Path: "/soak/qb/l0-d1"})
+
+	step(t, m, &Op{Kind: "link", Path: in, Path2: "/soak/d1/l0-hl1"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "link", Path: out, Path2: "/soak/qa/l0-hl2"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "link", Path: in, Path2: "/soak/qb/l0-hl3"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "link", Path: in, Path2: "/soak/qa/l0-hl4"}, 0)
+	step(t, m, &Op{Kind: "rename", Path: in, Path2: "/soak/d1/l0-r1"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "rename", Path: out, Path2: "/soak/qb/l0-d1/l0-r2"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "rename", Path: in, Path2: "/soak/qa/l0-r3"}, 0)
+	step(t, m, &Op{Kind: "rename", Path: "/soak/qb/l0-d1", Path2: "/soak/qa/l0-d2"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "rename", Path: "/soak/qb/l0-d1", Path2: out}, int(syscall.ENOTDIR))
+	step(t, m, &Op{Kind: "rename", Path: "/soak/qa/l0-missing", Path2: "/soak/d1/l0-r4"}, int(syscall.ENOENT))
+	step(t, m, &Op{Kind: "clone", Path: "/soak/qa/l0-r3", Path2: "/l0-c1"}, int(syscall.EXDEV))
+	step(t, m, &Op{Kind: "clone", Path: out, Path2: "/l0-c2"}, 0)
+	step(t, m, &Op{Kind: "clone", Path: "/soak/qa/l0-r3", Path2: "/l0-c2"}, int(syscall.EEXIST))
+
+	f := m.Files["/soak/qa/l0-r3"]
+	m.apply(&Op{Kind: "write", Path: "/soak/qa/l0-r3", Off: 200, Len: 50, Seed: 9, Got: int(syscall.EDQUOT), Wrote: 20})
+	if len(f.Data) != 220 || !bytes.Equal(f.Data[200:], genData(9, 20)) {
+		t.Fatalf("a write that wrote 20 of 50 bytes before EDQUOT left %d bytes", len(f.Data))
+	}
+	m.apply(&Op{Kind: "write", Path: "/soak/qa/l0-r3", Off: 500, Len: 50, Seed: 9, Got: int(syscall.EDQUOT)})
+	if len(f.Data) != 220 {
+		t.Fatalf("a write that EDQUOT stopped before its first byte grew the file to %d bytes", len(f.Data))
+	}
+}
+
+func TestParseQuotaUsage(t *testing.T) {
+	u, err := parseQuotaUsage("project=3 bytes=67108864 inodes=0 used_bytes=1048576 used_inodes=7")
+	if err != nil || u != (quotaUsage{limitBytes: 64 << 20, usedBytes: 1 << 20, usedInodes: 7}) {
+		t.Fatalf("got %+v, %v", u, err)
+	}
+	if _, err := parseQuotaUsage("project=3 bytes=1"); err == nil {
+		t.Fatal("a value without usage parsed")
+	}
+}

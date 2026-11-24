@@ -97,6 +97,9 @@ type driver struct {
 	ops, unexpected, faults, fscks, barriers, slow, stalls, resolved atomic.Int64
 	reloginSurvived, reloginStopped                                  atomic.Int64
 	slowDuringFault, slowStale                                       atomic.Int64
+	edquot, quotaDrift                                               atomic.Int64
+	// faultsAtFsck is the fault count when the last fsck ran: usage may drift only across a fault.
+	faultsAtFsck atomic.Int64
 	// waitsOf reads a node's wait totals for slow-check records; nil leaves them out.
 	waitsOf   func(*node) waits
 	slowestMs atomic.Int64
@@ -155,7 +158,7 @@ func (d *driver) bringUp() error {
 			return fmt.Errorf("mkdir %s: %v %s", dir, err, resp.Err)
 		}
 	}
-	return nil
+	return d.setQuotas(d.nodes[0])
 }
 
 func (d *driver) connect(n *node) error {
@@ -491,13 +494,19 @@ func (d *driver) finishOp(op *Op, resp response, err error) {
 		return
 	}
 	op.Got, op.Err = resp.Errno, resp.Err
+	if op.Kind == "write" && op.Got == int(syscall.EDQUOT) {
+		op.Wrote = resp.Size
+	}
 	d.check(op)
 }
 
 // matches reports whether an operation that returned got did what the model expected.
 func matches(want, got int) bool {
-	if want == anyErrno {
+	switch want {
+	case anyErrno:
 		return got != 0
+	case okOrEDQUOT:
+		return got == 0 || got == int(syscall.EDQUOT)
 	}
 	return want == got
 }
@@ -513,10 +522,18 @@ func (d *driver) check(op *Op) {
 		d.fail("op %d %s %s on node %d: errno %d (%s), want %d", op.Seq, op.Kind, op.Path, op.Node, op.Got, op.Err, op.Want)
 		return
 	}
-	if op.Got == 0 {
+	if op.Got == 0 || op.Kind == "write" && op.Got == int(syscall.EDQUOT) {
 		d.model.mu.Lock()
 		d.model.apply(op)
 		d.model.mu.Unlock()
+	}
+	if op.Got == int(syscall.EDQUOT) {
+		d.edquot.Add(1)
+		n := d.nodes[op.Node-1]
+		if err := d.onNode(n, func() error { return d.checkRefusal(n, op) }); err != nil {
+			d.fail("after op %d %s %s on node %d: %v", op.Seq, op.Kind, op.Path, op.Node, err)
+			return
+		}
 	}
 	var paths []string
 	if op.Path != "" {
@@ -711,24 +728,36 @@ func (d *driver) quiescedFsck() {
 		d.fail("fsck: %v", err)
 		return
 	}
-	var leaks, other []string
+	var leaks, drift, other []string
 	for _, line := range lines {
 		switch {
 		case strings.Contains(line, "is an orphan"):
 		case isLeak(line):
 			leaks = append(leaks, line)
+		case isQuotaDrift(line):
+			drift = append(drift, line)
 		default:
 			other = append(other, line)
 		}
 	}
 	d.fscks.Add(1)
-	d.logRecord(record{Type: "fsck", Detail: fmt.Sprintf("%s, %d leaks, %d other", rc, len(leaks), len(other)), Op: Op{At: start.UnixMilli()}})
+	faults := d.faults.Load()
+	quiet := faults == d.faultsAtFsck.Swap(faults)
+	d.logRecord(record{Type: "fsck", Detail: fmt.Sprintf("%s, %d leaks, %d quota drift, %d other", rc, len(leaks), len(drift), len(other)), Op: Op{At: start.UnixMilli()}})
 	if len(other) > 0 {
 		d.fail("fsck found more than leaks:\n%s", strings.Join(other, "\n"))
 		return
 	}
-	if len(leaks) > 0 {
-		log.Printf("fsck: repairing %d leaks", len(leaks))
+	if len(drift) > 0 && quiet {
+		d.fail("fsck found quota usage that drifted with no fault since the last fsck:\n%s", strings.Join(drift, "\n"))
+		return
+	}
+	if len(drift) > 0 {
+		d.quotaDrift.Add(int64(len(drift)))
+		log.Printf("fsck: quota usage drifted across a fault:\n%s", strings.Join(drift, "\n"))
+	}
+	if len(leaks) > 0 || len(drift) > 0 {
+		log.Printf("fsck: repairing %d leaks and %d projects' usage", len(leaks), len(drift))
 		if _, _, err := d.ctl.run("fsck -repair"); err != nil {
 			d.fail("fsck -repair: %v", err)
 			return
@@ -750,6 +779,10 @@ func (d *driver) quiescedFsck() {
 	}
 	for _, n := range d.nodes {
 		if err := d.verifyAll(n, true); err != nil {
+			d.fail("after fsck: node %d: %v", n.id, err)
+			return
+		}
+		if err := d.checkQuotas(n); err != nil {
 			d.fail("after fsck: node %d: %v", n.id, err)
 			return
 		}
@@ -775,6 +808,10 @@ func (d *driver) barrier() {
 			d.fail("barrier: node %d: %v", n.id, err)
 			return
 		}
+		if err := d.onNode(n, func() error { return d.checkQuotas(n) }); err != nil {
+			d.fail("barrier: node %d: %v", n.id, err)
+			return
+		}
 	}
 	d.barriers.Add(1)
 }
@@ -789,9 +826,9 @@ func (d *driver) report() string {
 		return true
 	})
 	sort.Strings(kinds)
-	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slow_during_faults=%d slow_with_stale=%d slowest_converge_ms=%d stalls=%d relogin_survived=%d relogin_stopped=%d files=%d snapshots=%d blocks=%d [%s]",
+	return fmt.Sprintf("ops=%d unexpected=%d faults=%d cut_short=%d fscks=%d barriers=%d slow_checks=%d slow_during_faults=%d slow_with_stale=%d slowest_converge_ms=%d stalls=%d relogin_survived=%d relogin_stopped=%d edquot=%d quota_drift=%d files=%d snapshots=%d blocks=%d [%s]",
 		d.ops.Load(), d.unexpected.Load(), d.faults.Load(), d.resolved.Load(), d.fscks.Load(), d.barriers.Load(), d.slow.Load(), d.slowDuringFault.Load(), d.slowStale.Load(), d.slowestMs.Load(), d.stalls.Load(),
-		d.reloginSurvived.Load(), d.reloginStopped.Load(), files, snaps, blocks, strings.Join(kinds, " "))
+		d.reloginSurvived.Load(), d.reloginStopped.Load(), d.edquot.Load(), d.quotaDrift.Load(), files, snaps, blocks, strings.Join(kinds, " "))
 }
 
 func newDriver(cfg config) (*driver, func(), error) {

@@ -104,7 +104,7 @@ func serve(root string, req request) response {
 			err = f.Close()
 		}
 	case "write":
-		err = writeSynced(p, req.Off, genData(req.Seed, req.Len))
+		resp.Size, err = writeSynced(p, req.Off, genData(req.Seed, req.Len))
 	case "truncate":
 		err = unix.Truncate(p, req.Len)
 	case "unlink":
@@ -180,20 +180,20 @@ func entryName(dir string, e os.DirEntry) string {
 	return fmt.Sprintf("f:%s:%d", e.Name(), st.Size)
 }
 
-func writeSynced(p string, off int64, data []byte) error {
+// writeSynced writes data at off and syncs the file. It returns how much a failed write wrote, synced too, since a
+// write that passes a quota limit part way keeps its first bytes.
+func writeSynced(p string, off int64, data []byte) (int64, error) {
 	f, err := os.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err := f.WriteAt(data, off); err != nil {
-		_ = f.Close()
-		return err
+	n, werr := f.WriteAt(data, off)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil {
+		return int64(n), werr
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
+	return 0, errors.Join(serr, cerr)
 }
 
 // apiToken matches GOCLUSTERFS_API_TOKEN in cluster.sh, which turns on the API's snapshot writes.
