@@ -6,6 +6,7 @@ import (
 	"errors"
 	"runtime"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/supporttools/GoClusterFS/internal/storage"
@@ -246,5 +247,101 @@ func TestFreeCountIsCachedAndAdjusted(t *testing.T) {
 	}
 	if got := local.FreeCount(); got != usable-3 {
 		t.Errorf("FreeCount after the refresh = %d, want %d", got, usable-3)
+	}
+}
+
+// Local creators find a slot, then commit to the journal before they claim it. Each must get its own slot: when all 16
+// found the same one, 15 lost the claim, retried, and kept colliding until creates failed with EAGAIN.
+func TestFindFreeSlotHandsEachLocalCallerItsOwnSlot(t *testing.T) {
+	const creators = 16
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+	table := NewTable(dev, 0, 256*InodeSize, nil, [16]byte{1})
+
+	var found, claimed sync.WaitGroup
+	found.Add(creators)
+	claimed.Add(creators)
+	nums := make([]uint32, creators)
+	errs := make([]error, creators)
+	for i := range creators {
+		go func() {
+			defer claimed.Done()
+			num, err := table.FindFreeSlot()
+			found.Done()
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			found.Wait()
+			nums[i] = num
+			_, errs[i] = table.ClaimSlot(ctx, num)
+		}()
+	}
+	claimed.Wait()
+	seen := map[uint32]bool{}
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("creator %d: claiming inode %d: %v", i, nums[i], err)
+		}
+		if seen[nums[i]] {
+			t.Errorf("creator %d got inode %d, which another creator got too", i, nums[i])
+		}
+		seen[nums[i]] = true
+	}
+}
+
+// A slot a caller gives back without claiming, or loses to another node's claim, is not lost to the next find.
+func TestFindFreeSlotAfterAReleaseOrALostClaim(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+	a := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
+	b := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+
+	first, err := a.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := a.FindFreeSlot()
+	if err != nil || second == first {
+		t.Fatalf("second FindFreeSlot = %d, %v; want a slot other than %d", second, err, first)
+	}
+	a.Release(first)
+	if num, err := a.FindFreeSlot(); err != nil || num != first {
+		t.Fatalf("FindFreeSlot after releasing inode %d = %d, %v; want it again", first, num, err)
+	}
+	if _, err := b.ClaimSlot(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ClaimSlot(ctx, first); !errors.Is(err, ErrInodeInUse) {
+		t.Fatalf("claiming inode %d after the other node did: %v, want ErrInodeInUse", first, err)
+	}
+	a.Release(second)
+	if num, err := a.FindFreeSlot(); err != nil || num != second {
+		t.Errorf("FindFreeSlot = %d, %v; want inode %d, the first free one", num, err, second)
+	}
+}
+
+// When every free slot is handed out, FindFreeSlot shares one rather than reporting a full table.
+func TestFindFreeSlotSharesTheLastFreeSlot(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+	table := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
+	for {
+		num, err := table.FindFreeSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if num == 63 {
+			break
+		}
+		if _, err := table.ClaimSlot(ctx, num); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if num, err := table.FindFreeSlot(); err != nil || num != 63 {
+		t.Errorf("FindFreeSlot with inode 63 the only free one, handed out = %d, %v; want 63", num, err)
 	}
 }

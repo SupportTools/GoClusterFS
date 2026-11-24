@@ -101,6 +101,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		logging.Debugf("Symlink %q: FindFreeSlot failed: %v", name, err)
 		return nil, syscall.ENOSPC
 	}
+	defer f.inodeTbl.Release(inodeNum)
 	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
 		logging.Debugf("Symlink %q: Read parent inode %d failed: %v", name, parentNum, err)
