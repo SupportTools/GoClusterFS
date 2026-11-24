@@ -3901,6 +3901,11 @@ test_quota_limits() {
     exec_on_node "$node" mkdir "$dir" || return 1
     # 4 blocks of 1 MB: the project's root directory takes one, so three are left for files.
     exec_on_node "$node" setfattr -n trusted.goclusterfs.quota -v "bytes=4194304 inodes=10" "$dir" || return 1
+    out=$(exec_on_node "$node" stat -f -c '%b %S %c' "$dir")
+    if [[ "$out" != "4 1048576 10" ]]; then
+        log "ERROR: statfs on the project reads '$out' (blocks, block size, inodes), want '4 1048576 10'"
+        return 1
+    fi
     if ! exec_on_node "$node" dd if=/dev/zero of="$dir/a" bs=1M count=2 conv=fsync 2>/dev/null; then
         log "ERROR: a write within the limit failed"
         return 1

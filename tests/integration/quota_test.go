@@ -44,3 +44,26 @@ func TestQuotaXattrThroughTheMount(t *testing.T) {
 		t.Errorf("quota after setting it: %q, %v; want project 1 with the limits", buf[:max(n, 0)], err)
 	}
 }
+
+// statfs on a directory below the root reports the volume, as on the root, through the mount.
+func TestStatfsOnASubdirectoryThroughTheMount(t *testing.T) {
+	mfs := NewMountedFS(t, 64)
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("FormatAndMount failed: %v", err)
+	}
+	dir := filepath.Join(mfs.MountPoint, "sub")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var root, sub unix.Statfs_t
+	if err := unix.Statfs(mfs.MountPoint, &root); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Statfs(dir, &sub); err != nil {
+		t.Fatal(err)
+	}
+	if sub.Blocks == 0 || sub.Blocks != root.Blocks || sub.Files != root.Files || sub.Bsize != root.Bsize {
+		t.Errorf("statfs on a subdirectory = %d blocks of %d, %d inodes; want the root's %d blocks of %d, %d inodes",
+			sub.Blocks, sub.Bsize, sub.Files, root.Blocks, root.Bsize, root.Files)
+	}
+}

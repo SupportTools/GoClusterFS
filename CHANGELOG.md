@@ -34,6 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `df` and `statfs` on a directory or file in a project with limits report the project's limits as its size, and what they leave as its free space and inodes, as XFS does for a project's directories.
+
 - A node whose storage path logged in again, under dm-multipath, registers its key again when the target refuses its writes, but only while the device still lists a registration of its key from before the loss and its registry slot shows no peer taking it over. It re-registers only the paths that lost the key, so a healthy path keeps its registration, and it checks with every write held. A peer's preempt is final, whatever the node's clock says after a hypervisor pause. Key listings work on any kernel through passthrough.
 - A node taking another over marks its intent in that node's slot before it revokes the node's key, and a node that reads such an intent in its own slot stops. `goclusterfs-fsck -list-slots` and `-inspect-slot` show the intent.
 - `goclusterfs-mount -format -block-size N` formats a volume with N-byte data blocks, a power of two from 8 KB to 1 MB; the default stays 1 MB. Small blocks suit volumes of many small files: a 316 MB node_modules tree takes 0.6 GB at 8 KB blocks and 44 GB at 1 MB. With smaller blocks `-bytes-per-inode` defaults to max(2 × block size, 16 KB) instead of 1 MB. Each extent lock covers 1 MB of the data region whatever the block size, so a write claims no more of them at small blocks than at 1 MB; at 1 MB blocks the lock keys are unchanged. Builds without this refuse such a volume ("superblock layout is not supported by this version: block size N").
@@ -120,6 +122,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The journal's `FullThreshold` setting, which nothing read. A checkpoint still runs every 5 seconds and when a transaction does not fit.
 
 ### Fixed
+
+- `df` and `statfs` on a directory or file below the root reported zero size, blocks and inodes, because only the root answered them. They now report the volume.
 
 - A takeover whose preempt failed while the device still listed the node's key gives the slot back, so the node keeps running; before, the node stopped at its next heartbeat. Lock waiters count a node a peer is taking over as failing, not live, although the intent changed its slot.
 - The reservation check a fenced mount runs every 5 seconds warned `checking the device's reservation failed: resource temporarily unavailable` when it ran while a dm-multipath map was suspended, as when multipath reloads its table after a path logs out and in. It now tries again twice, 250 ms apart, before it warns.
