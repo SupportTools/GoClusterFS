@@ -150,6 +150,9 @@ func (f *FS) dropLink(ctx context.Context, num uint32, live uint64) error {
 	if err != nil {
 		return err
 	}
+	if afterCommit != nil {
+		afterCommit("link dropped")
+	}
 	f.cacheInode(ino)
 	switch {
 	case ino.LinkCount != 0:
@@ -225,6 +228,9 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 		}
 		defer f.closeIntent(seq)
 		charged = true
+		if afterCommit != nil {
+			afterCommit("orphan free")
+		}
 	}
 	var freed *inode.Inode
 	ok, err := f.inodeTbl.FreeIf(ctx, num, func(ino *inode.Inode) bool {

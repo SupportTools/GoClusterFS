@@ -344,6 +344,7 @@ func (f *FS) InitSnapshots(ctx context.Context, snapshotOffset, snapshotSize uin
 	// Create and start background worker
 	cfg := snapshot.DefaultWorkerConfig()
 	f.snapshotWkr = snapshot.NewWorker(f.snapshotReg, f.extentMgr, f.inodeTbl, cfg)
+	f.chargeSnapshots()
 	f.snapshotWkr.Start()
 	f.snapshotsUp.Store(true)
 
@@ -4163,11 +4164,15 @@ func (f *FS) shareInto(ctx context.Context, srcNum uint32, dst *inode.Inode, sti
 		return err
 	}
 	dst.Size = src.Size
+	// No record maps the shared blocks into dst, so their charge commits before the write that does.
+	shared := int64(dst.AllocatedBlocks)
+	f.commitCharge(dst.ProjectID, shared, 0)
 	if err := f.inodeTbl.Write(ctx, dst); err != nil {
 		f.extentMgr.DiscardPending(ctx, dst)
 		// Only a conflict proves dst on disk does not map the blocks.
 		if errors.Is(err, extent.ErrTreeConflict) {
 			f.extentMgr.ReleaseBlocks(ctx, blocks)
+			f.commitCharge(dst.ProjectID, -shared, 0)
 		}
 		return err
 	}
@@ -4261,6 +4266,8 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
+	// No record makes the data inode, so its charge commits before the claim; the delete job gives it back.
+	f.fs.commitCharge(src.ProjectID, 0, 1)
 	data, err := f.fs.claimInode(ctx, func(ino *inode.Inode) {
 		ino.Mode, ino.UID, ino.GID = src.Mode, src.UID, src.GID
 		ino.Mtime, ino.Ctime = src.Mtime, src.Ctime
@@ -4269,6 +4276,7 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 	})
 	if err != nil {
 		log.Printf("[snapshot] No inode for the data of a snapshot of inode %d: %v", f.inodeNum, err)
+		f.fs.commitCharge(src.ProjectID, 0, -1)
 		return claimErrno(err)
 	}
 
@@ -4276,7 +4284,9 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		data.InodeNum, src.AllocatedBlocks, src.Size, snapshot.FlagReadOnly)
 	if err != nil {
 		log.Printf("[snapshot] Failed to add '%s' to the registry: %v", name, err)
-		f.fs.freeNewInode(ctx, data.InodeNum)
+		if f.fs.freeNewInode(ctx, data.InodeNum) {
+			f.fs.commitCharge(src.ProjectID, 0, -1)
+		}
 		if errors.Is(err, snapshot.ErrSnapshotExists) {
 			return syscall.EEXIST
 		}

@@ -33,6 +33,20 @@ func (f *FS) SetQuotaTable(num uint32, blockSize uint64, guard *quota.Guard) {
 	if f.dirMgr != nil {
 		f.dirMgr.SetCharge(func(project uint32, blocks int64) { f.commitCharge(project, blocks, 0) })
 	}
+	f.chargeSnapshots()
+}
+
+// chargeSnapshots makes snapshot deletes give back their data inodes' usage, once both quotas and snapshots are set.
+func (f *FS) chargeSnapshots() {
+	if f.snapshotWkr != nil && f.quotaInode != 0 {
+		f.snapshotWkr.SetCharge(f.commitCharge)
+	}
+}
+
+// ChargeQuota commits a change to project's usage that happened with no record of its own, such as an orphan a
+// replay freed.
+func (f *FS) ChargeQuota(project uint32, blocks, inodes int64) {
+	f.commitCharge(project, blocks, inodes)
 }
 
 func (f *FS) dataBlockSize() uint64 { return f.quotaBlockSize }

@@ -56,6 +56,25 @@ type Worker struct {
 
 	// Callbacks for integration
 	onJobComplete func(*JobResult)
+	// charge, when set, gives back to a data inode's quota project what a delete releases.
+	charge func(project uint32, blocks, inodes int64)
+}
+
+// SetCharge makes a delete call charge with a data inode's project and the negated blocks and inode it gives back,
+// once each is gone.
+func (w *Worker) SetCharge(charge func(project uint32, blocks, inodes int64)) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.charge = charge
+}
+
+func (w *Worker) charged(project uint32, blocks, inodes int64) {
+	w.mu.RLock()
+	charge := w.charge
+	w.mu.RUnlock()
+	if charge != nil {
+		charge(project, blocks, inodes)
+	}
 }
 
 // WorkerConfig contains configuration for the background worker.
@@ -244,9 +263,12 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 
 	// Freed only once no descriptor names it, so a reused slot is never released again.
 	if snap.HasData() {
+		data, readErr := w.inodeTable.Read(snap.DataInode)
 		if err := w.inodeTable.Free(ctx, snap.DataInode); err != nil {
 			log.Printf("[snapshot/worker] Failed to free data inode %d of snapshot %d: %v",
 				snap.DataInode, job.SnapshotID, err)
+		} else if readErr == nil && data.Flags&inode.FlagSnapshotData != 0 {
+			w.charged(data.ProjectID, 0, -1)
 		}
 	}
 
@@ -261,6 +283,8 @@ func (w *Worker) processDeleteJob(ctx context.Context, job *Job) error {
 // block is released, so a crash leaks blocks at worst and calling it again is
 // safe.
 func (w *Worker) ReleaseData(ctx context.Context, snapshotID uint64, num uint32) error {
+	var project uint32
+	var blocks uint64
 	ino, released, err := w.inodeTable.UpdateIf(ctx, num, func(ino *inode.Inode) (bool, error) {
 		desc, err := w.registry.Get(ctx, snapshotID)
 		if errors.Is(err, ErrSnapshotNotFound) {
@@ -275,6 +299,7 @@ func (w *Worker) ReleaseData(ctx context.Context, snapshotID uint64, num uint32)
 		if ino.ExtentCount == 0 && !ino.HasExtentTree() {
 			return false, nil
 		}
+		project, blocks = ino.ProjectID, ino.AllocatedBlocks
 		return true, w.extentMgr.Truncate(ctx, ino, 0)
 	})
 	if err != nil {
@@ -285,7 +310,9 @@ func (w *Worker) ReleaseData(ctx context.Context, snapshotID uint64, num uint32)
 	}
 	if !released {
 		log.Printf("[snapshot/worker] Nothing to release in inode %d for snapshot %d: already released or no longer its data", num, snapshotID)
+		return nil
 	}
+	w.charged(project, -int64(blocks), 0)
 	return nil
 }
 

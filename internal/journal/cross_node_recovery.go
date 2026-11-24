@@ -34,6 +34,8 @@ type RecoveryContext struct {
 	OrphanHolders func(num uint32) (uint64, error)
 	AddOrphan     func(num uint32, birth uint64) error
 	FreeSFBSlot   func(ctx context.Context, packed uint64)
+	// Charge, when set, takes what replay frees with no record of its own, an orphan, off the inode's quota project.
+	Charge func(project uint32, blocks, inodes int64)
 	// FoldQuota, when set, folds what the dirty journal in region, of registry slot slot and its node owner, owes the
 	// quota table, before replay begins.
 	FoldQuota func(ctx context.Context, slot int, owner [16]byte, region *Region) error
@@ -118,10 +120,14 @@ func ReplayJournal(ctx context.Context, rctx *RecoveryContext, info *node.Failed
 		}
 	}
 
+	logged, err := loggedFrees(region)
+	if err != nil {
+		return result, fmt.Errorf("reading the journal's inode frees: %w", err)
+	}
 	// Create handler that applies transactions idempotently
 	handler := func(txn *RecoveredTxn) error {
 		result.TxnReplayed++
-		txnResult, err := applyTransaction(ctx, rctx, txn)
+		txnResult, err := applyLogged(ctx, rctx, txn, logged)
 		if err != nil {
 			result.Errors = append(result.Errors, err)
 			return err
@@ -152,11 +158,17 @@ type txnApplyResult struct {
 
 // applyTransaction applies a single recovered transaction idempotently.
 func applyTransaction(ctx context.Context, rctx *RecoveryContext, txn *RecoveredTxn) (*txnApplyResult, error) {
+	return applyLogged(ctx, rctx, txn, nil)
+}
+
+// applyLogged is applyTransaction for a journal whose logged inode frees are logged, from loggedFrees.
+func applyLogged(ctx context.Context, rctx *RecoveryContext, txn *RecoveredTxn, logged map[inodeFree]bool) (*txnApplyResult, error) {
 	result := &txnApplyResult{}
 	if err := unknownOpIn(txn); err != nil {
 		return result, err
 	}
 	r := newTxnReplay(txn.Header.OwnerNodeUUID)
+	r.logged = logged
 
 	for _, entry := range txn.Entries {
 		applied, err := applyEntry(ctx, rctx, r, entry)
@@ -182,6 +194,48 @@ type txnReplay struct {
 	wrote   map[uint32]uint64
 	keep    map[uint64]bool // targets a replayed rename left named, so its records must not drop or free them
 	linked  map[uint64]bool // files this transaction gave a link, which its DirAddEntry names
+	logged  map[inodeFree]bool
+}
+
+// inodeFree is an inode at a MetaGeneration.
+type inodeFree struct {
+	num uint32
+	gen uint64
+}
+
+// loggedFrees reads which inodes, at which MetaGeneration, the journal in region logs InodeDelete records for,
+// completed or not, leaving out transactions whose commit failed.
+func loggedFrees(region *Region) (map[inodeFree]bool, error) {
+	logged := map[inodeFree]bool{}
+	err := scanJournal(region, func(txn *RecoveredTxn) error {
+		if txn.Abandoned {
+			return nil
+		}
+		for _, e := range txn.Entries {
+			if e.Entry.OpType != TxnOpInodeDelete {
+				continue
+			}
+			p, err := DeserializeInodeDelete(e.Payload)
+			if err != nil {
+				return err
+			}
+			if num, err := tableInode(p.InodeNum); err == nil {
+				logged[inodeFree{num, p.MetaGeneration}] = true
+			}
+		}
+		return nil
+	}, &RecoveryStats{}, nil, nil, true)
+	return logged, err
+}
+
+// freeOrphanOnce frees an orphan a replayed link drop leaves, unless the journal logs that free itself: that record
+// frees it and carries its quota credit, and freeing it here as well would credit it twice.
+func (r *txnReplay) freeOrphanOnce(ctx context.Context, rctx *RecoveryContext, num uint32, gen uint64) error {
+	if r.logged[inodeFree{num, gen}] {
+		log.Printf("[Recovery] LinkDrop: inode %d is freed by its own record later in the journal", num)
+		return nil
+	}
+	return freeOrphan(ctx, rctx, num, gen)
 }
 
 func newTxnReplay(owner [16]byte) *txnReplay {
@@ -504,7 +558,7 @@ func applyLinkDrop(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pay
 			return false, rctx.AddOrphan(num, ino.BirthGeneration)
 		}
 		// Without AddOrphan this node is alone, and the crash ended every open.
-		return false, freeOrphan(ctx, rctx, num, ino.MetaGeneration)
+		return false, r.freeOrphanOnce(ctx, rctx, num, ino.MetaGeneration)
 	case err != nil:
 		return false, fmt.Errorf("failed to drop a link of inode %d: %w", num, err)
 	}
@@ -518,7 +572,7 @@ func applyLinkDrop(ctx context.Context, rctx *RecoveryContext, r *txnReplay, pay
 	case after.Holders != 0 && rctx.AddOrphan != nil:
 		return true, rctx.AddOrphan(num, after.BirthGeneration)
 	default:
-		return true, freeOrphan(ctx, rctx, num, after.MetaGeneration)
+		return true, r.freeOrphanOnce(ctx, rctx, num, after.MetaGeneration)
 	}
 	log.Printf("[Recovery] LinkDrop: inode %d has %d links left", num, after.LinkCount)
 	return true, nil
@@ -534,6 +588,9 @@ func freeOrphan(ctx context.Context, rctx *RecoveryContext, num uint32, gen uint
 		return err
 	}
 	log.Printf("[Recovery] LinkDrop: freed inode %d", num)
+	if rctx.Charge != nil {
+		rctx.Charge(freed.ProjectID, -int64(freed.AllocatedBlocks), -1)
+	}
 	sfbBacked, sfbSlot := freed.IsSFBBacked(), freed.InlineExtents[0].PhysicalBlock
 	if err := rctx.ExtentMgr.Delete(ctx, freed); err != nil {
 		return err
@@ -1005,16 +1062,37 @@ func CreateRecoveryHandler(rctx *RecoveryContext) node.RecoveryHandler {
 // This is used for self-recovery during mount when we need to replay
 // transactions directly without the node.FailedNodeInfo wrapper.
 func CreateTxnRecoveryHandler(rctx *RecoveryContext) RecoveryHandler {
-	ctx := lock.ForReplay(context.Background())
-	return func(txn *RecoveredTxn) error {
-		result, err := applyTransaction(ctx, rctx, txn)
-		if err != nil {
-			return err
-		}
-		log.Printf("[Recovery] Replayed txn seq=%d: applied=%d, skipped=%d",
-			txn.Header.Seq, result.applied, result.skipped)
-		return nil
+	return NewReplay(rctx).Handle
+}
+
+// Replay applies one journal's transactions, as CreateTxnRecoveryHandler's handler does. After Prepare has read the
+// journal's inode frees, a replayed link drop leaves the free of an orphan to the journal's own record of it.
+type Replay struct {
+	ctx    context.Context
+	rctx   *RecoveryContext
+	logged map[inodeFree]bool
+}
+
+func NewReplay(rctx *RecoveryContext) *Replay {
+	return &Replay{ctx: lock.ForReplay(context.Background()), rctx: rctx}
+}
+
+// Prepare reads the inode frees the journal in region logs, before replay begins.
+func (r *Replay) Prepare(region *Region) error {
+	logged, err := loggedFrees(region)
+	r.logged = logged
+	return err
+}
+
+// Handle applies txn.
+func (r *Replay) Handle(txn *RecoveredTxn) error {
+	result, err := applyLogged(r.ctx, r.rctx, txn, r.logged)
+	if err != nil {
+		return err
 	}
+	log.Printf("[Recovery] Replayed txn seq=%d: applied=%d, skipped=%d",
+		txn.Header.Seq, result.applied, result.skipped)
+	return nil
 }
 
 // applyExtentFree cuts the inode to the logged size and frees its blocks past it, through refcounts for shared ones,

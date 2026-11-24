@@ -284,7 +284,7 @@ in_test_group() {
     [[ -z "$TEST_GROUP" ]] && return 0
     local group=1
     case "$1" in
-        "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|Staleness*|"Inode Reuse Stale Read"|"Rolling Restart")
+        "Container Kill Recovery"|Journal*|"Network Partition"|Broadcast*|Staleness*|"Inode Reuse Stale Read"|"Rolling Restart"|"Quota Orphan After Crash")
             group=2 ;;
         # Takes about 14 minutes in CI, so it runs alone.
         "More Than 4096 Files")
@@ -3891,6 +3891,61 @@ test_quota_project() {
     return 0
 }
 
+# quota_usage prints a project directory's used_bytes and used_inodes as another node reads them.
+quota_usage() {
+    exec_on_node "$1" getfattr --only-values -n trusted.goclusterfs.quota "$2" | grep -o 'used_bytes=[0-9]* used_inodes=[0-9]*'
+}
+
+# A file in a project, unlinked while open, still counts; once its node crashes and comes back, freeing the orphan
+# gives its blocks and inode back.
+test_quota_orphan_after_crash() {
+    log "Testing that a crashed node's open, unlinked file stops counting against its project..."
+
+    local node_a="${NODE_ARRAY[0]}"
+    local node_b="${NODE_ARRAY[1]:-}"
+    if [[ -z "$node_b" ]]; then
+        log "Skipping: needs 2 nodes"
+        return 0
+    fi
+    local dir=/mnt/goclusterfs/quota_orphan_$$
+    local file=$dir/held
+    exec_on_node "$node_a" mkdir "$dir" || return 1
+    exec_on_node "$node_a" setfattr -n trusted.goclusterfs.quota -v "bytes=1073741824 inodes=100" "$dir" || return 1
+    local before during after waited=0
+    before=$(quota_usage "$node_b" "$dir") || return 1
+
+    docker exec -d "$node_a" sh -c "exec 3>$file; head -c 2097152 /dev/zero >&3; rm $file; sleep 600"
+    while exec_on_node "$node_a" test -e "$file" 2>/dev/null || [[ $waited -lt 3 ]]; do
+        if [[ $waited -ge 30 ]]; then
+            log "ERROR: the held file was not written and unlinked within 30s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    during=$(quota_usage "$node_b" "$dir") || return 1
+    if [[ "$during" == "$before" ]]; then
+        log "ERROR: the open, unlinked file does not count: usage stays '$during'"
+        return 1
+    fi
+
+    kill_node "$node_a" || return 1
+    restart_node "$node_a"
+    wait_node_healthy "$node_a" 60 || return 1
+    waited=0
+    while after=$(quota_usage "$node_b" "$dir") && [[ "$after" != "$before" ]]; do
+        if [[ $waited -ge 60 ]]; then
+            log "ERROR: 60s after the crash usage is '$after', want '$before' as before the file (with it: '$during')"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    exec_on_node "$node_a" rm -rf "$dir"
+    log "Quota orphan after crash test passed: '$before', then '$during' with the open file, '$after' after the crash"
+    return 0
+}
+
 run_test "Create and Read File" test_create_read_file
 run_test "Create Directory" test_create_directory
 run_test "File in Directory" test_file_in_directory
@@ -3917,6 +3972,7 @@ run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 run_test "Snapshot During Writes" test_snapshot_during_writes
 run_test "Quota Project" test_quota_project
+run_test "Quota Orphan After Crash" test_quota_orphan_after_crash
 run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 run_test "Multi-Node Rename" test_multinode_rename
 run_test "Multi-Node Rename Of A Moved Directory" test_multinode_rename_moved_dir

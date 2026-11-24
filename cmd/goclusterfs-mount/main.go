@@ -414,6 +414,7 @@ func main() {
 	}
 	inodeTbl.SetTreeFlusher(extentMgr)
 	dirMgr := dir.NewManager(dev, inodeTbl, extentMgr, lockMgr, dataOffset)
+	ownCharges := laterCharges{}
 	dirMgr.SetIndexLimit(*dirIndex)
 
 	// Refcounts stay on without snapshots: blocks shared earlier still need copy-on-write, and replay frees shared blocks through them.
@@ -453,14 +454,22 @@ func main() {
 			},
 		}
 		// Use per-transaction handler for self-recovery
-		recoveryHandler := journal.CreateTxnRecoveryHandler(recoveryCtx)
+		// This node's journal does not exist yet, so the replay's charges wait for it.
+		if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
+			recoveryCtx.Charge = ownCharges.add
+			dirMgr.SetCharge(func(project uint32, blocks int64) { ownCharges.add(project, blocks, 0) })
+		}
+		replay := journal.NewReplay(recoveryCtx)
 		releaseReserved := recoveryCtx.ReleaseReserved(lock.ForReplay(context.Background()))
 
 		// Replay a dirty journal left in this slot's region by its previous owner
-		fold := func(region *journal.Region) error {
-			return foldQuota(lock.ForReplay(context.Background()), slotIdx, nodeUUID, region)
+		prepare := func(region *journal.Region) error {
+			if err := foldQuota(lock.ForReplay(context.Background()), slotIdx, nodeUUID, region); err != nil {
+				return err
+			}
+			return replay.Prepare(region)
 		}
-		result, err := recoverOwnJournal(dev, journalOffset, journalSize, fold, recoveryHandler, releaseReserved, slotIdx)
+		result, err := recoverOwnJournal(dev, journalOffset, journalSize, prepare, replay.Handle, releaseReserved, slotIdx)
 		if err != nil {
 			failf("Journal recovery for slot %d failed: %v. Check the device, then mount again; to discard this journal instead, mount with -skip-recovery=%d", slotIdx, err, slotIdx)
 		}
@@ -605,6 +614,7 @@ func main() {
 			goclusterfs.FreeSFBSlot(ctx, dev, lockMgr, dataOffset, packed)
 		},
 		FoldQuota: foldQuota,
+		Charge:    func(project uint32, blocks, inodes int64) { gfs.ChargeQuota(project, blocks, inodes) },
 	}
 	replayPeer := journal.CreateRecoveryHandler(recoveryCtx)
 	nodeReg.SetRecoveryHandler(func(info *node.FailedNodeInfo) error {
@@ -624,6 +634,23 @@ func main() {
 	gfs.SetDirectIO(*directIO)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
 	cacheMgr.OnOrphans(nodeReg.KickOrphans)
+	quotasSet := false
+	setUpQuotas := func() {
+		if quotasSet || sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 {
+			return
+		}
+		quotasSet = true
+		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
+		for project, c := range ownCharges {
+			gfs.ChargeQuota(project, c[0], c[1])
+		}
+		gfs.SetStopNode(func(reason string) {
+			failf("%s; stopping this node so a peer replays its journal. Mount again once the device is healthy", reason)
+		})
+		gfs.StartQuotaFlush(time.Duration(cmp.Or(sb.QuotaFlushMs, quota.DefaultFlushMs)) * time.Millisecond)
+	}
+	// Freeing orphans and replaying peers change usage, which counts only once the quota table is set.
+	setUpQuotas()
 	// Nothing is open here yet: let go of what this slot held before a crash.
 	if err := gfs.ForgetSlot(lock.ForReplay(context.Background()), slotIdx, nil); err != nil {
 		log.Printf("[WARN] letting go of orphans this slot held before: %v", err)
@@ -644,13 +671,7 @@ func main() {
 		}
 		log.Printf("Filesystem formatted successfully, with project quotas in inode %d", sb.QuotaInode)
 	}
-	if sb.RequiredFlags&superblock.RequiredProjectQuotas != 0 {
-		gfs.SetQuotaTable(sb.QuotaInode, uint64(sb.BlockSize), quotaGuard)
-		gfs.SetStopNode(func(reason string) {
-			failf("%s; stopping this node so a peer replays its journal. Mount again once the device is healthy", reason)
-		})
-		gfs.StartQuotaFlush(time.Duration(cmp.Or(sb.QuotaFlushMs, quota.DefaultFlushMs)) * time.Millisecond)
-	}
+	setUpQuotas()
 
 	// Verify root exists
 	rootIno, err := inodeTbl.Read(inode.InodeRoot)
@@ -1028,6 +1049,16 @@ func keepReserved(pr *fence.PR, stop <-chan struct{}) {
 					"so a revoked node could have gone on writing; reserved it again", pr.Key())
 			}
 		}
+	}
+}
+
+// laterCharges collects, per quota project, the blocks and inodes a replay frees or maps before this node's journal
+// can log them.
+type laterCharges map[uint32][2]int64
+
+func (c laterCharges) add(project uint32, blocks, inodes int64) {
+	if project != 0 {
+		c[project] = [2]int64{c[project][0] + blocks, c[project][1] + inodes}
 	}
 }
 
