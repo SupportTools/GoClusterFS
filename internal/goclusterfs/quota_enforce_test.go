@@ -108,3 +108,43 @@ func TestQuotaCountsTheProjectRoot(t *testing.T) {
 		t.Errorf("after removing the project root the project counts %+v, want nothing", got)
 	}
 }
+
+// A flush leaves this node's view of the usage current: the next allocation counts what the flush moved into the
+// table at once, not a second later.
+func TestQuotaCountsWhatAFlushMovedAtOnce(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	fsys.liveCount = func() int64 { return 1 }
+	bs := int64(fsys.dataBlockSize())
+	pvc := limitedProject(t, fsys, "pvc", "bytes=4194304")
+	f := createIn(t, pvc, "f")
+	writeAt(t, f, pattern(1, int(3*bs)), 0)
+	flushQuota(t, fsys)
+	if _, errno := f.Write(context.Background(), nil, pattern(2, int(bs)), 3*bs); errno != syscall.EDQUOT {
+		t.Errorf("a fifth block right after a flush filled the limit of 4: %v, want EDQUOT", errno)
+	}
+}
+
+// Close to a limit, a node reads the table again rather than trust its record from under a second ago, so it counts
+// what a peer flushed meanwhile.
+func TestQuotaRereadsAPeersUsageNearTheLimit(t *testing.T) {
+	fsys, path, offset, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	fsys.liveCount = func() int64 { return 2 }
+	bs := int64(fsys.dataBlockSize())
+	pvc := limitedProject(t, fsys, "pvc", "bytes=4194304")
+	f := createIn(t, pvc, "f")
+	flushQuota(t, fsys)
+	fsys.lockMgr.ReleaseCached()
+
+	peer := journaledPeer(t, path, offset, size)
+	commitDelta(t, peer, 1, 2, 0)
+	flushQuota(t, peer)
+	peer.lockMgr.ReleaseCached()
+	if got := tableUsage(t, fsys, 1); got[0] != 3 {
+		t.Fatalf("after the peer's flush the table holds %v, want the root's and the peer's 3 blocks", got)
+	}
+	if _, errno := f.Write(context.Background(), nil, pattern(3, int(2*bs)), 0); errno != syscall.EDQUOT {
+		t.Errorf("2 blocks with the peer's 2 and the root's 1 against a limit of 4: %v, want EDQUOT", errno)
+	}
+}

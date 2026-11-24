@@ -5917,6 +5917,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_enforce_test.go::TestQuotaCountsTheProjectRoot
 
+  - id: quota-enforce-after-flush
+    name: A flush leaves this node's view of usage current
+    description: Right after a flush fills a limit, the next allocation is refused at once
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_enforce_test.go::TestQuotaCountsWhatAFlushMovedAtOnce
+
+  - id: quota-enforce-peer-reread
+    name: Near a limit a node rereads a peer's usage
+    description: A peer flushes usage; this node's record is under a second old, and an allocation near the limit rereads the table and is refused
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_enforce_test.go::TestQuotaRereadsAPeersUsageNearTheLimit
+
   - id: quota-orphan-after-crash
     name: A crashed node's open, unlinked file stops counting
     description: A file in a project is written, unlinked while open, and its node killed; after the node comes back, the project's usage returns to what it was before the file
