@@ -406,15 +406,20 @@ type Checker struct {
 	snapsIncomplete []string         // why snapshotTargets and snapshotRefs may miss references
 	sfbContainers   map[uint64]bool  // blocks holding small files of older versions
 	extentTrees     map[uint32]*extentTree
-	uncounted       map[uint32]int  // inodes an older version shared -> problem index
-	uncountedRefs   map[uint64]int  // block -> references from extents an older version shared
-	uncountedPast   map[uint32]bool // inodes an older version shared with blocks past the refcount table
-	refsIncomplete  []string        // why inodeBlocks may miss references
-	superblockFix   func() error    // runs once repair knows no node uses the filesystem
-	layoutErr       error           // why mount refuses the superblock's layout
-	registry        []byte          // node registry as startRepair last saw it
-	unclean         []string        // nodes whose journal may hold changes fsck cannot see
-	finished        map[Phase]bool  // phases that ran to the end
+	uncounted       map[uint32]int    // inodes an older version shared -> problem index
+	uncountedRefs   map[uint64]int    // block -> references from extents an older version shared
+	uncountedPast   map[uint32]bool   // inodes an older version shared with blocks past the refcount table
+	refsIncomplete  []string          // why inodeBlocks may miss references
+	superblockFix   func() error      // runs once repair knows no node uses the filesystem
+	layoutErr       error             // why mount refuses the superblock's layout
+	registry        []byte            // node registry as startRepair last saw it
+	unclean         []string          // nodes whose journal may hold changes fsck cannot see
+	finished        map[Phase]bool    // phases that ran to the end
+	projectOf       map[uint32]uint32 // inode -> its quota project, for inodes in one
+	projectUse      map[uint32]*projectUsage
+	usageIncomplete []string     // why projectUse may miss inodes
+	strayEntries    []strayEntry // names whose inode's project differs from what their directory gives
+	quotaSectors    []uint64     // device offset of each quota table sector, when the quota inode maps them all
 }
 
 // SuperblockData holds parsed superblock information for use by other phases.
@@ -497,6 +502,8 @@ func New(dev *storage.Device, opts Options) *Checker {
 		uncounted:       make(map[uint32]int),
 		uncountedRefs:   make(map[uint64]int),
 		uncountedPast:   make(map[uint32]bool),
+		projectOf:       make(map[uint32]uint32),
+		projectUse:      make(map[uint32]*projectUsage),
 	}
 }
 

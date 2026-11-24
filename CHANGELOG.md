@@ -34,6 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `goclusterfs-fsck` recounts each quota project's usage from its inodes and reports a project whose usage in the quota table differs, which an I/O error or a crash at the wrong moment can leave; `-repair` writes the recount. It checks only when every journal is clean. It also reports inodes in a project with no record and names in another project than their directory gives.
 - `df` and `statfs` on a directory or file in a project with limits report the project's limits as its size, and what they leave as its free space and inodes, as XFS does for a project's directories.
 
 - A node whose storage path logged in again, under dm-multipath, registers its key again when the target refuses its writes, but only while the device still lists a registration of its key from before the loss and its registry slot shows no peer taking it over. It re-registers only the paths that lost the key, so a healthy path keeps its registration, and it checks with every write held. A peer's preempt is final, whatever the node's clock says after a hypervisor pause. Key listings work on any kernel through passthrough.

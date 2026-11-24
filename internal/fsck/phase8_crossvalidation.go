@@ -9,6 +9,7 @@ import (
 // Checks performed:
 //   - Bitmap allocation matches inode extent references
 //   - Every inode in use has a name in a directory; repair frees unnamed ones
+//   - Each quota project's usage matches its inodes; repair writes the recount
 //   - A regular file's link count is its number of names; repair sets it
 //   - No leaked blocks (allocated but unreferenced); repair frees them
 //   - No phantom blocks (referenced but not allocated)
@@ -29,6 +30,11 @@ func (c *Checker) crossValidate() error {
 
 	c.logf("  Checking for inodes no directory names...\n")
 	if err := c.checkUnnamed(); err != nil {
+		return err
+	}
+
+	c.logf("  Checking project quota usage...\n")
+	if err := c.checkQuotaUsage(); err != nil {
 		return err
 	}
 

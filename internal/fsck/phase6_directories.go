@@ -164,6 +164,7 @@ func (c *Checker) checkDirectories() error {
 				default:
 					c.dirEntryRefs[target]++
 					c.dirNames[inodeNum]++
+					c.noteEntryProject(inodeNum, inode, entry.Name, target)
 					if c.entryType[target] == DT_DIR {
 						tree.parents[target] = append(tree.parents[target], inodeNum)
 						tree.subdirs[inodeNum]++
