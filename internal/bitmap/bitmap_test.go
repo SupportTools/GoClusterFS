@@ -806,3 +806,42 @@ func TestCountReadsOneMBAtATime(t *testing.T) {
 		t.Errorf("count with sector 256 unreadable = %d allocated, %v; want %d and an error", allocated, err, 4+BitsPerSector)
 	}
 }
+
+// AllocContiguous takes the first run long enough, skipping shorter gaps, and finds runs that cross a sector.
+func TestAllocContiguous(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	total := uint64(BitsPerSector + 1000)
+	region := NewRegion(dev, 0, total, nil, [16]byte{})
+	ctx := context.Background()
+	for _, b := range []uint64{3, 10, BitsPerSector - 20} {
+		if err := region.MarkAllocated(ctx, b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := region.AllocContiguous(ctx, 6)
+	if err != nil || first != 4 {
+		t.Fatalf("a run of 6 after gaps of 3 and 6: %d, %v; want 4", first, err)
+	}
+	first, err = region.AllocContiguous(ctx, 100)
+	if err != nil || first != 11 {
+		t.Fatalf("a run of 100: %d, %v; want 11", first, err)
+	}
+	if first, err = region.AllocContiguous(ctx, int(BitsPerSector-20-111)); err != nil || first != 111 {
+		t.Fatalf("filling the first sector's last gap: %d, %v; want 111", first, err)
+	}
+	if first, err = region.AllocContiguous(ctx, 64); err != nil || first != BitsPerSector-19 {
+		t.Fatalf("a run of 64 that must cross into the second sector: %d, %v; want %d", first, err, BitsPerSector-19)
+	}
+	for b := first; b < first+64; b++ {
+		if free, err := region.IsFree(b); err != nil || free {
+			t.Fatalf("block %d of the crossing run is free (%v)", b, err)
+		}
+	}
+	if free, err := region.IsFree(first + 64); err != nil || !free {
+		t.Errorf("block %d past the run is allocated (%v)", first+64, err)
+	}
+	if _, err := region.AllocContiguous(ctx, 2000); !errors.Is(err, ErrNoFreeBlocks) {
+		t.Errorf("a run longer than any gap: %v, want ErrNoFreeBlocks", err)
+	}
+}

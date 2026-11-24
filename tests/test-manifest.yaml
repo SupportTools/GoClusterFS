@@ -5700,10 +5700,17 @@ scenarios:
 
   - id: quota-enable
     name: Enabling quotas creates the table inode and sets the superblock last
-    description: With no node mounted, as fsck -enable-quotas runs it, Enable allocates the table inode and its first block, writes the header and empty records, names the inode in the superblock and sets RequiredProjectQuotas; a second Enable changes nothing
+    description: With no node mounted, as fsck -enable-quotas runs it, Enable allocates the table inode and 1 MiB of blocks in a row, 16,065 records at 1 MB, 64 KB and 8 KB blocks, writes the header and empty records, names the inode in the superblock and sets RequiredProjectQuotas; a second Enable changes nothing
     priority: go_only
     environments:
       go: internal/quota/enable_test.go::TestEnableCreatesTheTable
+
+  - id: bitmap-alloc-contiguous
+    name: The bitmap allocates a run of blocks in a row
+    description: AllocContiguous takes the first free run long enough, skipping shorter gaps, finds a run that crosses a bitmap sector, and fails with ErrNoFreeBlocks when no gap is long enough
+    priority: go_only
+    environments:
+      go: internal/bitmap/bitmap_test.go::TestAllocContiguous
 
   - id: fsck-quota-table
     name: fsck checks the quota table and keeps its unnamed inode

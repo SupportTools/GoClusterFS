@@ -203,6 +203,59 @@ func (r *Region) allocOnce(ctx context.Context, count, runLen int) ([]uint64, er
 	return starts, nil
 }
 
+// AllocContiguous allocates the first run of count free blocks in a row and returns its first block. A run spans at
+// most two bitmap sectors.
+func (r *Region) AllocContiguous(ctx context.Context, count int) (uint64, error) {
+	if count <= 0 || uint64(count) > BitsPerSector {
+		return 0, fmt.Errorf("bitmap: a run of %d blocks", count)
+	}
+	if r.lockMgr != nil {
+		if err := r.lockMgr.Acquire(ctx, lock.LockTypeBlockBitmap, 0, lock.LockModeExclusive); err != nil {
+			return 0, fmt.Errorf("failed to acquire bitmap lock: %w", err)
+		}
+		defer r.unlock()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	sectors := map[uint64][]byte{}
+	run := uint64(0)
+	for block := uint64(0); block < r.totalBlocks; block++ {
+		idx, bit := block/BitsPerSector, block%BitsPerSector
+		data := sectors[idx]
+		if data == nil {
+			var err error
+			if data, err = r.readSector(idx); err != nil {
+				return 0, fmt.Errorf("failed to read bitmap sector %d: %w", idx, err)
+			}
+			if idx >= 2 {
+				delete(sectors, idx-2)
+			}
+			sectors[idx] = data
+		}
+		if data[bit/8]&(1<<(bit%8)) != 0 {
+			run = 0
+			continue
+		}
+		if run++; run < uint64(count) {
+			continue
+		}
+		first := block + 1 - run
+		var written []uint64
+		for b := first; b <= block; b++ {
+			sectors[b/BitsPerSector][b%BitsPerSector/8] |= 1 << (b % 8)
+			written = append(written, b)
+		}
+		for i := first / BitsPerSector; i <= idx; i++ {
+			if err := r.writeSector(i, sectors[i]); err != nil {
+				return 0, r.rollback(written, fmt.Errorf("failed to write bitmap sector %d: %w", i, err))
+			}
+		}
+		return first, nil
+	}
+	return 0, ErrNoFreeBlocks
+}
+
 // rollback frees the blocks a failed Alloc had marked and returns cause, joined
 // with an error naming each block it could not free.
 func (r *Region) rollback(blocks []uint64, cause error) error {
