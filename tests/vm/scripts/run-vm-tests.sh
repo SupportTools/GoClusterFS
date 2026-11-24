@@ -5847,15 +5847,21 @@ quota_power_up() {
     start_vm "$1" false && wait_vm_healthy "$1" && setup_goclusterfs "$1" false
 }
 
-# quota_fsck unmounts VMs 1 and 2, runs goclusterfs-fsck $1 on VM 1, and prints its quota project lines.
+# quota_fsck unmounts VMs 1 and 2, runs goclusterfs-fsck $1 on VM 1, and prints its quota project lines. It fails
+# when fsck could not compare usage, as with a journal left to replay, so no check passes without one.
 quota_fsck() {
-    local vm
+    local vm out
     for vm in 1 2; do
         if [[ -n "$(mount_pids "$vm")" ]]; then
             unmount_goclusterfs "$vm" || return 1
         fi
     done
-    ssh_run 1 "/usr/local/bin/goclusterfs-fsck ${1:-} $(cluster_device) 2>&1" | grep "quota project"
+    out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck ${1:-} $(cluster_device) 2>&1")
+    if grep -q "usage not checked" <<< "$out"; then
+        log_error "fsck did not check project usage: $(grep "usage not checked" <<< "$out")"
+        return 1
+    fi
+    grep "quota project" <<< "$out"
     return 0
 }
 
@@ -5909,10 +5915,21 @@ test_quota_fold_window_power_cut() {
     kill_vm 2 || return 1
     start_vm 1 false && wait_vm_healthy 1 || return 1
     start_vm 2 false && wait_vm_healthy 2 || return 1
-    # VM 1's mount replays its own journal, whose fold may wait out VM 2's claim on the quota lock.
-    GOCLUSTERFS_MOUNT_TIMEOUT=120 setup_goclusterfs 1 false || return 1
+    setup_goclusterfs 1 false || return 1
     setup_goclusterfs 2 false || return 1
-    log_info "after both power cuts, VM 1 reports used bytes and inodes: $(quota_used 1 qa)"
+    # The dead replayer left VM 1's old slot mid-recovery, so VM 1 may come back in a new slot; the fold is redone once
+    # a node replays the old one.
+    local waited=0 vm
+    until for vm in 1 2; do sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")"; done | grep -q "folded the usage of"; do
+        if [[ $waited -ge 180 ]]; then
+            log_error "no node redid the fold within 180s of both nodes mounting again"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    sleep 2
+    log_info "after the fold was redone, VM 1 reports used bytes and inodes: $(quota_used 1 qa)"
     quota_check_exact
 }
 
