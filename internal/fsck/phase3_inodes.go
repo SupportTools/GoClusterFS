@@ -42,6 +42,7 @@ const (
 	FlagDeleted       uint16 = 1 << 2
 	FlagSnapshotData  uint16 = 1 << 6
 	FlagInlineTarget  uint16 = 1 << 7
+	FlagProjInherit   uint16 = 1 << 8
 
 	MaxInlineTarget  = 92
 	MaxSymlinkTarget = 4095
@@ -74,6 +75,7 @@ type InodeData struct {
 
 	BirthGeneration uint64
 	Holders         uint64
+	ProjectID       uint32
 
 	// Target is an inline symlink's target, which takes the place of the extent fields.
 	Target [MaxInlineTarget]byte
@@ -138,6 +140,7 @@ func (c *Checker) checkInodes() error {
 		if err != nil {
 			c.addProblem(PhaseInodes, Critical, fmt.Sprintf("sector %d", sectorIdx), err.Error(), false)
 			c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode table sector %d", sectorIdx))
+			c.usageIncomplete = append(c.usageIncomplete, fmt.Sprintf("inode table sector %d is unreadable", sectorIdx))
 			continue
 		}
 
@@ -164,6 +167,7 @@ func (c *Checker) checkInodes() error {
 						inode.Magic, InodeMagic),
 					false)
 				c.refsIncomplete = append(c.refsIncomplete, fmt.Sprintf("inode %d", inodeNum))
+				c.usageIncomplete = append(c.usageIncomplete, fmt.Sprintf("inode %d has an invalid magic", inodeNum))
 				continue
 			}
 
@@ -182,6 +186,7 @@ func (c *Checker) checkInodes() error {
 			// The runtime refuses to read such an inode, so its extents may be garbage.
 			if computed := storage.CRC32C(inodeBuf[:InodeSize-4]); inode.Checksum != computed {
 				checksumErrors++
+				c.usageIncomplete = append(c.usageIncomplete, fmt.Sprintf("inode %d fails its checksum", inodeNum))
 				c.addProblem(PhaseInodes, Error, fmt.Sprintf("inode %d", inodeNum),
 					fmt.Sprintf("checksum mismatch: stored=0x%08X, computed=0x%08X",
 						inode.Checksum, computed),
@@ -231,6 +236,8 @@ func (c *Checker) checkInodes() error {
 				c.checkSymlink(inodeNum, inode)
 			}
 
+			c.countProjectUsage(inodeNum, inode)
+
 			// Record extents for cross-validation
 			c.recordInodeExtents(inodeNum, inode)
 		}
@@ -276,6 +283,7 @@ func (c *Checker) parseInode(buf []byte) *InodeData {
 
 	inode.BirthGeneration = binary.LittleEndian.Uint64(buf[196:204])
 	inode.Holders = binary.LittleEndian.Uint64(buf[204:212])
+	inode.ProjectID = binary.LittleEndian.Uint32(buf[212:216])
 	inode.Checksum = binary.LittleEndian.Uint32(buf[252:256])
 	if inode.Mode&S_IFMT == S_IFLNK && inode.Flags&FlagInlineTarget != 0 {
 		copy(inode.Target[:], buf[104:196])

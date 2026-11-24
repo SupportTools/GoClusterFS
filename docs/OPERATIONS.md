@@ -204,7 +204,8 @@ getfattr -n trusted.goclusterfs.quota /mnt/fs/pvc-1
 - **Several writers.** Each node writes its changes to the volume's quota table every second. Close to a limit, a node writes them before it allocates. Allocations that run at the same moment each check before any of them counts, so a limit can be passed by one allocation per concurrent writer, on this node or another.
 - **Moving files.** Links, renames and clones into or out of a project fail with `EXDEV`, and `mv` then copies the file. A project's root can move between directories outside every project.
 - **The volume needs a quota table.** `-format` creates one. On a volume an older build formatted, add it with `goclusterfs-fsck -enable-quotas DEVICE` while every node is stopped.
-- **Limits of the count.** A node mounted with `-journal=false` counts nothing. A directory takes the block it grows by even past the limit. An I/O error, or a crash at the wrong moment, can leave usage off by the operations in flight, and nothing recounts it yet.
+- **Limits of the count.** A node mounted with `-journal=false` counts nothing. A directory takes the block it grows by even past the limit. An I/O error, or a crash at the wrong moment, can leave usage off by the operations in flight.
+- **Checking the count.** `goclusterfs-fsck` recounts each project from its inodes and reports a project whose usage differs as an error. `-repair` writes the recount. fsck compares usage only when every journal is clean: a running node's journal, or a crashed node's journal that no mount has replayed, may hold changes the table does not show yet. Unmount every node, mounting once first if a node crashed, then run the check. fsck also reports inodes in a project the table has no record for, and a name whose inode is in another project than its directory gives; `-repair` fixes neither.
 
 ## Cluster Management
 

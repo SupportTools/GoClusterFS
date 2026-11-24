@@ -5940,6 +5940,55 @@ scenarios:
       docker: run-tests.sh::test_quota_limits
       vm: TODO  # Docker's stat -f through the mount covers the kernel path; the VM harness adds nothing for statfs
 
+  - id: quota-fsck-recount
+    name: fsck's quota recount agrees with the runtime's charges
+    description: After a clean stop, fsck and fsck -repair find nothing on a project that saw writes, a fallocate, a truncate, a mkdir, directory growth, symlinks, a snapshot with a copy on write, and an unlink; the project's root is not reported
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckRecountAgreesWithQuotaCharges
+
+  - id: quota-fsck-drift
+    name: fsck repairs drifted quota usage
+    description: A project whose usage in the table differs from its inodes is reported as a fixable error, and fsck -repair writes the recount
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckRepairsDriftedQuotaUsage
+
+  - id: quota-fsck-failed-write-drift
+    name: fsck repairs the drift a failed inode write leaves
+    description: A fallocate whose inode write fails keeps its charge, and fsck -repair writes the recount without the blocks the inode never mapped
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckRepairsQuotaDriftAfterAFailedInodeWrite
+
+  - id: quota-fsck-dirty-journal
+    name: fsck skips quota usage while a journal is dirty
+    description: With an unflushed charge in a dirty journal, fsck reports that it did not check usage and no error
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckSkipsQuotaUsageWhileAJournalIsDirty
+
+  - id: quota-fsck-bad-inode
+    name: fsck skips quota usage when an inode fails its checksum
+    description: An inode in a project that fails its checksum makes fsck report that it did not check usage, naming the inode
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckSkipsQuotaUsageWithAnInodeFailingItsChecksum
+
+  - id: quota-fsck-freed-orphan
+    name: fsck -repair takes the inodes it frees out of their project
+    description: Repair frees a project file unlinked while open on a stopped node and writes the recount without it
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckRepairTakesFreedInodesOutOfTheirProject
+
+  - id: quota-fsck-wrong-project
+    name: fsck reports inodes in the wrong project
+    description: A name whose inode is in another project than its directory gives, and inodes in a project the table has no record for, are reported as errors repair does not fix
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckReportsInodesInTheWrongProject
+
   - id: statfs-subdirectory
     name: statfs on a subdirectory reports the volume
     description: Through the mount, statfs on a directory below the root reports the same blocks and inodes as the root, not zeros

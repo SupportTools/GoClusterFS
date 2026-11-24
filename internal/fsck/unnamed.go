@@ -125,6 +125,7 @@ func (c *Checker) checkUnnamed() error {
 func (c *Checker) freeInodes(inodes []*InodeData) error {
 	var touched []uint64
 	for _, ino := range inodes {
+		c.uncountProjectUsage(ino)
 		for _, b := range c.mappedBlocks(ino.InodeNum, ino) {
 			c.inodeBlocks.add(b, -1)
 			touched = append(touched, b)
