@@ -25,7 +25,7 @@ type FS interface {
 	CloneFileSnapshot(ctx context.Context, p, name, dest string) error
 	CloneFile(ctx context.Context, p, dest string) error
 	ProjectQuota(ctx context.Context, p string) (*quota.Status, error)
-	SetProjectQuota(ctx context.Context, p string, bytes, inodes uint64) (*quota.Status, error)
+	SetProjectQuota(ctx context.Context, p string, bytes, inodes *uint64) (*quota.Status, error)
 }
 
 // Ops implements api.FileService on a mounted filesystem.
@@ -152,8 +152,9 @@ func (o *Ops) Quota(ctx context.Context, p string) (*api.QuotaInfo, error) {
 	return quotaInfo(p, q), nil
 }
 
-// SetQuota does what setfattr -n trusted.goclusterfs.quota -v "bytes=N inodes=N" does on the directory at p.
-func (o *Ops) SetQuota(ctx context.Context, p string, bytes, inodes uint64) (*api.QuotaInfo, error) {
+// SetQuota does what setfattr -n trusted.goclusterfs.quota -v "bytes=N inodes=N" does on the directory at p, a nil
+// limit standing for a key left out.
+func (o *Ops) SetQuota(ctx context.Context, p string, bytes, inodes *uint64) (*api.QuotaInfo, error) {
 	if err := checkDir(p); err != nil {
 		return nil, err
 	}

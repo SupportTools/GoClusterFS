@@ -23,12 +23,12 @@ func (q *fakeQuotas) Quota(_ context.Context, path string) (*QuotaInfo, error) {
 	return &QuotaInfo{Path: path, Project: 3, Bytes: 1 << 30, Inodes: 100, UsedBytes: 1 << 20, UsedInodes: 1}, nil
 }
 
-func (q *fakeQuotas) SetQuota(_ context.Context, path string, bytes, inodes uint64) (*QuotaInfo, error) {
-	q.calls = append(q.calls, fmt.Sprintf("set %s %d %d", path, bytes, inodes))
+func (q *fakeQuotas) SetQuota(_ context.Context, path string, bytes, inodes *uint64) (*QuotaInfo, error) {
+	q.calls = append(q.calls, fmt.Sprintf("set %s %s %s", path, limitText(bytes), limitText(inodes)))
 	if q.err != nil {
 		return nil, q.err
 	}
-	return &QuotaInfo{Path: path, Project: 3, Bytes: bytes, Inodes: inodes}, nil
+	return &QuotaInfo{Path: path, Project: 3}, nil
 }
 
 func startQuotaServer(t *testing.T, token string) (*Server, *fakeQuotas) {
@@ -39,7 +39,8 @@ func startQuotaServer(t *testing.T, token string) (*Server, *fakeQuotas) {
 	return srv, q
 }
 
-// GET reads a directory's quota and PUT sets it, each with the token; a limit left out of a PUT is 0, no limit.
+// GET reads a directory's quota and PUT sets it, each with the token; a limit left out of a PUT reaches the service
+// as one to leave alone.
 func TestQuotaEndpoints(t *testing.T) {
 	srv, q := startQuotaServer(t, "tok")
 	status, body := call(t, srv, "GET", "/api/v1/quotas?path=/pvc%201", "tok", "")
@@ -49,8 +50,8 @@ func TestQuotaEndpoints(t *testing.T) {
 	}
 	for _, c := range []struct{ body, want string }{
 		{`{"path":"/pvc","bytes":1048576,"inodes":10}`, "set /pvc 1048576 10"},
-		{`{"path":"/pvc","bytes":2097152}`, "set /pvc 2097152 0"},
-		{`{"path":"/pvc","inodes":0}`, "set /pvc 0 0"},
+		{`{"path":"/pvc","bytes":2097152}`, "set /pvc 2097152 unchanged"},
+		{`{"path":"/pvc","inodes":0}`, "set /pvc unchanged 0"},
 	} {
 		status, body = call(t, srv, "PUT", "/api/v1/quotas", "tok", c.body)
 		if status != http.StatusOK || q.calls[len(q.calls)-1] != c.want {
@@ -59,15 +60,15 @@ func TestQuotaEndpoints(t *testing.T) {
 	}
 }
 
-// Without the token both methods are refused before they reach the service, and a PUT needs a limit.
+// Without the token, from another origin, or with no limit, a request is refused before it reaches the service.
 func TestQuotaEndpointsRefuse(t *testing.T) {
-	srv, q := startQuotaServer(t, "")
+	srv, _ := startQuotaServer(t, "")
 	for _, method := range []string{"GET", "PUT"} {
 		if status, _ := call(t, srv, method, "/api/v1/quotas?path=/pvc", "", `{"path":"/pvc","bytes":1}`); status != http.StatusForbidden {
 			t.Errorf("%s without a token set: %d, want 403", method, status)
 		}
 	}
-	srv, q = startQuotaServer(t, "tok")
+	srv, q := startQuotaServer(t, "tok")
 	for _, c := range []struct {
 		method, body string
 		want         int
@@ -84,6 +85,20 @@ func TestQuotaEndpointsRefuse(t *testing.T) {
 	}
 	if status, _ := call(t, srv, "GET", "/api/v1/quotas?path=/pvc", "wrong", ""); status != http.StatusUnauthorized {
 		t.Errorf("GET with a wrong token: %d, want 401", status)
+	}
+	req, err := http.NewRequest("PUT", "http://"+srv.Addr()+"/api/v1/quotas", strings.NewReader(`{"path":"/pvc","bytes":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer tok")
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeBody(resp)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("PUT from another origin: %d, want 403", resp.StatusCode)
 	}
 	if len(q.calls) != 0 {
 		t.Errorf("refused requests reached the service: %v", q.calls)

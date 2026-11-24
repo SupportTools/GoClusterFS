@@ -140,7 +140,7 @@ Snapshots belong to single files. A snapshot stays with the file it was taken of
 | `POST /api/v1/snapshots/s1/clone` | `{"path": "/f", "dest": "/copy"}` | `setfattr -n user.snapshot.clone -v s1:/copy f` | 201 |
 | `POST /api/v1/clones` | `{"path": "/f", "dest": "/copy"}` | `setfattr -n user.clone -v /copy f` | 201 |
 | `GET /api/v1/quotas?path=/d` | | `getfattr -n trusted.goclusterfs.quota d`: the limits and usage of the project directory `/d` is in | 200, `{path, project, bytes, inodes, used_bytes, used_inodes}`; 404 if it is in none |
-| `PUT /api/v1/quotas` | `{"path": "/d", "bytes": 10737418240, "inodes": 100000}` | `setfattr -n trusted.goclusterfs.quota -v "bytes=… inodes=…" d`; a limit left out is 0, none, but one must be there | 200, the same object as `GET` |
+| `PUT /api/v1/quotas` | `{"path": "/d", "bytes": 10737418240, "inodes": 100000}` | `setfattr -n trusted.goclusterfs.quota -v "bytes=… inodes=…" d`; a limit left out keeps its value, or is none on a new project, but one must be there | 200, the same object as `GET` |
 | `POST /api/v1/admin/flush-journal` | | Checkpoints the journal now | 200 |
 | `POST /api/v1/admin/force-trim` | | Discards the queued TRIM blocks now | 200 |
 | `POST /api/v1/admin/clear-cache` | | Drops this node's inode, extent and negative caches | 200 |

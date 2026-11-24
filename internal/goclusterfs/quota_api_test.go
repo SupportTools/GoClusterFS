@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/quota"
 )
 
+func limit(n uint64) *uint64 { return &n }
+
 // The API's quota calls do what the xattr does on the directory at a path: setting one on an empty directory gives
-// it a project, setting it again changes the limits, and reading it returns what getfattr shows, from any directory
-// in the project.
+// it a project, setting it again changes the limits it names and keeps the others, and reading it returns what
+// getfattr shows, from any directory in the project.
 func TestProjectQuotaByPath(t *testing.T) {
 	fsys, _, _, _ := journaledFS(t)
 	fsys = withBridge(fsys)
@@ -20,7 +24,7 @@ func TestProjectQuotaByPath(t *testing.T) {
 	pvc := mkdirIn(t, fsys, "pvc")
 	bs := fsys.dataBlockSize()
 
-	q, err := fsys.SetProjectQuota(ctx, "/pvc", 1<<30, 100)
+	q, err := fsys.SetProjectQuota(ctx, "/pvc", limit(1<<30), limit(100))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,18 +32,61 @@ func TestProjectQuotaByPath(t *testing.T) {
 		t.Errorf("after setting the quota: %+v, want %+v", *q, want)
 	}
 	mkdirIn(t, pvc, "sub")
-	q, err = fsys.SetProjectQuota(ctx, "/pvc", 2<<30, 0)
+	q, err = fsys.SetProjectQuota(ctx, "/pvc", limit(2<<30), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if q.LimitBytes != 2<<30 || q.LimitInodes != 0 || q.UsedInodes != 2 {
-		t.Errorf("after changing the limits: %+v, want 2 GiB, no inode limit and 2 inodes used", *q)
+	if q.LimitBytes != 2<<30 || q.LimitInodes != 100 || q.UsedInodes != 2 {
+		t.Errorf("after a resize that names only bytes: %+v, want 2 GiB, the 100-inode limit kept and 2 inodes used", *q)
+	}
+	if q, err = fsys.SetProjectQuota(ctx, "/pvc", nil, limit(0)); err != nil || q.LimitBytes != 2<<30 || q.LimitInodes != 0 {
+		t.Errorf("after lifting the inode limit alone: %+v, %v; want 2 GiB kept and no inode limit", q, err)
 	}
 	if got, want := quotaOf(t, pvc), fmt.Sprintf("project=1 bytes=%d inodes=0 used_bytes=%d used_inodes=2", 2<<30, q.UsedBytes); got != want {
 		t.Errorf("getfattr reads %q, want %q", got, want)
 	}
 	if sub, err := fsys.ProjectQuota(ctx, "/pvc/sub"); err != nil || *sub != *q {
 		t.Errorf("the quota read from a subdirectory: %+v, %v; want the project's %+v", sub, err, *q)
+	}
+}
+
+// A key the xattr's value leaves out keeps the project's limit, and on a new project is none.
+func TestQuotaXattrKeepsTheLimitsItLeavesOut(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	ctx := context.Background()
+	pvc := mkdirIn(t, fsys, "pvc")
+	for _, c := range []struct{ value, want string }{
+		{"inodes=10", "bytes=0 inodes=10"},
+		{"bytes=1048576", "bytes=1048576 inodes=10"},
+		{"inodes=0", "bytes=1048576 inodes=0"},
+	} {
+		if errno := pvc.Setxattr(ctx, quotaXattr, []byte(c.value), 0); errno != 0 {
+			t.Fatalf("set %q: %v", c.value, errno)
+		}
+		if got := quotaOf(t, pvc); !strings.HasPrefix(got, "project=1 "+c.want+" ") {
+			t.Errorf("after %q the quota reads %q, want %q", c.value, got, c.want)
+		}
+	}
+}
+
+// A caller that gives up, such as an HTTP client that timed out, does not stop a quota change halfway: the change
+// waits out a peer's quota lock although its caller is gone.
+func TestProjectQuotaByPathOutlivesItsCaller(t *testing.T) {
+	fsys, path, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	mkdirIn(t, fsys, "pvc")
+	peer := openFormattedComponents(t, path)
+	unlock, err := peer.quotaGuard.Lock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.AfterFunc(200*time.Millisecond, unlock)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	q, err := fsys.SetProjectQuota(ctx, "/pvc", limit(1<<30), nil)
+	if err != nil || q.Project != 1 || q.LimitBytes != 1<<30 {
+		t.Fatalf("set the quota with a canceled context: %+v, %v; want project 1 with 1 GiB", q, err)
 	}
 }
 
@@ -65,7 +112,7 @@ func TestProjectQuotaByPathRefuses(t *testing.T) {
 		"/pvc/../f": syscall.EINVAL,
 		"pvc":       syscall.EINVAL,
 	} {
-		if _, err := fsys.SetProjectQuota(ctx, p, 1<<20, 1); !errors.Is(err, want) {
+		if _, err := fsys.SetProjectQuota(ctx, p, limit(1<<20), limit(1)); !errors.Is(err, want) {
 			t.Errorf("set the quota of %s: %v, want %v", p, err, want)
 		}
 	}

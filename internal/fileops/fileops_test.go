@@ -51,10 +51,12 @@ func (f *fakeFS) ProjectQuota(_ context.Context, p string) (*quota.Status, error
 	f.calls = append(f.calls, "quota "+p)
 	return &quota.Status{Project: 7, LimitBytes: 1 << 20, LimitInodes: 10, UsedBytes: 4096, UsedInodes: 2}, nil
 }
-func (f *fakeFS) SetProjectQuota(_ context.Context, p string, bytes, inodes uint64) (*quota.Status, error) {
-	f.calls = append(f.calls, fmt.Sprintf("setquota %s %d %d", p, bytes, inodes))
-	return &quota.Status{Project: 7, LimitBytes: bytes, LimitInodes: inodes}, nil
+func (f *fakeFS) SetProjectQuota(_ context.Context, p string, bytes, inodes *uint64) (*quota.Status, error) {
+	f.calls = append(f.calls, fmt.Sprintf("setquota %s %d %v", p, *bytes, inodes))
+	return &quota.Status{Project: 7, LimitBytes: *bytes}, nil
 }
+
+func ptr(n uint64) *uint64 { return &n }
 
 // The quota requests reach the FS only with an absolute, clean path, the root included, and return its figures.
 func TestQuotaOps(t *testing.T) {
@@ -68,8 +70,8 @@ func TestQuotaOps(t *testing.T) {
 	if want := (api.QuotaInfo{Path: "/pvc", Project: 7, Bytes: 1 << 20, Inodes: 10, UsedBytes: 4096, UsedInodes: 2}); *got != want {
 		t.Errorf("Quota = %+v, want %+v", *got, want)
 	}
-	if got, err = o.SetQuota(ctx, "/pvc", 5<<20, 3); err != nil || got.Bytes != 5<<20 || got.Inodes != 3 {
-		t.Errorf("SetQuota = %+v, %v; want the new limits", got, err)
+	if got, err = o.SetQuota(ctx, "/pvc", ptr(5<<20), nil); err != nil || got.Bytes != 5<<20 {
+		t.Errorf("SetQuota = %+v, %v; want the new limit", got, err)
 	}
 	if _, err := o.Quota(ctx, "/"); err != nil {
 		t.Fatal(err)
@@ -78,11 +80,11 @@ func TestQuotaOps(t *testing.T) {
 		if _, err := o.Quota(ctx, p); !errors.Is(err, api.ErrInvalidPath) {
 			t.Errorf("Quota(%q) = %v, want ErrInvalidPath", p, err)
 		}
-		if _, err := o.SetQuota(ctx, p, 1, 1); !errors.Is(err, api.ErrInvalidPath) {
+		if _, err := o.SetQuota(ctx, p, ptr(1), ptr(1)); !errors.Is(err, api.ErrInvalidPath) {
 			t.Errorf("SetQuota(%q) = %v, want ErrInvalidPath", p, err)
 		}
 	}
-	if got, want := strings.Join(fsys.calls, "|"), "quota /pvc|setquota /pvc 5242880 3|quota /"; got != want {
+	if got, want := strings.Join(fsys.calls, "|"), "quota /pvc|setquota /pvc 5242880 <nil>|quota /"; got != want {
 		t.Errorf("FS calls %q, want %q", got, want)
 	}
 }

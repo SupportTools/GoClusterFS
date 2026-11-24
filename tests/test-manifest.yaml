@@ -5382,6 +5382,20 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_api_test.go::TestProjectQuotaByPath
 
+  - id: quota-omitted-limit-kept
+    name: A quota change keeps the limit it leaves out
+    description: A trusted.goclusterfs.quota value that names one limit keeps the project's other limit, and on a new project leaves it unset
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_api_test.go::TestQuotaXattrKeepsTheLimitsItLeavesOut
+
+  - id: api-quota-outlives-caller
+    name: An API quota change outlives its caller
+    description: A quota set through the API with a canceled context waits out a peer's quota lock and completes, so a timed-out client cannot leave a record no directory names
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_api_test.go::TestProjectQuotaByPathOutlivesItsCaller
+
   - id: api-quota-through-mount
     name: API quotas hold through the mount
     description: A quota set through the API, without CAP_SYS_ADMIN, refuses a write past its limit with EDQUOT, statfs on the directory shows it, and GET reports the usage statfs leaves free; a PUT without a token gets 401

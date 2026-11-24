@@ -157,9 +157,11 @@ func (f *FS) ProjectQuota(ctx context.Context, p string) (*quota.Status, error) 
 	return q, nil
 }
 
-// SetProjectQuota does what setting trusted.goclusterfs.quota to "bytes=N inodes=N" on the directory at p does, and
-// returns the project's limits and usage after it.
-func (f *FS) SetProjectQuota(ctx context.Context, p string, bytes, inodes uint64) (*quota.Status, error) {
+// SetProjectQuota does what setting trusted.goclusterfs.quota to "bytes=N inodes=N" on the directory at p does, a nil
+// limit standing for a key left out, and returns the project's limits and usage after it. A caller that gives up does
+// not stop it halfway, which would leave a record no directory names.
+func (f *FS) SetProjectQuota(ctx context.Context, p string, bytes, inodes *uint64) (*quota.Status, error) {
+	ctx = detach(ctx)
 	dirIno, err := f.lookupDir(ctx, p)
 	if err != nil {
 		return nil, err

@@ -31,8 +31,8 @@ var quotaSetCmd = &cobra.Command{
 	Use:   "set PATH",
 	Short: "Set the limits of a project, making an empty directory one",
 	Long: `Set the limits of the project whose root is PATH. On an empty directory with
-no project, it makes the directory the root of a new project. A limit of 0, or
-one left out, means none.`,
+no project, it makes the directory the root of a new project. A limit of 0
+means none. A limit left out keeps its value, and on a new project is none.`,
 	Example: `  gfsctl quota set /pvc-1 --bytes 10737418240 --inodes 100000
   gfsctl quota set /pvc-1 --bytes 21474836480`,
 	Args: cobra.ExactArgs(1),

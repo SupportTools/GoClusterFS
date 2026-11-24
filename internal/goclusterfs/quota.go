@@ -108,9 +108,22 @@ func (f *FS) quotaTable() (quota.Table, error) {
 	return quota.Open(f.dev, f.inodeTbl, f.quotaInode, f.dataOffset, f.dataBlockSize())
 }
 
-// quotaSetting is the value of quotaXattr: limits in bytes and inodes, 0 for none.
+// quotaSetting is the value of quotaXattr: limits in bytes and inodes, 0 for none. A limit left out keeps the
+// project's current one, and on a new project is none.
 type quotaSetting struct {
-	bytes, inodes uint64
+	bytes, inodes *uint64
+}
+
+func (s quotaSetting) apply(rec *quota.Record, blockSize uint64) {
+	if s.bytes != nil {
+		rec.LimitBlocks = *s.bytes / blockSize
+		if *s.bytes%blockSize != 0 {
+			rec.LimitBlocks++
+		}
+	}
+	if s.inodes != nil {
+		rec.LimitInodes = *s.inodes
+	}
 }
 
 func parseQuotaSetting(value string) (quotaSetting, error) {
@@ -125,9 +138,9 @@ func parseQuotaSetting(value string) (quotaSetting, error) {
 		seen[key] = true
 		switch key {
 		case "bytes":
-			q.bytes = n
+			q.bytes = &n
 		case "inodes":
-			q.inodes = n
+			q.inodes = &n
 		default:
 			return q, fmt.Errorf("%q: want bytes=N inodes=N", field)
 		}
@@ -180,11 +193,6 @@ func (f *FS) setLimits(ctx context.Context, num uint32, setting quotaSetting) sy
 	case num == inode.InodeRoot:
 		return syscall.EPERM
 	}
-	blockSize := f.dataBlockSize()
-	limitBlocks := setting.bytes / blockSize
-	if setting.bytes%blockSize != 0 {
-		limitBlocks++
-	}
 	unlock, err := f.quotaGuard.Lock(ctx)
 	if err != nil {
 		return errToErrno(err)
@@ -200,7 +208,7 @@ func (f *FS) setLimits(ctx context.Context, num uint32, setting quotaSetting) sy
 		return errno
 	}
 	if rec != nil {
-		rec.LimitBlocks, rec.LimitInodes = limitBlocks, setting.inodes
+		setting.apply(rec, f.dataBlockSize())
 		if err := tbl.PutRecord(ino.ProjectID, rec); err != nil {
 			log.Printf("[ERROR] quota: project %d: %v", ino.ProjectID, err)
 			return syscall.EIO
@@ -232,7 +240,8 @@ func (f *FS) setLimits(ctx context.Context, num uint32, setting quotaSetting) sy
 		log.Printf("[ERROR] quota: %v", err)
 		return syscall.EIO
 	}
-	rec = &quota.Record{LimitBlocks: limitBlocks, LimitInodes: setting.inodes, RootInode: num, RootBirth: ino.BirthGeneration, Flags: quota.RecordInUse}
+	rec = &quota.Record{RootInode: num, RootBirth: ino.BirthGeneration, Flags: quota.RecordInUse}
+	setting.apply(rec, f.dataBlockSize())
 	if err := tbl.PutRecord(id, rec); err != nil {
 		log.Printf("[ERROR] quota: project %d: %v", id, err)
 		return syscall.EIO

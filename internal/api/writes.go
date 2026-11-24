@@ -28,7 +28,7 @@ type FileService interface {
 // within the mount.
 type QuotaService interface {
 	Quota(ctx context.Context, path string) (*QuotaInfo, error)
-	SetQuota(ctx context.Context, path string, bytes, inodes uint64) (*QuotaInfo, error)
+	SetQuota(ctx context.Context, path string, bytes, inodes *uint64) (*QuotaInfo, error)
 }
 
 // AdminService runs maintenance on this node. Each method returns a short
@@ -97,7 +97,8 @@ type QuotaInfo struct {
 	UsedInodes uint64 `json:"used_inodes"`
 }
 
-// QuotaRequest is sent to PUT /api/v1/quotas. A limit left out is 0, none, but one of them must be there.
+// QuotaRequest is sent to PUT /api/v1/quotas. A limit left out keeps the project's current one, and on a new project
+// is none; one of them must be there.
 type QuotaRequest struct {
 	Path   string  `json:"path"`
 	Bytes  *uint64 `json:"bytes"`
@@ -398,8 +399,8 @@ func (s *Server) handleQuotas(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body", "set bytes, inodes or both; 0 means no limit")
 		return
 	}
-	info, err := qs.SetQuota(r.Context(), req.Path, valueOr0(req.Bytes), valueOr0(req.Inodes))
-	logWrite(r, "quota.set", fmt.Sprintf("path=%q bytes=%d inodes=%d", req.Path, valueOr0(req.Bytes), valueOr0(req.Inodes)), err)
+	info, err := qs.SetQuota(r.Context(), req.Path, req.Bytes, req.Inodes)
+	logWrite(r, "quota.set", fmt.Sprintf("path=%q bytes=%s inodes=%s", req.Path, limitText(req.Bytes), limitText(req.Inodes)), err)
 	if err != nil {
 		writeOpError(w, err)
 		return
@@ -407,11 +408,11 @@ func (s *Server) handleQuotas(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, info)
 }
 
-func valueOr0(v *uint64) uint64 {
+func limitText(v *uint64) string {
 	if v == nil {
-		return 0
+		return "unchanged"
 	}
-	return *v
+	return fmt.Sprint(*v)
 }
 
 // handleAdmin serves POST /api/v1/admin/{flush-journal,force-trim,clear-cache}.
