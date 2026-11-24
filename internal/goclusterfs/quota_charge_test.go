@@ -19,8 +19,8 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
-// usage is a project's usage in blocks and inodes as reading its quota on directory d shows it, which counts this
-// node's unflushed changes.
+// usage is a project's usage in blocks and inodes as reading its quota on its root directory d shows it, which
+// counts this node's unflushed changes, less the root directory's own inode and blocks.
 func usage(t *testing.T, fsys *FS, d *Dir) [2]uint64 {
 	t.Helper()
 	var project, limitBytes, limitInodes, usedBytes, usedInodes uint64
@@ -28,7 +28,11 @@ func usage(t *testing.T, fsys *FS, d *Dir) [2]uint64 {
 		&project, &limitBytes, &limitInodes, &usedBytes, &usedInodes); err != nil {
 		t.Fatal(err)
 	}
-	return [2]uint64{usedBytes / fsys.dataBlockSize(), usedInodes}
+	root, err := fsys.inodeTbl.Read(d.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return [2]uint64{usedBytes/fsys.dataBlockSize() - root.AllocatedBlocks, usedInodes - 1}
 }
 
 // Every file operation charges its project the blocks it maps and the inodes it makes, and gives back what it frees:
@@ -268,8 +272,8 @@ func TestQuotaChargesSurviveACrash(t *testing.T) {
 
 	peer := openFormattedFS(t, path)
 	foldCrashed(t, peer, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
-		t.Errorf("after the crash the table holds %v blocks and inodes, want the file's 1 block and its inode", got)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{2, 2} {
+		t.Errorf("after the crash the table holds %v blocks and inodes, want the file's 1 block and its inode, and the project root's", got)
 	}
 }
 
@@ -326,8 +330,8 @@ func TestQuotaCreditsAnOrphanTheReplayFrees(t *testing.T) {
 
 	peer := journaledPeer(t, path, offset, size)
 	replayCrashedWithCharges(t, peer, fsys.nodeUUID, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{} {
-		t.Errorf("after the replay freed the orphan the table holds %v blocks and inodes, want none", got)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
+		t.Errorf("after the replay freed the orphan the table holds %v blocks and inodes, want only the project root's", got)
 	}
 }
 
@@ -386,8 +390,8 @@ func TestQuotaOrphanFreedOnceAfterACrash(t *testing.T) {
 
 	peer := journaledPeer(t, path, offset, size)
 	replayCrashedWithCharges(t, peer, fsys.nodeUUID, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
-		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file's 1 block and 1 inode", got)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{2, 2} {
+		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file and the project root's 1 block and 1 inode", got)
 	}
 }
 
@@ -449,8 +453,8 @@ func TestQuotaOrphanFreedByReplayWhenItsFreeWasNotLogged(t *testing.T) {
 	if ino, err := peer.inodeTbl.Read(replaced); err != nil || ino.Magic == inode.InodeMagic {
 		t.Errorf("after the replay the replaced file's inode %d is %+v, %v; want it freed", replaced, ino, err)
 	}
-	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
-		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file's 1 block and 1 inode", got)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{2, 2} {
+		t.Errorf("after the replay the table holds %v blocks and inodes, want the surviving file and the project root's 1 block and 1 inode", got)
 	}
 }
 
@@ -492,7 +496,7 @@ func TestQuotaOrphanFreedOnceAfterAPeerReplay(t *testing.T) {
 
 	peer := journaledPeer(t, path, offset, size)
 	replayCrashedAsPeer(t, peer, fsys.nodeUUID, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{1, 1} {
-		t.Errorf("after the peer's replay the table holds %v blocks and inodes, want the surviving file's 1 block and 1 inode", got)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{2, 2} {
+		t.Errorf("after the peer's replay the table holds %v blocks and inodes, want the surviving file and the project root's 1 block and 1 inode", got)
 	}
 }

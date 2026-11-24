@@ -306,6 +306,16 @@ func (m *Manager) holes(ino *inode.Inode, from, to uint64) ([]Extent, error) {
 	return holes, nil
 }
 
+// Unmapped counts the blocks from from up to to that ino does not map, which writing them would allocate.
+func (m *Manager) Unmapped(ino *inode.Inode, from, to uint64) (uint64, error) {
+	holes, err := m.holes(ino, from, to)
+	var n uint64
+	for _, h := range holes {
+		n += h.Length
+	}
+	return n, err
+}
+
 // freeUnmapped frees blocks no inode maps and returns cause, joined with the
 // error of a free that left some of them allocated.
 func (m *Manager) freeUnmapped(ctx context.Context, blocks []uint64, cause error) error {

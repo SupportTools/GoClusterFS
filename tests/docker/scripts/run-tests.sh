@@ -3891,6 +3891,37 @@ test_quota_project() {
     return 0
 }
 
+# A write that would pass a project's block limit fails with "Disk quota exceeded"; overwriting what a file maps works.
+test_quota_limits() {
+    log "Testing that a project's block limit refuses new blocks..."
+
+    local node="${NODE_ARRAY[0]}"
+    local dir=/mnt/goclusterfs/quota_limit_$$
+    local out
+    exec_on_node "$node" mkdir "$dir" || return 1
+    # 4 blocks of 1 MB: the project's root directory takes one, so three are left for files.
+    exec_on_node "$node" setfattr -n trusted.goclusterfs.quota -v "bytes=4194304 inodes=10" "$dir" || return 1
+    if ! exec_on_node "$node" dd if=/dev/zero of="$dir/a" bs=1M count=2 conv=fsync 2>/dev/null; then
+        log "ERROR: a write within the limit failed"
+        return 1
+    fi
+    if out=$(exec_on_node "$node" dd if=/dev/zero of="$dir/b" bs=1M count=2 conv=fsync 2>&1); then
+        log "ERROR: a write past the limit succeeded"
+        return 1
+    fi
+    if [[ "$out" != *"quota exceeded"* ]]; then
+        log "ERROR: past the limit dd said '$out', want 'Disk quota exceeded'"
+        return 1
+    fi
+    if ! exec_on_node "$node" dd if=/dev/zero of="$dir/a" bs=1M count=2 conv=notrunc,fsync 2>/dev/null; then
+        log "ERROR: overwriting a file in a full project failed"
+        return 1
+    fi
+    exec_on_node "$node" rm -rf "$dir"
+    log "Quota limits test passed"
+    return 0
+}
+
 # quota_usage prints a project directory's used_bytes and used_inodes as another node reads them.
 quota_usage() {
     exec_on_node "$1" getfattr --only-values -n trusted.goclusterfs.quota "$2" | grep -o 'used_bytes=[0-9]* used_inodes=[0-9]*'
@@ -3912,7 +3943,16 @@ test_quota_orphan_after_crash() {
     exec_on_node "$node_a" mkdir "$dir" || return 1
     exec_on_node "$node_a" setfattr -n trusted.goclusterfs.quota -v "bytes=1073741824 inodes=100" "$dir" || return 1
     local before during after waited=0
-    before=$(quota_usage "$node_b" "$dir") || return 1
+    # The project's root directory counts once node A has flushed it, within a second or so.
+    while before=$(quota_usage "$node_b" "$dir") && [[ "$before" != *"used_inodes=1" ]]; do
+        if [[ $waited -ge 10 ]]; then
+            log "ERROR: node B reads '$before' 10s after the quota was set, want the root directory's inode"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    waited=0
 
     docker exec -d "$node_a" sh -c "exec 3>$file; head -c 2097152 /dev/zero >&3; rm $file; sleep 600"
     while exec_on_node "$node_a" test -e "$file" 2>/dev/null || [[ $waited -lt 3 ]]; do
@@ -3972,6 +4012,7 @@ run_test "Snapshot Delete After Overwrite" test_snapshot_delete_after_overwrite
 run_test "Snapshot Concurrent Creates" test_snapshot_concurrent_creates
 run_test "Snapshot During Writes" test_snapshot_during_writes
 run_test "Quota Project" test_quota_project
+run_test "Quota Limits" test_quota_limits
 run_test "Quota Orphan After Crash" test_quota_orphan_after_crash
 run_test "Concurrent Directory Ops" test_concurrent_directory_ops
 run_test "Multi-Node Rename" test_multinode_rename

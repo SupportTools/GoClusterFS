@@ -108,6 +108,9 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	}
 	uid, gid, _ := f.newOwner(ctx, dirIno)
 	project := childProject(dirIno)
+	if errno := f.checkQuota(ctx, project, createBlocks(journal.DirEntrySymlink, &journal.SymlinkTargetPayload{DiskBlock: block}), 1, true); errno != 0 {
+		return nil, errno
+	}
 
 	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
 	// so replay can no longer finish the create it undoes.

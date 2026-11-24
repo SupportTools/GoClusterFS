@@ -186,6 +186,25 @@ Snapshots and clones share blocks with the file and copy a block on its first wr
 
 ---
 
+### Project Quotas
+
+A project quota limits the blocks and inodes a directory tree uses, as a Kubernetes volume's size would. Setting it needs CAP_SYS_ADMIN, which a container's root normally lacks.
+
+```bash
+mkdir /mnt/fs/pvc-1
+setfattr -n trusted.goclusterfs.quota -v "bytes=10737418240 inodes=100000" /mnt/fs/pvc-1
+getfattr -n trusted.goclusterfs.quota /mnt/fs/pvc-1
+# trusted.goclusterfs.quota="project=1 bytes=10737418240 inodes=100000 used_bytes=1048576 used_inodes=1"
+```
+
+- **Setting a quota.** The directory must be empty; it then becomes the root of a new project. Every file, directory and symlink made under it joins the project. Setting the attribute on the project's root again changes the limits. A limit of 0 means none. `setfattr -x` lifts both limits, and the project keeps counting. Directories inside a project and the volume root cannot take a quota (`EPERM`). The `XATTR_CREATE` and `XATTR_REPLACE` flags are ignored.
+- **What counts.** `used_bytes` is the blocks the project's files, directories and symlinks map, the project's root directory included, in whole blocks of the volume's block size. A snapshot counts every block it shares with its file. `used_inodes` counts files, directories, symlinks and snapshots.
+- **Limits.** A create, mkdir, write, fallocate or snapshot that would pass a limit fails with `EDQUOT` ("Disk quota exceeded"). A write that would pass it fails whole; it is not cut short. Only blocks a file does not map yet count, so overwriting a file in a full project works. Truncate, unlink and rmdir always work. Root is limited too.
+- **Several writers.** Each node writes its changes to the volume's quota table every second. Close to a limit, a node writes them before it allocates. Allocations that run at the same moment each check before any of them counts, so a limit can be passed by one allocation per concurrent writer, on this node or another.
+- **Moving files.** Links, renames and clones into or out of a project fail with `EXDEV`, and `mv` then copies the file. A project's root can move between directories outside every project.
+- **The volume needs a quota table.** `-format` creates one. On a volume an older build formatted, add it with `goclusterfs-fsck -enable-quotas DEVICE` while every node is stopped.
+- **Limits of the count.** A node mounted with `-journal=false` counts nothing. A directory takes the block it grows by even past the limit. An I/O error, or a crash at the wrong moment, can leave usage off by the operations in flight, and nothing recounts it yet.
+
 ## Cluster Management
 
 ### Node Requirements

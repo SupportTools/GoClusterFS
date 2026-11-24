@@ -122,6 +122,9 @@ func (f *FS) flushQuota(ctx context.Context) error {
 			keepLock = true
 			return f.quotaFlushFailed(fmt.Errorf("writing the usage of project %d: %w", u.Project, err))
 		}
+		rec := *used[u.Project]
+		rec.UsedBlocks, rec.UsedInodes = u.NewBlocks, u.NewInodes
+		f.noteRecord(u.Project, &rec)
 	}
 	if err := f.journal.CompleteIntentDurable(seq); err != nil {
 		keepLock = true
