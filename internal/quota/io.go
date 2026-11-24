@@ -144,11 +144,21 @@ func (t Table) FreeID(from uint32) (uint32, error) {
 	if from == 0 || from >= capacity {
 		from = 1
 	}
+	var sector []byte
+	var read uint64
 	for n, id := uint32(0), from; n < capacity-1; n, id = n+1, id+1 {
 		if id >= capacity {
 			id = 1
 		}
-		r, err := t.Record(id)
+		num, offset := RecordLocation(id)
+		if sector == nil || num != read {
+			var err error
+			if sector, err = t.read(num); err != nil {
+				return 0, err
+			}
+			read = num
+		}
+		r, err := GetRecord(sector, offset)
 		if err != nil {
 			return 0, err
 		}
