@@ -324,6 +324,15 @@ scenarios:
       docker: TODO  # counts inode claim collisions from mount debug logs; the Go test covers it
       vm: TODO  # same as docker
 
+  - id: local-concurrent-creates-own-inode-slots
+    name: Concurrent creates on one node each get their own inode slot
+    description: 16 creators on one node create files in their own directories at once; each create's free-slot search skips the slots other local creates hold, so no create fails with EAGAIN or logs "lost N races"
+    priority: high
+    environments:
+      go: inode_alloc_test.go::TestLocalConcurrentCreatesGetTheirOwnSlots
+      docker: TODO  # needs 16 creators through one mount and the mount log; the Go test drives both
+      vm: TODO  # same as docker
+
   - id: format-block-sizes
     name: Format at 8 KB, 64 KB and 1 MB blocks
     description: -format writes the block size into the superblock, sizes the bitmap, refcount and inode regions for it, and picks the inode density from it; mount reads the volume back
@@ -486,6 +495,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/inode/alloc_test.go::TestFindFreeSlotFindsEveryFreeInode
+
+  - id: inode-free-slot-per-local-caller
+    name: FindFreeSlot hands each local caller its own free inode
+    description: Callers that find a slot before any of them claims it get distinct slots; a slot given back without a claim, or lost to another node's claim, is found again
+    priority: go_only
+    environments:
+      go: internal/inode/alloc_test.go::TestFindFreeSlotHandsEachLocalCallerItsOwnSlot
 
   - id: data-io-one-request-per-span
     name: File data reaches the device in one I/O per contiguous span
