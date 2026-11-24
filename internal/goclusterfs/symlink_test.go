@@ -215,6 +215,7 @@ func TestSymlinkReplaySkipsReusedSlot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fsys.inodeTbl.Release(slot)
 	go func() { _, _ = fsys.Symlink(context.Background(), "target", "l", &fuse.EntryOut{}) }()
 	<-crashed
 	fsys.snapshotWkr.Stop()
