@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Creates, mkdirs and symlinks running at once on one node failed with EAGAIN, and the mount logged `lost 5 races with other nodes` with no other node mounted. Every create found the same free inode, then committed to the journal before claiming it, so the losers kept colliding: with 16 parallel creators, about 17% of creates failed. A node now hands each of its creates a free inode no other local create holds.
 - `df` and `statfs` on a directory or file below the root reported zero size, blocks and inodes, because only the root answered them. They now report the volume.
 
 - A takeover whose preempt failed while the device still listed the node's key gives the slot back, so the node keeps running; before, the node stopped at its next heartbeat. Lock waiters count a node a peer is taking over as failing, not live, although the intent changed its slot.
