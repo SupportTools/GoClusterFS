@@ -1281,6 +1281,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		logging.Debugf("Create %q: FindFreeSlot failed: %v", name, err)
 		return nil, syscall.ENOSPC
 	}
+	defer f.inodeTbl.Release(inodeNum)
 	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
 		logging.Debugf("Create %q: Read parent inode %d failed: %v", name, parentNum, err)
@@ -1381,6 +1382,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		logging.Debugf("Mkdir %q: FindFreeSlot failed: %v", name, err)
 		return nil, syscall.ENOSPC
 	}
+	defer f.inodeTbl.Release(inodeNum)
 	dirIno, err := f.inodeTbl.Read(parentNum)
 	if err != nil {
 		logging.Debugf("Mkdir %q: Read parent inode %d failed: %v", name, parentNum, err)

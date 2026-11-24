@@ -134,6 +134,7 @@ func TestCreateReportsStuckInodeLockAsEIO(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	nodeB.inodeTbl.Release(slot)
 	release := holdLock(t, nodeA, lock.LockTypeInode, uint64(slot))
 	_, errno := nodeB.createFileOnce(context.Background(), &nodeB.Inode, inode.InodeRoot, "stuck", 0o644, &fuse.EntryOut{})
 	release()

@@ -147,17 +147,18 @@ func TestQuotaCreateLosingItsSlotIsChargedOnce(t *testing.T) {
 	pvc := quotaProject(t, fsys, "pvc")
 	peer := openFormattedComponents(t, path)
 	ctx := context.Background()
+	slot, err := fsys.inodeTbl.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsys.inodeTbl.Release(slot)
 	taken := 0
 	afterCommit = func(op string) {
 		if op != "create" || taken > 0 {
 			return
 		}
 		taken++
-		num, err := fsys.inodeTbl.FindFreeSlot()
-		if err == nil {
-			_, err = peer.inodeTbl.ClaimSlot(ctx, num)
-		}
-		if err != nil {
+		if _, err := peer.inodeTbl.ClaimSlot(ctx, slot); err != nil {
 			t.Errorf("the peer taking the create's slot: %v", err)
 		}
 	}
@@ -166,6 +167,9 @@ func TestQuotaCreateLosingItsSlotIsChargedOnce(t *testing.T) {
 	afterCommit = nil
 	if taken != 1 {
 		t.Fatal("the create never reached its commit")
+	}
+	if f.inodeNum == slot {
+		t.Fatalf("the create kept inode %d, which the peer claimed", slot)
 	}
 	checkUsage(t, fsys, pvc, 1, f)
 }
@@ -342,27 +346,32 @@ func TestQuotaSymlinkLosingItsSlotIsChargedOnce(t *testing.T) {
 	pvc := quotaProject(t, fsys, "pvc")
 	peer := openFormattedComponents(t, path)
 	ctx := context.Background()
+	slot, err := fsys.inodeTbl.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsys.inodeTbl.Release(slot)
 	taken := 0
 	afterCommit = func(op string) {
 		if op != "symlink" || taken > 0 {
 			return
 		}
 		taken++
-		num, err := fsys.inodeTbl.FindFreeSlot()
-		if err == nil {
-			_, err = peer.inodeTbl.ClaimSlot(ctx, num)
-		}
-		if err != nil {
+		if _, err := peer.inodeTbl.ClaimSlot(ctx, slot); err != nil {
 			t.Errorf("the peer taking the symlink's slot: %v", err)
 		}
 	}
 	t.Cleanup(func() { afterCommit = nil })
-	if _, errno := pvc.Symlink(ctx, strings.Repeat("t", 200), "l", &fuse.EntryOut{}); errno != 0 {
+	var out fuse.EntryOut
+	if _, errno := pvc.Symlink(ctx, strings.Repeat("t", 200), "l", &out); errno != 0 {
 		t.Fatalf("symlink: %v", errno)
 	}
 	afterCommit = nil
 	if taken != 1 {
 		t.Fatal("the symlink never reached its commit")
+	}
+	if out.Attr.Ino == uint64(slot) {
+		t.Fatalf("the symlink kept inode %d, which the peer claimed", slot)
 	}
 	if got := usage(t, fsys, pvc); got != [2]uint64{1, 1} {
 		t.Errorf("after the retried symlink the project uses %v blocks and inodes, want its 1 block and 1 inode", got)

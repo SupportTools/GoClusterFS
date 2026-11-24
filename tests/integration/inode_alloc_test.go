@@ -4,8 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -106,5 +109,66 @@ func TestMultiNodeConcurrentCreatesDoNotCollide(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+var lostRacesRe = regexp.MustCompile(`lost \d+ races with other nodes`)
+
+// TestLocalConcurrentCreatesGetTheirOwnSlots has 16 creators on one node create files in their own directories at
+// once. A create finds a free inode slot, then commits to the journal before it claims the slot. When every creator
+// found the same slot, the losers kept colliding until creates failed with EAGAIN and the mount logged "lost 5 races
+// with other nodes", with no other node mounted.
+func TestLocalConcurrentCreatesGetTheirOwnSlots(t *testing.T) {
+	const creators = 16
+	perCreator := 100
+	if testing.Short() {
+		perCreator = 40
+	}
+	mfs := NewMountedFS(t, 1024)
+	var log syncBuffer
+	mfs.Log = &log
+	if err := mfs.FormatAndMount(false); err != nil {
+		t.Fatalf("format and mount: %v", err)
+	}
+	for c := range creators {
+		if err := os.Mkdir(filepath.Join(mfs.MountPoint, fmt.Sprintf("c%02d", c)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	failed := make([]int, creators)
+	firstErr := make([]error, creators)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for c := range creators {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range perCreator {
+				name := filepath.Join(mfs.MountPoint, fmt.Sprintf("c%02d", c), fmt.Sprintf("f%03d", i))
+				f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+				if err != nil {
+					failed[c]++
+					if firstErr[c] == nil {
+						firstErr[c] = err
+					}
+					continue
+				}
+				_ = f.Close()
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+	total := creators * perCreator
+	t.Logf("%d creators made %d files in %v: %.0f creates/s", creators, total, elapsed, float64(total)/elapsed.Seconds())
+
+	for c := range creators {
+		if failed[c] > 0 {
+			t.Errorf("creator %d: %d of %d creates failed (first: %v)", c, failed[c], perCreator, firstErr[c])
+		}
+	}
+	if lost := lostRacesRe.FindAllString(log.String(), -1); len(lost) > 0 {
+		t.Errorf("the mount logged %d creates that lost every race with other nodes, with no other node mounted", len(lost))
 	}
 }

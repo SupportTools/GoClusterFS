@@ -736,13 +736,17 @@ func TestFindFreeSlot(t *testing.T) {
 		t.Errorf("FindFreeSlot returned %d, want %d", slot, InodeFirstUsable)
 	}
 
-	// FindFreeSlot is read-only, calling again should return same slot
+	// Until the first slot is claimed or released, the next caller gets another one.
 	slot2, err := table.FindFreeSlot()
 	if err != nil {
 		t.Fatalf("Second FindFreeSlot failed: %v", err)
 	}
-	if slot2 != slot {
-		t.Errorf("Second FindFreeSlot returned %d, want %d", slot2, slot)
+	if slot2 != slot+1 {
+		t.Errorf("Second FindFreeSlot returned %d, want %d", slot2, slot+1)
+	}
+	table.Release(slot)
+	if slot3, err := table.FindFreeSlot(); err != nil || slot3 != slot {
+		t.Errorf("FindFreeSlot after a release = %d, %v; want %d", slot3, err, slot)
 	}
 }
 
@@ -839,10 +843,11 @@ func TestTwoPhaseAllocation(t *testing.T) {
 		t.Fatalf("FindFreeSlot 2 failed: %v", err)
 	}
 
-	// Both finds should return the same slot since neither claimed yet
-	if slot1 != slot2 {
-		t.Errorf("Two FindFreeSlot calls returned different slots: %d vs %d", slot1, slot2)
+	// Each find gets its own slot, so local creators do not race for one
+	if slot1 == slot2 {
+		t.Errorf("Two FindFreeSlot calls returned the same slot %d", slot1)
 	}
+	table.Release(slot2)
 
 	// Now claim the first slot
 	inode1, err := table.ClaimSlot(ctx, slot1)

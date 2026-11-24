@@ -171,6 +171,10 @@ type Table struct {
 	syncDevice  func() error
 	scanStart   uint64        // FindFreeSlot's first slot, as an offset from InodeFirstUsable
 	resume      atomic.Uint64 // where FindFreeSlot starts reading; the slots before it, from scanStart on, were in use
+	// findMu serializes FindFreeSlot and guards handedOut: the free slots it returned that are not claimed or released
+	// yet, which it skips so that local creators racing for a slot each get their own.
+	findMu    sync.Mutex
+	handedOut map[uint32]struct{}
 	// restartEvery is how often FindFreeSlot reads from scanStart again, to reuse inodes other nodes freed.
 	restartEvery time.Duration
 	restarted    atomic.Int64
@@ -220,6 +224,7 @@ func NewTable(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager, n
 		lockMgr:     lockMgr,
 		nodeUUID:    nodeUUID,
 		syncDevice:  dev.Sync,
+		handedOut:   map[uint32]struct{}{},
 
 		restartEvery: time.Minute,
 	}
@@ -426,9 +431,12 @@ func sameExtentTree(a, b *Inode) bool {
 // This is the first phase of a two-phase allocation pattern used to respect lock ordering.
 // Returns the inode number of a free slot, or ErrInodeFull if none available.
 //
-// Important: The slot may be claimed by another node between FindFreeSlot() and ClaimSlot().
-// Callers should be prepared to retry with a different slot if ClaimSlot() returns ErrInodeInUse.
+// It hands each free slot to one local caller until a claim of it ends or the caller releases it, so another node can
+// still claim the slot first. Callers should be prepared to retry with a different slot if ClaimSlot() returns
+// ErrInodeInUse, and must call Release if they give up on the slot without claiming it.
 func (t *Table) FindFreeSlot() (uint32, error) {
+	t.findMu.Lock()
+	defer t.findMu.Unlock()
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -437,21 +445,40 @@ func (t *Table) FindFreeSlot() (uint32, error) {
 		t.restarted.Store(now)
 		start = uint64(InodeFirstUsable) + t.scanStart
 	}
-	free := uint32(0)
+	first, free := uint32(0), uint32(0)
 	isFree := func(num, magic uint32) bool {
-		if magic == 0 {
-			free = num
+		if magic != 0 {
+			return true
 		}
-		return magic != 0
+		if first == 0 {
+			first = num
+		}
+		if _, taken := t.handedOut[num]; taken {
+			return true
+		}
+		free = num
+		return false
 	}
 	if t.scanMagic(start, t.totalInodes, SectorSize, isFree); free == 0 {
 		t.scanMagic(uint64(InodeFirstUsable), start, SectorSize, isFree)
 	}
 	if free == 0 {
+		// Every free slot is handed out: share one, and let the losing claim retry.
+		free = first
+	}
+	if free == 0 {
 		return 0, ErrInodeFull
 	}
-	t.resume.Store(uint64(free))
+	t.resume.Store(uint64(first))
+	t.handedOut[free] = struct{}{}
 	return free, nil
+}
+
+// Release gives back a slot FindFreeSlot returned that the caller will not claim.
+func (t *Table) Release(num uint32) {
+	t.findMu.Lock()
+	defer t.findMu.Unlock()
+	delete(t.handedOut, num)
 }
 
 // NoteFreed tells FindFreeSlot that another node freed inode num.
@@ -520,6 +547,7 @@ func (t *Table) ClaimSlotAs(ctx context.Context, num uint32, init func(*Inode)) 
 }
 
 func (t *Table) claimSlot(ctx context.Context, num uint32, ok func(free *Inode) bool, init func(*Inode)) (*Inode, error) {
+	defer t.Release(num)
 	var claimed *Inode
 	err := t.untilReplayed(ctx, func() error {
 		var err error

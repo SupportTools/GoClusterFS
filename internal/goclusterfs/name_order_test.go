@@ -284,6 +284,7 @@ func TestCreateNameErrors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			fsys.inodeTbl.Release(slot)
 			var errno syscall.Errno
 			if mkdir {
 				_, errno = fsys.makeDirOnce(ctx, &fsys.Inode, tc.parent, tc.name, 0o755, &fuse.EntryOut{})
