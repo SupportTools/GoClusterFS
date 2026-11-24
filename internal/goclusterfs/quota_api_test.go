@@ -39,8 +39,11 @@ func TestProjectQuotaByPath(t *testing.T) {
 	if q.LimitBytes != 2<<30 || q.LimitInodes != 100 || q.UsedInodes != 2 {
 		t.Errorf("after a resize that names only bytes: %+v, want 2 GiB, the 100-inode limit kept and 2 inodes used", *q)
 	}
-	if q, err = fsys.SetProjectQuota(ctx, "/pvc", nil, limit(0)); err != nil || q.LimitBytes != 2<<30 || q.LimitInodes != 0 {
-		t.Errorf("after lifting the inode limit alone: %+v, %v; want 2 GiB kept and no inode limit", q, err)
+	if q, err = fsys.SetProjectQuota(ctx, "/pvc", limit(bs+1), nil); err != nil || q.LimitBytes != 2*bs {
+		t.Errorf("after a limit of a block and a byte: %+v, %v; want it rounded up to 2 blocks", q, err)
+	}
+	if q, err = fsys.SetProjectQuota(ctx, "/pvc", limit(2<<30), limit(0)); err != nil || q.LimitBytes != 2<<30 || q.LimitInodes != 0 {
+		t.Errorf("after lifting the inode limit: %+v, %v; want 2 GiB and no inode limit", q, err)
 	}
 	if got, want := quotaOf(t, pvc), fmt.Sprintf("project=1 bytes=%d inodes=0 used_bytes=%d used_inodes=2", 2<<30, q.UsedBytes); got != want {
 		t.Errorf("getfattr reads %q, want %q", got, want)
