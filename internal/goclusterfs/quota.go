@@ -197,6 +197,7 @@ func (f *FS) setQuota(ctx context.Context, num uint32, value string) syscall.Err
 			log.Printf("[ERROR] quota: project %d: %v", ino.ProjectID, err)
 			return syscall.EIO
 		}
+		f.noteRecord(ino.ProjectID, rec)
 		return 0
 	}
 
@@ -228,7 +229,9 @@ func (f *FS) setQuota(ctx context.Context, num uint32, value string) syscall.Err
 		log.Printf("[ERROR] quota: project %d: %v", id, err)
 		return syscall.EIO
 	}
-	birth := ino.BirthGeneration
+	// The directory joins the project with its own inode and blocks, which a later rmdir gives back.
+	birth, rootBlocks := ino.BirthGeneration, int64(ino.AllocatedBlocks)
+	f.commitCharge(id, rootBlocks, 1)
 	ino, err = f.updateInode(ctx, num, func(cur *inode.Inode) error {
 		if cur.Magic != inode.InodeMagic || cur.BirthGeneration != birth || cur.ProjectID != 0 {
 			return errProjectRace
@@ -238,6 +241,7 @@ func (f *FS) setQuota(ctx context.Context, num uint32, value string) syscall.Err
 	})
 	switch {
 	case errors.Is(err, errProjectRace):
+		f.commitCharge(id, -rootBlocks, -1)
 		return syscall.EAGAIN
 	case err != nil:
 		return syscall.EIO
@@ -274,6 +278,7 @@ func (f *FS) clearQuota(ctx context.Context, num uint32) syscall.Errno {
 	if err := tbl.PutRecord(ino.ProjectID, rec); err != nil {
 		return syscall.EIO
 	}
+	f.noteRecord(ino.ProjectID, rec)
 	return 0
 }
 

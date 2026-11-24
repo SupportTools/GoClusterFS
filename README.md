@@ -14,6 +14,7 @@ A VMFS-like clustered filesystem written in Go. GoClusterFS enables multiple nod
 - **Symlinks**: Targets of up to 92 bytes live in the inode, longer ones up to 4095 bytes in one block
 - **Hard links**: `link(2)` gives a regular file up to 65,000 names; directories and symlinks get `EPERM`
 - **Thin Provisioning**: Allocate-on-write with TRIM/BLKDISCARD support
+- **Project Quotas**: Block and inode limits per directory tree, set with an extended attribute; see [Project Quotas](docs/OPERATIONS.md#project-quotas)
 - **8-Phase fsck**: Comprehensive filesystem consistency checker with repair mode
 
 ## Requirements

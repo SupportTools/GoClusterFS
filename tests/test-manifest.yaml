@@ -5894,6 +5894,29 @@ scenarios:
     environments:
       go: cmd/goclusterfs-mount/quota_test.go::TestLaterChargesAddUpPerProject
 
+  - id: quota-enforce-limits
+    name: A project's limits refuse new blocks and inodes with EDQUOT
+    description: Creates, mkdir, writes and fallocate of unmapped blocks, and snapshots past a limit fail with EDQUOT; overwrites, truncates and unlinks work
+    priority: high
+    environments:
+      go: internal/goclusterfs/quota_enforce_test.go::TestQuotaRefusesWhatPassesTheLimits
+      docker: run-tests.sh::test_quota_limits
+      vm: TODO  # Docker's dd through the mount covers the errno; the VM harness adds nothing for a single-node limit
+
+  - id: quota-enforce-flush
+    name: Allocations near a limit flush first
+    description: With 2 live nodes, an allocation whose unflushed share could pass the limit flushes this node's changes and reads the usage again first
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_enforce_test.go::TestQuotaFlushesBeforeItCouldPassTheLimit
+
+  - id: quota-project-root-counts
+    name: A project's root directory counts against it
+    description: Setting a quota charges the root's inode and block, and removing the root gives them back
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_enforce_test.go::TestQuotaCountsTheProjectRoot
+
   - id: quota-orphan-after-crash
     name: A crashed node's open, unlinked file stops counting
     description: A file in a project is written, unlinked while open, and its node killed; after the node comes back, the project's usage returns to what it was before the file

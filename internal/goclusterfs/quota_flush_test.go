@@ -98,23 +98,23 @@ func TestQuotaFlushMovesTheLedgerIntoTheTable(t *testing.T) {
 	bs := fsys.dataBlockSize()
 
 	commitDelta(t, fsys, 1, 3, 2)
-	if got, want := quotaOf(t, pvc), fmt.Sprintf(" used_bytes=%d used_inodes=2", 3*bs); !strings.HasSuffix(got, want) {
+	if got, want := quotaOf(t, pvc), fmt.Sprintf(" used_bytes=%d used_inodes=3", 4*bs); !strings.HasSuffix(got, want) {
 		t.Errorf("before the flush the quota reads %q, want it to end %q", got, want)
 	}
 	if got := tableUsage(t, fsys, 1); got != [2]uint64{} {
 		t.Errorf("before the flush the table holds %v", got)
 	}
 	flushQuota(t, fsys)
-	if got := tableUsage(t, fsys, 1); got != [2]uint64{3, 2} || len(fsys.journal.QuotaPending()) != 0 {
+	if got := tableUsage(t, fsys, 1); got != [2]uint64{4, 3} || len(fsys.journal.QuotaPending()) != 0 {
 		t.Errorf("after the flush the table holds %v and the ledger %v; want 3 blocks and 2 inodes moved", got, fsys.journal.QuotaPending())
 	}
-	if got, want := quotaOf(t, pvc), fmt.Sprintf(" used_bytes=%d used_inodes=2", 3*bs); !strings.HasSuffix(got, want) {
+	if got, want := quotaOf(t, pvc), fmt.Sprintf(" used_bytes=%d used_inodes=3", 4*bs); !strings.HasSuffix(got, want) {
 		t.Errorf("after the flush the quota reads %q, want it to end %q", got, want)
 	}
 	commitDelta(t, fsys, 1, -1, 0)
 	flushQuota(t, fsys)
-	if got := tableUsage(t, fsys, 1); got != [2]uint64{2, 2} {
-		t.Errorf("after a second flush the table holds %v, want 2 blocks and 2 inodes", got)
+	if got := tableUsage(t, fsys, 1); got != [2]uint64{3, 3} {
+		t.Errorf("after a second flush the table holds %v, want 3 blocks and 3 inodes with the project root's", got)
 	}
 	if _, err := fsys.journal.Checkpoint(); err != nil {
 		t.Fatal(err)
@@ -132,7 +132,7 @@ func TestStoppingTheQuotaFlushEmptiesTheLedger(t *testing.T) {
 	fsys.StartQuotaFlush(time.Hour)
 	commitDelta(t, fsys, 1, 4, 1)
 	fsys.stopQuotaFlush()
-	if got := tableUsage(t, fsys, 1); got != [2]uint64{4, 1} {
+	if got := tableUsage(t, fsys, 1); got != [2]uint64{5, 2} {
 		t.Errorf("after the last flush the table holds %v, want 4 blocks and 1 inode", got)
 	}
 	if err := fsys.journal.Stop(); err != nil {
@@ -159,7 +159,7 @@ func TestUnflushedQuotaUsageIsFoldedAfterACrash(t *testing.T) {
 	if _, err := journal.ScanFoldAndRecover(peer.dev, offset, size, fold, journal.CreateTxnRecoveryHandler(rctx), nil); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if got := tableUsage(t, peer, 1); got != [2]uint64{7, 2} {
+	if got := tableUsage(t, peer, 1); got != [2]uint64{8, 3} {
 		t.Errorf("after the replay the table holds %v, want 7 blocks and 2 inodes", got)
 	}
 }
@@ -181,7 +181,7 @@ func TestAQuotaFoldIsLoggedInTheDeadJournal(t *testing.T) {
 	if err != nil || !q.Folded || q.Owes() {
 		t.Errorf("after the fold the journal reads %+v, %v; want a completed fold that owes nothing", q, err)
 	}
-	if got := tableUsage(t, peer, 1); got != [2]uint64{5, 1} {
+	if got := tableUsage(t, peer, 1); got != [2]uint64{6, 2} {
 		t.Errorf("after the fold the table holds %v, want 5 blocks and 1 inode", got)
 	}
 }
@@ -213,19 +213,19 @@ func TestAQuotaFoldCutShortIsRedoneOnce(t *testing.T) {
 	peer := openFormattedFS(t, path)
 	foldCrashed(t, peer, offset, size)
 	foldCrashed(t, peer, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{5, 1} {
+	if got := tableUsage(t, peer, 1); got != [2]uint64{6, 2} {
 		t.Errorf("after the fold was redone twice the table holds %v, want 5 blocks and 1 inode", got)
 	}
 	tbl, err := peer.quotaTable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tbl.SetUsage(1, 6, 1); err != nil {
+	if err := tbl.SetUsage(1, 7, 2); err != nil {
 		t.Fatal(err)
 	}
 	foldCrashed(t, peer, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{6, 1} {
-		t.Errorf("a completed fold wrote the table again: %v, want the later 6 blocks", got)
+	if got := tableUsage(t, peer, 1); got != [2]uint64{7, 2} {
+		t.Errorf("a completed fold wrote the table again: %v, want the later 7 blocks", got)
 	}
 }
 
@@ -282,7 +282,7 @@ func TestAReplayerDyingMidFoldKeepsTheQuotaLockInTheDeadSlot(t *testing.T) {
 	if err := next.lockMgr.ReleaseAdopted(adopted); err != nil {
 		t.Fatal(err)
 	}
-	if got := tableUsage(t, next, 1); got != [2]uint64{5, 1} {
+	if got := tableUsage(t, next, 1); got != [2]uint64{6, 2} {
 		t.Errorf("after the redo the table holds %v, want 5 blocks and 1 inode", got)
 	}
 	if again, err := next.lockMgr.AdoptOwner(dead, deadSlot); err != nil || len(again) != 0 {
@@ -325,7 +325,7 @@ func TestAFlushFailingAfterItsCommitStopsTheNode(t *testing.T) {
 		t.Fatal("a peer took the quota lock while the failed flush waits for its replay")
 	}
 	foldCrashed(t, peer, offset, size)
-	if got := tableUsage(t, peer, 1); got != [2]uint64{3, 1} {
+	if got := tableUsage(t, peer, 1); got != [2]uint64{4, 2} {
 		t.Errorf("after the replay the table holds %v, want the failed flush's 3 blocks and 1 inode", got)
 	}
 }
@@ -346,14 +346,14 @@ func TestQuotaFlushWaitsOutAdoptedQuotaLock(t *testing.T) {
 	}
 	commitDelta(t, fsys, 1, 3, 0)
 	flushQuota(t, fsys)
-	if got := tableUsage(t, fsys, 1); got != [2]uint64{} || fsys.journal.QuotaPending()[1].Blocks != 3 {
+	if got := tableUsage(t, fsys, 1); got != [2]uint64{} || fsys.journal.QuotaPending()[1].Blocks != 4 {
 		t.Errorf("a flush during the replay wrote %v and left %v pending; want nothing written", got, fsys.journal.QuotaPending())
 	}
 	if err := fsys.lockMgr.ReleaseAdopted(adopted); err != nil {
 		t.Fatal(err)
 	}
 	flushQuota(t, fsys)
-	if got := tableUsage(t, fsys, 1); got != [2]uint64{3, 0} {
+	if got := tableUsage(t, fsys, 1); got != [2]uint64{4, 1} {
 		t.Errorf("after the replay the flush wrote %v, want 3 blocks", got)
 	}
 }

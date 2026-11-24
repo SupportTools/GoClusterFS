@@ -162,6 +162,11 @@ type FS struct {
 	quotaDone      chan struct{}
 	quotaStuck     atomic.Bool // a flush failed after its commit; the journal keeps it for a replay
 	openQuota      func() (quota.Table, error)
+	quotaSeenMu    sync.Mutex
+	quotaSeen      map[uint32]seenRecord // project records as this node last read them, for enforcement
+	live           int64
+	liveAt         time.Time
+	liveCount      func() int64 // set by tests in place of the registry
 	stopNode       func(reason string)
 
 	// Configuration
@@ -1283,6 +1288,9 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	}
 	uid, gid, _ := f.newOwner(ctx, dirIno)
 	project := childProject(dirIno)
+	if errno := f.checkQuota(ctx, project, 0, 1, true); errno != 0 {
+		return nil, errno
+	}
 
 	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
 	// so replay can no longer finish the create it undoes.
@@ -1384,6 +1392,9 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		perm |= inode.S_ISGID
 	}
 	project := childProject(dirIno)
+	if errno := f.checkQuota(ctx, project, 1, 1, true); errno != 0 {
+		return nil, errno
+	}
 
 	// takeBack gives back the charge of a create that failed after its commit. It runs after the deferred closeIntent,
 	// so replay can no longer finish the create it undoes.
@@ -2286,6 +2297,9 @@ func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int
 
 // writeIOLocked is Write for a caller that holds the file's I/O lock.
 func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	if errno := f.checkMapQuota(ctx, uint64(off), uint64(off)+uint64(len(data))); errno != 0 {
+		return 0, errno
+	}
 	// Retry loop to handle concurrent modifications from other nodes.
 	// When multiple nodes try to extend the same file simultaneously, they may race
 	// to allocate blocks. If a conflict is detected, errRetryWrite is returned and
@@ -3917,6 +3931,9 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 	logging.Debugf("Allocate inode %d: offset=%d length=%d blocks=%d-%d (total=%d)",
 		f.inodeNum, off, size, startBlock, endBlock-1, totalBlocks)
 
+	if errno := f.checkMapQuota(ctx, off, endOffset); errno != 0 {
+		return errno, nil
+	}
 	var allocErr error
 	newBlocks, allocErr = f.fs.extentMgr.Fallocate(ctx, ino, startBlock, endBlock)
 	if allocErr != nil {
@@ -4266,6 +4283,10 @@ func (f *File) createSnapshot(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
+	// The inode lock is held, so a snapshot near its project's limit cannot flush first.
+	if errno := f.fs.checkQuota(ctx, src.ProjectID, int64(src.AllocatedBlocks), 1, false); errno != 0 {
+		return errno
+	}
 	// No record makes the data inode, so its charge commits before the claim; the delete job gives it back.
 	f.fs.commitCharge(src.ProjectID, 0, 1)
 	data, err := f.fs.claimInode(ctx, func(ino *inode.Inode) {
