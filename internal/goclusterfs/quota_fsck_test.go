@@ -98,40 +98,53 @@ func TestFsckRecountAgreesWithQuotaCharges(t *testing.T) {
 }
 
 // A project whose usage in the table drifted from what its inodes use, as an I/O error or a crash between a usage
-// change's commit and its write leaves it, is reported as an error, and fsck -repair writes the recount.
+// change's commit and its write leaves it, is reported as an error, and fsck -repair writes the recount. Either
+// count alone may drift: a create or unlink of an empty file leaves only the inode count off.
 func TestFsckRepairsDriftedQuotaUsage(t *testing.T) {
-	fsys, _, _, _ := journaledFS(t)
-	fsys = withBridge(fsys)
-	pvc := quotaProject(t, fsys, "pvc")
-	writeAt(t, createIn(t, pvc, "f"), pattern(1, int(2*fsys.dataBlockSize())), 0)
-	stopClean(t, fsys)
-	want := tableUsage(t, fsys, 1)
-	tbl, err := fsys.quotaTable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tbl.SetUsage(1, want[0]+5, want[1]+1); err != nil {
-		t.Fatal(err)
-	}
+	for _, drift := range []struct {
+		name           string
+		blocks, inodes int64
+	}{
+		{"both", 5, 1},
+		{"blocks only", 5, 0},
+		{"one inode more", 0, 1},
+		{"one inode less", 0, -1},
+	} {
+		t.Run(drift.name, func(t *testing.T) {
+			fsys, _, _, _ := journaledFS(t)
+			fsys = withBridge(fsys)
+			pvc := quotaProject(t, fsys, "pvc")
+			writeAt(t, createIn(t, pvc, "f"), pattern(1, int(2*fsys.dataBlockSize())), 0)
+			stopClean(t, fsys)
+			want := tableUsage(t, fsys, 1)
+			tbl, err := fsys.quotaTable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tbl.SetUsage(1, uint64(int64(want[0])+drift.blocks), uint64(int64(want[1])+drift.inodes)); err != nil {
+				t.Fatal(err)
+			}
 
-	r := runFsck(t, fsys, fsck.DefaultOptions())
-	if ps := quotaProblems(r); len(ps) != 1 || ps[0].Location != "quota project 1" || ps[0].Severity != fsck.Error || !ps[0].Repairable {
-		t.Fatalf("fsck on a project whose usage drifted:%s", problemList(r))
+			r := runFsck(t, fsys, fsck.DefaultOptions())
+			if ps := quotaProblems(r); len(ps) != 1 || ps[0].Location != "quota project 1" || ps[0].Severity != fsck.Error || !ps[0].Repairable {
+				t.Fatalf("fsck on a project whose usage drifted:%s", problemList(r))
+			}
+			if r.ExitCode() != fsck.ExitUncorrected {
+				t.Errorf("fsck exit %d on drifted usage, want %d", r.ExitCode(), fsck.ExitUncorrected)
+			}
+			if r := runFsck(t, fsys, repairOptions()); r.RepairedCount != 1 || r.ExitCode() != fsck.ExitCorrected {
+				t.Fatalf("fsck -repair on drifted usage: exit %d, repaired %d:%s", r.ExitCode(), r.RepairedCount, problemList(r))
+			}
+			if got := tableUsage(t, fsys, 1); got != want {
+				t.Errorf("after repair the table holds %v blocks and inodes, want the recount %v", got, want)
+			}
+			expectCleanFsck(t, fsys)
+		})
 	}
-	if r.ExitCode() != fsck.ExitUncorrected {
-		t.Errorf("fsck exit %d on drifted usage, want %d", r.ExitCode(), fsck.ExitUncorrected)
-	}
-	if r := runFsck(t, fsys, repairOptions()); r.RepairedCount != 1 || r.ExitCode() != fsck.ExitCorrected {
-		t.Fatalf("fsck -repair on drifted usage: exit %d, repaired %d:%s", r.ExitCode(), r.RepairedCount, problemList(r))
-	}
-	if got := tableUsage(t, fsys, 1); got != want {
-		t.Errorf("after repair the table holds %v blocks and inodes, want the recount %v", got, want)
-	}
-	expectCleanFsck(t, fsys)
 }
 
-// A fallocate that keeps the file size and whose inode write fails keeps its charge, since the inode on disk may map the new blocks. When it does
-// not, the project's usage drifts, and fsck -repair writes the recount.
+// A fallocate that keeps the file size and whose inode write fails keeps its charge, since the inode on disk may map
+// the new blocks. When it does not, the project's usage drifts, and fsck -repair writes the recount.
 func TestFsckRepairsQuotaDriftAfterAFailedInodeWrite(t *testing.T) {
 	fsys, _, _, _ := journaledFS(t)
 	fsys = withBridge(fsys)
