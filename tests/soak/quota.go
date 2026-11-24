@@ -40,8 +40,8 @@ func parseQuotaUsage(s string) (quotaUsage, error) {
 	return u, nil
 }
 
-// quotaSlack is how far a project's usage may pass a limit, and how far below it a refusal may come: one allocation
-// in flight per lane, the largest a snapshot of a whole file.
+// quotaSlack is how far a project's usage may pass a limit: one allocation in flight per lane, the largest a
+// snapshot of a whole file.
 func (d *driver) quotaSlack() (bytes, inodes int64) {
 	return int64(d.cfg.lanes) * (maxFile + blockSize), int64(d.cfg.lanes)
 }
@@ -95,18 +95,30 @@ func (d *driver) freedLately(root string, op *Op) bool {
 	return d.lastFree[root].Load() >= op.At-2000
 }
 
-// checkRefusal checks, on the node that refused op with EDQUOT, that its project is near a limit, unless something
-// was freed there lately, and not past one.
+// allocation bounds what op adds when the node checks it against a limit: a write's one kernel request, which may
+// span two blocks, a snapshot's whole file, or a new entry's inode and directory or symlink block.
+func allocation(op *Op) (bytes, inodes int64) {
+	switch op.Kind {
+	case "write":
+		return 2 * blockSize, 0
+	case "snapshot":
+		return maxFile + blockSize, 1
+	}
+	return blockSize, 1
+}
+
+// checkRefusal checks, on the node that refused op with EDQUOT, that op would have passed a limit, unless something
+// was freed in the project lately, and that usage is not past a limit by more than the slack.
 func (d *driver) checkRefusal(n *node, op *Op) error {
 	root := opProject(op)
 	u, err := d.quotaUsage(n, root)
 	if err != nil {
 		return err
 	}
-	sb, si := d.quotaSlack()
-	if !d.freedLately(root, op) && !(u.limitBytes != 0 && u.usedBytes >= u.limitBytes-sb || u.limitInodes != 0 && u.usedInodes >= u.limitInodes-si) {
-		return fmt.Errorf("EDQUOT while project %s uses %d bytes and %d inodes, far below its limits of %d and %d",
-			root, u.usedBytes, u.usedInodes, u.limitBytes, u.limitInodes)
+	b, i := allocation(op)
+	if !d.freedLately(root, op) && !(u.limitBytes != 0 && u.usedBytes+b > u.limitBytes || u.limitInodes != 0 && u.usedInodes+i > u.limitInodes) {
+		return fmt.Errorf("EDQUOT while project %s uses %d bytes and %d inodes, so %s could add %d bytes and %d inodes within its limits of %d and %d",
+			root, u.usedBytes, u.usedInodes, op.Kind, b, i, u.limitBytes, u.limitInodes)
 	}
 	return d.overshoot(root, u)
 }

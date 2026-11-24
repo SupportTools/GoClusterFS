@@ -26,8 +26,8 @@ const (
 	maxInlineTarget = 92
 )
 
-// quotaDirs are project roots and their limits. qa limits bytes and qb inodes, so lanes reach both limits.
-var quotaDirs = map[string]string{"/soak/qa": "bytes=67108864 inodes=0", "/soak/qb": "bytes=0 inodes=24"}
+// quotaDirs are project roots and their limits. qa limits bytes and qb inodes, both below what lanes put there.
+var quotaDirs = map[string]string{"/soak/qa": "bytes=8388608 inodes=0", "/soak/qb": "bytes=0 inodes=10"}
 
 // sharedDirs hold files of every lane and are never removed.
 var sharedDirs = []string{"/soak/d0", "/soak/d1", "/soak/d2", "/soak/d3", "/soak/qa", "/soak/qb"}
