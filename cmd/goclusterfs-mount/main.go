@@ -752,7 +752,9 @@ func main() {
 					return st.KeyRestores, st.LastKeyRestore
 				},
 			})
-			apiServer.SetFileService(fileops.New(gfs))
+			ops := fileops.New(gfs)
+			apiServer.SetFileService(ops)
+			apiServer.SetQuotaService(ops)
 			apiServer.SetAdminService(adminOps{journal: j, trim: trimMgr, cache: cacheMgr})
 			if err := apiServer.Start(ctx); err != nil {
 				log.Printf("Warning: Failed to start the API server: %v; the mount continues without it. Choose a free -api-addr, or pass -api=false", err)

@@ -129,3 +129,11 @@ func verify(sector []byte) error {
 	}
 	return nil
 }
+
+// Status is a project's limits and usage in bytes and inodes, as the quota xattr and the HTTP API show them; a limit
+// of 0 means none.
+type Status struct {
+	Project                 uint32
+	LimitBytes, LimitInodes uint64
+	UsedBytes, UsedInodes   uint64
+}

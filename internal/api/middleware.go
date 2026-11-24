@@ -67,7 +67,7 @@ func (s *Server) countRequests(next http.Handler) http.Handler {
 }
 
 // apiRoutes are the route labels of goclusterfs_api_requests_total; anything else counts as "other".
-var apiRoutes = []string{"/api/v1/status", "/api/v1/stats", "/api/v1/snapshots", "/api/v1/clones", "/api/v1/admin"}
+var apiRoutes = []string{"/api/v1/status", "/api/v1/stats", "/api/v1/snapshots", "/api/v1/clones", "/api/v1/quotas", "/api/v1/admin"}
 
 func routeOf(p string) string {
 	switch p = path.Clean(p); {

@@ -24,6 +24,13 @@ type FileService interface {
 	CloneFile(ctx context.Context, path, dest string) error
 }
 
+// QuotaService reads and sets the project quotas of directories in the mounted filesystem. Paths are absolute
+// within the mount.
+type QuotaService interface {
+	Quota(ctx context.Context, path string) (*QuotaInfo, error)
+	SetQuota(ctx context.Context, path string, bytes, inodes *uint64) (*QuotaInfo, error)
+}
+
 // AdminService runs maintenance on this node. Each method returns a short
 // description of what it did.
 type AdminService interface {
@@ -79,6 +86,25 @@ type WriteResponse struct {
 	Dest   string `json:"dest,omitempty"`
 }
 
+// QuotaInfo is a project's limits and usage, returned by GET and PUT /api/v1/quotas. The fields are those of the
+// trusted.goclusterfs.quota xattr; a limit of 0 means none.
+type QuotaInfo struct {
+	Path       string `json:"path"`
+	Project    uint32 `json:"project"`
+	Bytes      uint64 `json:"bytes"`
+	Inodes     uint64 `json:"inodes"`
+	UsedBytes  uint64 `json:"used_bytes"`
+	UsedInodes uint64 `json:"used_inodes"`
+}
+
+// QuotaRequest is sent to PUT /api/v1/quotas. A limit left out keeps the project's current one, and on a new project
+// is none; one of them must be there.
+type QuotaRequest struct {
+	Path   string  `json:"path"`
+	Bytes  *uint64 `json:"bytes"`
+	Inodes *uint64 `json:"inodes"`
+}
+
 // AdminResponse is returned by POST /api/v1/admin/*.
 type AdminResponse struct {
 	Operation string `json:"operation"`
@@ -96,6 +122,13 @@ func (s *Server) SetFileService(fs FileService) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fileService = fs
+}
+
+// SetQuotaService sets the service behind the quota endpoints.
+func (s *Server) SetQuotaService(qs QuotaService) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.quotaService = qs
 }
 
 // SetAdminService sets the service behind the admin endpoints.
@@ -327,6 +360,61 @@ func (s *Server) handleClones(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, WriteResponse{Action: "clone", Path: req.Path, Dest: req.Dest})
 }
 
+// handleQuotas serves GET /api/v1/quotas?path= and PUT /api/v1/quotas.
+func (s *Server) handleQuotas(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if !s.requireToken(w) {
+			return
+		}
+	case http.MethodPut:
+		if !s.beginWrite(w, r) {
+			return
+		}
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "use GET or PUT")
+		return
+	}
+	s.mu.RLock()
+	qs := s.quotaService
+	s.mu.RUnlock()
+	if qs == nil {
+		writeError(w, http.StatusServiceUnavailable, "quotas not available", "no quota service configured")
+		return
+	}
+	if r.Method == http.MethodGet {
+		info, err := qs.Quota(r.Context(), r.URL.Query().Get("path"))
+		if err != nil {
+			writeOpError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, info)
+		return
+	}
+	var req QuotaRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Bytes == nil && req.Inodes == nil {
+		writeError(w, http.StatusBadRequest, "invalid request body", "set bytes, inodes or both; 0 means no limit")
+		return
+	}
+	info, err := qs.SetQuota(r.Context(), req.Path, req.Bytes, req.Inodes)
+	logWrite(r, "quota.set", fmt.Sprintf("path=%q bytes=%s inodes=%s", req.Path, limitText(req.Bytes), limitText(req.Inodes)), err)
+	if err != nil {
+		writeOpError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func limitText(v *uint64) string {
+	if v == nil {
+		return "unchanged"
+	}
+	return fmt.Sprint(*v)
+}
+
 // handleAdmin serves POST /api/v1/admin/{flush-journal,force-trim,clear-cache}.
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 	op := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/")
@@ -376,9 +464,9 @@ func writeOpError(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case errors.As(err, &errno):
 		switch errno {
-		case syscall.ENOENT:
+		case syscall.ENOENT, syscall.ENODATA:
 			status = http.StatusNotFound
-		case syscall.EEXIST, syscall.ENOTSUP, syscall.EBUSY, syscall.EAGAIN, syscall.ESTALE:
+		case syscall.EEXIST, syscall.ENOTSUP, syscall.EBUSY, syscall.EAGAIN, syscall.ESTALE, syscall.ENOTEMPTY:
 			status = http.StatusConflict
 		case syscall.EINVAL, syscall.ENAMETOOLONG, syscall.EISDIR, syscall.ENOTDIR, syscall.ELOOP, syscall.EXDEV:
 			status = http.StatusBadRequest

@@ -93,8 +93,8 @@ func TestQuotaXattrMakesAProject(t *testing.T) {
 	if errno := pvc.Setxattr(ctx, quotaXattr, []byte("bytes=5242880"), 0); errno != 0 {
 		t.Fatalf("change the project's limits: %v", errno)
 	}
-	if got := quotaOf(t, pvc); !strings.HasPrefix(got, "project=1 bytes=5242880 inodes=0 ") {
-		t.Errorf("after the change the quota is %q", got)
+	if got := quotaOf(t, pvc); !strings.HasPrefix(got, "project=1 bytes=5242880 inodes=10 ") {
+		t.Errorf("after a change that names only bytes the quota is %q, want the inode limit kept", got)
 	}
 	if errno := pvc.Removexattr(ctx, quotaXattr); errno != 0 {
 		t.Fatalf("remove the quota: %v", errno)

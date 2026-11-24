@@ -5368,6 +5368,48 @@ scenarios:
     environments:
       go: api_writes_test.go::TestAPISnapshotLifecycle
 
+  - id: api-quota-endpoints
+    name: API quota endpoints
+    description: GET and PUT /api/v1/quotas reach the quota service only with the token, refuse a PUT with no limit, unknown fields and other methods, and map the xattr's errors to statuses
+    priority: go_only
+    environments:
+      go: internal/api/quotas_test.go::TestQuotaEndpoints
+
+  - id: api-quota-by-path
+    name: Quota calls by path do what the xattr does
+    description: Setting a quota by path gives an empty directory a project or changes a project's limits, reading it from any directory in the project returns what getfattr shows, and the root, a directory inside a project, a non-empty directory, a file and a path through a symlink are refused
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_api_test.go::TestProjectQuotaByPath
+
+  - id: quota-omitted-limit-kept
+    name: A quota change keeps the limit it leaves out
+    description: A trusted.goclusterfs.quota value that names one limit keeps the project's other limit, and on a new project leaves it unset
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_api_test.go::TestQuotaXattrKeepsTheLimitsItLeavesOut
+
+  - id: api-quota-outlives-caller
+    name: An API quota change outlives its caller
+    description: A quota set through the API with a canceled context waits out a peer's quota lock and completes, so a timed-out client cannot leave a record no directory names
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_api_test.go::TestProjectQuotaByPathOutlivesItsCaller
+
+  - id: api-quota-through-mount
+    name: API quotas hold through the mount
+    description: A quota set through the API, without CAP_SYS_ADMIN, refuses a write past its limit with EDQUOT, statfs on the directory shows it, and GET reports the usage statfs leaves free; a PUT without a token gets 401
+    priority: go_only
+    environments:
+      go: api_writes_test.go::TestAPIQuotaThroughTheMount
+
+  - id: gfsctl-quota
+    name: gfsctl quota get and set
+    description: quota get asks for the escaped path with the token and prints usage against the limits; quota set sends only the limits it was given and refuses to send none
+    priority: go_only
+    environments:
+      go: cmd/gfsctl/commands/commands_test.go::TestQuota
+
   - id: api-writes-off-without-token
     name: API writes need a token
     description: Without -api-token, write endpoints answer 403 and mount logs that writes are off; reads still work

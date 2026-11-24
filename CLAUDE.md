@@ -35,7 +35,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 |------|--------------|
 | `cmd/goclusterfs-mount` | `goclusterfs-mount`: fixes the on-disk layout, runs journal recovery, wires all managers, mounts with go-fuse |
 | `cmd/goclusterfs-fsck` | `goclusterfs-fsck`: 8-phase checker with `-repair` and `-force` modes, and journal slot tools: `-list-slots`, `-inspect-slot`, and `-release-slot` with `-salvage`, `-discard-journal` and `-report` |
-| `cmd/gfsctl` | `gfsctl`: read-only CLI for the HTTP API (status, health, stats, metrics, snapshots) |
+| `cmd/gfsctl` | `gfsctl`: CLI for the HTTP API (status, health, stats, metrics, snapshots, quotas); `quota set` is its only write |
 | `internal/goclusterfs` | FUSE nodes (`FS` root, `Dir`, `File`) and every VFS operation |
 | `internal/storage` | O_DIRECT device, 4 KB aligned buffers, CRC32C |
 | `internal/superblock` | Superblock format and the on-disk layout; `-format` writes it, mount reads it |

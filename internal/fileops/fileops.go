@@ -1,4 +1,4 @@
-// Package fileops runs the API's snapshot and clone requests in the mount daemon. They reach the same code as
+// Package fileops runs the API's snapshot, clone and quota requests in the mount daemon. They reach the same code as
 // setfattr, but never through the daemon's own FUSE mount: a daemon that waits on its own mount can deadlock.
 package fileops
 
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/api"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/snapshot"
 )
 
@@ -23,6 +24,8 @@ type FS interface {
 	DeleteFileSnapshot(ctx context.Context, p, name string) error
 	CloneFileSnapshot(ctx context.Context, p, name, dest string) error
 	CloneFile(ctx context.Context, p, dest string) error
+	ProjectQuota(ctx context.Context, p string) (*quota.Status, error)
+	SetProjectQuota(ctx context.Context, p string, bytes, inodes *uint64) (*quota.Status, error)
 }
 
 // Ops implements api.FileService on a mounted filesystem.
@@ -35,7 +38,10 @@ func New(fsys FS) *Ops {
 	return &Ops{fs: fsys}
 }
 
-var _ api.FileService = (*Ops)(nil)
+var (
+	_ api.FileService  = (*Ops)(nil)
+	_ api.QuotaService = (*Ops)(nil)
+)
 
 // ListSnapshots returns every snapshot, marking those whose file is gone, or only those of the file at p.
 func (o *Ops) ListSnapshots(ctx context.Context, p string) ([]api.SnapshotInfo, error) {
@@ -132,6 +138,43 @@ func (o *Ops) CloneFile(ctx context.Context, p, dest string) error {
 		return err
 	}
 	return o.fs.CloneFile(ctx, p, dest)
+}
+
+// Quota does what getfattr -n trusted.goclusterfs.quota does on the directory at p.
+func (o *Ops) Quota(ctx context.Context, p string) (*api.QuotaInfo, error) {
+	if err := checkDir(p); err != nil {
+		return nil, err
+	}
+	q, err := o.fs.ProjectQuota(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	return quotaInfo(p, q), nil
+}
+
+// SetQuota does what setfattr -n trusted.goclusterfs.quota -v "bytes=N inodes=N" does on the directory at p, a nil
+// limit standing for a key left out.
+func (o *Ops) SetQuota(ctx context.Context, p string, bytes, inodes *uint64) (*api.QuotaInfo, error) {
+	if err := checkDir(p); err != nil {
+		return nil, err
+	}
+	q, err := o.fs.SetProjectQuota(ctx, p, bytes, inodes)
+	if err != nil {
+		return nil, err
+	}
+	return quotaInfo(p, q), nil
+}
+
+func quotaInfo(p string, q *quota.Status) *api.QuotaInfo {
+	return &api.QuotaInfo{Path: p, Project: q.Project, Bytes: q.LimitBytes, Inodes: q.LimitInodes, UsedBytes: q.UsedBytes, UsedInodes: q.UsedInodes}
+}
+
+// checkDir accepts an absolute, clean path to a directory in the mount, the root included.
+func checkDir(p string) error {
+	if !strings.HasPrefix(p, "/") || path.Clean(p) != p || strings.ContainsRune(p, '\x00') {
+		return fmt.Errorf("%w: %q must be an absolute, clean path to a directory in the mount", api.ErrInvalidPath, p)
+	}
+	return nil
 }
 
 // checkName refuses names the xattr interface cannot carry: user.snapshot.clone
