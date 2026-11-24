@@ -63,8 +63,8 @@ func enableCreatesTheTable(t *testing.T, blockSize uint64) {
 			onDisk.RequiredFlags, onDisk.QuotaInode, onDisk.QuotaFlushMs, onDisk.QuotaTableBlocks, n)
 	}
 	ino, err := inodes.Read(onDisk.QuotaInode)
-	if err != nil || ino.AllocatedBlocks != n || ino.InlineExtents[0].Length != n || ino.ProjectID != 0 {
-		t.Fatalf("quota inode %+v, %v; want %d blocks in one extent and no project", ino, err, n)
+	if err != nil || ino.AllocatedBlocks != n || ino.InlineExtents[0].Length != n || ino.Size != n*bs || ino.ProjectID != 0 {
+		t.Fatalf("quota inode %+v, %v; want %d blocks in one extent, as many bytes, and no project", ino, err, n)
 	}
 	block := ino.InlineExtents[0].PhysicalBlock
 	for b := block; b < block+n; b++ {
