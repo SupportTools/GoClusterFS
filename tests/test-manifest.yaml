@@ -5377,6 +5377,13 @@ scenarios:
   # HTTP API writes (one mount on one host)
   # ===========================================================================
 
+  - id: mount-memory-limit-from-cgroup
+    name: The Go memory limit comes from the cgroup
+    description: The smallest memory limit from the process's cgroup up to the root sets the Go memory limit, on cgroup v2 (memory.max) and v1 (memory.limit_in_bytes); max and v1's near-2^63 value mean no limit
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/memlimit_test.go::TestCgroupMemoryLimit
+
   - id: api-snapshot-lifecycle
     name: API snapshot, clone and delete
     description: The API creates, lists, clones and deletes snapshots and clones files through setxattr on the mount, the same path as setfattr; bad paths, names and destinations are refused

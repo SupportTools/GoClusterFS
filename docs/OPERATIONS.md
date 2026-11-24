@@ -672,6 +672,8 @@ The flags set how many entries each cache holds and how long cached data may be 
 
 When `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity` (or the extent pair does), the cache is full and drops entries it may need again; a larger limit trades memory for fewer disk reads.
 
+**Memory limit.** In a cgroup with a memory limit, such as a Kubernetes container or a systemd service with `MemoryMax`, the mount sets Go's memory limit to 90% of the smallest limit from its cgroup up, so the garbage collector works harder before the limit kills the mount. It logs `Memory: the cgroup allows N MB, so the Go memory limit is M MB`. Set `GOMEMLIMIT` to choose another limit.
+
 ```bash
 # Read-heavy, changes from other nodes may show up later
 goclusterfs-mount ... -cache-ttl 30s
