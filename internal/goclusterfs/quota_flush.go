@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/quota"
 )
@@ -63,7 +64,9 @@ func (f *FS) stopQuotaFlush() {
 
 // flushQuota moves this node's quota ledger into the table. Under the quota lock it reads each pending project's
 // usage, commits one QuotaFlush per project for its whole ledger, writes the usage, and completes the commit durably
-// before the lock goes: a replay writes an unfinished flush again, over whatever usage is newer.
+// before the lock goes: a replay writes an unfinished flush again, over whatever usage is newer. Changes of a project
+// whose record is free or holds another project now are dropped. A project left with no usage and no root directory
+// gives its record up.
 func (f *FS) flushQuota(ctx context.Context) error {
 	if f.quotaInode == 0 || f.journal == nil || f.quotaStuck.Load() {
 		return nil
@@ -102,10 +105,12 @@ func (f *FS) flushQuota(ctx context.Context) error {
 	seq, err := f.journal.CommitQuota(txn, func(ledger func(uint32) journal.QuotaDeltaPayload) error {
 		for _, p := range projects {
 			d, r := ledger(p), used[p]
-			u := journal.QuotaUpdatePayload{Project: p, CoveredBlocks: d.Blocks, CoveredInodes: d.Inodes,
-				OldBlocks: r.UsedBlocks, OldInodes: r.UsedInodes,
-				NewBlocks: journal.AddUsage(r.UsedBlocks, d.Blocks, p, "blocks"),
-				NewInodes: journal.AddUsage(r.UsedInodes, d.Inodes, p, "inodes")}
+			u := journal.QuotaUpdatePayload{Project: p, CoveredBlocks: d.Blocks, CoveredInodes: d.Inodes}
+			if r.Owns(p) {
+				u.OldBlocks, u.OldInodes = r.UsedBlocks, r.UsedInodes
+				u.NewBlocks = journal.AddUsage(r.UsedBlocks, d.Blocks, p, "blocks")
+				u.NewInodes = journal.AddUsage(r.UsedInodes, d.Inodes, p, "inodes")
+			}
 			if err := txn.LogQuotaFlush(&u); err != nil {
 				return err
 			}
@@ -118,12 +123,20 @@ func (f *FS) flushQuota(ctx context.Context) error {
 		return err
 	}
 	for _, u := range flushed {
-		if err := tbl.SetUsage(u.Project, u.NewBlocks, u.NewInodes); err != nil {
+		rec := *used[u.Project]
+		if !rec.Owns(u.Project) {
+			f.noteRecord(u.Project, &rec)
+			continue
+		}
+		rec.UsedBlocks, rec.UsedInodes = u.NewBlocks, u.NewInodes
+		if rec.UsedBlocks == 0 && rec.UsedInodes == 0 && !f.rootCarries(&rec, u.Project) {
+			rec = quota.Record{ID: u.Project}
+			log.Printf("quota: project %d has no root directory and nothing left in it; its record is free", u.Project)
+		}
+		if err := tbl.PutRecord(u.Project, &rec); err != nil {
 			keepLock = true
 			return f.quotaFlushFailed(fmt.Errorf("writing the usage of project %d: %w", u.Project, err))
 		}
-		rec := *used[u.Project]
-		rec.UsedBlocks, rec.UsedInodes = u.NewBlocks, u.NewInodes
 		f.noteRecord(u.Project, &rec)
 	}
 	if err := f.journal.CompleteIntentDurable(seq); err != nil {
@@ -131,6 +144,15 @@ func (f *FS) flushQuota(ctx context.Context) error {
 		return f.quotaFlushFailed(fmt.Errorf("completing the flush: %w", err))
 	}
 	return nil
+}
+
+// rootCarries reports whether the root directory rec names is still in project id; it says yes when it cannot tell.
+func (f *FS) rootCarries(rec *quota.Record, id uint32) bool {
+	root, err := f.inodeTbl.Read(rec.RootInode)
+	if err != nil {
+		return true
+	}
+	return root.Magic == inode.InodeMagic && root.BirthGeneration == rec.RootBirth && root.ProjectID == id
 }
 
 // quotaFlushFailed handles a flush that failed after its commit. A replay of this node's journal writes the flush

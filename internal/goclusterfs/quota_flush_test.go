@@ -202,7 +202,7 @@ func TestAQuotaFoldCutShortIsRedoneOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	folds, err := q.Fold(func(uint32) (uint64, uint64, error) { return 0, 0, nil })
+	folds, err := q.Fold(func(uint32) (uint64, uint64, bool, error) { return 0, 0, true, nil })
 	if err != nil {
 		t.Fatal(err)
 	}

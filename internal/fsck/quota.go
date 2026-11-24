@@ -1,11 +1,13 @@
 package fsck
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
 
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
@@ -128,8 +130,8 @@ func (c *Checker) checkQuotaTable() {
 	c.quotaSectors = sectors
 }
 
-// quotaRecords reads the table's records in use. A record sector that fails its checksum, which checkQuotaTable
-// reported, goes in unknown.
+// quotaRecords reads the table's records in use, by the project that has each. A record sector that fails its
+// checksum, which checkQuotaTable reported, goes in unknown.
 func (c *Checker) quotaRecords() (records map[uint32]*quota.Record, unknown map[uint64]bool) {
 	records, unknown = map[uint32]*quota.Record{}, map[uint64]bool{}
 	sector := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
@@ -139,22 +141,23 @@ func (c *Checker) quotaRecords() (records map[uint32]*quota.Record, unknown map[
 			continue
 		}
 		for k := range quota.RecordsPerSector {
-			id := uint32((s-1)*quota.RecordsPerSector + uint64(k))
+			index := uint32((s-1)*quota.RecordsPerSector + uint64(k))
 			rec, err := quota.GetRecord(sector, k*quota.RecordSize)
 			if err != nil {
 				unknown[s] = true
 				break
 			}
-			if id != 0 && rec.Flags&quota.RecordInUse != 0 {
-				records[id] = rec
+			if index != 0 && rec.Flags&quota.RecordInUse != 0 {
+				records[rec.Owner(index)] = rec
 			}
 		}
 	}
 	return records, unknown
 }
 
-// checkQuotaUsage reports inodes in projects the table has no record for and names whose project their directory
-// does not give, and compares each project's usage in the table with what its inodes use. Repair writes the recount.
+// checkQuotaUsage reports inodes in projects that have no record, which repair takes out of every project, and names
+// whose project their directory does not give. It compares each project's usage in the table with what its inodes
+// use, and repair writes the recount. A record no inode carries and whose root directory is gone, repair frees.
 func (c *Checker) checkQuotaUsage() error {
 	if !c.quotasEnabled() || c.quotaSectors == nil {
 		return nil
@@ -163,31 +166,42 @@ func (c *Checker) checkQuotaUsage() error {
 	if len(records) == 0 && len(c.projectUse) == 0 {
 		return nil
 	}
-	c.reportUnrecordedProjects(records, func(id uint32) bool {
+	unknownAt := func(id uint32) bool {
 		s, _ := quota.RecordLocation(id)
 		return s < uint64(len(c.quotaSectors)) && unknown[s]
-	})
+	}
+	stale := c.reportStaleProjects(records, unknownAt)
 	c.reportStrayEntries(records)
+	if err := c.clearStaleProjects(stale); err != nil {
+		return err
+	}
 
 	if why := c.usageUnverifiable(); why != "" {
 		c.addProblem(PhaseCrossValidation, Info, "quota table", "project usage not checked: "+why, false)
 		return nil
 	}
 	var problems []int
-	sectors := map[uint64]bool{}
+	sectors, free := map[uint64]bool{}, map[uint32]bool{}
 	for _, id := range slices.Sorted(maps.Keys(records)) {
 		rec, use := records[id], c.recount(id)
-		if rec.UsedBlocks == use.blocks && rec.UsedInodes == use.inodes {
-			continue
-		}
 		s, _ := quota.RecordLocation(id)
-		if sectors[s] = true; len(problems) < reportedLeaks {
+		switch {
+		case use.inodes == 0 && use.blocks == 0 && !c.rootCarries(rec, id):
+			c.addProblem(PhaseCrossValidation, Warning, fmt.Sprintf("quota project %d", id),
+				"its record is in use, but no inode is in the project and its root directory is gone; repair frees the record", true)
+			free[id], sectors[s] = true, true
+		case rec.UsedBlocks == use.blocks && rec.UsedInodes == use.inodes:
+			continue
+		case len(problems) < reportedLeaks:
 			c.addProblem(PhaseCrossValidation, Error, fmt.Sprintf("quota project %d", id),
 				fmt.Sprintf("the quota table counts %d blocks and %d inodes, but the project's inodes use %d blocks and %d inodes",
 					rec.UsedBlocks, rec.UsedInodes, use.blocks, use.inodes), true)
-		} else if len(problems) == reportedLeaks {
+			sectors[s] = true
+		case len(problems) == reportedLeaks:
 			c.addProblem(PhaseCrossValidation, Error, "quota table", "more projects count other usage than their inodes use", true)
-		} else {
+			sectors[s] = true
+		default:
+			sectors[s] = true
 			continue
 		}
 		problems = append(problems, c.lastProblem())
@@ -198,7 +212,7 @@ func (c *Checker) checkQuotaUsage() error {
 	if err := c.beforeWrites(); err != nil {
 		return err
 	}
-	if err := c.writeRecount(records, slices.Sorted(maps.Keys(sectors))); err != nil {
+	if err := c.writeRecount(records, slices.Sorted(maps.Keys(sectors)), free); err != nil {
 		return err
 	}
 	c.markRepaired(problems...)
@@ -212,10 +226,20 @@ func (c *Checker) recount(id uint32) projectUsage {
 	return projectUsage{}
 }
 
-// writeRecount sets the usage of every record in use in the given table sectors to the recount.
-func (c *Checker) writeRecount(records map[uint32]*quota.Record, sectors []uint64) error {
+// rootCarries reports whether the root directory rec names is still in project id.
+func (c *Checker) rootCarries(rec *quota.Record, id uint32) bool {
+	return c.inodeUsed[rec.RootInode] && c.inodeBirth[rec.RootInode] == rec.RootBirth && c.projectOf[rec.RootInode] == id
+}
+
+// writeRecount sets the usage of every record in use in the given table sectors to the recount, and frees those in
+// free.
+func (c *Checker) writeRecount(records map[uint32]*quota.Record, sectors []uint64, free map[uint32]bool) error {
 	if c.opts.DryRun {
 		return nil
+	}
+	owners := map[uint32]uint32{}
+	for id := range records {
+		owners[quota.Index(id)] = id
 	}
 	sector := storage.NewAlignedBuffer(storage.SectorSize).Bytes()
 	for _, s := range sectors {
@@ -224,12 +248,18 @@ func (c *Checker) writeRecount(records map[uint32]*quota.Record, sectors []uint6
 			return fmt.Errorf("quota table sector %d: %w", s, err)
 		}
 		for k := range quota.RecordsPerSector {
-			id := uint32((s-1)*quota.RecordsPerSector + uint64(k))
-			if rec := records[id]; rec != nil {
+			id, ok := owners[uint32((s-1)*quota.RecordsPerSector+uint64(k))]
+			if !ok {
+				continue
+			}
+			rec := records[id]
+			if free[id] {
+				rec = &quota.Record{ID: id}
+			} else {
 				use := c.recount(id)
 				rec.UsedBlocks, rec.UsedInodes = use.blocks, use.inodes
-				quota.PutRecord(sector, k*quota.RecordSize, rec)
 			}
+			quota.PutRecord(sector, k*quota.RecordSize, rec)
 		}
 		if _, err := c.dev.WriteAt(sector, int64(at)); err != nil {
 			return fmt.Errorf("quota table sector %d: %w", s, err)
@@ -238,23 +268,74 @@ func (c *Checker) writeRecount(records map[uint32]*quota.Record, sectors []uint6
 	return c.dev.Sync()
 }
 
-func (c *Checker) reportUnrecordedProjects(records map[uint32]*quota.Record, unknown func(uint32) bool) {
+// reportStaleProjects reports, per project, the inodes that carry a project ID no record has: the project's record
+// was freed, or holds a later project. It returns each such project's problem.
+func (c *Checker) reportStaleProjects(records map[uint32]*quota.Record, unknown func(uint32) bool) map[uint32]int {
+	stale := map[uint32]int{}
 	for _, id := range slices.Sorted(maps.Keys(c.projectUse)) {
 		use := c.projectUse[id]
 		if records[id] != nil || use.inodes == 0 || unknown(id) {
 			continue
 		}
 		c.addProblem(PhaseCrossValidation, Error, fmt.Sprintf("quota project %d", id),
-			fmt.Sprintf("%d inodes count against it, inode %d first, but the quota table has no record in use for it", use.inodes, use.first), false)
+			fmt.Sprintf("%d inodes carry it, inode %d first, but no record in the quota table belongs to it; repair takes them out of every project",
+				use.inodes, use.first), true)
+		stale[id] = c.lastProblem()
 	}
+	return stale
+}
+
+// clearStaleProjects takes the inodes of the projects in stale out of every project, as repair.
+func (c *Checker) clearStaleProjects(stale map[uint32]int) error {
+	if len(stale) == 0 || c.opts.Mode != Repair {
+		return nil
+	}
+	if err := c.beforeWrites(); err != nil {
+		return err
+	}
+	var nums []uint32
+	for num, id := range c.projectOf {
+		if _, ok := stale[id]; ok {
+			nums = append(nums, num)
+		}
+	}
+	slices.Sort(nums)
+	if !c.opts.DryRun {
+		sb := c.sbData
+		tbl := inode.NewTable(c.dev, sb.InodeTableOffset, sb.InodeTableSize, nil, [16]byte{})
+		for _, num := range nums {
+			ino, err := tbl.Read(num)
+			if err != nil {
+				return fmt.Errorf("inode %d: %w", num, err)
+			}
+			ino.ProjectID = 0
+			ino.Flags &^= inode.FlagProjInherit
+			if err := tbl.Write(context.Background(), ino); err != nil {
+				return fmt.Errorf("inode %d: %w", num, err)
+			}
+		}
+		if err := c.dev.Sync(); err != nil {
+			return err
+		}
+	}
+	for _, num := range nums {
+		delete(c.projectOf, num)
+	}
+	for id, problem := range stale {
+		delete(c.projectUse, id)
+		c.markRepaired(problem)
+	}
+	return nil
 }
 
 // reportStrayEntries reports names whose inode is in another project than its directory gives new entries. A
-// project's root is the one inode outside every project's directories that may have a project.
+// project's root is the one inode outside every project's directories that may have a project. An inode in a project
+// no record belongs to is left to reportStaleProjects.
 func (c *Checker) reportStrayEntries(records map[uint32]*quota.Record) {
 	n := 0
 	for _, e := range c.strayEntries {
-		if rec := records[e.got]; e.want == 0 && rec != nil && rec.RootInode == e.inode && rec.RootBirth == c.inodeBirth[e.inode] {
+		rec := records[e.got]
+		if e.want == 0 && rec != nil && rec.RootInode == e.inode && rec.RootBirth == c.inodeBirth[e.inode] || e.got != 0 && rec == nil {
 			continue
 		}
 		if n++; n <= reportedLeaks {

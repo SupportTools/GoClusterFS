@@ -547,6 +547,13 @@ func TestReleaseSlotSalvageFoldsQuotaUsage(t *testing.T) {
 	if err := quota.Enable(context.Background(), dev, sb, inodes, blocks); err != nil {
 		t.Fatal(err)
 	}
+	tbl, err := quota.Open(dev, inodes, sb.QuotaInode, sb.DataRegionOffset, uint64(sb.BlockSize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tbl.PutRecord(1, &quota.Record{Flags: quota.RecordInUse, ID: 1}); err != nil {
+		t.Fatal(err)
+	}
 	slot := goneNode(t, dev, sb)
 	journalAt := sb.JournalRegionOffset + uint64(slot)*sb.JournalSlotSize()
 	j, err := journal.Init(dev, journalAt, sb.JournalSlotSize(), [16]byte{1}, 1, journal.DefaultConfig())
@@ -572,10 +579,6 @@ func TestReleaseSlotSalvageFoldsQuotaUsage(t *testing.T) {
 	}
 	if salvaged, err := c.Release(plan, true); err != nil || salvaged.Err != nil {
 		t.Fatalf("Release with salvage: %+v, %v", salvaged, err)
-	}
-	tbl, err := quota.Open(dev, inodes, sb.QuotaInode, sb.DataRegionOffset, uint64(sb.BlockSize))
-	if err != nil {
-		t.Fatal(err)
 	}
 	if r, err := tbl.Record(1); err != nil || r.UsedBlocks != 5 || r.UsedInodes != 1 {
 		t.Errorf("after the salvage project 1 uses %+v, %v; want 5 blocks and 1 inode", r, err)

@@ -168,7 +168,7 @@ func (f *FS) projectRoot(num uint32, tbl quota.Table) (*inode.Inode, *quota.Reco
 		log.Printf("[ERROR] quota: project %d of directory inode %d: %v", ino.ProjectID, num, err)
 		return nil, nil, syscall.EIO
 	}
-	if rec.Flags&quota.RecordInUse == 0 || rec.RootInode != num || rec.RootBirth != ino.BirthGeneration {
+	if !rec.Owns(ino.ProjectID) || rec.RootInode != num || rec.RootBirth != ino.BirthGeneration {
 		return ino, nil, syscall.EPERM
 	}
 	return ino, rec, 0
@@ -227,7 +227,7 @@ func (f *FS) setLimits(ctx context.Context, num uint32, setting quotaSetting) sy
 		log.Printf("[ERROR] quota: %v", err)
 		return syscall.EIO
 	}
-	id, err := tbl.FreeID(h.NextProjectID)
+	index, err := tbl.FreeID(h.NextProjectID)
 	if errors.Is(err, quota.ErrTableFull) {
 		log.Printf("[WARN] quota: no project for directory inode %d: %v", num, err)
 		return syscall.ENOSPC
@@ -235,12 +235,18 @@ func (f *FS) setLimits(ctx context.Context, num uint32, setting quotaSetting) sy
 		log.Printf("[ERROR] quota: %v", err)
 		return syscall.EIO
 	}
-	h.NextProjectID = id + 1
+	free, err := tbl.Record(index)
+	if err != nil {
+		log.Printf("[ERROR] quota: %v", err)
+		return syscall.EIO
+	}
+	id := free.NextID(index)
+	h.NextProjectID = index + 1
 	if err := tbl.PutHeader(h); err != nil {
 		log.Printf("[ERROR] quota: %v", err)
 		return syscall.EIO
 	}
-	rec = &quota.Record{RootInode: num, RootBirth: ino.BirthGeneration, Flags: quota.RecordInUse}
+	rec = &quota.Record{RootInode: num, RootBirth: ino.BirthGeneration, Flags: quota.RecordInUse, ID: id}
 	setting.apply(rec, f.dataBlockSize())
 	if err := tbl.PutRecord(id, rec); err != nil {
 		log.Printf("[ERROR] quota: project %d: %v", id, err)
@@ -318,6 +324,9 @@ func (f *FS) projectQuota(num uint32) (*quota.Status, syscall.Errno) {
 	rec, err := tbl.Record(ino.ProjectID)
 	if err != nil {
 		return nil, syscall.EIO
+	}
+	if !rec.Owns(ino.ProjectID) {
+		return nil, syscall.ENODATA
 	}
 	usedBlocks, usedInodes := f.projectUsage(ino.ProjectID, rec)
 	blockSize := f.dataBlockSize()
@@ -446,5 +455,5 @@ func (f *FS) crossesProject(child, dir *inode.Inode) bool {
 		return true
 	}
 	rec, err := tbl.Record(child.ProjectID)
-	return err != nil || rec.RootInode != child.InodeNum || rec.RootBirth != child.BirthGeneration
+	return err != nil || !rec.Owns(child.ProjectID) || rec.RootInode != child.InodeNum || rec.RootBirth != child.BirthGeneration
 }
