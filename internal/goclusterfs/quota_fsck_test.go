@@ -280,7 +280,7 @@ func TestFsckReportsInodesInTheWrongProject(t *testing.T) {
 
 	r := runFsck(t, fsys, fsck.DefaultOptions())
 	want := map[string]bool{
-		fmt.Sprintf(`entry "outside" names inode %d, which counts against project 1, but the directory gives its entries project 0`, outside.inodeNum): false,
+		fmt.Sprintf(`entry "outside" names inode %d, which counts against project 1, but the directory gives its entries project 0`, outside.inodeNum):            false,
 		fmt.Sprintf("1 inodes carry it, inode %d first, but no record in the quota table belongs to it; repair takes them out of every project", inside.inodeNum): true,
 	}
 	ps := quotaProblems(r)
