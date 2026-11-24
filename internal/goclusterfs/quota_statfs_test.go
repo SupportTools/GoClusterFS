@@ -20,7 +20,8 @@ func statfsOf(t *testing.T, node interface {
 }
 
 // statfs on a directory or file in a project with limits reports the project: its limits as the size, and what they
-// leave as the free blocks and inodes. Outside a project, and for a limit left unset, it reports the volume.
+// leave as the free blocks and inodes. Outside a project, for a limit left unset, and where a limit promises more than
+// the volume has, it reports the volume.
 func TestStatfsReportsTheProjectLimits(t *testing.T) {
 	fsys, _, _, _ := journaledFS(t)
 	fsys = withBridge(fsys)
@@ -28,6 +29,7 @@ func TestStatfsReportsTheProjectLimits(t *testing.T) {
 	plain := mkdirIn(t, fsys, "plain")
 	pvc := limitedProject(t, fsys, "pvc", "bytes=10485760 inodes=5")
 	only := limitedProject(t, fsys, "only-inodes", "inodes=4")
+	big := limitedProject(t, fsys, "overcommitted", "bytes=1099511627776")
 	f := createIn(t, pvc, "f")
 	writeAt(t, f, pattern(1, int(2*bs)), 0)
 
@@ -41,6 +43,10 @@ func TestStatfsReportsTheProjectLimits(t *testing.T) {
 			t.Errorf("statfs on %s = blocks %d free %d avail %d, inodes %d free %d; want 10, 7, 7, 5, 3",
 				name, got.Blocks, got.Bfree, got.Bavail, got.Files, got.Ffree)
 		}
+	}
+	if got := statfsOf(t, big); got.Blocks != vol.Blocks || got.Bfree != vol.Bfree || got.Bavail != vol.Bavail {
+		t.Errorf("statfs on a project whose 1 TB limit passes the volume = blocks %d free %d avail %d; want the volume's %d, %d, %d",
+			got.Blocks, got.Bfree, got.Bavail, vol.Blocks, vol.Bfree, vol.Bavail)
 	}
 	if got := statfsOf(t, only); got.Blocks != vol.Blocks || got.Files != 4 || got.Ffree != 3 {
 		t.Errorf("statfs on a project with only an inode limit = blocks %d, inodes %d free %d; want the volume's %d blocks and 4, 3",
