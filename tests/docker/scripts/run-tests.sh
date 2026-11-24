@@ -3943,7 +3943,16 @@ test_quota_orphan_after_crash() {
     exec_on_node "$node_a" mkdir "$dir" || return 1
     exec_on_node "$node_a" setfattr -n trusted.goclusterfs.quota -v "bytes=1073741824 inodes=100" "$dir" || return 1
     local before during after waited=0
-    before=$(quota_usage "$node_b" "$dir") || return 1
+    # The project's root directory counts once node A has flushed it, within a second or so.
+    while before=$(quota_usage "$node_b" "$dir") && [[ "$before" != *"used_inodes=1" ]]; do
+        if [[ $waited -ge 10 ]]; then
+            log "ERROR: node B reads '$before' 10s after the quota was set, want the root directory's inode"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    waited=0
 
     docker exec -d "$node_a" sh -c "exec 3>$file; head -c 2097152 /dev/zero >&3; rm $file; sleep 600"
     while exec_on_node "$node_a" test -e "$file" 2>/dev/null || [[ $waited -lt 3 ]]; do

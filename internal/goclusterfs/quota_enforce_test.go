@@ -41,6 +41,9 @@ func TestQuotaRefusesWhatPassesTheLimits(t *testing.T) {
 	if _, errno := pvc.Symlink(ctx, "short", "s2", &fuse.EntryOut{}); errno != syscall.EDQUOT {
 		t.Errorf("a symlink past the inode limit: %v, want EDQUOT", errno)
 	}
+	if _, errno := pvc.Mkdir(ctx, "d2", 0o755, &fuse.EntryOut{}); errno != syscall.EDQUOT {
+		t.Errorf("a mkdir past the inode limit: %v, want EDQUOT", errno)
+	}
 	if _, errno := f.Write(ctx, nil, pattern(2, int(bs)), 3*bs); errno != syscall.EDQUOT {
 		t.Errorf("a sixth block under a limit of 5: %v, want EDQUOT", errno)
 	}
