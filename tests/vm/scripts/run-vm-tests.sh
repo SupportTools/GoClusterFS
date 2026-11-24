@@ -5817,6 +5817,187 @@ test_extent_tree_interleaved_appends() {
     return 0
 }
 
+# =============================================================================
+# Project quotas across power cuts
+# =============================================================================
+
+# quota_restart formats the volume through VM 1 and mounts VM 2, with mount environments $1 and $2, and makes
+# ${GOCLUSTERFS_MOUNT}/qa a project with a 64 MB limit.
+quota_restart() {
+    local env1="${1:-}" env2="${2:-}" vm
+    for vm in 1 2; do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || crash_goclusterfs "$vm" || return 1
+        fi
+        ssh_run "$vm" "fusermount3 -uz ${GOCLUSTERFS_MOUNT} 2>/dev/null; true"
+    done
+    setup_goclusterfs 1 true "$env1" || return 1
+    setup_goclusterfs 2 false "$env2" || return 1
+    ssh_run 1 "mkdir ${GOCLUSTERFS_MOUNT}/qa && setfattr -n trusted.goclusterfs.quota -v 'bytes=67108864 inodes=0' ${GOCLUSTERFS_MOUNT}/qa"
+}
+
+# quota_used prints the used bytes and inodes VM $1 reports for project directory $2.
+quota_used() {
+    ssh_run "$1" "getfattr --only-values -n trusted.goclusterfs.quota ${GOCLUSTERFS_MOUNT}/$2" |
+        sed -n 's/.*used_bytes=\([0-9]*\) used_inodes=\([0-9]*\).*/\1 \2/p'
+}
+
+# quota_power_up boots VM $1 again after a power cut and mounts it.
+quota_power_up() {
+    start_vm "$1" false && wait_vm_healthy "$1" && setup_goclusterfs "$1" false
+}
+
+# quota_fsck unmounts VMs 1 and 2, runs goclusterfs-fsck $1 on VM 1, and prints its quota project lines. It fails
+# when fsck could not compare usage, as with a journal left to replay, so no check passes without one.
+quota_fsck() {
+    local vm out
+    for vm in 1 2; do
+        if [[ -n "$(mount_pids "$vm")" ]]; then
+            unmount_goclusterfs "$vm" || return 1
+        fi
+    done
+    out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck ${1:-} $(cluster_device) 2>&1")
+    if grep -q "usage not checked" <<< "$out"; then
+        log_error "fsck did not check project usage: $(grep "usage not checked" <<< "$out")"
+        return 1
+    fi
+    grep "quota project" <<< "$out"
+    return 0
+}
+
+# quota_check_exact checks that fsck finds no quota project problem, then mounts both nodes again.
+quota_check_exact() {
+    local lines
+    lines=$(quota_fsck) || return 1
+    if [[ -n "$lines" ]]; then
+        log_error "fsck finds project usage the table does not match:"
+        echo "$lines" >&2
+        return 1
+    fi
+    setup_goclusterfs 1 false && setup_goclusterfs 2 false
+}
+
+# A node power-cut after its flush is in the journal and before it writes the table: its peer's replay applies the
+# flush once, and the table matches the recount.
+test_quota_flush_window_power_cut() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local marker="quota flush window $(date +%s)"
+    # The flush that holds may be the one that carries the new project's own charge.
+    mark_vm_logs "$marker"
+    quota_restart "GOCLUSTERFS_TEST_QUOTA_FLUSH_HOLD=300s" "" || return 1
+    ssh_run 1 "dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/qa/f bs=1M count=8 conv=fsync 2>/dev/null" || return 1
+    wait_log 1 "the flush of .* is committed; holding" 30 "$marker" || return 1
+    kill_vm 1 || return 1
+    wait_log 2 "folded the usage of" 120 "$marker" || return 1
+    wait_log 2 "\[Recovery\] Completed" 60 "$marker" || return 1
+    log_info "after VM 1's replay, VM 2 reports used bytes and inodes: $(quota_used 2 qa)"
+    quota_power_up 1 || return 1
+    quota_check_exact
+}
+
+# A replayer power-cut after its fold of a dead journal is in that journal and before it writes the usage: the next
+# replay of that journal redoes the fold once.
+test_quota_fold_window_power_cut() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local marker="quota fold window $(date +%s)"
+    mark_vm_logs "$marker"
+    quota_restart "GOCLUSTERFS_TEST_QUOTA_FLUSH_HOLD=300s" "GOCLUSTERFS_TEST_QUOTA_FOLD_HOLD=300s" || return 1
+    ssh_run 1 "dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/qa/f bs=1M count=8 conv=fsync 2>/dev/null" || return 1
+    wait_log 1 "the flush of .* is committed; holding" 30 "$marker" || return 1
+    kill_vm 1 || return 1
+    wait_log 2 "the fold of slot .* is in its journal; holding" 120 "$marker" || return 1
+    kill_vm 2 || return 1
+    start_vm 1 false && wait_vm_healthy 1 || return 1
+    start_vm 2 false && wait_vm_healthy 2 || return 1
+    setup_goclusterfs 1 false || return 1
+    setup_goclusterfs 2 false || return 1
+    # The dead replayer left VM 1's old slot mid-recovery, so VM 1 may come back in a new slot; the fold is redone once
+    # a node replays the old one.
+    local waited=0 vm
+    until [[ "$(for vm in 1 2; do sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")"; done)" == *"folded the usage of"* ]]; do
+        if [[ $waited -ge 180 ]]; then
+            log_error "no node redid the fold within 180s of both nodes mounting again"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    sleep 2
+    log_info "after the fold was redone, VM 1 reports used bytes and inodes: $(quota_used 1 qa)"
+    quota_check_exact
+}
+
+# A node power-cut while it writes into a project: a charge logged before its write landed may leave usage high by
+# at most one write request of 1 MiB, never low, and fsck -repair then leaves the volume clean.
+test_quota_midwrite_power_cut() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local marker="quota mid-write $(date +%s)" bs lines line up inodes bound
+    quota_restart "" "" || return 1
+    mark_vm_logs "$marker"
+    ssh_run 1 "nohup dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/qa/f bs=1M count=48 conv=fsync < /dev/null > /dev/null 2>&1 &"
+    sleep 3
+    kill_vm 1 || return 1
+    wait_log 2 "\[Recovery\] Completed" 120 "$marker" || return 1
+    quota_power_up 1 || return 1
+    bs=$(sed -n 's/.*Block size: \([0-9]*\) KB.*/\1/p' "$(get_vm_mount_log 2)" | tail -1)
+    bound=$(( (1024 + bs - 1) / bs ))
+    lines=$(quota_fsck) || return 1
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        read -r up inodes <<< "$(echo "$line" | sed -n 's/.*counts \([0-9]*\) blocks and \([0-9]*\) inodes, but .* use \([0-9]*\) blocks and \([0-9]*\) inodes.*/\1 \3 \2 \4/p' | awk '{print $1 - $2, $3 - $4}')"
+        if [[ -z "$up" || "$up" -lt 0 || "$up" -gt "$bound" || "$inodes" != 0 ]]; then
+            log_error "usage drifted past one write request ($bound blocks up, no inodes): $line"
+            return 1
+        fi
+        log_info "usage drifted up by $up blocks, within one write request: $line"
+    done <<< "$lines"
+    if [[ -n "$lines" ]]; then
+        quota_fsck -repair > /dev/null || return 1
+    fi
+    quota_check_exact
+}
+
+# A node power-cut while it holds open a project's file that it unlinked: the replay frees the file and takes its
+# blocks off the project.
+test_quota_orphan_power_cut() {
+    if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
+        log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
+        return 0
+    fi
+    local marker="quota orphan $(date +%s)" before after
+    quota_restart "" "" || return 1
+    ssh_run 1 "dd if=/dev/urandom of=${GOCLUSTERFS_MOUNT}/qa/f bs=1M count=8 conv=fsync 2>/dev/null" || return 1
+    sleep 3
+    before=$(quota_used 2 qa)
+    ssh_run 1 "nohup sh -c 'exec 3< ${GOCLUSTERFS_MOUNT}/qa/f; rm ${GOCLUSTERFS_MOUNT}/qa/f; sleep 600' < /dev/null > /dev/null 2>&1 &"
+    sleep 3
+    if ssh_run 1 "test -e ${GOCLUSTERFS_MOUNT}/qa/f"; then
+        log_error "VM 1 did not unlink the open file"
+        return 1
+    fi
+    mark_vm_logs "$marker"
+    kill_vm 1 || return 1
+    wait_log 2 "\[Recovery\] Completed" 120 "$marker" || return 1
+    sleep 3
+    after=$(quota_used 2 qa)
+    log_info "used bytes and inodes before the unlink: $before; after VM 1's replay: $after"
+    if [[ "${after% *}" != "$(( ${before% *} - 8 * 1048576 ))" || "${after#* }" != "$(( ${before#* } - 1 ))" ]]; then
+        log_error "the replay did not take the orphan's 8 MiB and inode off the project: before $before, after $after"
+        return 1
+    fi
+    quota_power_up 1 || return 1
+    quota_check_exact
+}
+
 main() {
     log_info "Starting VM test suite with $NODE_COUNT VMs..."
 
@@ -5960,6 +6141,10 @@ main() {
     run_test "Fencing: Rejoin After Relogin And Power Cut" test_fencing_rejoin_relogin_power_cut
     run_test "Fencing: Rejoin After Takeover And Power Cut" test_fencing_rejoin_takeover_power_cut
     run_test "Fencing: Rejoin After Power Cut" test_fencing_rejoin_power_cut
+    run_test "Quota: Flush Window Power Cut" test_quota_flush_window_power_cut
+    run_test "Quota: Fold Window Power Cut" test_quota_fold_window_power_cut
+    run_test "Quota: Mid-Write Power Cut" test_quota_midwrite_power_cut
+    run_test "Quota: Orphan Power Cut" test_quota_orphan_power_cut
     run_test "Hostile: Storage Latency Spikes" test_storage_latency_spikes
     run_test "Hostile: Short Storage Stalls" test_storage_short_stalls
     run_test "Hostile: Long Storage Stall" test_storage_long_stall

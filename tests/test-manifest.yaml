@@ -5398,6 +5398,13 @@ scenarios:
     environments:
       go: forget_test.go::TestRenamesUnderForgetPressure
 
+  - id: mount-memory-limit-from-cgroup
+    name: The Go memory limit comes from the cgroup
+    description: The smallest memory limit from the process's cgroup up to the root sets the Go memory limit, on cgroup v2 (memory.max) and v1 (memory.limit_in_bytes); max and v1's near-2^63 value mean no limit
+    priority: go_only
+    environments:
+      go: cmd/goclusterfs-mount/memlimit_test.go::TestCgroupMemoryLimit
+
   - id: api-snapshot-lifecycle
     name: API snapshot, clone and delete
     description: The API creates, lists, clones and deletes snapshots and clones files through setxattr on the mount, the same path as setfattr; bad paths, names and destinations are refused
@@ -6152,7 +6159,7 @@ scenarios:
     environments:
       go: TODO  # mount's ordering of the quota table before ForgetSlot lives in cmd/goclusterfs-mount main; quota_charge_test.go covers the replay side
       docker: run-tests.sh::test_quota_orphan_after_crash
-      vm: TODO  # Docker's container kill covers the crash; the VM harness adds power cuts, which the replay tests cover
+      vm: run-vm-tests.sh::test_quota_orphan_power_cut
 
   - id: quota-orphan-freed-once
     name: An orphan freed after a crash is credited once
@@ -7501,3 +7508,24 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/fairness_test.go::TestSlowWaitersGetTurnsFromALowSlotThatKeepsTheLock
+
+  - id: quota-flush-window-power-cut
+    name: Power cut between a quota flush's commit and its table write
+    description: A node holds its quota flush after the commit and before the table write and loses power; its peer's replay applies the flush once, and fsck with every node unmounted finds the table equal to the recount
+    priority: vm_only  # needs a power cut inside a failpoint hold
+    environments:
+      vm: run-vm-tests.sh::test_quota_flush_window_power_cut
+
+  - id: quota-fold-window-power-cut
+    name: Power cut between a dead journal's quota fold and its writes
+    description: A node dies mid-flush, and its replayer holds after appending the fold to the dead journal and loses power too; the dead node's own mount redoes the fold once, and fsck finds the table equal to the recount
+    priority: vm_only  # needs two power cuts inside failpoint holds
+    environments:
+      vm: run-vm-tests.sh::test_quota_fold_window_power_cut
+
+  - id: quota-midwrite-power-cut
+    name: Power cut while a node writes into a project
+    description: A node loses power during a 48 MiB write into a project; fsck finds usage equal to the recount or high by at most one 1 MiB write request, never low and never in inodes, and after -repair finds it equal
+    priority: vm_only  # needs a power cut
+    environments:
+      vm: run-vm-tests.sh::test_quota_midwrite_power_cut

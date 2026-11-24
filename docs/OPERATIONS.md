@@ -674,6 +674,8 @@ When `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity` 
 
 **Files the kernel caches.** The mount keeps about 400 bytes of memory for each file, directory and symlink the kernel holds in its dentry cache, and frees it when the kernel drops the entry, as the kernel does under memory pressure, within the container's memory limit in Kubernetes. A walk of 3 million files, such as a backup, costs about 1.3 GB until the kernel lets them go.
 
+**Memory limit.** In a cgroup with a memory limit, such as a Kubernetes container or a systemd service with `MemoryMax`, the mount sets Go's memory limit to 90% of the smallest limit from its cgroup up, so the garbage collector works harder before the limit kills the mount. It logs `Memory: the cgroup allows N MB, so the Go memory limit is M MB`. Set `GOMEMLIMIT` to choose another limit.
+
 ```bash
 # Read-heavy, changes from other nodes may show up later
 goclusterfs-mount ... -cache-ttl 30s

@@ -156,6 +156,7 @@ func main() {
 	}
 	logging.SetDebug(*debug)
 	dumpGoroutinesOnSIGUSR1()
+	setMemoryLimit()
 	collectGarbageForTests()
 
 	if *showVer {
