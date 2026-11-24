@@ -5707,7 +5707,7 @@ scenarios:
 
   - id: quota-record-freed
     name: A project's record is freed once the project is gone
-    description: After its root directory is removed with nothing left in it, the flush frees the project's record, and the next directory in that record gets a new project ID
+    description: After its root directory is removed with nothing left in it, the flush frees the project's record; the next project takes the record after the last one handed out, round-robin, and the directory that reuses the freed record gets a new project ID
     priority: go_only
     environments:
       go: internal/goclusterfs/quota_free_test.go::TestQuotaRecordFreedOnceItsProjectIsGone

@@ -47,8 +47,9 @@ func reuseRecord(t *testing.T, fsys *FS, id uint32, blocks, inodes uint64) uint3
 	return later
 }
 
-// A project's record is freed at the flush after its root directory is removed with nothing left in the project, and
-// the next project in the record gets a new ID.
+// A project's record is freed at the flush after its root directory is removed with nothing left in the project. The
+// next new project takes the record after the last one handed out, not the freed one, and the project that reuses a
+// record gets a new ID.
 func TestQuotaRecordFreedOnceItsProjectIsGone(t *testing.T) {
 	fsys, _, _, _ := journaledFS(t)
 	fsys = withBridge(fsys)
@@ -72,6 +73,9 @@ func TestQuotaRecordFreedOnceItsProjectIsGone(t *testing.T) {
 	flushQuota(t, fsys)
 	if rec := record(t, fsys, 1); rec.Flags&quota.RecordInUse != 0 || rec.ID != 1 {
 		t.Fatalf("after its root directory went project 1's record is %+v; want it free, naming project 1 last", rec)
+	}
+	if got := quotaOf(t, quotaProject(t, fsys, "second")); !strings.HasPrefix(got, "project=2 ") {
+		t.Errorf("the next project after a free reads %q; want record 2, round-robin, not the freed record 1", got)
 	}
 
 	tbl, err := fsys.quotaTable()
