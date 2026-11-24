@@ -9,9 +9,12 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 	"github.com/supporttools/GoClusterFS/internal/quota"
+	"github.com/supporttools/GoClusterFS/internal/storage"
+	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
 func record(t *testing.T, fsys *FS, id uint32) *quota.Record {
@@ -217,5 +220,29 @@ func TestQuotaProjectWithAReusedRecordHasNoLimits(t *testing.T) {
 	}
 	if errno := pvc.Statfs(context.Background(), &got); errno != 0 || got.Blocks != vol.Blocks {
 		t.Errorf("statfs reports %d blocks, %v; want the volume's %d", got.Blocks, errno, vol.Blocks)
+	}
+}
+
+// A flush that cannot read a project's root directory takes it as still in the project, and keeps the record.
+func TestQuotaRootThatCannotBeReadKeepsItsRecord(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	sb, err := superblock.Read(fsys.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := record(t, fsys, 1)
+	sector := int64(sb.InodeTableOffset + uint64(pvc.inodeNum)*inode.InodeSize&^(storage.SectorSize-1))
+	fsys.dev.SetReadFault(func(off int64) error {
+		if off == sector {
+			return syscall.EIO
+		}
+		return nil
+	})
+	carries := fsys.rootCarries(rec, 1)
+	fsys.dev.SetReadFault(func(int64) error { return nil })
+	if !carries {
+		t.Error("with its root directory unreadable project 1's root counts as gone; want it kept in the project")
 	}
 }

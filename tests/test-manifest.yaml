@@ -5733,6 +5733,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_free_test.go::TestQuotaProjectWithAReusedRecordHasNoLimits
 
+  - id: quota-unreadable-root-kept
+    name: A root the flush cannot read keeps its record
+    description: When reading a project's root directory fails, the flush takes the root as still in the project and does not free the record
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestQuotaRootThatCannotBeReadKeepsItsRecord
+
   - id: quota-stale-fold-dropped
     name: A fold drops changes of a reused record
     description: A crashed node's journal holding changes of a project whose record was freed and given to a later project folds without touching the later project, while another project's changes still fold
