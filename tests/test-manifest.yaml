@@ -5377,6 +5377,27 @@ scenarios:
   # HTTP API writes (one mount on one host)
   # ===========================================================================
 
+  - id: fuse-nodes-freed-on-forget
+    name: The mount frees its nodes when the kernel forgets them
+    description: After a stat of every file on a fresh mount, the kernel dropping its cached entries (drop_caches as root, or memory.reclaim on a user-owned cgroup) brings the mount's heap back to within half of what the walk added; GOCLUSTERFS_TEST_FORGET_NAMES scales it to millions
+    priority: go_only
+    environments:
+      go: forget_test.go::TestKernelForgetFreesNodes
+
+  - id: fuse-forget-handles-cwd-moves
+    name: Forgotten nodes keep handles, working directories and moves working
+    description: With the kernel forgetting everything it does not hold on both nodes, an open file, an open directory, a working directory, a move by the other node and a rename of the moved directory keep working, and a file unlinked while open keeps its data
+    priority: go_only
+    environments:
+      go: forget_test.go::TestForgottenNodesKeepHandlesCwdAndMoves
+
+  - id: fuse-renames-under-forget-pressure
+    name: Renames under forget pressure
+    description: Directories move between three parents from both nodes while the kernel forgets everything it does not hold every 100 ms; every move succeeds and the files follow; GOCLUSTERFS_TEST_SOAK sets the length
+    priority: go_only
+    environments:
+      go: forget_test.go::TestRenamesUnderForgetPressure
+
   - id: mount-memory-limit-from-cgroup
     name: The Go memory limit comes from the cgroup
     description: The smallest memory limit from the process's cgroup up to the root sets the Go memory limit, on cgroup v2 (memory.max) and v1 (memory.limit_in_bytes); max and v1's near-2^63 value mean no limit

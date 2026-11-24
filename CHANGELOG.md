@@ -127,6 +127,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A mount kept about 420 bytes of memory for every file and directory it ever looked up or created, until the name was removed or the mount ended: 1.3 GB after a walk of 3 million files. It now frees them when the kernel drops its cached entries, as it does under memory pressure.
+
 - Creates, mkdirs and symlinks running at once on one node failed with EAGAIN, and the mount logged `lost 5 races with other nodes` with no other node mounted. Every create found the same free inode, then committed to the journal before claiming it, so the losers kept colliding: with 16 parallel creators, about 17% of creates failed. A node now hands each of its creates a free inode no other local create holds.
 - `df` and `statfs` on a directory or file below the root reported zero size, blocks and inodes, because only the root answered them. They now report the volume.
 

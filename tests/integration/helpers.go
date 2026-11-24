@@ -253,7 +253,7 @@ func (m *MountedFS) Mount(debug bool) error {
 	// Create a fresh context for this mount operation
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
+	m.MountCmd = m.mountCommand(args)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -287,7 +287,7 @@ func (m *MountedFS) FormatAndMount(debug bool) error {
 	args = append(args, m.portArgs...)
 	args = append(args, m.ExtraArgs...)
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
+	m.MountCmd = m.mountCommand(args)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -435,6 +435,17 @@ func (m *MountedFS) IsMounted() bool {
 		return false
 	}
 	return strings.Contains(string(data), m.MountPoint)
+}
+
+// mountsInOwnScope starts each mount in a systemd user scope of its own. kernelForget sets it when the tests make the
+// kernel forget through memory.reclaim on their own cgroup, which would stall reclaiming the FUSE daemon's memory.
+var mountsInOwnScope bool
+
+func (m *MountedFS) mountCommand(args []string) *exec.Cmd {
+	if mountsInOwnScope {
+		return exec.CommandContext(m.ctx, "systemd-run", append([]string{"--user", "--scope", "--quiet", "--collect", m.BinaryPath}, withTestBlockSize(args)...)...)
+	}
+	return exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
 }
 
 // environ is the mount process environment: the test's, plus Env.
@@ -611,7 +622,7 @@ func (m *MountedFS) FormatAndMountWithSFB(debug bool) error {
 	}
 	args = append(args, m.portArgs...)
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
+	m.MountCmd = m.mountCommand(args)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
@@ -646,7 +657,7 @@ func (m *MountedFS) MountWithSFB(debug bool) error {
 	// Create a fresh context for this mount operation
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
-	m.MountCmd = exec.CommandContext(m.ctx, m.BinaryPath, withTestBlockSize(args)...)
+	m.MountCmd = m.mountCommand(args)
 	m.MountCmd.Stdout = m.output()
 	m.MountCmd.Stderr = m.MountCmd.Stdout
 	m.MountCmd.Env = m.environ()
