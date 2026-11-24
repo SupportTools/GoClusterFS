@@ -5920,7 +5920,7 @@ test_quota_fold_window_power_cut() {
     # The dead replayer left VM 1's old slot mid-recovery, so VM 1 may come back in a new slot; the fold is redone once
     # a node replays the old one.
     local waited=0 vm
-    until for vm in 1 2; do sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")"; done | grep -q "folded the usage of"; do
+    until [[ "$(for vm in 1 2; do sed -n "/$marker/,\$p" "$(get_vm_mount_log "$vm")"; done)" == *"folded the usage of"* ]]; do
         if [[ $waited -ge 180 ]]; then
             log_error "no node redid the fold within 180s of both nodes mounting again"
             return 1
