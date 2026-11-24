@@ -5705,6 +5705,62 @@ scenarios:
     environments:
       go: internal/quota/enable_test.go::TestEnableCreatesTheTable
 
+  - id: quota-record-freed
+    name: A project's record is freed once the project is gone
+    description: After its root directory is removed with nothing left in it, the flush frees the project's record, and the next directory in that record gets a new project ID
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestQuotaRecordFreedOnceItsProjectIsGone
+
+  - id: quota-record-kept-for-orphan
+    name: A project's record stays while an orphan is in it
+    description: A file unlinked while open keeps its project's record in use after the root directory goes, until its last close
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestQuotaRecordKeptWhileAnOrphanIsInIt
+
+  - id: quota-record-kept-with-root
+    name: A project's record stays while its root directory is there
+    description: A project whose usage drifted down to nothing keeps its record while its root directory still carries the project
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestQuotaRecordKeptWhileItsRootIsThere
+
+  - id: quota-reused-record-no-limits
+    name: A project whose record was reused has no limits
+    description: A directory whose project's record a later project took gets no limits, ENODATA for its quota and the volume's statfs
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestQuotaProjectWithAReusedRecordHasNoLimits
+
+  - id: quota-stale-fold-dropped
+    name: A fold drops changes of a reused record
+    description: A crashed node's journal holding changes of a project whose record was freed and given to a later project folds without touching the later project, while another project's changes still fold
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestStaleQuotaChangesAreDroppedAtTheFold
+
+  - id: quota-stale-flush-dropped
+    name: A flush drops changes of a reused record
+    description: A node's own unflushed changes of a project whose record a peer reused are dropped at its flush, and stop pinning the journal
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_free_test.go::TestQuotaFlushDropsChangesOfAReusedRecord
+
+  - id: quota-fsck-stale-projects
+    name: fsck repairs stale project IDs and leftover records
+    description: Inodes carrying a project no record belongs to are reported as fixable and repair takes them out of every project; a record no inode carries whose root directory is gone, repair frees
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_fsck_test.go::TestFsckRepairsStaleProjectsAndLeftoverRecords
+
+  - id: quota-record-ownership
+    name: Project IDs name their record and its reuse
+    description: A record belongs to the ID it stores, or its index when an older build wrote it, only while in use; each reuse adds 1<<20 to the ID and wraps
+    priority: go_only
+    environments:
+      go: internal/quota/table_test.go::TestRecordOwnership
+
   - id: bitmap-alloc-contiguous
     name: The bitmap allocates a run of blocks in a row
     description: AllocContiguous takes the first free run long enough, skipping shorter gaps, finds a run that crosses a bitmap sector, and fails with ErrNoFreeBlocks when no gap is long enough

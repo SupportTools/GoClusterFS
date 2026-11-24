@@ -4,7 +4,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/supporttools/GoClusterFS/internal/journal"
 	"github.com/supporttools/GoClusterFS/internal/lock"
@@ -170,5 +173,45 @@ func TestQuotaFlushDropsChangesOfAReusedRecord(t *testing.T) {
 	}
 	if head, tail := fsys.journal.Region().HeadOffset(), fsys.journal.Region().TailOffset(); head != tail {
 		t.Errorf("a checkpoint stopped at %d, short of the tail at %d: the dropped changes still pin the journal", head, tail)
+	}
+}
+
+// A project whose usage drifted down to nothing keeps its record while its root directory is still in it.
+func TestQuotaRecordKeptWhileItsRootIsThere(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	quotaProject(t, fsys, "pvc")
+	flushQuota(t, fsys)
+	used := tableUsage(t, fsys, 1)
+	commitDelta(t, fsys, 1, -int64(used[0]), -int64(used[1]))
+	flushQuota(t, fsys)
+	if rec := record(t, fsys, 1); !rec.Owns(1) || rec.UsedBlocks != 0 || rec.UsedInodes != 0 {
+		t.Errorf("with its usage at nothing and its root directory there project 1's record is %+v; want it kept", rec)
+	}
+}
+
+// A directory whose project's record a later project took has no project to the runtime: no limits, no quota to read,
+// and statfs reports the volume.
+func TestQuotaProjectWithAReusedRecordHasNoLimits(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	flushQuota(t, fsys)
+	later := uint32(1 + 1<<quota.IndexBits)
+	putRecord(t, fsys, later, &quota.Record{ID: later, Flags: quota.RecordInUse, LimitBlocks: 1, LimitInodes: 1, UsedBlocks: 1, UsedInodes: 1})
+	if _, err := fsys.projectRecord(1, true); err != nil {
+		t.Fatal(err)
+	}
+
+	writeAt(t, createIn(t, pvc, "f"), pattern(1, int(fsys.dataBlockSize())), 0)
+	if _, errno := pvc.Getxattr(context.Background(), quotaXattr, make([]byte, 256)); errno != syscall.ENODATA {
+		t.Errorf("reading the quota: %v, want ENODATA", errno)
+	}
+	var vol, got fuse.StatfsOut
+	if errno := fsys.Statfs(context.Background(), &vol); errno != 0 {
+		t.Fatal(errno)
+	}
+	if errno := pvc.Statfs(context.Background(), &got); errno != 0 || got.Blocks != vol.Blocks {
+		t.Errorf("statfs reports %d blocks, %v; want the volume's %d", got.Blocks, errno, vol.Blocks)
 	}
 }
