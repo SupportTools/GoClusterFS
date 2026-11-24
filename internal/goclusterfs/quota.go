@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
+	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/supporttools/GoClusterFS/internal/inode"
 	"github.com/supporttools/GoClusterFS/internal/journal"
@@ -20,6 +21,8 @@ import (
 const quotaXattr = "trusted.goclusterfs.quota"
 
 var (
+	_ fs.NodeStatfser      = (*Dir)(nil)
+	_ fs.NodeStatfser      = (*File)(nil)
 	_ fs.NodeGetxattrer    = (*Dir)(nil)
 	_ fs.NodeSetxattrer    = (*Dir)(nil)
 	_ fs.NodeRemovexattrer = (*Dir)(nil)
@@ -302,14 +305,62 @@ func (f *FS) quotaValue(num uint32) (string, syscall.Errno) {
 	if err != nil {
 		return "", syscall.EIO
 	}
-	usedBlocks, usedInodes := rec.UsedBlocks, rec.UsedInodes
-	if f.journal != nil {
-		d := f.journal.QuotaPending()[ino.ProjectID]
-		usedBlocks, usedInodes = uint64(max(int64(usedBlocks)+d.Blocks, 0)), uint64(max(int64(usedInodes)+d.Inodes, 0))
-	}
+	usedBlocks, usedInodes := f.projectUsage(ino.ProjectID, rec)
 	blockSize := f.dataBlockSize()
 	return fmt.Sprintf("project=%d bytes=%d inodes=%d used_bytes=%d used_inodes=%d",
 		ino.ProjectID, rec.LimitBlocks*blockSize, rec.LimitInodes, usedBlocks*blockSize, usedInodes), 0
+}
+
+// projectUsage is project's usage in rec plus this node's changes no flush moved into the table yet.
+func (f *FS) projectUsage(project uint32, rec *quota.Record) (blocks, inodes uint64) {
+	blocks, inodes = rec.UsedBlocks, rec.UsedInodes
+	if f.journal != nil {
+		d := f.journal.QuotaPending()[project]
+		blocks, inodes = uint64(max(int64(blocks)+d.Blocks, 0)), uint64(max(int64(inodes)+d.Inodes, 0))
+	}
+	return blocks, inodes
+}
+
+// statfsOf fills out with the volume's figures, as statfs on the root reports them, and for inode num in a project
+// with limits, with the project's: its limits as the size, and what they leave as the free space and inodes.
+func (f *FS) statfsOf(ctx context.Context, num uint32, out *fuse.StatfsOut) syscall.Errno {
+	if errno := f.Statfs(ctx, out); errno != 0 || f.quotaInode == 0 {
+		return errno
+	}
+	ino, err := f.getInode(num)
+	if err != nil {
+		return syscall.EIO
+	}
+	if ino.ProjectID == 0 {
+		return 0
+	}
+	rec, err := f.projectRecord(ino.ProjectID, false)
+	if err != nil {
+		log.Printf("[WARN] statfs: reading quota project %d: %v; reporting the volume", ino.ProjectID, err)
+		return 0
+	}
+	blocks, inodes := f.projectUsage(ino.ProjectID, rec)
+	left := func(limit, used uint64) uint64 { return limit - min(limit, used) }
+	if rec.LimitBlocks != 0 {
+		out.Blocks = min(out.Blocks, rec.LimitBlocks)
+		out.Bfree = min(out.Bfree, left(rec.LimitBlocks, blocks))
+		out.Bavail = min(out.Bavail, left(rec.LimitBlocks, blocks))
+	}
+	if rec.LimitInodes != 0 {
+		out.Files = min(out.Files, rec.LimitInodes)
+		out.Ffree = min(out.Ffree, left(rec.LimitInodes, inodes))
+	}
+	return 0
+}
+
+// Statfs reports the volume, or for a directory in a project with limits, the project.
+func (d *Dir) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	return d.fs.statfsOf(ctx, d.inodeNum, out)
+}
+
+// Statfs reports the volume, or for a file in a project with limits, the project.
+func (f *File) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
+	return f.fs.statfsOf(ctx, f.inodeNum, out)
 }
 
 func (d *Dir) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
