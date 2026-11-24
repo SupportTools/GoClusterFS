@@ -80,12 +80,12 @@ func (g *Guard) Fold(ctx context.Context, open func() (Table, error), slot, ownS
 	if err != nil {
 		return err
 	}
-	folds, err := q.Fold(func(project uint32) (uint64, uint64, error) {
+	folds, err := q.Fold(func(project uint32) (uint64, uint64, bool, error) {
 		r, err := tbl.Record(project)
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, false, err
 		}
-		return r.UsedBlocks, r.UsedInodes, nil
+		return r.UsedBlocks, r.UsedInodes, r.Owns(project), nil
 	})
 	if err != nil {
 		return err

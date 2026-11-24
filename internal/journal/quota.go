@@ -273,8 +273,9 @@ func (q *QuotaReplay) Owes() bool {
 
 // Fold returns the usage changes that bring the table up to date with the journal, with Old set to what used reads
 // now. Each unfinished update is written again: the quota lock kept every other writer off the record since, so it
-// holds the update's Old or its New. The running deltas add on, and usage that would go below zero stops at zero.
-func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, err error)) ([]QuotaUpdatePayload, error) {
+// holds the update's Old or its New. The running deltas add on, and usage that would go below zero stops at zero. A
+// project used says no longer owns its record gets nothing: its changes are dropped.
+func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, owned bool, err error)) ([]QuotaUpdatePayload, error) {
 	projects := slices.Collect(maps.Keys(q.Running))
 	for _, u := range q.Updates {
 		projects = append(projects, u.Project)
@@ -282,9 +283,13 @@ func (q *QuotaReplay) Fold(used func(project uint32) (blocks, inodes uint64, err
 	slices.Sort(projects)
 	var folds []QuotaUpdatePayload
 	for _, project := range slices.Compact(projects) {
-		blocks, inodes, err := used(project)
+		blocks, inodes, owned, err := used(project)
 		if err != nil {
 			return nil, fmt.Errorf("project %d: %w", project, err)
+		}
+		if !owned {
+			log.Printf("quota: project %d's record is free or holds another project; dropping its changes from the journal", project)
+			continue
 		}
 		f := QuotaUpdatePayload{Project: project, OldBlocks: blocks, OldInodes: inodes, NewBlocks: blocks, NewInodes: inodes}
 		for _, u := range q.Updates {

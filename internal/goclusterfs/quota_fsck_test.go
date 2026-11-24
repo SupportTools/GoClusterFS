@@ -12,6 +12,7 @@ import (
 
 	"github.com/supporttools/GoClusterFS/internal/fsck"
 	"github.com/supporttools/GoClusterFS/internal/inode"
+	"github.com/supporttools/GoClusterFS/internal/quota"
 	"github.com/supporttools/GoClusterFS/internal/storage"
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
@@ -257,8 +258,8 @@ func TestFsckRepairTakesFreedInodesOutOfTheirProject(t *testing.T) {
 	expectCleanFsck(t, fsys)
 }
 
-// fsck reports a name whose inode is in another project than its directory gives, and inodes in a project the table
-// has no record for.
+// fsck reports a name whose inode is in another project than its directory gives, and inodes in a project no record
+// belongs to, which repair can take out of every project.
 func TestFsckReportsInodesInTheWrongProject(t *testing.T) {
 	fsys, _, _, _ := journaledFS(t)
 	fsys = withBridge(fsys)
@@ -278,22 +279,52 @@ func TestFsckReportsInodesInTheWrongProject(t *testing.T) {
 	}
 
 	r := runFsck(t, fsys, fsck.DefaultOptions())
-	want := []string{
-		fmt.Sprintf(`entry "outside" names inode %d, which counts against project 1, but the directory gives its entries project 0`, outside.inodeNum),
-		fmt.Sprintf(`entry "inside" names inode %d, which counts against project 9, but the directory gives its entries project 1`, inside.inodeNum),
-		fmt.Sprintf("1 inodes count against it, inode %d first, but the quota table has no record in use for it", inside.inodeNum),
+	want := map[string]bool{
+		fmt.Sprintf(`entry "outside" names inode %d, which counts against project 1, but the directory gives its entries project 0`, outside.inodeNum):            false,
+		fmt.Sprintf("1 inodes carry it, inode %d first, but no record in the quota table belongs to it; repair takes them out of every project", inside.inodeNum): true,
 	}
 	ps := quotaProblems(r)
-	for _, w := range want {
+	for w, repairable := range want {
 		found := false
 		for _, p := range ps {
-			found = found || p.Message == w && p.Severity == fsck.Error && !p.Repairable
+			found = found || p.Message == w && p.Severity == fsck.Error && p.Repairable == repairable
 		}
 		if !found {
-			t.Errorf("fsck did not report %q:%s", w, problemList(r))
+			t.Errorf("fsck did not report %q, repairable %v:%s", w, repairable, problemList(r))
 		}
 	}
 	if len(ps) != len(want) {
 		t.Errorf("fsck reported %d quota problems, want %d:%s", len(ps), len(want), problemList(r))
 	}
+}
+
+// A project's record can be freed and reused while inodes still carry the project, when its usage drifted low. fsck
+// reports those inodes, and repair takes them out of every project. A record in use that no inode carries and whose
+// root directory is gone, repair frees.
+func TestFsckRepairsStaleProjectsAndLeftoverRecords(t *testing.T) {
+	fsys, _, _, _ := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := quotaProject(t, fsys, "pvc")
+	f := createIn(t, pvc, "f")
+	stopClean(t, fsys)
+	later := reuseRecord(t, fsys, 1, 0, 0)
+
+	r := runFsck(t, fsys, fsck.DefaultOptions())
+	ps := quotaProblems(r)
+	if len(ps) != 2 || ps[0].Location != "quota project 1" || ps[0].Severity != fsck.Error || !ps[0].Repairable ||
+		ps[1].Location != fmt.Sprintf("quota project %d", later) || ps[1].Severity != fsck.Warning || !ps[1].Repairable {
+		t.Fatalf("fsck with project 1's record reused:%s", problemList(r))
+	}
+	if r := runFsck(t, fsys, repairOptions()); r.UnrepairedErrors() > 0 {
+		t.Fatalf("fsck -repair:%s", problemList(r))
+	}
+	for _, num := range []uint32{pvc.inodeNum, f.inodeNum} {
+		if p, inherit := projectOf(t, fsys, num); p != 0 || inherit {
+			t.Errorf("after repair inode %d has project %d, PROJINHERIT %v; want neither", num, p, inherit)
+		}
+	}
+	if rec := record(t, fsys, later); rec.Flags&quota.RecordInUse != 0 || rec.ID != later {
+		t.Errorf("after repair project %d's record is %+v; want it free, naming project %d last", later, rec, later)
+	}
+	expectCleanFsck(t, fsys)
 }

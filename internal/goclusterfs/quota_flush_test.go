@@ -202,7 +202,7 @@ func TestAQuotaFoldCutShortIsRedoneOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	folds, err := q.Fold(func(uint32) (uint64, uint64, error) { return 0, 0, nil })
+	folds, err := q.Fold(func(uint32) (uint64, uint64, bool, error) { return 0, 0, true, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,13 +298,13 @@ func TestAFlushFailingAfterItsCommitStopsTheNode(t *testing.T) {
 	quotaProject(t, fsys, "pvc")
 	var stopped string
 	fsys.SetStopNode(func(reason string) { stopped = reason })
-	// A flush of one project reads its record once, then reads it twice more and writes it to set the usage.
+	// A flush of one project reads its record once, then reads its sector again and writes it to set the usage.
 	sectors := 0
 	fsys.openQuota = func() (quota.Table, error) {
 		tbl, err := quota.Open(fsys.dev, fsys.inodeTbl, fsys.quotaInode, fsys.dataOffset, fsys.dataBlockSize())
 		at := tbl.At
 		tbl.At = func(sector uint64) (int64, error) {
-			if sectors++; sectors > 3 {
+			if sectors++; sectors > 2 {
 				return 0, errors.New("injected write failure")
 			}
 			return at(sector)

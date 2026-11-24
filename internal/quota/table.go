@@ -44,15 +44,48 @@ type Record struct {
 	RootInode   uint32
 	Flags       uint32
 	RootBirth   uint64 // RootInode's BirthGeneration, so a later inode in the same slot is not taken for the root
+	// ID is the project that has the record, or had it last; 0 in records older builds wrote stands for the index.
+	ID uint32
 }
 
 // RecordInUse marks a record that belongs to a project.
 const RecordInUse uint32 = 1 << 0
 
+// IndexBits is how many low bits of a project ID name its record. The bits above count the record's reuses, so a
+// change an earlier project of the record logged names an ID the record no longer has, and is dropped.
+const IndexBits = 20
+
+// Index returns the record of project id.
+func Index(id uint32) uint32 {
+	return id & (1<<IndexBits - 1)
+}
+
+// Owner returns the project that has the record at index, or had it last.
+func (r *Record) Owner(index uint32) uint32 {
+	if r.ID == 0 {
+		return index
+	}
+	return r.ID
+}
+
+// Owns reports whether the record, as read for project id, belongs to that project.
+func (r *Record) Owns(id uint32) bool {
+	return r.Flags&RecordInUse != 0 && r.Owner(Index(id)) == id
+}
+
+// NextID is the ID the record at index gives the next project it holds.
+func (r *Record) NextID(index uint32) uint32 {
+	if r.ID == 0 {
+		return index
+	}
+	return r.ID + 1<<IndexBits
+}
+
 // RecordLocation returns the table sector that holds project id's record, counting the header as sector 0, and the
 // record's byte offset in it.
 func RecordLocation(id uint32) (sector uint64, offset int) {
-	return 1 + uint64(id)/RecordsPerSector, int(id%RecordsPerSector) * RecordSize
+	index := Index(id)
+	return 1 + uint64(index)/RecordsPerSector, int(index%RecordsPerSector) * RecordSize
 }
 
 // EncodeHeader writes h into a sector, with the magic, version and checksum.
@@ -89,6 +122,7 @@ func PutRecord(sector []byte, offset int, r *Record) {
 	binary.LittleEndian.PutUint32(b[32:36], r.RootInode)
 	binary.LittleEndian.PutUint32(b[36:40], r.Flags)
 	binary.LittleEndian.PutUint64(b[40:48], r.RootBirth)
+	binary.LittleEndian.PutUint32(b[48:52], r.ID)
 	seal(sector)
 }
 
@@ -106,6 +140,7 @@ func GetRecord(sector []byte, offset int) (*Record, error) {
 		RootInode:   binary.LittleEndian.Uint32(b[32:36]),
 		Flags:       binary.LittleEndian.Uint32(b[36:40]),
 		RootBirth:   binary.LittleEndian.Uint64(b[40:48]),
+		ID:          binary.LittleEndian.Uint32(b[48:52]),
 	}, nil
 }
 

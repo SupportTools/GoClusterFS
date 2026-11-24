@@ -20,7 +20,8 @@ type seenRecord struct {
 }
 
 // projectRecord returns project's record as this node last read it, and reads it again when fresh is set or the read
-// is older than quotaFresh.
+// is older than quotaFresh. A project whose record is free or holds another project now gets an empty record: no
+// limits.
 func (f *FS) projectRecord(project uint32, fresh bool) (*quota.Record, error) {
 	f.quotaSeenMu.Lock()
 	seen, ok := f.quotaSeen[project]
@@ -36,18 +37,22 @@ func (f *FS) projectRecord(project uint32, fresh bool) (*quota.Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	f.noteRecord(project, rec)
-	return rec, nil
+	return f.noteRecord(project, rec), nil
 }
 
-// noteRecord keeps project's record as this node just read or wrote it.
-func (f *FS) noteRecord(project uint32, rec *quota.Record) {
+// noteRecord keeps project's record as this node just read or wrote it, and returns what projectRecord returns for it.
+func (f *FS) noteRecord(project uint32, rec *quota.Record) *quota.Record {
+	seen := seenRecord{at: time.Now()}
+	if rec.Owns(project) {
+		seen.rec = *rec
+	}
 	f.quotaSeenMu.Lock()
 	defer f.quotaSeenMu.Unlock()
 	if f.quotaSeen == nil {
 		f.quotaSeen = map[uint32]seenRecord{}
 	}
-	f.quotaSeen[project] = seenRecord{rec: *rec, at: time.Now()}
+	f.quotaSeen[project] = seen
+	return &seen.rec
 }
 
 // liveNodes is how many nodes have the volume mounted, as the registry said at most quotaFresh ago.

@@ -171,18 +171,19 @@ func TestReadQuotaReplay(t *testing.T) {
 }
 
 // The fold writes each unfinished update again, landed or not, adds the running deltas, stops at zero, and leaves out
-// projects it does not change.
+// projects it does not change, and projects whose record holds another project now, as project 6's does.
 func TestQuotaReplayFold(t *testing.T) {
 	q := &QuotaReplay{
-		Running: map[uint32]QuotaDeltaPayload{1: {Project: 1, Blocks: 3}, 2: {Project: 2, Blocks: -5}, 4: {Project: 4, Inodes: 1}},
+		Running: map[uint32]QuotaDeltaPayload{1: {Project: 1, Blocks: 3}, 2: {Project: 2, Blocks: -5}, 4: {Project: 4, Inodes: 1}, 6: {Project: 6, Blocks: 4}},
 		Updates: []QuotaUpdatePayload{
 			{Project: 1, OldBlocks: 10, OldInodes: 1, NewBlocks: 12, NewInodes: 1},
 			{Project: 3, OldBlocks: 7, NewBlocks: 9},
 			{Project: 5, OldBlocks: 1, NewBlocks: 2},
+			{Project: 6, OldBlocks: 1, NewBlocks: 2},
 		},
 	}
-	table := map[uint32][2]uint64{1: {10, 1}, 2: {3, 0}, 3: {9, 0}, 5: {7, 0}}
-	folds, err := q.Fold(func(p uint32) (uint64, uint64, error) { return table[p][0], table[p][1], nil })
+	table := map[uint32][2]uint64{1: {10, 1}, 2: {3, 0}, 3: {9, 0}, 5: {7, 0}, 6: {8, 1}}
+	folds, err := q.Fold(func(p uint32) (uint64, uint64, bool, error) { return table[p][0], table[p][1], p != 6, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +206,7 @@ func TestQuotaFoldInTheJournalStandsForTheRecordsBefore(t *testing.T) {
 	delta(t, j, true, 2, 1, 1)
 	region, q := quotaAfterCrash(t, j)
 	table := map[uint32][2]uint64{1: {10, 0}}
-	used := func(p uint32) (uint64, uint64, error) { return table[p][0], table[p][1], nil }
+	used := func(p uint32) (uint64, uint64, bool, error) { return table[p][0], table[p][1], true, nil }
 	folds, err := q.Fold(used)
 	if err != nil {
 		t.Fatal(err)

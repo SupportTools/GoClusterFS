@@ -69,3 +69,31 @@ func TestRecordLocation(t *testing.T) {
 		t.Errorf("records end at %d, past the checksum at %d", end, crcOffset)
 	}
 }
+
+// A record belongs to the ID it stores, or to its index when an older build wrote it, and only while in use. Each
+// reuse adds 1<<IndexBits to the ID, wrapping after the top bits run out.
+func TestRecordOwnership(t *testing.T) {
+	legacy := &Record{Flags: RecordInUse}
+	if !legacy.Owns(5) || legacy.Owns(5+1<<IndexBits) || legacy.NextID(5) != 5 {
+		t.Errorf("a record without an ID owns 5: %v, owns a later 5: %v, next ID %d; want true, false, 5",
+			legacy.Owns(5), legacy.Owns(5+1<<IndexBits), legacy.NextID(5))
+	}
+	later := uint32(5 + 1<<IndexBits)
+	rec := &Record{Flags: RecordInUse, ID: later}
+	if rec.Owns(5) || !rec.Owns(later) || Index(later) != 5 {
+		t.Errorf("record of %d owns 5: %v, owns %d: %v, index %d", later, rec.Owns(5), later, rec.Owns(later), Index(later))
+	}
+	rec.Flags = 0
+	if rec.Owns(later) || rec.NextID(5) != 5+2<<IndexBits || rec.Owner(5) != later {
+		t.Errorf("a freed record owns %d: %v, next ID %d, owner %d", later, rec.Owns(later), rec.NextID(5), rec.Owner(5))
+	}
+	last := &Record{ID: 5 | 0xFFF<<IndexBits}
+	if next := last.NextID(5); next != 5 {
+		t.Errorf("after the last reuse the next ID is %#x, want it to wrap to 5", next)
+	}
+	sector := EmptyRecordSector()
+	PutRecord(sector, RecordSize, &Record{Flags: RecordInUse, ID: later, UsedBlocks: 3})
+	if got, err := GetRecord(sector, RecordSize); err != nil || got.ID != later || got.UsedBlocks != 3 {
+		t.Errorf("record read back: %+v, %v; want ID %d", got, err, later)
+	}
+}

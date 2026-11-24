@@ -21,12 +21,12 @@ type Table struct {
 	Sectors uint64
 }
 
-// Capacity is the number of project IDs the table has records for, counting the unused ID 0.
+// Capacity is the number of records the table has, counting the unused record 0.
 func (t Table) Capacity() uint32 {
 	if t.Sectors < 2 {
 		return 0
 	}
-	return uint32(min((t.Sectors-1)*RecordsPerSector, 1<<32-1))
+	return uint32(min((t.Sectors-1)*RecordsPerSector, 1<<IndexBits))
 }
 
 func (t Table) read(sector uint64) ([]byte, error) {
@@ -95,9 +95,9 @@ func (t Table) PutHeader(h *Header) error {
 	return t.write(0, sector)
 }
 
-// Record returns project id's record.
+// Record returns the record of project id, which may belong to another project now: see Record.Owns.
 func (t Table) Record(id uint32) (*Record, error) {
-	if id == 0 || id >= t.Capacity() {
+	if Index(id) == 0 || Index(id) >= t.Capacity() {
 		return nil, fmt.Errorf("project %d is outside the quota table's %d records", id, t.Capacity())
 	}
 	sectorNum, offset := RecordLocation(id)
@@ -110,7 +110,7 @@ func (t Table) Record(id uint32) (*Record, error) {
 
 // PutRecord writes project id's record and leaves its neighbours in the sector as they are.
 func (t Table) PutRecord(id uint32, r *Record) error {
-	if id == 0 || id >= t.Capacity() {
+	if Index(id) == 0 || Index(id) >= t.Capacity() {
 		return fmt.Errorf("project %d is outside the quota table's %d records", id, t.Capacity())
 	}
 	sectorNum, offset := RecordLocation(id)
@@ -135,7 +135,8 @@ func (t Table) SetUsage(id uint32, blocks, inodes uint64) error {
 	return t.PutRecord(id, r)
 }
 
-// FreeID returns the first project ID from from on, wrapping to 1, whose record is not in use.
+// FreeID returns the index of the first record from from on, wrapping to 1, that is not in use. The project that takes
+// it gets the record's NextID.
 func (t Table) FreeID(from uint32) (uint32, error) {
 	capacity := t.Capacity()
 	if capacity < 2 {
