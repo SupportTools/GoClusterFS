@@ -5910,6 +5910,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/quota_charge_test.go::TestQuotaOrphanFreedOnceAfterACrash
 
+  - id: quota-orphan-freed-once-peer
+    name: A peer's replay credits a crashed node's orphan once
+    description: A rename over a file crashes after the orphan free's commit; a live peer replays through ReplayJournal, frees the file once and credits it once
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/quota_charge_test.go::TestQuotaOrphanFreedOnceAfterAPeerReplay
+
   - id: dir-growth-charge-conflict
     name: Directory growth is charged once per block after a conflict
     description: A growth whose inode write conflicts gives its charge back before the retry
