@@ -48,7 +48,7 @@ func (f *FS) link(ctx context.Context, parent *fs.Inode, parentNum uint32, targe
 	if errno != 0 {
 		return nil, errno
 	}
-	ch := parent.NewPersistentInode(ctx, newFile(f, ino), fs.StableAttr{
+	ch := parent.NewInode(ctx, newFile(f, ino), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  uint64(file.inodeNum),
 		Gen:  ino.BirthGeneration,

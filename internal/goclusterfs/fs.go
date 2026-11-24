@@ -878,7 +878,7 @@ func (f *FS) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.I
 	out.Attr.Blocks = childIno.AllocatedBlocks * (f.blockSize / 512)
 	out.Attr.Blksize = uint32(f.blockSize)
 
-	ch := f.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
+	ch := f.NewInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  childInodeNum,
 		Gen:  childIno.BirthGeneration,
@@ -1356,7 +1356,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 	f.cacheInode(childIno)
 	f.announceDir(parentNum)
 
-	ch := parent.NewPersistentInode(ctx, newFile(f, childIno), fs.StableAttr{
+	ch := parent.NewInode(ctx, newFile(f, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  uint64(childIno.InodeNum),
 		Gen:  childIno.BirthGeneration,
@@ -1466,7 +1466,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	f.cacheInode(childIno)
 	f.announceDir(parentNum)
 
-	ch := parent.NewPersistentInode(ctx, &Dir{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
+	ch := parent.NewInode(ctx, &Dir{fs: f, inodeNum: childIno.InodeNum}, fs.StableAttr{
 		Mode: fuse.S_IFDIR,
 		Ino:  uint64(childIno.InodeNum),
 		Gen:  f.dirGen.Add(1),
@@ -1483,7 +1483,7 @@ func (f *FS) dirNode(ctx context.Context, parent *fs.Inode, name string, num uin
 	} else {
 		attr.Gen = f.dirGen.Add(1)
 	}
-	return parent.NewPersistentInode(ctx, &Dir{fs: f, inodeNum: uint32(num)}, attr)
+	return parent.NewInode(ctx, &Dir{fs: f, inodeNum: uint32(num)}, attr)
 }
 
 // Mkdir creates a new directory in the root directory.
@@ -1678,7 +1678,7 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.
 	out.Attr.Blocks = childIno.AllocatedBlocks * (d.fs.blockSize / 512)
 	out.Attr.Blksize = uint32(d.fs.blockSize)
 
-	ch := d.NewPersistentInode(ctx, newFile(d.fs, childIno), fs.StableAttr{
+	ch := d.NewInode(ctx, newFile(d.fs, childIno), fs.StableAttr{
 		Mode: fuse.S_IFREG,
 		Ino:  childInodeNum,
 		Gen:  childIno.BirthGeneration,

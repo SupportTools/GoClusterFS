@@ -672,6 +672,8 @@ The flags set how many entries each cache holds and how long cached data may be 
 
 When `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity` (or the extent pair does), the cache is full and drops entries it may need again; a larger limit trades memory for fewer disk reads.
 
+**Files the kernel caches.** The mount keeps about 400 bytes of memory for each file, directory and symlink the kernel holds in its dentry cache, and frees it when the kernel drops the entry, as the kernel does under memory pressure, within the container's memory limit in Kubernetes. A walk of 3 million files, such as a backup, costs about 1.3 GB until the kernel lets them go.
+
 ```bash
 # Read-heavy, changes from other nodes may show up later
 goclusterfs-mount ... -cache-ttl 30s
