@@ -298,6 +298,7 @@ func TestFindFreeSlotAfterAReleaseOrALostClaim(t *testing.T) {
 	ctx := context.Background()
 	a := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
 	b := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+	a.randomSlot = func(uint64) uint64 { return 0 }
 
 	first, err := a.FindFreeSlot()
 	if err != nil {
@@ -343,5 +344,33 @@ func TestFindFreeSlotSharesTheLastFreeSlot(t *testing.T) {
 	}
 	if num, err := table.FindFreeSlot(); err != nil || num != 63 {
 		t.Errorf("FindFreeSlot with inode 63 the only free one, handed out = %d, %v; want 63", num, err)
+	}
+}
+
+// Another node claimed the slot this node found: the next search reads from a random distance ahead instead of right
+// behind the other node, whose next slot it would keep finding.
+func TestFindFreeSlotMovesAwayAfterALostClaim(t *testing.T) {
+	dev, cleanup := createTestDevice(t, 1<<20)
+	defer cleanup()
+	ctx := context.Background()
+	a := NewTable(dev, 0, 256*InodeSize, nil, [16]byte{1})
+	b := NewTable(dev, 0, 256*InodeSize, nil, [16]byte{2})
+	a.randomSlot = func(n uint64) uint64 { return n / 2 }
+	a.SetAllocationStart(1, 2)
+
+	lost, err := a.FindFreeSlot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.ClaimSlot(ctx, lost); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.ClaimSlot(ctx, lost); !errors.Is(err, ErrInodeInUse) {
+		t.Fatalf("claiming inode %d after the other node: %v, want ErrInodeInUse", lost, err)
+	}
+	usable := uint32(256 - InodeFirstUsable)
+	want := InodeFirstUsable + (lost-InodeFirstUsable+1+usable/4)%usable
+	if num, err := a.FindFreeSlot(); err != nil || num != want {
+		t.Errorf("FindFreeSlot after a lost claim = %d, %v; want inode %d, away from the other node", num, err, want)
 	}
 }
