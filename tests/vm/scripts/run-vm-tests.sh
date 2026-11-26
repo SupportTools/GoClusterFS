@@ -2415,6 +2415,60 @@ test_dir_fsync() {
 
 # Test: Hard links
 # A file linked on one VM reads through both names on the other; removing one name keeps the file.
+# A flock on one VM keeps the other out until the holder releases it; a waiter there then gets it. It also logs flock latency.
+test_flock_across_nodes() {
+    log_info "Testing flock across nodes..."
+    ensure_cluster_healthy 2
+
+    local mnt=/mnt/goclusterfs
+    ssh_run 1 "touch $mnt/flock_file"
+    # The holder touches a marker once it holds the flock: a flock may first wait for the other VM's last release.
+    hold_flock() {
+        ssh_run 1 "rm -f /tmp/flock_held; nohup flock $1 $mnt/flock_file sh -c 'touch /tmp/flock_held; sleep $2' < /dev/null > /dev/null 2>&1 &"
+        local i
+        for i in $(seq 50); do
+            ssh_run 1 "test -e /tmp/flock_held" && return 0
+            sleep 0.2
+        done
+        log_error "VM 1 did not get its $1 flock within 10s"
+        return 1
+    }
+    hold_flock -x 4 || return 1
+    if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
+        log_error "VM 2 took an exclusive flock that VM 1 holds"
+        return 1
+    fi
+    if ssh_run 2 "flock -n -s $mnt/flock_file true"; then
+        log_error "VM 2 took a shared flock next to VM 1's exclusive one"
+        return 1
+    fi
+    local start=$SECONDS
+    if ! ssh_run 2 "timeout 15 flock -x $mnt/flock_file true"; then
+        log_error "VM 2 did not get the flock within 15s of waiting, though VM 1 holds it for 4s"
+        return 1
+    fi
+    log_info "VM 2 waited $((SECONDS - start))s for the flock"
+
+    hold_flock -s 3 || return 1
+    if ! ssh_run 2 "flock -n -s $mnt/flock_file true"; then
+        log_error "VM 2 could not share a flock with VM 1"
+        return 1
+    fi
+    if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
+        log_error "VM 2 took an exclusive flock next to VM 1's shared one"
+        return 1
+    fi
+    sleep 3
+
+    # 200 flock and unlock pairs through flock(1) on an open fd, less the same loop on a local file, which leaves out flock(1)'s own start-up.
+    local times
+    times=$(ssh_run 1 "touch /tmp/flock_local; up() { cut -d' ' -f1 /proc/uptime; }; loop() { exec 9< \$1; i=0; while [ \$i -lt 200 ]; do flock -x 9; flock -u 9; i=\$((i+1)); done; exec 9<&-; }; a=\$(up); loop $mnt/flock_file; b=\$(up); loop /tmp/flock_local; c=\$(up); echo \$a \$b \$c")
+    log_info "Flock latency on VM 1: $(echo "$times" | awk '{ printf "an uncontended flock and unlock take %.1f ms together (%d pairs: %.2fs on the volume, %.2fs on a local file)", (($2-$1)-($3-$2))/200*1000, 200, $2-$1, $3-$2 }')"
+    ssh_run 1 "rm -f $mnt/flock_file"
+    log_success "Flock across nodes test passed"
+    return 0
+}
+
 test_hard_links() {
     log_info "Testing hard links..."
     ensure_cluster_healthy 2
@@ -6098,6 +6152,7 @@ main() {
     run_test "Delete Directory" test_delete_directory
     run_test "Directory Fsync" test_dir_fsync
     run_test "Hard Links" test_hard_links
+    run_test "Flock Across Nodes" test_flock_across_nodes
     run_test "Truncate File" test_truncate_file
     run_test "Append File" test_append_file
     run_test "Rename File" test_rename_file

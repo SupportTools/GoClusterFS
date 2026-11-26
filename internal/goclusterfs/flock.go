@@ -144,6 +144,14 @@ type flockFile struct {
 	changed       chan struct{}
 }
 
+// clusterOf returns lockMgr as the cluster for flocks, or nil when there is no lock manager.
+func clusterOf(lockMgr *lock.Manager) clusterFlocks {
+	if lockMgr == nil {
+		return nil
+	}
+	return lockMgr
+}
+
 func newFlockTable(cluster clusterFlocks) *flockTable {
 	return &flockTable{cluster: cluster, files: map[lock.FlockKey]*flockFile{}, owners: map[uint64]lock.FlockKey{}}
 }

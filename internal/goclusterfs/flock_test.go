@@ -242,3 +242,15 @@ func TestLateReleaseKeepsANewerOpenFilesFlock(t *testing.T) {
 	requireFlockErrno(t, tbl.lock(context.Background(), lock.FlockKey{Inode: 7}, 99, lock.LockModeExclusive, false), 0,
 		"flock on handle 5's inode after its release")
 }
+
+// A flock taken through a handle frees at that handle's Release, whatever lock owner the kernel named.
+func TestReleaseFreesTheFlockOfItsHandle(t *testing.T) {
+	tbl := newFlockTable(nil)
+	raw := &flockFS{RawFileSystem: &flockRaw{RawFileSystem: fuse.NewDefaultRawFileSystem(), tbl: tbl}, flocks: tbl}
+	if st := raw.SetLk(nil, &fuse.LkIn{InHeader: fuse.InHeader{NodeId: 7}, Fh: 5, Owner: 0xabc, LkFlags: fuse.FUSE_LK_FLOCK}); !st.Ok() {
+		t.Fatalf("flock through handle 5 = %v", st)
+	}
+	raw.Release(nil, &fuse.ReleaseIn{Fh: 5, LockOwner: 0xabc, ReleaseFlags: fuse.FUSE_RELEASE_FLOCK_UNLOCK})
+	requireFlockErrno(t, tbl.lock(context.Background(), lock.FlockKey{Inode: 7}, 99, lock.LockModeExclusive, false), 0,
+		"flock on the inode after handle 5's release")
+}

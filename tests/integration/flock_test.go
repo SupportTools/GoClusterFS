@@ -206,3 +206,169 @@ func TestKilledFlockWaiterExits(t *testing.T) {
 	}
 	requireFlock(t, openForFlock(t, mfs.Path("lockfile")), syscall.LOCK_SH, syscall.EWOULDBLOCK, "the holder still holds after the waiter died")
 }
+
+func startFlockCluster(t *testing.T) (*MountedFS, *MountedFS) {
+	t.Helper()
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start node 0: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("start node 1: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	return cluster.Node(0), cluster.Node(1)
+}
+
+// flockSoon retries a non-blocking flock for d, as a release reaches the mount only after close returns.
+func flockSoon(t *testing.T, f *os.File, how int, d time.Duration, what string) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for {
+		err := syscall.Flock(int(f.Fd()), how|syscall.LOCK_NB)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) || time.Now().After(deadline) {
+			t.Fatalf("%s: flock = %v after %v", what, err, d)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestFlockExcludesAcrossNodes(t *testing.T) {
+	a, b := startFlockCluster(t)
+	if err := a.WriteFile("lockfile", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	onA, onB := openForFlock(t, a.Path("lockfile")), openForFlock(t, b.Path("lockfile"))
+
+	requireFlock(t, onA, syscall.LOCK_EX, nil, "exclusive on node 0")
+	requireFlock(t, onB, syscall.LOCK_EX, syscall.EWOULDBLOCK, "exclusive on node 1")
+	requireFlock(t, onB, syscall.LOCK_SH, syscall.EWOULDBLOCK, "shared on node 1")
+	if err := onA.Close(); err != nil {
+		t.Fatal(err)
+	}
+	flockSoon(t, onB, syscall.LOCK_SH, 2*time.Second, "shared on node 1 after node 0 closed")
+	onA = openForFlock(t, a.Path("lockfile"))
+	requireFlock(t, onA, syscall.LOCK_SH, nil, "shared on both nodes")
+	requireFlock(t, onA, syscall.LOCK_EX, syscall.EWOULDBLOCK, "node 0 converting to exclusive next to node 1's shared")
+}
+
+func TestFlockWaiterOnAnotherNodeWakesAtRelease(t *testing.T) {
+	a, b := startFlockCluster(t)
+	if err := a.WriteFile("lockfile", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	onA, onB := openForFlock(t, a.Path("lockfile")), openForFlock(t, b.Path("lockfile"))
+	requireFlock(t, onA, syscall.LOCK_EX, nil, "exclusive on node 0")
+
+	waited := make(chan error, 1)
+	go func() { waited <- syscall.Flock(int(onB.Fd()), syscall.LOCK_EX) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("node 1's blocking flock returned %v while node 0 holds it", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	released := time.Now()
+	requireFlock(t, onA, syscall.LOCK_UN, nil, "unlock on node 0")
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("node 1's blocking flock = %v", err)
+		}
+		t.Logf("node 1 got the flock %v after node 0 released it", time.Since(released).Round(time.Millisecond))
+	case <-time.After(5 * time.Second):
+		t.Fatal("node 1 still waits 5s after node 0 released the flock")
+	}
+	requireFlock(t, onA, syscall.LOCK_SH, syscall.EWOULDBLOCK, "shared on node 0 after node 1 got exclusive")
+}
+
+func TestKilledFlockWaiterOnAnotherNodeExits(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock(1) is not installed")
+	}
+	a, b := startFlockCluster(t)
+	if err := a.WriteFile("lockfile", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	requireFlock(t, openForFlock(t, a.Path("lockfile")), syscall.LOCK_EX, nil, "exclusive on node 0")
+
+	waiter := exec.Command("flock", "-x", b.Path("lockfile"), "true")
+	if err := waiter.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- waiter.Wait() }()
+	select {
+	case err := <-exited:
+		t.Fatalf("flock(1) on node 1 exited with %v while node 0 holds the lock", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := waiter.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-exited:
+		if err == nil {
+			t.Fatal("flock(1) on node 1 exited cleanly after SIGKILL")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a killed flock waiter on node 1 has not exited after 5s")
+	}
+	onB := openForFlock(t, b.Path("lockfile"))
+	requireFlock(t, onB, syscall.LOCK_SH, syscall.EWOULDBLOCK, "node 0 still holds after node 1's waiter died")
+}
+
+// A crashed node's flock moves to a waiter on a live node once the live node takes the crashed one over.
+func TestCrashedNodesFlockMovesToAWaiter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for a takeover, about 30s")
+	}
+	cluster := NewMultiNodeCluster(t, 2, 50)
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start node 0: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("start node 1: %v", err)
+	}
+	if err := cluster.WaitAllMounted(15 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	a, b := cluster.Node(0), cluster.Node(1)
+	if err := a.WriteFile("lockfile", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	onA, err := os.Open(a.Path("lockfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(onA.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	onB := openForFlock(t, b.Path("lockfile"))
+	waited := make(chan error, 1)
+	go func() { waited <- syscall.Flock(int(onB.Fd()), syscall.LOCK_EX) }()
+	select {
+	case err := <-waited:
+		t.Fatalf("node 1's blocking flock returned %v while node 0 holds it", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	killed := time.Now()
+	if err := cluster.KillNode(0); err != nil {
+		t.Fatalf("kill node 0: %v", err)
+	}
+	_ = onA.Close()
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("node 1's blocking flock = %v", err)
+		}
+		t.Logf("node 1 got the flock %v after node 0 died", time.Since(killed).Round(time.Second))
+	case <-time.After(90 * time.Second):
+		t.Fatal("node 1 still waits 90s after node 0 died holding the flock")
+	}
+}
