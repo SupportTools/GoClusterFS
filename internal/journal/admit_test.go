@@ -76,8 +76,8 @@ func TestAdmitEndsWithItsContext(t *testing.T) {
 	}
 }
 
-// Room an admission set aside stays its own: commits that cannot wait fill the rest of the ring, and the admitted
-// record still commits.
+// Room an admission set aside stays its own: commits that cannot wait, those that move the head included, fill the
+// rest of the ring, and the admitted record still commits.
 func TestAdmittedRoomOutlastsOtherCommits(t *testing.T) {
 	j := newTestJournal(t)
 	txn := createTxn(t, j, 0)
@@ -86,6 +86,13 @@ func TestAdmittedRoomOutlastsOtherCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	fillWithOpenIntents(t, j)
+	for n := 1; ; n++ {
+		if _, err := j.CommitMovingHead(createTxn(t, j, n)); errors.Is(err, ErrJournalFull) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := j.CommitAdmitted(a, txn); err != nil {
 		t.Fatalf("admitted commit after other commits filled the ring: %v", err)
 	}

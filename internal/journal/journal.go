@@ -375,10 +375,13 @@ func (j *Journal) CommitMovingHead(txn *Transaction) (uint64, error) {
 }
 
 // moveHeadRoom is the part of the ring only records that let the head move may use.
-func (j *Journal) moveHeadRoom() int64 { return int64(j.region.DataAreaSize()) / 16 }
+func (j *Journal) moveHeadRoom() int64 { return wholeSectors(j.region.DataAreaSize() / 16) }
+
+// wholeSectors rounds n down to whole sectors, the unit every record takes.
+func wholeSectors(n uint32) int64 { return int64(n / storage.SectorSize * storage.SectorSize) }
 
 // waitHeadroom is the part of the ring Admit leaves to commits that cannot wait. It is larger than moveHeadRoom.
-func (j *Journal) waitHeadroom() int64 { return int64(j.region.DataAreaSize()) / 4 }
+func (j *Journal) waitHeadroom() int64 { return wholeSectors(j.region.DataAreaSize() / 4) }
 
 // Admission is room Admit set aside for one record and its completion.
 type Admission struct {
