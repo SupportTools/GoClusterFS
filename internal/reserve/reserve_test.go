@@ -100,6 +100,10 @@ func (j *fakeJournal) Commit(*journal.Transaction) (uint64, error) {
 	return j.seq, nil
 }
 
+func (j *fakeJournal) CommitMovingHead(txn *journal.Transaction) (uint64, error) {
+	return j.Commit(txn)
+}
+
 func (j *fakeJournal) Abort(*journal.Transaction) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -278,6 +282,15 @@ func (h *hookJournal) Commit(txn *journal.Transaction) (uint64, error) {
 		}
 	}
 	return h.fakeJournal.Commit(txn)
+}
+
+func (h *hookJournal) CommitMovingHead(txn *journal.Transaction) (uint64, error) {
+	if h.onCommit != nil {
+		if err := h.onCommit(); err != nil {
+			return 0, err
+		}
+	}
+	return h.fakeJournal.CommitMovingHead(txn)
 }
 
 // A refresh that fails after a write used the last blocks of a record it was

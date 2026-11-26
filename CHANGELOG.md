@@ -125,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Hundreds of threads creating files at once filled the 4 MB journal with open intents, and creates, mkdirs, links, symlinks and unlinks then failed with EIO, logging "journal is full". These operations now wait for room in the journal before they take any lock, and the journal keeps room for every open intent's end, so a finished operation's end always fits. Writes, truncates and renames don't wait yet: they still fail with EIO if the journal stays full, which takes far more concurrency.
 - Creates, mkdirs and symlinks running at once on one node failed with EAGAIN, and the mount logged `lost 5 races with other nodes` with no other node mounted. Every create found the same free inode, then committed to the journal before claiming it, so the losers kept colliding: with 16 parallel creators, about 17% of creates failed. A node now hands each of its creates a free inode no other local create holds.
 - `df` and `statfs` on a directory or file below the root reported zero size, blocks and inodes, because only the root answered them. They now report the volume.
 

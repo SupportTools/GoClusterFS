@@ -1,7 +1,7 @@
 package journal
 
 import (
-	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -94,7 +94,9 @@ type Journal struct {
 
 	activeTxns     map[*Transaction]*ActiveTxn
 	pendingIntents map[uint64]uint32 // committed but not yet completed, by seq, with where each starts in the ring
-	unsyncedEnds   map[uint64]bool   // intents the in-memory head passed before the superblock was synced
+	owed           uint32            // records whose completion is still to come; Commit keeps a sector for each
+	admitted       int64             // room Admit set aside for records not yet committed, with their completions
+	roomFreed      chan struct{}     // closed when room may have freed, for Admit's waiters
 	checkpointHook atomic.Pointer[func()]
 	quotaPressure  atomic.Pointer[func()]
 	hookRunning    atomic.Bool
@@ -144,7 +146,6 @@ func Open(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
 		quota:             newQuotaLedger(),
-		unsyncedEnds:      make(map[uint64]bool),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: region.Superblock().LastCheckpointSeq,
 	}
@@ -168,7 +169,6 @@ func Init(dev *storage.Device, regionOffset uint64, regionSize uint64, nodeUUID 
 		activeTxns:        make(map[*Transaction]*ActiveTxn),
 		pendingIntents:    make(map[uint64]uint32),
 		quota:             newQuotaLedger(),
-		unsyncedEnds:      make(map[uint64]bool),
 		checkpointStop:    make(chan struct{}),
 		lastCheckpointSeq: 0,
 	}
@@ -337,6 +337,7 @@ func (j *Journal) advanceHead() (bool, error) {
 	}
 	j.lastCheckpointSeq = seq
 	j.lastCheckpointTime = time.Now()
+	j.roomMayHaveFreedLocked()
 	return true, nil
 }
 
@@ -363,16 +364,117 @@ func (j *Journal) Begin() *Transaction {
 //
 // Returns the transaction sequence number for use with CompleteIntent().
 func (j *Journal) Commit(txn *Transaction) (uint64, error) {
-	return j.commit(txn, nil)
+	return j.commit(txn, nil, nil, false)
+}
+
+// CommitMovingHead commits txn like Commit, for a record that lets the head move past an older one, such as the
+// reserve's renewal of an old batch. It may use the part of the ring other commits leave for such records: without
+// them, a head held by an old batch or by quota holds never moves, and waiting admissions never get room.
+func (j *Journal) CommitMovingHead(txn *Transaction) (uint64, error) {
+	return j.commit(txn, nil, nil, true)
+}
+
+// moveHeadRoom is the part of the ring only records that let the head move may use.
+func (j *Journal) moveHeadRoom() int64 { return int64(j.region.DataAreaSize()) / 16 }
+
+// waitHeadroom is the part of the ring Admit leaves to commits that cannot wait. It is larger than moveHeadRoom.
+func (j *Journal) waitHeadroom() int64 { return int64(j.region.DataAreaSize()) / 4 }
+
+// Admission is room Admit set aside for one record and its completion.
+type Admission struct {
+	room int64
+	done bool
+}
+
+// Admit waits until the ring has room for a record of up to size bytes and its completion, beyond what other
+// admissions hold and a part left to commits that cannot wait, and sets it aside. Room frees only as open intents
+// complete, so the caller must hold nothing an operation with an open intent may need: no lock, and no block taken
+// from the reserve, whose record stays open meanwhile. ctx or Stop ends the wait. Commit the record with
+// CommitAdmitted, or give the room back with Release.
+func (j *Journal) Admit(ctx context.Context, size uint32) (*Admission, error) {
+	a := &Admission{room: int64(sectorAligned(size)) + int64(endRoom)}
+	started, warned := time.Now(), time.Now()
+	for {
+		j.mu.Lock()
+		if j.freeLocked()-j.waitHeadroom() < a.room {
+			_ = j.forceCheckpoint()
+		}
+		if j.freeLocked()-j.waitHeadroom() >= a.room {
+			j.admitted += a.room
+			j.mu.Unlock()
+			return a, nil
+		}
+		if j.roomFreed == nil {
+			j.roomFreed = make(chan struct{})
+		}
+		freed := j.roomFreed
+		j.mu.Unlock()
+		j.runHookAsync()
+		if hook := j.quotaPressure.Load(); hook != nil {
+			(*hook)()
+		}
+		if time.Since(warned) >= admitWarnEvery {
+			warned = time.Now()
+			log.Printf("[WARN] journal: an operation has waited %v for room in the journal, which open intents fill", time.Since(started).Round(time.Second))
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-j.checkpointStop:
+			return nil, ErrJournalFull
+		case <-freed:
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+// admitWarnEvery is how often a long wait in Admit logs.
+const admitWarnEvery = 30 * time.Second
+
+// freeLocked is the ring's room that no owed completion and no admission holds. Must hold j.mu.
+func (j *Journal) freeLocked() int64 {
+	return int64(j.region.AvailableSpace()) - int64(endRoom)*int64(j.owed) - j.admitted
+}
+
+// CommitAdmitted commits txn like Commit, into the room a set aside.
+func (j *Journal) CommitAdmitted(a *Admission, txn *Transaction) (uint64, error) {
+	return j.commit(txn, nil, a, false)
+}
+
+// Release gives back the room of an admission that committed nothing. It does nothing once the admission committed.
+func (j *Journal) Release(a *Admission) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.releaseLocked(a)
+}
+
+func (j *Journal) releaseLocked(a *Admission) {
+	if a == nil || a.done {
+		return
+	}
+	a.done = true
+	j.admitted -= a.room
+	j.roomMayHaveFreedLocked()
+}
+
+// roomMayHaveFreedLocked wakes the commits waiting for room. Must hold j.mu.
+func (j *Journal) roomMayHaveFreedLocked() {
+	if j.roomFreed != nil {
+		close(j.roomFreed)
+		j.roomFreed = nil
+	}
 }
 
 // CommitQuota commits txn after build adds records that read this node's quota ledger, such as a flush. No other
-// commit changes the ledger between build and txn's commit.
+// commit changes the ledger between build and txn's commit. A flush moves the quota holds that keep the head back, so
+// it commits as CommitMovingHead does.
 func (j *Journal) CommitQuota(txn *Transaction, build func(pending func(project uint32) QuotaDeltaPayload) error) (uint64, error) {
-	return j.commit(txn, build)
+	return j.commit(txn, build, nil, true)
 }
 
-func (j *Journal) commit(txn *Transaction, build func(pending func(project uint32) QuotaDeltaPayload) error) (uint64, error) {
+// commit commits txn into the room a set aside, or with a nil, into room no admission holds, leaving moveHeadRoom
+// unless movesHead.
+func (j *Journal) commit(txn *Transaction, build func(pending func(project uint32) QuotaDeltaPayload) error, a *Admission, movesHead bool) (uint64, error) {
 	j.mu.Lock()
 
 	if _, ok := j.activeTxns[txn]; !ok {
@@ -386,17 +488,21 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 		}
 	}
 
-	// Check space for the sector-aligned record WriteAt writes
-	need := sectorAligned(txn.TotalLength())
-	available := j.region.AvailableSpace()
-	if need > available {
-		// Try to force checkpoint to free space
-		if err := j.forceCheckpoint(); err != nil {
-			j.mu.Unlock()
-			return 0, ErrJournalFull
+	// Room for the record and its completion beyond every completion still owed and every other admission, so
+	// completions always fit and admitted records find their room.
+	need := int64(sectorAligned(txn.TotalLength())) + int64(endRoom)
+	free := func() int64 {
+		switch {
+		case a != nil && !a.done:
+			return j.freeLocked() + a.room
+		case movesHead:
+			return j.freeLocked()
 		}
-		available = j.region.AvailableSpace()
-		if need > available {
+		return j.freeLocked() - j.moveHeadRoom()
+	}
+	if need > free() {
+		_ = j.forceCheckpoint()
+		if need > free() {
 			j.mu.Unlock()
 			return 0, ErrJournalFull
 		}
@@ -417,6 +523,11 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 	if err != nil {
 		j.mu.Unlock()
 		return 0, fmt.Errorf("failed to write transaction: %w", err)
+	}
+	j.owed++
+	if a != nil && !a.done {
+		a.done = true
+		j.admitted -= a.room
 	}
 
 	// Flush superblock with updated tail offset to disk
@@ -479,6 +590,9 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 	return seq, nil
 }
 
+// endRoom is the room the record that ends an intent takes: a completion or an abandon.
+var endRoom = sectorAligned(abandonLength)
+
 func sectorAligned(n uint32) uint32 {
 	return (n + storage.SectorSize - 1) / storage.SectorSize * storage.SectorSize
 }
@@ -507,6 +621,15 @@ func (j *Journal) abandonLocked(seq uint64, txn *Transaction) {
 	if err := j.appendRecordLocked(seq, record); err != nil {
 		log.Printf("[WARN] journal: record %d failed to commit and could not be ended, so replay may run it: %v", seq, err)
 	}
+	j.settleLocked()
+}
+
+// settleLocked takes back the room kept for one owed completion, once it is written or no longer needed.
+func (j *Journal) settleLocked() {
+	if j.owed > 0 {
+		j.owed--
+	}
+	j.roomMayHaveFreedLocked()
 }
 
 // Abort abandons a transaction without committing.
@@ -630,42 +753,29 @@ func (j *Journal) CompleteIntent(intentSeq uint64) error {
 	// The operation's writes must be durable before a record that says it finished, or a power cut could keep the
 	// record and lose the writes. The record itself is made durable by the next sync.
 	if err := j.syncBeforeCompletion(); err != nil {
+		j.mu.Lock()
+		j.settleLocked()
+		j.mu.Unlock()
 		return fmt.Errorf("failed to sync before completing intent %d: %w", intentSeq, err)
 	}
 
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	defer j.settleLocked()
 	return j.appendCompletionLocked(intentSeq)
 }
 
-// CompleteIntentDurable returns only after the intent's end is synced, and keeps
-// the intent pending on error, so a retry ends it. When the intent is the oldest
-// and the ring is too full for a completion record, the head moves past it instead.
+// CompleteIntentDurable returns only after the intent's end is synced, and keeps the intent pending on error, so a
+// retry ends it. The room its completion owes stays set aside until then, so a retry's record fits.
 func (j *Journal) CompleteIntentDurable(intentSeq uint64) error {
 	j.mu.Lock()
-	start, pending := j.pendingIntents[intentSeq]
-	unsynced := j.unsyncedEnds[intentSeq]
+	_, pending := j.pendingIntents[intentSeq]
 	var err error
-	switch {
-	case unsynced:
-		err = j.region.FlushSuperblock()
-	case pending:
+	if pending {
 		err = j.appendCompletionLocked(intentSeq)
-		if errors.Is(err, ErrJournalFull) && j.oldestIntentLocked(intentSeq) {
-			head := j.region.HeadOffset()
-			delete(j.pendingIntents, intentSeq)
-			_, err = j.advanceHead()
-			// Once the head moved past the intent, putting it back would checkpoint a seq the head no longer matches.
-			if j.region.HeadOffset() != head {
-				j.unsyncedEnds[intentSeq], unsynced = true, true
-			} else {
-				j.pendingIntents[intentSeq] = start
-				err = cmp.Or(err, ErrJournalFull)
-			}
-		}
 	}
 	j.mu.Unlock()
-	if (!pending && !unsynced) || err != nil {
+	if !pending || err != nil {
 		return err
 	}
 	if err := j.region.Sync(); err != nil {
@@ -673,26 +783,9 @@ func (j *Journal) CompleteIntentDurable(intentSeq uint64) error {
 	}
 	j.mu.Lock()
 	delete(j.pendingIntents, intentSeq)
-	delete(j.unsyncedEnds, intentSeq)
+	j.settleLocked()
 	j.mu.Unlock()
 	return nil
-}
-
-func (j *Journal) oldestIntentLocked(intentSeq uint64) bool {
-	head, size := j.region.HeadOffset(), j.region.DataAreaSize()
-	after := func(pos uint32) uint32 {
-		if pos >= head {
-			return pos - head
-		}
-		return pos + size - head
-	}
-	mine := after(j.pendingIntents[intentSeq])
-	for seq, pos := range j.pendingIntents {
-		if seq != intentSeq && after(pos) < mine {
-			return false
-		}
-	}
-	return true
 }
 
 func (j *Journal) appendCompletionLocked(intentSeq uint64) error {

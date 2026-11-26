@@ -949,6 +949,27 @@ func claimErrno(err error) syscall.Errno {
 	return syscall.EIO
 }
 
+// commitWhenRoom commits txn once the journal has room for it, waiting while open intents fill the ring. The caller
+// holds no lock and no reserve block, so its wait cannot keep an open intent from completing.
+func (f *FS) commitWhenRoom(ctx context.Context, txn *journal.Transaction) (uint64, error) {
+	a, err := f.journal.Admit(ctx, txn.TotalLength())
+	if err != nil {
+		f.journal.Abort(txn)
+		return 0, err
+	}
+	return f.commitAdmitted(a, txn)
+}
+
+// commitAdmitted commits txn into the room a set aside, and drops both if the commit fails.
+func (f *FS) commitAdmitted(a *journal.Admission, txn *journal.Transaction) (uint64, error) {
+	seq, err := f.journal.CommitAdmitted(a, txn)
+	if err != nil {
+		f.journal.Abort(txn)
+		f.journal.Release(a)
+	}
+	return seq, err
+}
+
 // closeIntent completes an intent its operation left open by returning early, so a failed operation is never replayed.
 func (f *FS) closeIntent(seq uint64) {
 	if err := f.journal.CompleteIntent(seq); err != nil {
@@ -1140,12 +1161,12 @@ func mayAccess(ino *inode.Inode, uid, gid uint32, want uint16) bool {
 }
 
 // logCreate commits the intent to create inode num with mode and to name it in directory parentNum.
-func (f *FS) logCreate(num, parentNum uint32, name string, mode, uid, gid, project uint32, entryType journal.DirEntryType) (uint64, error) {
+func (f *FS) logCreate(ctx context.Context, num, parentNum uint32, name string, mode, uid, gid, project uint32, entryType journal.DirEntryType) (uint64, error) {
 	txn, err := f.createTxn(num, parentNum, name, mode, uid, gid, project, entryType, nil)
 	if err != nil {
 		return 0, err
 	}
-	return f.journal.Commit(txn)
+	return f.commitWhenRoom(ctx, txn)
 }
 
 // createBlocks is how many blocks a create maps: a directory's first block, or a long symlink target's.
@@ -1302,7 +1323,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 		}
 	}()
 	if f.journal != nil {
-		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, project, journal.DirEntryRegular)
+		seq, err := f.logCreate(ctx, inodeNum, parentNum, name, uint32(inode.S_IFREG)|(mode&0o7777), uid, gid, project, journal.DirEntryRegular)
 		if err != nil {
 			logging.Debugf("Create %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
@@ -1407,7 +1428,7 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		}
 	}()
 	if f.journal != nil {
-		seq, err := f.logCreate(inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, project, journal.DirEntryDirectory)
+		seq, err := f.logCreate(ctx, inodeNum, parentNum, name, uint32(inode.S_IFDIR|perm), uid, gid, project, journal.DirEntryDirectory)
 		if err != nil {
 			logging.Debugf("Mkdir %q: journal commit failed: %v", name, err)
 			return nil, syscall.EIO
@@ -1950,7 +1971,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
 		var commitErr error
-		intentSeq, commitErr = d.fs.journal.Commit(txn)
+		intentSeq, commitErr = d.fs.commitWhenRoom(ctx, txn)
 		if commitErr != nil {
 			return syscall.EIO
 		}

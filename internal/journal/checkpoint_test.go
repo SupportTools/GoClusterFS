@@ -130,6 +130,41 @@ func TestPendingIntentSurvivesFullRing(t *testing.T) {
 	}
 }
 
+// Intents left open until the ring refuses more can each still be ended, newest first while the oldest pins the head:
+// Commit keeps room for every completion owed.
+func TestOpenIntentsCanAlwaysComplete(t *testing.T) {
+	j := newTestJournal(t)
+	open := fillWithOpenIntents(t, j)
+	for _, seq := range slices.Backward(open) {
+		if err := j.CompleteIntent(seq); err != nil {
+			t.Fatalf("completing intent %d of %d open: %v", seq, len(open), err)
+		}
+	}
+	if got := replayedAfterCrash(t, j); len(got) > 0 {
+		t.Errorf("replayed %v after every intent completed", got)
+	}
+}
+
+// Durable ends fit too: once every intent of a full ring ends, newest first, the head reaches the tail and replay runs
+// nothing.
+func TestOpenIntentsCanAlwaysCompleteDurably(t *testing.T) {
+	j := newTestJournal(t)
+	for _, seq := range slices.Backward(fillWithOpenIntents(t, j)) {
+		if err := j.CompleteIntentDurable(seq); err != nil {
+			t.Fatalf("ending intent %d: %v", seq, err)
+		}
+	}
+	if _, err := j.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if head, tail := j.region.HeadOffset(), j.region.TailOffset(); head != tail {
+		t.Errorf("head %d, tail %d after every intent ended; want them equal", head, tail)
+	}
+	if got := replayedAfterCrash(t, j); len(got) > 0 {
+		t.Errorf("replayed %v after every intent ended", got)
+	}
+}
+
 // A crash with the tail at the very end of the data area must not hang the next mount's scan.
 func TestRecoveryEndsWithTailAtEnd(t *testing.T) {
 	dev, cleanup := createTestDevice(t, 1024*1024)

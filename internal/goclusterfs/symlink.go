@@ -75,6 +75,15 @@ func (f *FS) symlink(ctx context.Context, parent *fs.Inode, parentNum uint32, ta
 
 // symlinkOnce returns EAGAIN when another node claims the free inode slot it picked first.
 func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32, target []byte, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
+	// Room comes before the target block: a block taken from the reserve keeps its record open, which can hold the room.
+	var room *journal.Admission
+	if f.journal != nil {
+		var err error
+		if room, err = f.journal.Admit(ctx, uint32(len(target)+len(name))+symlinkRecordOverhead); err != nil {
+			return nil, syscall.EIO
+		}
+		defer f.journal.Release(room)
+	}
 	var block uint64
 	reserved := false
 	// giveBack undoes the target block if the symlink never gets its name.
@@ -122,7 +131,7 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		}
 	}()
 	if f.journal != nil {
-		seq, err := f.logSymlink(inodeNum, parentNum, name, uid, gid, project, target, block, reserved)
+		seq, err := f.logSymlink(room, inodeNum, parentNum, name, uid, gid, project, target, block, reserved)
 		if err != nil {
 			logging.Debugf("Symlink %q: journal commit failed: %v", name, err)
 			// A full journal wrote nothing and Logged put a reserved block back; other failures may leave the record on disk.
@@ -237,14 +246,17 @@ func (f *FS) symlinkBlock(ctx context.Context, target []byte) (uint64, bool, sys
 	return b, reserved, 0
 }
 
-func (f *FS) logSymlink(num, parentNum uint32, name string, uid, gid, project uint32, target []byte, block uint64, reserved bool) (uint64, error) {
+// symlinkRecordOverhead bounds a symlink's record beyond its target and name.
+const symlinkRecordOverhead = 1024
+
+func (f *FS) logSymlink(room *journal.Admission, num, parentNum uint32, name string, uid, gid, project uint32, target []byte, block uint64, reserved bool) (uint64, error) {
 	link := &journal.SymlinkTargetPayload{InodeNum: uint64(num), DiskBlock: block, Target: target}
 	txn, err := f.createTxn(num, parentNum, name, uint32(inode.S_IFLNK|0o777), uid, gid, project, journal.DirEntrySymlink, link)
 	if err != nil {
 		return 0, err
 	}
 	commit := func() (uint64, error) {
-		seq, err := f.journal.Commit(txn)
+		seq, err := f.journal.CommitAdmitted(room, txn)
 		if err != nil {
 			f.journal.Abort(txn)
 		}
