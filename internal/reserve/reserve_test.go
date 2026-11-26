@@ -85,7 +85,13 @@ func (j *fakeJournal) take() []string {
 
 func (j *fakeJournal) Begin() *journal.Transaction { return journal.NewTransaction(0, [16]byte{1}, 1) }
 
-func (j *fakeJournal) Commit(*journal.Transaction) (uint64, error) {
+func (j *fakeJournal) Commit(*journal.Transaction) (uint64, error) { return j.commit("commit") }
+
+func (j *fakeJournal) CommitMovingHead(*journal.Transaction) (uint64, error) {
+	return j.commit("commit moving head")
+}
+
+func (j *fakeJournal) commit(event string) (uint64, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if j.commitErr != nil {
@@ -96,12 +102,8 @@ func (j *fakeJournal) Commit(*journal.Transaction) (uint64, error) {
 		j.pending = map[uint64]bool{}
 	}
 	j.pending[j.seq] = true
-	j.events = append(j.events, "commit")
+	j.events = append(j.events, event)
 	return j.seq, nil
-}
-
-func (j *fakeJournal) CommitMovingHead(txn *journal.Transaction) (uint64, error) {
-	return j.Commit(txn)
 }
 
 func (j *fakeJournal) Abort(*journal.Transaction) {
@@ -388,7 +390,7 @@ func TestRefreshRenewsAnOldRecord(t *testing.T) {
 
 	j.set(func(j *fakeJournal) { j.lag, j.completeErr = 300, errors.New("sync failed") })
 	m.Refresh(context.Background())
-	expectEvents(t, j, "refresh with a failing end", "commit")
+	expectEvents(t, j, "refresh with a failing end", "commit moving head")
 	j.set(func(j *fakeJournal) { j.lag = 0 })
 	m.ReturnAll(context.Background())
 	expectEvents(t, j, "return while the old record is unfinished")

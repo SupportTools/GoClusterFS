@@ -150,3 +150,39 @@ func TestAdmitRecordsRefusesRoomThatCanNeverBeFree(t *testing.T) {
 		t.Errorf("AdmitRecords for the whole ring = %v, want ErrJournalFull at once", err)
 	}
 }
+
+// Ending a record gives its room back, by CompleteIntent and CompleteIntentDurable alike: after several rings' worth of
+// records that ended, an admission still gets room at once.
+func TestEndedIntentsGiveBackTheirRoom(t *testing.T) {
+	j := newTestJournal(t)
+	records := 4 * int(j.region.DataAreaSize()/endRoom)
+	for n := range records {
+		seq, err := j.Commit(createTxn(t, j, n))
+		if err != nil {
+			t.Fatalf("record %d of %d: %v", n, records, err)
+		}
+		end := j.CompleteIntent
+		if n%2 == 1 {
+			end = j.CompleteIntentDurable
+		}
+		if err := end(seq); err != nil {
+			t.Fatalf("ending record %d: %v", n, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	a, err := j.Admit(ctx, 512)
+	if err != nil {
+		t.Fatalf("admitting after %d records ended: %v", records, err)
+	}
+	j.Release(a)
+}
+
+// A quota flush lets the head move past quota holds, so it must commit after unadmitted commits fill the ring.
+func TestQuotaFlushFindsRoomInAFullRing(t *testing.T) {
+	j := newTestJournal(t)
+	fillWithOpenIntents(t, j)
+	if _, err := j.CommitQuota(createTxn(t, j, 0), func(func(uint32) QuotaDeltaPayload) error { return nil }); err != nil {
+		t.Fatalf("flush after other commits filled the ring: %v", err)
+	}
+}
