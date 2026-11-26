@@ -277,6 +277,11 @@ type MountOptions struct {
 	// When used, you must implement the GetLk/SetLk/SetLkw methods.
 	EnableLocks bool
 
+	// EnableFlockLocks, if set and EnableLocks is not, asks the kernel to
+	// forward only flock(2) locks to FUSE, as SetLk/SetLkw with
+	// FUSE_LK_FLOCK set. The kernel keeps handling POSIX locks itself.
+	EnableFlockLocks bool
+
 	// EnableSymlinkCaching, if set, makes the kernel cache all Readlink return values.
 	// The filesystem must use content notification to force the
 	// kernel to issue a new Readlink call.
