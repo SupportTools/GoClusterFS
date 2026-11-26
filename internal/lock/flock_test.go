@@ -294,8 +294,9 @@ func TestConcurrentFlockClaimsLetTheLowerSlotWin(t *testing.T) {
 		t.Fatal("the higher slot kept its claim next to a lower one")
 	}
 
-	if err := low.Flock(context.Background(), key, LockModeExclusive, false); err != nil {
-		t.Fatalf("lower slot's flock after the higher one waits = %v", err)
+	won, _, err = low.claimFlock(record, key, LockModeExclusive, false)
+	if err != nil || !won {
+		t.Fatalf("lower slot's claim next to the higher one's waiting entry = won %v, %v; want it won", won, err)
 	}
 }
 
