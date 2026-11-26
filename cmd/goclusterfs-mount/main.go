@@ -223,17 +223,17 @@ func main() {
 		MaxPeers:             *broadcastPeers,
 	}
 	if *broadcastBeat <= 0 {
-		log.Fatalf("-broadcast-heartbeat must be positive, got %v", *broadcastBeat)
+		usageFailf("-broadcast-heartbeat must be positive, got %v", *broadcastBeat)
 	}
 	if *broadcastPeers < 1 {
-		log.Fatalf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
+		usageFailf("-broadcast-max-peers must be at least 1, got %d", *broadcastPeers)
 	}
 	var advertise netip.AddrPort
 	if *broadcastEnabled {
 		addr, err := broadcast.AdvertiseAddr(networkCfg, *advertiseAddr)
 		switch {
 		case err != nil && *advertiseAddr != "":
-			log.Fatalf("-advertise-addr: %v", err)
+			usageFailf("-advertise-addr: %v", err)
 		case err != nil:
 			log.Printf("[WARN] Broadcast: no unicast address to advertise (%v), so peers that miss this node's multicast cannot reach it. Set -advertise-addr", err)
 		default:
@@ -248,7 +248,7 @@ func main() {
 	cacheCfg.NegativeCacheSize = *cacheNegative
 	cacheCfg.Network = networkCfg
 	if err := cacheCfg.Validate(); err != nil {
-		log.Fatalf("Invalid cache flags: %v", err)
+		usageFailf("Invalid cache flags: %v", err)
 	}
 	if *preflight {
 		cfg := defaultPreflightConfig()

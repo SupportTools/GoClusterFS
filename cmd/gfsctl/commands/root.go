@@ -35,8 +35,9 @@ var rootCmd = &cobra.Command{
 	Short: "GoClusterFS management CLI",
 	Long: `gfsctl is the management CLI for GoClusterFS.
 
-It reads status, health, statistics and metrics from a running
-GoClusterFS mount through its HTTP API. It changes nothing.
+It reads status, health, statistics, metrics and quotas from a running
+GoClusterFS mount through its HTTP API. It changes nothing except a
+directory's quota, with quota set.
 
 Settings come from flags, then GFSCTL_HOST, GFSCTL_PORT, GFSCTL_TOKEN,
 GFSCTL_OUTPUT and GFSCTL_TIMEOUT, then the config file (gfsctl config path).

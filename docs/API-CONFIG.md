@@ -113,7 +113,7 @@ The kernel caches file attributes and directory entries for `-attr-timeout`. For
 | `-api-rate-limit` | float | `0` (off) | Requests per second per client IP, with bursts of twice that, up to 1,000,000. Over the limit, the API answers 429 |
 | `-dashboard` | bool | `true` | Serve the [web dashboard](#web-dashboard) under `/ui/` |
 
-The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` checks the device, journal, journal recovery, broadcast, broadcast peers and this node's heartbeat; see [HTTP API Health and Shutdown](#http-api-health-and-shutdown). With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
+The API serves `GET /health`, `GET /metrics`, `GET /api/v1/status`, `GET /api/v1/stats/...`, the [web dashboard](#web-dashboard) under `/ui/` and, with a token, the [write endpoints](#http-api-write-endpoints). [HTTP API Statistics](#http-api-statistics) lists what `/metrics`, `/api/v1/status` and `/api/v1/stats/...` return. `/health` checks the device, journal, journal recovery, broadcast, broadcast peers, fencing and this node's heartbeat; see [HTTP API Health and Shutdown](#http-api-health-and-shutdown). With a token set, `/api/v1/...` requests need `Authorization: Bearer <token>`. `/health`, `/metrics` and the dashboard's files under `/ui/` never need the token.
 
 Without a token, the API answers only requests whose `Host` header is `localhost`, a `127.x` address or `[::1]`, so a web page cannot reach it through DNS rebinding, and mount refuses `-api-cors '*'`. List the allowed origins instead. The dashboard at `/ui/` shares the API's origin and needs no CORS.
 
@@ -169,13 +169,13 @@ Mount copies its managers' counters every second. While requests read capacity o
 |----------|---------|
 | `/api/v1/status` | Version, uptime, mount and device paths, and `capacity`: total, used and free blocks and bytes of the data region, for the whole volume |
 | `/api/v1/stats` | `cache` and `journal`, as below |
-| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks), `silent_peers` (mounted nodes not heard on broadcast for 3 heartbeat intervals) and `max_peers` `dir_index` has `dirs` and `entries` (names) held, `limit`, `hits` (lookups an index answered), `misses`, `rebuilds` (full reads of a directory) and `hit_rate`. |
+| `/api/v1/stats/cache` | `inode_cache`, `extent_cache`, `negative_cache` and `lock_hint_cache`, each with `size` (entries), `capacity` (the limit), `hits`, `misses` and `hit_rate` (0 to 1). `lock_hint_cache` is always 0: locks no longer use a hint cache. With broadcast on, `broadcast` has `peers` (unicast peers), `senders` (nodes whose message numbers this node tracks), `silent_peers` (mounted nodes not heard on broadcast for 3 heartbeat intervals) and `max_peers`. `dir_index` has `dirs` and `entries` (names) held, `limit`, `hits` (lookups an index answered), `misses`, `rebuilds` (full reads of a directory) and `hit_rate`. |
 | `/api/v1/stats/journal` | This node's journal: `state` (`clean` or `dirty`), `head_offset` and `tail_offset` in the ring, `available_space` in bytes, `active_txn_count`, `commit_count`, `bytes_written`, `last_checkpoint_seq`, `batch_sync_count`. 404 with `-journal=false` |
 | `/api/v1/stats/trim` | `trim_enabled`, false with `-trim=false` or after the device refused a discard as unsupported (image files always do). With `-trim`, also `trim_operations` (discard calls), `trim_blocks` and `trim_bytes` discarded, `pending_trim_blocks`, `trim_errors` (failed ranges, plus flushes skipped because the freed blocks could not be reserved), `last_trim_at` and `batch_size` |
 | `/api/v1/stats/lock` | `active_locks` (locks this node holds), `pending_locks` (lock requests that found the lock taken and are retrying), `hint_cache_hits`, `hint_cache_misses` and `hint_cache_hit_rate`, which are always 0, and `types`: per lock type (`bitmap`, `refcount`, `inode`, ...), the `acquires` served, the `blocked` acquires whose first try found the lock taken, their `wait_seconds`, and the `failed` acquires that gave up with an error, such as a timeout or a crashed node whose replay lease lapsed |
 | `/api/v1/stats/cluster` | This node's `node_id` (UUID in hex), `node_address` (hostname), `state`, `last_heartbeat_at` and `joined_at`; `cluster_size` (registered nodes); `healthy_nodes` (active with a heartbeat under 10 seconds old); and `peers`, each with `node_id`, `address` (hostname), `state` and `last_seen`. A state is `active`, `leaving`, `dead`, or `stale` when the heartbeat is over 10 seconds old and no node has declared it dead yet. `role` is always `peer`: there is no leader |
 | `/api/v1/stats/sfb` | 404, because SFB containers are disabled |
-| `/api/v1/stats/all` | `collected_at` and every section above except `sfb`, plus `node`: `heartbeat_age_seconds` (how long ago this node's last heartbeat reached its registry slot), `peer_replays` and `peer_replay_failures` (crashed nodes' journals this node replayed, and replays that failed and wait for a retry), `replaying_slots` (replays running now), `mount_replayed_transactions` (committed transactions this node replayed from its own slot's journal when it mounted), `mount_discarded_journal` (true after `-skip-recovery` discarded that journal), `reservation_key_restores` (times this node registered its reservation key again after its storage path lost it) and `stale_reservation_keys` (reservation keys no registry slot owned in two checks a minute apart after this node joined; see Storage Fencing in OPERATIONS.md) |
+| `/api/v1/stats/all` | `collected_at` and every section above except `sfb`, plus `reserve` when block reserves are on (`blocks` this node holds, `refills`, `returns`, `peer_waits` and `peer_wait_seconds`), and `node`: `heartbeat_age_seconds` (how long ago this node's last heartbeat reached its registry slot), `peer_replays` and `peer_replay_failures` (crashed nodes' journals this node replayed, and replays that failed and wait for a retry), `replaying_slots` (replays running now), `mount_replayed_transactions` (committed transactions this node replayed from its own slot's journal when it mounted), `mount_discarded_journal` (true after `-skip-recovery` discarded that journal), `reservation_key_restores` (times this node registered its reservation key again after its storage path lost it) and `stale_reservation_keys` (reservation keys no registry slot owned in two checks a minute apart after this node joined; see Storage Fencing in OPERATIONS.md) |
 
 `/metrics` exports the same counters under the `goclusterfs_` prefix: `cache_*` (including `cache_inode_capacity`, `cache_extent_capacity` and `cache_negative_capacity`), `dir_index_*`, `broadcast_peers`, `broadcast_senders`, `broadcast_silent_peers` and `broadcast_max_peers` (with broadcast on), `journal_*`, `trim_*`, `lock_*` (including `lock_acquires_total`, `lock_blocked_total` and `lock_wait_seconds_total`, labeled by lock `type`), `lock_failures_total` (labeled by lock `type`), `reserve_blocks`, `reserve_refills_total`, `reserve_returns_total`, `reserve_peer_waits_total` and `reserve_peer_wait_seconds_total` (with block reserves on), `cluster_size`, `cluster_healthy_nodes`, `cluster_nodes` (registered nodes, this one included, labeled by `state`: `active`, `leaving`, `stale` or `dead`) and `cluster_is_leader` (always 0). From the `node` section: `node_heartbeat_age_seconds`, `fencing_stale_keys`, `journal_peer_replays_total` (labeled `result="ok"` or `"failed"`), `journal_peer_replays_running`, `journal_mount_replayed_transactions` and `journal_mount_discarded` and `fencing_key_restores_total` (times this node registered its reservation key again after its storage path lost it). `api_requests_total` counts the API's responses by `route` (`/health`, `/metrics`, `/ui`, `/api/v1/status`, `/api/v1/stats`, `/api/v1/snapshots`, `/api/v1/clones`, `/api/v1/quotas`, `/api/v1/admin` or `other`) and status `code`, including 401s, 403s and the rate limiter's 429s; 4xx and 5xx codes are errors. `goclusterfs_journal_state` is 0 for clean, 1 for dirty, 2 for recovering and 3 for corrupt. `goclusterfs_fs_size_bytes` and `goclusterfs_fs_free_bytes` give the data region's capacity. There are no `sfb_*` metrics.
 
@@ -211,10 +211,10 @@ The settings below have no flag unless the table names one. `goclusterfs-mount` 
 
 | Field | Default | Flag | Meaning |
 |-------|---------|------|---------|
-| `InodeCacheSize` | `10000` | | Cached inodes |
+| `InodeCacheSize` | `10000` | `-cache-inodes` | Cached inodes |
 | `InodeTTL` | `5s` | `-cache-ttl` | How long a cached inode is used before it is checked against the disk |
-| `ExtentCacheSize` | `50000` | | Cached mappings from (inode, logical block) to physical block. A mapping is only used with the inode version it was looked up with, so any inode write by any node makes it stale |
-| `NegativeCacheSize` | `1000` | | Cached "not found" lookups |
+| `ExtentCacheSize` | `50000` | `-cache-extents` | Cached mappings from (inode, logical block) to physical block. A mapping is only used with the inode version it was looked up with, so any inode write by any node makes it stale |
+| `NegativeCacheSize` | `1000` | `-cache-negative` | Cached "not found" lookups |
 | `NegativeTTL` | `1s` | | How long a "not found" result is kept |
 | `StrictMode` | `false` | `-cache-strict` | Check every cached inode against the disk before use |
 
@@ -253,7 +253,8 @@ Each node's journal is 4 MB, set by the on-disk layout.
 | `UnicastPort` | `24731` | `-unicast-port` | UDP port for unicast; must differ from `MulticastPort` |
 | `MulticastTTL` | `1` | | Multicast packets stay in the local subnet |
 | `MaxMulticastFailures` | `3` | | After this many multicast sends fail in a row, the node sends only to its unicast peers for 30 seconds, then tries multicast again. A successful send resets the count. `0` turns multicast off |
-| `HeartbeatInterval` | `30s` | | How often a node announces itself over UDP, so peers learn its unicast address. Failure detection uses the on-disk heartbeat, not this |
+| `HeartbeatInterval` | `30s` | `-broadcast-heartbeat` | How often a node announces itself over UDP, so peers learn its unicast address. Failure detection uses the on-disk heartbeat, not this |
+| `MaxPeers` | `256` | `-broadcast-max-peers` | Most nodes the peer table and lost-message tracking hold |
 | `Secret` | (empty) | `-broadcast-secret` | HMAC secret; all nodes must use the same one. With broadcast on and no secret, mount logs a `WARNING` at startup. Generate one with `openssl rand -hex 32` |
 | `Interface` | (system default) | `-broadcast-iface` | Network interface for multicast, such as `eth0` |
 
@@ -263,13 +264,13 @@ Each node's journal is 4 MB, set by the on-disk layout.
 
 | Workload | Flags | Notes |
 |----------|-------|-------|
-| Read-heavy | `-cache-ttl 30s` | Open files can see other nodes' changes up to 30 seconds late |
+| Read-heavy | `-cache-ttl 30s` | When a broadcast message is lost, another node's change can take up to 30 seconds to show |
 | Shared files, databases | `-cache-strict -attr-timeout 0` | Every node sees changes as soon as possible; `stat` and `ls` get much slower |
 | SSD or NVMe | `-trim-batch 512 -trim-age 10s` | Fewer, larger discards |
 | HDD, or storage without discard | `-trim=false` | |
-| Small files | | SFB is disabled, so each file with data uses a full 1 MB block |
+| Small files | `-format -block-size 8192` | Each file with data uses at least one full block, so small blocks waste less space. You can set it only at format time |
 
-Cache sizes and journal commit modes have no flags.
+Journal commit modes have no flag. Set cache sizes with `-cache-inodes`, `-cache-extents` and `-cache-negative`.
 
 ```bash
 ./goclusterfs-mount -device /dev/device -mount /mnt/fs -cache-ttl 30s
@@ -283,7 +284,7 @@ Cache sizes and journal commit modes have no flags.
 |----------|---------|---------|
 | `GOCLUSTERFS_API_TOKEN` | `goclusterfs-mount` | The API token, instead of `-api-token-file`. Set only one of them |
 | `GFSCTL_HOST`, `GFSCTL_PORT`, `GFSCTL_TOKEN`, `GFSCTL_OUTPUT`, `GFSCTL_TIMEOUT` | `gfsctl` | Defaults for its flags; see [gfsctl](../README.md#gfsctl) |
-| `XDG_CONFIG_HOME` | `gfsctl` | Its config file is `$XDG_CONFIG_HOME/gfsctl/`, or `~/.config/gfsctl/` |
+| `XDG_CONFIG_HOME` | `gfsctl` | Its config file is `$XDG_CONFIG_HOME/gfsctl/config.yaml`, or `~/.config/gfsctl/config.yaml` |
 | `NO_COLOR` | `gfsctl` | Turns off colored output |
 
 ---
