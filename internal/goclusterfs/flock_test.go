@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/supporttools/GoClusterFS/internal/lock"
 )
 
@@ -204,4 +206,39 @@ func TestInterruptedClusterWaitReturnsEINTR(t *testing.T) {
 	if len(tbl.files) != 0 || len(tbl.owners) != 0 {
 		t.Fatalf("an interrupted flock left files %v and owners %v", tbl.files, tbl.owners)
 	}
+}
+
+// flockRaw stands in for go-fuse's node file system: it takes an exclusive flock on the inode NodeId names.
+type flockRaw struct {
+	fuse.RawFileSystem
+	tbl *flockTable
+}
+
+func (r *flockRaw) SetLk(_ <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	return fuse.Status(r.tbl.lock(context.Background(), lock.FlockKey{Inode: uint32(in.NodeId)}, in.Owner, lock.LockModeExclusive, false))
+}
+
+func (r *flockRaw) Release(<-chan struct{}, *fuse.ReleaseIn) {}
+
+// The kernel names a flock's owner by its struct file's address, which a new open can reuse before the old open's
+// RELEASE arrives; that RELEASE must not drop the new open's flock.
+func TestLateReleaseKeepsANewerOpenFilesFlock(t *testing.T) {
+	tbl := newFlockTable(nil)
+	raw := &flockFS{RawFileSystem: &flockRaw{RawFileSystem: fuse.NewDefaultRawFileSystem(), tbl: tbl}, flocks: tbl}
+	const reused = 0xabc
+	setlk := func(fh, nodeID uint64) fuse.Status {
+		return raw.SetLk(nil, &fuse.LkIn{InHeader: fuse.InHeader{NodeId: nodeID}, Fh: fh, Owner: reused, LkFlags: fuse.FUSE_LK_FLOCK})
+	}
+	if st := setlk(5, 7); !st.Ok() {
+		t.Fatalf("flock through handle 5 = %v", st)
+	}
+	if st := setlk(7, 8); !st.Ok() {
+		t.Fatalf("flock through handle 7, from an open that reused the kernel's lock owner = %v", st)
+	}
+	raw.Release(nil, &fuse.ReleaseIn{Fh: 5, LockOwner: reused, ReleaseFlags: fuse.FUSE_RELEASE_FLOCK_UNLOCK})
+
+	requireFlockErrno(t, tbl.lock(context.Background(), lock.FlockKey{Inode: 8}, 99, lock.LockModeExclusive, false), syscall.EWOULDBLOCK,
+		"flock on handle 7's inode after handle 5's late release")
+	requireFlockErrno(t, tbl.lock(context.Background(), lock.FlockKey{Inode: 7}, 99, lock.LockModeExclusive, false), 0,
+		"flock on handle 5's inode after its release")
 }
