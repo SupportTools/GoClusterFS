@@ -47,6 +47,7 @@ func (m *Manager) watchHolds(stop <-chan struct{}, done chan<- struct{}) {
 			m.warnLongHolds()
 		case <-retry.C:
 			m.retryReleases()
+			m.retryFlockWrites()
 		}
 	}
 }
