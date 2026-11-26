@@ -2422,8 +2422,18 @@ test_flock_across_nodes() {
 
     local mnt=/mnt/goclusterfs
     ssh_run 1 "touch $mnt/flock_file"
-    ssh_run 1 "nohup flock -x $mnt/flock_file sleep 4 < /dev/null > /dev/null 2>&1 &"
-    sleep 1
+    # The holder touches a marker once it holds the flock: a flock may first wait for the other VM's last release.
+    hold_flock() {
+        ssh_run 1 "rm -f /tmp/flock_held; nohup flock $1 $mnt/flock_file sh -c 'touch /tmp/flock_held; sleep $2' < /dev/null > /dev/null 2>&1 &"
+        local i
+        for i in $(seq 50); do
+            ssh_run 1 "test -e /tmp/flock_held" && return 0
+            sleep 0.2
+        done
+        log_error "VM 1 did not get its $1 flock within 10s"
+        return 1
+    }
+    hold_flock -x 4 || return 1
     if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
         log_error "VM 2 took an exclusive flock that VM 1 holds"
         return 1
@@ -2439,8 +2449,7 @@ test_flock_across_nodes() {
     fi
     log_info "VM 2 waited $((SECONDS - start))s for the flock"
 
-    ssh_run 1 "nohup flock -s $mnt/flock_file sleep 3 < /dev/null > /dev/null 2>&1 &"
-    sleep 1
+    hold_flock -s 3 || return 1
     if ! ssh_run 2 "flock -n -s $mnt/flock_file true"; then
         log_error "VM 2 could not share a flock with VM 1"
         return 1

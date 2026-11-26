@@ -160,11 +160,12 @@ func (m *Manager) flock(ctx context.Context, recordID uint64, key FlockKey, mode
 		}
 	}
 	for {
+		wake := m.flockWaker(recordID)
 		won, blockers, err := m.claimFlock(recordID, key, mode, wait)
 		if err != nil || won {
 			return err
 		}
-		if err := m.awaitFlock(ctx, recordID, key, mode, blockers); err != nil {
+		if err := m.awaitFlock(ctx, recordID, key, mode, blockers, wake); err != nil {
 			return err
 		}
 	}
@@ -416,14 +417,14 @@ func (m *Manager) flockSlotBlocks(slot int, buf []byte, key FlockKey, mode LockM
 }
 
 // awaitFlock waits until none of blockers keeps this node from key in mode, or
-// ctx ends. It rereads only those slots, every flockPoll or at a hint.
-func (m *Manager) awaitFlock(ctx context.Context, recordID uint64, key FlockKey, mode LockMode, blockers []int) error {
+// ctx ends. It rereads only those slots, every flockPoll or at a hint. wake is
+// taken before the claim read the row, so a hint after that read is not lost.
+func (m *Manager) awaitFlock(ctx context.Context, recordID uint64, key FlockKey, mode LockMode, blockers []int, wake <-chan struct{}) error {
 	m.waits.Add(1)
 	m.waiting.Add(1)
 	defer m.waiting.Add(-1)
 	buf := storage.GetBuffer(SlotSize)
 	defer storage.PutBuffer(buf)
-	wake := m.flockWaker(recordID)
 	for {
 		poll := m.timing.flockPoll
 		timer := time.NewTimer(poll*4/5 + time.Duration(rand.Int63n(int64(poll*2/5)+1)))

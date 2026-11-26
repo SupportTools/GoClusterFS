@@ -343,7 +343,7 @@ A wait in `flock(2)` is the exception: a signal ends it, and the call restarts i
 
 `flock(2)` locks hold across nodes: an exclusive flock on one node keeps every process on every node out, and shared flocks hold together. `fcntl(2)` locks, OFD locks included, hold only on the node that takes them, so two processes on different nodes can both hold one and neither gets an error. SQLite's default locking uses fcntl locks, so do not share an SQLite database between nodes.
 
-- **Cost.** A flock no other node holds costs one 4 KB write and one 256 KB read of the lock region: FLOCK_LATENCY. Releasing it costs one 4 KB write. A flock this node already holds through another open file of the same file costs no I/O.
+- **Cost.** A flock no other node holds costs one 4 KB write and one 256 KB read of the lock region, and releasing it one 4 KB write. On the test VMs over iSCSI, a flock and its unlock took about 4 ms together. A flock this node already holds through another open file of the same file costs no I/O.
 - **Waits.** A waiter on another node gets the flock once the holder releases it: at once when the holder's UDP hint arrives, otherwise within about a second. A signal ends the wait, and the call restarts if the program's handler uses `SA_RESTART`, so a killed waiter exits at once.
 - **Node failure.** A crashed node's flocks pass to waiters once a live node takes it over, about 20 seconds after its last heartbeat. The takeover cuts the dead node off the storage, or the node stops writing once its heartbeat goes stale; neither stops the node's processes. Anything a process does outside the volume, such as calling an API or writing to another disk, is not protected once its flock moves to another node.
 - **Limits.**

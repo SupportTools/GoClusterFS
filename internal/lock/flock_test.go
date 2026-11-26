@@ -586,3 +586,26 @@ func TestTakeoverOfADeadHolderWakesItsWaiters(t *testing.T) {
 	}
 	requireFlocked(t, result, 2*time.Second)
 }
+
+// A hint that arrives after a claim read the row, before the wait starts, still wakes the waiter.
+func TestHintBetweenClaimAndWaitWakesTheWaiter(t *testing.T) {
+	nodes, _ := flockNodes(t, 2)
+	holder, waiter := nodes[0], nodes[1]
+	setTimings(func(tm *timings) { tm.flockPoll = time.Hour }, holder, waiter)
+	holder.SetFlockHint(waiter.FlockChanged)
+	key := FlockKey{Inode: 5, Birth: 1}
+	if err := holder.Flock(context.Background(), key, LockModeExclusive, false); err != nil {
+		t.Fatal(err)
+	}
+	var released atomic.Bool
+	waiter.rowRead = func(buf []byte, offset int64) (int, error) {
+		n, err := waiter.dev.ReadAtUnsharded(buf, offset)
+		if released.CompareAndSwap(false, true) {
+			if err := holder.Unflock(key); err != nil {
+				t.Error(err)
+			}
+		}
+		return n, err
+	}
+	requireFlocked(t, flockInBackground(waiter, key, LockModeExclusive), 2*time.Second)
+}

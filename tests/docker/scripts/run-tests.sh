@@ -787,8 +787,19 @@ test_flock_across_nodes() {
         return 1
     fi
     exec_on_node "$node" touch "$mnt/flock_file"
-    exec_on_node "$node" setsid -f flock -x "$mnt/flock_file" sleep 4
-    sleep 1
+    # The holder touches a marker once it holds the flock: a flock may first wait for the other node's last release.
+    hold_flock() {
+        exec_on_node "$node" rm -f /tmp/flock_held
+        exec_on_node "$node" setsid -f flock "$1" "$mnt/flock_file" sh -c "touch /tmp/flock_held; sleep $2"
+        local i
+        for i in $(seq 50); do
+            exec_on_node "$node" test -e /tmp/flock_held && return 0
+            sleep 0.2
+        done
+        log "ERROR: $node did not get its $1 flock within 10s"
+        return 1
+    }
+    hold_flock -x 4 || return 1
     if exec_on_node "$other" flock -n -x "$mnt/flock_file" true; then
         log "ERROR: $other took an exclusive flock that $node holds"
         return 1
@@ -804,8 +815,7 @@ test_flock_across_nodes() {
     fi
     log "$other waited $((SECONDS - start))s for the flock"
 
-    exec_on_node "$node" setsid -f flock -s "$mnt/flock_file" sleep 3
-    sleep 1
+    hold_flock -s 3 || return 1
     if ! exec_on_node "$other" flock -n -s "$mnt/flock_file" true; then
         log "ERROR: $other could not share a flock with $node"
         return 1
