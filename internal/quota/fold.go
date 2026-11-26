@@ -108,6 +108,7 @@ func (g *Guard) Fold(ctx context.Context, open func() (Table, error), slot, ownS
 	if hook := afterFoldAppend.Load(); hook != nil {
 		(*hook)()
 	}
+	holdFold(slot)
 	for _, f := range folds {
 		if err := tbl.SetUsage(f.Project, f.NewBlocks, f.NewInodes); err != nil {
 			return fmt.Errorf("project %d: %w", f.Project, err)

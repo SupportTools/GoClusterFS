@@ -37,6 +37,33 @@ func TestRegisterRefusesWhileALiveNodeHasAnotherLockLayout(t *testing.T) {
 	}
 }
 
+func TestRegisterNamesTheBuildOfAKnownOlderLockLayout(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	dev, cleanup := createTestDevice(t, 10<<20)
+	defer cleanup()
+	ctx := context.Background()
+
+	live := NewRegistry(dev, 0)
+	live.SetLockLayout(1)
+	if _, err := live.Register(ctx, "old-build"); err != nil {
+		t.Fatal(err)
+	}
+	if err := live.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = live.Unregister(ctx) }()
+
+	joining := NewRegistry(dev, 0)
+	joining.SetLockLayout(2)
+	joining.NameLockLayout(1, "whose flocks hold only on their own node")
+	_, err := joining.Register(ctx, "this-version")
+	if !errors.Is(err, ErrLockLayout) || !strings.Contains(err.Error(), "old-build") ||
+		!strings.Contains(err.Error(), "runs a build whose flocks hold only on their own node") ||
+		!strings.Contains(err.Error(), "unmount every node of that build") {
+		t.Fatalf("Register next to a live node of a named older layout = %v; want ErrLockLayout naming the node and its build", err)
+	}
+}
+
 func TestRegisterJoinsPastASilentNodeWithAnotherLockLayout(t *testing.T) {
 	shortenSilentSlotWatch(t)
 	dev, cleanup := createTestDevice(t, 10<<20)

@@ -280,7 +280,7 @@ func (f *FS) logSymlink(room *journal.Admission, num, parentNum uint32, name str
 
 func (f *FS) linkNode(ctx context.Context, parent *fs.Inode, ino *inode.Inode, out *fuse.EntryOut) *fs.Inode {
 	fillLinkAttr(&out.Attr, ino, f.blockSize)
-	return parent.NewPersistentInode(ctx, &Link{fs: f, inodeNum: ino.InodeNum, birth: ino.BirthGeneration}, fs.StableAttr{
+	return parent.NewInode(ctx, &Link{fs: f, inodeNum: ino.InodeNum, birth: ino.BirthGeneration}, fs.StableAttr{
 		Mode: fuse.S_IFLNK,
 		Ino:  uint64(ino.InodeNum),
 		Gen:  ino.BirthGeneration,

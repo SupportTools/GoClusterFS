@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- This version keeps 16 of the 256 lock records for flocks, taken from the inode locks' 128. Nodes of older builds map locks to records differently, so mount refuses to join one and names it as a build whose flocks hold only on their own node. Unmount every node before you upgrade.
 - Volumes this version formats carry the `RequiredTakeoverIntent` flag, and the first node of this version to mount an older volume sets it. After that, older builds and older `goclusterfs-fsck` cannot mount or check the volume; they refuse it with `unknown required flags 0x100`, or `0x300` before project quotas, because an older fsck revokes a node without marking a takeover intent first. Builds with and without takeover intents refuse to join each other, and the refusal names the takeover protocol, so unmount every node before you upgrade. Run fsck from the same build as the nodes.
 - Volumes this version formats carry the `RequiredProjectQuotas` flag and a project quota table, and older builds refuse them with `unknown required flags 0x200`. Add the table to a volume an older build formatted with `goclusterfs-fsck -enable-quotas DEVICE`, with every node stopped; older builds then refuse it too. Quotas themselves arrive in later changes.
 - A node now refuses to mount a volume without storage fencing while another node has it mounted, and tells you which slots hold the other nodes. Under QEMU a paused VM's clocks do not count the pause, so on an unfenced volume a VM paused past its takeover resumed and overwrote file data after a peer replayed its journal, in 6 of 6 test runs, and `goclusterfs-fsck` found nothing. Format multi-node volumes on a device with SCSI-3 or NVMe persistent reservations. To keep running several nodes on an unfenced volume, as on files or virtio disks, pass `-unsafe-allow-unfenced` on every node that joins. A node mounted alone is unchanged.
@@ -33,6 +34,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `-skip-recovery` now takes the slot number from the recovery error, as `-skip-recovery=N`, and discards a journal only when the mount takes slot N. A bare `-skip-recovery` is a usage error.
 
 ### Added
+
+- `flock(2)` holds across nodes. A waiter on another node gets the flock when the holder releases it, and a crashed node's flocks pass to waiters once a live node takes it over. `fcntl(2)` locks still hold only on the node that takes them. See [File Locks](docs/OPERATIONS.md#file-locks) for the cost and the limits.
+- In a cgroup with a memory limit, such as a Kubernetes container, the mount sets Go's memory limit to 90% of it unless `GOMEMLIMIT` is set, so the garbage collector works harder before the limit kills the mount.
 
 - `GET` and `PUT /api/v1/quotas` read and set a directory's project quota, as the `trusted.goclusterfs.quota` attribute does, behind the API token and without CAP_SYS_ADMIN. `gfsctl quota get PATH` and `gfsctl quota set PATH --bytes N --inodes N` call them.
 - `goclusterfs-fsck` recounts each quota project's usage from its inodes and reports a project whose usage in the quota table differs, which an I/O error or a crash at the wrong moment can leave; `-repair` writes the recount. It checks only when every journal is clean. It also reports inodes in a project with no record and names in another project than their directory gives.
@@ -95,6 +99,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The mount serves `flock(2)` on its files instead of the kernel, through a copy of go-fuse v2.9.0 with one patch (`third_party/README.md`). `/proc/locks` and `lslocks` no longer list flocks; fcntl locks stay in the kernel and still show there.
 - Writes handle contiguous blocks as one run instead of block by block. An overwrite of blocks one extent maps takes one in-place check, one extent lock per megabyte and one device write; new blocks that follow each other on the device are written together; and a first write into `fallocate`d blocks clears the whole range it covers at once. At 8 KB blocks, a 512 MB overwrite with 128 KB writes went from 57 to 257 MB/s on a tmpfs-backed volume, the same as at 1 MB, and writing into a `fallocate`d 512 MB file from 43 to 456 MB/s.
 - `goclusterfs-fsck` tracks blocks in a bitset and one byte per block instead of maps. On a 100 GB volume at 8 KB blocks with 90 GB allocated, a check takes 3.2 s and 39 MB of memory instead of 23 s and 1.6 GB.
 - `statfs` (`df`) no longer reads the whole inode table on every call. It returns a free-inode count that this node's creates and removes adjust at once, and that a background scan refreshes once it is older than 30 times the last scan took, at least a second. Other nodes' creates and removes show up late by that much. At 16 KB per inode the table of a 100 GB volume is 1.6 GB. `statfs` also reads the block bitmap 1 MB at a time instead of 4 KB.
@@ -126,6 +131,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Hundreds of threads creating files at once filled the 4 MB journal with open intents, and creates, mkdirs, links, symlinks and unlinks then failed with EIO, logging "journal is full". These operations now wait for room in the journal before they take any lock, and the journal keeps room for every open intent's end, so a finished operation's end always fits. Writes, truncates and renames don't wait yet: they still fail with EIO if the journal stays full, which takes far more concurrency.
+- A mount kept about 420 bytes of memory for every file and directory it ever looked up or created, until the name was removed or the mount ended: 1.3 GB after a walk of 3 million files. It now frees them when the kernel drops its cached entries, as it does under memory pressure.
+
 - Creates, mkdirs and symlinks running at once on one node failed with EAGAIN, and the mount logged `lost 5 races with other nodes` with no other node mounted. Every create found the same free inode, then committed to the journal before claiming it, so the losers kept colliding: with 16 parallel creators, about 17% of creates failed. A node now hands each of its creates a free inode no other local create holds.
 - `df` and `statfs` on a directory or file below the root reported zero size, blocks and inodes, because only the root answered them. They now report the volume.
 

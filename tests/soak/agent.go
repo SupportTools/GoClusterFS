@@ -104,7 +104,7 @@ func serve(root string, req request) response {
 			err = f.Close()
 		}
 	case "write":
-		err = writeSynced(p, req.Off, genData(req.Seed, req.Len))
+		resp.Size, err = writeSynced(p, req.Off, genData(req.Seed, req.Len))
 	case "truncate":
 		err = unix.Truncate(p, req.Len)
 	case "unlink":
@@ -126,6 +126,11 @@ func serve(root string, req request) response {
 		var n int
 		if n, err = unix.Getxattr(p, req.Attr, buf); err == nil {
 			resp.Text = string(buf[:n])
+		}
+	case "statfs":
+		var st unix.Statfs_t
+		if err = unix.Statfs(p, &st); err == nil {
+			resp.Text = fmt.Sprintf("%d %d", int64(st.Blocks)*st.Frsize, st.Files)
 		}
 	case "read":
 		var data []byte
@@ -180,20 +185,38 @@ func entryName(dir string, e os.DirEntry) string {
 	return fmt.Sprintf("f:%s:%d", e.Name(), st.Size)
 }
 
-func writeSynced(p string, off int64, data []byte) error {
+// writeSynced writes data at off and syncs the file. It returns how much a failed write wrote, synced too, since a
+// write that passes a quota limit part way keeps its first bytes. It calls pwrite itself: os.File.WriteAt drops the
+// count of a call that wrote some bytes and then failed.
+func writeSynced(p string, off int64, data []byte) (int64, error) {
 	f, err := os.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if _, err := f.WriteAt(data, off); err != nil {
-		_ = f.Close()
-		return err
+	var n int
+	var werr error
+	for n < len(data) {
+		m, err := unix.Pwrite(int(f.Fd()), data[n:], off+int64(n))
+		if m > 0 {
+			n += m
+		}
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err == nil && m == 0 {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			werr = err
+			break
+		}
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return err
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil {
+		return int64(n), werr
 	}
-	return f.Close()
+	return 0, errors.Join(serr, cerr)
 }
 
 // apiToken matches GOCLUSTERFS_API_TOKEN in cluster.sh, which turns on the API's snapshot writes.

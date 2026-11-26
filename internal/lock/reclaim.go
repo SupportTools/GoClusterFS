@@ -11,7 +11,8 @@ import (
 // node proven dead, in place while the slot's journal is replayed, and returns
 // their records. It writes each write slot there, and any torn one, again with
 // the current time, so peers stay off those records until ReleaseAdopted while
-// this node's own acquires ignore them. Read slots there are cleared at once.
+// this node's own acquires ignore them. Read slots there are cleared at once,
+// and so are flock slots, which no replay needs.
 // That covers claims an earlier node of the slot left, such as a node killed
 // before a mount that registered in its slot stopped before its replay. Call it
 // before the replay and pass the result to ReleaseAdopted after it.
@@ -43,6 +44,9 @@ func (m *Manager) adoptRecord(recordID uint64, owner [16]byte, ownerSlot int) (b
 	gate.Lock()
 	defer gate.Unlock()
 
+	if m.isFlockRecord(recordID) {
+		return false, m.clearFlockSlot(recordID, ownerSlot)
+	}
 	if _, inUse := m.ownSlotUse(recordID); ownerSlot == m.nodeSlot && inUse {
 		return false, nil
 	}
@@ -141,7 +145,8 @@ func (m *Manager) ReleaseAdopted(adopted []Adoption) error {
 // ClearForeignClaims clears the claims in this node's slot that it did not
 // write: a torn claim, or one an earlier occupant of the slot left that no
 // replay adopted, such as after fsck released the slot. Under an owner view they
-// would count as this node's. Call it after the mount's replay.
+// would count as this node's. It also clears this node's flock slots that hold
+// entries it does not keep. Call it after the mount's replay.
 func (m *Manager) ClearForeignClaims() error {
 	for recordID := uint64(0); recordID < m.size/RowSize; recordID++ {
 		if err := m.clearForeignClaim(recordID); err != nil {
@@ -156,6 +161,9 @@ func (m *Manager) clearForeignClaim(recordID uint64) error {
 	gate.Lock()
 	defer gate.Unlock()
 
+	if m.isFlockRecord(recordID) {
+		return m.clearFlockSlot(recordID, m.nodeSlot)
+	}
 	if _, inUse := m.ownSlotUse(recordID); inUse {
 		return nil
 	}

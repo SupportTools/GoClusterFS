@@ -253,6 +253,30 @@ func TestBroadcasterHandleOrphans(t *testing.T) {
 	}
 }
 
+func TestBroadcasterHandleFlockChanged(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Enabled = false
+	b, err := NewBroadcaster(cfg, [16]byte{1}, 0, newMockHandler())
+	if err != nil {
+		t.Fatalf("NewBroadcaster failed: %v", err)
+	}
+	var records []uint64
+	b.OnFlockChanged(func(recordID uint64) { records = append(records, recordID) })
+
+	wire, err := NewMessageBuilder([16]byte{2}).FlockChanged(247).Marshal(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Unmarshal(wire, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.handleMessage(got, nil, false)
+	if len(records) != 1 || records[0] != 247 || got.Type.String() != "FlockChanged" {
+		t.Errorf("handled %s message: OnFlockChanged got %v, want record 247 once", got.Type, records)
+	}
+}
+
 func TestBroadcasterIgnoresOwnMessages(t *testing.T) {
 	handler := newMockHandler()
 	uuid := [16]byte{1, 2, 3, 4}

@@ -156,6 +156,8 @@ func main() {
 	}
 	logging.SetDebug(*debug)
 	dumpGoroutinesOnSIGUSR1()
+	setMemoryLimit()
+	collectGarbageForTests()
 
 	if *showVer {
 		fmt.Println("goclusterfs-mount", version.String())
@@ -344,6 +346,7 @@ func main() {
 		nodeReg.PreferSlot(*skipRecovery)
 	}
 	nodeReg.SetLockLayout(lock.LayoutID())
+	nodeReg.NameLockLayout(lock.PreFlockLayoutID(), "whose flocks hold only on their own node")
 	nodeReg.SetAdvertiseAddr(advertise)
 	slotIdx, err := nodeReg.Register(ctx, hostname)
 	if errors.Is(err, node.ErrLockLayout) {
@@ -634,6 +637,8 @@ func main() {
 	gfs.SetDirectIO(*directIO)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
 	cacheMgr.OnOrphans(nodeReg.KickOrphans)
+	cacheMgr.OnFlockChanged(lockMgr.FlockChanged)
+	lockMgr.SetFlockHint(cacheMgr.BroadcastFlockChanged)
 	quotasSet := false
 	setUpQuotas := func() {
 		if quotasSet || sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 {
@@ -701,6 +706,8 @@ func main() {
 			MaxReadAhead:  1 << 20,
 			DisableXAttrs: false,
 			AllowOther:    *allowOther,
+			// fcntl locks stay in the kernel and hold only on this node.
+			EnableFlockLocks: true,
 		},
 		AttrTimeout:  attrTimeout,
 		EntryTimeout: attrTimeout,
@@ -712,7 +719,7 @@ func main() {
 
 	// Mount filesystem using go-fuse v2 API
 	log.Printf("Mounting at %s...", *mountPoint)
-	server, err := fs.Mount(*mountPoint, gfs, mountOpts)
+	server, err := mountFS(*mountPoint, gfs, mountOpts)
 	if err != nil && *allowOther && os.Getuid() != 0 {
 		failf("Failed to mount at %s: %v. A mount by a user other than root needs user_allow_other in /etc/fuse.conf for -allow-other", *mountPoint, err)
 	}
@@ -826,6 +833,11 @@ func main() {
 	goclusterfs.ShutdownStep("orphan release", func() {
 		if err := gfs.ForgetSlot(context.Background(), slotIdx, nil); err != nil {
 			log.Printf("[WARN] letting go of unlinked files at unmount: %v; the next node in slot %d does it", err, slotIdx)
+		}
+	})
+	goclusterfs.ShutdownStep("flock release", func() {
+		if err := lockMgr.ReleaseFlocks(); err != nil {
+			log.Printf("[WARN] clearing this node's flocks at unmount: %v; peers ignore them once this node leaves slot %d", err, slotIdx)
 		}
 	})
 	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)

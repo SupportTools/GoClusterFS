@@ -24,3 +24,5 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
+
+replace github.com/hanwen/go-fuse/v2 => ./third_party/go-fuse

@@ -19,12 +19,39 @@ const (
 	maxFile   = 8 << 20
 	// anyErrno is the expected result of an operation that must fail, with any errno.
 	anyErrno = -2
+	// okOrEDQUOT is the expected result of an operation that allocates in a quota project: it works, or the project's
+	// limit refuses it.
+	okOrEDQUOT = -3
 	// maxInlineTarget is the longest symlink target an inode holds; longer ones take a block.
 	maxInlineTarget = 92
 )
 
+// quotaDirs are project roots and their limits. qa limits bytes and qb inodes, both below what lanes put there.
+var quotaDirs = map[string]string{"/soak/qa": "bytes=8388608 inodes=0", "/soak/qb": "bytes=0 inodes=10"}
+
 // sharedDirs hold files of every lane and are never removed.
-var sharedDirs = []string{"/soak/d0", "/soak/d1", "/soak/d2", "/soak/d3"}
+var sharedDirs = []string{"/soak/d0", "/soak/d1", "/soak/d2", "/soak/d3", "/soak/qa", "/soak/qb"}
+
+// projectOf returns the project root that p is or lies under, or "" outside every project.
+func projectOf(p string) string {
+	for root := range quotaDirs {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return root
+		}
+	}
+	return ""
+}
+
+// allocates reports whether a successful op adds blocks or inodes to the project it lands in.
+func allocates(op *Op) bool {
+	switch op.Kind {
+	case "create", "mkdir", "symlink":
+		return projectOf(path.Dir(op.Path)) != ""
+	case "write", "snapshot":
+		return projectOf(op.Path) != ""
+	}
+	return false
+}
 
 // Op is one operation as the driver runs and logs it.
 type Op struct {
@@ -40,6 +67,7 @@ type Op struct {
 	Seed  uint64 `json:"seed,omitempty"`
 	Want  int    `json:"want"`
 	Got   int    `json:"got"`
+	Wrote int64  `json:"wrote,omitempty"` // bytes a write refused by EDQUOT wrote first
 	Err   string `json:"err,omitempty"`
 	At    int64  `json:"at"`
 	Ms    int64  `json:"ms"`
@@ -124,6 +152,14 @@ func (m *Model) hasChildren(dir string) bool {
 
 // expect returns the errno the operation must return on the model's current state.
 func (m *Model) expect(op *Op) int {
+	want := m.expectErrno(op)
+	if want == 0 && allocates(op) {
+		return okOrEDQUOT
+	}
+	return want
+}
+
+func (m *Model) expectErrno(op *Op) int {
 	f := m.Files[op.Path]
 	switch op.Kind {
 	case "create", "mkdir", "symlink":
@@ -168,6 +204,8 @@ func (m *Model) expect(op *Op) int {
 			return int(syscall.EEXIST)
 		case !m.Dirs[path.Dir(op.Path2)]:
 			return int(syscall.ENOENT)
+		case projectOf(op.Path) != projectOf(path.Dir(op.Path2)):
+			return int(syscall.EXDEV)
 		}
 	case "clone", "snapclone":
 		switch {
@@ -177,6 +215,8 @@ func (m *Model) expect(op *Op) int {
 			return int(syscall.ENOENT)
 		case m.exists(op.Path2):
 			return int(syscall.EEXIST)
+		case projectOf(op.Path) != "":
+			return int(syscall.EXDEV)
 		}
 	case "snapdelete":
 		if f == nil || m.Snaps[op.Name] == nil || m.Snaps[op.Name].Owner != f {
@@ -200,8 +240,15 @@ func (m *Model) apply(op *Op) {
 	case "create":
 		m.Files[op.Path] = &File{Snaps: map[string]bool{}}
 	case "write":
-		data := genData(op.Seed, op.Len)
-		if end := op.Off + op.Len; end > int64(len(f.Data)) {
+		n := op.Len
+		if op.Got == int(syscall.EDQUOT) {
+			n = op.Wrote
+		}
+		if n == 0 {
+			return
+		}
+		data := genData(op.Seed, n)
+		if end := op.Off + n; end > int64(len(f.Data)) {
 			f.Data = append(f.Data, make([]byte, end-int64(len(f.Data)))...)
 		}
 		copy(f.Data[op.Off:], data)
@@ -454,9 +501,10 @@ func (l *lane) generate(m *Model) *Op {
 	return op
 }
 
-// expectRename returns what rename(2) returns, in the order the kernel and goclusterfs check.
+// expectRename returns what rename(2) returns, in the order the kernel and goclusterfs check. goclusterfs refuses a
+// move between projects after the kernel's checks and before it looks at the target.
 func (m *Model) expectRename(src, dst string) int {
-	srcDir := m.Dirs[src]
+	srcDir, dstThere := m.Dirs[src], m.exists(dst)
 	switch {
 	case !m.exists(src) || !m.Dirs[path.Dir(dst)]:
 		return int(syscall.ENOENT)
@@ -466,13 +514,13 @@ func (m *Model) expectRename(src, dst string) int {
 		return int(syscall.EINVAL)
 	case strings.HasPrefix(src, dst+"/"):
 		return int(syscall.ENOTEMPTY)
-	case !m.exists(dst):
-		return 0
-	case srcDir && !m.Dirs[dst]:
+	case dstThere && srcDir && !m.Dirs[dst]:
 		return int(syscall.ENOTDIR)
-	case !srcDir && m.Dirs[dst]:
+	case dstThere && !srcDir && m.Dirs[dst]:
 		return int(syscall.EISDIR)
-	case srcDir && m.hasChildren(dst):
+	case path.Dir(src) != path.Dir(dst) && projectOf(src) != projectOf(path.Dir(dst)):
+		return int(syscall.EXDEV)
+	case dstThere && srcDir && m.hasChildren(dst):
 		return int(syscall.ENOTEMPTY)
 	}
 	return 0

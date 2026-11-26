@@ -337,6 +337,21 @@ On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead
 
 GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait for a live holder fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock and the node that holds it. A wait for a failed node lasts until its journal replay ends, about 35 seconds after a crash on another host; see [Distributed Lock Limits](#distributed-lock-limits).
 
+A wait in `flock(2)` is the exception: a signal ends it, and the call restarts if the program's handler uses `SA_RESTART`, so a killed program never hangs in it.
+
+### File Locks
+
+`flock(2)` locks hold across nodes: an exclusive flock on one node keeps every process on every node out, and shared flocks hold together. `fcntl(2)` locks, OFD locks included, hold only on the node that takes them, so two processes on different nodes can both hold one and neither gets an error. SQLite's default locking uses fcntl locks, so do not share an SQLite database between nodes.
+
+- **Cost.** A flock no other node holds costs one 4 KB write and one 256 KB read of the lock region, and releasing it one 4 KB write. On the test VMs over iSCSI, a flock and its unlock took about 4 ms together. A flock this node already holds through another open file of the same file costs no I/O.
+- **Waits.** A waiter on another node gets the flock once the holder releases it: at once when the holder's UDP hint arrives, otherwise within about a second. A signal ends the wait, and the call restarts if the program's handler uses `SA_RESTART`, so a killed waiter exits at once.
+- **Node failure.** A crashed node's flocks pass to waiters once a live node takes it over, about 20 seconds after its last heartbeat. The takeover cuts the dead node off the storage, or the node stops writing once its heartbeat goes stale; neither stops the node's processes. Anything a process does outside the volume, such as calling an API or writing to another disk, is not protected once its flock moves to another node.
+- **Limits.**
+  - A node holds or waits for at most 254 flocks in each of the 16 flock lock records, and a flock past that fails with `ENOLCK`. Files spread over the records by inode number, so a node holds about 4,000 flocks before a record fills, fewer if they cluster.
+  - Of nodes that want one flock, the node in the lowest registry slot gets it first. Under steady contention a node in a higher slot can wait a long time.
+  - While one open file on a node waits for other nodes, the node's other open files of that file wait behind it, even for a shared flock another node could grant at once.
+  - The mount serves flocks itself, so `/proc/locks` and `lslocks` do not list flocks on GoClusterFS files; they list fcntl locks as usual.
+
 ### Distributed Lock Limits
 
 Nodes coordinate metadata writes (block bitmap, inodes, directories, refcounts, SFB containers, snapshots) and every read and write of file data through lock records on the shared device. Read this before you run more than one node.
@@ -378,7 +393,7 @@ Writers go first. A node that wants to read a file while another node waits to w
 
 **An open can fail with `ESTALE` while other nodes reuse the name.** If another node removes a name and creates it again while this node opens it, the open can reach the removed file. This node then answers `ESTALE`, and the kernel looks the name up again and retries once. If the name is removed again before the retry opens it, the open fails with `ESTALE`, as it can on NFS. An open never switches to a different file than the one it looked up, and it does not answer `ENOENT`, because the name may exist again.
 
-**Locks of one type share records.** Each lock type has its own records of the 256: 128 for inodes, 65 for block extents, 39 for file I/O, 16 for inode table sectors, and one for each other type. Two files' inode locks can map to one record, and a node holding one of them blocks other nodes from both. A lock never waits on a record another type uses. A node takes a file I/O lock before any other lock, then the others in type order and, within a type, in record order, so two nodes cannot each wait for a record the other holds. The exception is a replay of a failed node's journal: the replaying node keeps the failed node's records until the replay ends, so a node that holds a lock the replay needs and waits on one of those records gives up after 30 seconds with `EIO`. The replay's waits have no limit, so it then finishes.
+**Locks of one type share records.** Each lock type has its own records of the 256: 112 for inodes, 65 for block extents, 39 for file I/O, 16 for inode table sectors, 16 for flocks, and one for each other type. Two files' inode locks can map to one record, and a node holding one of them blocks other nodes from both. A lock never waits on a record another type uses. A node takes a file I/O lock before any other lock, then the others in type order and, within a type, in record order, so two nodes cannot each wait for a record the other holds. The exception is a replay of a failed node's journal: the replaying node keeps the failed node's records until the replay ends, so a node that holds a lock the replay needs and waits on one of those records gives up after 30 seconds with `EIO`. The replay's waits have no limit, so it then finishes.
 
 **Safe operating limits:**
 
@@ -671,6 +686,10 @@ The flags set how many entries each cache holds and how long cached data may be 
 | `-dir-index-entries` | `1048576` | Names kept in directory indexes, about 100 bytes each. Past it, the least recently used directories are dropped and read whole again on their next lookup. `0` turns indexes off |
 
 When `goclusterfs_cache_inode_size` stays at `goclusterfs_cache_inode_capacity` (or the extent pair does), the cache is full and drops entries it may need again; a larger limit trades memory for fewer disk reads.
+
+**Files the kernel caches.** The mount keeps about 400 bytes of memory for each file, directory and symlink the kernel holds in its dentry cache, and frees it when the kernel drops the entry, as the kernel does under memory pressure, within the container's memory limit in Kubernetes. A walk of 3 million files, such as a backup, costs about 1.3 GB until the kernel lets them go.
+
+**Memory limit.** In a cgroup with a memory limit, such as a Kubernetes container or a systemd service with `MemoryMax`, the mount sets Go's memory limit to 90% of the smallest limit from its cgroup up, so the garbage collector works harder before the limit kills the mount. It logs `Memory: the cgroup allows N MB, so the Go memory limit is M MB`. Set `GOMEMLIMIT` to choose another limit.
 
 ```bash
 # Read-heavy, changes from other nodes may show up later

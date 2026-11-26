@@ -137,8 +137,10 @@ type Registry struct {
 	bootID     [16]byte
 	pidNS      uint64
 	lockLayout uint32
-	advertise  netip.AddrPort
-	onSlotLost atomic.Pointer[func(SlotLoss)]
+	// layoutBuilds describes the builds of older lock layouts, by the layout a slot records.
+	layoutBuilds map[uint32]string
+	advertise    netip.AddrPort
+	onSlotLost   atomic.Pointer[func(SlotLoss)]
 
 	onOwnerDead func(owner [16]byte, slot int) (done func(replayed bool))
 	onOrphans   func(ctx context.Context, slot int, orphans []Orphan)
@@ -454,6 +456,17 @@ func (r *Registry) SetLockLayout(id uint32) {
 	r.lockLayout = id ^ takeoverProtocol
 }
 
+// NameLockLayout makes Register's refusal describe a node with lock layout id
+// as running a build that is described by build.
+func (r *Registry) NameLockLayout(id uint32, build string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.layoutBuilds == nil {
+		r.layoutBuilds = map[uint32]string{}
+	}
+	r.layoutBuilds[id^takeoverProtocol] = build
+}
+
 // checkLockLayouts returns ErrLockLayout naming a node whose slot holds another
 // lock layout, unless its heartbeat stays unchanged for silentSlotWatch: two
 // such nodes would not exclude each other. Called with r.mu held.
@@ -485,6 +498,11 @@ func (r *Registry) checkLockLayouts() error {
 				return fmt.Errorf("%w: node %s in slot %d (%x) takes nodes over without marking an intent in their slot first, "+
 					"as builds before takeover intents do; unmount every node of that build before mounting this one",
 					ErrLockLayout, s.Host(), i, s.UUID[:8])
+			}
+			if build, ok := r.layoutBuilds[s.LockLayout]; ok {
+				return fmt.Errorf("%w: node %s in slot %d (%x) runs a build %s (lock layout %08x, this build %08x); "+
+					"unmount every node of that build before mounting this one",
+					ErrLockLayout, s.Host(), i, s.UUID[:8], build, s.LockLayout, r.lockLayout)
 			}
 			return fmt.Errorf("%w: node %s in slot %d (%x) has lock layout %08x, this build %08x",
 				ErrLockLayout, s.Host(), i, s.UUID[:8], s.LockLayout, r.lockLayout)

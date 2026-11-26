@@ -122,6 +122,7 @@ func (f *FS) flushQuota(ctx context.Context) error {
 		f.journal.Abort(txn)
 		return err
 	}
+	holdFlush(len(flushed))
 	for _, u := range flushed {
 		rec := *used[u.Project]
 		if !rec.Owns(u.Project) {

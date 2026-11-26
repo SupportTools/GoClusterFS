@@ -360,6 +360,19 @@ func (m *Manager) OnReturnReserves(fn func()) {
 	}
 }
 
+func (m *Manager) BroadcastFlockChanged(recordID uint64) {
+	if m.broadcaster != nil {
+		m.broadcaster.BroadcastFlockChanged(recordID)
+	}
+}
+
+// OnFlockChanged must be called after StartBroadcast.
+func (m *Manager) OnFlockChanged(fn func(recordID uint64)) {
+	if m.broadcaster != nil {
+		m.broadcaster.OnFlockChanged(fn)
+	}
+}
+
 func (m *Manager) BroadcastOrphans() {
 	if m.broadcaster != nil {
 		m.broadcaster.BroadcastOrphans()

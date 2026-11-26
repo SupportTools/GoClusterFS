@@ -43,7 +43,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/inode` | Inode table, 256-byte inodes, CRC32C per sector |
 | `internal/extent` | File block mapping: 2 extents inline in the inode, the rest in an on-disk overflow tree |
 | `internal/dir` | Directory entries |
-| `internal/lock` | Distributed locks stored on the device: a node writes its claim into its own slot of a lock record, then reads the record. Reads take a file's I/O lock shared and writes exclusive for each whole request |
+| `internal/lock` | Distributed locks stored on the device: a node writes its claim into its own slot of a lock record, then reads the record. Reads take a file's I/O lock shared and writes exclusive for each whole request. In the 16 flock records a node's slot lists an entry per inode it holds a flock on or waits for (`flock.go`) |
 | `internal/node` | Node registry, heartbeats, failed-node detection |
 | `internal/journal` | Write-ahead journal, local and cross-node recovery |
 | `internal/cache` | Inode and extent caches, checked against on-disk generation counters |
@@ -62,6 +62,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
 | `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
 | `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
+| `third_party/go-fuse` | go-fuse v2.9.0 with one patch, `EnableFlockLocks`, so the kernel sends flock(2) to the mount and keeps fcntl locks; `third_party/README.md` lists the patch |
 
 ## On-Disk Layout
 
@@ -100,6 +101,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, a directory's wrong `.` or `..`, project quota usage, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. `statfs` (`df`) counts free inodes with a background scan of the whole inode table, so other nodes' creates and removes show up after up to 30 times the scan time, at least a second.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
+- `flock(2)` holds across nodes; `fcntl(2)` locks hold only on the node that takes them, because the kernel keeps them. A node holds at most 254 flocks per flock lock record, and under steady contention the lowest registry slot wins, so higher slots can wait long. A dead node's processes keep running after the takeover frees its flocks.
 - Rename supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`. Symlinks need a volume formatted by a build with symlink support.
 
 ## Testing
