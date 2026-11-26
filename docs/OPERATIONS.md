@@ -39,6 +39,7 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 |----------|---------|
 | `Journal recovery: replayed N committed transactions` | This node replayed a journal left in its slot by a crashed mount. Normal after a crash. When the slot's journal was clean there is no recovery line, only `Journal: initialized` and `Journal: started`. |
 | `[WARN] Journal recovery for slot N is waiting for another node's lock` | The replay waits for a lock another node holds and retries every 1 to 30 seconds, with no limit. The line names the holder. |
+| `[WARN] journal: an operation has waited N for room in the journal` | Open intents fill this node's journal, and a create, mkdir, symlink, link or unlink waits for room. It repeats every 30 seconds and ends once enough operations finish. See [Interrupted File Operations](#interrupted-file-operations). |
 | `Journal recovery for slot N failed` | The mount stops. See [Damaged Journal Slot](#damaged-journal-slot). |
 | `Journal: WARNING - discarding the journal of slot N (-skip-recovery)` | `-skip-recovery=N` threw away this slot's journal. Run fsck after unmounting every node. |
 | `Journal: ignoring -skip-recovery=N` | The mount took a different slot, so it replayed that slot's journal and discarded nothing. |
@@ -60,7 +61,7 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 
 ### Journal
 
-Each node writes its own 4 MB journal. Commits are synchronous by default. The journal checkpoints every 5 seconds, and also when a transaction does not fit. None of this has a flag.
+Each node writes its own 4 MB journal. Commits are synchronous by default. The journal checkpoints every 5 seconds, and also when a transaction does not fit. None of this has a flag. When open intents fill it, creates, mkdirs, symlinks, links and unlinks wait for room. Writes, truncates and renames don't wait yet: they fail with EIO if it stays full.
 
 ---
 
@@ -337,7 +338,9 @@ On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead
 
 GoClusterFS ignores interrupts, like an NFS `hard` mount. A signal to a program that is inside a file operation, including the `SIGURG` the Go runtime sends for preemption, does not end the operation; the program handles the signal once the operation returns. `SIGKILL` still ends the program. A lock wait for a live holder fails the operation with EIO after 30 seconds (`DefaultTimeout`), and the mount log names the lock and the node that holds it. A wait for a failed node lasts until its journal replay ends, about 35 seconds after a crash on another host; see [Distributed Lock Limits](#distributed-lock-limits).
 
-A wait in `flock(2)` is the exception: a signal ends it, and the call restarts if the program's handler uses `SA_RESTART`, so a killed program never hangs in it.
+A wait for room in the journal does not end on a signal either. When hundreds of operations run at once on one node, the intents they log can fill its 4 MB journal. A create, mkdir, symlink, link or unlink then waits for room before it takes any lock, and the mount logs a warning every 30 seconds while it waits. The wait cannot deadlock: the waiting operation holds nothing the operations in the journal need, so it ends once enough of them finish.
+
+A wait in `flock(2)` is the exception: a signal ends it, and the call restarts if the program's handler uses `SA_RESTART`, so a killed program never hangs in it. A flock wait needs this because it lasts as long as another process holds the lock, which can be forever.
 
 ### File Locks
 
