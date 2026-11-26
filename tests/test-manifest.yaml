@@ -1349,6 +1349,15 @@ scenarios:
       docker: TODO
       vm: TODO
 
+  - id: parallel-writers-journal-space
+    name: Parallel writers wait for journal space
+    description: Hundreds of writers overwrite their own files and rename them while open intents fill the journal; writes and renames wait for room instead of failing with EIO
+    priority: medium
+    environments:
+      go: journal_space_test.go::TestParallelWritersWaitForJournalSpace
+      docker: TODO
+      vm: TODO
+
   - id: recovery-ends-with-tail-at-end
     name: Recovery ends when the tail is at the end of the data area
     description: A crash with the journal tail exactly at the end of the data area replays the pending transaction and returns, instead of scanning forever
