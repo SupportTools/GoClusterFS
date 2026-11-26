@@ -311,7 +311,10 @@ func TestKilledFlockWaiterOnAnotherNodeExits(t *testing.T) {
 		t.Fatal(err)
 	}
 	select {
-	case <-exited:
+	case err := <-exited:
+		if err == nil {
+			t.Fatal("flock(1) on node 1 exited cleanly after SIGKILL")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a killed flock waiter on node 1 has not exited after 5s")
 	}
