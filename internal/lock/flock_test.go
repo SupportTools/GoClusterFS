@@ -2,7 +2,10 @@ package lock
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -122,6 +125,13 @@ func TestFlockSlotRoundTrip(t *testing.T) {
 	if _, got, err := decodeFlockSlot(encodeFlockSlot(owner, full)); err != nil || len(got) != FlockCapacity {
 		t.Errorf("full slot decodes as %d entries, %v; want %d", len(got), err, FlockCapacity)
 	}
+
+	overfull := encodeFlockSlot(owner, full)
+	binary.LittleEndian.PutUint16(overfull[4:6], FlockCapacity+50)
+	binary.LittleEndian.PutUint32(overfull[SlotSize-4:], storage.CRC32C(overfull[:SlotSize-4]))
+	if _, _, err := decodeFlockSlot(overfull); !errors.Is(err, errTornSlot) {
+		t.Errorf("slot counting %d entries decodes with %v, want errTornSlot", FlockCapacity+50, err)
+	}
 }
 
 func TestFlockRecordsAreTheirOwn(t *testing.T) {
@@ -141,6 +151,9 @@ func TestFlockRecordsAreTheirOwn(t *testing.T) {
 	}
 	if LayoutID() == PreFlockLayoutID() {
 		t.Fatal("the flock records left LayoutID unchanged")
+	}
+	if got := PreFlockLayoutID(); got != 0x18740ee8 {
+		t.Fatalf("PreFlockLayoutID = %08x, want 18740ee8, the LayoutID of the builds before flock records", got)
 	}
 
 	small := &Manager{size: 64 * RowSize}
@@ -382,6 +395,28 @@ func TestTornFlockSlotBlocksUntilItsRegistrySlotEmpties(t *testing.T) {
 	}
 }
 
+// A live node's torn slot may hide a claim from a lower slot, so a claimer next to it waits even from below.
+func TestClaimNextToAHigherTornSlotWaits(t *testing.T) {
+	nodes, _ := flockNodes(t, 2)
+	m, torn := nodes[0], nodes[1]
+	key := FlockKey{Inode: 5, Birth: 1}
+	record, _ := m.flockRecord(key)
+
+	buf := storage.NewAlignedBuffer(SlotSize)
+	copy(buf.Bytes(), encodeFlockSlot(torn.nodeUUID, map[FlockKey]flockEntry{key: {mode: LockModeShared}}))
+	buf.Bytes()[flockHeader] ^= 1
+	if _, err := m.dev.WriteAtUnsharded(buf.Bytes(), m.slotOffset(record, torn.nodeSlot)); err != nil {
+		t.Fatal(err)
+	}
+	won, blockers, err := m.claimFlock(record, key, LockModeExclusive, true)
+	if err != nil || won || len(blockers) != 1 || blockers[0] != torn.nodeSlot {
+		t.Fatalf("claim next to a torn slot = won %v, blockers %v, %v; want a wait on slot %d", won, blockers, err, torn.nodeSlot)
+	}
+	if e, ok := m.ownFlock(record, key); !ok || !e.waiting {
+		t.Fatalf("a claim next to a higher torn slot left entry %+v (%v); want a waiting entry", e, ok)
+	}
+}
+
 func TestFlocksBeyondASlotsCapacityAreRefused(t *testing.T) {
 	nodes, _ := flockNodes(t, 1)
 	m := nodes[0]
@@ -453,21 +488,35 @@ func TestReleaseFlocksClearsEveryEntry(t *testing.T) {
 func TestFailedFlockWriteIsWrittenAgain(t *testing.T) {
 	nodes, _ := flockNodes(t, 2)
 	m, peer := nodes[0], nodes[1]
+	setTimings(func(tm *timings) { tm.releaseRetry = 50 * time.Millisecond }, m)
+	var failNext atomic.Bool
+	m.slotWrite = func(buf []byte, offset int64) (int, error) {
+		if failNext.CompareAndSwap(true, false) {
+			return 0, syscall.EIO
+		}
+		return m.dev.WriteAtUnsharded(buf, offset)
+	}
+	m.Start()
+	defer m.Stop()
+
 	key := FlockKey{Inode: 5, Birth: 1}
 	if err := m.Flock(context.Background(), key, LockModeExclusive, false); err != nil {
 		t.Fatal(err)
 	}
-	m.slotWrite = func([]byte, int64) (int, error) { return 0, errors.New("injected write failure") }
+	failNext.Store(true)
 	if err := m.Unflock(key); err == nil {
 		t.Fatal("Unflock with a failing write succeeded")
 	}
-	m.slotWrite = nil
-	if err := peer.Flock(context.Background(), key, LockModeExclusive, false); !errors.Is(err, ErrWouldBlock) {
-		t.Fatalf("flock while the release write failed = %v, want ErrWouldBlock", err)
-	}
-	m.retryFlockWrites()
-	if err := peer.Flock(context.Background(), key, LockModeExclusive, false); err != nil {
-		t.Fatalf("flock after the retry wrote the release = %v", err)
+	deadline := time.Now().Add(5 * m.timing.releaseRetry)
+	for {
+		err := peer.Flock(context.Background(), key, LockModeExclusive, false)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrWouldBlock) || time.Now().After(deadline) {
+			t.Fatalf("flock %v after one failed release write = %v; the watcher should have written the release", 5*m.timing.releaseRetry, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
