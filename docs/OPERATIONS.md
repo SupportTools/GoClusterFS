@@ -43,18 +43,18 @@ Broadcast stats: sent=..., received=..., duplicates=..., lost=...
 | `Journal recovery for slot N failed` | The mount stops. See [Damaged Journal Slot](#damaged-journal-slot). |
 | `Journal: WARNING - discarding the journal of slot N (-skip-recovery)` | `-skip-recovery=N` threw away this slot's journal. Run fsck after unmounting every node. |
 | `Journal: ignoring -skip-recovery=N` | The mount took a different slot, so it replayed that slot's journal and discarded nothing. |
-| `Journal: disabled (no crash consistency guarantees)` | `-journal=false`. This node also skipped replaying its slot's journal. |
+| `Journal: disabled (no crash consistency guarantees)` | `-journal=false`. This node does not journal its own writes, so a crash of this node can leave metadata half written. It still replays its slot's journal first. |
 | `[Recovery] Replaying slot N (node ...) failed` | Another node's journal cannot be replayed. See [Damaged Journal Slot](#damaged-journal-slot). |
-| `ERROR: heartbeats to node registry slot N have failed` | This node cannot write the device. It stops. |
+| `Heartbeats to registry slot N failed for ...; stopping so two nodes never share a journal` | This node cannot write the device. It stops. |
 | `[ERROR] Stopping this node and keeping its locks: rename of ... is half done` | A rename hit a write error after its journal commit, and three tries to redo the missing writes failed too. The mount exits without releasing its locks, so another node replays its journal and finishes the rename. See [Handling Node Failure](#handling-node-failure). Check the device before mounting this node again. |
 | `Node registry slot N is no longer this node's` | Another node took this node's slot, usually after a stall. The mount exits so two nodes never share a journal. |
 | `Node registry slot N may no longer be this node's: it went ... without a heartbeat` | This node went more than 15 seconds without a heartbeat, for example a paused process or a suspended host. Another node may have replayed it, so it exits without writing to the device again. |
 | `The device refused a write from this node (...): another node declared it dead and revoked its access` | On a fenced volume, another node proved this node dead and revoked its reservation key. The mount exits. See [Storage Fencing](#storage-fencing). |
 | `Failed to start cache broadcast: ...` | The mount stops before it touches the device. See [Mount Fails: "Failed to start cache broadcast"](TROUBLESHOOTING.md#mount-fails-failed-to-start-cache-broadcast). |
-| `Warning: Failed to start API server` | The API port is taken. The mount runs without the API, `/metrics`, `gfsctl` and the dashboard. |
+| `Warning: Failed to start the API server` | The API port is taken. The mount runs without the API, `/metrics`, `gfsctl` and the dashboard. |
 | `[broadcast] missed N messages from ...` | This node lost broadcast messages, usually because its receive buffer filled during a burst of changes on another node. It dropped all cached inodes and extents and rereads them from the device. Logged at most every 10 seconds. If it repeats, raise `net.core.rmem_max` to at least 1 MB (`sysctl -w net.core.rmem_max=1048576`) and remount. |
 | `[broadcast] WARN: no broadcast heard from node ...` | The registry shows that node mounted, but this node has heard none of its broadcasts for 3 `-broadcast-heartbeat` intervals (90 seconds by default). A network that drops multicast causes this, as does a node with `-broadcast=false` or another `-mcast-group` or `-mcast-port`. Until it is fixed, this node sees that node's directory changes only after `-cache-ttl`. `/health` reports it as `broadcast-peers`, and the mount logs `heard from node ... again` when it ends. |
-| `lock.Acquire: ... acquired (retries=N, dur=...)` | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
+| `[DEBUG] lock.Acquire: ... acquired (retries=N, dur=...)`, with `-debug` only | Lock waits. High `retries` or `dur` means nodes contend for the same files or directories. |
 | `[WARN] lock: ... which holds it and is failing or being recovered` | A lock wait for a failed node. It repeats every 30 seconds and ends when that node's journal replay ends. |
 | `[WARN] lock: gave up waiting for ...` | A lock wait gave up: after 30 seconds (`DefaultTimeout`) on a live holder, on a failed holder while the operation held another lock, at once when the holder's replay failed, or because a background task stopped at unmount. The line names the holder. After a give-up on a failed holder, the operation lets go of its locks, waits for the replay and retries, so it does not fail. If that replay keeps failing, the wait lasts until an admin releases the slot; see [Damaged Journal Slot](#damaged-journal-slot). Otherwise a file operation that was waiting fails with EIO; during block allocation it fails with ENOSPC. See [Distributed Lock Limits](#distributed-lock-limits). |
 | `[WARN] lock: this node has held record N for ...` | This node has held a lock for over 60 seconds. Other nodes wait for it until it is released. |
@@ -116,7 +116,7 @@ fuser -km /mnt/fs
 fusermount3 -u /mnt/fs
 ```
 
-A mount that was killed leaves its journal for the next mount on the same host to replay.
+A mount that was killed leaves its journal in its slot. A running node replays it about 20 seconds later, unless the next mount on the same host replays it first.
 
 #### What Happens at Shutdown
 
@@ -131,7 +131,7 @@ A mount that was killed leaves its journal for the next mount on the same host t
 It then logs the totals and `Filesystem unmounted.`, and exits 0, or 8 when closing the filesystem failed. After `fusermount3 -u`, steps 1, 3, 4 and 5 run once the unmount is done.
 
 - An open file or a file operation still running makes the unmount fail, so stop applications first.
-- A signal after a failed unmount tries again; once the unmount is done, further signals are ignored. `kill -9` stops the process at once and leaves its journal for the next mount to replay.
+- A signal after a failed unmount tries again; once the unmount is done, further signals are ignored. `kill -9` stops the process at once and leaves its journal in its slot, for a running node or the next mount on the host to replay.
 - A clean unmount empties the node's registry slot once its journal stopped cleanly. If the unmount could not let go of files unlinked while open, or stopping its journal failed, the slot stays active instead: a remount on the same host takes it back at once, and otherwise a running node clears it about 20 seconds later. `goclusterfs-fsck -repair` waits up to 11 seconds before it trusts that no node is mounted.
 
 ### Running fsck
@@ -206,7 +206,7 @@ getfattr -n trusted.goclusterfs.quota /mnt/fs/pvc-1
 - **Several writers.** Each node writes its changes to the volume's quota table every second. Close to a limit, a node writes them before it allocates. Allocations that run at the same moment each check before any of them counts, so a limit can be passed by one allocation per concurrent writer, on this node or another.
 - **Moving files.** Links, renames and clones into or out of a project fail with `EXDEV`, and `mv` then copies the file. A project's root can move between directories outside every project.
 - **The volume needs a quota table.** `-format` creates one. On a volume an older build formatted, add it with `goclusterfs-fsck -enable-quotas DEVICE` while every node is stopped; it needs 1 MiB of free blocks in a row.
-- **At most 16,065 quota directories per volume**, whatever the block size: for a CSI driver, the most PVCs one volume can hold at once. A project's place frees up at the next flush after its root directory is removed and nothing in it is left: no file still open after its unlink, and no snapshot of one of its files. New directories take places round-robin, after the last one handed out. A directory that takes a freed place gets a new project ID, so a change still on its way for the old project cannot reach the new one. Each place hands out 4,096 IDs before one repeats, so an ID comes back only after about 65 million quota directories were made on the volume (4,096 × 16,064 places), or 4,096 times as many as its places on a volume with a smaller table. ID 0 means no project. When every place is taken, setting a quota on a new directory fails with `ENOSPC` (507 through the API). Volumes formatted before this table size hold fewer: 63 at 8 KB blocks, 945 at 64 KB.
+- **At most 16,064 quota directories per volume**, whatever the block size: for a CSI driver, the most PVCs one volume can hold at once. A project's place frees up at the next flush after its root directory is removed and nothing in it is left: no file still open after its unlink, and no snapshot of one of its files. New directories take places round-robin, after the last one handed out. A directory that takes a freed place gets a new project ID, so a change still on its way for the old project cannot reach the new one. Each place hands out 4,096 IDs before one repeats, so an ID comes back only after about 65 million quota directories were made on the volume (4,096 × 16,064 places), or 4,096 times as many as its places on a volume with a smaller table. ID 0 means no project. When every place is taken, setting a quota on a new directory fails with `ENOSPC` (507 through the API). Volumes formatted before this table size hold fewer: 62 at 8 KB blocks, 944 at 64 KB.
 - **Limits of the count.** A node mounted with `-journal=false` counts nothing. A directory takes the block it grows by even past the limit. An I/O error, or a crash at the wrong moment, can leave usage off by the operations in flight.
 - **Checking the count.** `goclusterfs-fsck` recounts each project from its inodes and reports a project whose usage differs as an error, and `-repair` writes the recount. fsck compares usage only when every journal is clean: a running node's journal, or a crashed node's journal that no mount has replayed, may hold changes the table does not show yet. Unmount every node, mounting once first if a node crashed, then run the check. fsck also reports a name whose inode is in another project than its directory gives, which `-repair` does not fix.
 - **A file left outside every project.** A project's place can be freed while a file or snapshot still carries the project: when usage drifted low, or when another node made the file, or a snapshot of one, in the second before the project's last name and root directory went. That file then counts against no project and has no limit, though its space still shows in the volume's `df`. `goclusterfs-fsck` reports it as `quota project N: K inodes carry it, ... but no record in the quota table belongs to it`. To fix it, unmount every node and run `goclusterfs-fsck -repair DEVICE`, which takes such inodes out of every project. A CSI driver avoids the second case by removing a volume's directory only after every pod that used the volume has stopped.
@@ -235,7 +235,7 @@ On a device with SCSI-3 or NVMe persistent reservations, GoClusterFS fences dead
   2. Within 10 minutes, on host B, run `goclusterfs-fsck -test-reservations -preempt KEY DEVICE`, with host B's path to the same disk. It preempts host A's key and holds its own for 30 seconds.
   3. Host A then writes 4 KiB with O_DIRECT, which must fail with `EBADE`.
 
-  To check what survives detaching and attaching the disk, or a restart of the storage, run `-test-reservations -keep DEVICE`, detach and attach the disk or restart the storage, then run `-test-reservations -check-kept KEY DEVICE` on the same host. The exit code is 0 when every step passed, 4 when a step failed, and 8 when the test was refused or could not run.
+  To check what survives detaching and attaching the disk, or a restart of the storage, run `-test-reservations -keep DEVICE`, detach and attach the disk or restart the storage, then run `-test-reservations -check-kept KEY DEVICE` on the same host. The exit code is 0 when no step failed, even with WARN or SKIP steps, 4 when a step failed, and 8 when the test was refused or could not run.
 - **Turning it on:** `-format` with `-fencing=auto`, the default, fences when the device supports persistent reservations; `-fencing=pr` requires them and `-fencing=none` turns fencing off. The superblock records the choice, so every node fences, and older builds refuse the volume. Files, loop devices, virtio-blk disks and partitions have no reservations; a reservation covers the whole disk, so format the whole disk. Format and every mount warn, `/health` reports `fencing` as `none:`, and `-require-fencing` refuses to mount such a volume.
 - **Several nodes need fencing:** a node refuses to mount a volume without fencing while another node has it mounted. That covers a volume formatted with `-fencing=none`, and one formatted with `-fencing=auto` on a device without reservations; the superblock then lacks `RequiredReservations`, so no node registers a key. Without fencing, the stall guards rely on the node's own clock, and under QEMU a paused VM's clocks do not count the pause. Such a VM, paused past its takeover, resumes and writes after a peer replayed its journal. In tests on QEMU it overwrote file data in 6 of 6 runs, and `goclusterfs-fsck` found nothing. The rules:
   - A node mounted alone needs no flag, and the mount logs the existing warning.
@@ -431,7 +431,7 @@ When a node fails unexpectedly:
 
 A node also stops on purpose when a rename hits a lasting I/O error after its journal commit. A rename changes two directory entries in separate writes, so the node first redoes the writes that failed while it still holds its locks. If they keep failing, it logs `[ERROR] Stopping this node and keeping its locks` with the names, the inode numbers and the error, and exits. Its locks stay claimed, so no other node can change those directories until failover replays its journal and finishes the rename. The file or directory then has its new name only. Other operations that fail after their commit leave at most an inode or blocks that no name reaches; `goclusterfs-fsck -repair` reclaims those.
 
-**When the failed node comes back**, mount it again with the same options. If it gets its old registry slot back (same hostname and boot ID), it replays its own journal before serving. Don't run fsck while other nodes have the device mounted: `-repair` refuses, and a check-only run reads metadata that is changing.
+**When the failed node comes back**, mount it again with the same options. If no running node replayed its slot first, it takes back the slot its hostname held and replays that journal before serving. Don't run fsck while other nodes have the device mounted: `-repair` refuses, and a check-only run reads metadata that is changing.
 
 ```bash
 goclusterfs-mount -device /dev/device -mount /mnt/cluster
@@ -454,7 +454,7 @@ A mount exits with `Journal recovery for slot N failed: ...` when it cannot repl
 
 `-skip-recovery=N` does not stop the node from replaying crashed peers' journals. `-journal=false` does not skip the replay of its own slot.
 
-A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed`, naming `-skip-recovery=N`, and retry every minute. After 3 failures in a row with the same error, a node retries only once the slot has stayed unchanged for 10 minutes, logs the failure at most once an hour, and its `/health` `recovery` check reports degraded with the slot number. Each attempt by any node changes the slot, so the cluster as a whole then tries about every 10 minutes. Lock timeouts do not count toward the 3. A mount takes such a slot only when `-skip-recovery=N` names it or no slot is empty. Discard its journal as above, or free the slot with fsck:
+A slot belongs to its host's hostname and boot ID. If the damaged slot belongs to a node that has rebooted or will not mount again, the other nodes log `Replaying slot N ... failed`, naming `-skip-recovery=N`, and retry every minute. After 3 failures in a row with the same error, a node retries only once the slot has stayed unchanged for 10 minutes, logs the failure at most once an hour, and its `/health` `recovery` check reports degraded with the slot number. Each attempt by any node changes the slot, so the cluster as a whole then tries about every 10 minutes. Lock timeouts do not count toward the 3. A mount takes such a slot only when `-skip-recovery=N` names it, and only after the replay's lease has lapsed for a minute. Without that flag, a mount never takes it, even when no slot is empty. Discard its journal as above, or free the slot with fsck:
 
 ```bash
 ./goclusterfs-fsck -list-slots /dev/device                       # find the slot and its journal state
@@ -563,13 +563,13 @@ goclusterfs-fsck -repair /dev/device
 goclusterfs-mount -device /dev/device -mount /mnt/cluster
 ```
 
-`-repair` fixes refcounts and the superblock checksum, frees leaked blocks and inodes no directory names, and rewrites a snapshot registry sector that fails its checksum, keeping the snapshots whose descriptors pass their own checksum. It edits directories only to point a wrong `.` or `..` back at the right directory, and there is no `lost+found`. Restore anything else from backup. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide).
+`-repair` fixes refcounts and the superblock checksum, frees leaked blocks and inodes no directory names, sets a regular file's link count to its number of names, recounts project quota usage, frees quota records no project uses, takes inodes out of projects that have no record, and rewrites a snapshot registry sector that fails its checksum, keeping the snapshots whose descriptors pass their own checksum. It edits directories only to point a wrong `.` or `..` back at the right directory, and there is no `lost+found`. Restore anything else from backup. See the [fsck Guide](TROUBLESHOOTING.md#fsck-guide).
 
 ---
 
 ## Health Checks
 
-`gfsctl health` and `GET /health` report the mount's device, journal, peer replays, broadcast and heartbeat: see [HTTP API Health](API-CONFIG.md#http-api-health-and-shutdown). They do not read or write files. Use the script below to check the filesystem itself.
+`gfsctl health` and `GET /health` report the mount's device, journal, peer replays, broadcast, broadcast peers, heartbeat and fencing: see [HTTP API Health](API-CONFIG.md#http-api-health-and-shutdown). They do not read or write files. Use the script below to check the filesystem itself.
 
 ### Quick Health Check Script
 
@@ -652,7 +652,7 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 |---------|-------------|---------------|
 | Slow `ls -l` or `stat` | Each name lookup reads two inodes from disk, and `ls -l` repeats its lookups once it runs longer than `-attr-timeout`. A directory left out of the index (past `-dir-index-entries`) is read whole on every lookup | A higher `-attr-timeout`; `goclusterfs_dir_index_rebuilds_total` growing with lookups means directories don't fit `-dir-index-entries` |
 | Slow reads | Cache misses | `gfsctl stats cache`, or `Cache stats` at unmount |
-| Slow metadata | Lock contention | `lock.Acquire` lines with high `retries` |
+| Slow metadata | Lock contention | `lock.Acquire` lines with high `retries`, shown only with `-debug` |
 | Slow writes | Synchronous journal commits and per-block extent locks | Storage latency |
 
 ### Block Size
@@ -729,7 +729,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 
 **The shared device.** All data, locks, and journals live on the device in plain form. Nothing on disk is encrypted or signed, so any host that can write the device can change any file or take any lock. Give only the cluster nodes access to it.
 
-**Who can use a mount.** `goclusterfs-mount` does not set the FUSE `allow_other` option, so only the user who started the mount can use it. GoClusterFS does not check file permission bits, so that user can read and write every file.
+**Who can use a mount.** By default the mount does not set the FUSE `allow_other` option, so only the user who started it can use it, and GoClusterFS does not check permission bits, so that user can read and write every file. With `-allow-other`, every user on the host can use the mount, and the kernel checks each file's owner, group and mode bits. A mount by a user other than root then needs `user_allow_other` in `/etc/fuse.conf`.
 
 **Locks.** Locks keep cooperating nodes from changing the same metadata at once. They are not access control, and a stalled node can keep writing after it lost a lock. See [Distributed Lock Limits](#distributed-lock-limits).
 
@@ -743,7 +743,7 @@ GoClusterFS assumes every node, and everything that can reach the shared device 
 - Messages are never encrypted. Any host that joins the multicast group can see which inodes change.
 - The secret is a command-line flag, so local users on a node can read it with `ps`.
 
-**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`), every `/api/v1/...` request needs it, reads included, and the API also lists, creates, clones and deletes snapshots, clones files and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots and create files in the root directory, so treat it like the device itself.
+**HTTP API.** Each mount serves an HTTP API on `127.0.0.1:8080` (`-api-addr`), so only local users can reach it. Without a token it only reads status and statistics. With a token (`-api-token-file` or `GOCLUSTERFS_API_TOKEN`), every `/api/v1/...` request needs it, reads included, and the API also lists, creates, clones and deletes snapshots, clones files, sets directory quotas and runs admin tasks; see [HTTP API Write Endpoints](API-CONFIG.md#http-api-write-endpoints). Anyone with the token can change any file's snapshots, create files in the root directory and set any directory's quota, so treat it like the device itself.
 
 - To expose it, set `-api-addr` and a token. Mount refuses a non-loopback address without a token.
 - `/health` and `/metrics` never need the token, on purpose: load balancers, probes and Prometheus can read them without a secret. Anyone who can reach the port can read them too. They show no file names or data, but `/health` messages name peers' hostnames and registry slot numbers.

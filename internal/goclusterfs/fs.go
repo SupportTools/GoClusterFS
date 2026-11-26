@@ -94,8 +94,8 @@ const MaxWriteRetries = 10
 // collision was detected during Create/Mkdir and the operation should be retried.
 var errRetryCreate = errors.New("retry create: inode slot collision")
 
-// MaxCreateRetries is the maximum number of retry attempts for Create/Mkdir
-// operations when inode slot collisions occur across cluster nodes.
+// MaxCreateRetries bounds how often retryRace runs a remove, a rename, or a create that met another node's name, after
+// losing a race with another node. A lost inode slot is retried by untilClaimed instead.
 const MaxCreateRetries = 5
 
 // maxConflictRetries bounds how often an inode update is redone after another
@@ -1104,6 +1104,10 @@ func (f *FS) freeSlotGeneration(num uint32) uint64 {
 // afterCommit runs between an operation's journal commit and its first change; tests stop there as a crash would.
 var afterCommit func(op string)
 
+// claiming runs just before a create, mkdir or symlink claims free inode num; tests take the inode there as another
+// node would.
+var claiming func(op string, num uint32)
+
 // retryRace runs try again, after a jittered backoff, while it returns EAGAIN for losing a race with another node.
 func retryRace(op, name string, try func() syscall.Errno) syscall.Errno {
 	for attempt := 0; attempt < MaxCreateRetries; attempt++ {
@@ -1118,6 +1122,19 @@ func retryRace(op, name string, try func() syscall.Errno) syscall.Errno {
 	}
 	log.Printf("[WARN] %s %q: lost %d races with other nodes", op, name, MaxCreateRetries)
 	return syscall.EAGAIN
+}
+
+// untilClaimed runs a create attempt again at once while it returns EAGAIN, which a create, mkdir or symlink attempt
+// returns only when another node claimed the free inode it picked. Each loss uses up a free inode, so it ends with a
+// slot, or ENOSPC once none is left.
+func untilClaimed(op, name string, try func() syscall.Errno) syscall.Errno {
+	for lost := 1; ; lost++ {
+		errno := try()
+		if errno != syscall.EAGAIN {
+			return errno
+		}
+		logging.Debugf("%s %q: another node claimed the free inode it picked (%d so far), trying another", op, name, lost)
+	}
 }
 
 // nameErrno maps a failure to add, find or remove a directory entry.
@@ -1246,7 +1263,10 @@ func fillEntryOut(out *fuse.EntryOut, ino *inode.Inode, blockSize uint64) {
 func (f *FS) createFile(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	var node *fs.Inode
 	errno := retryRace("Create", name, func() (errno syscall.Errno) {
-		node, errno = f.createFileOnce(ctx, parent, parentNum, name, mode, out)
+		errno = untilClaimed("Create", name, func() (errno syscall.Errno) {
+			node, errno = f.createFileOnce(ctx, parent, parentNum, name, mode, out)
+			return errno
+		})
 		if errno == syscall.EEXIST && flags&syscall.O_EXCL == 0 {
 			node, errno = f.openExisting(ctx, parent, name, flags, out)
 		}
@@ -1339,6 +1359,9 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 
 	// Claiming before naming means a crash in between leaks an unnamed inode, not a name for a free slot.
 	uncharge := func() { takeBack = func() { f.commitCharge(project, 0, -1) } }
+	if claiming != nil {
+		claiming("create", inodeNum)
+	}
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Create %q: ClaimSlot %d failed: %v", name, inodeNum, err)
@@ -1392,7 +1415,7 @@ func (f *FS) createFileOnce(ctx context.Context, parent *fs.Inode, parentNum uin
 // makeDir creates a directory called name in directory parentNum, whose go-fuse node is parent.
 func (f *FS) makeDir(ctx context.Context, parent *fs.Inode, parentNum uint32, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	var node *fs.Inode
-	errno := retryRace("Mkdir", name, func() (errno syscall.Errno) {
+	errno := untilClaimed("Mkdir", name, func() (errno syscall.Errno) {
 		node, errno = f.makeDirOnce(ctx, parent, parentNum, name, mode, out)
 		return errno
 	})
@@ -1443,6 +1466,9 @@ func (f *FS) makeDirOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 	}
 
 	uncharge := func() { takeBack = func() { f.commitCharge(project, -1, -1) } }
+	if claiming != nil {
+		claiming("mkdir", inodeNum)
+	}
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Mkdir %q: ClaimSlot %d failed: %v", name, inodeNum, err)

@@ -66,7 +66,7 @@ func (f *FS) symlink(ctx context.Context, parent *fs.Inode, parentNum uint32, ta
 		return nil, syscall.ENAMETOOLONG
 	}
 	var node *fs.Inode
-	errno := retryRace("Symlink", name, func() (errno syscall.Errno) {
+	errno := untilClaimed("Symlink", name, func() (errno syscall.Errno) {
 		node, errno = f.symlinkOnce(ctx, parent, parentNum, []byte(target), name, out)
 		return errno
 	})
@@ -164,6 +164,9 @@ func (f *FS) symlinkOnce(ctx context.Context, parent *fs.Inode, parentNum uint32
 		blocks = 1
 	}
 	uncharge := func() { takeBack = func() { f.commitCharge(project, -blocks, -1) } }
+	if claiming != nil {
+		claiming("symlink", inodeNum)
+	}
 	childIno, err := f.inodeTbl.ClaimSlot(ctx, inodeNum)
 	if err != nil {
 		logging.Debugf("Symlink %q: ClaimSlot %d failed: %v", name, inodeNum, err)
