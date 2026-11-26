@@ -2184,6 +2184,66 @@ test_power_failure() {
     return 0
 }
 
+# VM 1 holds an exclusive flock and loses power while VM 2 waits for it; VM 2 gets it once it takes VM 1 over,
+# and VM 1's flock is gone once it mounts again.
+test_flock_moves_after_power_cut() {
+    log_info "Testing a flock moving to a waiter when its holder loses power..."
+    ensure_cluster_healthy 2
+
+    local mnt=/mnt/goclusterfs
+    local holder=1 waiter=2
+    ssh_run "$holder" "touch $mnt/flock_power"
+    ssh_run "$holder" "rm -f /tmp/flock_power_held; nohup flock -x $mnt/flock_power sh -c 'touch /tmp/flock_power_held; sleep 3600' < /dev/null > /dev/null 2>&1 &"
+    local i
+    for i in $(seq 50); do
+        ssh_run "$holder" "test -e /tmp/flock_power_held" && break
+        sleep 0.2
+    done
+    if ! ssh_run "$holder" "test -e /tmp/flock_power_held"; then
+        log_error "VM $holder did not get the flock within 10s"
+        return 1
+    fi
+    if ssh_run "$waiter" "flock -n -x $mnt/flock_power true"; then
+        log_error "VM $waiter took an exclusive flock that VM $holder holds"
+        return 1
+    fi
+    ssh_run "$waiter" "rm -f /tmp/flock_power_got; nohup sh -c 'flock -x $mnt/flock_power true && date +%s > /tmp/flock_power_got' < /dev/null > /dev/null 2>&1 &"
+    sleep 3
+    if ssh_run "$waiter" "test -e /tmp/flock_power_got"; then
+        log_error "VM $waiter got the flock while VM $holder still holds it"
+        return 1
+    fi
+
+    log_info "Cutting power to VM $holder..."
+    local cut=$SECONDS
+    kill_vm "$holder"
+    local waited=0
+    until ssh_run "$waiter" "test -e /tmp/flock_power_got"; do
+        if (( SECONDS - cut > 120 )); then
+            log_error "VM $waiter still waits for the flock 120s after VM $holder lost power"
+            return 1
+        fi
+        sleep 2
+    done
+    waited=$((SECONDS - cut))
+    log_info "VM $waiter got the flock ${waited}s after VM $holder lost power"
+
+    start_vm "$holder" false
+    wait_vm_healthy "$holder"
+    setup_goclusterfs "$holder" false
+    if ! ssh_run "$holder" "flock -n -x $mnt/flock_power true"; then
+        log_error "VM $holder cannot take the flock after it mounted again; its old flock may have survived"
+        return 1
+    fi
+    if ! ssh_run "$waiter" "flock -n -x $mnt/flock_power true"; then
+        log_error "VM $waiter cannot take the flock after VM $holder mounted again"
+        return 1
+    fi
+    ssh_run "$holder" "rm -f $mnt/flock_power"
+    log_success "Flock moved to the waiter ${waited}s after the power cut"
+    return 0
+}
+
 # Test 7: O_DIRECT validation
 test_odirect_validation() {
     log_info "Testing O_DIRECT behavior..."
@@ -6145,6 +6205,7 @@ main() {
 
     # Run VM-specific tests
     run_test "Power Failure Simulation" test_power_failure
+    run_test "Flock Moves After Power Cut" test_flock_moves_after_power_cut
     run_test "O_DIRECT Validation" test_odirect_validation
     run_test "Large File Handling" test_large_file
     run_test "Many Files" test_many_files

@@ -7593,4 +7593,4 @@ scenarios:
     environments:
       go: flock_test.go::TestCrashedNodesFlockMovesToAWaiter
       docker: TODO  # killing a container's mount is the Go test; the VM test cuts power
-      vm: TODO  # the power-cut test follows in its own change
+      vm: run-vm-tests.sh::test_flock_moves_after_power_cut
