@@ -2833,8 +2833,8 @@ heal_network_faults() {
 # measure_staleness has node 1 rewrite a file 20 times, growing and truncating
 # it, while node 2 reads it through a file it holds open, node 3 stats it, and
 # node 4 opens it afresh for each look (or floods invalidations with "flood").
-# Fails if any of them sees a version later than its bound allows, with the
-# default -attr-timeout 1s and -cache-ttl 5s.
+# Fails if a look that starts more than its bound after a version's close
+# still misses it, with the default -attr-timeout 1s and -cache-ttl 5s.
 measure_staleness() {
     local name=$1 flood=${2:-}
     local writer="${NODE_ARRAY[0]}" held="${NODE_ARRAY[1]}" stat="${NODE_ARRAY[2]}" fresh="${NODE_ARRAY[3]}"
