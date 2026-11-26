@@ -469,3 +469,28 @@ func TestFailedFlockWriteIsWrittenAgain(t *testing.T) {
 		t.Fatalf("flock after the retry wrote the release = %v", err)
 	}
 }
+
+func TestDowngradeWhoseWriteFailsKeepsTheFlock(t *testing.T) {
+	nodes, _ := flockNodes(t, 2)
+	m, peer := nodes[0], nodes[1]
+	key := FlockKey{Inode: 5, Birth: 1}
+	ctx := context.Background()
+	if err := m.Flock(ctx, key, LockModeExclusive, false); err != nil {
+		t.Fatal(err)
+	}
+	m.slotWrite = func([]byte, int64) (int, error) { return 0, errors.New("injected write failure") }
+	if err := m.Flock(ctx, key, LockModeShared, false); err != nil {
+		t.Fatalf("downgrade with a failing write = %v, want the flock kept", err)
+	}
+	m.slotWrite = nil
+	if e, ok := m.ownFlock(m.hashToRecord(LockTypeFlock, uint64(key.Inode)), key); !ok || e.mode != LockModeShared {
+		t.Fatalf("after the failed downgrade write this node keeps %+v, %v; want a shared flock", e, ok)
+	}
+	if err := peer.Flock(ctx, key, LockModeShared, false); !errors.Is(err, ErrWouldBlock) {
+		t.Fatalf("shared flock while the slot still holds the exclusive entry = %v, want ErrWouldBlock", err)
+	}
+	m.retryFlockWrites()
+	if err := peer.Flock(ctx, key, LockModeShared, false); err != nil {
+		t.Fatalf("shared flock after the retry wrote the downgrade = %v", err)
+	}
+}

@@ -154,7 +154,9 @@ func (m *Manager) flock(ctx context.Context, recordID uint64, key FlockKey, mode
 		case held.mode == mode:
 			return nil
 		case mode == LockModeShared:
-			return m.setFlock(recordID, key, &flockEntry{mode: LockModeShared})
+			// If the write fails, the slot keeps the exclusive entry until the watcher writes the shared one.
+			_ = m.setFlock(recordID, key, &flockEntry{mode: LockModeShared})
+			return nil
 		}
 	}
 	for {
