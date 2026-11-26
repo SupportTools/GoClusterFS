@@ -86,8 +86,9 @@ func errnoName(err error) string {
 	return err.Error()
 }
 
-// Hundreds of writers overwrite their own files and rename them, while open intents fill the journal. A write or a
-// rename then waits for journal space instead of failing with EIO.
+// Hundreds of writers each grow their own file, truncate it back to nothing and rename it, so every write allocates
+// and logs intents, while open intents fill the journal. A write, truncate or rename then waits for journal space
+// instead of failing with EIO.
 func TestParallelWritersWaitForJournalSpace(t *testing.T) {
 	writers := envInt("GOCLUSTERFS_TEST_WRITERS", 256)
 	seconds := 20
@@ -96,13 +97,14 @@ func TestParallelWritersWaitForJournalSpace(t *testing.T) {
 	}
 	run := time.Duration(envInt("GOCLUSTERFS_TEST_WRITE_SECONDS", seconds)) * time.Second
 	mfs := NewMountedFS(t, envInt("GOCLUSTERFS_TEST_IMAGE_MB", 8192))
+	mfs.ExtraArgs = append(mfs.ExtraArgs, "-bytes-per-inode", "1048576")
 	log := &syncBuffer{}
 	mfs.Log = log
 	if err := mfs.FormatAndMount(false); err != nil {
 		t.Fatalf("FormatAndMount failed: %v", err)
 	}
 
-	var writes, renames, failed atomic.Int64
+	var writes, truncates, renames, failed atomic.Int64
 	var mu sync.Mutex
 	errnos := map[string]int{}
 	fail := func(op string, err error) {
@@ -133,10 +135,17 @@ func TestParallelWritersWaitForJournalSpace(t *testing.T) {
 					fail("open", err)
 					continue
 				}
-				if _, err := f.WriteAt(buf, int64(i%8)*int64(len(buf))); err != nil {
+				if _, err := f.WriteAt(buf, int64(i%16)*int64(len(buf))); err != nil {
 					fail("write", err)
 				} else {
 					writes.Add(1)
+				}
+				if i%16 == 15 {
+					if err := f.Truncate(0); err != nil {
+						fail("truncate", err)
+					} else {
+						truncates.Add(1)
+					}
 				}
 				if err := f.Close(); err != nil {
 					fail("close", err)
@@ -153,7 +162,7 @@ func TestParallelWritersWaitForJournalSpace(t *testing.T) {
 	}
 	wg.Wait()
 	full := strings.Count(log.String(), "journal is full")
-	t.Logf("%d writers for %v: %d writes, %d renames, %d failed %v, %d \"journal is full\" log lines", writers, run, writes.Load(), renames.Load(), failed.Load(), errnos, full)
+	t.Logf("%d writers for %v: %d writes, %d truncates, %d renames, %d failed %v, %d \"journal is full\" log lines", writers, run, writes.Load(), truncates.Load(), renames.Load(), failed.Load(), errnos, full)
 	if failed.Load() > 0 || full > 0 {
 		t.Errorf("operations failed: %v; \"journal is full\" logged %d times", errnos, full)
 	}
