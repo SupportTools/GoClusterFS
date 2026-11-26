@@ -569,6 +569,9 @@ func (t *Table) claimSlot(ctx context.Context, num uint32, ok func(free *Inode) 
 // next slot; jumping forward lands in the free inodes ahead of the other node rather than behind it again.
 func (t *Table) moveAway(lost uint32) {
 	usable := t.totalInodes - uint64(InodeFirstUsable)
+	if usable < 2 {
+		return
+	}
 	ahead := (uint64(lost) - uint64(InodeFirstUsable) + 1 + t.randomSlot(usable/2)) % usable
 	t.resume.Store(uint64(InodeFirstUsable) + ahead)
 }
