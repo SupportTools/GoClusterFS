@@ -704,6 +704,8 @@ func main() {
 			MaxReadAhead:  1 << 20,
 			DisableXAttrs: false,
 			AllowOther:    *allowOther,
+			// fcntl locks stay in the kernel and hold only on this node.
+			EnableFlockLocks: true,
 		},
 		AttrTimeout:  attrTimeout,
 		EntryTimeout: attrTimeout,
@@ -715,7 +717,7 @@ func main() {
 
 	// Mount filesystem using go-fuse v2 API
 	log.Printf("Mounting at %s...", *mountPoint)
-	server, err := fs.Mount(*mountPoint, gfs, mountOpts)
+	server, err := mountFS(*mountPoint, gfs, mountOpts)
 	if err != nil && *allowOther && os.Getuid() != 0 {
 		failf("Failed to mount at %s: %v. A mount by a user other than root needs user_allow_other in /etc/fuse.conf for -allow-other", *mountPoint, err)
 	}

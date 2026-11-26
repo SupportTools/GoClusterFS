@@ -7529,3 +7529,36 @@ scenarios:
     priority: vm_only  # needs a power cut
     environments:
       vm: run-vm-tests.sh::test_quota_midwrite_power_cut
+
+  # ===========================================================================
+  # FILE LOCKS
+  # The kernel sends flock(2) to the mount and keeps fcntl locks itself.
+  # ===========================================================================
+
+  - id: flock-local-exclusion
+    name: Flocks of open files on one mount exclude each other
+    description: An exclusive flock refuses others, a dup keeps it until the last close, a blocking flock wakes at that close, and shared flocks hold together
+    priority: go_only  # one mount; the cross-node scenario covers Docker and VMs
+    environments:
+      go: flock_test.go::TestFlockExcludesOpenFilesOnOneMount
+
+  - id: flock-directory
+    name: Flock on a directory and the root
+    description: Two opens of one directory exclude each other's exclusive flocks until the holder closes
+    priority: go_only
+    environments:
+      go: flock_test.go::TestFlockOnADirectory
+
+  - id: fcntl-locks-in-kernel
+    name: fcntl locks stay in the kernel
+    description: An fcntl lock on a mounted file shows in /proc/locks, and a flock next to it does not, so the kernel keeps fcntl locks and sends flocks to the mount
+    priority: go_only
+    environments:
+      go: flock_test.go::TestFcntlLocksStayInTheKernel
+
+  - id: flock-killed-waiter
+    name: A killed flock waiter exits
+    description: SIGKILL ends a process blocked in flock at once, because the mount answers the kernel's interrupt
+    priority: go_only
+    environments:
+      go: flock_test.go::TestKilledFlockWaiterExits

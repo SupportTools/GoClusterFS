@@ -62,6 +62,7 @@ fusermount3 -u mnt                                            # or Ctrl+C the mo
 | `internal/version` | Build version, set with `-ldflags -X` by `scripts/dist.sh` |
 | `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
 | `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
+| `third_party/go-fuse` | go-fuse v2.9.0 with one patch, `EnableFlockLocks`, so the kernel sends flock(2) to the mount and keeps fcntl locks; `third_party/README.md` lists the patch |
 
 ## On-Disk Layout
 
@@ -100,6 +101,7 @@ Clone paths are absolute from the filesystem root, and clones can only go in the
 - `goclusterfs-fsck -repair` fixes only block refcounts, sharing that older versions left uncounted, leaked blocks, inodes no directory names, snapshot registry sectors that fail their checksum, a directory's wrong `.` or `..`, project quota usage, and the superblock checksum. It reports every other problem without fixing it.
 - The inode count is set at format time and cannot change. `statfs` (`df`) counts free inodes with a background scan of the whole inode table, so other nodes' creates and removes show up after up to 30 times the scan time, at least a second.
 - SFB is disabled: writes never allocate SFB slots, so every file uses full blocks. `internal/sfb` container I/O is broken (unaligned header buffers, no data offset) and stays until it is fixed or removed.
+- `flock(2)` and `fcntl(2)` locks hold only on the node that takes them. The mount serves flocks (`internal/goclusterfs/flock.go`); the kernel keeps fcntl locks.
 - Rename supports `RENAME_NOREPLACE`; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` fail with `EINVAL`. Symlinks need a volume formatted by a build with symlink support.
 
 ## Testing
