@@ -176,7 +176,7 @@ type Table struct {
 	// yet, which it skips so that local creators racing for a slot each get their own.
 	findMu    sync.Mutex
 	handedOut map[uint32]struct{}
-	// randomSlot picks where FindFreeSlot reads next after another node claimed a slot it found, below n.
+	// randomSlot picks how far past a slot another node claimed FindFreeSlot reads next, below n.
 	randomSlot func(n uint64) uint64
 	// restartEvery is how often FindFreeSlot reads from scanStart again, to reuse inodes other nodes freed.
 	restartEvery time.Duration
@@ -559,15 +559,18 @@ func (t *Table) claimSlot(ctx context.Context, num uint32, ok func(free *Inode) 
 		return err
 	})
 	if errors.Is(err, ErrInodeInUse) {
-		t.moveAway()
+		t.moveAway(num)
 	}
 	return claimed, err
 }
 
-// moveAway sends FindFreeSlot to a random part of the table. Another node claimed a slot this node found free, so both
-// were scanning the same free inodes, and the one behind would keep finding the other's next slot.
-func (t *Table) moveAway() {
-	t.resume.Store(uint64(InodeFirstUsable) + t.randomSlot(t.totalInodes-uint64(InodeFirstUsable)))
+// moveAway sends FindFreeSlot a random distance of up to half the table past lost, the slot another node claimed after
+// this node found it free. Both were scanning the same free inodes, and the one behind would keep finding the other's
+// next slot; jumping forward lands in the free inodes ahead of the other node rather than behind it again.
+func (t *Table) moveAway(lost uint32) {
+	usable := t.totalInodes - uint64(InodeFirstUsable)
+	ahead := (uint64(lost) - uint64(InodeFirstUsable) + 1 + t.randomSlot(usable/2)) % usable
+	t.resume.Store(uint64(InodeFirstUsable) + ahead)
 }
 
 func (t *Table) claimSlotOnce(ctx context.Context, num uint32, ok func(free *Inode) bool, init func(*Inode)) (*Inode, error) {

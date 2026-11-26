@@ -172,3 +172,92 @@ func TestLocalConcurrentCreatesGetTheirOwnSlots(t *testing.T) {
 		t.Errorf("the mount logged %d creates that lost every race with other nodes, with no other node mounted", len(lost))
 	}
 }
+
+// TestCrossNodeCreatesInOnePartOfTheTable has node 0 create files until it runs into node 1's part of the inode table,
+// then has both nodes create files with 16 creators each. Node 0's search then followed right behind node 1's and kept
+// finding the inode node 1 was about to claim, so creates failed with EAGAIN after 5 lost races.
+func TestCrossNodeCreatesInOnePartOfTheTable(t *testing.T) {
+	const creators = 16
+	perCreator := 60
+	if testing.Short() {
+		perCreator = 30
+	}
+	cluster := NewMultiNodeCluster(t, 2, 1024)
+	logs := []*syncBuffer{{}, {}}
+	cluster.Node(0).Log, cluster.Node(1).Log = logs[0], logs[1]
+	cluster.Node(0).ExtraArgs = append(cluster.Node(0).ExtraArgs, "-bytes-per-inode", "262144")
+	if err := cluster.FormatAndStartFirst(false); err != nil {
+		t.Fatalf("format and start node 0: %v", err)
+	}
+	if err := cluster.StartNode(1, false); err != nil {
+		t.Fatalf("start node 1: %v", err)
+	}
+	inodeOf := func(path string) uint64 {
+		var st syscall.Stat_t
+		if err := syscall.Stat(path, &st); err != nil {
+			t.Fatal(err)
+		}
+		return st.Ino
+	}
+	n0, n1 := cluster.Node(0).MountPoint, cluster.Node(1).MountPoint
+	if err := os.WriteFile(filepath.Join(n1, "probe"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nodeOneStart := inodeOf(filepath.Join(n1, "probe"))
+	if err := os.Mkdir(filepath.Join(n0, "fill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; ; i++ {
+		name := filepath.Join(n0, "fill", fmt.Sprintf("f%05d", i))
+		if err := os.WriteFile(name, nil, 0o644); err != nil {
+			t.Fatalf("filling node 0's part of the table: %v", err)
+		}
+		if inodeOf(name) > nodeOneStart {
+			break
+		}
+	}
+	for idx, mnt := range []string{n0, n1} {
+		for c := range creators {
+			if err := os.Mkdir(filepath.Join(mnt, fmt.Sprintf("n%dc%02d", idx, c)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	var mu sync.Mutex
+	failed := map[string]int{}
+	start := time.Now()
+	cluster.RunConcurrent([]int{0, 1}, func(idx int, node *MountedFS) error {
+		var wg sync.WaitGroup
+		for c := range creators {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range perCreator {
+					name := filepath.Join(node.MountPoint, fmt.Sprintf("n%dc%02d", idx, c), fmt.Sprintf("f%03d", i))
+					f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+					if err != nil {
+						mu.Lock()
+						failed[fmt.Sprintf("node %d: %v", idx, errors.Unwrap(err))]++
+						mu.Unlock()
+						continue
+					}
+					_ = f.Close()
+				}
+			}()
+		}
+		wg.Wait()
+		return nil
+	})
+	elapsed := time.Since(start)
+	total := 2 * creators * perCreator
+	t.Logf("2 nodes x %d creators made %d files in one part of the table in %v: %.0f creates/s", creators, total, elapsed, float64(total)/elapsed.Seconds())
+	for kind, n := range failed {
+		t.Errorf("%d creates failed with %s", n, kind)
+	}
+	for idx, buf := range logs {
+		if lost := lostRacesRe.FindAllString(buf.String(), -1); len(lost) > 0 {
+			t.Errorf("node %d logged %d creates that lost every race with the other node", idx, len(lost))
+		}
+	}
+}
