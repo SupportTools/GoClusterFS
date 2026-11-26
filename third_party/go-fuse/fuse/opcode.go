@@ -104,6 +104,8 @@ func doInit(server *protocolServer, req *request) {
 
 	if server.opts.EnableLocks {
 		kernelFlags |= CAP_FLOCK_LOCKS | CAP_POSIX_LOCKS
+	} else if server.opts.EnableFlockLocks {
+		kernelFlags |= CAP_FLOCK_LOCKS
 	}
 	if server.opts.EnableSymlinkCaching {
 		kernelFlags |= CAP_CACHE_SYMLINKS
