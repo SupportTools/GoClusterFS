@@ -2422,7 +2422,7 @@ test_flock_across_nodes() {
 
     local mnt=/mnt/goclusterfs
     ssh_run 1 "touch $mnt/flock_file"
-    ssh_run 1 "setsid -f flock -x $mnt/flock_file sleep 4 < /dev/null > /dev/null 2>&1"
+    ssh_run 1 "nohup flock -x $mnt/flock_file sleep 4 < /dev/null > /dev/null 2>&1 &"
     sleep 1
     if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
         log_error "VM 2 took an exclusive flock that VM 1 holds"
@@ -2439,7 +2439,7 @@ test_flock_across_nodes() {
     fi
     log_info "VM 2 waited $((SECONDS - start))s for the flock"
 
-    ssh_run 1 "setsid -f flock -s $mnt/flock_file sleep 3 < /dev/null > /dev/null 2>&1"
+    ssh_run 1 "nohup flock -s $mnt/flock_file sleep 3 < /dev/null > /dev/null 2>&1 &"
     sleep 1
     if ! ssh_run 2 "flock -n -s $mnt/flock_file true"; then
         log_error "VM 2 could not share a flock with VM 1"
@@ -2451,18 +2451,10 @@ test_flock_across_nodes() {
     fi
     sleep 3
 
-    if ssh_run 1 "command -v python3" > /dev/null; then
-        log_info "Flock latency on VM 1, 200 uncontended exclusive flocks: $(ssh_run 1 "python3 -c '
-import fcntl, statistics, time
-f = open(\"$mnt/flock_file\")
-lock, unlock = [], []
-for _ in range(200):
-    t0 = time.perf_counter_ns(); fcntl.flock(f, fcntl.LOCK_EX); t1 = time.perf_counter_ns(); fcntl.flock(f, fcntl.LOCK_UN); t2 = time.perf_counter_ns()
-    lock.append((t1 - t0) / 1e3); unlock.append((t2 - t1) / 1e3)
-q = lambda xs, p: sorted(xs)[int(p * (len(xs) - 1))]
-print(\"lock p50 %.0f us p99 %.0f us, unlock p50 %.0f us p99 %.0f us\" % (q(lock, .5), q(lock, .99), q(unlock, .5), q(unlock, .99)))
-'")"
-    fi
+    # 200 flock and unlock pairs through flock(1) on an open fd, less the same loop on a local file, which leaves out flock(1)'s own start-up.
+    local times
+    times=$(ssh_run 1 "touch /tmp/flock_local; up() { cut -d' ' -f1 /proc/uptime; }; loop() { exec 9< \$1; i=0; while [ \$i -lt 200 ]; do flock -x 9; flock -u 9; i=\$((i+1)); done; exec 9<&-; }; a=\$(up); loop $mnt/flock_file; b=\$(up); loop /tmp/flock_local; c=\$(up); echo \$a \$b \$c")
+    log_info "Flock latency on VM 1: $(echo "$times" | awk '{ printf "an uncontended flock and unlock take %.1f ms together (%d pairs: %.2fs on the volume, %.2fs on a local file)", (($2-$1)-($3-$2))/200*1000, 200, $2-$1, $3-$2 }')"
     ssh_run 1 "rm -f $mnt/flock_file"
     log_success "Flock across nodes test passed"
     return 0
