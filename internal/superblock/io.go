@@ -42,8 +42,9 @@ const (
 	// LockRegionSize holds 256 lock records of one claim slot per node.
 	LockRegionSize = 256 * MaxNodes * lockSlotSize
 
-	// MinDeviceSize holds all metadata regions and one data block.
-	MinDeviceSize = 6*regionSize + LockRegionSize + MaxNodes*NodeJournalSize + storage.DefaultBlockSize
+	// MinDeviceSize holds all metadata regions, the 1 MiB quota table, the root directory's first block and one free
+	// data block at 1 MB blocks.
+	MinDeviceSize = 6*regionSize + LockRegionSize + MaxNodes*NodeJournalSize + 3*storage.DefaultBlockSize
 
 	legacyRootInodeOffset = 2*regionSize + 2*inodeSize
 	legacyInodeMagic      = 0x494E4F44

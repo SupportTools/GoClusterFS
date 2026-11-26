@@ -301,8 +301,8 @@ func TestNewSuperblock(t *testing.T) {
 	if sb.InodeCount != 3<<20/256 {
 		t.Errorf("InodeCount = %d, want %d (10240 rounded up to fill 3 MB)", sb.InodeCount, 3<<20/256)
 	}
-	if New(MinDeviceSize, 0, 0).TotalBlocks != 1 {
-		t.Errorf("MinDeviceSize leaves %d data blocks, want 1", New(MinDeviceSize, 0, 0).TotalBlocks)
+	if New(MinDeviceSize, 0, 0).TotalBlocks != 3 {
+		t.Errorf("MinDeviceSize leaves %d data blocks, want 3: the quota table, the root directory and one free", New(MinDeviceSize, 0, 0).TotalBlocks)
 	}
 
 	// Check timestamps

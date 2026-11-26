@@ -67,8 +67,8 @@ func TestFormatThenRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read after Format: %v", err)
 	}
-	if got.UUID != formatted.UUID || got.TotalBlocks != 9 || got.Version != 3 {
-		t.Errorf("read back UUID %x, %d blocks, v%d; want %x, 9 blocks, v3",
+	if got.UUID != formatted.UUID || got.TotalBlocks != 11 || got.Version != 3 {
+		t.Errorf("read back UUID %x, %d blocks, v%d; want %x, 11 blocks, v3",
 			got.UUID, got.TotalBlocks, got.Version, formatted.UUID)
 	}
 
@@ -150,7 +150,7 @@ func TestReadDestroyedSuperblock(t *testing.T) {
 
 func TestFormatRefusesNoDataBlocks(t *testing.T) {
 	dev := testDevice(t, MinDeviceSize)
-	_, err := Format(dev, 0, 64<<10)
+	_, err := Format(dev, 0, 16<<10)
 	if !errors.Is(err, ErrDeviceTooSmall) || !strings.Contains(err.Error(), "-bytes-per-inode") {
 		t.Errorf("Format with no room for data blocks: err = %v, want ErrDeviceTooSmall naming -bytes-per-inode", err)
 	}

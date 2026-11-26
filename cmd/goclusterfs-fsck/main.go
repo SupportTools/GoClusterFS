@@ -354,9 +354,12 @@ Repair:
   -repair rewrites block refcounts from the extents of every inode, snapshot
   and clone, marks blocks that older versions shared as counted, frees leaked
   blocks that nothing maps, frees inodes that no directory names along with
-  their blocks, and fixes the superblock checksum when every other superblock
-  field checks out. It never edits directories, and it leaves problems not
-  marked [FIXABLE] as they are. It keeps the refcounts, leaked blocks and
+  their blocks, sets a regular file's link count to its number of names,
+  rewrites snapshot registry sectors that fail their checksum, recounts
+  project quota usage and frees quota records no project uses, and fixes the
+  superblock checksum when every other superblock field checks out. It edits
+  directories only to point a wrong . or .. at the right directory, and it
+  leaves problems not marked [FIXABLE] as they are. It keeps the refcounts, leaked blocks and
   unnamed inodes as they are when it could not read every reference to them
   or a node's journal still needs replay, since it could then miss an owner.
 
