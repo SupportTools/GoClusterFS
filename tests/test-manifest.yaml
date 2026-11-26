@@ -1342,7 +1342,7 @@ scenarios:
 
   - id: journal-admit-records
     name: An admission for several records sets all their room aside
-    description: Each admitted record finds its room after other commits filled the ring; a record past the admission commits as an unadmitted one would
+    description: Each admitted record, the large one first, uses the room that fits it after other commits filled the ring; a record past the admission commits as an unadmitted one would
     priority: go_only
     environments:
       go: internal/journal/admit_test.go::TestAdmitRecordsSetsAsideEveryRecord
@@ -1353,6 +1353,13 @@ scenarios:
     priority: go_only
     environments:
       go: internal/journal/admit_test.go::TestAdmitRecordsRefusesRoomThatCanNeverBeFree
+
+  - id: journal-release-every-room
+    name: Release gives back every record's room
+    description: After an admission for several records is released, the same admission fits again at once
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestReleaseGivesBackEveryRecordsRoom
 
   - id: journal-ended-intents-room
     name: Ended intents give back their room
@@ -1374,6 +1381,20 @@ scenarios:
     priority: go_only
     environments:
       go: internal/goclusterfs/symlink_test.go::TestRefusedSymlinksGiveBackTheirJournalRoom
+
+  - id: write-waits-for-journal-room
+    name: A write waits for journal room
+    description: A write into a journal full of open intents waits until they complete, then succeeds, instead of failing with EIO
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/journal_room_test.go::TestWriteWaitsForJournalRoom
+
+  - id: write-between-rounds-journal-head
+    name: A write between allocation rounds does not hold the journal head
+    description: While a write waits for another node's bitmap lock between rounds, the journal keeps taking records, because the earlier rounds' records have ended
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/journal_room_test.go::TestWriteBetweenRoundsDoesNotHoldTheJournalHead
 
   - id: parallel-creators-journal-space
     name: Parallel creators wait for journal space

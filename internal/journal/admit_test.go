@@ -118,26 +118,58 @@ func TestHeadMovingCommitFindsRoomInAFullRing(t *testing.T) {
 	}
 }
 
-// An admission for several records sets all of their room aside at once: each finds its room after other commits
-// filled the ring, and a record past them commits as an unadmitted one would.
+func admittedRoom(j *Journal) int64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.admitted
+}
+
+func roomFor(size uint32) int64 { return int64(sectorAligned(size)) + int64(endRoom) }
+
+// An admission for several records sets all of their room aside at once, and each commit uses the room that fits its
+// record: the large record first, then the small ones, after other commits filled the ring. A record past them
+// commits as an unadmitted one would.
 func TestAdmitRecordsSetsAsideEveryRecord(t *testing.T) {
 	j := newTestJournal(t)
 	a, err := j.AdmitRecords(context.Background(), 512, 512, 8192)
 	if err != nil {
 		t.Fatal(err)
 	}
+	small, large := roomFor(512), roomFor(8192)
+	if got, want := admittedRoom(j), 2*small+large; got != want {
+		t.Fatalf("admitted room %d after admitting 2 small records and 1 large, want %d", got, want)
+	}
 	fillWithOpenIntents(t, j)
 	big := j.Begin()
 	if err := big.LogSymlinkTarget(&SymlinkTargetPayload{InodeNum: 1, Target: make([]byte, 6000)}); err != nil {
 		t.Fatal(err)
 	}
-	for i, txn := range []*Transaction{createTxn(t, j, 1), big, createTxn(t, j, 2)} {
+	left := []int64{2 * small, small, 0}
+	for i, txn := range []*Transaction{big, createTxn(t, j, 1), createTxn(t, j, 2)} {
 		if _, err := j.CommitAdmitted(a, txn); err != nil {
 			t.Fatalf("admitted record %d: %v", i, err)
+		}
+		if got := admittedRoom(j); got != left[i] {
+			t.Fatalf("admitted room %d after record %d, want %d", got, i, left[i])
 		}
 	}
 	if _, err := j.CommitAdmitted(a, createTxn(t, j, 3)); !errors.Is(err, ErrJournalFull) {
 		t.Errorf("a record past the admission's into a full ring = %v, want ErrJournalFull", err)
+	}
+}
+
+// Release gives back the room of every record an admission did not commit, so the same admission fits again at once.
+func TestReleaseGivesBackEveryRecordsRoom(t *testing.T) {
+	j := newTestJournal(t)
+	quarter := uint32((int64(j.region.DataAreaSize())-j.waitHeadroom())/4) - endRoom
+	for round := range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		a, err := j.AdmitRecords(ctx, quarter, quarter, quarter)
+		cancel()
+		if err != nil {
+			t.Fatalf("admission %d: %v", round, err)
+		}
+		j.Release(a)
 	}
 }
 
