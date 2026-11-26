@@ -414,3 +414,31 @@ func TestStaleLinkNodeAfterSlotReuse(t *testing.T) {
 	}
 	expectTarget(t, lookupLink(t, fsys, "m"), "/secret/new-target")
 }
+
+// A symlink the quota refuses gives back the journal room it admitted: more refusals than the journal has sectors
+// would otherwise leave none, and the next symlink would wait for good.
+func TestRefusedSymlinksGiveBackTheirJournalRoom(t *testing.T) {
+	fsys, _, _, size := journaledFS(t)
+	fsys = withBridge(fsys)
+	pvc := limitedProject(t, fsys, "pvc", "inodes=1")
+	attempts := int(size / 4096)
+
+	done := make(chan error, 1)
+	go func() {
+		for n := range attempts {
+			if _, errno := pvc.Symlink(context.Background(), "short", fmt.Sprintf("s%d", n), &fuse.EntryOut{}); errno != syscall.EDQUOT {
+				done <- fmt.Errorf("symlink %d past an inode limit of 1: %v, want EDQUOT", n, errno)
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Minute):
+		t.Fatalf("%d symlinks the quota refuses did not return within a minute", attempts)
+	}
+}

@@ -1340,6 +1340,27 @@ scenarios:
     environments:
       go: internal/journal/admit_test.go::TestHeadMovingCommitFindsRoomInAFullRing
 
+  - id: journal-ended-intents-room
+    name: Ended intents give back their room
+    description: After several rings' worth of records ended by CompleteIntent and CompleteIntentDurable, an admission still gets room at once
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestEndedIntentsGiveBackTheirRoom
+
+  - id: journal-quota-flush-room
+    name: Quota flush finds room in a full ring
+    description: A quota flush commits after unadmitted commits fill the ring, into the part kept for records that move the head
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestQuotaFlushFindsRoomInAFullRing
+
+  - id: symlink-refused-journal-room
+    name: Refused symlinks give back their journal room
+    description: Symlinks the quota refuses with EDQUOT, more than the journal has sectors, all return without waiting for room
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestRefusedSymlinksGiveBackTheirJournalRoom
+
   - id: parallel-creators-journal-space
     name: Parallel creators wait for journal space
     description: Hundreds of creators, each in its own directory, fill the journal with open intents; creates wait for room instead of failing with EIO
@@ -4485,7 +4506,7 @@ scenarios:
 
   - id: reserve-refresh
     name: Old reserve record is renewed
-    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record and ends; if the old record cannot end, nothing is freed until it does
+    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record, committed as one that moves the head, and ends; if the old record cannot end, nothing is freed until it does
     priority: go_only
     environments:
       go: internal/reserve/reserve_test.go::TestRefreshRenewsAnOldRecord
