@@ -1340,6 +1340,20 @@ scenarios:
     environments:
       go: internal/journal/admit_test.go::TestHeadMovingCommitFindsRoomInAFullRing
 
+  - id: journal-admit-records
+    name: An admission for several records sets all their room aside
+    description: Each admitted record finds its room after other commits filled the ring; a record past the admission commits as an unadmitted one would
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestAdmitRecordsSetsAsideEveryRecord
+
+  - id: journal-admit-records-impossible
+    name: Room that can never be free fails at once
+    description: An admission larger than the ring can ever free returns ErrJournalFull instead of waiting forever
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestAdmitRecordsRefusesRoomThatCanNeverBeFree
+
   - id: parallel-creators-journal-space
     name: Parallel creators wait for journal space
     description: Hundreds of creators, each in its own directory, fill the journal with open intents; creates wait for room instead of failing with EIO

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -383,10 +384,29 @@ func wholeSectors(n uint32) int64 { return int64(n / storage.SectorSize * storag
 // waitHeadroom is the part of the ring Admit leaves to commits that cannot wait. It is larger than moveHeadRoom.
 func (j *Journal) waitHeadroom() int64 { return wholeSectors(j.region.DataAreaSize() / 4) }
 
-// Admission is room Admit set aside for one record and its completion.
+// Admission is room Admit set aside for records and their completions.
 type Admission struct {
-	room int64
-	done bool
+	rooms []int64 // the room of each record not committed yet, with its completion
+}
+
+// pick is the index of the smallest room that fits need, or of the largest when none does.
+func (a *Admission) pick(need int64) int {
+	best := 0
+	for i, r := range a.rooms {
+		fits, bestFits := r >= need, a.rooms[best] >= need
+		if fits && (!bestFits || r < a.rooms[best]) || !fits && !bestFits && r > a.rooms[best] {
+			best = i
+		}
+	}
+	return best
+}
+
+// take removes and returns the room pick chooses. Must hold j.mu.
+func (a *Admission) take(need int64) int64 {
+	i := a.pick(need)
+	r := a.rooms[i]
+	a.rooms = slices.Delete(a.rooms, i, i+1)
+	return r
 }
 
 // Admit waits until the ring has room for a record of up to size bytes and its completion, beyond what other
@@ -395,15 +415,31 @@ type Admission struct {
 // from the reserve, whose record stays open meanwhile. ctx or Stop ends the wait. Commit the record with
 // CommitAdmitted, or give the room back with Release.
 func (j *Journal) Admit(ctx context.Context, size uint32) (*Admission, error) {
-	a := &Admission{room: int64(sectorAligned(size)) + int64(endRoom)}
+	return j.AdmitRecords(ctx, size)
+}
+
+// AdmitRecords is Admit for one record of up to each of sizes bytes, set aside all at once: an operation that held room
+// for some while it waited for the rest could keep others from ever getting theirs. Room that could never be free fails
+// at once with ErrJournalFull.
+func (j *Journal) AdmitRecords(ctx context.Context, sizes ...uint32) (*Admission, error) {
+	a := &Admission{}
+	var need int64
+	for _, size := range sizes {
+		room := int64(sectorAligned(size)) + int64(endRoom)
+		a.rooms = append(a.rooms, room)
+		need += room
+	}
+	if need > int64(j.region.DataAreaSize())-j.waitHeadroom() {
+		return nil, ErrJournalFull
+	}
 	started, warned := time.Now(), time.Now()
 	for {
 		j.mu.Lock()
-		if j.freeLocked()-j.waitHeadroom() < a.room {
+		if j.freeLocked()-j.waitHeadroom() < need {
 			_ = j.forceCheckpoint()
 		}
-		if j.freeLocked()-j.waitHeadroom() >= a.room {
-			j.admitted += a.room
+		if j.freeLocked()-j.waitHeadroom() >= need {
+			j.admitted += need
 			j.mu.Unlock()
 			return a, nil
 		}
@@ -439,12 +475,13 @@ func (j *Journal) freeLocked() int64 {
 	return int64(j.region.AvailableSpace()) - int64(endRoom)*int64(j.owed) - j.admitted
 }
 
-// CommitAdmitted commits txn like Commit, into the room a set aside.
+// CommitAdmitted commits txn like Commit, into the room a set aside for one record; with none left, it commits as
+// Commit does.
 func (j *Journal) CommitAdmitted(a *Admission, txn *Transaction) (uint64, error) {
 	return j.commit(txn, nil, a, false)
 }
 
-// Release gives back the room of an admission that committed nothing. It does nothing once the admission committed.
+// Release gives back the room of the records an admission did not commit.
 func (j *Journal) Release(a *Admission) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -452,11 +489,13 @@ func (j *Journal) Release(a *Admission) {
 }
 
 func (j *Journal) releaseLocked(a *Admission) {
-	if a == nil || a.done {
+	if a == nil || len(a.rooms) == 0 {
 		return
 	}
-	a.done = true
-	j.admitted -= a.room
+	for _, r := range a.rooms {
+		j.admitted -= r
+	}
+	a.rooms = nil
 	j.roomMayHaveFreedLocked()
 }
 
@@ -496,8 +535,8 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 	need := int64(sectorAligned(txn.TotalLength())) + int64(endRoom)
 	free := func() int64 {
 		switch {
-		case a != nil && !a.done:
-			return j.freeLocked() + a.room
+		case a != nil && len(a.rooms) > 0:
+			return j.freeLocked() + a.rooms[a.pick(need)]
 		case movesHead:
 			return j.freeLocked()
 		}
@@ -528,9 +567,8 @@ func (j *Journal) commit(txn *Transaction, build func(pending func(project uint3
 		return 0, fmt.Errorf("failed to write transaction: %w", err)
 	}
 	j.owed++
-	if a != nil && !a.done {
-		a.done = true
-		j.admitted -= a.room
+	if a != nil && len(a.rooms) > 0 {
+		j.admitted -= a.take(int64(sectorAligned(txn.TotalLength())) + int64(endRoom))
 	}
 
 	// Flush superblock with updated tail offset to disk

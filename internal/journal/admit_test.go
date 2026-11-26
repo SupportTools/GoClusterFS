@@ -117,3 +117,36 @@ func TestHeadMovingCommitFindsRoomInAFullRing(t *testing.T) {
 		t.Fatalf("renewal after other commits filled the ring: %v", err)
 	}
 }
+
+// An admission for several records sets all of their room aside at once: each finds its room after other commits
+// filled the ring, and a record past them commits as an unadmitted one would.
+func TestAdmitRecordsSetsAsideEveryRecord(t *testing.T) {
+	j := newTestJournal(t)
+	a, err := j.AdmitRecords(context.Background(), 512, 512, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillWithOpenIntents(t, j)
+	big := j.Begin()
+	if err := big.LogSymlinkTarget(&SymlinkTargetPayload{InodeNum: 1, Target: make([]byte, 6000)}); err != nil {
+		t.Fatal(err)
+	}
+	for i, txn := range []*Transaction{createTxn(t, j, 1), big, createTxn(t, j, 2)} {
+		if _, err := j.CommitAdmitted(a, txn); err != nil {
+			t.Fatalf("admitted record %d: %v", i, err)
+		}
+	}
+	if _, err := j.CommitAdmitted(a, createTxn(t, j, 3)); !errors.Is(err, ErrJournalFull) {
+		t.Errorf("a record past the admission's into a full ring = %v, want ErrJournalFull", err)
+	}
+}
+
+// Room that could never be free fails at once instead of waiting forever.
+func TestAdmitRecordsRefusesRoomThatCanNeverBeFree(t *testing.T) {
+	j := newTestJournal(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := j.AdmitRecords(ctx, j.region.DataAreaSize()); !errors.Is(err, ErrJournalFull) {
+		t.Errorf("AdmitRecords for the whole ring = %v, want ErrJournalFull at once", err)
+	}
+}

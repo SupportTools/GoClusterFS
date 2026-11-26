@@ -973,6 +973,35 @@ func (f *FS) commitAdmitted(a *journal.Admission, txn *journal.Transaction) (uin
 	return seq, err
 }
 
+type opRoomKey struct{}
+
+// admitOp waits until the journal has room for one record of up to each of sizes bytes, and returns ctx carrying it
+// for commit, with a release for the records the operation did not commit. Room frees only as open intents complete,
+// so call it holding no lock and no reserve block: on entry, before the operation takes any.
+func (f *FS) admitOp(ctx context.Context, sizes ...uint32) (context.Context, func()) {
+	if f.journal == nil {
+		return ctx, func() {}
+	}
+	a, err := f.journal.AdmitRecords(ctx, sizes...)
+	if err != nil {
+		return ctx, func() {}
+	}
+	return context.WithValue(ctx, opRoomKey{}, a), func() { f.journal.Release(a) }
+}
+
+// commit commits txn into room its operation set aside on entry, or without waiting once it has none left.
+func (f *FS) commit(ctx context.Context, txn *journal.Transaction) (uint64, error) {
+	a, _ := ctx.Value(opRoomKey{}).(*journal.Admission)
+	return f.journal.CommitAdmitted(a, txn)
+}
+
+// writeRecordBounds bounds the records a write of n bytes commits: its main record, with an extent per block it may
+// map, and the records of two allocation rounds, each naming the reserve blocks it used.
+func (f *FS) writeRecordBounds(n int) []uint32 {
+	blocks := uint32(uint64(n)/f.blockSize) + 2
+	return []uint32{1024 + 64*blocks, 512 + 8*blocks, 512 + 8*blocks}
+}
+
 // closeIntent completes an intent its operation left open by returning early, so a failed operation is never replayed.
 func (f *FS) closeIntent(seq uint64) {
 	if err := f.journal.CompleteIntent(seq); err != nil {
@@ -1820,8 +1849,14 @@ func (d *Dir) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 // removeEntry removes a file or empty directory.
 func (d *Dir) removeEntry(ctx context.Context, name string, isDir bool) syscall.Errno {
+	// Room for the removal's record and for freeing a file it leaves without a link or an opener.
+	ctx, release := d.fs.admitOp(ctx, uint32(len(name))+1024, freeRecordBound)
+	defer release()
 	return retryRace("Remove", name, func() syscall.Errno { return d.removeEntryOnce(ctx, name, isDir) })
 }
+
+// freeRecordBound bounds the record that frees an inode and the extents it maps, for a file that is not fragmented.
+const freeRecordBound = 4096
 
 // sameForRemoval reports whether cur still matches the removal's checks: a file's writes don't count, a directory's new entries do.
 func sameForRemoval(was, cur *inode.Inode) bool {
@@ -2000,7 +2035,7 @@ func (d *Dir) removeEntryOnce(ctx context.Context, name string, isDir bool) sysc
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
 		var commitErr error
-		intentSeq, commitErr = d.fs.commitWhenRoom(ctx, txn)
+		intentSeq, commitErr = d.fs.commit(ctx, txn)
 		if commitErr != nil {
 			return syscall.EIO
 		}
@@ -2337,7 +2372,8 @@ func (f *File) inodeForRead() (*inode.Inode, error) {
 // Write writes file data.
 // Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
-	ctx = detach(ctx)
+	ctx, release := f.fs.admitOp(detach(ctx), f.fs.writeRecordBounds(len(data))...)
+	defer release()
 	unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeExclusive)
 	if err != nil {
 		log.Printf("[ERROR] Write inode %d: %v", f.inodeNum, err)
@@ -2712,7 +2748,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 				return err
 			}
 			var err error
-			if seq, err = f.fs.journal.Commit(txn); err != nil {
+			if seq, err = f.fs.commit(ctx, txn); err != nil {
 				f.fs.journal.Abort(txn)
 			}
 			return err
@@ -2788,6 +2824,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			committedAllocs, committedCoW = len(allocatedExtents), len(cowDone)
 		}
 		releaseInodeLock()
+		// The inode on disk now maps the blocks the round's records named, so they end now, and a long write does not
+		// hold the journal's head back.
+		for _, seq := range intents {
+			f.fs.closeIntent(seq)
+		}
+		intents = nil
 		return nil
 	}
 	inodeWritten := false
@@ -3295,12 +3337,12 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		if len(reserveOut) > 0 {
 			commitErr = f.fs.reserve.Logged(reserveOut, func() error {
 				var err error
-				intentSeq, err = f.fs.journal.Commit(txn)
+				intentSeq, err = f.fs.commit(ctx, txn)
 				return err
 			})
 			reserveOut = nil
 		} else {
-			intentSeq, commitErr = f.fs.journal.Commit(txn)
+			intentSeq, commitErr = f.fs.commit(ctx, txn)
 		}
 		if commitErr != nil {
 			logging.Debugf("Write inode %d: journal commit failed: %v", f.inodeNum, commitErr)
@@ -3608,7 +3650,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 		}
 		// === COMMIT POINT ===
 		var commitErr error
-		intentSeq, commitErr = f.fs.journal.Commit(txn)
+		intentSeq, commitErr = f.fs.commit(ctx, txn)
 		if commitErr != nil {
 			f.fs.freeUnused(ctx, f.inodeNum, newBlock)
 			return commitErr
@@ -3648,6 +3690,10 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 func (f *File) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	ctx = detach(ctx)
 	if _, resizing := in.GetSize(); resizing {
+		// Room for the resize's record, and for a write's when it grows the file.
+		var release func()
+		ctx, release = f.fs.admitOp(ctx, freeRecordBound, f.fs.writeRecordBounds(0)[0])
+		defer release()
 		unlockIO, err := f.fs.lockFileIO(ctx, f.inodeNum, lock.LockModeExclusive)
 		if err != nil {
 			log.Printf("[ERROR] Setattr inode %d: %v", f.inodeNum, err)
@@ -3808,7 +3854,7 @@ func (f *File) setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn
 
 		// === COMMIT POINT: After this, operation is guaranteed recoverable ===
 		var commitErr error
-		intentSeq, commitErr = f.fs.journal.Commit(txn)
+		intentSeq, commitErr = f.fs.commit(ctx, txn)
 		if commitErr != nil {
 			return syscall.EIO, nil
 		}
