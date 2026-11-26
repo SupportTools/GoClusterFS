@@ -2415,6 +2415,59 @@ test_dir_fsync() {
 
 # Test: Hard links
 # A file linked on one VM reads through both names on the other; removing one name keeps the file.
+# A flock on one VM keeps the other out until the holder releases it; a waiter there then gets it. It also logs flock latency.
+test_flock_across_nodes() {
+    log_info "Testing flock across nodes..."
+    ensure_cluster_healthy 2
+
+    local mnt=/mnt/goclusterfs
+    ssh_run 1 "touch $mnt/flock_file"
+    ssh_run 1 "setsid -f flock -x $mnt/flock_file sleep 4 < /dev/null > /dev/null 2>&1"
+    sleep 1
+    if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
+        log_error "VM 2 took an exclusive flock that VM 1 holds"
+        return 1
+    fi
+    if ssh_run 2 "flock -n -s $mnt/flock_file true"; then
+        log_error "VM 2 took a shared flock next to VM 1's exclusive one"
+        return 1
+    fi
+    local start=$SECONDS
+    if ! ssh_run 2 "timeout 15 flock -x $mnt/flock_file true"; then
+        log_error "VM 2 did not get the flock within 15s of waiting, though VM 1 holds it for 4s"
+        return 1
+    fi
+    log_info "VM 2 waited $((SECONDS - start))s for the flock"
+
+    ssh_run 1 "setsid -f flock -s $mnt/flock_file sleep 3 < /dev/null > /dev/null 2>&1"
+    sleep 1
+    if ! ssh_run 2 "flock -n -s $mnt/flock_file true"; then
+        log_error "VM 2 could not share a flock with VM 1"
+        return 1
+    fi
+    if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
+        log_error "VM 2 took an exclusive flock next to VM 1's shared one"
+        return 1
+    fi
+    sleep 3
+
+    if ssh_run 1 "command -v python3" > /dev/null; then
+        log_info "Flock latency on VM 1, 200 uncontended exclusive flocks: $(ssh_run 1 "python3 -c '
+import fcntl, statistics, time
+f = open(\"$mnt/flock_file\")
+lock, unlock = [], []
+for _ in range(200):
+    t0 = time.perf_counter_ns(); fcntl.flock(f, fcntl.LOCK_EX); t1 = time.perf_counter_ns(); fcntl.flock(f, fcntl.LOCK_UN); t2 = time.perf_counter_ns()
+    lock.append((t1 - t0) / 1e3); unlock.append((t2 - t1) / 1e3)
+q = lambda xs, p: sorted(xs)[int(p * (len(xs) - 1))]
+print(\"lock p50 %.0f us p99 %.0f us, unlock p50 %.0f us p99 %.0f us\" % (q(lock, .5), q(lock, .99), q(unlock, .5), q(unlock, .99)))
+'")"
+    fi
+    ssh_run 1 "rm -f $mnt/flock_file"
+    log_success "Flock across nodes test passed"
+    return 0
+}
+
 test_hard_links() {
     log_info "Testing hard links..."
     ensure_cluster_healthy 2
@@ -6098,6 +6151,7 @@ main() {
     run_test "Delete Directory" test_delete_directory
     run_test "Directory Fsync" test_dir_fsync
     run_test "Hard Links" test_hard_links
+    run_test "Flock Across Nodes" test_flock_across_nodes
     run_test "Truncate File" test_truncate_file
     run_test "Append File" test_append_file
     run_test "Rename File" test_rename_file

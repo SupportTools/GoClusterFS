@@ -775,6 +775,51 @@ test_hard_links() {
     return 0
 }
 
+# A flock on one node keeps the other node out until the holder releases it; a waiter there then gets it.
+test_flock_across_nodes() {
+    log "Testing flock across nodes..."
+
+    local node="${NODE_ARRAY[0]}"
+    local other="${NODE_ARRAY[1]:-}"
+    local mnt=/mnt/goclusterfs
+    if [[ -z "$other" ]]; then
+        log "ERROR: needs two nodes"
+        return 1
+    fi
+    exec_on_node "$node" touch "$mnt/flock_file"
+    exec_on_node "$node" setsid -f flock -x "$mnt/flock_file" sleep 4
+    sleep 1
+    if exec_on_node "$other" flock -n -x "$mnt/flock_file" true; then
+        log "ERROR: $other took an exclusive flock that $node holds"
+        return 1
+    fi
+    if exec_on_node "$other" flock -n -s "$mnt/flock_file" true; then
+        log "ERROR: $other took a shared flock next to $node's exclusive one"
+        return 1
+    fi
+    local start=$SECONDS
+    if ! exec_on_node "$other" timeout 15 flock -x "$mnt/flock_file" true; then
+        log "ERROR: $other did not get the flock within 15s of waiting, though $node holds it for 4s"
+        return 1
+    fi
+    log "$other waited $((SECONDS - start))s for the flock"
+
+    exec_on_node "$node" setsid -f flock -s "$mnt/flock_file" sleep 3
+    sleep 1
+    if ! exec_on_node "$other" flock -n -s "$mnt/flock_file" true; then
+        log "ERROR: $other could not share a flock with $node"
+        return 1
+    fi
+    if exec_on_node "$other" flock -n -x "$mnt/flock_file" true; then
+        log "ERROR: $other took an exclusive flock next to $node's shared one"
+        return 1
+    fi
+    sleep 3
+    exec_on_node "$node" rm -f "$mnt/flock_file"
+    log "Flock across nodes test passed"
+    return 0
+}
+
 # With -allow-other, users other than root get what each file's mode bits give them, from any node.
 test_non_root_users() {
     log "Testing users other than root across nodes..."
@@ -4002,6 +4047,7 @@ run_test "Nested Directories" test_nested_directories
 run_test "Delete Directory" test_delete_directory
 run_test "Directory Fsync" test_dir_fsync
 run_test "Hard Links" test_hard_links
+run_test "Flock Across Nodes" test_flock_across_nodes
 run_test "Users Other Than Root" test_non_root_users
 run_test "Truncate File" test_truncate_file
 run_test "Append File" test_append_file

@@ -7562,3 +7562,35 @@ scenarios:
     priority: go_only
     environments:
       go: flock_test.go::TestKilledFlockWaiterExits
+
+  - id: flock-across-nodes
+    name: Flocks exclude each other across nodes
+    description: An exclusive flock on one node refuses exclusive and shared flocks on another until it is released, a waiter there then gets it, and shared flocks hold on both nodes together
+    priority: critical
+    environments:
+      go: flock_test.go::TestFlockExcludesAcrossNodes
+      docker: run-tests.sh::test_flock_across_nodes
+      vm: run-vm-tests.sh::test_flock_across_nodes
+
+  - id: flock-waiter-wakes-across-nodes
+    name: A flock waiter on another node wakes at the release
+    description: A blocking flock on one node returns once the holder on the other node unlocks, and then excludes the first node
+    priority: go_only  # the cross-node scenario's shell tests wait the same way
+    environments:
+      go: flock_test.go::TestFlockWaiterOnAnotherNodeWakesAtRelease
+
+  - id: flock-killed-waiter-across-nodes
+    name: A killed flock waiter exits while another node holds the flock
+    description: SIGKILL ends a process on one node blocked in flock for a flock the other node holds, and the holder keeps it
+    priority: go_only
+    environments:
+      go: flock_test.go::TestKilledFlockWaiterOnAnotherNodeExits
+
+  - id: flock-crashed-holder
+    name: A crashed node's flock moves to a waiter
+    description: A node holding an exclusive flock is killed; the waiter on the other node gets the flock once that node takes the dead one over
+    priority: high
+    environments:
+      go: flock_test.go::TestCrashedNodesFlockMovesToAWaiter
+      docker: TODO  # killing a container's mount is the Go test; the VM test cuts power
+      vm: TODO  # the power-cut test follows in its own change

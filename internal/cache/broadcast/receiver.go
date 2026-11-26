@@ -2,6 +2,7 @@ package broadcast
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -35,6 +36,7 @@ type Broadcaster struct {
 	sendMu sync.Mutex
 
 	onReturnReserves atomic.Pointer[func()]
+	onFlockChanged   atomic.Pointer[func(uint64)]
 	onOrphans        atomic.Pointer[func()]
 
 	sendersMu sync.Mutex
@@ -220,6 +222,11 @@ func (b *Broadcaster) handleMessage(msg *Message, addr *net.UDPAddr, viaMulticas
 		if fn := b.onOrphans.Load(); fn != nil {
 			(*fn)()
 		}
+
+	case TypeFlockChanged:
+		if fn := b.onFlockChanged.Load(); fn != nil && len(msg.Payload) == 8 {
+			(*fn)(binary.BigEndian.Uint64(msg.Payload))
+		}
 	}
 }
 
@@ -250,6 +257,21 @@ func (b *Broadcaster) BroadcastOrphans() {
 	}
 	if err := b.send(b.builder.Orphans); err != nil {
 		log.Printf("[broadcast] failed to send Orphans: %v", err)
+	}
+}
+
+// OnFlockChanged sets what runs, on the receive loop, when a peer's flock record changed; fn must not block.
+func (b *Broadcaster) OnFlockChanged(fn func(recordID uint64)) {
+	b.onFlockChanged.Store(&fn)
+}
+
+// A lost message only delays a flock waiter until its next poll.
+func (b *Broadcaster) BroadcastFlockChanged(recordID uint64) {
+	if !b.running.Load() {
+		return
+	}
+	if err := b.send(func() *Message { return b.builder.FlockChanged(recordID) }); err != nil {
+		log.Printf("[broadcast] failed to send FlockChanged: %v", err)
 	}
 }
 

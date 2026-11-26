@@ -35,6 +35,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `flock(2)` holds across nodes. A waiter on another node gets the flock when the holder releases it, and a crashed node's flocks pass to waiters once a live node takes it over. `fcntl(2)` locks still hold only on the node that takes them. See [File Locks](docs/OPERATIONS.md#file-locks) for the cost and the limits.
 - In a cgroup with a memory limit, such as a Kubernetes container, the mount sets Go's memory limit to 90% of it unless `GOMEMLIMIT` is set, so the garbage collector works harder before the limit kills the mount.
 
 - `GET` and `PUT /api/v1/quotas` read and set a directory's project quota, as the `trusted.goclusterfs.quota` attribute does, behind the API token and without CAP_SYS_ADMIN. `gfsctl quota get PATH` and `gfsctl quota set PATH --bytes N --inodes N` call them.
@@ -98,7 +99,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- The mount serves `flock(2)` on its files instead of the kernel, through a copy of go-fuse v2.9.0 with one patch (`third_party/README.md`). Flocks still hold only on one node. `/proc/locks` and `lslocks` no longer list them; fcntl locks stay in the kernel and still show there.
+- The mount serves `flock(2)` on its files instead of the kernel, through a copy of go-fuse v2.9.0 with one patch (`third_party/README.md`). `/proc/locks` and `lslocks` no longer list flocks; fcntl locks stay in the kernel and still show there.
 - Writes handle contiguous blocks as one run instead of block by block. An overwrite of blocks one extent maps takes one in-place check, one extent lock per megabyte and one device write; new blocks that follow each other on the device are written together; and a first write into `fallocate`d blocks clears the whole range it covers at once. At 8 KB blocks, a 512 MB overwrite with 128 KB writes went from 57 to 257 MB/s on a tmpfs-backed volume, the same as at 1 MB, and writing into a `fallocate`d 512 MB file from 43 to 456 MB/s.
 - `goclusterfs-fsck` tracks blocks in a bitset and one byte per block instead of maps. On a 100 GB volume at 8 KB blocks with 90 GB allocated, a check takes 3.2 s and 39 MB of memory instead of 23 s and 1.6 GB.
 - `statfs` (`df`) no longer reads the whole inode table on every call. It returns a free-inode count that this node's creates and removes adjust at once, and that a background scan refreshes once it is older than 30 times the last scan took, at least a second. Other nodes' creates and removes show up late by that much. At 16 KB per inode the table of a 100 GB volume is 1.6 GB. `statfs` also reads the block bitmap 1 MB at a time instead of 4 KB.

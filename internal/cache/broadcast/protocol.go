@@ -68,6 +68,9 @@ const (
 	// TypeUnicastRequest tells one peer that the sender misses its multicast, so the peer also sends to the
 	// sender's registry address. It carries sequence 0 and is not tracked, since only that peer gets it.
 	TypeUnicastRequest MessageType = 8
+
+	// TypeFlockChanged tells peers a flock record changed, so their waiters on it look again now.
+	TypeFlockChanged MessageType = 9
 )
 
 // String returns a human-readable message type name.
@@ -89,6 +92,8 @@ func (t MessageType) String() string {
 		return "Orphans"
 	case TypeUnicastRequest:
 		return "UnicastRequest"
+	case TypeFlockChanged:
+		return "FlockChanged"
 	default:
 		return fmt.Sprintf("Unknown(%d)", t)
 	}
@@ -437,6 +442,19 @@ func (b *MessageBuilder) ReturnReserves() *Message {
 		SenderUUID: b.senderUUID,
 		Sequence:   b.seqGen.Next(),
 		Timestamp:  time.Now().UnixNano(),
+	}
+}
+
+// FlockChanged creates a hint that flock record recordID changed.
+func (b *MessageBuilder) FlockChanged(recordID uint64) *Message {
+	return &Message{
+		Version:    ProtocolVersion,
+		Type:       TypeFlockChanged,
+		Flags:      FlagUrgent,
+		SenderUUID: b.senderUUID,
+		Sequence:   b.seqGen.Next(),
+		Timestamp:  time.Now().UnixNano(),
+		Payload:    binary.BigEndian.AppendUint64(nil, recordID),
 	}
 }
 

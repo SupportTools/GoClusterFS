@@ -267,7 +267,7 @@ func New(cfg *Config) (*FS, error) {
 		blockSize:  cfg.BlockSize,
 		uid:        uint32(os.Getuid()),
 		gid:        uint32(os.Getgid()),
-		flocks:     newFlockTable(nil),
+		flocks:     newFlockTable(clusterOf(lockMgr)),
 	}, nil
 }
 
@@ -309,7 +309,7 @@ func NewWithComponents(
 		blockSize:   extentMgr.BlockSize(),
 		uid:         uint32(os.Getuid()),
 		gid:         uint32(os.Getgid()),
-		flocks:      newFlockTable(nil),
+		flocks:      newFlockTable(clusterOf(lockMgr)),
 	}
 }
 

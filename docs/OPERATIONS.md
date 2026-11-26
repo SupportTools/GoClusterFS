@@ -341,7 +341,16 @@ A wait in `flock(2)` is the exception: a signal ends it, and the call restarts i
 
 ### File Locks
 
-`flock(2)` and `fcntl(2)` locks on GoClusterFS files hold only on the node that takes them. Two processes on different nodes can both hold an exclusive lock on one file, and neither gets an error, so coordinate writers on different nodes some other way. The mount serves flocks itself, so `/proc/locks` and `lslocks` do not list flocks on GoClusterFS files; they list fcntl locks as usual.
+`flock(2)` locks hold across nodes: an exclusive flock on one node keeps every process on every node out, and shared flocks hold together. `fcntl(2)` locks, OFD locks included, hold only on the node that takes them, so two processes on different nodes can both hold one and neither gets an error. SQLite's default locking uses fcntl locks, so do not share an SQLite database between nodes.
+
+- **Cost.** A flock no other node holds costs one 4 KB write and one 256 KB read of the lock region: FLOCK_LATENCY. Releasing it costs one 4 KB write. A flock this node already holds through another open file of the same file costs no I/O.
+- **Waits.** A waiter on another node gets the flock once the holder releases it: at once when the holder's UDP hint arrives, otherwise within about a second. A signal ends the wait, and the call restarts if the program's handler uses `SA_RESTART`, so a killed waiter exits at once.
+- **Node failure.** A crashed node's flocks pass to waiters once a live node takes it over, about 20 seconds after its last heartbeat. The takeover cuts the dead node off the storage, or the node stops writing once its heartbeat goes stale; neither stops the node's processes. Anything a process does outside the volume, such as calling an API or writing to another disk, is not protected once its flock moves to another node.
+- **Limits.**
+  - A node holds or waits for at most 254 flocks in each of the 16 flock lock records, and a flock past that fails with `ENOLCK`. Files spread over the records by inode number, so a node holds about 4,000 flocks before a record fills, fewer if they cluster.
+  - Of nodes that want one flock, the node in the lowest registry slot gets it first. Under steady contention a node in a higher slot can wait a long time.
+  - While one open file on a node waits for other nodes, the node's other open files of that file wait behind it, even for a shared flock another node could grant at once.
+  - The mount serves flocks itself, so `/proc/locks` and `lslocks` do not list flocks on GoClusterFS files; they list fcntl locks as usual.
 
 ### Distributed Lock Limits
 

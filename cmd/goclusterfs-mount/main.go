@@ -637,6 +637,8 @@ func main() {
 	gfs.SetDirectIO(*directIO)
 	nodeReg.SetOrphanHandler(gfs.LearnOrphans)
 	cacheMgr.OnOrphans(nodeReg.KickOrphans)
+	cacheMgr.OnFlockChanged(lockMgr.FlockChanged)
+	lockMgr.SetFlockHint(cacheMgr.BroadcastFlockChanged)
 	quotasSet := false
 	setUpQuotas := func() {
 		if quotasSet || sb.RequiredFlags&superblock.RequiredProjectQuotas == 0 {
@@ -831,6 +833,11 @@ func main() {
 	goclusterfs.ShutdownStep("orphan release", func() {
 		if err := gfs.ForgetSlot(context.Background(), slotIdx, nil); err != nil {
 			log.Printf("[WARN] letting go of unlinked files at unmount: %v; the next node in slot %d does it", err, slotIdx)
+		}
+	})
+	goclusterfs.ShutdownStep("flock release", func() {
+		if err := lockMgr.ReleaseFlocks(); err != nil {
+			log.Printf("[WARN] clearing this node's flocks at unmount: %v; peers ignore them once this node leaves slot %d", err, slotIdx)
 		}
 	})
 	goclusterfs.ShutdownStep("node registry stop", nodeReg.Stop)
