@@ -707,7 +707,7 @@ func main() {
 			DisableXAttrs: false,
 			AllowOther:    *allowOther,
 			// fcntl locks stay in the kernel and hold only on this node.
-			EnableFlockLocks: true,
+			ExtraCapabilities: fuse.CAP_FLOCK_LOCKS,
 		},
 		AttrTimeout:  attrTimeout,
 		EntryTimeout: attrTimeout,

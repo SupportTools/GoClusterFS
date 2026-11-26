@@ -68,7 +68,6 @@ An image file has no persistent reservations, so a second node joins it only wit
 | `internal/testnet` | Local ports for tests that their own traffic reaches, even on a Kubernetes node where kube-proxy answers NodePorts |
 | `internal/webui` | Serves the web dashboard under `/ui/`; embeds `make dashboard`'s build, or a placeholder page |
 | `web/dashboard` | React dashboard source (Vite, npm); `make dashboard` builds it into `internal/webui/build/dist` |
-| `third_party/go-fuse` | go-fuse v2.9.0 with one patch, `EnableFlockLocks`, so the kernel sends flock(2) to the mount and keeps fcntl locks; `third_party/README.md` lists the patch |
 
 ## On-Disk Layout
 

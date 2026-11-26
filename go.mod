@@ -2,7 +2,7 @@ module github.com/supporttools/GoClusterFS
 
 go 1.26.0
 
-require github.com/hanwen/go-fuse/v2 v2.9.0
+require github.com/hanwen/go-fuse/v2 v2.12.1
 
 require (
 	github.com/prometheus/client_golang v1.23.2
@@ -24,5 +24,3 @@ require (
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
-
-replace github.com/hanwen/go-fuse/v2 => ./third_party/go-fuse
