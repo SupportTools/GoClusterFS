@@ -27,25 +27,35 @@ var (
 // flock(2) locks, with fuse.MountOptions.EnableFlockLocks, and it drops a
 // flock at the last close of the open file that holds it.
 func (f *FS) RawFS(opts *fs.Options) fuse.RawFileSystem {
-	return &flockReleaser{RawFileSystem: fs.NewNodeFS(f, opts), flocks: f.flocks}
+	return &flockFS{RawFileSystem: fs.NewNodeFS(f, opts), flocks: f.flocks}
 }
 
-type flockReleaser struct {
+// flockFS names a flock's owner by the open file's handle, not by the kernel's
+// lock owner. That owner is the address of the kernel's struct file, which a
+// new open can reuse before the old one's RELEASE, sent in the background,
+// arrives. go-fuse frees a handle only in Release, after its flock is dropped.
+type flockFS struct {
 	fuse.RawFileSystem
 	flocks *flockTable
 }
 
-func (r *flockReleaser) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
-	if in.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK != 0 {
-		r.flocks.unlock(in.LockOwner)
-	}
+func (r *flockFS) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	in.Owner = in.Fh
+	return r.RawFileSystem.SetLk(cancel, in)
+}
+
+func (r *flockFS) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	in.Owner = in.Fh
+	return r.RawFileSystem.SetLkw(cancel, in)
+}
+
+func (r *flockFS) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
+	r.flocks.unlock(in.Fh)
 	r.RawFileSystem.Release(cancel, in)
 }
 
-func (r *flockReleaser) ReleaseDir(in *fuse.ReleaseIn) {
-	if in.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK != 0 {
-		r.flocks.unlock(in.LockOwner)
-	}
+func (r *flockFS) ReleaseDir(in *fuse.ReleaseIn) {
+	r.flocks.unlock(in.Fh)
 	r.RawFileSystem.ReleaseDir(in)
 }
 
@@ -88,7 +98,7 @@ func (f *FS) setDirFlock(ctx context.Context, num uint32, owner uint64, lk *fuse
 }
 
 // setFlock serves a flock(2) call, which the kernel sends as a lock on the
-// whole file with FUSE_LK_FLOCK set. owner names the open file description.
+// whole file with FUSE_LK_FLOCK set. owner is the open file's handle.
 func (f *FS) setFlock(ctx context.Context, key lock.FlockKey, owner uint64, lk *fuse.FileLock, flags uint32, wait bool) syscall.Errno {
 	if flags&fuse.FUSE_LK_FLOCK == 0 {
 		return syscall.ENOTSUP
@@ -111,8 +121,8 @@ type clusterFlocks interface {
 	Unflock(key lock.FlockKey) error
 }
 
-// flockTable serves flock(2) on this node. Each open file description, which
-// the kernel names by a lock owner, holds one mode on one inode. Owners on this
+// flockTable serves flock(2) on this node. Each open file, named by its FUSE
+// handle, holds one mode on one inode. Owners on this
 // node wait here for each other, and the node's cluster flock on an inode
 // follows the strongest mode its owners hold. Without a cluster, flocks hold
 // only on this node.
