@@ -10,7 +10,6 @@ WORKDIR /build
 
 # Copy go mod files first for layer caching
 COPY go.mod go.sum ./
-COPY third_party/go-fuse ./third_party/go-fuse
 RUN go mod download
 
 # Copy source code
