@@ -145,6 +145,8 @@ head -c 16 /dev/device | hexdump -C
 
 **Symptom**: Mount exits with `Cannot join the cluster: a live node maps locks to lock records differently from this build: node <host> in slot <n> (<uuid>) has lock layout <id>, this build <id>. ...`
 
+Next to a node of a build from before cluster-wide flock, the message reads `node <host> in slot <n> (<uuid>) runs a build whose flocks hold only on their own node (lock layout <id>, this build <id>); unmount every node of that build before mounting this one`.
+
 **Cause**: The named node runs another GoClusterFS version, and the two versions use lock records differently, so they would not lock each other out. Mount checks this before it takes a registry slot. A node whose heartbeat stays unchanged for about 20 seconds, such as one that crashed, does not count.
 
 **Solution**: Unmount the named node, then mount every node with one version.

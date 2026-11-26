@@ -346,6 +346,7 @@ func main() {
 		nodeReg.PreferSlot(*skipRecovery)
 	}
 	nodeReg.SetLockLayout(lock.LayoutID())
+	nodeReg.NameLockLayout(lock.PreFlockLayoutID(), "whose flocks hold only on their own node")
 	nodeReg.SetAdvertiseAddr(advertise)
 	slotIdx, err := nodeReg.Register(ctx, hostname)
 	if errors.Is(err, node.ErrLockLayout) {

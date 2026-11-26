@@ -136,7 +136,7 @@ func TestLocksDoNotWaitOnRecordsOfOtherTypes(t *testing.T) {
 	}()
 
 	for lt := LockType(0); int(lt) < numLockTypes; lt++ {
-		if lt == LockTypeInode {
+		if lt == LockTypeInode || lt == LockTypeFlock {
 			continue
 		}
 		for id := uint64(0); id < 64; id++ {
@@ -203,5 +203,8 @@ func TestAcquireRefusesUnknownLockType(t *testing.T) {
 	m := newTestNode(dev, 0, region, 1)
 	if err := acquireWithin(m, time.Second, LockType(numLockTypes), 1, LockModeExclusive); err == nil {
 		t.Fatal("Acquire of a lock type outside the record layout succeeded")
+	}
+	if err := acquireWithin(m, time.Second, LockTypeFlock, 1, LockModeExclusive); err == nil {
+		t.Fatal("Acquire of a flock record succeeded; its slots have their own format")
 	}
 }

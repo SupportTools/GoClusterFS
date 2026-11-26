@@ -113,6 +113,8 @@ const (
 	LockTypeInodeSector  LockType = 10
 	// LockTypeFileIO covers one file's data for a whole read or write request. It ranks before every other type.
 	LockTypeFileIO LockType = 11
+	// LockTypeFlock records hold flock(2) locks, in slots of their own format; Flock takes them, Acquire does not.
+	LockTypeFlock LockType = 12
 )
 
 // LockMode indicates shared (read) or exclusive (write) access.
@@ -174,6 +176,14 @@ type Manager struct {
 	slotWrite func(buf []byte, offset int64) (int, error)
 	// rowRead, when a test sets it, replaces the device read of a row.
 	rowRead func(buf []byte, offset int64) (int, error)
+	// flocks holds this node's entries in each flock record, as its slot there holds them.
+	flocks map[uint64]map[FlockKey]flockEntry
+	// flocksUnwritten holds flock records whose slot write failed; the watcher writes them again.
+	flocksUnwritten map[uint64]bool
+	// flockWake has a channel per flock record that FlockChanged closes to wake waiters.
+	flockWake map[uint64]chan struct{}
+	// flockHint tells peers a flock record changed.
+	flockHint func(recordID uint64)
 	// stopWatch and watchDone run the long-hold watcher between Start and Stop.
 	stopWatch, watchDone chan struct{}
 
@@ -223,6 +233,7 @@ var typeNames = [numLockTypes]string{
 	LockTypeExtent:       "extent",
 	LockTypeInodeSector:  "inode_sector",
 	LockTypeFileIO:       "file_io",
+	LockTypeFlock:        "flock",
 }
 
 type lockKey struct {
@@ -288,6 +299,8 @@ type timings struct {
 	// releaseRetry is how often the watcher clears again a slot whose release
 	// write failed. Other nodes wait for the record until it is cleared.
 	releaseRetry time.Duration
+	// flockPoll is how often a flock waiter rereads the slots in its way.
+	flockPoll time.Duration
 }
 
 func defaultTimings() timings {
@@ -301,6 +314,7 @@ func defaultTimings() timings {
 		tornExpiry:     StaleThreshold,
 		longHold:       time.Minute,
 		releaseRetry:   time.Second,
+		flockPoll:      FlockPoll,
 	}
 }
 
@@ -338,8 +352,12 @@ func NewManager(dev *storage.Device, offset, size uint64, nodeUUID [16]byte, nod
 		retrying:   make(map[uint64]int),
 		adopted:    make(map[uint64]map[int][16]byte),
 		unreleased: make(map[uint64]bool),
-		tornSince:  make(map[slotRef]tornSighting),
-		timing:     defaultTimings(),
+
+		flocks:          make(map[uint64]map[FlockKey]flockEntry),
+		flocksUnwritten: make(map[uint64]bool),
+		flockWake:       make(map[uint64]chan struct{}),
+		tornSince:       make(map[slotRef]tornSighting),
+		timing:          defaultTimings(),
 	}
 }
 
@@ -377,7 +395,7 @@ func (m *Manager) Stats() Stats {
 	return stats
 }
 
-const numLockTypes = int(LockTypeFileIO) + 1
+const numLockTypes = int(LockTypeFlock) + 1
 
 // layoutRows is how many records a volume's lock region has; typeRows divides them among the types.
 const layoutRows = 256
@@ -392,18 +410,32 @@ var typeRows = [numLockTypes]uint64{
 	LockTypeQuota:        1,
 	LockTypeBlockBitmap:  1,
 	LockTypeSFBContainer: 1,
-	LockTypeInode:        128,
+	LockTypeInode:        112,
 	LockTypeExtent:       65,
 	LockTypeInodeSector:  16,
 	LockTypeFileIO:       39,
+	LockTypeFlock:        16,
 }
+
+// preFlockRows is typeRows of the builds before flock records.
+var preFlockRows = []uint64{1, 1, 1, 1, 1, 1, 1, 1, 128, 65, 16, 39}
 
 // LayoutID identifies how lock keys map to records. Nodes whose IDs differ do
 // not exclude each other.
 func LayoutID() uint32 {
+	return layoutID(typeRows[:])
+}
+
+// PreFlockLayoutID is the LayoutID of the builds before flock records, whose
+// flocks hold only on their own node.
+func PreFlockLayoutID() uint32 {
+	return layoutID(preFlockRows)
+}
+
+func layoutID(rows []uint64) uint32 {
 	buf := binary.LittleEndian.AppendUint64(nil, layoutRows)
-	for _, rows := range typeRows {
-		buf = binary.LittleEndian.AppendUint64(buf, rows)
+	for _, n := range rows {
+		buf = binary.LittleEndian.AppendUint64(buf, n)
 	}
 	return storage.CRC32C(buf)
 }
@@ -528,8 +560,8 @@ func (m *Manager) AcquireAs(ctx context.Context, owner Owner, lockType LockType,
 }
 
 func (m *Manager) acquire(ctx context.Context, gid uint64, lockType LockType, resourceID uint64, mode LockMode) (err error) {
-	if int(lockType) >= numLockTypes {
-		return fmt.Errorf("lock: unknown lock type %d", lockType)
+	if int(lockType) >= numLockTypes || lockType == LockTypeFlock {
+		return fmt.Errorf("lock: Acquire cannot take lock type %d", lockType)
 	}
 	defer func() {
 		if err != nil {
