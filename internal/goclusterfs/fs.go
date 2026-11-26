@@ -999,7 +999,7 @@ func (f *FS) commit(ctx context.Context, txn *journal.Transaction) (uint64, erro
 // map, and the records of two allocation rounds, each naming the reserve blocks it used.
 func (f *FS) writeRecordBounds(n int) []uint32 {
 	blocks := uint32(uint64(n)/f.blockSize) + 2
-	return []uint32{1024 + 64*blocks, 512 + 8*blocks, 512 + 8*blocks}
+	return []uint32{1024 + 64*blocks, 512 + 12*blocks, 512 + 12*blocks}
 }
 
 // closeIntent completes an intent its operation left open by returning early, so a failed operation is never replayed.
@@ -3649,6 +3649,7 @@ func (f *File) migrateToExtent(ctx context.Context, ino *inode.Inode) error {
 			return err
 		}
 		// === COMMIT POINT ===
+		// Inside a write this takes one of the write's admitted rooms, so its main record may commit unadmitted.
 		var commitErr error
 		intentSeq, commitErr = f.fs.commit(ctx, txn)
 		if commitErr != nil {
