@@ -66,7 +66,7 @@ func (f *FS) symlink(ctx context.Context, parent *fs.Inode, parentNum uint32, ta
 		return nil, syscall.ENAMETOOLONG
 	}
 	var node *fs.Inode
-	errno := retryRace("Symlink", name, func() (errno syscall.Errno) {
+	errno := untilClaimed(ctx, "Symlink", name, func() (errno syscall.Errno) {
 		node, errno = f.symlinkOnce(ctx, parent, parentNum, []byte(target), name, out)
 		return errno
 	})

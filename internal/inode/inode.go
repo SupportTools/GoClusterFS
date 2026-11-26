@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"math/bits"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -175,6 +176,8 @@ type Table struct {
 	// yet, which it skips so that local creators racing for a slot each get their own.
 	findMu    sync.Mutex
 	handedOut map[uint32]struct{}
+	// randomSlot picks where FindFreeSlot reads next after another node claimed a slot it found, below n.
+	randomSlot func(n uint64) uint64
 	// restartEvery is how often FindFreeSlot reads from scanStart again, to reuse inodes other nodes freed.
 	restartEvery time.Duration
 	restarted    atomic.Int64
@@ -225,6 +228,7 @@ func NewTable(dev *storage.Device, offset, size uint64, lockMgr *lock.Manager, n
 		nodeUUID:    nodeUUID,
 		syncDevice:  dev.Sync,
 		handedOut:   map[uint32]struct{}{},
+		randomSlot:  rand.Uint64N,
 
 		restartEvery: time.Minute,
 	}
@@ -554,7 +558,16 @@ func (t *Table) claimSlot(ctx context.Context, num uint32, ok func(free *Inode) 
 		claimed, err = t.claimSlotOnce(ctx, num, ok, init)
 		return err
 	})
+	if errors.Is(err, ErrInodeInUse) {
+		t.moveAway()
+	}
 	return claimed, err
+}
+
+// moveAway sends FindFreeSlot to a random part of the table. Another node claimed a slot this node found free, so both
+// were scanning the same free inodes, and the one behind would keep finding the other's next slot.
+func (t *Table) moveAway() {
+	t.resume.Store(uint64(InodeFirstUsable) + t.randomSlot(t.totalInodes-uint64(InodeFirstUsable)))
 }
 
 func (t *Table) claimSlotOnce(ctx context.Context, num uint32, ok func(free *Inode) bool, init func(*Inode)) (*Inode, error) {
