@@ -28,16 +28,16 @@ This guide covers deploying GoClusterFS in both single-node and multi-node clust
 
 ### Software Requirements
 
-- **Operating System**: Linux (kernel 4.x or later)
+- **Operating System**: Linux 4.5 or later, which added the persistent reservation ioctls that fencing uses. With `-allow-other`, use 6.0 or later
 - **Go**: Version 1.26 or later (for building from source)
 - **FUSE**: `fuse3` package with `fusermount3` utility
 
 ```bash
 # Debian/Ubuntu
-apt-get install fuse3 build-essential
+apt-get install fuse3 make
 
 # RHEL/CentOS/Fedora
-dnf install fuse3 fuse3-devel gcc make
+dnf install fuse3 make
 
 # Verify FUSE is available
 fusermount3 --version
@@ -45,26 +45,18 @@ fusermount3 --version
 
 ### Permissions
 
-GoClusterFS requires either:
-- Root access, OR
-- Membership in the `fuse` group
+Run `goclusterfs-mount` as root. A user other than root needs read and write access to `/dev/fuse` and to the device, and a setuid-root `fusermount3`; `-preflight` checks these. On a fenced volume, Linux before 6.5 lets only root register a reservation key, so run cluster nodes as root.
 
-```bash
-# Add user to fuse group
-sudo usermod -aG fuse $USER
-
-# Re-login or use newgrp
-newgrp fuse
-```
+The build needs no C compiler or FUSE headers.
 
 ### Network Requirements (Multi-Node)
 
 | Requirement | Details |
 |-------------|---------|
-| Connectivity | All nodes on same L2 network segment |
+| Connectivity | Multicast reaches only the local subnet. Nodes on other subnets reach each other by unicast, so open UDP 24731 between them |
 | Multicast | UDP multicast between nodes where the network routes it. Where it does not, as in AWS, Azure and GCP VPCs, nodes ask each other for unicast at the address in each node's registry slot, after 3 silent `-broadcast-heartbeat` intervals. Set `-advertise-addr` when peers cannot reach the address a node picks by default, such as behind NAT. |
 | Ports | UDP 24730 (multicast) and UDP 24731 (unicast), set with `-mcast-port` and `-unicast-port`. TCP 8080 on loopback for the HTTP API; open it only if you expose the API. On a Kubernetes node, keep all three below 30000: kube-proxy sends local traffic to ports in its NodePort range (30000-32767 by default) to its services. `-preflight` warns about it |
-| Several mounts per host | Each mount on a host needs its own `-unicast-port` and `-api-addr`. Mounts of different volumes also need their own `-mcast-group` or `-mcast-port` |
+| Several mounts per host | Each mount on a host needs its own `-unicast-port` and `-api-addr`. Mounts of different volumes also need their own `-mcast-group` or `-mcast-port`. A host can mount a fenced volume only once |
 | Several clusters per LAN | Give each cluster its own `-mcast-group`, or set `-broadcast-secret`; otherwise clusters receive each other's invalidations and peer announcements |
 | Latency | < 10ms between nodes recommended |
 
@@ -97,13 +89,13 @@ sudo cp goclusterfs-mount goclusterfs-fsck gfsctl /usr/local/bin/
 ./gfsctl version
 ```
 
-`make build` reports version `dev`. Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives, with the version set and the dashboard included, on the GitHub Releases page. Run the same version on every node: builds from before [#85](https://github.com/SupportTools/GoClusterFS/pull/85) refuse volumes formatted by later builds with `unknown required flags 0x10`, builds from before file I/O locks with `0x40`, and later builds refuse their volumes. Mount also refuses to join while a live node runs a build that uses lock records differently, and names that node.
+`make build` reports version `dev`. Each `v*` tag publishes prebuilt `linux/amd64` and `linux/arm64` archives, with the version set and the dashboard included, on the GitHub Releases page. Run the same version on every node, and stop every node before you upgrade. Older builds refuse volumes that newer builds formatted or mounted, with `unknown required flags 0x...`. The first mount of a new build can set a flag that older builds and their fsck then refuse for good. Mount also refuses to join while a live node runs a build that uses lock records differently, and names that node.
 
 ---
 
 ## Block Device Setup
 
-GoClusterFS can use any O_DIRECT-capable block device of at least 327 MB. The layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records.
+GoClusterFS can use any O_DIRECT-capable block device of at least 329 MB. The layout reserves 256 MB for 64 node journals of 4 MB and 64 MB for lock records, and the quota table and root directory take the first data blocks.
 
 ### Option 1: File-Backed Device (Development/Testing)
 
@@ -138,8 +130,8 @@ For multi-node deployments, use shared storage with SCSI-3 persistent reservatio
 iscsiadm -m discovery -t st -p <iscsi-target-ip>
 iscsiadm -m node -T <iqn> -p <ip> --login
 
-# Device appears as /dev/sdX
-# Use multipath for redundancy
+# Mount the LUN through dm-multipath, even with one path: an iSCSI logout
+# deletes a plain /dev/sdX, and the mount on it stops
 multipath -ll
 # Use /dev/mapper/mpathX
 ```
@@ -175,7 +167,7 @@ mkdir -p /mnt/goclusterfs
 
 Press Ctrl+C or run `fusermount3 -u /mnt/goclusterfs` to unmount. Never pass `-format` again on a device that holds data, and never while another node has it mounted.
 
-The block size is fixed at 1 MB. `-format` creates one inode per `-bytes-per-inode` bytes of device (default 1 MB), between 4096 and 16,777,216, and the count cannot change later. The block bitmap, refcount table and inode table are sized from the device, so a 1 GB image holds 698 data blocks.
+`-format -block-size` sets the data block size, a power of two from 8 KB to 1 MB; the default is 1 MB, and it cannot change later. Use 8192 for many small files, 65536 for mixed files, and 1048576 for VM disks and large files. `-format` creates one inode per `-bytes-per-inode` bytes of device: by default one per block at 1 MB blocks, and max(2 × block size, 16 KB) below that. The inode count is between 4096 and 16,777,216 and cannot change later. The block bitmap, refcount table and inode table are sized from the device, so at 1 MB blocks a 1 GB image holds 698 data blocks. `-format` also creates the project quota table; a volume formatted by an older build gets it with `goclusterfs-fsck -enable-quotas` while every node is stopped, and builds without quotas then refuse the volume.
 
 ### Verify Format
 
@@ -219,9 +211,13 @@ Requires=local-fs.target
 
 [Service]
 Type=simple
+# A mount that stopped on an error leaves a dead FUSE mount, and a restart cannot mount over it
+ExecStartPre=-/usr/bin/fusermount3 -uz /mnt/goclusterfs
 ExecStart=/usr/local/bin/goclusterfs-mount \
     -device /dev/vg_data/goclusterfs \
     -mount /mnt/goclusterfs
+# The mount does not notify systemd, so wait until the filesystem is mounted before the unit counts as started
+ExecStartPost=/bin/sh -c 'until mountpoint -q /mnt/goclusterfs; do sleep 1; done'
 ExecStop=/usr/bin/fusermount3 -u /mnt/goclusterfs
 Restart=on-failure
 RestartSec=5
@@ -278,26 +274,27 @@ udevadm info --query=all --name=/dev/mapper/shared_lun | grep SERIAL
 
 ### Step 2: Format (Once, from Any Node)
 
-Format on one node while no other node has the device mounted, then unmount:
+Format the whole disk, not a partition, on one node while no other node has the device mounted, then unmount. Pass `-fencing=pr`: if the device cannot fence, the format fails instead of making a volume that only one node can mount.
 
 ```bash
-./goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster -format
+./goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster -format -fencing=pr
 # In another shell, once it has mounted:
 fusermount3 -u /mnt/cluster
 ```
 
 ### Step 3: Mount on All Nodes
 
-Use identical mount options and the same GoClusterFS version on all nodes:
+Use the same GoClusterFS version, `-mcast-group`, `-mcast-port` and `-broadcast-secret` on every node. Give every host its own hostname: a mount treats a stopped slot under its hostname as its own and takes it back. Pass `-require-fencing`, so a node refuses a volume that was formatted without fencing:
 
 ```bash
 ./goclusterfs-mount -device /dev/mapper/shared_lun -mount /mnt/cluster \
+    -require-fencing \
     -mcast-group 239.192.74.75 \
     -mcast-port 24730 \
     -broadcast-secret "your-shared-secret"
 ```
 
-Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) first. Nodes must not stall, and storage must fail I/O rather than queue it.
+`-preflight` checks FUSE, O_DIRECT on the device, the mount point and the ports without changing anything; run it on each new node first. Read [Node Requirements](OPERATIONS.md#node-requirements) and [Distributed Lock Limits](OPERATIONS.md#distributed-lock-limits) first. Nodes must not stall, and storage must fail I/O rather than queue it. The storage target must keep its reservations across a restart (APTPL); see [Storage Fencing](OPERATIONS.md#storage-fencing). Only `flock(2)` locks hold across nodes: `fcntl` locks hold only on their own node, so don't share a SQLite database between nodes.
 
 ### Step 4: Verify Cluster Communication
 
@@ -344,9 +341,12 @@ Wants=iscsi.service multipathd.service
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 5
+# A mount that stopped on an error leaves a dead FUSE mount, and a restart cannot mount over it
+ExecStartPre=-/usr/bin/fusermount3 -uz /mnt/cluster
 ExecStart=/usr/local/bin/goclusterfs-mount \
     -device /dev/mapper/shared_lun \
     -mount /mnt/cluster \
+    -require-fencing \
     -mcast-group 239.192.74.75 \
     -mcast-port 24730 \
     -broadcast-secret "${GOCLUSTERFS_SECRET}"
@@ -354,7 +354,9 @@ ExecStop=/usr/bin/fusermount3 -u /mnt/cluster
 Restart=on-failure
 RestartSec=10
 EnvironmentFile=-/etc/default/goclusterfs
-# A mount after a crash or reboot of this host can wait about 30s for a peer to take over the earlier mount
+# The mount does not notify systemd, so wait until the filesystem is mounted before the unit counts as started.
+# A mount after a crash or reboot of this host can wait 20 to 30 seconds before it joins.
+ExecStartPost=/bin/sh -c 'until mountpoint -q /mnt/cluster; do sleep 1; done'
 TimeoutStartSec=120
 
 [Install]
@@ -395,7 +397,7 @@ For workloads where every node must see other nodes' changes as soon as possible
 
 ### High Performance
 
-For read-heavy workloads where open files may see other nodes' changes up to 30 seconds late:
+For read-heavy workloads. When a broadcast message is lost, another node's change can take up to 30 seconds to show:
 
 ```bash
 ./goclusterfs-mount -device /dev/device -mount /mnt/fs \
@@ -405,7 +407,7 @@ For read-heavy workloads where open files may see other nodes' changes up to 30 
 
 ### Minimal (Testing/Development)
 
-Disable optional features for debugging, on a single node only. `-journal=false` gives no crash consistency and skips replay of this node's journal slot:
+Disable optional features for debugging, on a single node only. `-journal=false` gives no crash consistency for this node's own writes; the mount still replays the journal in its registry slot, and only `-skip-recovery` discards it:
 
 ```bash
 ./goclusterfs-mount -device /dev/device -mount /mnt/fs \
@@ -438,10 +440,10 @@ Mount logs a `WARNING` line at startup when broadcast is on without a secret.
 
 ### HTTP API Access
 
-The API listens on `127.0.0.1:8080` by default. A token turns on the snapshot, clone and admin endpoints and is required for any address other hosts can reach. Keep it in a file only the mount's user can read:
+The API listens on `127.0.0.1:8080` by default. A token turns on the snapshot, clone, quota and admin endpoints, and is required for any address other hosts can reach. Once a token is set, every `/api/v1` request needs it, so set `GFSCTL_TOKEN` for gfsctl. `/health`, `/metrics` and `/ui/` answer without a token, to anyone who can reach the port. Keep the token in a file that belongs to the mount's user or root, and that only that user can read:
 
 ```bash
-install -m 600 /dev/null /etc/goclusterfs/api-token
+install -D -m 600 /dev/null /etc/goclusterfs/api-token
 openssl rand -hex 32 > /etc/goclusterfs/api-token
 ./goclusterfs-mount ... -api-addr :8080 -api-token-file /etc/goclusterfs/api-token
 ```
