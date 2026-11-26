@@ -298,6 +298,7 @@ func TestFindFreeSlotAfterAReleaseOrALostClaim(t *testing.T) {
 	ctx := context.Background()
 	a := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{1})
 	b := NewTable(dev, 0, 64*InodeSize, nil, [16]byte{2})
+	a.randomSlot = func(uint64) uint64 { return 0 }
 
 	first, err := a.FindFreeSlot()
 	if err != nil {
