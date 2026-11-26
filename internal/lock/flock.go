@@ -364,12 +364,14 @@ func (m *Manager) claimFlock(recordID uint64, key FlockKey, mode LockMode, wait 
 		if err := m.writeFlocks(recordID, entries); err != nil {
 			return false, nil, err
 		}
+		m.sendFlockHint(recordID)
 		return false, nil, ErrWouldBlock
 	case lower:
 		entries[key] = flockEntry{mode: mode, waiting: true}
 		if err := m.writeFlocks(recordID, entries); err != nil {
 			return false, nil, err
 		}
+		m.sendFlockHint(recordID)
 	}
 	return false, blockers, nil
 }
@@ -451,7 +453,7 @@ func (m *Manager) awaitFlock(ctx context.Context, recordID uint64, key FlockKey,
 }
 
 // clearFlockSlot clears slot's entries in a flock record, unless the slot is
-// this node's and holds entries it keeps. Callers hold the gate.
+// this node's and holds entries it keeps, and hints peers. Callers hold the gate.
 func (m *Manager) clearFlockSlot(recordID uint64, slot int) error {
 	m.mu.Lock()
 	kept := slot == m.nodeSlot && len(m.flocks[recordID]) > 0
@@ -467,5 +469,9 @@ func (m *Manager) clearFlockSlot(recordID uint64, slot int) error {
 	if isZeroSlot(buf.Bytes()) {
 		return nil
 	}
-	return m.writeSlot(recordID, slot, nil)
+	if err := m.writeSlot(recordID, slot, nil); err != nil {
+		return err
+	}
+	m.sendFlockHint(recordID)
+	return nil
 }

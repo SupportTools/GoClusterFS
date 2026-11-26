@@ -544,3 +544,45 @@ func TestDowngradeWhoseWriteFailsKeepsTheFlock(t *testing.T) {
 		t.Fatalf("shared flock after the retry wrote the downgrade = %v", err)
 	}
 }
+
+// A higher slot that backs off from a lower slot's claim hints, so the lower one claims before its next poll.
+func TestBackingOffFromALowerClaimWakesIt(t *testing.T) {
+	nodes, _ := flockNodes(t, 2)
+	low, high := nodes[0], nodes[1]
+	setTimings(func(tm *timings) { tm.flockPoll = time.Hour }, low, high)
+	high.SetFlockHint(low.FlockChanged)
+	key := FlockKey{Inode: 5, Birth: 1}
+	record, _ := low.flockRecord(key)
+
+	gate := high.recordGate(record)
+	gate.Lock()
+	err := high.writeFlocks(record, map[FlockKey]flockEntry{key: {mode: LockModeExclusive}})
+	gate.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := flockInBackground(low, key, LockModeExclusive)
+	requireFlockWaiting(t, result, 200*time.Millisecond)
+	if won, _, err := high.claimFlock(record, key, LockModeExclusive, true); err != nil || won {
+		t.Fatalf("higher claim next to a lower one = won %v, %v; want a wait", won, err)
+	}
+	requireFlocked(t, result, 2*time.Second)
+}
+
+func TestTakeoverOfADeadHolderWakesItsWaiters(t *testing.T) {
+	nodes, reg := flockNodes(t, 3)
+	dead, waiter, survivor := nodes[0], nodes[1], nodes[2]
+	setTimings(func(tm *timings) { tm.flockPoll = time.Hour }, dead, waiter, survivor)
+	survivor.SetFlockHint(waiter.FlockChanged)
+	key := FlockKey{Inode: 5, Birth: 1}
+	if err := dead.Flock(context.Background(), key, LockModeExclusive, true); err != nil {
+		t.Fatal(err)
+	}
+	result := flockInBackground(waiter, key, LockModeExclusive)
+	requireFlockWaiting(t, result, 200*time.Millisecond)
+	reg.set(dead.nodeSlot, OwnerRecovering)
+	if _, err := survivor.AdoptOwner(dead.nodeUUID, dead.nodeSlot); err != nil {
+		t.Fatal(err)
+	}
+	requireFlocked(t, result, 2*time.Second)
+}
