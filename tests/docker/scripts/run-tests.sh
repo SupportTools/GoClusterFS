@@ -787,19 +787,24 @@ test_flock_across_nodes() {
         return 1
     fi
     exec_on_node "$node" touch "$mnt/flock_file"
-    # The holder touches a marker once it holds the flock: a flock may first wait for the other node's last release.
+    # The holder touches a marker once it holds the flock, which may first wait for the other node's last release,
+    # and holds it until the test touches /tmp/flock_release, or for 60s at most.
     hold_flock() {
-        exec_on_node "$node" rm -f /tmp/flock_held
-        exec_on_node "$node" setsid -f flock "$1" "$mnt/flock_file" sh -c "touch /tmp/flock_held; sleep $2"
+        exec_on_node "$node" rm -f /tmp/flock_held /tmp/flock_release
+        exec_on_node "$node" setsid -f flock "$1" "$mnt/flock_file" sh -c \
+            'touch /tmp/flock_held; i=0; while [ ! -e /tmp/flock_release ] && [ $i -lt 300 ]; do sleep 0.2; i=$((i+1)); done'
+        wait_for_file "$node" /tmp/flock_held || { log "ERROR: $node did not get its $1 flock within 10s"; return 1; }
+    }
+    wait_for_file() {
         local i
         for i in $(seq 50); do
-            exec_on_node "$node" test -e /tmp/flock_held && return 0
+            exec_on_node "$1" test -e "$2" && return 0
             sleep 0.2
         done
-        log "ERROR: $node did not get its $1 flock within 10s"
         return 1
     }
-    hold_flock -x 4 || return 1
+
+    hold_flock -x || return 1
     if exec_on_node "$other" flock -n -x "$mnt/flock_file" true; then
         log "ERROR: $other took an exclusive flock that $node holds"
         return 1
@@ -808,14 +813,22 @@ test_flock_across_nodes() {
         log "ERROR: $other took a shared flock next to $node's exclusive one"
         return 1
     fi
-    local start=$SECONDS
-    if ! exec_on_node "$other" timeout 15 flock -x "$mnt/flock_file" true; then
-        log "ERROR: $other did not get the flock within 15s of waiting, though $node holds it for 4s"
+    exec_on_node "$other" rm -f /tmp/flock_got
+    exec_on_node "$other" setsid -f sh -c "flock -x $mnt/flock_file true && touch /tmp/flock_got"
+    sleep 1
+    if exec_on_node "$other" test -e /tmp/flock_got; then
+        log "ERROR: $other's waiter got the flock while $node holds it"
         return 1
     fi
-    log "$other waited $((SECONDS - start))s for the flock"
+    local start=$SECONDS
+    exec_on_node "$node" touch /tmp/flock_release
+    if ! wait_for_file "$other" /tmp/flock_got; then
+        log "ERROR: $other's waiter did not get the flock within 10s of $node releasing it"
+        return 1
+    fi
+    log "$other got the flock $((SECONDS - start))s after $node released it"
 
-    hold_flock -s 3 || return 1
+    hold_flock -s || return 1
     if ! exec_on_node "$other" flock -n -s "$mnt/flock_file" true; then
         log "ERROR: $other could not share a flock with $node"
         return 1
@@ -824,7 +837,7 @@ test_flock_across_nodes() {
         log "ERROR: $other took an exclusive flock next to $node's shared one"
         return 1
     fi
-    sleep 3
+    exec_on_node "$node" touch /tmp/flock_release
     exec_on_node "$node" rm -f "$mnt/flock_file"
     log "Flock across nodes test passed"
     return 0
