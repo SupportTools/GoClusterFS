@@ -123,6 +123,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Hundreds of threads creating files at once filled the 4 MB journal with open intents, and creates, mkdirs, links, symlinks and unlinks then failed with EIO, logging "journal is full". These operations now wait for room in the journal before they take any lock, and the journal keeps room for every open intent's end, so a finished operation's end always fits. Writes, truncates and renames don't wait yet: they still fail with EIO if the journal stays full, which takes far more concurrency.
 - With `-trim` on, the default, a freed block could be allocated and written again before its discard ran, up to 5 seconds later, and the discard then erased the new data, on devices that support discard. TRIM now discards only blocks that are still free.
 - Two nodes writing files whose inodes share one 4 KB sector of the inode table could undo each other's inode writes, and a file then lost its size and the blocks it mapped.
 - Cache broadcast never started with the default flags: the unicast socket tried to bind the multicast port, the mount only logged a warning, and peers saw changes only after `-cache-ttl`. Unicast now has its own port, `-unicast-port`.

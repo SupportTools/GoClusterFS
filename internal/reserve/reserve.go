@@ -35,6 +35,7 @@ type Bitmap interface {
 type Journal interface {
 	Begin() *journal.Transaction
 	Commit(txn *journal.Transaction) (uint64, error)
+	CommitMovingHead(txn *journal.Transaction) (uint64, error)
 	Abort(txn *journal.Transaction)
 	CompleteIntentDurable(seq uint64) error
 	IntentLag(seq uint64) (lag, size uint32, ok bool)
@@ -255,7 +256,7 @@ func (m *Manager) Refresh(ctx context.Context) {
 		blocks = append(blocks, bs...)
 	}
 	if len(blocks) > 0 {
-		seq, err := m.commitRecord(blocks)
+		seq, err := m.commitRecord(blocks, true)
 		if err != nil {
 			log.Printf("[reserve] renewing %d reserved blocks failed: %v", len(blocks), err)
 			for r, bs := range moved {
@@ -377,7 +378,7 @@ func (m *Manager) refill(ctx context.Context) bool {
 	var seq uint64
 	var recordErr, endErr error
 	blocks, err := m.bm.Reserve(ctx, n, func(picked []uint64) bool {
-		seq, recordErr = m.commitRecord(picked)
+		seq, recordErr = m.commitRecord(picked, false)
 		return !errors.Is(recordErr, journal.ErrJournalFull)
 	}, func() error {
 		if endErr = recordErr; endErr == nil {
@@ -608,13 +609,18 @@ func (m *Manager) refreshCounts() {
 	}
 }
 
-func (m *Manager) commitRecord(blocks []uint64) (uint64, error) {
+// commitRecord logs blocks as a new batch. A renewal lets the head move past the old batches it replaces.
+func (m *Manager) commitRecord(blocks []uint64, renewal bool) (uint64, error) {
 	txn := m.j.Begin()
 	if err := txn.LogBlockReserve(blocks); err != nil {
 		m.j.Abort(txn)
 		return 0, err
 	}
-	seq, err := m.j.Commit(txn)
+	commit := m.j.Commit
+	if renewal {
+		commit = m.j.CommitMovingHead
+	}
+	seq, err := commit(txn)
 	if err != nil {
 		m.j.Abort(txn)
 	}

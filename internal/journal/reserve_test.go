@@ -208,9 +208,9 @@ func TestCompleteIntentDurableRetriesAfterFailure(t *testing.T) {
 	}
 }
 
-// A reserve record that is the oldest intent in a ring too full for a completion
-// record still ends: the head moves past it, replay no longer frees its blocks,
-// and commits work again.
+// A reserve record that holds back the head of a full ring still ends, since its
+// completion has room set aside: replay no longer frees its blocks, and commits
+// work again.
 func TestCompleteIntentDurableEndsOldestIntentInFullRing(t *testing.T) {
 	r := newReserveJournal(t)
 	j := r.j
@@ -272,11 +272,9 @@ func fillRingBehindReserve(t *testing.T, r *reserveJournal) uint64 {
 	}
 }
 
-// When moving the head past a full ring's oldest intent fails after the head
-// moved in memory, the intent does not come back as pending, so the next
-// checkpoint stays consistent and replay still runs every pending intent. A
-// retry then writes the moved head before it reports the record ended.
-func TestFailedHeadMoveKeepsReplayWhole(t *testing.T) {
+// An end the device refuses keeps the record pending, so replay still frees its blocks after a crash, and a retry
+// ends it.
+func TestRefusedEndKeepsTheRecordForReplay(t *testing.T) {
 	r := newReserveJournal(t)
 	j := r.j
 	reserveSeq := fillRingBehindReserve(t, r)
@@ -286,24 +284,15 @@ func TestFailedHeadMoveKeepsReplayWhole(t *testing.T) {
 	if err == nil {
 		t.Fatal("ending the record succeeded although no write could reach the disk")
 	}
-
-	pending := commitIntents(t, j, true, false)[1]
-	if _, err := j.Checkpoint(); err != nil {
-		t.Fatal(err)
+	if _, _, pending := j.IntentLag(reserveSeq); !pending {
+		t.Error("the record is no longer pending after its end was refused")
 	}
-	if got := replayedAfterCrash(t, j); !slices.Contains(got, pending) {
-		t.Fatalf("replay after a crash ran %v and skipped the pending intent %d", got, pending)
+	if got := r.unused(); len(got) == 0 {
+		t.Error("replay after the refused end would not free the record's unused blocks")
 	}
 
 	if err := j.CompleteIntentDurable(reserveSeq); err != nil {
 		t.Fatalf("retrying the end: %v", err)
-	}
-	onDisk, err := OpenRegionForRecovery(j.region.dev, j.region.regionOffset, j.region.regionSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := onDisk.Superblock().HeadOffset, j.region.HeadOffset(); got != want {
-		t.Errorf("head on disk %d after the retried end, want %d", got, want)
 	}
 	if got := r.unused(); len(got) != 0 {
 		t.Errorf("replay would free %v of the ended record", got)

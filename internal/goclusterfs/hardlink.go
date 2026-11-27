@@ -83,7 +83,7 @@ func (f *FS) addLink(ctx context.Context, parentNum uint32, file *File, name str
 	}
 
 	if f.journal != nil {
-		seq, err := f.logLink(num, ino.MetaGeneration, parentNum, name)
+		seq, err := f.logLink(ctx, num, ino.MetaGeneration, parentNum, name)
 		if err != nil {
 			return nil, syscall.EIO
 		}
@@ -134,7 +134,7 @@ func (f *FS) addLink(ctx context.Context, parentNum uint32, file *File, name str
 }
 
 // logLink commits the intent to give inode num, at MetaGeneration gen, one more link and the name in parentNum.
-func (f *FS) logLink(num uint32, gen uint64, parentNum uint32, name string) (uint64, error) {
+func (f *FS) logLink(ctx context.Context, num uint32, gen uint64, parentNum uint32, name string) (uint64, error) {
 	txn := f.journal.Begin()
 	err := txn.LogLinkAdd(&journal.LinkAddPayload{InodeNum: uint64(num), MetaGeneration: gen})
 	if err == nil {
@@ -149,7 +149,7 @@ func (f *FS) logLink(num uint32, gen uint64, parentNum uint32, name string) (uin
 		f.journal.Abort(txn)
 		return 0, err
 	}
-	return f.journal.Commit(txn)
+	return f.commitWhenRoom(ctx, txn)
 }
 
 // dropUnnamedLink takes back the link of a name that never appeared; other nodes may have unlinked every name since.

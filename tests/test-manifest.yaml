@@ -1298,6 +1298,78 @@ scenarios:
     environments:
       go: internal/journal/checkpoint_test.go::TestPendingIntentSurvivesFullRing
 
+  - id: journal-open-intents-complete
+    name: Open intents can always complete
+    description: Intents left open until the ring refuses more each still complete, newest first, since Commit keeps room for every completion owed
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestOpenIntentsCanAlwaysComplete
+
+  - id: journal-open-intents-complete-durably
+    name: Open intents can always end durably
+    description: Every intent of a full ring ends durably, newest first; the head then reaches the tail and replay runs nothing
+    priority: go_only
+    environments:
+      go: internal/journal/checkpoint_test.go::TestOpenIntentsCanAlwaysCompleteDurably
+
+  - id: journal-admit-waits
+    name: Admission waits for open intents to complete
+    description: An operation that finds the ring full of open intents waits for room, then commits
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestAdmitWaitsForOpenIntentsToComplete
+
+  - id: journal-admit-context
+    name: Admission ends with its context
+    description: A wait for journal room returns the context's error when the context ends
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestAdmitEndsWithItsContext
+
+  - id: journal-admitted-room
+    name: Admitted room outlasts other commits
+    description: Room an admission set aside stays its own while commits that cannot wait fill the rest of the ring
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestAdmittedRoomOutlastsOtherCommits
+
+  - id: journal-head-moving-room
+    name: Records that move the head find room
+    description: Commits that cannot wait leave a part of the ring to records that let the head move, such as a reserve renewal or a quota flush
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestHeadMovingCommitFindsRoomInAFullRing
+
+  - id: journal-ended-intents-room
+    name: Ended intents give back their room
+    description: After several rings' worth of records ended by CompleteIntent and CompleteIntentDurable, an admission still gets room at once
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestEndedIntentsGiveBackTheirRoom
+
+  - id: journal-quota-flush-room
+    name: Quota flush finds room in a full ring
+    description: A quota flush commits after unadmitted commits fill the ring, into the part kept for records that move the head
+    priority: go_only
+    environments:
+      go: internal/journal/admit_test.go::TestQuotaFlushFindsRoomInAFullRing
+
+  - id: symlink-refused-journal-room
+    name: Refused symlinks give back their journal room
+    description: Symlinks the quota refuses with EDQUOT, more than the journal has sectors, all return without waiting for room
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/symlink_test.go::TestRefusedSymlinksGiveBackTheirJournalRoom
+
+  - id: parallel-creators-journal-space
+    name: Parallel creators wait for journal space
+    description: Hundreds of creators, each in its own directory, fill the journal with open intents; creates wait for room instead of failing with EIO
+    priority: medium
+    environments:
+      go: journal_space_test.go::TestParallelCreatorsWaitForJournalSpace
+      docker: TODO
+      vm: TODO
+
   - id: recovery-ends-with-tail-at-end
     name: Recovery ends when the tail is at the end of the data area
     description: A crash with the journal tail exactly at the end of the data area replays the pending transaction and returns, instead of scanning forever
@@ -4434,7 +4506,7 @@ scenarios:
 
   - id: reserve-refresh
     name: Old reserve record is renewed
-    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record and ends; if the old record cannot end, nothing is freed until it does
+    description: A record a quarter of the journal behind the tail moves its untaken blocks to a new record, committed as one that moves the head, and ends; if the old record cannot end, nothing is freed until it does
     priority: go_only
     environments:
       go: internal/reserve/reserve_test.go::TestRefreshRenewsAnOldRecord
@@ -4502,12 +4574,12 @@ scenarios:
     environments:
       go: internal/journal/reserve_test.go::TestCompleteIntentDurableEndsOldestIntentInFullRing
 
-  - id: journal-failed-head-move
-    name: Failed head move keeps replay whole
-    description: When moving the head past a full ring's oldest intent fails after the head moved in memory, the intent stays ended, the next checkpoint stays consistent and replay runs every pending intent; a retry writes the moved head
+  - id: journal-refused-end-keeps-record
+    name: A refused end keeps the record for replay
+    description: When the device refuses a reserve record's end, the record stays pending and replay still frees its blocks; a retry ends it
     priority: go_only
     environments:
-      go: internal/journal/reserve_test.go::TestFailedHeadMoveKeepsReplayWhole
+      go: internal/journal/reserve_test.go::TestRefusedEndKeepsTheRecordForReplay
 
   - id: reserve-journal-full-log
     name: Journal-full use commit puts blocks back
