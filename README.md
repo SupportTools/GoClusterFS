@@ -55,7 +55,7 @@ make build
 
 This builds `goclusterfs-mount`, `goclusterfs-fsck` and `gfsctl` in the repo root. To include the web dashboard, run `make dashboard build` instead; it needs Node 22 and npm. Release archives include it.
 
-`go install` does not work for this module: its go.mod replaces go-fuse with the patched copy in `third_party/`. Build from a checkout with `make build`, or use a release archive.
+Or install all three into `$(go env GOPATH)/bin`, without the dashboard, with `go install github.com/supporttools/GoClusterFS/cmd/...@latest`.
 
 ### Shell Completions
 

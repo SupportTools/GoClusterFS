@@ -2482,18 +2482,22 @@ test_flock_across_nodes() {
 
     local mnt=/mnt/goclusterfs
     ssh_run 1 "touch $mnt/flock_file"
-    # The holder touches a marker once it holds the flock: a flock may first wait for the other VM's last release.
+    # The holder touches a marker once it holds the flock, which may first wait for the other VM's last release,
+    # and holds it until the test touches /tmp/flock_release, or for 60s at most.
     hold_flock() {
-        ssh_run 1 "rm -f /tmp/flock_held; nohup flock $1 $mnt/flock_file sh -c 'touch /tmp/flock_held; sleep $2' < /dev/null > /dev/null 2>&1 &"
+        ssh_run 1 "rm -f /tmp/flock_held /tmp/flock_release; nohup flock $1 $mnt/flock_file sh -c 'touch /tmp/flock_held; i=0; while [ ! -e /tmp/flock_release ] && [ \$i -lt 300 ]; do sleep 0.2; i=\$((i+1)); done' < /dev/null > /dev/null 2>&1 &"
+        wait_for_vm_file 1 /tmp/flock_held || { log_error "VM 1 did not get its $1 flock within 10s"; return 1; }
+    }
+    wait_for_vm_file() {
         local i
         for i in $(seq 50); do
-            ssh_run 1 "test -e /tmp/flock_held" && return 0
+            ssh_run "$1" "test -e $2" && return 0
             sleep 0.2
         done
-        log_error "VM 1 did not get its $1 flock within 10s"
         return 1
     }
-    hold_flock -x 4 || return 1
+
+    hold_flock -x || return 1
     if ssh_run 2 "flock -n -x $mnt/flock_file true"; then
         log_error "VM 2 took an exclusive flock that VM 1 holds"
         return 1
@@ -2502,14 +2506,21 @@ test_flock_across_nodes() {
         log_error "VM 2 took a shared flock next to VM 1's exclusive one"
         return 1
     fi
-    local start=$SECONDS
-    if ! ssh_run 2 "timeout 15 flock -x $mnt/flock_file true"; then
-        log_error "VM 2 did not get the flock within 15s of waiting, though VM 1 holds it for 4s"
+    ssh_run 2 "rm -f /tmp/flock_got; nohup sh -c 'flock -x $mnt/flock_file true && touch /tmp/flock_got' < /dev/null > /dev/null 2>&1 &"
+    sleep 1
+    if ssh_run 2 "test -e /tmp/flock_got"; then
+        log_error "VM 2's waiter got the flock while VM 1 holds it"
         return 1
     fi
-    log_info "VM 2 waited $((SECONDS - start))s for the flock"
+    local start=$SECONDS
+    ssh_run 1 "touch /tmp/flock_release"
+    if ! wait_for_vm_file 2 /tmp/flock_got; then
+        log_error "VM 2's waiter did not get the flock within 10s of VM 1 releasing it"
+        return 1
+    fi
+    log_info "VM 2 got the flock $((SECONDS - start))s after VM 1 released it"
 
-    hold_flock -s 3 || return 1
+    hold_flock -s || return 1
     if ! ssh_run 2 "flock -n -s $mnt/flock_file true"; then
         log_error "VM 2 could not share a flock with VM 1"
         return 1
@@ -2518,7 +2529,8 @@ test_flock_across_nodes() {
         log_error "VM 2 took an exclusive flock next to VM 1's shared one"
         return 1
     fi
-    sleep 3
+    ssh_run 1 "touch /tmp/flock_release"
+    sleep 1
 
     # 200 flock and unlock pairs through flock(1) on an open fd, less the same loop on a local file, which leaves out flock(1)'s own start-up.
     local times

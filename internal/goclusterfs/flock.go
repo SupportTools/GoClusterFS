@@ -24,7 +24,7 @@ var (
 )
 
 // RawFS is the go-fuse file system to mount for f. The kernel sends it only
-// flock(2) locks, with fuse.MountOptions.EnableFlockLocks, and it drops a
+// flock(2) locks, with CAP_FLOCK_LOCKS in fuse.MountOptions.ExtraCapabilities, and it drops a
 // flock at the last close of the open file that holds it.
 func (f *FS) RawFS(opts *fs.Options) fuse.RawFileSystem {
 	return &flockFS{RawFileSystem: fs.NewNodeFS(f, opts), flocks: f.flocks}
