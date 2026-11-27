@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
-
 )
 
 type readResult struct {
