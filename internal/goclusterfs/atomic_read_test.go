@@ -10,7 +10,6 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/supporttools/GoClusterFS/internal/cache"
 )
 
 type readResult struct {
@@ -127,11 +126,6 @@ func TestReadSeesAnotherNodesWriteThatGrewACachedInode(t *testing.T) {
 	lockPath := newLockImage(t)
 	fsA := openLockedTreeFSNode(t, path, lockPath, 1)
 	fsB := openLockedTreeFSNode(t, path, lockPath, 2)
-	cacheMgr, err := cache.NewManager(cache.DefaultConfig(), fsB.inodeTbl, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fsB.cacheMgr = cacheMgr
 	fileA := newRegularFile(t, fsA)
 	data := pattern(3, 2*BlockSize)
 	writeAt(t, fileA, data[:BlockSize], 0)

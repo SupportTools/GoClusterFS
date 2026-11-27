@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
+	"github.com/supporttools/GoClusterFS/internal/cache"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
 	"github.com/supporttools/GoClusterFS/internal/inode"
@@ -20,7 +21,7 @@ import (
 	"github.com/supporttools/GoClusterFS/internal/superblock"
 )
 
-// openLockedTreeFS is openTreeFS with a lock manager, as on a real mount.
+// openLockedTreeFS is openTreeFS with a lock manager and an inode cache, as on a real mount.
 func openLockedTreeFS(t *testing.T, path string) *FS {
 	t.Helper()
 	return openLockedTreeFSNode(t, path, newLockImage(t), 1)
@@ -73,7 +74,12 @@ func openLockedTreeFSNodeWithRegion(t *testing.T, path, lockPath string, slot in
 	inodeTbl := inode.NewTable(dev, treeFSInodeOffset, 4096*inode.InodeSize, lm, nodeUUID)
 	extentMgr := extent.NewManager(dev, bm, lm, treeFSDataOffset, storage.DefaultBlockSize)
 	inodeTbl.SetTreeFlusher(extentMgr)
+	cacheMgr, err := cache.NewManager(cache.DefaultConfig(), inodeTbl, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &FS{
+		cacheMgr:   cacheMgr,
 		dev:        dev,
 		lockMgr:    lm,
 		bitmapMgr:  bm,

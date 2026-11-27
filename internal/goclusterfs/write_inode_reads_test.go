@@ -8,19 +8,8 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/supporttools/GoClusterFS/internal/cache"
 	"github.com/supporttools/GoClusterFS/internal/lock"
 )
-
-func withInodeCache(t *testing.T, fsys *FS) *FS {
-	t.Helper()
-	cacheMgr, err := cache.NewManager(cache.DefaultConfig(), fsys.inodeTbl, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fsys.cacheMgr = cacheMgr
-	return fsys
-}
 
 func holdFileIO(t *testing.T, f *File) func() {
 	t.Helper()
@@ -43,7 +32,7 @@ func writeIOLockedAt(t *testing.T, f *File, data []byte, off int64) {
 // to check the block in place and once to set mtime. The security.capability
 // lookup before it and the plan read nothing.
 func TestOverwriteUnderOneHoldReadsItsInodeTwice(t *testing.T) {
-	fsys := withInodeCache(t, openLockedTreeFS(t, newTreeFSImage(t)))
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
 	f := newRegularFile(t, fsys)
 	unlock := holdFileIO(t, f)
 	writeIOLockedAt(t, f, pattern(1, 2*BlockSize), 0)
@@ -79,7 +68,7 @@ func TestOverwriteUnderOneHoldReadsItsInodeTwice(t *testing.T) {
 // lock, plans again from disk, and keeps the peer's mode.
 func TestWriteAfterAPeersChmodPlansAgainFromDisk(t *testing.T) {
 	path, lockPath := newTreeFSImage(t), newLockImage(t)
-	fsys := withInodeCache(t, openLockedTreeFSNode(t, path, lockPath, 1))
+	fsys := openLockedTreeFSNode(t, path, lockPath, 1)
 	peer := openLockedTreeFSNode(t, path, lockPath, 2)
 	f := newRegularFile(t, fsys)
 	unlock := holdFileIO(t, f)
