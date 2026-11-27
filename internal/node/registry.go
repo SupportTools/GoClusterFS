@@ -1549,6 +1549,7 @@ func (r *Registry) acquireForRecovery(slotIdx int, observed *Slot, timeout time.
 	if err != nil {
 		return nil, err
 	}
+	failpointSleep(testIntentDelay, "slot %d: intent written; the revoke of node %x waits", slotIdx, slot.UUID[:8])
 	// Before the CAS, so the dead node's late heartbeat cannot land over the Dead mark, and outside r.mu, so a slow
 	// preempt cannot hold up this node's own heartbeat.
 	if err := r.revoke(slotIdx, raw, marked, slot.UUID); err != nil {

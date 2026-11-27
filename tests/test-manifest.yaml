@@ -6795,10 +6795,12 @@ scenarios:
 
   - id: fencing-rejoin-slow-peer-revoke
     name: A rejoining node registers only after a peer's slow revoke
-    description: A peer marks its intent in the earlier mount's slot late in the new mount's watch and revokes a second later; the new mount registers its key after that revoke and can write on the LIO fake
-    priority: go_only  # the VM suite cannot hold a peer between its intent and its revoke
+    description: The takeover-and-power-cut sequence with the peer's revoke held after its intent in the earlier mount's slot; the new mount registers its key only after that revoke, so LIO keeps its writes, and it stays up and writes
+    priority: high
     environments:
       go: internal/node/rejoin_test.go::TestJoinWaitsForAPeersSlowRevoke
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_rejoin_slow_revoke
 
   - id: fencing-rejoin-stopped-peer-intent
     name: A rejoining node takes over its earlier slot when a peer stops after its intent

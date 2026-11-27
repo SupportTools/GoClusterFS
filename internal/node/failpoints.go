@@ -6,10 +6,11 @@ import (
 	"time"
 )
 
-// For tests only. GOCLUSTERFS_TEST_TAKEOVER_DELAY holds a takeover between its preempt and its Dead mark, and
-// GOCLUSTERFS_TEST_BEAT_STALL holds a heartbeat between its slot read and its write, so a VM test can resume a paused
-// node inside those windows.
+// For tests only. GOCLUSTERFS_TEST_INTENT_DELAY holds a takeover between its intent and its preempt,
+// GOCLUSTERFS_TEST_TAKEOVER_DELAY between its preempt and its Dead mark, and GOCLUSTERFS_TEST_BEAT_STALL holds a
+// heartbeat between its slot read and its write, so a VM test can act inside those windows.
 var (
+	testIntentDelay   = testDuration("GOCLUSTERFS_TEST_INTENT_DELAY")
 	testTakeoverDelay = testDuration("GOCLUSTERFS_TEST_TAKEOVER_DELAY")
 	testBeatStall     = testDuration("GOCLUSTERFS_TEST_BEAT_STALL")
 )

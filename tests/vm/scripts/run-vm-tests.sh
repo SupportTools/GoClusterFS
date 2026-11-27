@@ -4394,13 +4394,14 @@ rejoin_reset() {
 }
 
 # rejoin_test runs rejoin case $1 for VM 2 next to VM 1, then resets VM 2 however the case ended, so failures don't cascade.
+# $2 is extra environment for VM 1's mount.
 rejoin_test() {
     if [[ "$VM_STORAGE" != iscsi || $NODE_COUNT -lt 2 ]]; then
         log_warn "Skipping: needs VM_STORAGE=iscsi and 2 VMs"
         return 0
     fi
     local result=0
-    fencing_restart pr || return 1
+    fencing_restart pr "${2:-}" || return 1
     "$1" 2 1 || result=1
     rejoin_reset 2 || result=1
     return $result
@@ -4481,6 +4482,8 @@ rejoin_power_cuts() {
 test_fencing_rejoin_relogin_kill() { rejoin_test rejoin_relogin_kill; }
 test_fencing_rejoin_relogin_power_cut() { rejoin_test rejoin_relogin_power_cut; }
 test_fencing_rejoin_takeover_power_cut() { rejoin_test rejoin_takeover_power_cut; }
+# As above, with VM 1's takeovers held 5s between their intent and their revoke, as the bug hunt's peer was by chance.
+test_fencing_rejoin_slow_revoke() { rejoin_test rejoin_takeover_power_cut "GOCLUSTERFS_TEST_INTENT_DELAY=5s"; }
 test_fencing_rejoin_power_cut() { rejoin_test rejoin_power_cuts; }
 
 # reservation_test runs fsck -test-reservations on VM $1 with the arguments $2 and prints its output and exit code.
@@ -6268,6 +6271,7 @@ main() {
     run_test "Fencing: Rejoin After Relogin And Kill" test_fencing_rejoin_relogin_kill
     run_test "Fencing: Rejoin After Relogin And Power Cut" test_fencing_rejoin_relogin_power_cut
     run_test "Fencing: Rejoin After Takeover And Power Cut" test_fencing_rejoin_takeover_power_cut
+    run_test "Fencing: Rejoin After A Slow Revoke" test_fencing_rejoin_slow_revoke
     run_test "Fencing: Rejoin After Power Cut" test_fencing_rejoin_power_cut
     run_test "Quota: Flush Window Power Cut" test_quota_flush_window_power_cut
     run_test "Quota: Fold Window Power Cut" test_quota_fold_window_power_cut
