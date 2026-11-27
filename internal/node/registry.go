@@ -602,20 +602,45 @@ func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
 
 // awaitSilentSlots reads slots until each has changed or for d, and returns the
 // ones that never changed with the bytes they held. It times the wait on this node's clock.
+//
+// A peer's intent in a slot is not yet a change: the peer revokes the slot's node next, and on LIO that revoke stops a
+// mount of the same host that registered its key in between. The slot is watched on from the intent for d, so a slot
+// whose peer stops before its revoke is taken over like a silent one.
 func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []watchedSlot {
-	first := map[int][]byte{}
+	type watch struct {
+		raw   []byte
+		until time.Time
+	}
+	watching := map[int]*watch{}
 	for _, i := range slots {
 		if raw, _, err := r.readSlotRaw(i); err == nil {
-			first[i] = raw
+			watching[i] = &watch{raw, time.Now().Add(d)}
 		}
 	}
-	deadline := time.Now().Add(d)
-	for len(first) > 0 && time.Now().Before(deadline) {
-		time.Sleep(HeartbeatInterval / 4)
-		for i, was := range first {
-			if raw, _, err := r.readSlotRaw(i); err != nil || !bytes.Equal(raw, was) {
-				delete(first, i)
+	waiting := func() bool {
+		for _, w := range watching {
+			if time.Now().Before(w.until) {
+				return true
 			}
+		}
+		return false
+	}
+	for waiting() {
+		time.Sleep(HeartbeatInterval / 4)
+		for i, w := range watching {
+			raw, slot, err := r.readSlotRaw(i)
+			if err != nil {
+				delete(watching, i)
+				continue
+			}
+			if bytes.Equal(raw, w.raw) {
+				continue
+			}
+			if _, _, intent := slot.Intent(); intent {
+				w.raw, w.until = raw, time.Now().Add(d)
+				continue
+			}
+			delete(watching, i)
 		}
 	}
 	if afterSilentWatch != nil {
@@ -623,8 +648,8 @@ func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []watchedSlot 
 	}
 	var silent []watchedSlot
 	for _, i := range slots {
-		if raw, ok := first[i]; ok {
-			silent = append(silent, watchedSlot{i, raw})
+		if w, ok := watching[i]; ok {
+			silent = append(silent, watchedSlot{i, w.raw})
 		}
 	}
 	return silent

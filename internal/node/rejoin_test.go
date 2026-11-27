@@ -167,6 +167,60 @@ func TestJoinRegistersAfterAPeerRevokesTheEarlierMount(t *testing.T) {
 	}
 }
 
+// The bug hunt's ordering: the peer's revoke lands a second after it marks its intent in the earlier mount's slot,
+// here late in vm2's watch. vm2 must not register its key in that second, or the revoke stops vm2's writes on LIO.
+func TestJoinWaitsForAPeersSlowRevoke(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	w := newRejoinWorld(t)
+	w.writeEarlier(t)
+	peer, revoked := w.peer(t)
+	preempt := peer.preempt
+	peer.SetPreempter(func(owner [16]byte) error {
+		time.Sleep(time.Second)
+		return preempt(owner)
+	})
+	reg, joined, _, _ := w.rebooted(t)
+	recovered := make(chan error, 1)
+	go func() {
+		time.Sleep(silentSlotWatch * 3 / 4)
+		recovered <- peer.RecoverFailedNode(earlierSlot)
+	}()
+	if _, err := reg.Register(context.Background(), "vm2"); err != nil {
+		t.Fatalf("vm2's Register: %v", err)
+	}
+	if err := <-recovered; err != nil {
+		t.Fatalf("the peer's takeover: %v", err)
+	}
+	if at := revoked(); at.IsZero() || !joined.After(at) || !w.target.MayWrite("vm2/1") {
+		t.Errorf("vm2 joined at %v, the peer revoked at %v, vm2 may write: %v; want the join after the revoke and vm2 writing",
+			joined.Format(time.StampMilli), at.Format(time.StampMilli), w.target.MayWrite("vm2/1"))
+	}
+}
+
+// A peer marks its intent in the earlier mount's slot during vm2's watch and stops before it revokes. vm2 watches the
+// intent stay unchanged and takes the slot over itself.
+func TestJoinTakesOverAnEarlierMountAPeerStoppedTakingOver(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	w := newRejoinWorld(t)
+	w.writeEarlier(t)
+	if err := w.target.Node("vm2/1", 0x47430000000000ff).Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	reg, _, _, _ := w.rebooted(t)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		w.earlier.RecoveryOwner, w.earlier.RecoveryStart = [16]byte{0x77}, time.Now().Unix()
+		w.writeEarlier(t)
+	}()
+	slot, err := reg.Register(context.Background(), "vm2")
+	if err != nil || slot != earlierSlot {
+		t.Fatalf("vm2's Register: slot %d, %v; want the earlier mount's slot %d", slot, err, earlierSlot)
+	}
+	if !slices.Equal(w.target.Preempted(), []uint64{w.key}) || !w.target.MayWrite("vm2/1") {
+		t.Errorf("vm2 revoked %x, may write: %v; want the earlier key revoked and vm2 writing", w.target.Preempted(), w.target.MayWrite("vm2/1"))
+	}
+}
+
 // With no peer to take it over, vm2's mount watches its earlier mount's slot silent and takes it over itself. vm2's
 // first session reserved before the relogin, so its new key there holds the reservation, and vm2 writes as the holder
 // after revoking the earlier mount's key, without registering anew.

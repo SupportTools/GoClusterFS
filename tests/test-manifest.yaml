@@ -6793,6 +6793,20 @@ scenarios:
       docker: TODO - the Docker suite's shared disk has no persistent reservations
       vm: run-vm-tests.sh::test_fencing_rejoin_takeover_power_cut
 
+  - id: fencing-rejoin-slow-peer-revoke
+    name: A rejoining node registers only after a peer's slow revoke
+    description: A peer marks its intent in the earlier mount's slot late in the new mount's watch and revokes a second later; the new mount registers its key after that revoke and can write on the LIO fake
+    priority: go_only  # the VM suite cannot hold a peer between its intent and its revoke
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinWaitsForAPeersSlowRevoke
+
+  - id: fencing-rejoin-stopped-peer-intent
+    name: A rejoining node takes over its earlier slot when a peer stops after its intent
+    description: A peer marks its intent in the earlier mount's slot and never revokes; the new mount watches the intent stay unchanged, then takes the slot over itself and revokes the earlier key
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinTakesOverAnEarlierMountAPeerStoppedTakingOver
+
   - id: fencing-rejoin-power-cut
     name: A power-cut node rejoins on a plain disk and a multipath map
     description: VM 2 is power cut and mounts at once or 3 s after it boots, racing VM 1's takeover, on its iSCSI disk and on a multipath map; each time it joins, stays up 25 s and writes a file VM 1 reads
