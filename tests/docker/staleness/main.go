@@ -238,9 +238,9 @@ func analyze(args []string) {
 	writerLog := fs.String("writer", "", "writer log")
 	readerLog := fs.String("reader", "", "reader logs, comma separated")
 	bounds := map[string]*time.Duration{
-		"open":   fs.Duration("bound-open", 6*time.Second, "most lag allowed through a file held open"),
-		"stat":   fs.Duration("bound-stat", 1500*time.Millisecond, "most lag allowed for stat on the path"),
-		"reopen": fs.Duration("bound-reopen", 500*time.Millisecond, "most lag allowed for a fresh open"),
+		"open":   fs.Duration("bound-open", 6*time.Second, "longest a read through a file held open may miss a closed version"),
+		"stat":   fs.Duration("bound-stat", 1500*time.Millisecond, "longest a stat on the path may miss a closed version"),
+		"reopen": fs.Duration("bound-reopen", 500*time.Millisecond, "longest a fresh open may miss a closed version"),
 	}
 	_ = fs.Parse(args)
 
@@ -284,8 +284,8 @@ func analyze(args []string) {
 			continue
 		}
 		var lags []time.Duration
-		var worst, worstStale, slowest time.Duration
-		worstVersion, bad := 0, 0
+		var worst, stale, slowest time.Duration
+		worstVersion, staleVersion, bad := 0, 0, 0
 		for v := 1; v <= maxVersion; v++ {
 			var seen *change
 			for i := range cs {
@@ -304,8 +304,8 @@ func analyze(args []string) {
 			if lag > worst {
 				worst, worstVersion = lag, v
 			}
-			if seen.prevStart > 0 {
-				worstStale = max(worstStale, time.Duration(seen.prevStart-done[v]))
+			if missed := time.Duration(seen.prevStart - done[v]); seen.prevStart > 0 && missed > stale {
+				stale, staleVersion = missed, v
 			}
 			slowest = max(slowest, time.Duration(seen.at-seen.start))
 		}
@@ -329,7 +329,8 @@ func analyze(args []string) {
 			median = lags[len(lags)/2]
 		}
 		verdict := "ok"
-		if worst > *bounds[mode] {
+		// Lag includes how long the seeing look took, so only a look that began after the close and missed the version proves stale data.
+		if stale > *bounds[mode] {
 			verdict = "OUT OF BOUND"
 			failed = true
 		}
@@ -342,9 +343,13 @@ func analyze(args []string) {
 			verdict = fmt.Sprintf("NEVER SAW %d VERSIONS", maxVersion-len(lags))
 			failed = true
 		}
-		fmt.Printf("%-6s versions seen %d/%d  median %v  worst %v (v%d)  bound %v  unreadable looks %d  regressions %d  %s  [stale-proven %v, slowest seeing look %v]\n",
-			mode, len(lags), maxVersion, median.Round(time.Millisecond), worst.Round(time.Millisecond), worstVersion, *bounds[mode], bad, regressions, verdict,
-			worstStale.Round(time.Millisecond), slowest.Round(time.Millisecond))
+		proven := stale.Round(time.Millisecond).String()
+		if staleVersion > 0 {
+			proven += fmt.Sprintf(" (v%d)", staleVersion)
+		}
+		fmt.Printf("%-6s versions seen %d/%d  stale-proven %s  bound %v  unreadable looks %d  regressions %d  %s  [lag median %v, worst %v (v%d), slowest seeing look %v]\n",
+			mode, len(lags), maxVersion, proven, *bounds[mode], bad, regressions, verdict,
+			median.Round(time.Millisecond), worst.Round(time.Millisecond), worstVersion, slowest.Round(time.Millisecond))
 	}
 	if failed {
 		os.Exit(1)
