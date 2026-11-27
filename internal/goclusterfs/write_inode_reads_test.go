@@ -95,3 +95,23 @@ func TestWriteAfterAPeersChmodPlansAgainFromDisk(t *testing.T) {
 		t.Fatalf("mode after the write = %o, want the peer's 600", mode)
 	}
 }
+
+// Reads and writes under one file I/O lock hold take the inode from the cache,
+// so a fallocate that grows the file leaves its new size there.
+func TestFallocateCachesTheInodeItWrote(t *testing.T) {
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
+	f := newRegularFile(t, fsys)
+	unlock := holdFileIO(t, f)
+	defer unlock()
+	writeIOLockedAt(t, f, pattern(1, 4096), 0)
+	if errno, err := f.allocate(context.Background(), 0, 3*BlockSize, 0); errno != 0 || err != nil {
+		t.Fatalf("fallocate: %v, %v", errno, err)
+	}
+	ino, err := f.inodeForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.Size != 3*BlockSize {
+		t.Fatalf("a read after the fallocate sees %d bytes, want %d", ino.Size, 3*BlockSize)
+	}
+}

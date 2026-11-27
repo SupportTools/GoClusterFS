@@ -4129,6 +4129,7 @@ func (f *File) allocate(ctx context.Context, off uint64, size uint64, mode uint3
 		return syscall.EIO, nil
 	}
 	committed = true
+	f.fs.cacheInode(ino)
 
 	logging.Debugf("Allocate inode %d: success, AllocatedBlocks=%d WrittenBlocks=%d Size=%d",
 		f.inodeNum, ino.AllocatedBlocks, ino.WrittenBlocks, ino.Size)

@@ -412,6 +412,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/write_inode_reads_test.go::TestWriteAfterAPeersChmodPlansAgainFromDisk
 
+  - id: fallocate-caches-inode
+    name: A fallocate leaves the inode it wrote in the cache
+    description: Under one file I/O lock hold, after a write, a fallocate that grows the file leaves its new size in the inode cache that reads and writes under the same hold use, so a read right after it is not cut short at the old size
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_inode_reads_test.go::TestFallocateCachesTheInodeItWrote
+
   - id: fallocated-run-zeroes-tail
     name: A first write into fallocated blocks zeroes the last block's tail
     description: Over old disk contents, a write from the middle of block 0 to the middle of block 2 of a fallocated file leaves the uncovered head and tail reading zeros
