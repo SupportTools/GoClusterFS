@@ -8,7 +8,6 @@ package goclusterfs
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -2413,37 +2412,6 @@ func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint3
 	return 0, syscall.EAGAIN
 }
 
-// waitOutReplay waits, holding no lock, for the extent lock key that a failing
-// node holds until its replay ends, then has the write retried. A replay that
-// needed the inode lock this write gave up can finish meanwhile.
-func (f *File) waitOutReplay(ctx context.Context, key uint64) error {
-	if err := f.fs.lockMgr.AcquireExtent(ctx, key, lock.LockModeExclusive); err != nil {
-		log.Printf("[WARN] Write inode %d: waiting for extent lock %d after its holder's replay failed: %v", f.inodeNum, key, err)
-		return syscall.EIO
-	}
-	f.fs.release(lock.LockTypeExtent, key, "block")
-	return errRetryWrite
-}
-
-// extentLockKey names the extent lock that covers physBlock: one per 1 MB of the data region, whatever the block
-// size, so at 1 MB blocks it is the block number.
-func (f *FS) extentLockKey(physBlock uint64) uint64 {
-	return physBlock * f.blockSize >> 20
-}
-
-// extentLockKeys returns the extent locks that cover n blocks from physBlock, in the record order they must be
-// taken in.
-func (f *FS) extentLockKeys(physBlock, n uint64) []uint64 {
-	var keys []uint64
-	for key := f.extentLockKey(physBlock); key <= f.extentLockKey(physBlock+n-1); key++ {
-		keys = append(keys, key)
-	}
-	slices.SortFunc(keys, func(a, b uint64) int {
-		return cmp.Compare(f.lockMgr.Record(lock.LockTypeExtent, a), f.lockMgr.Record(lock.LockTypeExtent, b))
-	})
-	return keys
-}
-
 // stillWritableInPlace checks, under the inode lock, that the slot still holds this file, that n logical blocks
 // from blockNum still map to the blocks from physBlock, and that no other file shares them.
 func (f *File) stillWritableInPlace(blockNum, physBlock, n uint64) error {
@@ -3139,10 +3107,6 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			toWrite = int(min((ext.Length-extOffset)*f.fs.blockSize-blockOffset, remaining))
 		}
 		blocks := (blockOffset + uint64(toWrite) + f.fs.blockSize - 1) / f.fs.blockSize
-		var extentKeys []uint64
-		if f.fs.lockMgr != nil && !newBlock {
-			extentKeys = f.fs.extentLockKeys(physBlock, blocks)
-		}
 		tail := (blockOffset + uint64(toWrite)) - (blocks-1)*f.fs.blockSize
 		zeroFirst = zeroFirst && (blockOffset != 0 || tail != f.fs.blockSize)
 
@@ -3162,14 +3126,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 		if !lockHeld && f.fs.lockMgr != nil {
-			// A shared hold could not take an extent lock below on the same record.
-			mode := lock.LockModeShared
-			if slices.ContainsFunc(extentKeys, func(key uint64) bool {
-				return f.fs.lockMgr.SameRecord(lock.LockTypeInode, uint64(f.inodeNum), lock.LockTypeExtent, key)
-			}) {
-				mode = lock.LockModeExclusive
-			}
-			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), mode); err != nil {
+			if err := f.fs.lockMgr.Acquire(ctx, lock.LockTypeInode, uint64(f.inodeNum), lock.LockModeShared); err != nil {
 				logging.Debugf("Write inode %d: failed to acquire inode lock: %v", f.inodeNum, err)
 				return 0, syscall.EIO
 			}
@@ -3180,37 +3137,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 		}
 
-		// Extent locks serialize in-place writes to the same blocks across nodes,
-		// so one node's read-modify-write of a partial sector cannot overwrite
-		// another's data. A whole-sector write still takes them, or it lands
-		// inside a peer's read-modify-write.
-		var heldKeys []uint64
-		releaseExtentLocks := func() {
-			for _, key := range heldKeys {
-				f.fs.release(lock.LockTypeExtent, key, "block")
-			}
-			heldKeys = nil
-		}
-		// Holding only the shared inode lock taken above, this write has changed
-		// nothing yet that a retry would not redo, so it can step aside for a replay.
-		retryable := inPlaceLockHeld
-		extentCtx := ctx
-		if retryable {
-			extentCtx = lock.Retryable(ctx)
-		}
-		for _, key := range extentKeys {
-			if err := f.fs.lockMgr.AcquireExtent(extentCtx, key, lock.LockModeExclusive); err != nil {
-				logging.Debugf("Write inode %d: failed to acquire extent lock %d for block %d: %v",
-					f.inodeNum, key, physBlock, err)
-				releaseExtentLocks()
-				releaseInPlaceLock()
-				if retryable && errors.Is(err, lock.ErrReplayBlocked) {
-					return 0, f.waitOutReplay(ctx, key)
-				}
-				return 0, syscall.EIO
-			}
-			heldKeys = append(heldKeys, key)
-		}
+		// No extent lock: only writes to this file write its blocks in place, and they hold its file I/O lock exclusive.
 		if inPlaceLockHeld && duringInPlaceWrite != nil {
 			duringInPlaceWrite()
 		}
@@ -3226,7 +3153,6 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 			}
 			if err != nil {
 				logging.Debugf("Write inode %d: zeroing block %d failed: %v", f.inodeNum, physBlock, err)
-				releaseExtentLocks()
 				releaseInPlaceLock()
 				return 0, syscall.EIO
 			}
@@ -3240,11 +3166,9 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 		if writeErr != nil {
 			logging.Debugf("Write inode %d: writing %d bytes at %d failed: %v", f.inodeNum, toWrite, diskOffset, writeErr)
-			releaseExtentLocks()
 			releaseInPlaceLock()
 			return 0, syscall.EIO
 		}
-		releaseExtentLocks()
 		releaseInPlaceLock()
 
 		bytesWritten += toWrite

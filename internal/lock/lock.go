@@ -109,8 +109,9 @@ const (
 	LockTypeBlockBitmap  LockType = 6
 	LockTypeSFBContainer LockType = 7
 	LockTypeInode        LockType = 8
-	LockTypeExtent       LockType = 9
-	LockTypeInodeSector  LockType = 10
+	// LockTypeExtent is no longer taken: the file I/O lock keeps writes apart. Its records stay in the layout.
+	LockTypeExtent      LockType = 9
+	LockTypeInodeSector LockType = 10
 	// LockTypeFileIO covers one file's data for a whole read or write request. It ranks before every other type.
 	LockTypeFileIO LockType = 11
 	// LockTypeFlock records hold flock(2) locks, in slots of their own format; Flock takes them, Acquire does not.

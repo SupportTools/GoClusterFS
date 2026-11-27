@@ -3,14 +3,11 @@ package goclusterfs
 import (
 	"context"
 	"sync/atomic"
-	"syscall"
 	"testing"
-	"time"
 
 	"github.com/supporttools/GoClusterFS/internal/bitmap"
 	"github.com/supporttools/GoClusterFS/internal/dir"
 	"github.com/supporttools/GoClusterFS/internal/extent"
-	"github.com/supporttools/GoClusterFS/internal/lock"
 )
 
 func withBlockSize(fsys *FS, blockSize uint64) *FS {
@@ -22,49 +19,24 @@ func withBlockSize(fsys *FS, blockSize uint64) *FS {
 	return fsys
 }
 
-// At 8 KB blocks one extent lock covers each 1 MB of the data region, so a
-// peer that holds it for one block holds off an in-place write to another
-// block of that megabyte.
-func TestExtentLockCoversAMegabyte(t *testing.T) {
-	const blockSize = 8 << 10
-	path, lockPath := newTreeFSImage(t), newLockImage(t)
-	fsys := withBlockSize(openLockedTreeFSNode(t, path, lockPath, 1), blockSize)
-	peer := withBlockSize(openLockedTreeFSNode(t, path, lockPath, 2), blockSize)
+// A write holds its file's I/O lock exclusive, which keeps every other write
+// off the file's blocks, so an overwrite claims no extent lock.
+func TestOverwriteClaimsNoExtentLock(t *testing.T) {
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
 	f := newRegularFile(t, fsys)
-	writeAt(t, f, pattern(1, 202*blockSize), 0)
-	first, second := physicalBlock(t, fsys, f.inodeNum, 200), physicalBlock(t, fsys, f.inodeNum, 201)
-	key := fsys.extentLockKey(second)
-	if first == second || first == key || fsys.extentLockKey(first) != key {
-		t.Fatalf("blocks %d and %d have extent lock keys %d and %d, want one key that is neither block", first, second, fsys.extentLockKey(first), key)
+	writeAt(t, f, pattern(1, 4*BlockSize), 0)
+	overwrite := pattern(2, 4096)
+	writeAt(t, f, overwrite, 2*BlockSize+8192)
+	for _, typ := range fsys.lockMgr.Stats().Types {
+		if typ.Name == "extent" && typ.Acquires > 0 {
+			t.Fatalf("the writes took %d extent locks, want none", typ.Acquires)
+		}
 	}
-	fsys.lockMgr.ReleaseCached()
-
-	ctx := context.Background()
-	if err := peer.lockMgr.AcquireExtent(ctx, key, lock.LockModeExclusive); err != nil {
-		t.Fatal(err)
-	}
-	written := make(chan syscall.Errno, 1)
-	go func() {
-		_, errno := f.Write(ctx, nil, pattern(2, 4096), 200*blockSize)
-		written <- errno
-	}()
-	select {
-	case errno := <-written:
-		t.Fatalf("the write to block %d ended (%v) while the peer held the extent lock of block %d", first, errno, second)
-	case <-time.After(300 * time.Millisecond):
-	}
-	if err := peer.lockMgr.ReleaseExtent(key); err != nil {
-		t.Fatal(err)
-	}
-	peer.lockMgr.ReleaseCached()
-	if errno := <-written; errno != 0 {
-		t.Fatalf("write after the peer let go: %v", errno)
-	}
-	checkAt(t, f, pattern(2, 4096), 200*blockSize)
+	checkAt(t, f, overwrite, 2*BlockSize+8192)
 }
 
 // An overwrite of written blocks that one extent maps goes to the device in one
-// write, and one that crosses a megabyte takes the extent locks of both.
+// write.
 func TestOverwriteOfARunIsOneDeviceWrite(t *testing.T) {
 	const blockSize = 8 << 10
 	path, lockPath := newTreeFSImage(t), newLockImage(t)
@@ -72,9 +44,6 @@ func TestOverwriteOfARunIsOneDeviceWrite(t *testing.T) {
 	f := newRegularFile(t, fsys)
 	writeAt(t, f, pattern(1, 256*blockSize), 0)
 	start, end := uint64(124), uint64(132)
-	if fsys.extentLockKey(physicalBlock(t, fsys, f.inodeNum, start)) == fsys.extentLockKey(physicalBlock(t, fsys, f.inodeNum, end-1)) {
-		t.Fatal("blocks 124 to 131 do not cross a megabyte of the data region")
-	}
 
 	var dataWrites atomic.Int64
 	fsys.dev.SetWriteObserver(func(offset int64, n int) {

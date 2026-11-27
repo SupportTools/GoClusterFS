@@ -329,39 +329,6 @@ func TestConcurrentRefcountReadsDoNotDelaySnapshots(t *testing.T) {
 	})
 }
 
-// A write into an existing block holds the inode lock while it takes the block's
-// extent lock, so it must still succeed when the two locks share a record.
-func TestWriteWhenInodeAndBlockShareLockRecord(t *testing.T) {
-	// Few records, so some file's inode and first block land in one.
-	const region = 4 * lock.RowSize
-	fsys := openLockedTreeFSNodeWithRegion(t, newTreeFSImage(t), newLockImageOfSize(t, region), 1, region)
-	data := bytes.Repeat([]byte{'w'}, storage.SectorSize)
-	for range 32 {
-		f := newRegularFile(t, fsys)
-		writeAt(t, f, make([]byte, storage.SectorSize), 0)
-		ino, err := fsys.inodeTbl.Read(f.inodeNum)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ext, off, err := fsys.extentMgr.Lookup(ino, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		block := ext.PhysicalBlock + off
-		if !fsys.lockMgr.SameRecord(lock.LockTypeInode, uint64(f.inodeNum), lock.LockTypeExtent, block) {
-			continue
-		}
-		// Otherwise the write joins the first write's exclusive hold, still cached.
-		fsys.lockMgr.ReleaseCached()
-		if _, errno := f.Write(context.Background(), nil, data, 0); errno != 0 {
-			t.Fatalf("write to inode %d, whose block %d shares its lock record: %v", f.inodeNum, block, errno)
-		}
-		checkAt(t, f, data, 0)
-		return
-	}
-	t.Fatal("no file's inode and first block shared a lock record")
-}
-
 // A whole-sector write must not land between another node's read and write
 // back of the same sector, or that write-back erases it.
 func TestWholeSectorWriteSurvivesPeerPartialWrite(t *testing.T) {
