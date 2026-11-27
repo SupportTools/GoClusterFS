@@ -49,6 +49,9 @@ import (
 // modification was detected and the Write operation should be retried.
 var errRetryWrite = errors.New("retry write operation")
 
+// errGrowsFile means the file is now shorter than a write that planned to stay inside it.
+var errGrowsFile = errors.New("the write now grows the file")
+
 // beforeCoWCommit lets tests run another node's write after this write mapped
 // its copy of a shared block, before it takes the inode lock to copy the data
 // and commit it.
@@ -2369,6 +2372,27 @@ func (f *File) inodeForRead() (*inode.Inode, error) {
 	return ino, nil
 }
 
+// inodeForWrite returns a copy of this file's inode for a write to plan from, from the cache when inodeForRead would
+// use it. Each step the plan leads to checks the inode again under the inode lock.
+func (f *File) inodeForWrite() (*inode.Inode, error) {
+	ino, err := f.inodeForRead()
+	if err != nil {
+		return nil, err
+	}
+	plan := *ino
+	return &plan, nil
+}
+
+// wrote hands the inode a write put on disk to this node's cache and other nodes'. The write held the file I/O lock
+// since start, so later reads and writes under the same hold can plan from the cache.
+func (f *File) wrote(ino *inode.Inode, start time.Time) {
+	if f.fs.cacheMgr != nil {
+		f.fs.cacheMgr.BroadcastInvalidateInode(uint32(f.inodeNum), ino.DataGeneration, ino.MetaGeneration)
+	}
+	f.fs.cacheInode(ino)
+	f.readFrom.Store(&start)
+}
+
 // Write writes file data.
 // Uses an optimistic retry pattern to handle concurrent modifications from other nodes.
 func (f *File) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
@@ -2399,6 +2423,7 @@ func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint3
 		if err == errRetryWrite {
 			logging.Debugf("Write inode %d: retry attempt %d due to concurrent modification",
 				f.inodeNum, attempt+1)
+			f.readFrom.Store(nil)
 			conflictBackoff(attempt)
 			continue
 		}
@@ -2773,8 +2798,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		}
 	}()
 
-	// Read initial inode state
-	ino, err := f.fs.inodeTbl.Read(f.inodeNum)
+	start := time.Now()
+	ino, err := f.inodeForWrite()
 	if err != nil {
 		logging.Debugf("Write inode %d: Read failed: %v", f.inodeNum, err)
 		return 0, syscall.EIO
@@ -3277,6 +3302,29 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 		lockHeld = true
 	}
 
+	newMtime := time.Now().UnixNano()
+	// An overwrite that mapped nothing new and stays inside the file sets only mtime, in one read and write of the
+	// inode's sector.
+	if acquiredLockForSize && len(allocatedExtents) == 0 && len(cowDone) == 0 {
+		written, err := f.fs.inodeTbl.UpdateWithLockHeld(f.inodeNum, func(fresh *inode.Inode) error {
+			if fresh.Size < offset {
+				return errGrowsFile
+			}
+			fresh.Mtime = newMtime
+			return nil
+		})
+		if err == nil {
+			inodeWritten = true
+			releaseInodeLock()
+			f.wrote(written, start)
+			return requested, nil
+		}
+		if !errors.Is(err, errGrowsFile) {
+			logging.Debugf("Write inode %d: setting mtime failed: %v", f.inodeNum, err)
+			return 0, syscall.EIO
+		}
+	}
+
 	// Re-read the inode while holding the lock to get the freshest size
 	freshIno, err := f.fs.inodeTbl.Read(f.inodeNum)
 	if err != nil {
@@ -3293,7 +3341,6 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	if offset > newSize {
 		newSize = offset // Our write extended the file
 	}
-	newMtime := time.Now().UnixNano()
 
 	// === WAL: Log extent allocations and inode update before committing metadata ===
 	var intentSeq uint64
@@ -3478,14 +3525,7 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 
 	releaseCopied(cowDone)
 
-	// Broadcast inode invalidation to other nodes for immediate visibility.
-	// This is fire-and-forget - doesn't block the write operation.
-	if f.fs.cacheMgr != nil {
-		f.fs.cacheMgr.BroadcastInvalidateInode(uint32(f.inodeNum), ino.DataGeneration, ino.MetaGeneration)
-	}
-
-	// Cache the freshly-written inode for subsequent reads
-	f.fs.cacheInode(ino)
+	f.wrote(ino, start)
 
 	// === WAL: Mark intent complete ===
 	// Now that all metadata and data have been persisted, mark the intent as complete.
@@ -3740,6 +3780,7 @@ func (f *File) growTo(ctx context.Context, size uint64, resizing bool) (syscall.
 	}
 	if _, err := f.writeInternal(ctx, nil, size); err != nil {
 		if err == errRetryWrite {
+			f.readFrom.Store(nil)
 			return 0, err
 		}
 		return errToErrno(err), nil
@@ -4142,16 +4183,14 @@ func (f *File) setxattr(ctx context.Context, attr string, data []byte) syscall.E
 func (f *File) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
 	ctx = detach(ctx)
 	logging.Debugf("File.Getxattr: inode=%d attr=%s", f.inodeNum, attr)
+	// The kernel asks for security.capability before every write.
+	if attr != "user.snapshots" {
+		return 0, syscall.ENODATA
+	}
 	if errno := f.stillCurrent(); errno != 0 {
 		return 0, errno
 	}
-
-	switch attr {
-	case "user.snapshots":
-		return f.listSnapshots(ctx, dest)
-	default:
-		return 0, syscall.ENODATA
-	}
+	return f.listSnapshots(ctx, dest)
 }
 
 // Removexattr removes an extended attribute from the file.
