@@ -49,13 +49,16 @@ func newRejoinWorld(t *testing.T) *rejoinWorld {
 
 func (w *rejoinWorld) writeEarlier(t *testing.T) {
 	t.Helper()
-	reg := NewRegistry(w.dev, 0)
-	reg.mu.Lock()
-	err := reg.writeSlot(earlierSlot, w.earlier)
-	reg.mu.Unlock()
-	if err != nil {
+	if err := writeSlotAt(w.dev, earlierSlot, w.earlier); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeSlotAt(dev *storage.Device, idx int, slot *Slot) error {
+	reg := NewRegistry(dev, 0)
+	reg.mu.Lock()
+	defer reg.mu.Unlock()
+	return reg.writeSlot(idx, slot)
 }
 
 // peer registers host vm1's node and reserves the device; it watches the earlier mount's slot silent and records
@@ -167,16 +170,21 @@ func TestJoinRegistersAfterAPeerRevokesTheEarlierMount(t *testing.T) {
 	}
 }
 
-// The bug hunt's ordering: the peer's revoke lands a second after it marks its intent in the earlier mount's slot,
-// here late in vm2's watch. vm2 must not register its key in that second, or the revoke stops vm2's writes on LIO.
+// The bug hunt's ordering: the peer's revoke lands well after it marks its intent in the earlier mount's slot, here
+// late in vm2's watch and longer after it than the watch itself, while the peer's heartbeat goes on. vm2 must not
+// register its key before that revoke, or the revoke stops vm2's writes on LIO.
 func TestJoinWaitsForAPeersSlowRevoke(t *testing.T) {
 	shortenSilentSlotWatch(t)
 	w := newRejoinWorld(t)
 	w.writeEarlier(t)
 	peer, revoked := w.peer(t)
+	if err := peer.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(peer.Stop)
 	preempt := peer.preempt
 	peer.SetPreempter(func(owner [16]byte) error {
-		time.Sleep(time.Second)
+		time.Sleep(silentSlotWatch + time.Second)
 		return preempt(owner)
 	})
 	reg, joined, _, _ := w.rebooted(t)
@@ -197,27 +205,161 @@ func TestJoinWaitsForAPeersSlowRevoke(t *testing.T) {
 	}
 }
 
-// A peer marks its intent in the earlier mount's slot during vm2's watch and stops before it revokes. vm2 watches the
-// intent stay unchanged and takes the slot over itself.
-func TestJoinTakesOverAnEarlierMountAPeerStoppedTakingOver(t *testing.T) {
+// A peer marks its intent in the earlier mount's slot right after vm2's watch found the slot silent, before vm2's own
+// intent: vm2 has registered its key by then, and the peer's revoke a second later stops vm2's writes on LIO. vm2
+// waits for that revoke, registers anew at its next write and joins another slot.
+func TestJoinLosingTheEarlierSlotToAPeerRegistersAnew(t *testing.T) {
 	shortenSilentSlotWatch(t)
 	w := newRejoinWorld(t)
 	w.writeEarlier(t)
+	peer, _ := w.peer(t)
+	preempt := peer.preempt
+	peer.SetPreempter(func(owner [16]byte) error {
+		time.Sleep(time.Second)
+		return preempt(owner)
+	})
+	reg, _, _, rejoins := w.rebooted(t)
+	recovered := make(chan error, 1)
+	var once sync.Once
+	t.Cleanup(func() { afterSilentWatch = nil })
+	afterSilentWatch = func() {
+		once.Do(func() {
+			go func() { recovered <- peer.RecoverFailedNode(earlierSlot) }()
+			for start := time.Now(); time.Since(start) < 5*time.Second; time.Sleep(10 * time.Millisecond) {
+				if _, s, err := reg.readSlotRaw(earlierSlot); err == nil && underIntent(s) {
+					return
+				}
+			}
+			t.Error("the peer marked no intent in the earlier mount's slot")
+		})
+	}
+	slot, err := reg.Register(context.Background(), "vm2")
+	if err != nil || slot == earlierSlot {
+		t.Fatalf("vm2's Register: slot %d, %v; want another slot than the earlier mount's %d", slot, err, earlierSlot)
+	}
+	if err := <-recovered; err != nil {
+		t.Fatalf("the peer's takeover: %v", err)
+	}
+	if *rejoins != 1 || !w.target.MayWrite("vm2/1") {
+		t.Errorf("vm2 registered anew %d times, may write: %v; want one rejoin after the peer's revoke and vm2 writing", *rejoins, w.target.MayWrite("vm2/1"))
+	}
+}
+
+// stoppedPeer writes slot 0 as host vm1's node whose heartbeat never moves, and returns its UUID.
+func (w *rejoinWorld) stoppedPeer(t *testing.T) [16]byte {
+	t.Helper()
+	peer := &Slot{Magic: SlotMagic, State: NodeStateActive, UUID: [16]byte{0x77}, HeartbeatSeq: 9,
+		HeartbeatTime: time.Now().Unix(), JournalOffset: 9 << 20, JournalSize: 4 << 20}
+	copy(peer.Hostname[:], "vm1")
+	if err := writeSlotAt(w.dev, 0, peer); err != nil {
+		t.Fatal(err)
+	}
+	return peer.UUID
+}
+
+// A peer marks its intent in the earlier mount's slot during vm2's watch and stops before it revokes. vm2 takes the
+// earlier slot over itself once the peer's heartbeat stayed unchanged for the watch, well inside the recovery lease.
+func TestJoinTakesOverAnEarlierMountAPeerStoppedTakingOver(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	t.Cleanup(SetRecoveryLease(30 * time.Second))
+	w := newRejoinWorld(t)
+	w.writeEarlier(t)
+	owner := w.stoppedPeer(t)
 	if err := w.target.Node("vm2/1", 0x47430000000000ff).Reserve(); err != nil {
 		t.Fatal(err)
 	}
 	reg, _, _, _ := w.rebooted(t)
+	marked := *w.earlier
+	marked.RecoveryOwner, marked.RecoveryStart = owner, time.Now().Unix()
+	wrote := make(chan error, 1)
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		w.earlier.RecoveryOwner, w.earlier.RecoveryStart = [16]byte{0x77}, time.Now().Unix()
-		w.writeEarlier(t)
+		wrote <- writeSlotAt(w.dev, earlierSlot, &marked)
 	}()
+	start := time.Now()
 	slot, err := reg.Register(context.Background(), "vm2")
-	if err != nil || slot != earlierSlot {
-		t.Fatalf("vm2's Register: slot %d, %v; want the earlier mount's slot %d", slot, err, earlierSlot)
+	took := time.Since(start)
+	if werr := <-wrote; werr != nil {
+		t.Fatal(werr)
+	}
+	if err != nil || slot != earlierSlot || took > 3*silentSlotWatch {
+		t.Fatalf("vm2's Register: slot %d, %v after %v; want the earlier mount's slot %d within %v", slot, err,
+			took.Round(time.Millisecond), earlierSlot, 3*silentSlotWatch)
 	}
 	if !slices.Equal(w.target.Preempted(), []uint64{w.key}) || !w.target.MayWrite("vm2/1") {
 		t.Errorf("vm2 revoked %x, may write: %v; want the earlier key revoked and vm2 writing", w.target.Preempted(), w.target.MayWrite("vm2/1"))
+	}
+}
+
+// A peer that keeps beating marks its intent in the earlier mount's slot and never revokes. vm2 waits for it only up
+// to the recovery lease after the intent, then takes the slot over itself.
+func TestJoinStopsWaitingForAPeerThatNeverRevokes(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	t.Cleanup(SetRecoveryLease(3 * time.Second))
+	w := newRejoinWorld(t)
+	w.writeEarlier(t)
+	peer, _ := w.peer(t)
+	if err := peer.StartHeartbeat(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(peer.Stop)
+	reg, _, _, _ := w.rebooted(t)
+	marked := *w.earlier
+	marked.RecoveryOwner, marked.RecoveryStart = peer.LocalUUID(), time.Now().Unix()
+	if err := writeSlotAt(w.dev, earlierSlot, &marked); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		slot int
+		err  error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	go func() {
+		slot, err := reg.Register(context.Background(), "vm2")
+		done <- result{slot, err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil || got.slot != earlierSlot {
+			t.Fatalf("vm2's Register: slot %d, %v; want the earlier mount's slot %d", got.slot, got.err, earlierSlot)
+		}
+		if took := time.Since(start); took < 3*time.Second {
+			t.Errorf("vm2 took the slot after %v, inside the recovery lease the peer's intent holds it for", took.Round(time.Millisecond))
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("vm2 still waits 15s after the peer's intent, which never ends while the peer beats")
+	}
+}
+
+// A peer marks its intent in the earlier mount's slot and puts the slot back as it was, as after a revoke that did not
+// take effect. The earlier key stays registered for a later revoke, so vm2 watches the slot on and takes it over itself.
+func TestJoinTakesOverAnEarlierMountAPeerPutBack(t *testing.T) {
+	shortenSilentSlotWatch(t)
+	w := newRejoinWorld(t)
+	w.writeEarlier(t)
+	owner := w.stoppedPeer(t)
+	if err := w.target.Node("vm2/1", 0x47430000000000ff).Reserve(); err != nil {
+		t.Fatal(err)
+	}
+	reg, _, _, _ := w.rebooted(t)
+	marked := *w.earlier
+	marked.RecoveryOwner, marked.RecoveryStart = owner, time.Now().Unix()
+	wrote := make(chan error, 2)
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		wrote <- writeSlotAt(w.dev, earlierSlot, &marked)
+		time.Sleep(500 * time.Millisecond)
+		wrote <- writeSlotAt(w.dev, earlierSlot, w.earlier)
+	}()
+	slot, err := reg.Register(context.Background(), "vm2")
+	for range 2 {
+		if werr := <-wrote; werr != nil {
+			t.Fatal(werr)
+		}
+	}
+	if err != nil || slot != earlierSlot {
+		t.Fatalf("vm2's Register: slot %d, %v; want the earlier mount's slot %d", slot, err, earlierSlot)
 	}
 }
 

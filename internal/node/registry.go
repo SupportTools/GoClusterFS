@@ -604,17 +604,15 @@ func (r *Registry) claimWatched(slots []watchedSlot) (int, error) {
 // ones that never changed with the bytes they held. It times the wait on this node's clock.
 //
 // A peer's intent in a slot is not yet a change: the peer revokes the slot's node next, and on LIO that revoke stops a
-// mount of the same host that registered its key in between. The slot is watched on from the intent for d, so a slot
-// whose peer stops before its revoke is taken over like a silent one.
+// mount of the same host that registered its key in between. A slot under an intent is watched until the peer marks
+// it Dead, and counts as silent only once the peer's heartbeat stayed unchanged for d, or recoveryLease after the
+// intent. A slot the peer puts back as it first was, after a revoke that did not take effect, is watched on.
 func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []watchedSlot {
-	type watch struct {
-		raw   []byte
-		until time.Time
-	}
-	watching := map[int]*watch{}
+	watching := map[int]*slotWatch{}
 	for _, i := range slots {
-		if raw, _, err := r.readSlotRaw(i); err == nil {
-			watching[i] = &watch{raw, time.Now().Add(d)}
+		if raw, slot, err := r.readSlotRaw(i); err == nil {
+			watching[i] = &slotWatch{first: raw, raw: raw, until: time.Now().Add(d)}
+			watching[i].noteIntent(slot, d)
 		}
 	}
 	waiting := func() bool {
@@ -627,20 +625,19 @@ func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []watchedSlot 
 	}
 	for waiting() {
 		time.Sleep(HeartbeatInterval / 4)
+		var all []*Slot
 		for i, w := range watching {
 			raw, slot, err := r.readSlotRaw(i)
-			if err != nil {
+			if err != nil || !w.follow(raw, slot, d) {
 				delete(watching, i)
 				continue
 			}
-			if bytes.Equal(raw, w.raw) {
-				continue
+			if !w.intent.IsZero() {
+				if all == nil {
+					all, _ = r.readAllSlots()
+				}
+				w.followOwner(all, d)
 			}
-			if _, _, intent := slot.Intent(); intent {
-				w.raw, w.until = raw, time.Now().Add(d)
-				continue
-			}
-			delete(watching, i)
 		}
 	}
 	if afterSilentWatch != nil {
@@ -653,6 +650,78 @@ func (r *Registry) awaitSilentSlots(slots []int, d time.Duration) []watchedSlot 
 		}
 	}
 	return silent
+}
+
+// slotWatch is a slot awaitSilentSlots watches: the bytes it read first and the bytes a claim must find, until when
+// it waits, and the peer whose intent the slot holds, with when this node read that intent and saw the peer beat.
+type slotWatch struct {
+	first, raw []byte
+	until      time.Time
+	intent     time.Time
+	owner      [16]byte
+	ownerSeq   uint64
+	ownerBeat  time.Time
+}
+
+func (w *slotWatch) noteIntent(slot *Slot, d time.Duration) {
+	owner, _, ok := slot.Intent()
+	if !ok {
+		w.intent = time.Time{}
+		return
+	}
+	now := time.Now()
+	w.intent, w.owner, w.ownerSeq, w.ownerBeat = now, owner, 0, now
+	w.until = later(w.until, now.Add(d))
+}
+
+// follow takes a new read of the slot and reports whether the slot may still turn out silent.
+func (w *slotWatch) follow(raw []byte, slot *Slot, d time.Duration) bool {
+	switch {
+	case bytes.Equal(raw, w.raw):
+	case bytes.Equal(raw, w.first), underIntent(slot):
+		w.raw = raw
+		w.noteIntent(slot, d)
+	default:
+		return false
+	}
+	return true
+}
+
+// followOwner keeps the watch going while the intent's node beats: its revoke holds its heartbeat, so a node that
+// beats has not revoked yet and is not stuck in its revoke.
+func (w *slotWatch) followOwner(all []*Slot, d time.Duration) {
+	for _, s := range all {
+		if s != nil && s.UUID == w.owner && (s.State == NodeStateActive || s.State == NodeStateLeaving) {
+			if s.HeartbeatSeq != w.ownerSeq {
+				w.ownerSeq, w.ownerBeat = s.HeartbeatSeq, time.Now()
+			}
+			break
+		}
+	}
+	until := w.ownerBeat.Add(d)
+	if limit := w.intent.Add(recoveryLease); limit.Before(until) {
+		until = limit
+	}
+	w.until = later(w.until, until)
+}
+
+func underIntent(slot *Slot) bool {
+	_, _, ok := slot.Intent()
+	return ok
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+// awaitTakeover waits while slot slotIdx holds a peer's intent, as awaitSilentSlots does.
+func (r *Registry) awaitTakeover(slotIdx int) {
+	if _, slot, err := r.readSlotRaw(slotIdx); err == nil && underIntent(slot) {
+		r.awaitSilentSlots([]int{slotIdx}, silentSlotWatch)
+	}
 }
 
 func allSlots() []int {
@@ -1007,6 +1076,11 @@ func (r *Registry) claimSlot(slotIdx int, expected []byte) error {
 				if err = r.rejoinOnce(err); err == nil {
 					marked, err = r.markIntent(slotIdx, expected)
 				}
+			}
+			if errors.Is(err, ErrSlotTaken) {
+				// A peer marked its intent first. Its revoke of the slot's node stops this node on LIO, so this node
+				// waits for it: its next write then meets the refusal and registers anew.
+				r.awaitTakeover(slotIdx)
 			}
 			if err != nil {
 				return err

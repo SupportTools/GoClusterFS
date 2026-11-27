@@ -6809,6 +6809,27 @@ scenarios:
     environments:
       go: internal/node/rejoin_test.go::TestJoinTakesOverAnEarlierMountAPeerStoppedTakingOver
 
+  - id: fencing-rejoin-lost-slot-to-peer
+    name: A rejoining node that loses its earlier slot to a peer's intent registers anew
+    description: A peer marks its intent in the earlier mount's slot just after the new mount's watch found it silent; the new mount waits for the peer's revoke, registers anew at its next write and joins another slot, writing on the LIO fake
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinLosingTheEarlierSlotToAPeerRegistersAnew
+
+  - id: fencing-rejoin-peer-never-revokes
+    name: A rejoining node stops waiting for a live peer that never revokes
+    description: A peer that keeps beating marks its intent in the earlier mount's slot and never revokes; the new mount takes the slot over itself once the recovery lease after the intent has passed
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinStopsWaitingForAPeerThatNeverRevokes
+
+  - id: fencing-rejoin-peer-put-back
+    name: A rejoining node keeps watching a slot a peer put back
+    description: A peer marks its intent in the earlier mount's slot and puts the slot back as it was; the new mount watches on and takes the slot over itself
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinTakesOverAnEarlierMountAPeerPutBack
+
   - id: fencing-rejoin-power-cut
     name: A power-cut node rejoins on a plain disk and a multipath map
     description: VM 2 is power cut and mounts at once or 3 s after it boots, racing VM 1's takeover, on its iSCSI disk and on a multipath map; each time it joins, stays up 25 s and writes a file VM 1 reads
