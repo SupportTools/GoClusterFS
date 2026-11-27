@@ -54,6 +54,10 @@ func (f *FS) rename(ctx context.Context, oldParent uint32, oldName string, newPa
 }
 
 func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, newParent uint32, newName string, flags uint32) syscall.Errno {
+	// Room comes before the directory locks the rename's record is committed under: for that record and for freeing
+	// a file it replaces.
+	ctx, release := f.admitOp(ctx, uint32(len(oldName)+len(newName))+2048, freeRecordBound)
+	defer release()
 	oldDir, err := f.inodeTbl.Read(oldParent)
 	if err != nil {
 		return syscall.EIO
@@ -122,7 +126,7 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 		if f.journal == nil {
 			return nil
 		}
-		seq, err := f.logRename(op, r, flags)
+		seq, err := f.logRename(ctx, op, r, flags)
 		intentSeq = seq
 		if err == nil && afterCommit != nil {
 			afterCommit("rename")
@@ -187,7 +191,7 @@ func (f *FS) renameOnce(ctx context.Context, oldParent uint32, oldName string, n
 }
 
 // logRename commits the rename and what it does to the target, before any of it reaches the device.
-func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, error) {
+func (f *FS) logRename(ctx context.Context, op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, error) {
 	txn := f.journal.Begin()
 	payload := &journal.DirRenamePayload{
 		OldParentInodeNum: uint64(op.OldParent),
@@ -216,7 +220,7 @@ func (f *FS) logRename(op *dir.RenameOp, r *dir.Renamed, flags uint32) (uint64, 
 		f.journal.Abort(txn)
 		return 0, err
 	}
-	return f.journal.Commit(txn)
+	return f.commit(ctx, txn)
 }
 
 // freeReplacedDir frees an empty directory a rename replaced, unless it changed since the rename checked it, and

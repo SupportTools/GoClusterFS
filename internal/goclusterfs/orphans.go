@@ -222,7 +222,7 @@ func (f *FS) freeOrphan(ctx context.Context, num uint32, gen uint64) error {
 			f.journal.Abort(txn)
 			return err
 		}
-		seq, err := f.journal.Commit(txn)
+		seq, err := f.commit(ctx, txn)
 		if err != nil {
 			return err
 		}
