@@ -1,0 +1,149 @@
+package goclusterfs
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"syscall"
+	"testing"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+
+	"github.com/supporttools/GoClusterFS/internal/lock"
+)
+
+func holdFileIO(t *testing.T, f *File) func() {
+	t.Helper()
+	unlock, err := f.fs.lockFileIO(context.Background(), f.inodeNum, lock.LockModeExclusive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unlock
+}
+
+func writeIOLockedAt(t *testing.T, f *File, data []byte, off int64) {
+	t.Helper()
+	if _, errno := f.writeIOLocked(context.Background(), data, off); errno != 0 {
+		t.Fatalf("write at %d: %v", off, errno)
+	}
+}
+
+// A 4K overwrite of an allocated, unshared block, as the kernel sends it after
+// another write under the same file I/O lock hold, reads the inode twice: once
+// to check the block in place and once to set mtime. The security.capability
+// lookup before it and the plan read nothing.
+func TestOverwriteUnderOneHoldReadsItsInodeTwice(t *testing.T) {
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
+	f := newRegularFile(t, fsys)
+	unlock := holdFileIO(t, f)
+	writeIOLockedAt(t, f, pattern(1, 2*BlockSize), 0)
+
+	sector := inodeSector(f.inodeNum)
+	var reads, inodeReads atomic.Int32
+	fsys.dev.SetReadFault(func(off int64) error {
+		reads.Add(1)
+		if off == sector {
+			inodeReads.Add(1)
+		}
+		return nil
+	})
+	if _, errno := f.Getxattr(context.Background(), "security.capability", make([]byte, 64)); errno != syscall.ENODATA {
+		t.Fatalf("security.capability: errno %v, want ENODATA", errno)
+	}
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("security.capability took %d device reads, want 0", n)
+	}
+	overwrite := pattern(2, 4096)
+	writeIOLockedAt(t, f, overwrite, BlockSize+8192)
+	fsys.dev.SetReadFault(func(int64) error { return nil })
+	unlock()
+
+	if n := inodeReads.Load(); n != 2 {
+		t.Fatalf("the overwrite read the inode %d times, want 2", n)
+	}
+	checkAt(t, f, overwrite, BlockSize+8192)
+}
+
+// While this node holds the file I/O lock, a peer's chmod writes the inode. A
+// write into a hole then finds its cached plan out of date under the inode
+// lock, plans again from disk, and keeps the peer's mode.
+func TestWriteAfterAPeersChmodPlansAgainFromDisk(t *testing.T) {
+	path, lockPath := newTreeFSImage(t), newLockImage(t)
+	fsys := openLockedTreeFSNode(t, path, lockPath, 1)
+	peer := openLockedTreeFSNode(t, path, lockPath, 2)
+	f := newRegularFile(t, fsys)
+	unlock := holdFileIO(t, f)
+	writeIOLockedAt(t, f, pattern(1, 4096), 0)
+	writeIOLockedAt(t, f, pattern(1, 4096), 2*BlockSize)
+	fsys.lockMgr.ReleaseCached()
+
+	in := &fuse.SetAttrIn{}
+	in.Valid, in.Mode = fuse.FATTR_MODE, 0o600
+	if errno := fileNode(peer, f.inodeNum).Setattr(context.Background(), nil, in, &fuse.AttrOut{}); errno != 0 {
+		t.Fatalf("peer chmod: %v", errno)
+	}
+	peer.lockMgr.ReleaseCached()
+
+	data := pattern(3, 4096)
+	writeIOLockedAt(t, f, data, BlockSize)
+	unlock()
+	checkAt(t, f, data, BlockSize)
+	ino, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := ino.Mode & 0o7777; mode != 0o600 {
+		t.Fatalf("mode after the write = %o, want the peer's 600", mode)
+	}
+}
+
+// Reads and writes under one file I/O lock hold take the inode from the cache,
+// so a fallocate that grows the file leaves its new size there.
+func TestFallocateCachesTheInodeItWrote(t *testing.T) {
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
+	f := newRegularFile(t, fsys)
+	unlock := holdFileIO(t, f)
+	defer unlock()
+	writeIOLockedAt(t, f, pattern(1, 4096), 0)
+	if errno, err := f.allocate(context.Background(), 0, 3*BlockSize, 0); errno != 0 || err != nil {
+		t.Fatalf("fallocate: %v, %v", errno, err)
+	}
+	ino, err := f.inodeForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ino.Size != 3*BlockSize {
+		t.Fatalf("a read after the fallocate sees %d bytes, want %d", ino.Size, 3*BlockSize)
+	}
+}
+
+// A write that maps a hole block and then fails before its last inode write leaves that block mapped on disk.
+func TestReadAfterAFailedWriteSeesTheBlockItMapped(t *testing.T) {
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
+	f := newRegularFile(t, fsys)
+	unlock := holdFileIO(t, f)
+	defer unlock()
+	writeIOLockedAt(t, f, pattern(1, 4096), 3*BlockSize)
+
+	testHookBeforeInodeCommit = func() error { return errors.New("injected inode write failure") }
+	t.Cleanup(func() { testHookBeforeInodeCommit = nil })
+	if _, errno := f.writeIOLocked(context.Background(), pattern(2, 2*BlockSize), BlockSize); errno != syscall.EIO {
+		t.Fatalf("write with a failing inode write: errno %v, want EIO", errno)
+	}
+	testHookBeforeInodeCommit = nil
+
+	onDisk, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fsys.extentMgr.Lookup(onDisk, 1); err != nil {
+		t.Fatalf("block 1 is not mapped on disk after the failed write (%v); the test needs a mid-write persist", err)
+	}
+	ino, err := f.inodeForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fsys.extentMgr.Lookup(ino, 1); err != nil {
+		t.Fatalf("a read after the failed write finds no block 1 (%v), but the disk maps it", err)
+	}
+}

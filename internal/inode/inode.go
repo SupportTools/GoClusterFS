@@ -311,7 +311,7 @@ func (t *Table) lockedWrite(ctx context.Context, inode *Inode, wantGen *uint64) 
 			return nil, fmt.Errorf("%w: inode %d was written since it was read", ErrTreeConflict, inode.InodeNum)
 		}
 	}
-	return t.writeWithTree(inode)
+	return t.writeWithTree(inode, nil)
 }
 
 // Update applies change to inode num and writes it back, holding the inode lock from the read to the write.
@@ -344,14 +344,44 @@ func (t *Table) lockedUpdate(ctx context.Context, num uint32, change func(*Inode
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	ino, err := t.readInodeUnlocked(num)
+	_, committed, err := t.update(num, change)
+	return committed, err
+}
+
+// update reads inode num, applies change and writes it back, reading its sector once. The caller holds the inode
+// lock, the sector lock and t.mu.
+func (t *Table) update(num uint32, change func(*Inode) error) (*Inode, func(), error) {
+	sector := storage.GetBuffer(SectorSize)
+	defer storage.PutBuffer(sector)
+	buf := sector.Bytes()[:SectorSize]
+	ino, err := t.readInodeInto(buf, num)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := change(ino); err != nil {
+		return nil, nil, err
+	}
+	committed, err := t.writeWithTree(ino, buf)
+	return ino, committed, err
+}
+
+// UpdateWithLockHeld is Update for a caller that holds the inode lock. It returns the inode it wrote.
+func (t *Table) UpdateWithLockHeld(num uint32, change func(*Inode) error) (*Inode, error) {
+	if uint64(num) >= t.totalInodes {
+		return nil, ErrInodeOutOfRange
+	}
+	unlockSector, err := t.lockSector(num)
 	if err != nil {
 		return nil, err
 	}
-	if err := change(ino); err != nil {
-		return nil, err
+	t.mu.Lock()
+	ino, committed, err := t.update(num, change)
+	t.mu.Unlock()
+	unlockSector()
+	if committed != nil {
+		committed()
 	}
-	return t.writeWithTree(ino)
+	return ino, err
 }
 
 // WriteWithLockHeld writes an inode to disk without acquiring the distributed lock.
@@ -367,7 +397,7 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 		return err
 	}
 	t.mu.Lock()
-	committed, err := t.writeWithTree(inode)
+	committed, err := t.writeWithTree(inode, nil)
 	t.mu.Unlock()
 	unlockSector()
 	if committed != nil {
@@ -381,15 +411,22 @@ func (t *Table) WriteWithLockHeld(inode *Inode) error {
 // finishes the commit by freeing released blocks; Write runs it after dropping
 // the inode lock. Under WriteWithLockHeld the caller still holds that lock, so
 // frees that would break the lock order are deferred by the flusher.
-// Caller must hold t.mu and the inode lock.
-func (t *Table) writeWithTree(inode *Inode) (func(), error) {
+// Caller must hold t.mu and the inode lock. sector is the inode's sector as read
+// under those locks, or nil.
+func (t *Table) writeWithTree(inode *Inode, sector []byte) (func(), error) {
 	var committed func()
 	flushed := inode.PendingTree != nil
 	if flushed {
 		if t.treeFlusher == nil {
 			return nil, ErrNoTreeFlusher
 		}
-		onDisk, err := t.readInodeUnlocked(inode.InodeNum)
+		var onDisk *Inode
+		var err error
+		if sector != nil {
+			onDisk, err = deserializeInode(sector[t.inodeStart(inode.InodeNum):][:InodeSize])
+		} else {
+			onDisk, err = t.readInodeUnlocked(inode.InodeNum)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -401,7 +438,7 @@ func (t *Table) writeWithTree(inode *Inode) (func(), error) {
 	inode.LastModifierUUID = t.nodeUUID
 	inode.MetaGeneration++
 
-	if err := t.writeInodeSector(inode, !flushed); err != nil {
+	if err := t.writeInodeSector(inode, !flushed, sector); err != nil {
 		return nil, err
 	}
 	inode.PendingTree = nil
@@ -747,7 +784,7 @@ func (t *Table) updateIfLocked(ctx context.Context, inodeNum uint32, update func
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	committed, err := t.writeWithTree(inode)
+	committed, err := t.writeWithTree(inode, nil)
 	return committed, inode, err == nil, err
 }
 
@@ -791,31 +828,31 @@ func (t *Table) recount() {
 // readInodeUnlocked reads an inode without acquiring the mutex.
 // Caller must hold at least t.mu.RLock().
 func (t *Table) readInodeUnlocked(inodeNum uint32) (*Inode, error) {
-	// Calculate sector containing this inode
-	sectorIdx := uint64(inodeNum) / InodesPerSector
-	inodeOffset := uint64(inodeNum) % InodesPerSector
-
-	// Read the entire sector
-	sectorOffset := int64(t.offset) + int64(sectorIdx)*SectorSize
-
 	buf := storage.GetBuffer(SectorSize)
 	defer storage.PutBuffer(buf)
+	return t.readInodeInto(buf.Bytes()[:SectorSize], inodeNum)
+}
 
-	if _, err := t.dev.ReadAt(buf.Bytes(), sectorOffset); err != nil {
+// readInodeInto reads inodeNum's sector into sector and returns the inode.
+func (t *Table) readInodeInto(sector []byte, inodeNum uint32) (*Inode, error) {
+	if _, err := t.dev.ReadAt(sector, t.sectorOffset(inodeNum)); err != nil {
 		return nil, err
 	}
+	return deserializeInode(sector[t.inodeStart(inodeNum):][:InodeSize])
+}
 
-	// Extract this inode's data
-	start := inodeOffset * InodeSize
-	inodeData := buf.Bytes()[start : start+InodeSize]
+func (t *Table) sectorOffset(inodeNum uint32) int64 {
+	return int64(t.offset) + int64(uint64(inodeNum)/InodesPerSector)*SectorSize
+}
 
-	return deserializeInode(inodeData)
+func (t *Table) inodeStart(inodeNum uint32) uint64 {
+	return uint64(inodeNum) % InodesPerSector * InodeSize
 }
 
 // writeInodeUnlocked writes an inode without acquiring the mutex.
 // Caller must hold t.mu.Lock().
 func (t *Table) writeInodeUnlocked(inode *Inode) error {
-	return t.writeInodeSector(inode, false)
+	return t.writeInodeSector(inode, false, nil)
 }
 
 // lockSector takes the cluster lock on the inode table sector that holds
@@ -850,44 +887,32 @@ func (t *Table) unlock(lt lock.LockType, id uint64) {
 // whose extent tree differs from the stored one fails with ErrTreeConflict:
 // it has no extent edits, so writing it would roll back or wipe a tree that
 // another node committed, and the tree it read may already be freed.
-func (t *Table) writeInodeSector(inode *Inode, checkTree bool) error {
-	// Calculate sector containing this inode
-	sectorIdx := uint64(inode.InodeNum) / InodesPerSector
-	inodeOffset := uint64(inode.InodeNum) % InodesPerSector
-
-	// Read the entire sector first (we need to preserve other inodes)
-	sectorOffset := int64(t.offset) + int64(sectorIdx)*SectorSize
-
-	buf := storage.GetBuffer(SectorSize)
-	defer storage.PutBuffer(buf)
-
-	if _, err := t.dev.ReadAt(buf.Bytes(), sectorOffset); err != nil {
-		// For new sectors, initialize with zeros
-		if err == syscall.EINVAL {
-			for i := range buf.Bytes() {
-				buf.Bytes()[i] = 0
+// sector is the sector as read under those locks; nil reads it first.
+func (t *Table) writeInodeSector(inode *Inode, checkTree bool, sector []byte) error {
+	sectorOffset := t.sectorOffset(inode.InodeNum)
+	if sector == nil {
+		buf := storage.GetBuffer(SectorSize)
+		defer storage.PutBuffer(buf)
+		sector = buf.Bytes()[:SectorSize]
+		if _, err := t.dev.ReadAt(sector, sectorOffset); err != nil {
+			// For new sectors, initialize with zeros
+			if err != syscall.EINVAL {
+				return err
 			}
-		} else {
-			return err
+			clear(sector)
 		}
 	}
 
-	start := inodeOffset * InodeSize
+	start := t.inodeStart(inode.InodeNum)
 	if checkTree {
-		onDisk, err := deserializeInode(buf.Bytes()[start : start+InodeSize])
+		onDisk, err := deserializeInode(sector[start : start+InodeSize])
 		if err == nil && staleExtents(inode, onDisk) {
 			return fmt.Errorf("%w: inode %d", ErrTreeConflict, inode.InodeNum)
 		}
 	}
 
-	// Serialize the inode
-	inodeData := serializeInode(inode)
-
-	// Copy into the sector at the correct offset
-	copy(buf.Bytes()[start:start+InodeSize], inodeData)
-
-	// Write the sector back
-	_, err := t.dev.WriteAt(buf.Bytes(), sectorOffset)
+	copy(sector[start:start+InodeSize], serializeInode(inode))
+	_, err := t.dev.WriteAt(sector, sectorOffset)
 	return err
 }
 
