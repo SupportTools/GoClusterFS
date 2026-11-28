@@ -16,7 +16,7 @@
 //	Level 6: BlockBitmap
 //	Level 7: SFBContainer
 //	Level 8: Inode (by number)
-//	Level 9: Extent (by block)
+//	Level 9: Extent, no longer taken
 //	Level 10: InodeSector (by inode table sector), a leaf: no lock of another
 //	type is taken while one is held. It is held around one sector's
 //	read-modify-write, except that a rename takes the sectors of the inodes it
