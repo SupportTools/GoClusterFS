@@ -115,6 +115,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Mount no longer creates an SFB manager, which nothing used, and logs that SFB is disabled instead of `SFB: enabled`.
 - FUSE read and write requests carry up to 1 MB, up from 128 KB, and readahead is 1 MB.
 - Reads use the inode cache, a node keeps a released lock for 10 ms so back-to-back operations take it again without disk I/O and yields a lock it has reused for 250 ms, and the inode and extent caches are split into 16 shards.
+- O_DIRECT reads and writes through Linux AIO (libaio, QEMU `aio=native`) are queued: the mount asks the kernel for `FUSE_ASYNC_DIO` and allows 64 background requests instead of 12. Before, the kernel ran each AIO request to the end before it accepted the next. On an iSCSI LUN, 4K random reads at queue depth 32 went from 3,100 to 18,000 IOPS, as fast as 32 threads; at queue depth 1 nothing changed. Writes to one file still run one at a time, and at most 64 O_DIRECT requests run at once on a mount. An O_DIRECT read that crosses the end of file this node last saw now stops within a megabyte past it; open the file again, or wait `-attr-timeout`, to read what another node appended.
 
 ### Removed
 
@@ -124,6 +125,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- On an LIO target, a mount after a power cut could stop at once with "The device refused a write from this node" while a peer took over the host's earlier mount. The mount waits for that takeover before it registers its key, but it stopped waiting as soon as the peer marked the earlier mount's slot, before the peer revoked that mount's key, and on LIO the revoke then stopped every session of the host. The mount now waits until the peer's revoke is done, and if a peer marks the slot just before the mount does, the mount waits for that revoke too and registers its key anew. If the peer stops after its mark, the mount takes the slot over itself once the peer's heartbeat stays unchanged for about 20 seconds, or 60 seconds after the mark.
 - Hundreds of threads creating files at once filled the 4 MB journal with open intents, and creates, mkdirs, links, symlinks and unlinks then failed with EIO, logging "journal is full". These operations now wait for room in the journal before they take any lock, and the journal keeps room for every open intent's end, so a finished operation's end always fits. Writes, truncates and renames wait too, for room sized to the request. fallocate, snapshots and clones don't wait yet: they still fail with EIO if the journal stays full.
 - With `-trim` on, the default, a freed block could be allocated and written again before its discard ran, up to 5 seconds later, and the discard then erased the new data, on devices that support discard. TRIM now discards only blocks that are still free.
 - Two nodes writing files whose inodes share one 4 KB sector of the inode table could undo each other's inode writes, and a file then lost its size and the blocks it mapped.
