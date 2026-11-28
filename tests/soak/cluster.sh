@@ -15,7 +15,7 @@
 #   unmount-all         unmount every node
 #   mount-all           mount every node that is not mounted
 #   fsck [-repair]      run goclusterfs-fsck on VM 1 with every node unmounted; answers
-#                       "out <line>" for each problem line, then "ok rc=<exit code>"
+#                       "out <line>" for each line of its output, then "ok rc=<exit code>"
 #   save-image DEST     copy the shared disk to DEST
 #   down                stop every VM and exit
 
@@ -194,11 +194,13 @@ handle() {
             reply ok
             ;;
         fsck)
-            local out rc device
+            local out rc device body
             device=$(node_device 1) || return 1
             out=$(ssh_run 1 "/usr/local/bin/goclusterfs-fsck ${1:-} $device 2>&1; echo rc=\$?")
             rc=${out##*rc=}
-            echo "$out" | grep -E '^ *\[(WARN|ERROR)\]' | sed 's/^ */out /'
+            body=${out%rc=*}
+            [[ -z "$body" || "$body" == *$'\n' ]] || body+=$'\n'
+            printf '%s' "$body" | sed 's/^/out /'
             reply "ok rc=$rc"
             ;;
         save-image)

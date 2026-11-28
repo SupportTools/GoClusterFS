@@ -729,7 +729,8 @@ func (d *driver) quiescedFsck() {
 		d.fail("fsck: unmount: %v", err)
 		return
 	}
-	rc, lines, err := d.ctl.run("fsck")
+	seq := d.fscks.Load() + 1
+	rc, lines, err := d.fsckPass(seq, "check", "")
 	if err != nil {
 		d.fail("fsck: %v", err)
 		return
@@ -749,7 +750,8 @@ func (d *driver) quiescedFsck() {
 	d.fscks.Add(1)
 	faults := d.faults.Load()
 	since := faults - d.faultsAtFsck.Swap(faults)
-	d.logRecord(record{Type: "fsck", Detail: fmt.Sprintf("%s, %d leaks, %d quota drift, %d other", rc, len(leaks), len(drift), len(other)), Op: Op{At: start.UnixMilli()}})
+	leaked := describeLeaks(leaks)
+	d.logRecord(record{Type: "fsck", Detail: fmt.Sprintf("%s, %s, %d quota drift, %d other", rc, leaked, len(drift), len(other)), Op: Op{At: start.UnixMilli()}})
 	if len(other) > 0 {
 		d.fail("fsck found more than leaks:\n%s", strings.Join(other, "\n"))
 		return
@@ -765,12 +767,12 @@ func (d *driver) quiescedFsck() {
 		log.Printf("fsck: quota usage drifted across a fault:\n%s", strings.Join(drift, "\n"))
 	}
 	if len(leaks) > 0 || len(drift) > 0 {
-		log.Printf("fsck: repairing %d leaks and %d projects' usage", len(leaks), len(drift))
-		if _, _, err := d.ctl.run("fsck -repair"); err != nil {
+		log.Printf("fsck: repairing %s and %d projects' usage; output in fsck/%d-*.txt", leaked, len(drift), seq)
+		if _, _, err := d.fsckPass(seq, "repair", "-repair"); err != nil {
 			d.fail("fsck -repair: %v", err)
 			return
 		}
-		if _, lines, err = d.ctl.run("fsck"); err != nil || slices.ContainsFunc(lines, func(l string) bool { return !strings.Contains(l, "is an orphan") }) {
+		if _, lines, err = d.fsckPass(seq, "recheck", ""); err != nil || slices.ContainsFunc(lines, func(l string) bool { return !strings.Contains(l, "is an orphan") }) {
 			d.fail("fsck after repair: %v %v", err, lines)
 			return
 		}
@@ -799,7 +801,7 @@ func (d *driver) quiescedFsck() {
 			return
 		}
 	}
-	log.Printf("fsck: %d leaks repaired, every node shows the model (%s)", len(leaks), time.Since(start).Round(time.Second))
+	log.Printf("fsck: %s repaired, every node shows the model (%s)", leaked, time.Since(start).Round(time.Second))
 }
 
 func isLeak(line string) bool {
