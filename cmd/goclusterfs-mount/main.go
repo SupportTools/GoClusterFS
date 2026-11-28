@@ -707,7 +707,9 @@ func main() {
 			DisableXAttrs: false,
 			AllowOther:    *allowOther,
 			// fcntl locks stay in the kernel and hold only on this node.
-			ExtraCapabilities: fuse.CAP_FLOCK_LOCKS,
+			// With ASYNC_DIO the kernel queues O_DIRECT AIO, up to MaxBackground requests, instead of running each at submit.
+			ExtraCapabilities: fuse.CAP_FLOCK_LOCKS | fuse.CAP_ASYNC_DIO,
+			MaxBackground:     64,
 		},
 		AttrTimeout:  attrTimeout,
 		EntryTimeout: attrTimeout,

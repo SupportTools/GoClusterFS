@@ -73,6 +73,8 @@ STD_ISO_SHA256="4cf7cd3bad64122a8a2423e78369a486a02334d4d88645aab9d08120bb76b0f9
 VM_MEMORY="512M"
 VM_CPUS=1
 VM_BOOT_ATTEMPTS=2
+# A closed connection keeps its port in TIME_WAIT for 60s
+VM_PORT_WAIT=${VM_PORT_WAIT:-70}
 
 # QEMU dies with the shell that started it, so a killed run cannot leave VMs behind
 VM_REAPER=(setpriv --pdeathsig KILL --)
@@ -364,7 +366,7 @@ is_vm_running() {
     # A stale pid file may name a reused PID, so check that it is still this VM's QEMU
     if [[ -f "$pid_file" ]]; then
         local pid=$(cat "$pid_file")
-        local cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+        local cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline")
         if [[ "$cmdline" == *"-name goclusterfs-vm${vm_id} "* ]]; then
             return 0
         fi
@@ -382,7 +384,7 @@ free_vm_port() {
     local vm_id="$1" port="$2"
     local pid=$(port_owner "$port")
     [[ -n "$pid" ]] || return 0
-    local cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+    local cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline")
     if [[ "$cmdline" != *"-name goclusterfs-vm${vm_id} "* || "$cmdline" != *"${VM_DIR}/"* ]]; then
         log_error "VM $vm_id: SSH port $port is held by pid $pid (${cmdline:-unknown}); pick another base port"
         return 1
@@ -398,6 +400,39 @@ free_vm_port() {
         sleep 0.2
         waited=$((waited + 1))
     done
+}
+
+# port_bindable says whether QEMU could listen on 127.0.0.1:$1, binding with SO_REUSEADDR as it does.
+port_bindable() {
+    command -v python3 > /dev/null || return 0
+    python3 -I -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(1)' "$1" 2> /dev/null
+}
+
+port_sockets() {
+    local sockets
+    sockets=$(ss -Htanp "sport = :$1" 2> /dev/null | tr -s ' ' | paste -sd ';' -) || true
+    echo "${sockets:-none listed}"
+}
+
+# The kernel also hands a stopped VM's port to outgoing connections, and such a socket blocks QEMU's bind until 60s
+# after it closes.
+wait_port_bindable() {
+    local vm_id="$1" port="$2" start=$SECONDS
+    port_bindable "$port" && return 0
+    log_warn "VM $vm_id: port $port is taken, waiting up to ${VM_PORT_WAIT}s; its sockets: $(port_sockets "$port")" >&2
+    until port_bindable "$port"; do
+        if (( SECONDS - start >= VM_PORT_WAIT )); then
+            log_error "VM $vm_id: port $port is still taken after ${VM_PORT_WAIT}s; its sockets: $(port_sockets "$port"); pick another base port"
+            return 1
+        fi
+        sleep 1
+    done
+    log_warn "VM $vm_id: port $port came free after $((SECONDS - start))s" >&2
 }
 
 mark_vm_log() {
@@ -527,7 +562,7 @@ target_query() {
     local script vm disk vms
     script=$(cat)
     if [[ $NODE_COUNT -lt 3 ]]; then
-        start_vm 3 false > /dev/null 2>&1 || { log_error "target_query: VM 3, which asks the target, did not start"; return 1; }
+        start_vm 3 false > /dev/null || { log_error "target_query: VM 3, which asks the target, did not start"; return 1; }
         vms=3
     else
         vms=$(seq 1 "$NODE_COUNT")
@@ -635,18 +670,22 @@ boot_vm() {
     local pid_file=$(get_vm_pid_file "$vm_id")
     local accelerator=$(get_accelerator)
     local cpu_type=$(get_cpu_type)
-    local iso="${ISO_PATH}" forwards="hostfwd=tcp:127.0.0.1:${ssh_port}-:22"
+    local iso="${ISO_PATH}" forwards="hostfwd=tcp:127.0.0.1:${ssh_port}-:22" ports=("$ssh_port") port
     local broadcast_net=(-netdev "socket,id=net1,mcast=${BROADCAST_NET},localaddr=127.0.0.1"
         -device "virtio-net-pci,netdev=net1,mac=52:54:00:a8:00:$(printf %02x "$vm_id")")
     if [[ "$vm_id" == "$TARGET_VM_ID" ]]; then
         iso="${STD_ISO_PATH}"
         forwards="${forwards},hostfwd=tcp:127.0.0.1:${ISCSI_PORT}-:3260"
+        ports+=("$ISCSI_PORT")
         broadcast_net=()
     fi
 
     # Clean up old sockets before starting (avoids "Address already in use")
     rm -f "$monitor_socket" "$serial_socket"
     free_vm_port "$vm_id" "$ssh_port" || return 1
+    for port in "${ports[@]}"; do
+        wait_port_bindable "$vm_id" "$port" || return 1
+    done
 
     log_info "Starting VM $vm_id (SSH port: $ssh_port)..."
     log_info "Using accelerator: $accelerator, cpu: $cpu_type"

@@ -6779,6 +6779,43 @@ scenarios:
       docker: TODO - the Docker suite's shared disk has no persistent reservations
       vm: run-vm-tests.sh::test_fencing_rejoin_takeover_power_cut
 
+  - id: fencing-rejoin-slow-peer-revoke
+    name: A rejoining node registers only after a peer's slow revoke
+    description: The takeover-and-power-cut sequence with the peer's revoke held after its intent in the earlier mount's slot; the new mount registers its key only after that revoke, so LIO keeps its writes, and it stays up and writes
+    priority: high
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinWaitsForAPeersSlowRevoke
+      docker: TODO - the Docker suite's shared disk has no persistent reservations
+      vm: run-vm-tests.sh::test_fencing_rejoin_slow_revoke
+
+  - id: fencing-rejoin-stopped-peer-intent
+    name: A rejoining node takes over its earlier slot when a peer stops after its intent
+    description: A peer marks its intent in the earlier mount's slot and never revokes; the new mount watches the intent stay unchanged, then takes the slot over itself and revokes the earlier key
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinTakesOverAnEarlierMountAPeerStoppedTakingOver
+
+  - id: fencing-rejoin-lost-slot-to-peer
+    name: A rejoining node that loses its earlier slot to a peer's intent registers anew
+    description: A peer marks its intent in the earlier mount's slot just after the new mount's watch found it silent; the new mount waits for the peer's revoke, registers anew at its next write and joins another slot, writing on the LIO fake
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinLosingTheEarlierSlotToAPeerRegistersAnew
+
+  - id: fencing-rejoin-peer-never-revokes
+    name: A rejoining node stops waiting for a live peer that never revokes
+    description: A peer that keeps beating marks its intent in the earlier mount's slot and never revokes; the new mount takes the slot over itself once the recovery lease after the intent has passed
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinStopsWaitingForAPeerThatNeverRevokes
+
+  - id: fencing-rejoin-peer-put-back
+    name: A rejoining node keeps watching a slot a peer put back
+    description: A peer marks its intent in the earlier mount's slot and puts the slot back as it was; the new mount watches on and takes the slot over itself
+    priority: go_only
+    environments:
+      go: internal/node/rejoin_test.go::TestJoinTakesOverAnEarlierMountAPeerPutBack
+
   - id: fencing-rejoin-power-cut
     name: A power-cut node rejoins on a plain disk and a multipath map
     description: VM 2 is power cut and mounts at once or 3 s after it boots, racing VM 1's takeover, on its iSCSI disk and on a multipath map; each time it joins, stays up 25 s and writes a file VM 1 reads
