@@ -653,7 +653,7 @@ tcpdump -i eth0 -c 10 udp port 24730 or udp port 24731
 | Slow `ls -l` or `stat` | Each name lookup reads two inodes from disk, and `ls -l` repeats its lookups once it runs longer than `-attr-timeout`. A directory left out of the index (past `-dir-index-entries`) is read whole on every lookup | A higher `-attr-timeout`; `goclusterfs_dir_index_rebuilds_total` growing with lookups means directories don't fit `-dir-index-entries` |
 | Slow reads | Cache misses | `gfsctl stats cache`, or `Cache stats` at unmount |
 | Slow metadata | Lock contention | `lock.Acquire` lines with high `retries`, shown only with `-debug` |
-| Slow writes | Synchronous journal commits and per-block extent locks | Storage latency |
+| Slow writes | Synchronous journal commits; writes to one file run one at a time, on all nodes together | Storage latency |
 
 ### Block Size
 

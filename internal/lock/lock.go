@@ -16,7 +16,7 @@
 //	Level 6: BlockBitmap
 //	Level 7: SFBContainer
 //	Level 8: Inode (by number)
-//	Level 9: Extent (by block)
+//	Level 9: Extent, no longer taken
 //	Level 10: InodeSector (by inode table sector), a leaf: no lock of another
 //	type is taken while one is held. It is held around one sector's
 //	read-modify-write, except that a rename takes the sectors of the inodes it
@@ -109,8 +109,9 @@ const (
 	LockTypeBlockBitmap  LockType = 6
 	LockTypeSFBContainer LockType = 7
 	LockTypeInode        LockType = 8
-	LockTypeExtent       LockType = 9
-	LockTypeInodeSector  LockType = 10
+	// LockTypeExtent is no longer taken: the file I/O lock keeps writes apart. Its records stay in the layout.
+	LockTypeExtent      LockType = 9
+	LockTypeInodeSector LockType = 10
 	// LockTypeFileIO covers one file's data for a whole read or write request. It ranks before every other type.
 	LockTypeFileIO LockType = 11
 	// LockTypeFlock records hold flock(2) locks, in slots of their own format; Flock takes them, Acquire does not.

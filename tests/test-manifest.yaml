@@ -356,33 +356,33 @@ scenarios:
     environments:
       go: internal/superblock/block_size_test.go::TestFormatRefusesOtherBlockSizes
 
-  - id: extent-lock-covers-megabyte
-    name: An extent lock covers 1 MB of the data region
-    description: At 8 KB blocks a peer holding the extent lock of one block holds off an in-place write to another block of the same megabyte; at 1 MB blocks the key is the block number, as before
+  - id: overwrite-claims-no-extent-lock
+    name: An overwrite claims no extent lock
+    description: Writes hold the file I/O lock exclusive, which keeps other writes off the file's blocks, so an overwrite of allocated blocks takes no extent lock
     priority: go_only
     environments:
-      go: internal/goclusterfs/extent_lock_region_test.go::TestExtentLockCoversAMegabyte
+      go: internal/goclusterfs/write_run_io_test.go::TestOverwriteClaimsNoExtentLock
 
   - id: overwrite-run-one-write
     name: An overwrite of contiguous written blocks is one device write
-    description: At 8 KB blocks an unaligned overwrite of 8 blocks that one extent maps, across a megabyte of the data region, makes one data write, takes both extent locks in record order, and leaves the bytes around it unchanged
+    description: At 8 KB blocks an unaligned overwrite of 8 blocks that one extent maps makes one data write and leaves the bytes around it unchanged
     priority: go_only
     environments:
-      go: internal/goclusterfs/extent_lock_region_test.go::TestOverwriteOfARunIsOneDeviceWrite
+      go: internal/goclusterfs/write_run_io_test.go::TestOverwriteOfARunIsOneDeviceWrite
 
   - id: new-blocks-one-write
     name: New blocks that follow each other on the device are one write
     description: At 8 KB blocks a 128 KB write into an empty file maps 16 contiguous blocks and reaches the device as one data write
     priority: go_only
     environments:
-      go: internal/goclusterfs/extent_lock_region_test.go::TestNewBlocksThatFollowEachOtherAreOneDeviceWrite
+      go: internal/goclusterfs/write_run_io_test.go::TestNewBlocksThatFollowEachOtherAreOneDeviceWrite
 
   - id: fallocated-write-one-run
     name: A write into fallocated blocks clears them as one run
     description: At 8 KB blocks an unaligned write over 16 fallocated blocks makes 3 data writes, the zeroed head, the zeroed tail and the data, and the bytes it does not cover read as zeros
     priority: go_only
     environments:
-      go: internal/goclusterfs/extent_lock_region_test.go::TestWriteIntoFallocatedBlocksIsOneRun
+      go: internal/goclusterfs/write_run_io_test.go::TestWriteIntoFallocatedBlocksIsOneRun
 
   - id: run-stops-at-clone-shared-blocks
     name: A run does not extend into blocks a clone still shares
@@ -4904,13 +4904,6 @@ scenarios:
     environments:
       go: internal/goclusterfs/lock_commit_test.go::TestWholeSectorWriteSurvivesPeerPartialWrite
 
-  - id: write-when-inode-and-block-share-lock-record
-    name: Write succeeds when the inode and block share a lock record
-    description: A write into an existing block whose extent lock maps to the same lock record as the file's inode lock succeeds instead of failing as a shared-to-exclusive upgrade
-    priority: go_only
-    environments:
-      go: internal/goclusterfs/lock_commit_test.go::TestWriteWhenInodeAndBlockShareLockRecord
-
   - id: lock-failing-holder-blocks-until-released
     name: Failing holder's claim blocks until its registry slot empties
     description: A claim older than the stale threshold keeps blocking while its node is failing, and frees once the node's registry slot is empty
@@ -4994,13 +4987,6 @@ scenarios:
     priority: go_only
     environments:
       go: internal/lock/owner_test.go::TestRetryableNestedWaitOnFailingHolderReturnsAtOnce
-
-  - id: in-place-write-steps-aside-for-replay
-    name: In-place write steps aside for a replay
-    description: An overwrite of a block whose lock a failed node held lets go of its inode lock, waits holding nothing while the replay takes the inode lock, then completes without EIO
-    priority: go_only
-    environments:
-      go: internal/goclusterfs/replay_wait_test.go::TestInPlaceWriteStepsAsideForReplay
 
   - id: lock-long-hold-logged-once
     name: Long lock hold is logged once
