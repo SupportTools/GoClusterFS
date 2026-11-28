@@ -366,7 +366,7 @@ is_vm_running() {
     # A stale pid file may name a reused PID, so check that it is still this VM's QEMU
     if [[ -f "$pid_file" ]]; then
         local pid=$(cat "$pid_file")
-        local cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+        local cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline")
         if [[ "$cmdline" == *"-name goclusterfs-vm${vm_id} "* ]]; then
             return 0
         fi
@@ -384,7 +384,7 @@ free_vm_port() {
     local vm_id="$1" port="$2"
     local pid=$(port_owner "$port")
     [[ -n "$pid" ]] || return 0
-    local cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
+    local cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline")
     if [[ "$cmdline" != *"-name goclusterfs-vm${vm_id} "* || "$cmdline" != *"${VM_DIR}/"* ]]; then
         log_error "VM $vm_id: SSH port $port is held by pid $pid (${cmdline:-unknown}); pick another base port"
         return 1
