@@ -419,6 +419,13 @@ scenarios:
     environments:
       go: internal/goclusterfs/write_inode_reads_test.go::TestFallocateCachesTheInodeItWrote
 
+  - id: read-after-failed-write-sees-mapped-block
+    name: A read after a failed write sees the block the write mapped
+    description: Under one file I/O lock hold, a write maps a hole block, persists it mid-write, then fails on its last inode write; a read after it reads the inode from disk and finds the block every other node sees
+    priority: go_only
+    environments:
+      go: internal/goclusterfs/write_inode_reads_test.go::TestReadAfterAFailedWriteSeesTheBlockItMapped
+
   - id: fallocated-run-zeroes-tail
     name: A first write into fallocated blocks zeroes the last block's tail
     description: Over old disk contents, a write from the middle of block 0 to the middle of block 2 of a fallocated file leaves the uncovered head and tail reading zeros

@@ -2,6 +2,7 @@ package goclusterfs
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -113,5 +114,36 @@ func TestFallocateCachesTheInodeItWrote(t *testing.T) {
 	}
 	if ino.Size != 3*BlockSize {
 		t.Fatalf("a read after the fallocate sees %d bytes, want %d", ino.Size, 3*BlockSize)
+	}
+}
+
+// A write that maps a hole block and then fails before its last inode write leaves that block mapped on disk.
+func TestReadAfterAFailedWriteSeesTheBlockItMapped(t *testing.T) {
+	fsys := openLockedTreeFS(t, newTreeFSImage(t))
+	f := newRegularFile(t, fsys)
+	unlock := holdFileIO(t, f)
+	defer unlock()
+	writeIOLockedAt(t, f, pattern(1, 4096), 3*BlockSize)
+
+	testHookBeforeInodeCommit = func() error { return errors.New("injected inode write failure") }
+	t.Cleanup(func() { testHookBeforeInodeCommit = nil })
+	if _, errno := f.writeIOLocked(context.Background(), pattern(2, 2*BlockSize), BlockSize); errno != syscall.EIO {
+		t.Fatalf("write with a failing inode write: errno %v, want EIO", errno)
+	}
+	testHookBeforeInodeCommit = nil
+
+	onDisk, err := fsys.inodeTbl.Read(f.inodeNum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fsys.extentMgr.Lookup(onDisk, 1); err != nil {
+		t.Fatalf("block 1 is not mapped on disk after the failed write (%v); the test needs a mid-write persist", err)
+	}
+	ino, err := f.inodeForRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fsys.extentMgr.Lookup(ino, 1); err != nil {
+		t.Fatalf("a read after the failed write finds no block 1 (%v), but the disk maps it", err)
 	}
 }

@@ -2423,7 +2423,6 @@ func (f *File) writeIOLocked(ctx context.Context, data []byte, off int64) (uint3
 		if err == errRetryWrite {
 			logging.Debugf("Write inode %d: retry attempt %d due to concurrent modification",
 				f.inodeNum, attempt+1)
-			f.readFrom.Store(nil)
 			conflictBackoff(attempt)
 			continue
 		}
@@ -2860,6 +2859,8 @@ func (f *File) writeInternal(ctx context.Context, data []byte, offset uint64) (i
 	inodeWritten := false
 	defer func() {
 		if !inodeWritten {
+			// A mid-write persist may have put a mapping on disk that the cached inode lacks.
+			f.readFrom.Store(nil)
 			// Discarding frees tree blocks, which needs the bitmap lock: drop the inode lock first.
 			releaseInodeLock()
 			f.fs.extentMgr.DiscardPending(ctx, ino)
@@ -3780,7 +3781,6 @@ func (f *File) growTo(ctx context.Context, size uint64, resizing bool) (syscall.
 	}
 	if _, err := f.writeInternal(ctx, nil, size); err != nil {
 		if err == errRetryWrite {
-			f.readFrom.Store(nil)
 			return 0, err
 		}
 		return errToErrno(err), nil
